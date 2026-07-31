@@ -106,9 +106,10 @@ pub use code_structure_sidecar::{
     extract_code_structure_signals,
 };
 pub use concurrency::{
-    AccessMode, ContentionMetrics, ContentionPolicy, ContentionSnapshot, LockLevel, LockOrderGuard,
-    LockSentinel, PipelineStageAccess, ResourceId, ResourceToken, pipeline_access_matrix,
-    read_sentinel, remove_sentinel, try_acquire_sentinel, write_sentinel,
+    AccessMode, ContentionMetrics, ContentionPolicy, ContentionSnapshot,
+    INDEX_ROOT_WRITER_LOCK_FILE, IndexRootWriterLease, IndexRootWriterLeaseError, LockLevel,
+    LockOrderGuard, LockSentinel, PipelineStageAccess, ResourceId, ResourceToken,
+    pipeline_access_matrix, read_sentinel, remove_sentinel, try_acquire_sentinel, write_sentinel,
 };
 pub use config::{
     CliOverrides, ConfigDiagnosticSeverity, ConfigEffectiveSnapshot, ConfigLoadResult,

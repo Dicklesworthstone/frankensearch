@@ -80,6 +80,7 @@ use crate::adapters::format_emitter::{emit_envelope, emit_stream_frame, meta_for
 use crate::adapters::tui::FsfsTuiShellModel;
 use crate::agent_ergonomics::result_id;
 use crate::catalog::cleanup_tombstones_for_path;
+use crate::concurrency::{IndexRootWriterLease, IndexRootWriterLeaseError};
 use crate::config::{
     DegradationOverrideMode, DiscoveryCandidate, DiscoveryDecision, DiscoveryScopeDecision,
     FsfsConfig, IngestionClass, PressureProfile, RootDiscoveryDecision,
@@ -1779,6 +1780,7 @@ struct LiveIngestPipeline {
     target_root: PathBuf,
     lexical_index: QuillIndex,
     vector_index: Arc<std::sync::Mutex<VectorIndex>>,
+    writer_lease: Arc<IndexRootWriterLease>,
     embedder: Arc<dyn Embedder>,
     canonicalizer: DefaultCanonicalizer,
     storage_db_path: Option<PathBuf>,
@@ -1787,6 +1789,7 @@ struct LiveIngestPipeline {
 #[derive(Debug)]
 struct LiveVectorSink {
     vector_index: Arc<std::sync::Mutex<VectorIndex>>,
+    writer_lease: Arc<IndexRootWriterLease>,
 }
 
 impl EmbeddingVectorSink for LiveVectorSink {
@@ -1796,6 +1799,10 @@ impl EmbeddingVectorSink for LiveVectorSink {
         _embedding_embedder_id: &str,
         embedding: &[f32],
     ) -> SearchResult<()> {
+        FsfsRuntime::fence_index_root_writer_lease(
+            &self.writer_lease,
+            "live storage vector sink mutation",
+        )?;
         let mut vi = self
             .vector_index
             .lock()
@@ -1946,6 +1953,7 @@ impl LiveIngestPipeline {
             return Ok(false);
         }
 
+        self.fence_writer_lease("live flush lexical commit")?;
         self.lexical_index.commit(cx).await?;
         let ack = FsfsFlushAck {
             request_id: request.request_id,
@@ -1953,6 +1961,7 @@ impl LiveIngestPipeline {
                 self.lexical_index.segment_stats(),
             ),
         };
+        self.fence_writer_lease("live flush acknowledgement publication")?;
         write_durable_json(&ack_path, &ack, "fsfs.flush.ack.write")?;
         Ok(true)
     }
@@ -1961,12 +1970,14 @@ impl LiveIngestPipeline {
         target_root: PathBuf,
         lexical_index: QuillIndex,
         vector_index: VectorIndex,
+        writer_lease: Arc<IndexRootWriterLease>,
         embedder: Arc<dyn Embedder>,
     ) -> Self {
         Self {
             target_root,
             lexical_index,
             vector_index: Arc::new(std::sync::Mutex::new(vector_index)),
+            writer_lease,
             embedder,
             canonicalizer: DefaultCanonicalizer::default(),
             storage_db_path: None,
@@ -1976,6 +1987,10 @@ impl LiveIngestPipeline {
     fn with_storage_db_path(mut self, storage_db_path: PathBuf) -> Self {
         self.storage_db_path = Some(storage_db_path);
         self
+    }
+
+    fn fence_writer_lease(&self, boundary: &'static str) -> SearchResult<()> {
+        FsfsRuntime::fence_index_root_writer_lease(&self.writer_lease, boundary)
     }
 
     fn resolve_paths(&self, file_key: &str) -> frankensearch_core::SearchResult<(PathBuf, String)> {
@@ -2012,7 +2027,8 @@ impl LiveIngestPipeline {
         Ok((canonical, rel_key))
     }
 
-    fn soft_delete_vector(&self, rel_key: &str) {
+    fn soft_delete_vector(&self, rel_key: &str) -> SearchResult<()> {
+        self.fence_writer_lease("live vector soft delete")?;
         let mut vi = self
             .vector_index
             .lock()
@@ -2024,6 +2040,7 @@ impl LiveIngestPipeline {
                 "soft_delete_vector: ignored (doc may not exist yet)"
             );
         }
+        Ok(())
     }
 
     async fn prune_indexes(&self, cx: &Cx, rel_key: &str) -> frankensearch_core::SearchResult<()> {
@@ -2034,7 +2051,7 @@ impl LiveIngestPipeline {
             "watch_delete",
         )];
         self.apply_lexical_mutations(cx, &mutations).await?;
-        self.soft_delete_vector(rel_key);
+        self.soft_delete_vector(rel_key)?;
         Ok(())
     }
 
@@ -2043,9 +2060,11 @@ impl LiveIngestPipeline {
         cx: &Cx,
         mutations: &[LexicalMutation],
     ) -> SearchResult<()> {
+        self.fence_writer_lease("live lexical incremental mutation")?;
         let backend = QuillLexicalBackend::new(&self.lexical_index);
         let mut pipeline = LexicalPipeline::new(backend);
         let _stats = pipeline.apply_incremental(mutations)?;
+        self.fence_writer_lease("live lexical incremental flush")?;
         pipeline.backend_mut().flush(cx).await
     }
 
@@ -2067,6 +2086,7 @@ impl LiveIngestPipeline {
         ));
         let sink = Arc::new(LiveVectorSink {
             vector_index: Arc::clone(&self.vector_index),
+            writer_lease: Arc::clone(&self.writer_lease),
         }) as Arc<dyn EmbeddingVectorSink>;
 
         let runner = StorageBackedJobRunner::new(
@@ -2187,11 +2207,12 @@ impl LiveIngestPipeline {
                         reason_code = %vector_plan.reason_code,
                         "watcher ingest: tombstoning stale vector for revision invalidation"
                     );
-                    self.soft_delete_vector(rel_key);
+                    self.soft_delete_vector(rel_key)?;
                 }
                 VectorIndexWriteAction::AppendFast { .. } => {
                     match self.embedder.embed(cx, canonical).await {
                         Ok(embedding) => {
+                            self.fence_writer_lease("live vector append")?;
                             let mut vi = self
                                 .vector_index
                                 .lock()
@@ -2222,7 +2243,7 @@ impl LiveIngestPipeline {
                 }
                 VectorIndexWriteAction::MarkLexicalFallback { .. }
                 | VectorIndexWriteAction::Skip { .. } => {
-                    self.soft_delete_vector(rel_key);
+                    self.soft_delete_vector(rel_key)?;
                 }
             }
         }
@@ -2361,7 +2382,7 @@ impl LiveIngestPipeline {
                     .await?;
             }
         } else {
-            self.soft_delete_vector(&rel_key);
+            self.soft_delete_vector(&rel_key)?;
             Self::purge_storage_document(storage_ctx, &rel_key)?;
         }
 
@@ -2439,7 +2460,7 @@ impl LiveIngestPipeline {
             self.apply_live_vector_actions(cx, &rel_key, revision, &canonical, &vector_plan)
                 .await?;
         } else {
-            self.soft_delete_vector(&rel_key);
+            self.soft_delete_vector(&rel_key)?;
         }
 
         Ok(true)
@@ -2463,6 +2484,7 @@ impl LiveIngestPipeline {
         cx: &Cx,
         batch: &[WatchIngestOp],
     ) -> frankensearch_core::SearchResult<usize> {
+        self.fence_writer_lease("live ingest batch admission")?;
         let storage_ctx = self.build_storage_batch_context()?;
         let mut count = 0_usize;
 
@@ -2496,6 +2518,7 @@ impl LiveIngestPipeline {
         }
 
         if count > 0 {
+            self.fence_writer_lease("live ingest batch lexical commit")?;
             self.lexical_index.commit(cx).await?;
             if let Some(storage_ctx) = storage_ctx.as_ref() {
                 self.drain_storage_jobs(cx, storage_ctx).await?;
@@ -3511,6 +3534,26 @@ impl FsfsRuntime {
     #[must_use]
     pub const fn config(&self) -> &FsfsConfig {
         &self.config
+    }
+
+    fn writer_lease_search_error(source: IndexRootWriterLeaseError) -> SearchError {
+        SearchError::SubsystemError {
+            subsystem: "fsfs.writer_lease",
+            source: Box::new(source),
+        }
+    }
+
+    fn acquire_index_root_writer_lease(index_root: &Path) -> SearchResult<IndexRootWriterLease> {
+        IndexRootWriterLease::acquire(index_root).map_err(Self::writer_lease_search_error)
+    }
+
+    fn fence_index_root_writer_lease(
+        lease: &IndexRootWriterLease,
+        boundary: &'static str,
+    ) -> SearchResult<()> {
+        lease
+            .fence(boundary)
+            .map_err(Self::writer_lease_search_error)
     }
 
     /// Pressure sampler cadence for fsfs control-state updates.
@@ -8087,7 +8130,10 @@ impl FsfsRuntime {
             entries.push((id.clone(), embedding));
         }
 
-        // Open index and append.
+        // Embed outside the critical section, then serialize the shared WAL
+        // publication with every other index-root mutator.
+        let writer_lease = Self::acquire_index_root_writer_lease(&index_root)?;
+        Self::fence_index_root_writer_lease(&writer_lease, "append-batch WAL publication")?;
         let mut index = VectorIndex::open(&vector_path)?;
         index.append_batch(&entries)?;
 
@@ -8143,20 +8189,32 @@ impl FsfsRuntime {
             });
         };
 
-        let index_freshness =
-            match QuillIndex::open(cx, &lexical_path, QuillConfig::default()).await {
-                Ok(lexical) => {
-                    lexical.commit(cx).await?;
-                    drop(lexical);
-                    Self::index_freshness_payload(
-                        KeeperSnapshot::open(&lexical_path, DEFAULT_SCHEMA)?.segment_stats(),
-                    )
+        let index_freshness = match IndexRootWriterLease::acquire(&index_root) {
+            Ok(writer_lease) => {
+                Self::fence_index_root_writer_lease(
+                    &writer_lease,
+                    "direct lexical flush publication",
+                )?;
+                match QuillIndex::open(cx, &lexical_path, QuillConfig::default()).await {
+                    Ok(lexical) => {
+                        lexical.commit(cx).await?;
+                        drop(lexical);
+                        Self::index_freshness_payload(
+                            KeeperSnapshot::open(&lexical_path, DEFAULT_SCHEMA)?.segment_stats(),
+                        )
+                    }
+                    Err(QuillIndexError::Keeper(KeeperError::WriterBusy { .. })) => {
+                        drop(writer_lease);
+                        self.request_live_flush(cx, &lexical_path).await?
+                    }
+                    Err(error) => return Err(error.into()),
                 }
-                Err(QuillIndexError::Keeper(KeeperError::WriterBusy { .. })) => {
-                    self.request_live_flush(cx, &lexical_path).await?
-                }
-                Err(error) => return Err(error.into()),
-            };
+            }
+            Err(IndexRootWriterLeaseError::Busy { .. }) => {
+                self.request_live_flush(cx, &lexical_path).await?
+            }
+            Err(error) => return Err(Self::writer_lease_search_error(error)),
+        };
         let payload = FsfsFlushPayload {
             index_path: lexical_path.display().to_string(),
             index_freshness,
@@ -8256,6 +8314,8 @@ impl FsfsRuntime {
             return Err(SearchError::IndexNotFound { path: vector_path });
         }
 
+        let writer_lease = Self::acquire_index_root_writer_lease(&index_root)?;
+        Self::fence_index_root_writer_lease(&writer_lease, "delete WAL publication")?;
         let mut index = VectorIndex::open(&vector_path)?;
         let ids = &self.cli_input.delete_ids;
 
@@ -8350,6 +8410,8 @@ impl FsfsRuntime {
             return Err(SearchError::IndexNotFound { path: vector_path });
         }
 
+        let writer_lease = Self::acquire_index_root_writer_lease(&index_root)?;
+        Self::fence_index_root_writer_lease(&writer_lease, "explicit vector compaction")?;
         let mut index = VectorIndex::open(&vector_path)?;
 
         // First compact WAL into main index.
@@ -8481,39 +8543,61 @@ impl FsfsRuntime {
                     );
                 }
 
-                match VectorIndex::open(&vector_path) {
-                    Ok(mut index) => match index.compact() {
-                        Ok(stats) => {
-                            info!(
-                                wal_merged = stats.wal_records,
-                                total_after = stats.total_records_after,
-                                elapsed_ms = %format!("{:.1}", stats.elapsed_ms),
-                                "daemon: compaction completed"
-                            );
-                            if self.cli_input.format == OutputFormat::Table {
-                                println!(
-                                    "daemon: compacted {} WAL entries -> {} total records ({:.1}ms)",
-                                    stats.wal_records, stats.total_records_after, stats.elapsed_ms
-                                );
+                let mut compacted = false;
+                match IndexRootWriterLease::acquire(&index_root) {
+                    Ok(writer_lease) => {
+                        Self::fence_index_root_writer_lease(
+                            &writer_lease,
+                            "daemon vector compaction",
+                        )?;
+                        match VectorIndex::open(&vector_path) {
+                            Ok(mut index) => match index.compact() {
+                                Ok(stats) => {
+                                    compacted = true;
+                                    info!(
+                                        wal_merged = stats.wal_records,
+                                        total_after = stats.total_records_after,
+                                        elapsed_ms = %format!("{:.1}", stats.elapsed_ms),
+                                        "daemon: compaction completed"
+                                    );
+                                    if self.cli_input.format == OutputFormat::Table {
+                                        println!(
+                                            "daemon: compacted {} WAL entries -> {} total records ({:.1}ms)",
+                                            stats.wal_records,
+                                            stats.total_records_after,
+                                            stats.elapsed_ms
+                                        );
+                                    }
+                                }
+                                Err(error) => {
+                                    warn!(error = %error, "daemon: compaction failed");
+                                    if self.cli_input.format == OutputFormat::Table {
+                                        eprintln!("daemon: compaction error: {error}");
+                                    }
+                                }
+                            },
+                            Err(error) => {
+                                warn!(error = %error, "daemon: failed to open index for compaction");
+                                if self.cli_input.format == OutputFormat::Table {
+                                    eprintln!("daemon: index open error: {error}");
+                                }
                             }
-                        }
-                        Err(error) => {
-                            warn!(error = %error, "daemon: compaction failed");
-                            if self.cli_input.format == OutputFormat::Table {
-                                eprintln!("daemon: compaction error: {error}");
-                            }
-                        }
-                    },
-                    Err(error) => {
-                        warn!(error = %error, "daemon: failed to open index for compaction");
-                        if self.cli_input.format == OutputFormat::Table {
-                            eprintln!("daemon: index open error: {error}");
                         }
                     }
+                    Err(error @ IndexRootWriterLeaseError::Busy { .. }) => {
+                        info!(
+                            error = %error,
+                            "daemon: index-root writer busy; preserving WAL observation for retry"
+                        );
+                    }
+                    Err(error) => return Err(Self::writer_lease_search_error(error)),
                 }
 
-                // Re-read the current WAL length after compaction (it should be gone or reset).
-                last_wal_len = wal_sidecar.metadata().map(|m| m.len()).unwrap_or(0);
+                if compacted {
+                    // Advance the observation only after a successful compaction.
+                    // Busy and failure paths retain the old length and retry.
+                    last_wal_len = wal_sidecar.metadata().map(|m| m.len()).unwrap_or(0);
+                }
             } else {
                 last_wal_len = current_wal_len;
             }
@@ -9935,6 +10019,8 @@ impl FsfsRuntime {
         let total_start = Instant::now();
         let target_root = self.resolve_target_root()?;
         let index_root = self.resolve_index_root(&target_root)?;
+        let writer_lease = Self::acquire_index_root_writer_lease(&index_root)?;
+        Self::fence_index_root_writer_lease(&writer_lease, "one-shot index entry")?;
 
         let root_decision = self.config.discovery.evaluate_root(&target_root, None);
         if !root_decision.include() {
@@ -10070,6 +10156,7 @@ impl FsfsRuntime {
         Self::ensure_semantic_embedder_admissible(embedder.as_ref(), cfg!(test))?;
         Self::probe_indexing_embedder(cx, embedder.as_ref()).await?;
 
+        Self::fence_index_root_writer_lease(&writer_lease, "one-shot index artifact directories")?;
         fs::create_dir_all(index_root.join("vector"))?;
         fs::create_dir_all(index_root.join("cache"))?;
 
@@ -10148,6 +10235,10 @@ impl FsfsRuntime {
             .as_ref()
             .filter(|_| checkpoint_metadata_valid)
             .map_or_else(pressure_timestamp_ms, |previous| previous.started_at_ms);
+        Self::fence_index_root_writer_lease(
+            &writer_lease,
+            "one-shot initial checkpoint publication",
+        )?;
         write_indexing_checkpoint(
             &index_root,
             &IndexingCheckpoint {
@@ -10199,6 +10290,10 @@ impl FsfsRuntime {
             None
         };
         if vector_index.is_none() {
+            Self::fence_index_root_writer_lease(
+                &writer_lease,
+                "one-shot vector generation replacement",
+            )?;
             vector_index = Some(VectorIndex::replace_with_empty(
                 &vector_path,
                 embedder.id(),
@@ -10212,6 +10307,7 @@ impl FsfsRuntime {
             HashSet::new()
         };
 
+        Self::fence_index_root_writer_lease(&writer_lease, "one-shot lexical generation planning")?;
         let lexical_plan = Self::plan_lexical_build(&index_root)?;
         let lexical_path = lexical_plan.engine_dir.clone();
         let lexical_manifest_path = if lexical_plan.lexical_root == index_root {
@@ -10234,6 +10330,7 @@ impl FsfsRuntime {
         // One-shot construction uses Quill's routed shard set and suppresses
         // ordinary tier merges until the final bulk concat. Watch sessions use
         // the deterministic singleton policy in `build_live_ingest_pipeline`.
+        Self::fence_index_root_writer_lease(&writer_lease, "one-shot lexical writer admission")?;
         let lexical_index = QuillIndex::create(
             cx,
             &lexical_path,
@@ -10244,6 +10341,10 @@ impl FsfsRuntime {
         )
         .await?;
         if discard_undurable_lexical_generation {
+            Self::fence_index_root_writer_lease(
+                &writer_lease,
+                "one-shot undurable lexical generation reset",
+            )?;
             lexical_index.delete_all(cx).await?;
         }
 
@@ -10316,6 +10417,7 @@ impl FsfsRuntime {
             .map(String::as_str)
             .collect::<Vec<_>>();
         if !stale_vector_ids.is_empty() {
+            Self::fence_index_root_writer_lease(&writer_lease, "one-shot stale vector tombstones")?;
             vector_index.soft_delete_batch(&stale_vector_ids)?;
         }
 
@@ -10391,6 +10493,10 @@ impl FsfsRuntime {
         for chunk in candidates.chunks(BATCH_SIZE) {
             checkpoint.artifacts_durable = false;
             checkpoint.updated_at_ms = pressure_timestamp_ms();
+            Self::fence_index_root_writer_lease(
+                &writer_lease,
+                "one-shot batch checkpoint publication",
+            )?;
             write_indexing_checkpoint(&index_root, &checkpoint)?;
             let mut chunk_docs = Vec::with_capacity(chunk.len());
 
@@ -10556,9 +10662,17 @@ impl FsfsRuntime {
                 })
                 .collect::<Vec<_>>();
             if !lexical_batch.is_empty() {
+                Self::fence_index_root_writer_lease(
+                    &writer_lease,
+                    "one-shot lexical batch mutation",
+                )?;
                 let backend = QuillLexicalBackend::new(&lexical_index);
                 let mut pipeline = LexicalPipeline::new(backend);
                 let _stats = pipeline.apply_initial(&lexical_batch)?;
+                Self::fence_index_root_writer_lease(
+                    &writer_lease,
+                    "one-shot lexical batch resumable flush",
+                )?;
                 let resume_stats = pipeline.backend_mut().flush_resumable(cx).await?;
                 lexical_resume_absent = lexical_resume_absent.saturating_add(resume_stats.absent);
                 lexical_resume_unchanged =
@@ -10653,6 +10767,10 @@ impl FsfsRuntime {
                             .zip(embeddings)
                             .map(|(pending, embedding)| (pending.document.id.clone(), embedding))
                             .collect::<Vec<_>>();
+                        Self::fence_index_root_writer_lease(
+                            &writer_lease,
+                            "one-shot vector WAL append",
+                        )?;
                         vector_index.append_batch(&vector_batch)?;
                         semantic_succeeded_this_chunk
                             .extend(semantic_docs.iter().map(|pending| pending.file_key.clone()));
@@ -10716,15 +10834,27 @@ impl FsfsRuntime {
 
             batch_counter = batch_counter.saturating_add(1);
             if batch_counter % CHECKPOINT_PERSIST_INTERVAL == 0 && remaining_reused_semantic == 0 {
+                Self::fence_index_root_writer_lease(
+                    &writer_lease,
+                    "one-shot incremental generation publication",
+                )?;
                 checkpoint.artifacts_durable = false;
                 checkpoint.updated_at_ms = pressure_timestamp_ms();
                 write_indexing_checkpoint(&index_root, &checkpoint)?;
 
                 let lexical_commit_start = Instant::now();
+                Self::fence_index_root_writer_lease(
+                    &writer_lease,
+                    "one-shot incremental lexical commit",
+                )?;
                 lexical_index.commit(cx).await?;
                 lexical_elapsed_ms =
                     lexical_elapsed_ms.saturating_add(lexical_commit_start.elapsed().as_millis());
 
+                Self::fence_index_root_writer_lease(
+                    &writer_lease,
+                    "one-shot incremental vector reconciliation",
+                )?;
                 let vector_compact_start = Instant::now();
                 reconcile_vector_generation(&mut vector_index, &checkpoint)?;
                 vector_elapsed_ms =
@@ -10737,6 +10867,10 @@ impl FsfsRuntime {
                 checkpoint.skipped_files = stats
                     .discovered_files
                     .saturating_sub(published_manifests.len());
+                Self::fence_index_root_writer_lease(
+                    &writer_lease,
+                    "one-shot incremental manifest and sentinel publication",
+                )?;
                 self.write_index_artifacts(
                     &index_root,
                     &lexical_manifest_path,
@@ -10764,6 +10898,10 @@ impl FsfsRuntime {
                     },
                 )?;
                 checkpoint.artifacts_durable = true;
+                Self::fence_index_root_writer_lease(
+                    &writer_lease,
+                    "one-shot incremental durable checkpoint publication",
+                )?;
                 write_indexing_checkpoint(&index_root, &checkpoint)?;
             }
 
@@ -10806,9 +10944,17 @@ impl FsfsRuntime {
                     )
                 })
                 .collect::<Vec<_>>();
+            Self::fence_index_root_writer_lease(
+                &writer_lease,
+                "one-shot stale lexical reconciliation",
+            )?;
             let backend = QuillLexicalBackend::new(&lexical_index);
             let mut pipeline = LexicalPipeline::new(backend);
             let _stats = pipeline.apply_initial(&mutations)?;
+            Self::fence_index_root_writer_lease(
+                &writer_lease,
+                "one-shot stale lexical reconciliation flush",
+            )?;
             pipeline.backend_mut().flush_resumable(cx).await?.deleted
         };
         info!(
@@ -10847,15 +10993,24 @@ impl FsfsRuntime {
 
         // 4. Publish the final durable generation. The checkpoint is always
         // last, so every row it advertises is already represented on disk.
+        Self::fence_index_root_writer_lease(
+            &writer_lease,
+            "final generation checkpoint publication",
+        )?;
         checkpoint.artifacts_durable = false;
         checkpoint.updated_at_ms = pressure_timestamp_ms();
         write_indexing_checkpoint(&index_root, &checkpoint)?;
         let lexical_commit_start = Instant::now();
+        Self::fence_index_root_writer_lease(&writer_lease, "final lexical bulk-load publication")?;
         lexical_index.finish_bulk_load(cx).await?;
         lexical_elapsed_ms =
             lexical_elapsed_ms.saturating_add(lexical_commit_start.elapsed().as_millis());
 
         let vector_finish_start = Instant::now();
+        Self::fence_index_root_writer_lease(
+            &writer_lease,
+            "final vector generation reconciliation",
+        )?;
         reconcile_vector_generation(&mut vector_index, &checkpoint)?;
         vector_elapsed_ms =
             vector_elapsed_ms.saturating_add(vector_finish_start.elapsed().as_millis());
@@ -10869,6 +11024,7 @@ impl FsfsRuntime {
         });
         let reason_codes = observed_reason_codes.into_iter().collect::<Vec<_>>();
 
+        Self::fence_index_root_writer_lease(&writer_lease, "final paired manifest publication")?;
         self.write_index_artifacts(&index_root, &lexical_manifest_path, &manifests)?;
         let generation_complete = semantic_generation_complete(semantic_deferred_files);
         let sentinel = IndexSentinel {
@@ -10898,6 +11054,10 @@ impl FsfsRuntime {
         let final_stage = indexing_final_stage(embedder_degraded, generation_complete);
 
         if let Some(pointer) = lexical_plan.publish_pointer.as_ref() {
+            Self::fence_index_root_writer_lease(
+                &writer_lease,
+                "final lexical CURRENT publication",
+            )?;
             publish_current(&lexical_plan.lexical_root, pointer).map_err(|source| {
                 SearchError::SubsystemError {
                     subsystem: "fsfs.lexical.current",
@@ -10919,7 +11079,15 @@ impl FsfsRuntime {
         // checkpoint remains an admission lock across the entire publication
         // window, so a concurrent search cannot combine the successor vector
         // generation with the predecessor lexical CURRENT.
+        Self::fence_index_root_writer_lease(
+            &writer_lease,
+            "final generation admission publication",
+        )?;
         self.write_index_sentinel(&index_root, &sentinel)?;
+        Self::fence_index_root_writer_lease(
+            &writer_lease,
+            "final checkpoint admission transition",
+        )?;
         if generation_complete {
             remove_indexing_checkpoint(&index_root)?;
         } else {
@@ -12126,14 +12294,20 @@ impl FsfsRuntime {
 
     /// Build a live ingest pipeline for the watcher by opening existing indexes.
     ///
-    /// Returns the pipeline and a cloned `Arc` to the vector index so callers
-    /// can compact the WAL on graceful shutdown.
+    /// Returns the pipeline plus cloned vector-index and writer-lease handles
+    /// so graceful shutdown remains inside the same root capability.
     async fn build_live_ingest_pipeline(
         &self,
         cx: &Cx,
-    ) -> SearchResult<(LiveIngestPipeline, Arc<std::sync::Mutex<VectorIndex>>)> {
+    ) -> SearchResult<(
+        LiveIngestPipeline,
+        Arc<std::sync::Mutex<VectorIndex>>,
+        Arc<IndexRootWriterLease>,
+    )> {
         let target_root = self.resolve_target_root()?;
         let index_root = self.resolve_index_root(&target_root)?;
+        let writer_lease = Arc::new(Self::acquire_index_root_writer_lease(&index_root)?);
+        Self::fence_index_root_writer_lease(&writer_lease, "live ingest pipeline initialization")?;
         let storage_db_path = self.resolve_storage_db_path()?;
         if storage_db_path.as_os_str() != ":memory:"
             && let Some(parent) = storage_db_path.parent()
@@ -12152,6 +12326,7 @@ impl FsfsRuntime {
         };
         let vector_path = index_root.join(FSFS_VECTOR_INDEX_FILE);
 
+        Self::fence_index_root_writer_lease(&writer_lease, "live Quill writer initialization")?;
         let lexical_index = QuillIndex::create_durable(
             cx,
             &lexical_path,
@@ -12164,6 +12339,7 @@ impl FsfsRuntime {
             fsfs_quill_protector()?,
         )
         .await?;
+        Self::fence_index_root_writer_lease(&writer_lease, "live vector writer initialization")?;
         let vector_index = VectorIndex::open(&vector_path)?;
         let embedder = self.resolve_fast_embedder()?;
 
@@ -12175,12 +12351,18 @@ impl FsfsRuntime {
             "live ingest pipeline initialized for watch mode"
         );
 
-        let pipeline = LiveIngestPipeline::new(target_root, lexical_index, vector_index, embedder)
-            .with_storage_db_path(storage_db_path);
+        let pipeline = LiveIngestPipeline::new(
+            target_root,
+            lexical_index,
+            vector_index,
+            Arc::clone(&writer_lease),
+            embedder,
+        )
+        .with_storage_db_path(storage_db_path);
         self.repair_quarantined_lexical_gap(cx, &index_root, &pipeline)
             .await?;
         let vi_handle = Arc::clone(&pipeline.vector_index);
-        Ok((pipeline, vi_handle))
+        Ok((pipeline, vi_handle, writer_lease))
     }
 
     async fn repair_quarantined_lexical_gap(
@@ -12259,6 +12441,7 @@ impl FsfsRuntime {
             }
         }
         if reindexed > 0 {
+            pipeline.fence_writer_lease("quarantine repair lexical commit")?;
             pipeline.lexical_index.commit(cx).await?;
         }
         let post_repair = pipeline.quarantine_freshness_audit(&manifests)?;
@@ -13911,7 +14094,7 @@ impl FsfsRuntime {
 
         if watch_enabled_for_command {
             match self.build_live_ingest_pipeline(cx).await {
-                Ok((pipeline, vi_handle)) => {
+                Ok((pipeline, vi_handle, writer_lease)) => {
                     let target_root = self.resolve_target_root()?;
                     let watcher = FsWatcher::new(
                         vec![target_root],
@@ -13936,10 +14119,12 @@ impl FsfsRuntime {
                             shutdown,
                             Some(&watcher),
                             Some((&lifecycle_tracker, &storage_paths)),
+                            Some(&writer_lease),
                         )
                         .await;
                     watcher.stop().await;
-                    self.finalize_shutdown(cx, reason, Some(&vi_handle)).await?;
+                    self.finalize_shutdown(cx, reason, Some(&vi_handle), Some(&writer_lease))
+                        .await?;
                 }
                 Err(ref error)
                     if matches!(
@@ -13969,8 +14154,8 @@ impl FsfsRuntime {
         if self.cli_input.command == CliCommand::Tui {
             return Ok(());
         }
-        let reason = self.await_shutdown(cx, shutdown, None, None).await;
-        self.finalize_shutdown(cx, reason, None).await
+        let reason = self.await_shutdown(cx, shutdown, None, None, None).await;
+        self.finalize_shutdown(cx, reason, None, None).await
     }
 
     #[allow(clippy::too_many_lines)]
@@ -13980,6 +14165,7 @@ impl FsfsRuntime {
         shutdown: &ShutdownCoordinator,
         watcher: Option<&FsWatcher>,
         disk_budget: Option<(&LifecycleTracker, &IndexStoragePaths)>,
+        writer_lease: Option<&Arc<IndexRootWriterLease>>,
     ) -> ShutdownReason {
         let mut pressure_collector = HostPressureCollector::default();
         let mut pressure_controller = self.new_pressure_controller();
@@ -14046,22 +14232,47 @@ impl FsfsRuntime {
                                                     >= TOMBSTONE_CLEANUP_MIN_INTERVAL_MS
                                             });
                                         if cleanup_due {
-                                            match self.cleanup_catalog_tombstones(now_ms) {
-                                                Ok((deleted_rows, cutoff_ms)) => {
-                                                    info!(
-                                                        deleted_rows,
-                                                        cutoff_ms,
-                                                        reason_code = control_plan.reason_code,
-                                                        "fsfs catalog tombstone cleanup executed"
-                                                    );
-                                                    last_tombstone_cleanup_ms = Some(now_ms);
+                                            let writer_fenced = match writer_lease {
+                                                Some(lease) => {
+                                                    match Self::fence_index_root_writer_lease(
+                                                        lease,
+                                                        "watch catalog tombstone cleanup",
+                                                    ) {
+                                                        Ok(()) => true,
+                                                        Err(error) => {
+                                                            warn!(
+                                                                error = %error,
+                                                                "fsfs catalog tombstone cleanup skipped after writer-lease fence failure"
+                                                            );
+                                                            false
+                                                        }
+                                                    }
                                                 }
-                                                Err(error) => {
+                                                None => {
                                                     warn!(
-                                                        error = %error,
-                                                        reason_code = control_plan.reason_code,
-                                                        "fsfs catalog tombstone cleanup failed"
+                                                        "fsfs catalog tombstone cleanup skipped without index-root writer lease"
                                                     );
+                                                    false
+                                                }
+                                            };
+                                            if writer_fenced {
+                                                match self.cleanup_catalog_tombstones(now_ms) {
+                                                    Ok((deleted_rows, cutoff_ms)) => {
+                                                        info!(
+                                                            deleted_rows,
+                                                            cutoff_ms,
+                                                            reason_code = control_plan.reason_code,
+                                                            "fsfs catalog tombstone cleanup executed"
+                                                        );
+                                                        last_tombstone_cleanup_ms = Some(now_ms);
+                                                    }
+                                                    Err(error) => {
+                                                        warn!(
+                                                            error = %error,
+                                                            reason_code = control_plan.reason_code,
+                                                            "fsfs catalog tombstone cleanup failed"
+                                                        );
+                                                    }
                                                 }
                                             }
                                         }
@@ -14129,13 +14340,25 @@ impl FsfsRuntime {
         _cx: &Cx,
         reason: ShutdownReason,
         vector_index: Option<&Arc<std::sync::Mutex<VectorIndex>>>,
+        writer_lease: Option<&Arc<IndexRootWriterLease>>,
     ) -> SearchResult<()> {
         if let Some(vi_handle) = vector_index {
+            let writer_lease = writer_lease.ok_or_else(|| SearchError::InvalidConfig {
+                field: "fsfs.shutdown.writer_lease".to_owned(),
+                value: "missing".to_owned(),
+                reason: "vector shutdown compaction requires the live index-root writer lease"
+                    .to_owned(),
+            })?;
+            Self::fence_index_root_writer_lease(
+                writer_lease,
+                "graceful-shutdown vector compaction",
+            )?;
             let mut vi = vi_handle
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             let wal_count = vi.wal_record_count();
             if wal_count > 0 {
+                Self::fence_index_root_writer_lease(writer_lease, "graceful-shutdown WAL rewrite")?;
                 info!(
                     wal_records = wal_count,
                     "shutdown: compacting WAL into vector index"
@@ -18422,6 +18645,7 @@ mod tests {
     };
     use crate::adapters::cli::{CliCommand, CliInput, CompletionShell, OutputFormat};
     use crate::catalog::bootstrap_catalog_schema;
+    use crate::concurrency::IndexRootWriterLease;
     use crate::config::{
         DegradationOverrideMode, DiscoveryCandidate, DiscoveryScopeDecision, FsfsConfig,
         IngestionClass, PressureProfile,
@@ -18457,6 +18681,13 @@ mod tests {
         )
         .await
         .expect("create Quill index")
+    }
+
+    fn test_index_root_writer_lease(index_root: &Path) -> Arc<IndexRootWriterLease> {
+        Arc::new(
+            IndexRootWriterLease::acquire(index_root)
+                .expect("acquire test index-root writer lease"),
+        )
     }
 
     async fn open_test_quill(cx: &Cx, path: &Path) -> QuillIndex {
@@ -18962,6 +19193,97 @@ mod tests {
         assert!(
             !pipeline.contains("falling back to hash embeddings"),
             "the production indexing pipeline must not report false semantic success"
+        );
+    }
+
+    #[test]
+    fn every_shared_publication_entry_point_requires_the_index_root_writer_lease() {
+        fn source_region<'a>(source: &'a str, start: &str, end: &str) -> &'a str {
+            let start = source.find(start).expect("publication entry-point start");
+            let end = source[start..]
+                .find(end)
+                .map(|offset| start + offset)
+                .expect("publication entry-point end");
+            &source[start..end]
+        }
+
+        let source = include_str!("runtime.rs");
+        for (label, start, end, required) in [
+            (
+                "append-batch",
+                "async fn run_append_batch_command",
+                "async fn run_flush_command",
+                "acquire_index_root_writer_lease",
+            ),
+            (
+                "direct/live flush",
+                "async fn run_flush_command",
+                "async fn request_live_flush",
+                "IndexRootWriterLease::acquire",
+            ),
+            (
+                "delete",
+                "fn run_delete_command",
+                "fn run_compact_command",
+                "acquire_index_root_writer_lease",
+            ),
+            (
+                "compact",
+                "fn run_compact_command",
+                "async fn run_daemon_command",
+                "acquire_index_root_writer_lease",
+            ),
+            (
+                "daemon compaction",
+                "async fn run_daemon_command",
+                "fn collect_doctor_payload",
+                "IndexRootWriterLease::acquire",
+            ),
+            (
+                "one-shot index",
+                "async fn run_one_shot_index_scaffold_internal",
+                "fn resolve_target_root",
+                "acquire_index_root_writer_lease",
+            ),
+            (
+                "search-triggered lexical migration",
+                "async fn rebuild_tantivy_lexical_index_if_needed",
+                "fn ensure_semantic_embedder_admissible",
+                "run_one_shot_index_scaffold_internal",
+            ),
+            (
+                "live watcher initialization",
+                "async fn build_live_ingest_pipeline",
+                "async fn repair_quarantined_lexical_gap",
+                "acquire_index_root_writer_lease",
+            ),
+            (
+                "live watcher batch",
+                "async fn apply_batch_inner",
+                "struct FsfsStatusPayload",
+                "fence_writer_lease",
+            ),
+            (
+                "graceful shutdown compaction",
+                "async fn finalize_shutdown",
+                "fn print_cli_help",
+                "fence_index_root_writer_lease",
+            ),
+        ] {
+            assert!(
+                source_region(source, start, end).contains(required),
+                "{label} must not publish without {required}"
+            );
+        }
+
+        let search = source_region(
+            source,
+            "async fn run_search_command",
+            "async fn ensure_search_index_ready",
+        );
+        assert!(
+            !search.contains("acquire_index_root_writer_lease"),
+            "pure search remains read-only; migration enters the separately leased one-shot path"
         );
     }
 
@@ -21092,7 +21414,7 @@ mod tests {
                 watch: true,
                 ..CliInput::default()
             });
-            let (protected, vector_handle) = watch_runtime
+            let (protected, vector_handle, writer_lease) = watch_runtime
                 .build_live_ingest_pipeline(&cx)
                 .await
                 .expect("bootstrap durable watch writer");
@@ -21104,6 +21426,7 @@ mod tests {
             assert!(!protected.lexical_index.segment_stats().degraded);
             drop(protected);
             drop(vector_handle);
+            drop(writer_lease);
 
             let segment_path = fs::read_dir(&lexical_path)
                 .expect("scan lexical directory")
@@ -21124,7 +21447,7 @@ mod tests {
             fs::write(&segment_path, corrupt).expect("corrupt segment");
             fs::write(&sidecar, b"invalid repair sidecar").expect("corrupt repair sidecar");
 
-            let (recovered, _vector_handle) = watch_runtime
+            let (recovered, _vector_handle, _writer_lease) = watch_runtime
                 .build_live_ingest_pipeline(&cx)
                 .await
                 .expect("quarantine, audit, and reindex before watch start");
@@ -21236,7 +21559,7 @@ mod tests {
                 watch: true,
                 ..CliInput::default()
             });
-            let (pipeline, _vi_handle) = runtime
+            let (pipeline, _vi_handle, _writer_lease) = runtime
                 .build_live_ingest_pipeline(&cx)
                 .await
                 .expect("build live ingest pipeline");
@@ -21338,6 +21661,7 @@ mod tests {
                 target_root.clone(),
                 lexical_index,
                 vector_index,
+                test_index_root_writer_lease(&index_root),
                 Arc::new(HashEmbedder::default_256()),
             );
             let ingest_rt = asupersync::runtime::RuntimeBuilder::current_thread()
@@ -21386,6 +21710,7 @@ mod tests {
                 target_root.clone(),
                 lexical_index,
                 vector_index,
+                test_index_root_writer_lease(&index_root),
                 Arc::new(HashEmbedder::default_256()),
             );
 
@@ -21442,6 +21767,7 @@ mod tests {
                 resolved_root,
                 lexical_index,
                 vector_index,
+                test_index_root_writer_lease(&index_root),
                 Arc::new(HashEmbedder::default_256()),
             );
 
@@ -21497,6 +21823,7 @@ mod tests {
                 target_root.clone(),
                 lexical_index,
                 vector_index,
+                test_index_root_writer_lease(&index_root),
                 Arc::new(HashEmbedder::default_256()),
             );
             let ingest_rt = asupersync::runtime::RuntimeBuilder::current_thread()
@@ -21569,6 +21896,7 @@ mod tests {
                 target_root.clone(),
                 lexical_index,
                 vector_index,
+                test_index_root_writer_lease(&index_root),
                 Arc::new(HashEmbedder::default_256()),
             );
             let ingest_rt = asupersync::runtime::RuntimeBuilder::current_thread()
@@ -21656,6 +21984,7 @@ mod tests {
                 target_root.clone(),
                 lexical_index,
                 vector_index,
+                test_index_root_writer_lease(&index_root),
                 Arc::new(HashEmbedder::default_256()),
             );
             let ingest_rt = asupersync::runtime::RuntimeBuilder::current_thread()
@@ -24452,6 +24781,7 @@ mod tests {
                 target_root,
                 lexical,
                 VectorIndex::open(&vector_path).expect("open vector index"),
+                test_index_root_writer_lease(&index_root),
                 Arc::new(HashEmbedder::default_256()),
             );
             let requester_path = lexical_root.clone();

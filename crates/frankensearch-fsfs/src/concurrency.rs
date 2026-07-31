@@ -32,12 +32,13 @@
 
 #![allow(clippy::module_name_repetitions)]
 
-use std::fs::OpenOptions;
-use std::io::Write;
+use std::fs::{File, OpenOptions};
+use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime};
 
+use sha2::{Digest, Sha256};
 use tracing::{debug, warn};
 
 // ─── Lock Ordering ──────────────────────────────────────────────────────────
@@ -369,6 +370,764 @@ impl ContentionSnapshot {
             return 0.0;
         }
         self.contentions as f64 / self.acquisitions as f64
+    }
+}
+
+// ─── Index-root writer lease ───────────────────────────────────────────────
+
+/// Persistent lock inode used to serialize every fsfs mutation rooted at an
+/// index directory.
+///
+/// The inode is deliberately never unlinked during normal release. Kernel
+/// `flock` ownership, rather than wall-clock age or a PID-file deletion race,
+/// is the sole authority for writer admission.
+pub const INDEX_ROOT_WRITER_LOCK_FILE: &str = ".fsfs-writer.lock";
+
+const INDEX_ROOT_WRITER_RECORD_MAGIC: [u8; 8] = *b"FSFSWLK1";
+const INDEX_ROOT_WRITER_RECORD_VERSION: u32 = 1;
+const INDEX_ROOT_WRITER_RECORD_PREFIX_BYTES: usize = 96;
+const INDEX_ROOT_WRITER_RECORD_BYTES: usize = 128;
+
+/// Typed, fail-closed failure from index-root writer admission or fencing.
+#[derive(Debug)]
+pub enum IndexRootWriterLeaseError {
+    /// Another cooperating process currently owns the kernel flock.
+    Busy {
+        /// Persistent lock pathname.
+        path: PathBuf,
+        /// Best-effort owner PID from the sealed record. The flock remains the
+        /// authority even when the record is absent or being written.
+        owner_pid: Option<u32>,
+    },
+    /// The root or lock inode failed an identity, ownership, or record check.
+    Invalid {
+        /// Path whose capability could not be proved.
+        path: PathBuf,
+        /// Stable operator-facing explanation.
+        detail: String,
+    },
+    /// A filesystem operation failed.
+    Io {
+        /// Operation that failed.
+        operation: &'static str,
+        /// Path involved in the failure.
+        path: PathBuf,
+        /// Underlying I/O failure.
+        source: std::io::Error,
+    },
+    /// This target cannot provide the required no-follow flock contract.
+    Unsupported {
+        /// Requested index root.
+        path: PathBuf,
+    },
+}
+
+impl std::fmt::Display for IndexRootWriterLeaseError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Busy { path, owner_pid } => {
+                write!(formatter, "index root {} is busy", path.display())?;
+                if let Some(pid) = owner_pid {
+                    write!(formatter, " (writer pid {pid})")?;
+                }
+                Ok(())
+            }
+            Self::Invalid { path, detail } => {
+                write!(
+                    formatter,
+                    "index-root writer lease rejected {}: {detail}",
+                    path.display()
+                )
+            }
+            Self::Io {
+                operation,
+                path,
+                source,
+            } => write!(formatter, "{operation} {}: {source}", path.display()),
+            Self::Unsupported { path } => write!(
+                formatter,
+                "index-root writer lease at {} requires no-follow Unix flock semantics",
+                path.display()
+            ),
+        }
+    }
+}
+
+impl std::error::Error for IndexRootWriterLeaseError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io { source, .. } => Some(source),
+            Self::Busy { .. } | Self::Invalid { .. } | Self::Unsupported { .. } => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct IndexRootWriterOwnerRecord {
+    pid: u32,
+    owner_uid: u32,
+    process_start: u64,
+    host_id: u64,
+    boot_id: u64,
+    nonce_high: u64,
+    nonce_low: u64,
+    root_device: u64,
+    root_inode: u64,
+    lock_device: u64,
+    lock_inode: u64,
+}
+
+impl IndexRootWriterOwnerRecord {
+    #[cfg(all(
+        unix,
+        not(any(
+            target_os = "espidf",
+            target_os = "horizon",
+            target_os = "solaris",
+            target_os = "vita",
+            target_os = "wasi"
+        ))
+    ))]
+    fn current(
+        index_root: &Path,
+        owner_uid: u32,
+        root_device: u64,
+        root_inode: u64,
+        lock_device: u64,
+        lock_inode: u64,
+    ) -> Result<Self, IndexRootWriterLeaseError> {
+        let pid = std::process::id();
+        let system_pid = sysinfo::Pid::from_u32(pid);
+        let mut system = sysinfo::System::new();
+        system.refresh_processes(sysinfo::ProcessesToUpdate::Some(&[system_pid]), true);
+        let process_start = system
+            .process(system_pid)
+            .map(sysinfo::Process::start_time)
+            .filter(|value| *value != 0)
+            .ok_or_else(|| IndexRootWriterLeaseError::Invalid {
+                path: index_root.to_path_buf(),
+                detail: "current process start identity is unavailable".to_owned(),
+            })?;
+        let boot_id = sysinfo::System::boot_time();
+        if boot_id == 0 {
+            return Err(IndexRootWriterLeaseError::Invalid {
+                path: index_root.to_path_buf(),
+                detail: "current boot identity is unavailable".to_owned(),
+            });
+        }
+        let host_id = stable_identity_hash(hostname().as_bytes());
+        let nonce_input = (
+            pid,
+            owner_uid,
+            process_start,
+            boot_id,
+            root_device,
+            root_inode,
+            lock_device,
+            lock_inode,
+            index_root,
+        );
+        let nonce_high = ahash::RandomState::new().hash_one(nonce_input);
+        let nonce_low = ahash::RandomState::new().hash_one(nonce_input);
+        if nonce_high == 0 && nonce_low == 0 {
+            return Err(IndexRootWriterLeaseError::Invalid {
+                path: index_root.to_path_buf(),
+                detail: "random writer nonce generation returned the reserved zero identity"
+                    .to_owned(),
+            });
+        }
+
+        Ok(Self {
+            pid,
+            owner_uid,
+            process_start,
+            host_id,
+            boot_id,
+            nonce_high,
+            nonce_low,
+            root_device,
+            root_inode,
+            lock_device,
+            lock_inode,
+        })
+    }
+
+    fn to_bytes(self) -> [u8; INDEX_ROOT_WRITER_RECORD_BYTES] {
+        let mut bytes = [0_u8; INDEX_ROOT_WRITER_RECORD_BYTES];
+        bytes[..8].copy_from_slice(&INDEX_ROOT_WRITER_RECORD_MAGIC);
+        put_u32(&mut bytes, 8, INDEX_ROOT_WRITER_RECORD_VERSION);
+        put_u32(&mut bytes, 12, self.pid);
+        put_u32(&mut bytes, 16, self.owner_uid);
+        put_u32(&mut bytes, 20, 0);
+        for (offset, value) in [
+            (24, self.process_start),
+            (32, self.host_id),
+            (40, self.boot_id),
+            (48, self.nonce_high),
+            (56, self.nonce_low),
+            (64, self.root_device),
+            (72, self.root_inode),
+            (80, self.lock_device),
+            (88, self.lock_inode),
+        ] {
+            put_u64(&mut bytes, offset, value);
+        }
+        let checksum = Sha256::digest(&bytes[..INDEX_ROOT_WRITER_RECORD_PREFIX_BYTES]);
+        bytes[INDEX_ROOT_WRITER_RECORD_PREFIX_BYTES..].copy_from_slice(&checksum);
+        bytes
+    }
+
+    fn from_bytes(bytes: &[u8]) -> Result<Self, String> {
+        if bytes.len() != INDEX_ROOT_WRITER_RECORD_BYTES {
+            return Err(format!(
+                "v1 writer record must be exactly {INDEX_ROOT_WRITER_RECORD_BYTES} bytes, found {}",
+                bytes.len()
+            ));
+        }
+        if bytes[..8] != INDEX_ROOT_WRITER_RECORD_MAGIC {
+            return Err("invalid index-root writer record magic".to_owned());
+        }
+        let version = get_u32(bytes, 8);
+        if version != INDEX_ROOT_WRITER_RECORD_VERSION {
+            return Err(format!(
+                "unsupported index-root writer record version {version}"
+            ));
+        }
+        if get_u32(bytes, 20) != 0 {
+            return Err("index-root writer record reserved bits are nonzero".to_owned());
+        }
+        let expected = Sha256::digest(&bytes[..INDEX_ROOT_WRITER_RECORD_PREFIX_BYTES]);
+        if bytes[INDEX_ROOT_WRITER_RECORD_PREFIX_BYTES..] != expected[..] {
+            return Err("index-root writer record checksum mismatch".to_owned());
+        }
+
+        let record = Self {
+            pid: get_u32(bytes, 12),
+            owner_uid: get_u32(bytes, 16),
+            process_start: get_u64(bytes, 24),
+            host_id: get_u64(bytes, 32),
+            boot_id: get_u64(bytes, 40),
+            nonce_high: get_u64(bytes, 48),
+            nonce_low: get_u64(bytes, 56),
+            root_device: get_u64(bytes, 64),
+            root_inode: get_u64(bytes, 72),
+            lock_device: get_u64(bytes, 80),
+            lock_inode: get_u64(bytes, 88),
+        };
+        if record.pid == 0 {
+            return Err("index-root writer record has pid zero".to_owned());
+        }
+        if record.process_start == 0 || record.boot_id == 0 {
+            return Err("index-root writer record lacks process/boot identity".to_owned());
+        }
+        if record.nonce_high == 0 && record.nonce_low == 0 {
+            return Err("index-root writer record has the reserved zero nonce".to_owned());
+        }
+        Ok(record)
+    }
+}
+
+fn put_u32(bytes: &mut [u8], offset: usize, value: u32) {
+    bytes[offset..offset + 4].copy_from_slice(&value.to_le_bytes());
+}
+
+fn put_u64(bytes: &mut [u8], offset: usize, value: u64) {
+    bytes[offset..offset + 8].copy_from_slice(&value.to_le_bytes());
+}
+
+fn get_u32(bytes: &[u8], offset: usize) -> u32 {
+    u32::from_le_bytes(
+        bytes[offset..offset + 4]
+            .try_into()
+            .expect("fixed writer-record u32 range"),
+    )
+}
+
+fn get_u64(bytes: &[u8], offset: usize) -> u64 {
+    u64::from_le_bytes(
+        bytes[offset..offset + 8]
+            .try_into()
+            .expect("fixed writer-record u64 range"),
+    )
+}
+
+fn stable_identity_hash(bytes: &[u8]) -> u64 {
+    let digest = Sha256::digest(bytes);
+    u64::from_le_bytes(
+        digest[..8]
+            .try_into()
+            .expect("SHA-256 prefix is exactly eight bytes"),
+    )
+}
+
+/// An owned, kernel-backed capability for mutating one fsfs index root.
+///
+/// Call [`Self::fence`] immediately before each shared mutation boundary. The
+/// check binds the still-open root and lock descriptors, their pathname
+/// identities and owners, and the sealed owner record written after acquiring
+/// the flock.
+#[derive(Debug)]
+pub struct IndexRootWriterLease {
+    index_root: PathBuf,
+    lock_path: PathBuf,
+    #[cfg(all(
+        unix,
+        not(any(
+            target_os = "espidf",
+            target_os = "horizon",
+            target_os = "solaris",
+            target_os = "vita",
+            target_os = "wasi"
+        ))
+    ))]
+    root_file: File,
+    #[cfg(all(
+        unix,
+        not(any(
+            target_os = "espidf",
+            target_os = "horizon",
+            target_os = "solaris",
+            target_os = "vita",
+            target_os = "wasi"
+        ))
+    ))]
+    lock_file: File,
+    owner_record: IndexRootWriterOwnerRecord,
+}
+
+impl IndexRootWriterLease {
+    /// Acquire the nonblocking exclusive writer flock for `index_root`.
+    ///
+    /// The root directory is the only artifact this function may create before
+    /// writer admission; it is needed to host the persistent lock inode.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IndexRootWriterLeaseError::Busy`] if another process owns the
+    /// flock, or a fail-closed identity/I/O error if the root, lock inode, or
+    /// sealed owner record cannot be proved.
+    #[cfg(all(
+        unix,
+        not(any(
+            target_os = "espidf",
+            target_os = "horizon",
+            target_os = "solaris",
+            target_os = "vita",
+            target_os = "wasi"
+        ))
+    ))]
+    pub fn acquire(index_root: &Path) -> Result<Self, IndexRootWriterLeaseError> {
+        use rustix::fs::{FlockOperation, Mode, OFlags, flock, open, openat};
+        use std::os::unix::fs::MetadataExt;
+
+        std::fs::create_dir_all(index_root).map_err(|source| IndexRootWriterLeaseError::Io {
+            operation: "create index root for writer lease",
+            path: index_root.to_path_buf(),
+            source,
+        })?;
+        let root = open(
+            index_root,
+            OFlags::RDONLY
+                | OFlags::CLOEXEC
+                | OFlags::DIRECTORY
+                | OFlags::NOFOLLOW
+                | OFlags::NONBLOCK,
+            Mode::empty(),
+        )
+        .map_err(std::io::Error::from)
+        .map_err(|source| IndexRootWriterLeaseError::Io {
+            operation: "open no-follow index root",
+            path: index_root.to_path_buf(),
+            source,
+        })?;
+        let root_file = File::from(root);
+        let root_metadata =
+            root_file
+                .metadata()
+                .map_err(|source| IndexRootWriterLeaseError::Io {
+                    operation: "inspect index-root descriptor",
+                    path: index_root.to_path_buf(),
+                    source,
+                })?;
+        if !root_metadata.is_dir() {
+            return Err(IndexRootWriterLeaseError::Invalid {
+                path: index_root.to_path_buf(),
+                detail: "index root must be a no-follow directory".to_owned(),
+            });
+        }
+        let owner_uid = rustix::process::geteuid().as_raw();
+        if root_metadata.uid() != owner_uid {
+            return Err(IndexRootWriterLeaseError::Invalid {
+                path: index_root.to_path_buf(),
+                detail: format!(
+                    "index root is owned by uid {}, current effective uid is {owner_uid}",
+                    root_metadata.uid()
+                ),
+            });
+        }
+
+        let lock_path = index_root.join(INDEX_ROOT_WRITER_LOCK_FILE);
+        let lock = openat(
+            &root_file,
+            INDEX_ROOT_WRITER_LOCK_FILE,
+            OFlags::RDWR | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::CREATE,
+            Mode::RUSR | Mode::WUSR,
+        )
+        .map_err(std::io::Error::from)
+        .map_err(|source| IndexRootWriterLeaseError::Io {
+            operation: "open no-follow index-root writer lock",
+            path: lock_path.clone(),
+            source,
+        })?;
+        let mut lock_file = File::from(lock);
+        let lock_metadata =
+            lock_file
+                .metadata()
+                .map_err(|source| IndexRootWriterLeaseError::Io {
+                    operation: "inspect index-root writer lock",
+                    path: lock_path.clone(),
+                    source,
+                })?;
+        validate_lock_metadata(&lock_path, &lock_metadata, owner_uid)?;
+
+        if let Err(source) = flock(&lock_file, FlockOperation::NonBlockingLockExclusive) {
+            if source == rustix::io::Errno::AGAIN {
+                let owner_pid = read_index_root_writer_record(&lock_path, &lock_file)
+                    .ok()
+                    .flatten()
+                    .map(|record| record.pid);
+                return Err(IndexRootWriterLeaseError::Busy {
+                    path: lock_path,
+                    owner_pid,
+                });
+            }
+            return Err(IndexRootWriterLeaseError::Io {
+                operation: "acquire index-root writer flock",
+                path: lock_path,
+                source: std::io::Error::from(source),
+            });
+        }
+
+        let owner_record = IndexRootWriterOwnerRecord::current(
+            index_root,
+            owner_uid,
+            root_metadata.dev(),
+            root_metadata.ino(),
+            lock_metadata.dev(),
+            lock_metadata.ino(),
+        )?;
+        write_index_root_writer_record(&lock_path, &mut lock_file, owner_record)?;
+        root_file
+            .sync_all()
+            .map_err(|source| IndexRootWriterLeaseError::Io {
+                operation: "sync index-root writer lock directory",
+                path: index_root.to_path_buf(),
+                source,
+            })?;
+
+        let lease = Self {
+            index_root: index_root.to_path_buf(),
+            lock_path,
+            root_file,
+            lock_file,
+            owner_record,
+        };
+        lease.fence("writer admission")?;
+        Ok(lease)
+    }
+
+    /// Fail closed on targets without the required kernel and no-follow
+    /// semantics.
+    #[cfg(not(all(
+        unix,
+        not(any(
+            target_os = "espidf",
+            target_os = "horizon",
+            target_os = "solaris",
+            target_os = "vita",
+            target_os = "wasi"
+        ))
+    )))]
+    pub fn acquire(index_root: &Path) -> Result<Self, IndexRootWriterLeaseError> {
+        Err(IndexRootWriterLeaseError::Unsupported {
+            path: index_root.to_path_buf(),
+        })
+    }
+
+    /// Revalidate the held owner/root/lock capability before a shared mutation.
+    ///
+    /// # Errors
+    ///
+    /// Returns a fail-closed error if either pathname was substituted, owner or
+    /// file type changed, the persistent lock gained a hard link, or the sealed
+    /// owner record no longer matches this holder.
+    #[cfg(all(
+        unix,
+        not(any(
+            target_os = "espidf",
+            target_os = "horizon",
+            target_os = "solaris",
+            target_os = "vita",
+            target_os = "wasi"
+        ))
+    ))]
+    pub fn fence(&self, boundary: &'static str) -> Result<(), IndexRootWriterLeaseError> {
+        use std::os::unix::fs::MetadataExt;
+
+        let root_descriptor =
+            self.root_file
+                .metadata()
+                .map_err(|source| IndexRootWriterLeaseError::Io {
+                    operation: "inspect held index-root descriptor",
+                    path: self.index_root.clone(),
+                    source,
+                })?;
+        let root_path = std::fs::symlink_metadata(&self.index_root).map_err(|source| {
+            IndexRootWriterLeaseError::Io {
+                operation: "resolve held index-root pathname",
+                path: self.index_root.clone(),
+                source,
+            }
+        })?;
+        if !root_descriptor.is_dir()
+            || !root_path.is_dir()
+            || root_descriptor.dev() != self.owner_record.root_device
+            || root_descriptor.ino() != self.owner_record.root_inode
+            || root_path.dev() != self.owner_record.root_device
+            || root_path.ino() != self.owner_record.root_inode
+            || root_descriptor.uid() != self.owner_record.owner_uid
+            || root_path.uid() != self.owner_record.owner_uid
+        {
+            return Err(IndexRootWriterLeaseError::Invalid {
+                path: self.index_root.clone(),
+                detail: format!(
+                    "{boundary}: index-root pathname/descriptor identity or owner changed"
+                ),
+            });
+        }
+
+        let lock_descriptor =
+            self.lock_file
+                .metadata()
+                .map_err(|source| IndexRootWriterLeaseError::Io {
+                    operation: "inspect held index-root lock descriptor",
+                    path: self.lock_path.clone(),
+                    source,
+                })?;
+        validate_lock_metadata(
+            &self.lock_path,
+            &lock_descriptor,
+            self.owner_record.owner_uid,
+        )?;
+        let lock_path = std::fs::symlink_metadata(&self.lock_path).map_err(|source| {
+            IndexRootWriterLeaseError::Io {
+                operation: "resolve held index-root lock pathname",
+                path: self.lock_path.clone(),
+                source,
+            }
+        })?;
+        if !lock_path.file_type().is_file()
+            || lock_path.dev() != self.owner_record.lock_device
+            || lock_path.ino() != self.owner_record.lock_inode
+            || lock_descriptor.dev() != self.owner_record.lock_device
+            || lock_descriptor.ino() != self.owner_record.lock_inode
+            || lock_path.uid() != self.owner_record.owner_uid
+        {
+            return Err(IndexRootWriterLeaseError::Invalid {
+                path: self.lock_path.clone(),
+                detail: format!(
+                    "{boundary}: writer-lock pathname/descriptor identity or owner changed"
+                ),
+            });
+        }
+
+        let observed = read_index_root_writer_record(&self.lock_path, &self.lock_file)?
+            .ok_or_else(|| IndexRootWriterLeaseError::Invalid {
+                path: self.lock_path.clone(),
+                detail: format!("{boundary}: sealed writer owner record is absent"),
+            })?;
+        if observed != self.owner_record {
+            return Err(IndexRootWriterLeaseError::Invalid {
+                path: self.lock_path.clone(),
+                detail: format!("{boundary}: sealed writer owner record changed"),
+            });
+        }
+        Ok(())
+    }
+
+    /// Fail closed on targets without the required kernel and no-follow
+    /// semantics.
+    #[cfg(not(all(
+        unix,
+        not(any(
+            target_os = "espidf",
+            target_os = "horizon",
+            target_os = "solaris",
+            target_os = "vita",
+            target_os = "wasi"
+        ))
+    )))]
+    pub fn fence(&self, _: &'static str) -> Result<(), IndexRootWriterLeaseError> {
+        Err(IndexRootWriterLeaseError::Unsupported {
+            path: self.index_root.clone(),
+        })
+    }
+
+    /// Path to the index root bound by this lease.
+    #[must_use]
+    pub fn index_root(&self) -> &Path {
+        &self.index_root
+    }
+}
+
+#[cfg(all(
+    unix,
+    not(any(
+        target_os = "espidf",
+        target_os = "horizon",
+        target_os = "solaris",
+        target_os = "vita",
+        target_os = "wasi"
+    ))
+))]
+fn validate_lock_metadata(
+    path: &Path,
+    metadata: &std::fs::Metadata,
+    owner_uid: u32,
+) -> Result<(), IndexRootWriterLeaseError> {
+    use std::os::unix::fs::MetadataExt;
+
+    if !metadata.file_type().is_file() {
+        return Err(IndexRootWriterLeaseError::Invalid {
+            path: path.to_path_buf(),
+            detail: "persistent writer lock must be a no-follow regular file".to_owned(),
+        });
+    }
+    if metadata.uid() != owner_uid {
+        return Err(IndexRootWriterLeaseError::Invalid {
+            path: path.to_path_buf(),
+            detail: format!(
+                "writer lock is owned by uid {}, expected uid {owner_uid}",
+                metadata.uid()
+            ),
+        });
+    }
+    if metadata.nlink() != 1 {
+        return Err(IndexRootWriterLeaseError::Invalid {
+            path: path.to_path_buf(),
+            detail: format!(
+                "persistent writer lock must have exactly one link, found {}",
+                metadata.nlink()
+            ),
+        });
+    }
+    if metadata.mode() & 0o077 != 0 {
+        return Err(IndexRootWriterLeaseError::Invalid {
+            path: path.to_path_buf(),
+            detail: format!(
+                "persistent writer lock permissions must be owner-only, found {:04o}",
+                metadata.mode() & 0o7777
+            ),
+        });
+    }
+    Ok(())
+}
+
+#[cfg(all(
+    unix,
+    not(any(
+        target_os = "espidf",
+        target_os = "horizon",
+        target_os = "solaris",
+        target_os = "vita",
+        target_os = "wasi"
+    ))
+))]
+fn read_index_root_writer_record(
+    path: &Path,
+    file: &File,
+) -> Result<Option<IndexRootWriterOwnerRecord>, IndexRootWriterLeaseError> {
+    use std::os::unix::fs::FileExt;
+
+    let length = file
+        .metadata()
+        .map_err(|source| IndexRootWriterLeaseError::Io {
+            operation: "inspect index-root writer record",
+            path: path.to_path_buf(),
+            source,
+        })?
+        .len();
+    if length == 0 {
+        return Ok(None);
+    }
+    if length != u64::try_from(INDEX_ROOT_WRITER_RECORD_BYTES).expect("record size fits u64") {
+        return Err(IndexRootWriterLeaseError::Invalid {
+            path: path.to_path_buf(),
+            detail: format!(
+                "v1 writer record must be exactly {INDEX_ROOT_WRITER_RECORD_BYTES} bytes, found {length}"
+            ),
+        });
+    }
+    let mut bytes = [0_u8; INDEX_ROOT_WRITER_RECORD_BYTES];
+    file.read_exact_at(&mut bytes, 0)
+        .map_err(|source| IndexRootWriterLeaseError::Io {
+            operation: "read index-root writer record",
+            path: path.to_path_buf(),
+            source,
+        })?;
+    IndexRootWriterOwnerRecord::from_bytes(&bytes)
+        .map(Some)
+        .map_err(|detail| IndexRootWriterLeaseError::Invalid {
+            path: path.to_path_buf(),
+            detail,
+        })
+}
+
+#[cfg(all(
+    unix,
+    not(any(
+        target_os = "espidf",
+        target_os = "horizon",
+        target_os = "solaris",
+        target_os = "vita",
+        target_os = "wasi"
+    ))
+))]
+fn write_index_root_writer_record(
+    path: &Path,
+    file: &mut File,
+    record: IndexRootWriterOwnerRecord,
+) -> Result<(), IndexRootWriterLeaseError> {
+    let bytes = record.to_bytes();
+    file.set_len(0)
+        .and_then(|()| file.seek(SeekFrom::Start(0)).map(|_| ()))
+        .and_then(|()| file.write_all(&bytes))
+        .and_then(|()| file.sync_all())
+        .map_err(|source| IndexRootWriterLeaseError::Io {
+            operation: "persist index-root writer record",
+            path: path.to_path_buf(),
+            source,
+        })
+}
+
+#[cfg(all(
+    unix,
+    not(any(
+        target_os = "espidf",
+        target_os = "horizon",
+        target_os = "solaris",
+        target_os = "vita",
+        target_os = "wasi"
+    ))
+))]
+impl Drop for IndexRootWriterLease {
+    fn drop(&mut self) {
+        use rustix::fs::{FlockOperation, flock};
+
+        // The record is intentionally retained as historical owner context.
+        // Acquiring the kernel flock is sufficient to overwrite it; normal
+        // release never mutates or unlinks the persistent lock inode.
+        let _ = flock(&self.lock_file, FlockOperation::Unlock);
     }
 }
 
@@ -1504,6 +2263,394 @@ mod tests {
         assert_eq!(snap.retries, 1);
         assert_eq!(snap.backpressure_events, 0);
         assert!((snap.contention_rate() - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[cfg(all(
+        unix,
+        not(any(
+            target_os = "espidf",
+            target_os = "horizon",
+            target_os = "solaris",
+            target_os = "vita",
+            target_os = "wasi"
+        ))
+    ))]
+    mod index_root_writer_lease_tests {
+        use std::fs;
+        use std::process::{Command, Output, Stdio};
+        use std::thread;
+
+        use frankensearch_index::VectorIndex;
+
+        use super::*;
+
+        const HELPER_ROOT_ENV: &str = "FSFS_WRITER_LEASE_TEST_ROOT";
+        const HELPER_OPERATION_ENV: &str = "FSFS_WRITER_LEASE_TEST_OPERATION";
+        const HELPER_GENERATION_ENV: &str = "FSFS_WRITER_LEASE_TEST_GENERATION";
+
+        fn retry_writer_lease(index_root: &Path) -> IndexRootWriterLease {
+            for _ in 0..400 {
+                match IndexRootWriterLease::acquire(index_root) {
+                    Ok(lease) => return lease,
+                    Err(IndexRootWriterLeaseError::Busy { .. }) => {
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("unexpected writer-lease admission failure: {error}"),
+                }
+            }
+            panic!("timed out retrying index-root writer lease")
+        }
+
+        fn helper_command(index_root: &Path, operation: &str) -> Command {
+            let mut command = Command::new(std::env::current_exe().expect("current test binary"));
+            command
+                .arg("index_root_writer_lease_subprocess_helper")
+                .arg("--nocapture")
+                .arg("--test-threads=1")
+                .env(HELPER_ROOT_ENV, index_root)
+                .env(HELPER_OPERATION_ENV, operation);
+            command
+        }
+
+        fn assert_helper_output(output: Output, token: &str) {
+            assert!(
+                output.status.success(),
+                "writer-lease helper failed: status={:?}, stdout={}, stderr={}",
+                output.status,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            assert!(
+                String::from_utf8_lossy(&output.stdout).contains(token),
+                "writer-lease helper did not execute expected branch {token}: stdout={}",
+                String::from_utf8_lossy(&output.stdout)
+            );
+        }
+
+        #[test]
+        fn index_root_writer_owner_record_roundtrips_and_rejects_tampering() {
+            let record = IndexRootWriterOwnerRecord {
+                pid: 42,
+                owner_uid: 1000,
+                process_start: 17,
+                host_id: 23,
+                boot_id: 29,
+                nonce_high: 31,
+                nonce_low: 37,
+                root_device: 41,
+                root_inode: 43,
+                lock_device: 47,
+                lock_inode: 53,
+            };
+            let bytes = record.to_bytes();
+            assert_eq!(
+                IndexRootWriterOwnerRecord::from_bytes(&bytes).expect("decode sealed record"),
+                record
+            );
+
+            let mut tampered = bytes;
+            tampered[48] ^= 0x80;
+            assert!(
+                IndexRootWriterOwnerRecord::from_bytes(&tampered)
+                    .expect_err("tampered nonce must invalidate checksum")
+                    .contains("checksum")
+            );
+        }
+
+        #[test]
+        fn index_root_writer_lease_keeps_one_persistent_inode_across_release() {
+            use std::os::unix::fs::MetadataExt;
+
+            let temp = tempfile::tempdir().expect("tempdir");
+            let index_root = temp.path().join("index");
+            let first = IndexRootWriterLease::acquire(&index_root).expect("first lease");
+            first.fence("first holder").expect("fence first holder");
+            let lock_path = index_root.join(INDEX_ROOT_WRITER_LOCK_FILE);
+            let first_inode = fs::metadata(&lock_path).expect("first lock metadata").ino();
+
+            assert!(matches!(
+                IndexRootWriterLease::acquire(&index_root),
+                Err(IndexRootWriterLeaseError::Busy {
+                    owner_pid: Some(pid),
+                    ..
+                }) if pid == std::process::id()
+            ));
+
+            drop(first);
+            assert!(
+                lock_path.is_file(),
+                "normal release must retain the persistent lock inode"
+            );
+            let second = IndexRootWriterLease::acquire(&index_root).expect("second lease");
+            second.fence("second holder").expect("fence second holder");
+            assert_eq!(
+                fs::metadata(&lock_path)
+                    .expect("second lock metadata")
+                    .ino(),
+                first_inode,
+                "release/reacquire must not replace the lock inode"
+            );
+        }
+
+        #[test]
+        fn index_root_writer_lease_fails_closed_after_root_substitution() {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let index_root = temp.path().join("index");
+            let displaced_root = temp.path().join("displaced-index");
+            let lease = IndexRootWriterLease::acquire(&index_root).expect("lease");
+
+            fs::rename(&index_root, &displaced_root).expect("displace held root");
+            fs::create_dir(&index_root).expect("substitute index root");
+            let guarded_marker = index_root.join("must-not-publish");
+            if lease.fence("root substitution").is_ok() {
+                fs::write(&guarded_marker, b"invalid publication")
+                    .expect("write only if fencing incorrectly succeeded");
+            }
+            assert!(
+                !guarded_marker.exists(),
+                "failed root identity must prevent the guarded publication"
+            );
+        }
+
+        #[test]
+        fn index_root_writer_lease_fails_closed_after_lock_substitution() {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let index_root = temp.path().join("index");
+            let lease = IndexRootWriterLease::acquire(&index_root).expect("lease");
+            let lock_path = index_root.join(INDEX_ROOT_WRITER_LOCK_FILE);
+            let displaced_lock = index_root.join(".fsfs-writer.lock.displaced");
+
+            fs::rename(&lock_path, &displaced_lock).expect("displace held lock");
+            OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&lock_path)
+                .expect("substitute writer lock");
+            assert!(matches!(
+                lease.fence("lock substitution"),
+                Err(IndexRootWriterLeaseError::Invalid { .. })
+            ));
+        }
+
+        #[test]
+        fn index_root_writer_lease_fails_closed_after_owner_record_tampering() {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let index_root = temp.path().join("index");
+            let lease = IndexRootWriterLease::acquire(&index_root).expect("lease");
+            let lock_path = index_root.join(INDEX_ROOT_WRITER_LOCK_FILE);
+            let mut bytes = fs::read(&lock_path).expect("read sealed owner record");
+            bytes[56] ^= 0x40;
+            fs::write(&lock_path, bytes).expect("tamper owner record");
+
+            assert!(matches!(
+                lease.fence("owner record tampering"),
+                Err(IndexRootWriterLeaseError::Invalid { .. })
+            ));
+        }
+
+        #[test]
+        fn fresh_process_observes_busy_then_acquires_while_readers_continue() {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let index_root = temp.path().join("index");
+            fs::create_dir_all(&index_root).expect("create index root");
+            fs::write(index_root.join("readable"), b"stable snapshot").expect("write read fixture");
+            let lease = IndexRootWriterLease::acquire(&index_root).expect("parent lease");
+
+            assert_helper_output(
+                helper_command(&index_root, "busy")
+                    .output()
+                    .expect("run busy helper"),
+                "FSFS_HELPER_BUSY_OK",
+            );
+            assert_helper_output(
+                helper_command(&index_root, "read")
+                    .output()
+                    .expect("run reader helper"),
+                "FSFS_HELPER_READ_OK",
+            );
+
+            drop(lease);
+            assert_helper_output(
+                helper_command(&index_root, "acquire")
+                    .output()
+                    .expect("run acquisition helper"),
+                "FSFS_HELPER_ACQUIRE_OK",
+            );
+            assert!(index_root.join("fresh-process-acquired").is_file());
+        }
+
+        #[test]
+        fn concurrent_publishers_cannot_expose_a_mixed_generation() {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let index_root = temp.path().join("index");
+
+            let mut first = helper_command(&index_root, "publish");
+            first
+                .env(HELPER_GENERATION_ENV, "generation-a")
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            let mut second = helper_command(&index_root, "publish");
+            second
+                .env(HELPER_GENERATION_ENV, "generation-b")
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            let first = first.spawn().expect("spawn first publisher");
+            let second = second.spawn().expect("spawn second publisher");
+            let first_output = first.wait_with_output().expect("wait first publisher");
+            let second_output = second.wait_with_output().expect("wait second publisher");
+            assert_helper_output(first_output, "FSFS_HELPER_PUBLISH_OK");
+            assert_helper_output(second_output, "FSFS_HELPER_PUBLISH_OK");
+
+            let lexical =
+                fs::read_to_string(index_root.join("lexical.generation")).expect("read lexical");
+            let vector =
+                fs::read_to_string(index_root.join("vector.generation")).expect("read vector");
+            assert_eq!(
+                lexical, vector,
+                "a complete writer critical section must publish one paired generation"
+            );
+            assert!(matches!(lexical.as_str(), "generation-a" | "generation-b"));
+        }
+
+        #[test]
+        fn daemon_compaction_cannot_erase_a_concurrent_acknowledged_append() {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let index_root = temp.path().join("index");
+            fs::create_dir_all(&index_root).expect("create index root");
+            let vector_path = index_root.join("vectors.fsvi");
+            let mut writer =
+                VectorIndex::create(&vector_path, "writer-lease-test", 4).expect("create FSVI");
+            writer
+                .write_record("base", &[1.0, 0.0, 0.0, 0.0])
+                .expect("write base record");
+            writer.finish().expect("finish FSVI");
+            let mut seed = VectorIndex::open(&vector_path).expect("open FSVI for seed WAL");
+            seed.append("seed", &[0.0, 1.0, 0.0, 0.0])
+                .expect("seed WAL");
+            drop(seed);
+
+            let mut compact_command = helper_command(&index_root, "vector-compact");
+            compact_command
+                .env("FSFS_WRITER_LEASE_TEST_VECTOR", &vector_path)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            let compact_child = compact_command.spawn().expect("spawn compactor");
+            let ready_path = index_root.join("compactor-ready");
+            for _ in 0..200 {
+                if ready_path.is_file() {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
+            assert!(
+                ready_path.is_file(),
+                "compactor must hold the lease before append starts"
+            );
+
+            let mut append_command = helper_command(&index_root, "vector-append");
+            append_command
+                .env("FSFS_WRITER_LEASE_TEST_VECTOR", &vector_path)
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            let append_child = append_command.spawn().expect("spawn appender");
+            assert_helper_output(
+                compact_child
+                    .wait_with_output()
+                    .expect("wait vector compactor"),
+                "FSFS_HELPER_VECTOR_COMPACT_OK",
+            );
+            assert_helper_output(
+                append_child
+                    .wait_with_output()
+                    .expect("wait vector appender"),
+                "FSFS_HELPER_VECTOR_APPEND_OK",
+            );
+
+            let admitted = VectorIndex::open(&vector_path).expect("reopen final FSVI");
+            let hits = admitted
+                .search_top_k(&[0.0, 0.0, 1.0, 0.0], 10, None)
+                .expect("search final FSVI");
+            assert!(
+                hits.iter().any(|hit| hit.doc_id == "survivor"),
+                "acknowledged append must survive daemon compaction"
+            );
+        }
+
+        #[test]
+        fn index_root_writer_lease_subprocess_helper() {
+            let Some(index_root) = std::env::var_os(HELPER_ROOT_ENV).map(PathBuf::from) else {
+                return;
+            };
+            let operation =
+                std::env::var(HELPER_OPERATION_ENV).expect("helper operation environment");
+            match operation.as_str() {
+                "busy" => {
+                    assert!(matches!(
+                        IndexRootWriterLease::acquire(&index_root),
+                        Err(IndexRootWriterLeaseError::Busy { .. })
+                    ));
+                    println!("FSFS_HELPER_BUSY_OK");
+                }
+                "read" => {
+                    assert_eq!(
+                        fs::read(index_root.join("readable")).expect("read shared snapshot"),
+                        b"stable snapshot"
+                    );
+                    println!("FSFS_HELPER_READ_OK");
+                }
+                "acquire" => {
+                    let lease = retry_writer_lease(&index_root);
+                    lease.fence("fresh-process acquisition").expect("fence");
+                    fs::write(index_root.join("fresh-process-acquired"), b"acquired")
+                        .expect("write acquisition marker");
+                    println!("FSFS_HELPER_ACQUIRE_OK");
+                }
+                "publish" => {
+                    let generation =
+                        std::env::var(HELPER_GENERATION_ENV).expect("publisher generation");
+                    let lease = retry_writer_lease(&index_root);
+                    lease.fence("paired lexical publication").expect("fence");
+                    fs::write(index_root.join("lexical.generation"), &generation)
+                        .expect("publish lexical generation");
+                    thread::sleep(Duration::from_millis(75));
+                    lease.fence("paired vector publication").expect("fence");
+                    fs::write(index_root.join("vector.generation"), &generation)
+                        .expect("publish vector generation");
+                    println!("FSFS_HELPER_PUBLISH_OK");
+                }
+                "vector-compact" => {
+                    let vector_path = PathBuf::from(
+                        std::env::var_os("FSFS_WRITER_LEASE_TEST_VECTOR")
+                            .expect("vector path environment"),
+                    );
+                    let lease = retry_writer_lease(&index_root);
+                    lease.fence("daemon compactor ready").expect("fence");
+                    fs::write(index_root.join("compactor-ready"), b"ready")
+                        .expect("write compactor handshake");
+                    thread::sleep(Duration::from_millis(100));
+                    lease.fence("daemon compaction publication").expect("fence");
+                    VectorIndex::open(&vector_path)
+                        .expect("open vector for compaction")
+                        .compact()
+                        .expect("compact vector");
+                    println!("FSFS_HELPER_VECTOR_COMPACT_OK");
+                }
+                "vector-append" => {
+                    let vector_path = PathBuf::from(
+                        std::env::var_os("FSFS_WRITER_LEASE_TEST_VECTOR")
+                            .expect("vector path environment"),
+                    );
+                    let lease = retry_writer_lease(&index_root);
+                    lease.fence("append WAL publication").expect("fence");
+                    VectorIndex::open(&vector_path)
+                        .expect("open vector for append")
+                        .append("survivor", &[0.0, 0.0, 1.0, 0.0])
+                        .expect("append surviving vector");
+                    println!("FSFS_HELPER_VECTOR_APPEND_OK");
+                }
+                other => panic!("unknown writer-lease helper operation {other}"),
+            }
+        }
     }
 
     // ── Lock Sentinel ──
