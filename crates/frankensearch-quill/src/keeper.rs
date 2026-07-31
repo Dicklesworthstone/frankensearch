@@ -1936,6 +1936,19 @@ impl RecoveredSegmentBacking {
         }
     }
 
+    /// Trailer-verified xxh3-64 over the file prefix, recorded at parse time.
+    ///
+    /// This is the content-identity witness for the whole immutable backing:
+    /// it was checked against the actual bytes when the reader was
+    /// constructed, and [`validate_segment_witnesses`] re-checks it against
+    /// every manifest generation that binds this backing.
+    fn file_xxh3(&self) -> u64 {
+        match self {
+            Self::Mapped(reader) => reader.file_xxh3(),
+            Self::Owned(reader) => reader.file_xxh3(),
+        }
+    }
+
     fn validate_witnesses(
         &self,
         path: &Path,
@@ -2218,6 +2231,7 @@ impl RankPruningCache {
 struct TermDictionaryCacheCounters {
     full_validations: AtomicU64,
     borrowed_views: AtomicU64,
+    metadata_reuses: AtomicU64,
 }
 
 #[cfg(test)]
@@ -2226,6 +2240,7 @@ impl TermDictionaryCacheCounters {
         Self {
             full_validations: AtomicU64::new(0),
             borrowed_views: AtomicU64::new(0),
+            metadata_reuses: AtomicU64::new(0),
         }
     }
 }
@@ -2240,6 +2255,11 @@ pub struct RecoveredSegment {
     live_doc_count: u32,
     rank_pruning_cache: Arc<RankPruningCache>,
     term_dictionary_metadata: Arc<ValidatedTermDictionaryMetadata>,
+    /// Whole-file xxh3 witness of the exact bytes the retained TERMDICT
+    /// metadata was completely validated against. Recorded from the
+    /// trailer-verified reader at validation time and carried unchanged
+    /// across tombstone-only rebinds of the same immutable backing.
+    term_dictionary_file_xxh3: u64,
     #[cfg(test)]
     term_dictionary_cache_counters: Arc<TermDictionaryCacheCounters>,
 }
@@ -2292,15 +2312,29 @@ impl RecoveredSegment {
             Arc::new(reader),
             Arc::new(RankPruningCache::new()),
             schema,
+            None,
         )
     }
 
+    /// Bind one manifest generation over a shared immutable backing.
+    ///
+    /// `reuse_from` names the predecessor binding of the exact same backing
+    /// when the caller is performing a tombstone-only manifest rebind. Its
+    /// already-validated TERMDICT metadata is reused only after every
+    /// content-identity witness holds: the backing must be the same `Arc`
+    /// allocation, the trailer-verified whole-file xxh3 recorded at
+    /// validation time must equal this reader's, the schema must match, and
+    /// the live TERMDICT slice must still be the exact address/length the
+    /// metadata was minted for. Any witness mismatch falls back to one
+    /// complete fresh validation, so reuse can never weaken admission; it can
+    /// only skip re-validating bytes that were already proven valid.
     fn bind_shared(
         path: PathBuf,
         manifest: ManifestSegment,
         reader: Arc<RecoveredSegmentBacking>,
         rank_pruning_cache: Arc<RankPruningCache>,
         schema: SchemaDescriptor,
+        reuse_from: Option<&Self>,
     ) -> Result<Self, KeeperError> {
         let id_map_bytes = required_identity_section(&path, &reader, SectionKind::IDMAP)?;
         let id_map = IdMapSection::parse(id_map_bytes, manifest.docid_lo, manifest.docid_hi)
@@ -2346,14 +2380,47 @@ impl RecoveredSegment {
             }
         })?;
         let live_doc_count = manifest.live_doc_count();
+
+        // Reuse the predecessor's validated TERMDICT metadata only when every
+        // content-identity witness proves the backing is byte-identical to
+        // what that metadata was completely validated against.
+        let reused_metadata = reuse_from.and_then(|previous| {
+            let identical_backing = Arc::ptr_eq(&previous.reader, &reader)
+                && previous.term_dictionary_file_xxh3 == reader.file_xxh3()
+                && schema == previous.term_dictionary_metadata.schema()
+                && validated_term_dictionary_is_bound(&reader, &previous.term_dictionary_metadata);
+            identical_backing.then(|| Arc::clone(&previous.term_dictionary_metadata))
+        });
         #[cfg(test)]
-        let term_dictionary_cache_counters = Arc::new(TermDictionaryCacheCounters::new());
-        let term_dictionary_metadata =
-            Arc::new(validate_term_dictionary_metadata(&path, &reader, schema)?);
-        #[cfg(test)]
-        term_dictionary_cache_counters
-            .full_validations
-            .fetch_add(1, AtomicOrdering::Relaxed);
+        let term_dictionary_cache_counters = match (&reused_metadata, reuse_from) {
+            // A reused binding shares its predecessor's counters so the
+            // observable contract stays "exactly one complete validation per
+            // unique immutable backing", not merely per binding.
+            (Some(_), Some(previous)) => {
+                let counters = Arc::clone(&previous.term_dictionary_cache_counters);
+                counters
+                    .metadata_reuses
+                    .fetch_add(1, AtomicOrdering::Relaxed);
+                counters
+            }
+            _ => Arc::new(TermDictionaryCacheCounters::new()),
+        };
+        let term_dictionary_metadata = match reused_metadata {
+            Some(metadata) => metadata,
+            None => {
+                let metadata = Arc::new(validate_term_dictionary_metadata(&path, &reader, schema)?);
+                #[cfg(test)]
+                term_dictionary_cache_counters
+                    .full_validations
+                    .fetch_add(1, AtomicOrdering::Relaxed);
+                metadata
+            }
+        };
+        // The reader's trailer hash was verified against the actual bytes at
+        // parse time; on reuse it was just proven equal to the predecessor's
+        // recorded witness, so recording it preserves the anchor to the
+        // originally validated content across rebind chains.
+        let term_dictionary_file_xxh3 = reader.file_xxh3();
         Ok(Self {
             path,
             manifest,
@@ -2363,11 +2430,19 @@ impl RecoveredSegment {
             live_doc_count,
             rank_pruning_cache,
             term_dictionary_metadata,
+            term_dictionary_file_xxh3,
             #[cfg(test)]
             term_dictionary_cache_counters,
         })
     }
 
+    /// Rebind this immutable backing under a successor manifest generation.
+    ///
+    /// Tombstones live in the MANIFEST, not in the FSLX image, so a
+    /// tombstone-only rebind re-checks the manifest witnesses against the
+    /// backing and then reuses the already-validated TERMDICT metadata via
+    /// [`Self::bind_shared`]'s identity-gated reuse path instead of
+    /// re-validating unchanged bytes.
     fn rebind(&self, manifest: ManifestSegment) -> Result<Self, KeeperError> {
         self.reader.validate_witnesses(&self.path, &manifest)?;
         let schema = self.term_dictionary_metadata.schema();
@@ -2377,6 +2452,7 @@ impl RecoveredSegment {
             Arc::clone(&self.reader),
             Arc::clone(&self.rank_pruning_cache),
             schema,
+            Some(self),
         )
     }
 
@@ -2422,6 +2498,25 @@ impl RecoveredSegment {
                 .borrowed_views
                 .load(AtomicOrdering::Relaxed),
         )
+    }
+
+    /// Test-only count of identity-verified TERMDICT metadata reuses across
+    /// tombstone-only rebinds of this segment's immutable backing.
+    #[cfg(test)]
+    pub(crate) fn term_dictionary_metadata_reuse_count(&self) -> u64 {
+        self.term_dictionary_cache_counters
+            .metadata_reuses
+            .load(AtomicOrdering::Relaxed)
+    }
+
+    /// Exact heap bytes retained by this binding's validated TERMDICT
+    /// metadata.
+    ///
+    /// Rebound generations of the same immutable backing share one metadata
+    /// allocation; each binding reports the full size of the shared object.
+    #[must_use]
+    pub fn term_dictionary_metadata_bytes(&self) -> usize {
+        self.term_dictionary_metadata.heap_bytes()
     }
 
     pub(crate) fn cached_rank_pruning_metadata(
@@ -2569,6 +2664,24 @@ fn bind_validated_term_dictionary<'a>(
 ) -> Result<TermDictionary<'a>, KeeperError> {
     TermDictionary::from_validated_metadata(bytes, metadata)
         .map_err(|source| term_dictionary_admission_error(path, source))
+}
+
+/// Whether `metadata` is still bound to `reader`'s live TERMDICT slice.
+///
+/// Resolves the TERMDICT section (its payload checksum gate is a warm
+/// `OnceLock` on a shared backing, so no bytes are re-hashed) and checks the
+/// exact address/length binding recorded at validation time. This is the
+/// pointer fast path of the once-per-unique-backing reuse contract; it never
+/// re-validates content.
+fn validated_term_dictionary_is_bound(
+    reader: &RecoveredSegmentBacking,
+    metadata: &ValidatedTermDictionaryMetadata,
+) -> bool {
+    reader
+        .section(SectionKind::TERMDICT)
+        .ok()
+        .flatten()
+        .is_some_and(|bytes| TermDictionary::from_validated_metadata(bytes, metadata).is_ok())
 }
 
 impl crate::argus::LiveDocs for RecoveredSegment {
@@ -3017,6 +3130,23 @@ impl KeeperSnapshot {
     #[must_use]
     pub fn segments(&self) -> &[RecoveredSegment] {
         &self.segments
+    }
+
+    /// Total heap bytes retained by validated TERMDICT metadata across every
+    /// segment bound in this snapshot.
+    ///
+    /// This is the persistent memory cost of validating TERMDICT metadata
+    /// once per unique immutable backing instead of per query or per rebind.
+    /// A snapshot holds each segment exactly once, so the sum never
+    /// double-counts inside one snapshot; successive snapshot generations that
+    /// share a backing also share one metadata allocation.
+    #[must_use]
+    pub fn term_dictionary_metadata_bytes(&self) -> u64 {
+        self.segments.iter().fold(0_u64, |total, segment| {
+            total.saturating_add(
+                u64::try_from(segment.term_dictionary_metadata_bytes()).unwrap_or(u64::MAX),
+            )
+        })
     }
 
     /// Physical at-seal rows retained for BM25 statistics until compaction.
@@ -15410,15 +15540,199 @@ mod tests {
         let mut tombstoned = published.next_manifest()?;
         assert!(tombstoned.segments[0].insert_tombstone(0)?);
         let rebound = published.publish_owned_segments(&tombstoned, Vec::new())?;
+        assert!(
+            Arc::ptr_eq(
+                &rebound.segments()[0].term_dictionary_metadata,
+                &published.segments()[0].term_dictionary_metadata,
+            ),
+            "a tombstone-only rebind must reuse the exact validated metadata \
+             allocation for the identical immutable backing"
+        );
         assert_eq!(
             rebound.segments()[0].term_dictionary_cache_counts(),
-            (1, 0),
-            "a new manifest generation receives a fresh validation"
+            (1, 128),
+            "the rebound binding shares its backing's counters: still exactly \
+             one complete validation for these bytes"
+        );
+        assert_eq!(
+            rebound.segments()[0].term_dictionary_metadata_reuse_count(),
+            1
         );
         assert_eq!(
             published.segments()[0].term_dictionary_cache_counts(),
             (1, 128),
-            "the prior snapshot retains its own cache generation"
+            "the prior snapshot observes the same shared backing counters"
+        );
+
+        let mut chained = rebound.next_manifest()?;
+        assert!(chained.segments[1].insert_tombstone(65_536)?);
+        let chained_snapshot = rebound.publish_owned_segments(&chained, Vec::new())?;
+        assert!(Arc::ptr_eq(
+            &chained_snapshot.segments()[0].term_dictionary_metadata,
+            &published.segments()[0].term_dictionary_metadata,
+        ));
+        assert_eq!(
+            chained_snapshot.segments()[0].term_dictionary_metadata_reuse_count(),
+            2,
+            "rebind chains keep reusing the original validation"
+        );
+        assert_eq!(
+            chained_snapshot.segments()[0]
+                .term_dictionary_cache_counts()
+                .0,
+            1,
+            "no rebind in the chain may repeat a complete validation"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn term_dictionary_reuse_witness_mismatch_falls_back_to_fresh_validation() -> TestResult {
+        let original = KeeperSnapshot::in_memory(DEFAULT_SCHEMA)?;
+        let first = encoded_identity_test_segment(0xd01, 0, &[Some("wit-a")])?;
+        let second = encoded_identity_test_segment(0xd02, 65_536, &[Some("wit-b")])?;
+        let mut proposed = original.next_manifest()?;
+        proposed.docid_high_watermark = 65_537;
+        proposed.segments = vec![manifest_segment(&first, 10), manifest_segment(&second, 20)];
+        let published = original.publish_owned_segments(&proposed, vec![first, second])?;
+        let [seg_a, seg_b] = published.segments() else {
+            panic!("fixture publishes exactly two segments");
+        };
+
+        // A predecessor naming a DIFFERENT immutable backing must never leak
+        // its validated metadata into this binding: the Arc identity witness
+        // fails first and the binding falls back to one complete validation.
+        let rebound = RecoveredSegment::bind_shared(
+            seg_b.path.clone(),
+            seg_b.manifest.clone(),
+            Arc::clone(&seg_b.reader),
+            Arc::clone(&seg_b.rank_pruning_cache),
+            DEFAULT_SCHEMA,
+            Some(seg_a),
+        )?;
+        assert!(
+            !Arc::ptr_eq(
+                &rebound.term_dictionary_metadata,
+                &seg_a.term_dictionary_metadata
+            ),
+            "cross-backing reuse must be rejected"
+        );
+        assert_eq!(
+            rebound.term_dictionary_cache_counts(),
+            (1, 0),
+            "the fallback path performs exactly one complete fresh validation"
+        );
+        assert_eq!(rebound.term_dictionary_metadata_reuse_count(), 0);
+        assert_eq!(rebound.term_dictionary(DEFAULT_SCHEMA)?.term_count(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn cached_termdict_views_do_not_re_read_bytes_while_fresh_open_fails_closed() -> TestResult {
+        let directory = tempdir()?;
+        let encoded = encoded_identity_test_segment(0xe01, 0, &[Some("live"), Some("spare")])?;
+        let segment_path = directory.path().join(canonical_segment_name(0xe01));
+        std::fs::write(&segment_path, encoded.as_bytes())?;
+        let manifest = durable_test_manifest(1, vec![manifest_segment(&encoded, 1)]);
+        write_manifest(&directory.path().join("MANIFEST"), &manifest)?;
+
+        let snapshot = KeeperSnapshot::open(directory.path(), DEFAULT_SCHEMA)?;
+        assert_eq!(
+            snapshot.segments()[0].term_dictionary_cache_counts(),
+            (1, 0)
+        );
+        assert_eq!(
+            snapshot.segments()[0]
+                .term_dictionary(DEFAULT_SCHEMA)?
+                .term_count(),
+            0
+        );
+
+        // Corrupt the durable TERMDICT payload AFTER the snapshot validated
+        // and cached its metadata. The empty dictionary's leading block_count
+        // becomes non-zero, so ANY re-validation of these bytes must fail.
+        //
+        // Note the structural QG-3 guard this test leans on: mutable bytes
+        // exist only on the durable path, and every durable successor
+        // snapshot is a cold reopen that re-validates from scratch. The
+        // in-memory rebind reuse path can never observe divergent bytes
+        // because its backing is an immutable shared allocation.
+        let termdict_offset = usize::try_from(
+            encoded
+                .section_entries()
+                .iter()
+                .find(|entry| entry.kind == SectionKind::TERMDICT)
+                .expect("fixture TERMDICT entry")
+                .offset,
+        )?;
+        let mut corrupted = std::fs::read(&segment_path)?;
+        corrupted[termdict_offset] ^= 0x01;
+        std::fs::write(&segment_path, corrupted)?;
+
+        // The live snapshot keeps serving borrowed views from the cached
+        // validated metadata without re-reading or re-hashing TERMDICT
+        // content, so it must not detect the on-disk mutation.
+        assert_eq!(
+            snapshot.segments()[0]
+                .term_dictionary(DEFAULT_SCHEMA)?
+                .term_count(),
+            0,
+            "cached views must not re-read durable TERMDICT bytes"
+        );
+        assert_eq!(
+            snapshot.segments()[0].term_dictionary_cache_counts().0,
+            1,
+            "the cached path must not run a second complete validation"
+        );
+
+        // A cold open of the same directory sees the corrupted bytes with no
+        // cache to lean on and must fail closed before publication.
+        let Err(error) = KeeperSnapshot::open(directory.path(), DEFAULT_SCHEMA) else {
+            panic!("fresh open must re-validate and reject corrupted TERMDICT bytes");
+        };
+        assert!(
+            matches!(&error, KeeperError::SegmentOpen { path, .. } if path == &segment_path),
+            "fresh open must fail closed on the corrupted segment: {error:?}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn validated_termdict_metadata_bytes_are_accounted_and_shared_across_rebinds() -> TestResult {
+        let original = KeeperSnapshot::in_memory(DEFAULT_SCHEMA)?;
+        let first = encoded_identity_test_segment(0xf01, 0, &[Some("acct-a")])?;
+        let second = encoded_identity_test_segment(0xf02, 65_536, &[Some("acct-b")])?;
+        let mut proposed = original.next_manifest()?;
+        proposed.docid_high_watermark = 65_537;
+        proposed.segments = vec![manifest_segment(&first, 10), manifest_segment(&second, 20)];
+        let published = original.publish_owned_segments(&proposed, vec![first, second])?;
+
+        let per_segment = published
+            .segments()
+            .iter()
+            .map(RecoveredSegment::term_dictionary_metadata_bytes)
+            .collect::<Vec<_>>();
+        assert!(
+            per_segment.iter().all(|&bytes| bytes > 0),
+            "every binding must account its retained metadata object"
+        );
+        let expected_total = per_segment.iter().fold(0_u64, |total, &bytes| {
+            total.saturating_add(u64::try_from(bytes).unwrap_or(u64::MAX))
+        });
+        assert_eq!(published.term_dictionary_metadata_bytes(), expected_total);
+
+        let mut tombstoned = published.next_manifest()?;
+        assert!(tombstoned.segments[0].insert_tombstone(0)?);
+        let rebound = published.publish_owned_segments(&tombstoned, Vec::new())?;
+        assert_eq!(
+            rebound.segments()[0].term_dictionary_metadata_bytes(),
+            per_segment[0],
+            "a rebound binding reports the shared allocation, not a new one"
+        );
+        assert_eq!(
+            rebound.term_dictionary_metadata_bytes(),
+            expected_total,
+            "tombstone-only rebinds must not grow persistent metadata bytes"
         );
         Ok(())
     }
