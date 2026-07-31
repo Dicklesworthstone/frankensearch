@@ -10700,6 +10700,13 @@ cargo, local or remote.
 
 ## 2026-07-10 — REJECTED MEASUREMENT BUNDLE: unbatched paired int8 row-block A/B exceeds the 5% CV gate (cod_fse)
 
+> **2026-07-31 basis correction (BlackThrush):** the rejection recorded in this row
+> rests on the 5% CV gate, which the 2026-07-27 model-integrity correction
+> **withdrew**. This bundle carries no same-invocation A/A arm, so there is no null
+> floor to decide against: its correct label is **UNDECIDABLE**, not REJECTED. The
+> `bd-b5wl` lever is separately re-decided on direction consistency at the end of
+> this file; production source is unchanged.
+
 **This rejects the timing bundle, not the row-blocked candidate.** The first same-binary A/B of the four-row
 AVX2 query-reuse candidate ran both ORIGINAL and candidate in every measured routine, counterbalanced AB/BA
 order, and black-boxed both input and result. It was one `RCH_REQUIRE_REMOTE=1 env -u CARGO_TARGET_DIR rch
@@ -10736,6 +10743,13 @@ amortizes worker scheduling jitter without splitting arms across workers or invo
 
 ## 2026-07-10 — REJECTED MEASUREMENT BUNDLE: batch16 int8 row-block A/B misses CV gate by 0.0318 point (cod_fse)
 
+> **2026-07-31 basis correction (BlackThrush):** the rejection recorded in this row
+> rests on the 5% CV gate, which the 2026-07-27 model-integrity correction
+> **withdrew**. This bundle carries no same-invocation A/A arm, so there is no null
+> floor to decide against: its correct label is **UNDECIDABLE**, not REJECTED. The
+> `bd-b5wl` lever is separately re-decided on direction consistency at the end of
+> this file; production source is unchanged.
+
 **This again rejects the timing bundle, not the candidate.** The recorded retry condition above was exercised
 as one fail-closed RCH invocation on worker `ovh-a` (AMD Ryzen 7 5800X), with both arms in one binary and a
 fixed 16-query AB/BA batch inside every Criterion iteration. Inputs and results remained black-boxed, and the
@@ -10770,6 +10784,13 @@ different iteration counts for the two independently estimated arms.
 
 ## 2026-07-10 — REJECTED MEASUREMENT BUNDLE: batch32 linear sampling collides with active worker contention (cod_fse)
 
+> **2026-07-31 basis correction (BlackThrush):** the rejection recorded in this row
+> rests on the 5% CV gate, which the 2026-07-27 model-integrity correction
+> **withdrew**. This bundle carries no same-invocation A/A arm, so there is no null
+> floor to decide against: its correct label is **UNDECIDABLE**, not REJECTED. The
+> `bd-b5wl` lever is separately re-decided on direction consistency at the end of
+> this file; production source is unchanged.
+
 **This rejects the timing bundle, not the candidate.** The full-query retry ran as one fail-closed RCH
 invocation on `vmi1152480` (AMD EPYC, 10 physical CPUs), with 32-query AB/BA batches, both arms in every
 measured routine, black-boxed inputs/results, exact output parity, and batch-normalized values below. The
@@ -10803,6 +10824,13 @@ below 5%, that is an infrastructure blocker rather than evidence for or against 
 
 ## 2026-07-10 — REJECTED MEASUREMENT BUNDLE: 60-second flat sampling leaves one mult5 CV above gate (cod_fse)
 
+> **2026-07-31 basis correction (BlackThrush):** the rejection recorded in this row
+> rests on the 5% CV gate, which the 2026-07-27 model-integrity correction
+> **withdrew**. This bundle carries no same-invocation A/A arm, so there is no null
+> floor to decide against: its correct label is **UNDECIDABLE**, not REJECTED. The
+> `bd-b5wl` lever is separately re-decided on direction consistency at the end of
+> this file; production source is unchanged.
+
 **This rejects the timing bundle, not yet the candidate.** Criterion flat sampling was encoded in the bench
 source and run in one fail-closed RCH invocation on `hz1` (AMD EPYC-Milan, four cores/eight threads). Each of
 20 samples averaged a fixed number of complete 32-query AB/BA batches; both arms ran inside every measured
@@ -10833,6 +10861,13 @@ the lone unstable estimator without changing code or splitting the A/B across wo
 ---
 
 ## 2026-07-10 — REJECTED MEASUREMENT BUNDLE / BLOCKER: 120-second flat samples remain scheduler-dominated (cod_fse)
+
+> **2026-07-31 basis correction (BlackThrush):** the rejection recorded in this row
+> rests on the 5% CV gate, which the 2026-07-27 model-integrity correction
+> **withdrew**. This bundle carries no same-invocation A/A arm, so there is no null
+> floor to decide against: its correct label is **UNDECIDABLE**, not REJECTED. The
+> `bd-b5wl` lever is separately re-decided on direction consistency at the end of
+> this file; production source is unchanged.
 
 **This rejects the timing bundle and surfaces an infrastructure blocker; it does not bind the candidate.**
 The final recorded retry ran one fail-closed RCH invocation on `ovh-a` (AMD Ryzen 7 5800X) after admission
@@ -10902,6 +10937,11 @@ cost; it also gives each row one accumulator instead of the incumbent's dual-cha
 ---
 
 ## 2026-07-10 — REJECTED MEASUREMENT BUNDLE / BLOCKER: balanced null control cannot resolve int8 row blocks (cod_fse)
+
+> **2026-07-31 basis correction (BlackThrush):** unlike the five CV-gated bundles
+> above, this row ran a real A/A null, so its `INSIDE NULL FLOOR` basis **stands**.
+> It is one of the six occasions in the end-of-file direction-consistency
+> re-decision of `bd-b5wl`.
 
 **This rejects the measurement bundle, not the four-row candidate or the int8 ADC family.** The superseding
 null-controlled substrate ran as one fail-closed `RCH_REQUIRE_REMOTE=1 env -u CARGO_TARGET_DIR rch exec --
@@ -16584,3 +16624,95 @@ Full card: `docs/evidence/e8h/p3-local-qg2-allocator-sensitivity-20260729.md`.
 certified class moves the quill arm's median ratio >3% with an admissible
 same-invocation A/A null, or (b) a certified-class arm-scoped profile
 attributes >8% of quill self-time to allocator frames.
+
+### 2026-07-31 — BASIS CORRECTION: five 2026-07-10 int8 row-block bundles are UNDECIDABLE, not decided; the `bd-b5wl` lever stays UNDECIDABLE (BlackThrush)
+
+**Scope: five decision *bases* are void and are relabelled. No lever verdict is
+issued. No source changed; production stays ORIGINAL.**
+
+The `2026-07-27 model-integrity correction` withdrew the coefficient-of-variation
+admissibility rule campaign-wide — *"decide solely from the candidate median CI
+versus the A/A null floor. Raw CV is diagnostic only."* It was applied to five
+rows (`bd-l5x3` x4, `bd-3srq` x1). It was **never applied to the 2026-07-10
+`cod_fse` measurement-bundle family**, every member of which was decided on
+exactly that withdrawn rule:
+
+| 2026-07-10 bundle | basis recorded then | basis now |
+|---|---|---|
+| unbatched paired int8 row-block A/B | dispersion rule | **VOID** |
+| batch16 int8 row-block A/B | dispersion rule, missed by 0.0318 pt | **VOID** |
+| batch32 linear sampling | dispersion rule | **VOID** |
+| 60-second flat sampling | dispersion rule | **VOID** |
+| 120-second flat samples | dispersion rule | **VOID** |
+| balanced null control | *inside its own null floor* | **stands** |
+
+**They are not re-decidable under the corrected gate either.** The five carry
+Criterion mean/CI and dispersion only, with **no same-invocation A/A arm**. The
+corrected gate decides against an A/A null floor; with no null arm there is no
+floor. Their correct label is **UNDECIDABLE**. Only the balanced-null-control
+occasion ran a real null, and it already records the honest `INSIDE NULL FLOOR`
+outcome — which is also UNDECIDABLE.
+
+**Therefore the `bd-b5wl` four-row int8 query-reuse candidate remains
+UNDECIDABLE.** It has never been decided by an admissible measurement, and this
+correction does not decide it.
+
+### Directional prior — recorded as evidence, explicitly NOT a verdict
+
+The six occasions ran on three microarchitectures (`hz1` EPYC-Milan, `ovh-a`
+Ryzen 7 5800X, `vmi1227854` EPYC) under five sampling substrates, each with
+bit-exact index/doc/score parity and recall@10 = nDCG@10 = 1.0000. Their twelve
+candidate/original ratios (>1.0 = candidate slower):
+
+| occasion | mult3 | mult5 |
+|---|---:|---:|
+| unbatched | 0.9852 | 1.0948 |
+| batch16 | 1.0209 | 1.0024 |
+| batch32 | 1.2389 | 1.0301 |
+| flat60 | 1.0212 | 1.0203 |
+| flat120 | 1.2048 | 1.1893 |
+| balanced null control | 1.1369 | 1.1928 |
+
+**11 of 12 exceed 1.0. Sign test p = 0.0064 two-sided; median ratio 1.0625.**
+
+```bash
+python3 -c "
+from math import comb
+v=[0.9852,1.0948,1.020871,1.002430,1.238912,1.030111,1.021188,1.020255,1.204816,1.189327,1.136852,1.192786]
+s=sum(1 for x in v if x>1.0); n=len(v)
+print(s,'/',n,' p2=',2*sum(comb(n,k) for k in range(s,n+1))/2**n)"
+# -> 11 / 12  p2= 0.006347656250
+```
+
+**This is a prior, not a decision.** The occasions are not independent replicates
+of one protocol — they differ in batching, sampling and worker — so the sign test
+describes a consistent *direction* and licenses no ratio. Under this repository's
+own contract the direction cannot retire the lever: a decision needs a
+same-invocation numeric A/A null or a counted unchanged mechanism, and this has
+neither.
+
+**Method note — the gate caught this row.** An earlier draft of this entry
+declared the lever rejected on the strength of the sign test above. The
+pre-commit ledger gate refused it with `BLOCKED REJECT ... missing:
+same-invocation numeric A/A null OR counted no-change mechanism`. That refusal
+was correct and the verdict was downgraded to UNDECIDABLE rather than the gate
+worked around. The direction is worth recording precisely because it is the kind
+of evidence that feels decisive and is not.
+
+**Decision: BASIS CORRECTION only. Comparison class: SELF-SPEEDUP** (frankensearch
+vs frankensearch; no incumbent arm ran).
+
+Production is unchanged and was verified this session: `search.rs:615,634` call
+`int8_scan_range_orig`; the four-row `int8_scan_range` (`:751` -> `dot_i8x4_i8`
+`:800`) remains bench-only, exactly as the balanced-null-control occasion left it.
+
+The distinct `vpmaddubs` primitive (kernel-level 1.23x) is a **separate vein**
+and is untouched here.
+
+**To actually decide `bd-b5wl`:** one invocation, both arms in one binary, a
+`paired_median_ratio` A/A null plus the A/B, self-reported ELF SHA-256, and a
+median-CI/null-floor decision — the same substrate `int8_vs_f16_fast_ab` already
+implements. It is not blocked on a lever; it is blocked on a quiet worker.
+
+Full sweep of all 84 retry predicates:
+`docs/evidence/retry-predicate-sweep-20260731.md`.

@@ -149,6 +149,88 @@ already enforces the contract on **new** rows — it passed on this session's
 commit with `checked_new_rows=0` — so the exposure is entirely historical and
 is not growing.
 
+---
+
+# CORRECTION 2026-07-31 (BlackThrush) — Tier 0 is NOT empty. `CHANGELOG.md` carries 10 public perf claims.
+
+**The 2026-07-30 audit above got its own headline finding wrong.** It recorded
+`CHANGELOG.md | 0` perf claims and concluded "Tier 0 — public/user-facing
+unsupported claims: **0**". That is false, and it is false against the audit's
+*own* reproduce command, which returns five matching lines, not zero:
+
+```
+$ grep -cE "[0-9]+(\.[0-9]+)?\s*[x×]|faster|speedup|beats" README.md CHANGELOG.md
+README.md:0
+CHANGELOG.md:5
+```
+
+The `README.md → 0` half is confirmed and stands. The `CHANGELOG.md → 0` half
+was a misread of a non-empty result. `CHANGELOG.md` is rendered on the GitHub
+repository front page; it is as public as the README.
+
+## The 10 public claims (CHANGELOG.md:65-68)
+
+| # | claim | line | comparator actually used | incumbent-live ratio? |
+|---|---|---:|---|---|
+| 1 | f16 dot products **3.6–4.0x** | 65 | our scalar/`wide` path | no |
+| 2 | 4-bit slab pack **10.3–13.6x** | 65 | our prior scalar pack | no |
+| 3 | FSVI slab write **6.4–7.3x** | 65 | our prior byte path | no |
+| 4 | **"the fastest lossless vector-search primitive"** | 66 | *nothing* — unbounded superlative | no |
+| 5 | parallelized MRL truncated scan **8.64x** | 66 | our serial scan | no |
+| 6 | selective-filter gather **6.9–50x** | 66 | our prior filter path | no |
+| 7 | fuse-step `doc_id` moves **7.8–21.5x** | 67 | our prior clone path | no |
+| 8 | merge-structured `rrf_fuse` **1.31–1.46x** | 67 | our prior sort | no |
+| 9 | ASCII NFC analyzer hot path **~45–368x** | 68 | our prior NFC path | no |
+| 10 | Tantivy fast-field id materialization **up to 6.32x** | 68 | our own prior materialization, *not* Tantivy-as-incumbent | no |
+
+**0 of 10 carry a vs-incumbent ratio.** Every one is a self-vs-self
+before/after promoted to a public surface. Claim 10 is the trap worth naming:
+it contains the word "Tantivy", so it reads as an incumbent comparison, but
+Tantivy is the substrate being optimized, not the arm being beaten.
+
+(`CHANGELOG.md:101` additionally carries "dense tier ~4.4x smaller
+contribution" — a retrieval-quality contribution ratio, not a speed claim, so
+it is excluded from the 10 and is separately supported by the BEIR harness.)
+
+## Claim 4 is the load-bearing one
+
+Claims 1-3 and 5-10 are bounded self-improvements: an over-claimed ratio
+misleads about *how much we improved*, which is a campaign-integrity problem
+but not a user-actionable one. **Claim 4 is different in kind.** "The fastest
+lossless vector-search primitive" is an unbounded superlative about the world.
+A user reading it could reasonably choose frankensearch over faiss, usearch, or
+hnswlib on its strength. Its entire evidentiary base is
+`docs/PERF_LEDGER.md:825` and `:827`, and both compare the 4-bit two-pass
+against **our own int8 two-pass and our own flat f16 scan**:
+
+> `| 888.2 µs | 831.4 µs | 0.936 (1.07× vs int8; 2.56× vs flat) | KEEP` — `:825`
+> `... 3.09× vs flat — the fastest lossless in-memory vector-search primitive` — `:827`
+
+There is no third-party arm anywhere in its provenance. It is therefore ranked
+**#1 in the conversion queue** and converted in
+`fsvi-4bit-vs-incumbent-20260731.md`.
+
+## Effect on the audit's numbers
+
+The three headline numbers are **unchanged** — 147 / 10 / 137 — because the 10
+CHANGELOG claims are restatements of ledger rows already counted in the 137.
+What changes is the *ranking*: the queue is no longer "Tier 0 empty, start with
+the cheapest paperwork". It starts with a public superlative.
+
+The audit's other counts were re-verified independently on 2026-07-31 and hold:
+`Actual legacy incumbent` → 0, form (a) → 83, form (c) → 10, N/A rows → 48.
+Form (b)'s **44** is mechanically reproducible; the **54** is 44 plus 10
+hand-identified older-format headings, so the defensible total is a range,
+**137–147, with 137 as the mechanically reproducible floor**.
+
+## Method note
+
+The audit ran the right command and misreported its output. A grep whose result
+contradicts the conclusion drawn from it is the cheapest possible error to
+catch and the most expensive to leave standing, because every downstream
+ranking inherits it. Reproduce commands in this directory should be run and
+their output pasted, not summarised.
+
 ## Reproduce
 
 ```bash
