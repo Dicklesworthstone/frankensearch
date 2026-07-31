@@ -1,0 +1,15 @@
+RED PROOF 3: TwoTierIndexBuilder::finish declared-identity attach DISABLED (.filter(|_| false) on both tiers)
+mutation applied to crates/frankensearch-index/src/two_tier.rs at commit e5693265b11c31cb98ba4864a6fa8ff21524a643
+expected RED: builder_finish_retains_declared_typed_identity, semantic_vector_with_tier_reports_serving_tier
+test two_tier::tests::semantic_vector_with_tier_reports_serving_tier ... FAILED
+test two_tier::tests::builder_finish_retains_declared_typed_identity ... FAILED
+thread 'two_tier::tests::semantic_vector_with_tier_reports_serving_tier' (2073459) panicked at crates/frankensearch-index/src/two_tier.rs:4537:9:
+assertion `left == right` failed: Quality provenance joins to the quality tier's space
+  left: None
+ right: Some("ccadd9f2741d68e497052f123610bb0fe243b991b5dcc44670f5cac0b878c85f")
+thread 'two_tier::tests::builder_finish_retains_declared_typed_identity' (2073458) panicked at crates/frankensearch-index/src/two_tier.rs:4351:9:
+assertion `left == right` failed
+  left: None
+ right: Some("00b4e21721bfb496625f3d4520749678babedce7f53b63cbc4b07b46c370756d")
+test result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 525 filtered out; finished in 0.05s
+EXIT_STATUS=101
