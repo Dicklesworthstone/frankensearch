@@ -182,5 +182,5 @@ pub use traits::{
 pub use types::{
     BoundQueryEmbedding, DocId, EmbeddingMetrics, FusedHit, IndexMetrics, IndexableDocument,
     PhaseMetrics, RankChanges, RetrievalTopology, ScoreSource, ScoredResult, SearchMetrics,
-    SearchMode, SearchPhase, TieredQueryEmbeddings, VectorHit,
+    SearchMode, SearchPhase, SpaceIdentityAdmission, TieredQueryEmbeddings, VectorHit,
 };

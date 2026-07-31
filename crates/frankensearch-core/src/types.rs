@@ -145,18 +145,27 @@ pub struct BoundQueryEmbedding {
     vector: Vec<f32>,
     identity: EmbeddingIdentityBundleV1,
     identity_fingerprint: String,
+    space_fingerprint: String,
 }
 
 impl BoundQueryEmbedding {
     /// Bind a vector to the identity of the space that produced it.
     ///
+    /// The identity bundle is validated before anything is bound
+    /// ([`EmbeddingIdentityBundleV1::validate`]): a bound embedding is a
+    /// claim every downstream verifier trusts, so an incoherent bundle —
+    /// component fingerprints that do not bind each other, dimension
+    /// contradictions — must be rejected here, not discovered at a seam.
+    ///
     /// # Errors
     ///
-    /// Returns [`SearchError::DimensionMismatch`] when the vector length
-    /// does not match the identity's storage dimension — a bound embedding
-    /// must be internally consistent before it can prove anything to a
-    /// consumer.
+    /// Returns [`SearchError::InvalidConfig`] when the identity bundle fails
+    /// its own validation, and [`SearchError::DimensionMismatch`] when the
+    /// vector length does not match the validated identity's storage
+    /// dimension — a bound embedding must be internally consistent before it
+    /// can prove anything to a consumer.
     pub fn new(vector: Vec<f32>, identity: EmbeddingIdentityBundleV1) -> SearchResult<Self> {
+        identity.validate()?;
         let expected = identity.storage.dimension as usize;
         if vector.len() != expected {
             return Err(SearchError::DimensionMismatch {
@@ -165,10 +174,12 @@ impl BoundQueryEmbedding {
             });
         }
         let identity_fingerprint = identity.fingerprint();
+        let space_fingerprint = identity.space.fingerprint();
         Ok(Self {
             vector,
             identity,
             identity_fingerprint,
+            space_fingerprint,
         })
     }
 
@@ -191,7 +202,28 @@ impl BoundQueryEmbedding {
         &self.identity_fingerprint
     }
 
-    /// Verify this embedding was produced in the space a consumer expects.
+    /// Lowercase SHA-256 fingerprint of the *space* component only
+    /// ([`EmbeddingIdentityBundleV1::space`]), computed once at bind time.
+    ///
+    /// This is the join key at every index seam: a query-side bundle binds
+    /// in-memory `f32` storage while an index-side bundle binds its
+    /// persisted storage format (for example `fsvi-v2`), so their
+    /// full-bundle fingerprints legitimately differ even when both were
+    /// produced by the same model in the same mathematical space.
+    #[must_use]
+    pub fn space_fingerprint(&self) -> &str {
+        &self.space_fingerprint
+    }
+
+    /// Verify this embedding's complete identity bundle — space, producer,
+    /// input contract, *and* storage — matches what a consumer expects.
+    ///
+    /// This is an embedder-to-embedder comparison: use it only when both
+    /// sides bind the same storage identity. At an index seam the storage
+    /// components legitimately differ (query-side `in-memory-*` versus the
+    /// index's persisted format), so full-bundle fingerprints can never
+    /// match there — join on [`Self::verify_space_identity`] and admit via
+    /// [`Self::verify_producer_conformance`] instead.
     ///
     /// # Errors
     ///
@@ -210,6 +242,154 @@ impl BoundQueryEmbedding {
                  {tier} index expects (expected identity fingerprint {expected_fingerprint})"
             ),
         })
+    }
+
+    /// Join this embedding against an index-side *space* fingerprint — the
+    /// index-seam identity check (bd-9xuj T2-C1).
+    ///
+    /// At an index seam the two sides legitimately disagree on storage
+    /// (see [`Self::verify_space`]), so the join key is the space
+    /// fingerprint ([`EmbeddingSpaceIdentityV1::fingerprint`]), which binds
+    /// model, revision, dimension, and the input contract via
+    /// [`EmbeddingSpaceIdentityV1::input_contract_fingerprint`] — but not
+    /// the physical storage.
+    ///
+    /// A matching space fingerprint is **necessary, not sufficient**, for
+    /// admission: a bare fingerprint carries no producer attestation, so
+    /// this check cannot certify that a *different producer's* vectors are
+    /// interchangeable with the index's. Seams that retain the full
+    /// expected identity bundle must call
+    /// [`Self::verify_producer_conformance`], which applies the complete
+    /// bd-9xuj admission law (same producer, or a conformance-certified
+    /// foreign producer; anything else rejects).
+    ///
+    /// # The `LegacyUnidentified` boundary
+    ///
+    /// `expected_space_fingerprint` must come from an identity-bearing
+    /// source: an FSVI v2 header written by `VectorIndex::create_v2`, or an
+    /// explicitly supplied space identity. Today **zero production writers
+    /// call `create_v2`** — `TwoTierIndexBuilder::finish` routes through
+    /// the legacy v1 constructors with `identity_v2: None` — so every
+    /// production index on disk is v1 and has *no* space fingerprint to
+    /// pass here. Those artifacts must never reach this verifier: the seam
+    /// routes them as typed `LegacyUnidentified`
+    /// (`FsviReindexReason::LegacyUnidentified` → `RecoveryPlan` reindex,
+    /// then FSVI v2 activation) rather than fabricating a fingerprint,
+    /// admitting on dimension equality, or warning and proceeding.
+    ///
+    /// [`EmbeddingSpaceIdentityV1::fingerprint`]: crate::generation::EmbeddingSpaceIdentityV1::fingerprint
+    /// [`EmbeddingSpaceIdentityV1::input_contract_fingerprint`]: crate::generation::EmbeddingSpaceIdentityV1::input_contract_fingerprint
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError::InvalidConfig`] naming `tier` when the space
+    /// fingerprints differ — including the same-dimension wrong-space case
+    /// that raw vector APIs silently accept.
+    pub fn verify_space_identity(
+        &self,
+        expected_space_fingerprint: &str,
+        tier: &str,
+    ) -> SearchResult<()> {
+        if self.space_fingerprint == expected_space_fingerprint {
+            return Ok(());
+        }
+        Err(SearchError::InvalidConfig {
+            field: format!("query_embedding.{tier}.space_identity"),
+            value: self.space_fingerprint.clone(),
+            reason: format!(
+                "query embedding was produced in a different embedding space than the \
+                 {tier} index expects (expected space fingerprint {expected_space_fingerprint})"
+            ),
+        })
+    }
+
+    /// Apply the complete bd-9xuj admission law against a fully known
+    /// expected identity bundle.
+    ///
+    /// Admission requires the space fingerprints to join (exactly as
+    /// [`Self::verify_space_identity`]) **and** producer conformance:
+    ///
+    /// - the same attested producer →
+    ///   [`SpaceIdentityAdmission::SameProducer`];
+    /// - a different producer → admitted only when
+    ///   [`EmbeddingIdentityBundleV1::is_conformance_compatible_with`]
+    ///   verifies the pinned golden-vector certificate, returning
+    ///   [`SpaceIdentityAdmission::ConformanceCompatibleProducer`] — typed
+    ///   telemetry the caller is expected to record;
+    /// - otherwise the pairing is rejected. A matching space fingerprint
+    ///   alone never admits a foreign producer.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError::InvalidConfig`]: propagated from
+    /// [`EmbeddingIdentityBundleV1::validate`] when `expected` is not itself
+    /// a coherent bundle; naming `query_embedding.<tier>.space_identity`
+    /// when the space fingerprints differ; naming
+    /// `query_embedding.<tier>.producer_conformance` when the spaces join
+    /// but the foreign producer carries no matching golden-vector
+    /// certificate.
+    pub fn verify_producer_conformance(
+        &self,
+        expected: &EmbeddingIdentityBundleV1,
+        tier: &str,
+    ) -> SearchResult<SpaceIdentityAdmission> {
+        expected.validate()?;
+        self.verify_space_identity(&expected.space.fingerprint(), tier)?;
+        let query_producer_fingerprint = self.identity.producer.fingerprint();
+        let expected_producer_fingerprint = expected.producer.fingerprint();
+        if query_producer_fingerprint == expected_producer_fingerprint {
+            return Ok(SpaceIdentityAdmission::SameProducer);
+        }
+        if self.identity.is_conformance_compatible_with(expected) {
+            return Ok(SpaceIdentityAdmission::ConformanceCompatibleProducer {
+                query_producer_fingerprint,
+                expected_producer_fingerprint,
+            });
+        }
+        Err(SearchError::InvalidConfig {
+            field: format!("query_embedding.{tier}.producer_conformance"),
+            value: query_producer_fingerprint,
+            reason: format!(
+                "query embedding's producer shares the {tier} index's embedding space but \
+                 is not certified conformance-compatible with its producer (expected \
+                 producer fingerprint {expected_producer_fingerprint}); a matching space \
+                 fingerprint alone never admits a foreign producer — admission requires \
+                 the identical pinned golden-vector certificate"
+            ),
+        })
+    }
+}
+
+/// Typed outcome of the bd-9xuj admission law for a space-verified pairing.
+///
+/// Emitted by [`BoundQueryEmbedding::verify_producer_conformance`] so callers
+/// can log and route the admission basis instead of collapsing it into a bare
+/// `Ok`: a foreign producer admitted through its golden-vector certificate is
+/// telemetry-visible by construction.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "admission")]
+pub enum SpaceIdentityAdmission {
+    /// Same space and the same attested producer.
+    SameProducer,
+    /// Same space, different producer, admitted because both producers carry
+    /// the identical pinned golden-vector certificate
+    /// ([`EmbeddingIdentityBundleV1::is_conformance_compatible_with`]).
+    ConformanceCompatibleProducer {
+        /// Producer fingerprint of the query-side bundle.
+        query_producer_fingerprint: String,
+        /// Producer fingerprint the consumer expected.
+        expected_producer_fingerprint: String,
+    },
+}
+
+impl SpaceIdentityAdmission {
+    /// Stable `snake_case` code for logs and machine payloads.
+    #[must_use]
+    pub const fn code(&self) -> &'static str {
+        match self {
+            Self::SameProducer => "same_producer",
+            Self::ConformanceCompatibleProducer { .. } => "conformance_compatible_producer",
+        }
     }
 }
 
@@ -688,6 +868,235 @@ mod tests {
             .verify_space(&expected, "fast")
             .expect("same space must verify");
         assert_eq!(bound.vector().len(), 8);
+    }
+
+    // ─── bd-9xuj T2-C1 (rebuild): bind-time validation + corrected admission law ───
+
+    #[test]
+    fn bind_time_validation_rejects_incoherent_identity_bundle() -> Result<(), String> {
+        // The bundle must prove itself before it can prove anything to a
+        // consumer: this producer's space_fingerprint no longer binds the
+        // bundled space, so binding must surface the bundle's own typed
+        // validation error instead of accepting the incoherent claim.
+        let mut broken = identity("bind-validate-model", 8);
+        broken.producer.space_fingerprint = broken.producer.golden_vectors.corpus_sha256.clone();
+        let error = BoundQueryEmbedding::new(vec![0.5; 8], broken)
+            .expect_err("an incoherent identity bundle must not bind");
+        let rendered = format!("{error:?}");
+        let SearchError::InvalidConfig { field, .. } = error else {
+            return Err(format!("expected InvalidConfig, got {rendered}"));
+        };
+        assert_eq!(field, "embedding_identity.producer.space_fingerprint");
+        Ok(())
+    }
+
+    /// Pins the T2-C1 impedance mismatch (readiness map §0.1) under the
+    /// corrected admission law: same space, same producer, different
+    /// storage. The full-bundle fingerprints can never match across an
+    /// index seam, the space fingerprint joins, and admission is granted as
+    /// typed [`SpaceIdentityAdmission::SameProducer`] — not because "same
+    /// space is sufficient".
+    #[test]
+    fn same_producer_admits_across_storage_formats() {
+        // Query side: explicit test identity, in-memory f32 storage.
+        let query_side = identity("shared-model", 8);
+        // Index side: the SAME space and producer, persisted as fsvi-v2.
+        let mut index_side = identity("shared-model", 8);
+        index_side.storage.format = "fsvi-v2".to_owned();
+        index_side.storage.endianness = "little-endian".to_owned();
+        index_side
+            .validate()
+            .expect("index-side bundle must be a legitimate, validating bundle");
+
+        assert_eq!(
+            query_side.space.fingerprint(),
+            index_side.space.fingerprint(),
+            "same model + dimension is the same mathematical space"
+        );
+        assert_ne!(
+            query_side.fingerprint(),
+            index_side.fingerprint(),
+            "storage difference must alter the full-bundle fingerprint"
+        );
+
+        let bound = BoundQueryEmbedding::new(vec![0.5; 8], query_side).expect("bind");
+        assert_eq!(
+            bound.space_fingerprint(),
+            bound.identity().space.fingerprint(),
+            "bind-time space fingerprint must match the bundled space"
+        );
+
+        // Full-bundle verify: fails closed on this legitimate pairing (§0.1)...
+        bound
+            .verify_space(&index_side.fingerprint(), "quality")
+            .expect_err("full-bundle fingerprints never match across storage formats");
+        // ...the space fingerprint joins at the seam...
+        bound
+            .verify_space_identity(&index_side.space.fingerprint(), "quality")
+            .expect("same space must join space-scoped across storage formats");
+        // ...and the admission law grants the pairing as the SAME producer.
+        let admission = bound
+            .verify_producer_conformance(&index_side, "quality")
+            .expect("same producer must be admitted");
+        assert_eq!(admission, SpaceIdentityAdmission::SameProducer);
+        assert_eq!(admission.code(), "same_producer");
+    }
+
+    #[test]
+    fn same_dimension_wrong_space_is_rejected_by_space_fingerprint() -> Result<(), String> {
+        // The defining bd-9xuj case through the seam verifier: identical
+        // dimensions, different models. Dimension checks cannot tell these
+        // apart; the space fingerprint must.
+        let bound =
+            BoundQueryEmbedding::new(vec![0.5; 8], identity("fast-model", 8)).expect("bind fast");
+        let quality_space = identity("quality-model", 8);
+        let error = bound
+            .verify_space_identity(&quality_space.space.fingerprint(), "quality")
+            .expect_err("fast vector must not enter the quality space");
+        let rendered = format!("{error:?}");
+        let SearchError::InvalidConfig {
+            field,
+            value,
+            reason,
+        } = error
+        else {
+            return Err(format!("expected InvalidConfig, got {rendered}"));
+        };
+        assert_eq!(field, "query_embedding.quality.space_identity");
+        assert_eq!(value, bound.space_fingerprint());
+        assert!(reason.contains("different embedding space"));
+        assert!(reason.contains(&quality_space.space.fingerprint()));
+
+        // The bundle-level admission law rejects the same pairing at the
+        // space join, before producer conformance is even considered.
+        let error = bound
+            .verify_producer_conformance(&quality_space, "quality")
+            .expect_err("wrong space must reject at the bundle level too");
+        let rendered = format!("{error:?}");
+        let SearchError::InvalidConfig { field, .. } = error else {
+            return Err(format!("expected InvalidConfig, got {rendered}"));
+        };
+        assert_eq!(field, "query_embedding.quality.space_identity");
+        Ok(())
+    }
+
+    /// The corrected admission law (bd-9xuj map, post-review supersession
+    /// notice): a foreign producer in the same space is admitted ONLY when
+    /// [`EmbeddingIdentityBundleV1::is_conformance_compatible_with`]
+    /// verifies the pinned golden-vector certificate, with typed
+    /// [`SpaceIdentityAdmission::ConformanceCompatibleProducer`] telemetry;
+    /// otherwise it is rejected. Matching space fingerprints alone never
+    /// admit a pairing.
+    #[test]
+    fn foreign_producer_admission_requires_conformance_certificate() -> Result<(), String> {
+        let base = identity("conformance-model", 8);
+        let bound = BoundQueryEmbedding::new(vec![0.5; 8], base.clone()).expect("bind");
+
+        // Same space, different producer, SAME golden-vector certificate:
+        // certified conformance-compatible → admitted, telemetry-typed.
+        let mut certified = base.clone();
+        certified.producer.backend = "alternate-conformant-backend".to_owned();
+        certified
+            .validate()
+            .expect("certified sibling must validate");
+        assert_ne!(
+            certified.producer.fingerprint(),
+            base.producer.fingerprint(),
+            "a different backend attestation must alter the producer fingerprint"
+        );
+        let admission = bound
+            .verify_producer_conformance(&certified, "fast")
+            .expect("certified foreign producer must be admitted");
+        assert_eq!(admission.code(), "conformance_compatible_producer");
+        let rendered = format!("{admission:?}");
+        let SpaceIdentityAdmission::ConformanceCompatibleProducer {
+            query_producer_fingerprint,
+            expected_producer_fingerprint,
+        } = admission
+        else {
+            return Err(format!(
+                "expected ConformanceCompatibleProducer, got {rendered}"
+            ));
+        };
+        assert_eq!(query_producer_fingerprint, base.producer.fingerprint());
+        assert_eq!(
+            expected_producer_fingerprint,
+            certified.producer.fingerprint()
+        );
+
+        // Same space, different producer, DIFFERENT golden-vector
+        // certificate: same-space is not sufficient — typed rejection.
+        let mut uncertified = base.clone();
+        uncertified.producer.backend = "alternate-uncertified-backend".to_owned();
+        uncertified.producer.golden_vectors.vectors_sha256 = base.space.fingerprint();
+        uncertified
+            .validate()
+            .expect("uncertified sibling must still be a coherent bundle");
+        let error = bound
+            .verify_producer_conformance(&uncertified, "fast")
+            .expect_err("uncertified foreign producer must be rejected");
+        let rendered = format!("{error:?}");
+        let SearchError::InvalidConfig {
+            field,
+            value,
+            reason,
+        } = error
+        else {
+            return Err(format!("expected InvalidConfig, got {rendered}"));
+        };
+        assert_eq!(field, "query_embedding.fast.producer_conformance");
+        assert_eq!(value, base.producer.fingerprint());
+        assert!(reason.contains("golden-vector certificate"));
+        Ok(())
+    }
+
+    #[test]
+    fn distinct_models_at_equal_dimension_always_reject_space_scoped() {
+        // Readiness-map §3.3(10) property at C1 scope: explicit_test_model(a, d)
+        // vs (b, d) with a != b must always reject, for every tier label —
+        // at the space join and under the full admission law alike.
+        let dims = [8_u32, 384];
+        let models = ["model-a", "model-b", "model-c"];
+        for dim in dims {
+            for (i, a) in models.iter().enumerate() {
+                for b in &models[i + 1..] {
+                    let bound =
+                        BoundQueryEmbedding::new(vec![0.25; dim as usize], identity(a, dim))
+                            .expect("bind");
+                    let other = identity(b, dim);
+                    for tier in ["fast", "quality"] {
+                        bound
+                            .verify_space_identity(&other.space.fingerprint(), tier)
+                            .expect_err("distinct models must never share a space");
+                        bound
+                            .verify_producer_conformance(&other, tier)
+                            .expect_err("distinct models must never be admitted");
+                    }
+                    // Reflexive: a model always verifies against its own space.
+                    bound
+                        .verify_space_identity(&identity(a, dim).space.fingerprint(), "fast")
+                        .expect("own space must verify");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn space_identity_admission_codes_and_serde_are_stable() {
+        let same = SpaceIdentityAdmission::SameProducer;
+        assert_eq!(same.code(), "same_producer");
+        let json = serde_json::to_string(&same).expect("serialize");
+        assert!(json.contains("\"admission\":\"same_producer\""));
+
+        let compat = SpaceIdentityAdmission::ConformanceCompatibleProducer {
+            query_producer_fingerprint: "a".repeat(64),
+            expected_producer_fingerprint: "b".repeat(64),
+        };
+        assert_eq!(compat.code(), "conformance_compatible_producer");
+        let json = serde_json::to_string(&compat).expect("serialize");
+        assert!(json.contains("\"admission\":\"conformance_compatible_producer\""));
+        let back: SpaceIdentityAdmission = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(back, compat);
     }
 
     #[test]
