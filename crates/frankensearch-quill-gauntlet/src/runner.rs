@@ -8880,12 +8880,8 @@ mod tests {
         #[cfg(not(target_os = "linux"))]
         let path =
             std::env::current_exe().expect("resolve current UNION_HORIZON test executable path");
-        let mut file = std::fs::File::open(&path).unwrap_or_else(|error| {
-            panic!(
-                "open current UNION_HORIZON test executable {}: {error}",
-                path.display(),
-            )
-        });
+        let mut file = std::fs::File::open(&path)
+            .unwrap_or_else(|error| panic!("open current UNION_HORIZON test executable: {error}"));
         let metadata = file
             .metadata()
             .expect("stat current UNION_HORIZON test executable");
@@ -9828,8 +9824,7 @@ mod tests {
             .publish_unique_no_clobber(&temporary_name, &target_name, &bytes)
             .unwrap_or_else(|error| {
                 panic!(
-                    "atomically publish UNION_HORIZON artifact without replacing {}: {error}",
-                    target.display(),
+                    "atomically publish UNION_HORIZON diagnostic {filename} without replacement: {error}",
                 )
             });
         let published_bytes = directory
