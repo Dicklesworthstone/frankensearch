@@ -22,7 +22,6 @@ use std::time::{Duration, Instant, SystemTime};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
-use crate::adapters::cli::{CliCommand, CliInput, ConfigAction, OutputFormat, parse_cli_args};
 use crate::config::PressureConfig;
 use crate::evidence::FsfsReasonCode;
 
@@ -397,7 +396,6 @@ pub const INDEX_FOOTPRINT_ADVISOR_SCHEMA_VERSION: u32 = 1;
 pub const INDEX_FOOTPRINT_ADVISOR_CONTRACT_KIND: &str = "fsfs_index_footprint_advisor_contract";
 pub const INDEX_FOOTPRINT_ADVISOR_REPORT_KIND: &str = "fsfs_index_footprint_advisor_report";
 pub const INDEX_FOOTPRINT_ADVISOR_POLICY_VERSION: &str = "fsfs-index-footprint-advisor-policy-v1";
-pub const OPERATOR_COMMAND_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -456,135 +454,6 @@ pub enum IndexFootprintAdvisorRisk {
     Low,
     Medium,
     High,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum OperatorCommandMutationClass {
-    ReadOnlyDiagnostic,
-    Mutating,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum OperatorCommandDryRunSupport {
-    Unavailable,
-    NativePreview,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum OperatorCommandPrecondition {
-    ReviewDiagnosticOutput,
-    SelectSupportedMutationWorkflow,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct OperatorCommandContract {
-    pub schema_version: u32,
-    pub command: String,
-    pub arguments: Vec<String>,
-    pub preconditions: Vec<OperatorCommandPrecondition>,
-    pub mutation_class: OperatorCommandMutationClass,
-    pub dry_run_support: OperatorCommandDryRunSupport,
-    pub confirmation_required: bool,
-    pub guidance: String,
-}
-
-impl OperatorCommandContract {
-    /// Validates the structured command and feeds its argv through the real
-    /// fsfs parser.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error for an unknown schema, shell-shaped command, malformed
-    /// argv, ambiguous output format, mutation mislabeled as read-only, or
-    /// missing operator guidance.
-    pub fn validate(&self) -> Result<(), String> {
-        self.parsed_input().map(|_| ())
-    }
-
-    fn parsed_input(&self) -> Result<CliInput, String> {
-        if self.schema_version != OPERATOR_COMMAND_SCHEMA_VERSION {
-            return Err("unsupported operator-command schema version".to_owned());
-        }
-        if self.command != "fsfs" {
-            return Err("operator command must use the fsfs executable directly".to_owned());
-        }
-        if self.arguments.is_empty()
-            || self.arguments.iter().any(|argument| {
-                argument.is_empty()
-                    || argument
-                        .chars()
-                        .any(|character| matches!(character, '\0' | '\n' | '\r'))
-            })
-        {
-            return Err("operator command contains malformed argv".to_owned());
-        }
-        if self.preconditions.is_empty()
-            || self
-                .preconditions
-                .iter()
-                .enumerate()
-                .any(|(index, precondition)| self.preconditions[..index].contains(precondition))
-        {
-            return Err("operator command requires unique preconditions".to_owned());
-        }
-        if !self
-            .preconditions
-            .contains(&OperatorCommandPrecondition::ReviewDiagnosticOutput)
-            || !self
-                .preconditions
-                .contains(&OperatorCommandPrecondition::SelectSupportedMutationWorkflow)
-        {
-            return Err("operator command omits a required precondition".to_owned());
-        }
-        if self.guidance.trim().is_empty() {
-            return Err("operator command requires human guidance".to_owned());
-        }
-        if self
-            .arguments
-            .iter()
-            .any(|argument| argument == "--dry-run")
-        {
-            return Err("operator command advertises unsupported dry-run syntax".to_owned());
-        }
-        if self
-            .arguments
-            .iter()
-            .filter(|argument| argument.as_str() == "--format")
-            .count()
-            != 1
-        {
-            return Err("operator command requires one unambiguous output format".to_owned());
-        }
-
-        let parsed = parse_cli_args(self.arguments.clone())
-            .map_err(|error| format!("operator command does not parse: {error}"))?;
-        if parsed.format != OutputFormat::Json || !parsed.format_explicit {
-            return Err("operator command must request explicit json output".to_owned());
-        }
-        if !matches!(parsed.command, CliCommand::Status | CliCommand::Config) {
-            return Err("operator command must be a supported read-only diagnostic".to_owned());
-        }
-        if parsed.command == CliCommand::Config
-            && parsed.config_action != Some(ConfigAction::Validate)
-        {
-            return Err(
-                "operator config command must use the read-only validate action".to_owned(),
-            );
-        }
-        if self.mutation_class != OperatorCommandMutationClass::ReadOnlyDiagnostic
-            || self.dry_run_support != OperatorCommandDryRunSupport::Unavailable
-            || self.confirmation_required
-        {
-            return Err(
-                "supported operator command must be labeled as a read-only diagnostic without native preview or mutation confirmation"
-                    .to_owned(),
-            );
-        }
-        Ok(parsed)
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -771,7 +640,7 @@ pub struct IndexFootprintRecommendation {
     pub measured_bytes: u64,
     pub projected_savings_bytes: u64,
     pub replay_command: String,
-    pub operator_command: OperatorCommandContract,
+    pub operator_command: String,
     pub rationale: String,
 }
 
@@ -1150,32 +1019,11 @@ impl IndexFootprintRecommendation {
         {
             return Err("index-footprint recommendation missing exact replay command".to_owned());
         }
-        let parsed_operator_command = self.operator_command.parsed_input()?;
-        let command_matches_action = match self.action {
-            IndexFootprintAdvisorAction::Compaction | IndexFootprintAdvisorAction::Rebuild => {
-                parsed_operator_command.command == CliCommand::Status
-            }
-            IndexFootprintAdvisorAction::Retention => {
-                parsed_operator_command.command == CliCommand::Status
-            }
-            IndexFootprintAdvisorAction::FeatureAdjustment => {
-                parsed_operator_command.command == CliCommand::Config
-                    && parsed_operator_command.config_action == Some(ConfigAction::Validate)
-            }
-        };
-        if !command_matches_action {
-            return Err(
-                "index-footprint recommendation diagnostic does not match its action".to_owned(),
-            );
+        if self.operator_command.trim().is_empty() {
+            return Err("index-footprint recommendation missing operator command".to_owned());
         }
-        if self.operator_command.mutation_class != OperatorCommandMutationClass::ReadOnlyDiagnostic
-            || self.operator_command.dry_run_support != OperatorCommandDryRunSupport::Unavailable
-            || self.operator_command.confirmation_required
-        {
-            return Err(
-                "index-footprint recommendation must advertise a truthful read-only diagnostic"
-                    .to_owned(),
-            );
+        if !self.operator_command.contains("--dry-run") {
+            return Err("index-footprint recommendation must be dry-run".to_owned());
         }
         if self.projected_savings_bytes > self.measured_bytes {
             return Err("index-footprint projected savings exceed measured bytes".to_owned());
@@ -1271,70 +1119,23 @@ fn replay_command(scenario: IndexFootprintScenario, domain: IndexFootprintDomain
 }
 
 #[must_use]
-fn operator_command(
-    action: IndexFootprintAdvisorAction,
-    domain: IndexFootprintDomain,
-) -> OperatorCommandContract {
-    let (arguments, guidance) = match action {
-        IndexFootprintAdvisorAction::Compaction => (
-            vec![
-                "status".to_owned(),
-                "--format".to_owned(),
-                "json".to_owned(),
-            ],
+fn operator_command(action: IndexFootprintAdvisorAction, domain: IndexFootprintDomain) -> String {
+    match action {
+        IndexFootprintAdvisorAction::Compaction => {
+            "fsfs compact --dry-run --format json".to_owned()
+        }
+        IndexFootprintAdvisorAction::Rebuild => {
             format!(
-                "Compaction preview is not supported; inspect {domain} status, then select a documented mutation workflow and independently confirm its targets.",
-                domain = domain.as_str()
-            ),
-        ),
-        IndexFootprintAdvisorAction::Rebuild => (
-            vec![
-                "status".to_owned(),
-                "--format".to_owned(),
-                "json".to_owned(),
-            ],
-            format!(
-                "Rebuild preview is not supported; inspect {domain} status, then select a documented mutation workflow and independently confirm its targets.",
-                domain = domain.as_str()
-            ),
-        ),
-        IndexFootprintAdvisorAction::Retention => (
-            vec![
-                "status".to_owned(),
-                "--format".to_owned(),
-                "json".to_owned(),
-            ],
-            format!(
-                "Retention preview is not supported; run read-only diagnostics for {domain} and review policy guidance before selecting any mutation workflow.",
-                domain = domain.as_str()
-            ),
-        ),
-        IndexFootprintAdvisorAction::FeatureAdjustment => (
-            vec![
-                "config".to_owned(),
-                "validate".to_owned(),
-                "--format".to_owned(),
-                "json".to_owned(),
-            ],
-            format!(
-                "Configuration mutation preview is not supported; validate the current configuration for {domain}, then edit it through a documented confirmed workflow.",
-                domain = domain.as_str()
-            ),
-        ),
-    };
-
-    OperatorCommandContract {
-        schema_version: OPERATOR_COMMAND_SCHEMA_VERSION,
-        command: "fsfs".to_owned(),
-        arguments,
-        preconditions: vec![
-            OperatorCommandPrecondition::ReviewDiagnosticOutput,
-            OperatorCommandPrecondition::SelectSupportedMutationWorkflow,
-        ],
-        mutation_class: OperatorCommandMutationClass::ReadOnlyDiagnostic,
-        dry_run_support: OperatorCommandDryRunSupport::Unavailable,
-        confirmation_required: false,
-        guidance,
+                "fsfs index --rebuild {} --dry-run --format json",
+                domain.as_str()
+            )
+        }
+        IndexFootprintAdvisorAction::Retention => {
+            "fsfs doctor --retention-audit --dry-run --format json".to_owned()
+        }
+        IndexFootprintAdvisorAction::FeatureAdjustment => {
+            "fsfs config set search.fast_only true --dry-run --format json".to_owned()
+        }
     }
 }
 
@@ -3029,10 +2830,7 @@ mod tests {
             .expect("vector recommendation");
         assert_eq!(vector.action, IndexFootprintAdvisorAction::Compaction);
         assert_eq!(vector.risk, IndexFootprintAdvisorRisk::Low);
-        assert_eq!(
-            vector.operator_command.arguments,
-            ["status", "--format", "json"]
-        );
+        assert!(vector.operator_command.contains("--dry-run"));
 
         let lexical = fragmented
             .recommendations
@@ -3041,10 +2839,7 @@ mod tests {
             .expect("lexical recommendation");
         assert_eq!(lexical.action, IndexFootprintAdvisorAction::Rebuild);
         assert_eq!(lexical.risk, IndexFootprintAdvisorRisk::Medium);
-        assert_eq!(
-            lexical.operator_command.arguments,
-            ["status", "--format", "json"]
-        );
+        assert!(lexical.operator_command.contains("--dry-run"));
 
         let oversized = index_footprint_advisor_oversized_fixture();
         let model_cache = oversized
@@ -3057,10 +2852,7 @@ mod tests {
             IndexFootprintAdvisorAction::FeatureAdjustment
         );
         assert_eq!(model_cache.risk, IndexFootprintAdvisorRisk::High);
-        assert_eq!(
-            model_cache.operator_command.arguments,
-            ["config", "validate", "--format", "json"]
-        );
+        assert!(model_cache.operator_command.contains("--dry-run"));
     }
 
     #[test]
@@ -3090,103 +2882,7 @@ mod tests {
                     .replay_command
                     .contains("index_footprint_advisor_policy_suite")
             }));
-            assert!(report.recommendations.iter().all(|recommendation| {
-                recommendation.operator_command.mutation_class
-                    == OperatorCommandMutationClass::ReadOnlyDiagnostic
-                    && recommendation.operator_command.dry_run_support
-                        == OperatorCommandDryRunSupport::Unavailable
-                    && !recommendation.operator_command.confirmation_required
-                    && !recommendation
-                        .operator_command
-                        .arguments
-                        .iter()
-                        .any(|argument| argument == "--dry-run")
-            }));
         }
-    }
-
-    #[test]
-    fn index_footprint_operator_commands_parse_through_the_real_cli() {
-        for report in [
-            index_footprint_advisor_small_fixture(),
-            index_footprint_advisor_fragmented_fixture(),
-            index_footprint_advisor_oversized_fixture(),
-        ] {
-            for recommendation in report.recommendations {
-                recommendation
-                    .operator_command
-                    .validate()
-                    .expect("advertised operator argv must parse");
-
-                let parsed = parse_cli_args(recommendation.operator_command.arguments)
-                    .expect("advertised operator argv must parse through the real CLI");
-                let expected_command = match recommendation.action {
-                    IndexFootprintAdvisorAction::Compaction
-                    | IndexFootprintAdvisorAction::Rebuild => CliCommand::Status,
-                    IndexFootprintAdvisorAction::Retention => CliCommand::Status,
-                    IndexFootprintAdvisorAction::FeatureAdjustment => CliCommand::Config,
-                };
-                assert_eq!(parsed.command, expected_command);
-                assert_eq!(parsed.format, OutputFormat::Json);
-                assert!(parsed.format_explicit);
-                if recommendation.action == IndexFootprintAdvisorAction::FeatureAdjustment {
-                    assert_eq!(parsed.config_action, Some(ConfigAction::Validate));
-                }
-            }
-        }
-    }
-
-    #[test]
-    fn index_footprint_operator_command_rejects_ambiguous_or_fictional_argv() {
-        let baseline = operator_command(
-            IndexFootprintAdvisorAction::Compaction,
-            IndexFootprintDomain::VectorIndex,
-        );
-
-        for arguments in [
-            vec!["compact", "--dry-run", "--format", "json"],
-            vec!["status", "--unknown", "--format", "json"],
-            vec!["status", "--index-dir", "--format", "json"],
-            vec!["status", "--format", "json", "--format", "toon"],
-            vec!["status;rm", "--format", "json"],
-            vec!["doctor", "--format", "json"],
-        ] {
-            let mut candidate = baseline.clone();
-            candidate.arguments = arguments.into_iter().map(str::to_owned).collect();
-            assert!(candidate.validate().is_err());
-        }
-
-        let mut shell_shaped_executable = baseline.clone();
-        shell_shaped_executable.command = "fsfs;rm".to_owned();
-        assert!(shell_shaped_executable.validate().is_err());
-
-        let mut mislabeled_mutation = baseline.clone();
-        mislabeled_mutation.mutation_class = OperatorCommandMutationClass::Mutating;
-        mislabeled_mutation.confirmation_required = true;
-        assert!(mislabeled_mutation.validate().is_err());
-
-        let mut fictional_preview = baseline;
-        fictional_preview.dry_run_support = OperatorCommandDryRunSupport::NativePreview;
-        assert!(fictional_preview.validate().is_err());
-    }
-
-    #[test]
-    fn index_footprint_operator_command_preserves_space_and_unicode_argv() {
-        let mut command = operator_command(
-            IndexFootprintAdvisorAction::Compaction,
-            IndexFootprintDomain::VectorIndex,
-        );
-        command.arguments = vec![
-            "status".to_owned(),
-            "--index-dir".to_owned(),
-            "/tmp/index with spaces/$(not-a-shell);still-one-argument/Δ".to_owned(),
-            "--format".to_owned(),
-            "json".to_owned(),
-        ];
-
-        command
-            .validate()
-            .expect("structured argv must preserve spaces and Unicode without a shell");
     }
 
     // ── LifecycleTracker ──

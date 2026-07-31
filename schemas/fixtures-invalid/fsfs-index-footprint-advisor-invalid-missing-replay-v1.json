@@ -55,23 +55,7 @@
       "measured_bytes": 1,
       "projected_savings_bytes": 0,
       "replay_command": "",
-      "operator_command": {
-        "schema_version": 1,
-        "command": "fsfs",
-        "arguments": [
-          "status",
-          "--format",
-          "json"
-        ],
-        "preconditions": [
-          "review_diagnostic_output",
-          "select_supported_mutation_workflow"
-        ],
-        "mutation_class": "read_only_diagnostic",
-        "dry_run_support": "unavailable",
-        "confirmation_required": false,
-        "guidance": "Retention preview is not supported; run read-only diagnostics for vector_index and review policy guidance before selecting any mutation workflow."
-      },
+      "operator_command": "fsfs doctor --retention-audit --dry-run --format json",
       "rationale": "small: retain current files and only audit policy for vector_index"
     }
   ],

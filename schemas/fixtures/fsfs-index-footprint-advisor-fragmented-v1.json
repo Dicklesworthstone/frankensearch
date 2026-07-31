@@ -55,23 +55,7 @@
       "measured_bytes": 440401920,
       "projected_savings_bytes": 100663296,
       "replay_command": "FSFS_INDEX_FOOTPRINT_FIXTURE=fragmented FSFS_INDEX_FOOTPRINT_DOMAIN=vector_index cargo test -p frankensearch-fsfs index_footprint_advisor_policy_suite -- --nocapture",
-      "operator_command": {
-        "schema_version": 1,
-        "command": "fsfs",
-        "arguments": [
-          "status",
-          "--format",
-          "json"
-        ],
-        "preconditions": [
-          "review_diagnostic_output",
-          "select_supported_mutation_workflow"
-        ],
-        "mutation_class": "read_only_diagnostic",
-        "dry_run_support": "unavailable",
-        "confirmation_required": false,
-        "guidance": "Compaction preview is not supported; inspect vector_index status, then select a documented mutation workflow and independently confirm its targets."
-      },
+      "operator_command": "fsfs compact --dry-run --format json",
       "rationale": "fragmented: compact reclaimable fragments for vector_index"
     },
     {
@@ -82,23 +66,7 @@
       "measured_bytes": 293601280,
       "projected_savings_bytes": 75497472,
       "replay_command": "FSFS_INDEX_FOOTPRINT_FIXTURE=fragmented FSFS_INDEX_FOOTPRINT_DOMAIN=lexical_index cargo test -p frankensearch-fsfs index_footprint_advisor_policy_suite -- --nocapture",
-      "operator_command": {
-        "schema_version": 1,
-        "command": "fsfs",
-        "arguments": [
-          "status",
-          "--format",
-          "json"
-        ],
-        "preconditions": [
-          "review_diagnostic_output",
-          "select_supported_mutation_workflow"
-        ],
-        "mutation_class": "read_only_diagnostic",
-        "dry_run_support": "unavailable",
-        "confirmation_required": false,
-        "guidance": "Rebuild preview is not supported; inspect lexical_index status, then select a documented mutation workflow and independently confirm its targets."
-      },
+      "operator_command": "fsfs index --rebuild lexical_index --dry-run --format json",
       "rationale": "fragmented: rebuild the domain to remove stale segments for lexical_index"
     },
     {
@@ -109,23 +77,7 @@
       "measured_bytes": 83886080,
       "projected_savings_bytes": 16777216,
       "replay_command": "FSFS_INDEX_FOOTPRINT_FIXTURE=fragmented FSFS_INDEX_FOOTPRINT_DOMAIN=metadata cargo test -p frankensearch-fsfs index_footprint_advisor_policy_suite -- --nocapture",
-      "operator_command": {
-        "schema_version": 1,
-        "command": "fsfs",
-        "arguments": [
-          "status",
-          "--format",
-          "json"
-        ],
-        "preconditions": [
-          "review_diagnostic_output",
-          "select_supported_mutation_workflow"
-        ],
-        "mutation_class": "read_only_diagnostic",
-        "dry_run_support": "unavailable",
-        "confirmation_required": false,
-        "guidance": "Rebuild preview is not supported; inspect metadata status, then select a documented mutation workflow and independently confirm its targets."
-      },
+      "operator_command": "fsfs index --rebuild metadata --dry-run --format json",
       "rationale": "fragmented: rebuild the domain to remove stale segments for metadata"
     },
     {
@@ -136,23 +88,7 @@
       "measured_bytes": 230686720,
       "projected_savings_bytes": 0,
       "replay_command": "FSFS_INDEX_FOOTPRINT_FIXTURE=fragmented FSFS_INDEX_FOOTPRINT_DOMAIN=model_cache cargo test -p frankensearch-fsfs index_footprint_advisor_policy_suite -- --nocapture",
-      "operator_command": {
-        "schema_version": 1,
-        "command": "fsfs",
-        "arguments": [
-          "status",
-          "--format",
-          "json"
-        ],
-        "preconditions": [
-          "review_diagnostic_output",
-          "select_supported_mutation_workflow"
-        ],
-        "mutation_class": "read_only_diagnostic",
-        "dry_run_support": "unavailable",
-        "confirmation_required": false,
-        "guidance": "Retention preview is not supported; run read-only diagnostics for model_cache and review policy guidance before selecting any mutation workflow."
-      },
+      "operator_command": "fsfs doctor --retention-audit --dry-run --format json",
       "rationale": "fragmented: retain current files and only audit policy for model_cache"
     },
     {
@@ -163,23 +99,7 @@
       "measured_bytes": 146800640,
       "projected_savings_bytes": 50331648,
       "replay_command": "FSFS_INDEX_FOOTPRINT_FIXTURE=fragmented FSFS_INDEX_FOOTPRINT_DOMAIN=artifact cargo test -p frankensearch-fsfs index_footprint_advisor_policy_suite -- --nocapture",
-      "operator_command": {
-        "schema_version": 1,
-        "command": "fsfs",
-        "arguments": [
-          "status",
-          "--format",
-          "json"
-        ],
-        "preconditions": [
-          "review_diagnostic_output",
-          "select_supported_mutation_workflow"
-        ],
-        "mutation_class": "read_only_diagnostic",
-        "dry_run_support": "unavailable",
-        "confirmation_required": false,
-        "guidance": "Compaction preview is not supported; inspect artifact status, then select a documented mutation workflow and independently confirm its targets."
-      },
+      "operator_command": "fsfs compact --dry-run --format json",
       "rationale": "fragmented: compact reclaimable fragments for artifact"
     }
   ],
