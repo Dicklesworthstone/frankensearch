@@ -26,8 +26,7 @@ use tracing::instrument;
 
 use frankensearch_core::config::TwoTierConfig;
 use frankensearch_core::error::{SearchError, SearchResult};
-#[cfg(all(feature = "lexical", not(feature = "quill")))]
-use frankensearch_core::traits::LexicalSearch;
+use frankensearch_core::traits::LexicalRead;
 use frankensearch_core::traits::{Embedder, MetricsExporter};
 use frankensearch_core::types::{EmbeddingMetrics, IndexMetrics, IndexableDocument};
 #[cfg(all(feature = "durability", feature = "quill"))]
@@ -42,21 +41,80 @@ use frankensearch_index::{
 #[cfg(all(feature = "lexical", not(feature = "quill")))]
 use frankensearch_lexical::TantivyIndex;
 #[cfg(feature = "quill")]
-use frankensearch_quill::{QuillConfig, QuillIndex};
+use frankensearch_quill::{
+    BlueGreenEngine, LexicalLayout, QuillConfig, QuillIndex, inspect_lexical_layout,
+};
+
+/// Per-arm byte accounting for a completed build (bd-8nqz.3).
+///
+/// Vector-only size reporting hid the lexical arm entirely; every arm that
+/// wrote bytes must appear here so no aggregate can mask a missing arm.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct IndexSizeBreakdown {
+    /// Sum of all arms below.
+    pub total: u64,
+    /// Fast-tier FSVI bytes (dedicated or fallback filename).
+    pub vector_fast: u64,
+    /// Quality-tier FSVI bytes (0 when no quality index was built).
+    pub vector_quality: u64,
+    /// Recursive size of the lexical index directory (0 when absent).
+    pub lexical: u64,
+}
+
+/// Receipt for the lexical indexing arm of a build (bd-8nqz.3).
+///
+/// Lexical admission is independent of embedding outcome: every valid source
+/// document is attempted here even when its embeddings failed, so the
+/// documents most in need of lexical fallback remain lexically searchable.
+#[derive(Debug, Clone)]
+pub struct LexicalArmReceipt {
+    /// Active backend: `"quill"` or `"tantivy"`.
+    pub backend: &'static str,
+    /// Directory the lexical index was written to.
+    pub path: PathBuf,
+    /// Documents attempted (all valid source documents).
+    pub attempted: usize,
+    /// Documents successfully indexed.
+    pub indexed: usize,
+    /// Per-document lexical errors (`doc_id`, error message).
+    pub errors: Vec<(String, String)>,
+    /// Published manifest generation. Currently `None`: the keeper snapshot
+    /// does not expose its generation publicly yet; the root-bound reader
+    /// work (bd-8nqz.2) adds that accessor and fills this in.
+    pub generation: Option<u64>,
+    /// Whether the lexical index was published (bulk seal / commit reached).
+    pub published: bool,
+}
 
 /// Statistics from a completed index build.
 #[derive(Debug, Clone)]
 pub struct IndexBuildStats {
-    /// Number of documents successfully indexed.
+    /// Total valid source documents submitted to the build.
+    pub source_count: usize,
+    /// Number of documents successfully indexed into the fast vector tier.
     pub doc_count: usize,
-    /// Number of documents that failed to embed (skipped).
+    /// Number of documents whose fast embedding failed (absent from the
+    /// vector tiers; still admitted to the lexical arm when enabled).
     pub error_count: usize,
-    /// Per-document errors (`doc_id`, error message).
+    /// Per-document fast-embedding errors (`doc_id`, error message).
     pub errors: Vec<(String, String)>,
+    /// Documents successfully indexed into the quality vector tier.
+    /// Zero when no quality embedder is configured.
+    pub quality_indexed: usize,
+    /// Per-document quality-embedding errors (`doc_id`, error message).
+    /// These documents remain in the fast tier (fast-only degradation).
+    pub quality_errors: Vec<(String, String)>,
+    /// Receipt for the lexical arm. `None` when lexical indexing is compiled
+    /// out or no document reached lexical staging.
+    pub lexical: Option<LexicalArmReceipt>,
+    /// Per-arm byte accounting (replaces vector-only size reporting).
+    pub size_bytes: IndexSizeBreakdown,
     /// Total build time in milliseconds.
     pub total_ms: f64,
     /// Time spent on embedding in milliseconds.
     pub embed_ms: f64,
+    /// Time spent building the lexical arm in milliseconds (0 when skipped).
+    pub lexical_ms: f64,
     /// Whether a quality-tier index was built.
     pub has_quality_index: bool,
     /// Embedder availability this generation was actually built with.
@@ -269,11 +327,11 @@ impl IndexBuilder {
         let total = self.documents.len();
         let mut errors = Vec::new();
         let mut doc_count = 0usize;
+        let mut quality_indexed = 0usize;
+        let mut quality_errors: Vec<(String, String)> = Vec::new();
         let mut embed_ms = 0.0f64;
         #[cfg(any(feature = "lexical", feature = "quill"))]
         let mut lexical_docs = Vec::with_capacity(total);
-        #[cfg(any(feature = "lexical", feature = "quill"))]
-        let mut failed_documents = Vec::new();
 
         // Keep the old borrowed loop available only for the same-binary benchmark arm. This is the
         // exact former residency behavior: all originals stay in `self.documents` while successful
@@ -296,7 +354,10 @@ impl IndexBuilder {
                     )
                     .await
                     {
-                        Ok(()) => {
+                        // Benchmark arm: pins the exact former residency AND
+                        // former admission behavior (embed-gated lexical
+                        // staging); quality receipts are not collected here.
+                        Ok(_) => {
                             doc_count += 1;
                             lexical_docs.push(doc.clone());
                         }
@@ -333,14 +394,23 @@ impl IndexBuilder {
                     )
                     .await
                     {
-                        Ok(()) => {
+                        Ok(quality_error) => {
                             doc_count += 1;
+                            if let Some(message) = quality_error {
+                                quality_errors.push((doc.id.clone(), message));
+                            } else if quality_embedder.is_some() {
+                                quality_indexed += 1;
+                            }
                             lexical_docs.push(doc);
                         }
                         Err(err) => {
                             tracing::warn!(doc_id = %doc.id, error = %err, "failed to embed document");
                             errors.push((doc.id.clone(), err.to_string()));
-                            failed_documents.push(doc);
+                            // bd-8nqz.3: lexical admission is independent of
+                            // embedding outcome — the documents most in need
+                            // of lexical fallback must stay lexically
+                            // searchable.
+                            lexical_docs.push(doc);
                         }
                     }
                 }
@@ -377,14 +447,23 @@ impl IndexBuilder {
                     )
                     .await
                     {
-                        Ok(()) => {
+                        Ok(quality_error) => {
                             doc_count += 1;
+                            if let Some(message) = quality_error {
+                                quality_errors.push((doc.id.clone(), message));
+                            } else if quality_embedder.is_some() {
+                                quality_indexed += 1;
+                            }
                             lexical_docs.push(doc);
                         }
                         Err(err) => {
                             tracing::warn!(doc_id = %doc.id, error = %err, "failed to embed document");
                             errors.push((doc.id.clone(), err.to_string()));
-                            failed_documents.push(doc);
+                            // bd-8nqz.3: lexical admission is independent of
+                            // embedding outcome — the documents most in need
+                            // of lexical fallback must stay lexically
+                            // searchable.
+                            lexical_docs.push(doc);
                         }
                     }
                 }
@@ -416,7 +495,14 @@ impl IndexBuilder {
                 )
                 .await
                 {
-                    Ok(()) => doc_count += 1,
+                    Ok(quality_error) => {
+                        doc_count += 1;
+                        if let Some(message) = quality_error {
+                            quality_errors.push((doc.id.clone(), message));
+                        } else if quality_embedder.is_some() {
+                            quality_indexed += 1;
+                        }
+                    }
                     Err(err) => {
                         tracing::warn!(doc_id = %doc.id, error = %err, "failed to embed document");
                         errors.push((doc.id.clone(), err.to_string()));
@@ -453,14 +539,29 @@ impl IndexBuilder {
             }
         };
 
+        #[cfg(not(any(feature = "lexical", feature = "quill")))]
+        let (lexical_receipt, lexical_ms): (Option<LexicalArmReceipt>, f64) = (None, 0.0);
         #[cfg(any(feature = "lexical", feature = "quill"))]
-        if !lexical_docs.is_empty() {
+        let (lexical_receipt, lexical_ms) = if lexical_docs.is_empty() {
+            (None, 0.0)
+        } else {
             let lexical_path = self.data_dir.join("lexical");
-            if let Err(error) = build_lexical_index(cx, &lexical_path, &lexical_docs).await {
-                export_error(metrics_exporter.as_ref(), &error);
-                return Err(error);
+            let lexical_start = Instant::now();
+            match build_lexical_index(cx, &lexical_path, &lexical_docs).await {
+                Ok(receipt) => (
+                    Some(receipt),
+                    lexical_start.elapsed().as_secs_f64() * 1000.0,
+                ),
+                // Publication failure (create/seal/commit) stays fatal: a
+                // half-written lexical index is worse than an absent arm.
+                // Per-document indexing errors are NOT fatal; they are
+                // reported in the receipt.
+                Err(error) => {
+                    export_error(metrics_exporter.as_ref(), &error);
+                    return Err(error);
+                }
             }
-        }
+        };
 
         #[cfg(feature = "durability")]
         {
@@ -471,11 +572,11 @@ impl IndexBuilder {
         }
 
         let has_quality = quality_embedder.is_some();
-        let index_size_bytes = compute_index_size_bytes(&self.data_dir);
+        let size_bytes = compute_size_breakdown(&self.data_dir);
         export_index_updated(
             metrics_exporter.as_ref(),
             doc_count,
-            index_size_bytes,
+            size_bytes.total,
             doc_count,
         );
 
@@ -488,24 +589,30 @@ impl IndexBuilder {
         );
 
         let stats = IndexBuildStats {
+            source_count: total,
             doc_count,
             error_count: errors.len(),
             errors,
+            quality_indexed,
+            quality_errors,
+            lexical: lexical_receipt,
+            size_bytes,
             total_ms: start.elapsed().as_secs_f64() * 1000.0,
             embed_ms,
+            lexical_ms,
             has_quality_index: has_quality,
             embedder_availability,
         };
-
-        // Match the former borrowed-input lifetime: failed documents remain resident until the
-        // entire index build, including lexical commit and metrics export, has completed.
-        #[cfg(any(feature = "lexical", feature = "quill"))]
-        drop(failed_documents);
 
         Ok(stats)
     }
 
     /// Embed a single document and add it to the index builder.
+    ///
+    /// Returns `Ok(None)` when every attempted arm succeeded, and
+    /// `Ok(Some(message))` when the fast tier succeeded but the quality
+    /// embedding failed (fast-only degradation for this document). A fast
+    /// embedding failure is a hard `Err`: the document enters no vector tier.
     async fn embed_and_add(
         cx: &Cx,
         fast_embedder: &Arc<dyn Embedder>,
@@ -513,7 +620,7 @@ impl IndexBuilder {
         builder: &mut TwoTierIndexBuilder,
         doc: &IndexableDocument,
         metrics_exporter: Option<&Arc<dyn MetricsExporter>>,
-    ) -> SearchResult<()> {
+    ) -> SearchResult<Option<String>> {
         let text = doc.content.as_str();
 
         // Fast embedding (required).
@@ -547,11 +654,12 @@ impl IndexBuilder {
                         error = %error,
                         "quality embedding failed, fast-only for this document"
                     );
+                    return Ok(Some(error.to_string()));
                 }
             }
         }
 
-        Ok(())
+        Ok(None)
     }
 }
 
@@ -597,18 +705,143 @@ fn export_index_updated(
     exporter.on_index_updated(&payload);
 }
 
-fn compute_index_size_bytes(data_dir: &Path) -> u64 {
+fn compute_size_breakdown(data_dir: &Path) -> IndexSizeBreakdown {
     let fast_path = data_dir.join(VECTOR_INDEX_FAST_FILENAME);
     let fallback_path = data_dir.join(VECTOR_INDEX_FALLBACK_FILENAME);
     let quality_path = data_dir.join(VECTOR_INDEX_QUALITY_FILENAME);
 
-    let fast_bytes = if fast_path.exists() {
+    let vector_fast = if fast_path.exists() {
         file_size_bytes(&fast_path)
     } else {
         file_size_bytes(&fallback_path)
     };
+    let vector_quality = file_size_bytes(&quality_path);
+    let lexical = dir_size_bytes(&data_dir.join("lexical"));
 
-    fast_bytes.saturating_add(file_size_bytes(&quality_path))
+    IndexSizeBreakdown {
+        total: vector_fast
+            .saturating_add(vector_quality)
+            .saturating_add(lexical),
+        vector_fast,
+        vector_quality,
+        lexical,
+    }
+}
+
+/// Recursive byte size of a directory tree; 0 when the directory is absent.
+fn dir_size_bytes(dir: &Path) -> u64 {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    entries.filter_map(Result::ok).fold(0u64, |acc, entry| {
+        let path = entry.path();
+        let size = if path.is_dir() {
+            dir_size_bytes(&path)
+        } else {
+            file_size_bytes(&path)
+        };
+        acc.saturating_add(size)
+    })
+}
+
+/// The opened arms of a hybrid index directory (bd-8nqz.3).
+#[derive(Clone)]
+pub struct HybridIndexParts {
+    /// Two-tier vector index.
+    pub vectors: Arc<TwoTierIndex>,
+    /// Active lexical reader for `<dir>/lexical`, when one exists and a
+    /// lexical backend is compiled in.
+    pub lexical: Option<Arc<dyn LexicalRead>>,
+}
+
+impl std::fmt::Debug for HybridIndexParts {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("HybridIndexParts")
+            .field("has_lexical", &self.lexical.is_some())
+            .finish_non_exhaustive()
+    }
+}
+
+/// Open every arm of an index directory produced by [`IndexBuilder`].
+///
+/// The advertised hybrid flow used to build lexical data and then construct
+/// a searcher without attaching it; this helper makes the correct wiring the
+/// ergonomic default:
+///
+/// ```rust,ignore
+/// let parts = open_hybrid(&cx, "./my_index", TwoTierConfig::default()).await?;
+/// let mut searcher = TwoTierSearcher::new(parts.vectors, fast_embedder, config);
+/// if let Some(lexical) = parts.lexical {
+///     searcher = searcher.with_lexical(lexical);
+/// }
+/// ```
+///
+/// # Errors
+///
+/// Returns an error when the vector index cannot be opened, or when a
+/// lexical directory exists but its index fails to open (a corrupt lexical
+/// arm is reported, never silently dropped). A missing lexical directory
+/// yields `lexical: None`, as does a build without a lexical backend
+/// compiled in.
+pub async fn open_hybrid(
+    cx: &Cx,
+    data_dir: impl AsRef<Path>,
+    config: TwoTierConfig,
+) -> SearchResult<HybridIndexParts> {
+    let data_dir = data_dir.as_ref();
+    let vectors = Arc::new(TwoTierIndex::open(data_dir, config)?);
+
+    let lexical_dir = data_dir.join("lexical");
+    let lexical = if lexical_dir.is_dir() {
+        open_lexical_reader(cx, &lexical_dir).await?
+    } else {
+        None
+    };
+
+    Ok(HybridIndexParts { vectors, lexical })
+}
+
+#[cfg(feature = "quill")]
+async fn open_lexical_reader(cx: &Cx, dir: &Path) -> SearchResult<Option<Arc<dyn LexicalRead>>> {
+    // bd-8nqz.2: dispatch on the inspected layout instead of blindly opening
+    // the root — a blue-green root opens its ACTIVE engine dir, a foreign or
+    // damaged layout is a typed error, and inspection never adopts/publishes.
+    let layout = inspect_lexical_layout(dir).map_err(|source| SearchError::SubsystemError {
+        subsystem: "facade.lexical.layout",
+        source: Box::new(source),
+    })?;
+    let target = match layout {
+        LexicalLayout::Empty => return Ok(None),
+        LexicalLayout::DirectQuill => dir.to_path_buf(),
+        LexicalLayout::BlueGreen { ref pointer, .. }
+            if pointer.engine() == BlueGreenEngine::Quill =>
+        {
+            pointer.engine_dir(dir)
+        }
+        ref layout => {
+            return Err(SearchError::InvalidConfig {
+                field: "data_dir/lexical".to_owned(),
+                value: dir.display().to_string(),
+                reason: format!(
+                    "lexical layout is {}, which this Quill-backed build cannot open",
+                    layout.label()
+                ),
+            });
+        }
+    };
+    let index = QuillIndex::open(cx, target, QuillConfig::default()).await?;
+    Ok(Some(Arc::new(index)))
+}
+
+#[cfg(all(feature = "lexical", not(feature = "quill")))]
+async fn open_lexical_reader(_cx: &Cx, dir: &Path) -> SearchResult<Option<Arc<dyn LexicalRead>>> {
+    let index = TantivyIndex::open(dir)?;
+    Ok(Some(Arc::new(index)))
+}
+
+#[cfg(not(any(feature = "lexical", feature = "quill")))]
+async fn open_lexical_reader(_cx: &Cx, _dir: &Path) -> SearchResult<Option<Arc<dyn LexicalRead>>> {
+    Ok(None)
 }
 
 #[cfg(feature = "quill")]
@@ -616,7 +849,29 @@ async fn build_lexical_index(
     cx: &Cx,
     data_dir: &Path,
     documents: &[IndexableDocument],
-) -> SearchResult<()> {
+) -> SearchResult<LexicalArmReceipt> {
+    // bd-8nqz.2: never initialize Quill on top of a foreign, damaged,
+    // blue-green, or ambiguous layout — MANIFEST absence is NOT emptiness.
+    // Empty proceeds; DirectQuill preserves the existing create-over-own
+    // behavior; everything else is a typed refusal.
+    match inspect_lexical_layout(data_dir).map_err(|source| SearchError::SubsystemError {
+        subsystem: "facade.lexical.layout",
+        source: Box::new(source),
+    })? {
+        LexicalLayout::Empty | LexicalLayout::DirectQuill => {}
+        layout => {
+            return Err(SearchError::InvalidConfig {
+                field: "data_dir/lexical".to_owned(),
+                value: data_dir.display().to_string(),
+                reason: format!(
+                    "refusing to initialize Quill over a {} lexical layout; \
+                     inspect or repair the directory first",
+                    layout.label()
+                ),
+            });
+        }
+    }
+
     let config = QuillConfig {
         bulk_load_mode: true,
         ..QuillConfig::default()
@@ -631,9 +886,64 @@ async fn build_lexical_index(
     #[cfg(not(feature = "durability"))]
     let lexical = QuillIndex::create(cx, data_dir, config).await?;
 
-    lexical.index_documents(cx, documents).await?;
+    // Per-document indexing so one rejected document (duplicate id, oversized
+    // field) cannot silently void the whole arm; failures land in the
+    // receipt, not in an aggregate error.
+    let mut indexed = 0usize;
+    let mut errors: Vec<(String, String)> = Vec::new();
+    let mut documents_iter = documents.iter();
+    while let Some(document) = documents_iter.next() {
+        match lexical.index_document(cx, document).await {
+            Ok(()) => indexed += 1,
+            // Cancellation is a caller contract, not a document defect: abort
+            // the build with the typed error instead of laundering it into
+            // the receipt and spinning the recovery machinery.
+            Err(error @ frankensearch_quill::QuillIndexError::Cancelled { .. }) => {
+                return Err(error.into());
+            }
+            Err(error) => {
+                tracing::warn!(
+                    doc_id = %document.id,
+                    error = %error,
+                    "lexical indexing failed for document"
+                );
+                errors.push((document.id.clone(), error.to_string()));
+                // A failed batch arms Quill's fail-closed retry guard: the
+                // batch is ambiguous until a commit reconciles its accepted
+                // prefix (Quill contract test: successful_sealed_batches_
+                // compose_but_failed_batches_require_commit_retry). Reconcile
+                // so one rejected document cannot void the rest of the arm.
+                if let Err(recovery_error) = lexical.commit(cx).await {
+                    tracing::warn!(
+                        error = %recovery_error,
+                        "lexical writer recovery failed; remaining documents skipped"
+                    );
+                    // Exact accounting: every unattempted document is recorded,
+                    // never silently dropped.
+                    for skipped in documents_iter {
+                        errors.push((
+                            skipped.id.clone(),
+                            format!(
+                                "skipped: lexical writer recovery failed after prior \
+                                 error: {recovery_error}"
+                            ),
+                        ));
+                    }
+                    break;
+                }
+            }
+        }
+    }
     let _ = lexical.finish_bulk_load(cx).await?;
-    Ok(())
+    Ok(LexicalArmReceipt {
+        backend: "quill",
+        path: data_dir.to_path_buf(),
+        attempted: documents.len(),
+        indexed,
+        errors,
+        generation: None,
+        published: true,
+    })
 }
 
 #[cfg(all(feature = "lexical", not(feature = "quill")))]
@@ -641,10 +951,36 @@ async fn build_lexical_index(
     cx: &Cx,
     data_dir: &Path,
     documents: &[IndexableDocument],
-) -> SearchResult<()> {
+) -> SearchResult<LexicalArmReceipt> {
     let lexical = TantivyIndex::create(data_dir)?;
-    lexical.index_documents(cx, documents).await?;
-    lexical.commit(cx).await
+    let mut indexed = 0usize;
+    let mut errors: Vec<(String, String)> = Vec::new();
+    for document in documents {
+        match lexical
+            .index_documents(cx, std::slice::from_ref(document))
+            .await
+        {
+            Ok(()) => indexed += 1,
+            Err(error) => {
+                tracing::warn!(
+                    doc_id = %document.id,
+                    error = %error,
+                    "lexical indexing failed for document"
+                );
+                errors.push((document.id.clone(), error.to_string()));
+            }
+        }
+    }
+    lexical.commit(cx).await?;
+    Ok(LexicalArmReceipt {
+        backend: "tantivy",
+        path: data_dir.to_path_buf(),
+        attempted: documents.len(),
+        indexed,
+        errors,
+        generation: None,
+        published: true,
+    })
 }
 
 #[cfg(feature = "durability")]
@@ -691,8 +1027,6 @@ mod tests {
     use std::sync::Arc;
     use std::sync::Mutex;
 
-    #[cfg(all(feature = "lexical", not(feature = "quill")))]
-    use frankensearch_core::traits::LexicalSearch;
     use frankensearch_core::traits::{MetricsExporter, ModelCategory, SearchFuture};
     use frankensearch_core::types::{EmbeddingMetrics, IndexMetrics, SearchMetrics};
     #[cfg(feature = "durability")]
@@ -741,10 +1075,8 @@ mod tests {
         }
     }
 
-    #[cfg(any(feature = "lexical", feature = "quill"))]
     struct SelectiveFailEmbedder;
 
-    #[cfg(any(feature = "lexical", feature = "quill"))]
     impl Embedder for SelectiveFailEmbedder {
         fn embed<'a>(&'a self, _cx: &'a Cx, text: &'a str) -> SearchFuture<'a, Vec<f32>> {
             Box::pin(async move {
@@ -844,6 +1176,7 @@ mod tests {
     /// plausible results at query time. Without a machine-readable signal on
     /// the build result there is nothing for a caller to check, which is
     /// exactly how this shipped unnoticed.
+    #[cfg(feature = "hash")]
     #[test]
     fn build_reports_hash_only_generation_as_degraded() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
@@ -1067,9 +1400,13 @@ mod tests {
         });
     }
 
+    /// bd-8nqz.3: lexical admission is independent of embedding outcome. A
+    /// document whose fast embedding fails is exactly the document that needs
+    /// lexical fallback, so it MUST be lexically searchable — the previous
+    /// contract (embed-gated staging) silently dropped it from both arms.
     #[cfg(any(feature = "lexical", feature = "quill"))]
     #[test]
-    fn lexical_staging_excludes_fast_embedding_failures() {
+    fn lexical_admission_survives_fast_embedding_failures() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             let dir = tempfile::tempdir().unwrap();
             let stack = EmbedderStack::from_parts(Arc::new(SelectiveFailEmbedder), None);
@@ -1077,54 +1414,62 @@ mod tests {
                 .with_embedder_stack(stack)
                 .with_batch_size(2)
                 .add_document("doc-first", "first-success sentinel")
-                .add_document("doc-failed", "fail-fast-embedding excluded sentinel")
+                .add_document("doc-failed", "fail-fast-embedding admitted sentinel")
                 .add_document("doc-last", "last-success sentinel")
                 .build(&cx)
                 .await
                 .unwrap();
 
-            assert_eq!(stats.doc_count, 2);
+            assert_eq!(stats.source_count, 3);
+            assert_eq!(stats.doc_count, 2, "vector arm holds only embedded docs");
             assert_eq!(stats.error_count, 1);
             assert_eq!(stats.errors[0].0, "doc-failed");
 
+            let receipt = stats.lexical.as_ref().expect("lexical arm receipt");
+            assert_eq!(receipt.attempted, 3, "every valid source doc attempted");
+            assert_eq!(receipt.indexed, 3);
+            assert!(receipt.errors.is_empty());
+            assert!(receipt.published);
+            assert!(
+                stats.size_bytes.lexical > 0,
+                "lexical bytes must be visible"
+            );
+            assert_eq!(
+                stats.size_bytes.total,
+                stats.size_bytes.vector_fast
+                    + stats.size_bytes.vector_quality
+                    + stats.size_bytes.lexical,
+            );
+
+            // The vector arm must NOT contain the failed document...
+            let index = TwoTierIndex::open(dir.path(), TwoTierConfig::default()).unwrap();
+            assert_eq!(index.doc_count(), 2);
+
+            // ...but the lexical arm MUST.
             #[cfg(feature = "quill")]
-            let successful_ids = {
+            let admitted_ids = {
                 let lexical =
                     QuillIndex::open(&cx, dir.path().join("lexical"), QuillConfig::default())
                         .await
                         .unwrap();
-                assert!(
-                    lexical
-                        .search_doc_ids(&cx, "excluded", 10)
-                        .unwrap()
-                        .is_empty()
-                );
                 lexical
-                    .search_doc_ids(&cx, "sentinel", 10)
+                    .search_doc_ids(&cx, "admitted", 10)
                     .unwrap()
                     .into_iter()
                     .map(|hit| hit.document_id)
                     .collect::<Vec<_>>()
             };
             #[cfg(all(feature = "lexical", not(feature = "quill")))]
-            let successful_ids = {
+            let admitted_ids = {
                 let lexical = TantivyIndex::open(&dir.path().join("lexical")).unwrap();
-                assert!(
-                    lexical
-                        .search_doc_ids(&cx, "excluded", 10)
-                        .unwrap()
-                        .is_empty()
-                );
                 lexical
-                    .search_doc_ids(&cx, "sentinel", 10)
+                    .search_doc_ids(&cx, "admitted", 10)
                     .unwrap()
                     .into_iter()
                     .map(|hit| hit.doc_id.to_string())
                     .collect::<Vec<_>>()
             };
-            assert_eq!(successful_ids.len(), 2);
-            assert!(successful_ids.iter().any(|doc_id| doc_id == "doc-first"));
-            assert!(successful_ids.iter().any(|doc_id| doc_id == "doc-last"));
+            assert_eq!(admitted_ids, vec!["doc-failed".to_owned()]);
         });
     }
 
@@ -1268,21 +1613,46 @@ mod tests {
     #[test]
     fn index_build_stats_debug_clone() {
         let stats = IndexBuildStats {
+            source_count: 6,
             doc_count: 5,
             error_count: 1,
             errors: vec![("bad-doc".into(), "embed failed".into())],
+            quality_indexed: 4,
+            quality_errors: vec![("slow-doc".into(), "quality timeout".into())],
+            lexical: Some(LexicalArmReceipt {
+                backend: "quill",
+                path: PathBuf::from("/tmp/idx/lexical"),
+                attempted: 6,
+                indexed: 6,
+                errors: Vec::new(),
+                generation: None,
+                published: true,
+            }),
+            size_bytes: IndexSizeBreakdown {
+                total: 300,
+                vector_fast: 100,
+                vector_quality: 50,
+                lexical: 150,
+            },
             total_ms: 42.0,
             embed_ms: 30.0,
+            lexical_ms: 5.0,
             has_quality_index: true,
             embedder_availability: TwoTierAvailability::Full,
         };
         let cloned = stats.clone();
+        assert_eq!(cloned.source_count, 6);
         assert_eq!(cloned.doc_count, 5);
         assert_eq!(cloned.error_count, 1);
         assert_eq!(cloned.errors.len(), 1);
+        assert_eq!(cloned.quality_indexed, 4);
+        assert_eq!(cloned.quality_errors.len(), 1);
+        assert_eq!(cloned.lexical.as_ref().map(|arm| arm.indexed), Some(6));
+        assert_eq!(cloned.size_bytes.total, 300);
         assert!(cloned.has_quality_index);
         let dbg = format!("{stats:?}");
         assert!(dbg.contains("IndexBuildStats"));
+        assert!(dbg.contains("LexicalArmReceipt"));
     }
 
     #[test]
@@ -1343,6 +1713,270 @@ mod tests {
             assert_eq!(indexed_docs, 2);
             assert!(indexed_bytes > 0);
             assert_eq!(error_count, 0);
+        });
+    }
+
+    /// Per-arm quality receipts (bd-8nqz.3): a document whose quality
+    /// embedding fails stays in the fast tier and is reported per-document,
+    /// not silently absorbed into an aggregate.
+    #[test]
+    fn quality_receipts_track_partial_quality_failures() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let dir = tempfile::tempdir().unwrap();
+            let stack = EmbedderStack::from_parts(
+                Arc::new(StubEmbedder {
+                    id: "stub-fast",
+                    dim: 4,
+                }),
+                Some(Arc::new(SelectiveFailEmbedder)),
+            );
+            let stats = IndexBuilder::new(dir.path())
+                .with_embedder_stack(stack)
+                .add_document("doc-clean", "quality succeeds here")
+                .add_document("doc-marked", "fail-fast-embedding marker text")
+                .build(&cx)
+                .await
+                .unwrap();
+
+            assert_eq!(stats.source_count, 2);
+            assert_eq!(stats.doc_count, 2, "fast tier holds both documents");
+            assert_eq!(stats.error_count, 0, "no fast embedding failed");
+            assert_eq!(stats.quality_indexed, 1);
+            assert_eq!(stats.quality_errors.len(), 1);
+            assert_eq!(stats.quality_errors[0].0, "doc-marked");
+        });
+    }
+
+    /// The preserved gate: when every fast embedding fails, the build still
+    /// errors — an index generation without a single vector record is not
+    /// representable by `TwoTierIndexBuilder::finish` (empty-generation
+    /// support is bd-tqhc index-crate scope, not facade scope).
+    #[test]
+    fn all_embeddings_failing_still_errors() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let dir = tempfile::tempdir().unwrap();
+            let stack = EmbedderStack::from_parts(Arc::new(SelectiveFailEmbedder), None);
+            let result = IndexBuilder::new(dir.path())
+                .with_embedder_stack(stack)
+                .add_document("doc-a", "fail-fast-embedding alpha")
+                .add_document("doc-b", "fail-fast-embedding beta")
+                .build(&cx)
+                .await;
+
+            assert!(result.is_err());
+        });
+    }
+
+    /// Empty-content documents are valid source documents: they embed (the
+    /// embedder decides what an empty text means) and they are admitted to
+    /// the lexical arm (which may index zero tokens for them).
+    #[test]
+    fn empty_content_documents_are_admitted() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let dir = tempfile::tempdir().unwrap();
+            let stats = IndexBuilder::new(dir.path())
+                .with_embedder_stack(stub_stack())
+                .add_document("doc-empty", "")
+                .add_document("doc-full", "real content")
+                .build(&cx)
+                .await
+                .unwrap();
+
+            assert_eq!(stats.source_count, 2);
+            assert_eq!(stats.doc_count, 2);
+            assert_eq!(stats.error_count, 0);
+            #[cfg(any(feature = "lexical", feature = "quill"))]
+            {
+                let receipt = stats.lexical.as_ref().expect("lexical arm receipt");
+                assert_eq!(receipt.attempted, 2);
+                assert_eq!(
+                    receipt.indexed + receipt.errors.len(),
+                    receipt.attempted,
+                    "every attempted document is accounted for exactly once",
+                );
+            }
+        });
+    }
+
+    /// Duplicate IDs: pin that the lexical arm reports per-document errors in
+    /// the receipt instead of voiding the whole arm, and that accounting
+    /// stays exact.
+    #[cfg(feature = "quill")]
+    #[test]
+    fn duplicate_ids_land_in_lexical_receipt_not_aggregate_failure() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let dir = tempfile::tempdir().unwrap();
+            let stats = IndexBuilder::new(dir.path())
+                .with_embedder_stack(stub_stack())
+                .add_document("doc-dup", "alpha duplicate content")
+                .add_document("doc-dup", "beta duplicate content")
+                .add_document("doc-ok", "gamma unique content")
+                .build(&cx)
+                .await
+                .unwrap();
+
+            assert_eq!(stats.source_count, 3);
+            let receipt = stats.lexical.as_ref().expect("lexical arm receipt");
+            assert_eq!(receipt.attempted, 3);
+            assert_eq!(receipt.indexed, 2, "first doc-dup and doc-ok both index");
+            assert_eq!(receipt.errors.len(), 1);
+            assert_eq!(receipt.errors[0].0, "doc-dup");
+            assert!(
+                receipt.errors[0].1.contains("duplicate live document id"),
+                "the receipt carries the typed duplicate rejection: {:?}",
+                receipt.errors[0].1,
+            );
+            assert!(receipt.published);
+
+            // The clean document AFTER the rejected duplicate survived — the
+            // reconcile-commit recovery keeps one bad document from voiding
+            // the rest of the arm.
+            let lexical = QuillIndex::open(&cx, dir.path().join("lexical"), QuillConfig::default())
+                .await
+                .unwrap();
+            let gamma_ids = lexical
+                .search_doc_ids(&cx, "gamma", 10)
+                .unwrap()
+                .into_iter()
+                .map(|hit| hit.document_id)
+                .collect::<Vec<_>>();
+            assert_eq!(gamma_ids, vec!["doc-ok".to_owned()]);
+        });
+    }
+
+    /// bd-8nqz.2: a tantivy meta.json squatting in the lexical dir must be a
+    /// typed refusal, not a silent Quill initialization beside it (MANIFEST
+    /// absence is not emptiness).
+    #[cfg(feature = "quill")]
+    #[test]
+    fn build_refuses_quill_init_over_foreign_lexical_layout() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let dir = tempfile::tempdir().unwrap();
+            let lexical_dir = dir.path().join("lexical");
+            std::fs::create_dir_all(&lexical_dir).unwrap();
+            std::fs::write(lexical_dir.join("meta.json"), b"{}").unwrap();
+
+            let error = IndexBuilder::new(dir.path())
+                .with_embedder_stack(stub_stack())
+                .add_document("doc-1", "content")
+                .build(&cx)
+                .await
+                .expect_err("foreign lexical layout must refuse Quill init");
+            let message = error.to_string();
+            assert!(
+                message.contains("direct-tantivy"),
+                "error must carry the typed layout label: {message}"
+            );
+            assert!(
+                !lexical_dir.join("MANIFEST").exists(),
+                "no Quill artifacts may appear beside the foreign index"
+            );
+        });
+    }
+
+    /// bd-8nqz.2: `open_hybrid` reports a mixed lexical layout as a typed
+    /// error instead of silently picking an engine.
+    #[cfg(feature = "quill")]
+    #[test]
+    fn open_hybrid_reports_mixed_layout_as_typed_error() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let dir = tempfile::tempdir().unwrap();
+            IndexBuilder::new(dir.path())
+                .with_embedder_stack(stub_stack())
+                .add_document("doc-1", "Alpha content")
+                .build(&cx)
+                .await
+                .unwrap();
+            std::fs::write(dir.path().join("lexical").join("meta.json"), b"{}").unwrap();
+
+            let error = open_hybrid(&cx, dir.path(), TwoTierConfig::default())
+                .await
+                .expect_err("mixed layout must be a typed error");
+            assert!(
+                error.to_string().contains("mixed"),
+                "error must carry the typed layout label: {error}"
+            );
+        });
+    }
+
+    /// bd-8nqz.3 cancellation matrix: a cancelled `Cx` aborts the build with
+    /// the typed cancellation error — never a per-document receipt entry,
+    /// never recovery-machinery churn — and a cleared `Cx` builds clean.
+    #[cfg(feature = "quill")]
+    #[test]
+    fn build_rejects_cancelled_cx_with_typed_error() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let dir = tempfile::tempdir().unwrap();
+            cx.set_cancel_requested(true);
+            let error = IndexBuilder::new(dir.path())
+                .with_embedder_stack(stub_stack())
+                .add_document("doc-1", "content")
+                .build(&cx)
+                .await
+                .expect_err("cancelled cx must reject the build");
+            assert!(
+                matches!(error, SearchError::Cancelled { .. }),
+                "typed cancellation must survive to the caller, got {error:?}"
+            );
+
+            // Retry-clean: a cleared cx builds successfully from scratch.
+            cx.set_cancel_requested(false);
+            let fresh = tempfile::tempdir().unwrap();
+            let stats = IndexBuilder::new(fresh.path())
+                .with_embedder_stack(stub_stack())
+                .add_document("doc-1", "content")
+                .build(&cx)
+                .await
+                .expect("cleared cx must build clean");
+            assert_eq!(stats.doc_count, 1);
+        });
+    }
+
+    /// `open_hybrid` (bd-8nqz.3): the ergonomic opener must attach the
+    /// lexical arm the advertised examples previously dropped, and the
+    /// attached reader must actually answer through the trait object.
+    #[cfg(any(feature = "lexical", feature = "quill"))]
+    #[test]
+    fn open_hybrid_attaches_lexical_arm() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let dir = tempfile::tempdir().unwrap();
+            IndexBuilder::new(dir.path())
+                .with_embedder_stack(stub_stack())
+                .add_document("doc-1", "Alpha retrieval content")
+                .add_document("doc-2", "Beta ranking content")
+                .build(&cx)
+                .await
+                .unwrap();
+
+            let parts = open_hybrid(&cx, dir.path(), TwoTierConfig::default())
+                .await
+                .unwrap();
+            assert_eq!(parts.vectors.doc_count(), 2);
+            let lexical = parts.lexical.expect("lexical arm must be attached");
+            let hits = lexical.search(&cx, "Alpha", 5).await.unwrap();
+            assert!(!hits.is_empty(), "trait-object search must answer");
+        });
+    }
+
+    /// Without a lexical backend compiled in, `open_hybrid` still opens the
+    /// vector arms and reports the lexical arm as absent rather than erroring.
+    #[cfg(not(any(feature = "lexical", feature = "quill")))]
+    #[test]
+    fn open_hybrid_without_lexical_backend_reports_absent_arm() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let dir = tempfile::tempdir().unwrap();
+            IndexBuilder::new(dir.path())
+                .with_embedder_stack(stub_stack())
+                .add_document("doc-1", "Alpha retrieval content")
+                .build(&cx)
+                .await
+                .unwrap();
+
+            let parts = open_hybrid(&cx, dir.path(), TwoTierConfig::default())
+                .await
+                .unwrap();
+            assert_eq!(parts.vectors.doc_count(), 1);
+            assert!(parts.lexical.is_none());
         });
     }
 }

@@ -30,8 +30,10 @@ pub use cass_compat::{
 };
 
 // Re-export tantivy types that appear in frankensearch-lexical's public API.
-// Consumers can import these from `frankensearch::lexical::` instead of adding
-// a direct tantivy dependency.
+// Consumers can import these from `frankensearch::lexical_tantivy::` instead
+// of adding a direct Tantivy dependency. The explicit namespace keeps
+// foreign-format and oracle callers stable when the facade's generic
+// `lexical` feature selects Quill.
 pub use tantivy::collector::{Count, TopDocs};
 pub use tantivy::query::{BooleanQuery, Occur, Query, TermQuery};
 pub use tantivy::schema::{Field, IndexRecordOption, Schema, Value};
@@ -2049,6 +2051,47 @@ impl LexicalSearch for TantivyIndex {
 
     fn doc_count(&self) -> usize {
         self.doc_count.load(Ordering::Relaxed)
+    }
+}
+
+// bd-8nqz.1 slice B: split-trait surface. Delegates to the combined-trait
+// impl above; bodies move here when `LexicalSearch` is removed. Tantivy
+// returns full metadata from `search`, so the default eager
+// `search_candidates` and no-op hydration are exact.
+impl frankensearch_core::traits::LexicalRead for TantivyIndex {
+    fn search<'a>(
+        &'a self,
+        cx: &'a Cx,
+        query: &'a str,
+        limit: usize,
+    ) -> SearchFuture<'a, Vec<ScoredResult>> {
+        LexicalSearch::search(self, cx, query, limit)
+    }
+
+    fn doc_count(&self) -> usize {
+        LexicalSearch::doc_count(self)
+    }
+}
+
+impl frankensearch_core::traits::LexicalWrite for TantivyIndex {
+    fn index_document<'a>(
+        &'a self,
+        cx: &'a Cx,
+        doc: &'a IndexableDocument,
+    ) -> SearchFuture<'a, ()> {
+        LexicalSearch::index_document(self, cx, doc)
+    }
+
+    fn index_documents<'a>(
+        &'a self,
+        cx: &'a Cx,
+        docs: &'a [IndexableDocument],
+    ) -> SearchFuture<'a, ()> {
+        LexicalSearch::index_documents(self, cx, docs)
+    }
+
+    fn commit<'a>(&'a self, cx: &'a Cx) -> SearchFuture<'a, ()> {
+        LexicalSearch::commit(self, cx)
     }
 }
 

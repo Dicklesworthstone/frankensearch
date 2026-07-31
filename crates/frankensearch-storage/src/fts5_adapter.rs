@@ -460,6 +460,47 @@ impl LexicalSearch for Fts5LexicalSearch {
     }
 }
 
+// bd-8nqz.1 slice B: split-trait surface. Delegates to the combined-trait
+// impl above; bodies move here when `LexicalSearch` is removed. FTS5 returns
+// full metadata from `search`, so the default eager `search_candidates` and
+// no-op hydration are exact.
+impl frankensearch_core::LexicalRead for Fts5LexicalSearch {
+    fn search<'a>(
+        &'a self,
+        cx: &'a Cx,
+        query: &'a str,
+        limit: usize,
+    ) -> SearchFuture<'a, Vec<ScoredResult>> {
+        LexicalSearch::search(self, cx, query, limit)
+    }
+
+    fn doc_count(&self) -> usize {
+        LexicalSearch::doc_count(self)
+    }
+}
+
+impl frankensearch_core::LexicalWrite for Fts5LexicalSearch {
+    fn index_document<'a>(
+        &'a self,
+        cx: &'a Cx,
+        doc: &'a IndexableDocument,
+    ) -> SearchFuture<'a, ()> {
+        LexicalSearch::index_document(self, cx, doc)
+    }
+
+    fn index_documents<'a>(
+        &'a self,
+        cx: &'a Cx,
+        docs: &'a [IndexableDocument],
+    ) -> SearchFuture<'a, ()> {
+        LexicalSearch::index_documents(self, cx, docs)
+    }
+
+    fn commit<'a>(&'a self, cx: &'a Cx) -> SearchFuture<'a, ()> {
+        LexicalSearch::commit(self, cx)
+    }
+}
+
 // ─── Hit type for snippet-aware search ──────────────────────────────────────
 
 /// A hit from FTS5 search with optional snippet.
