@@ -45,7 +45,6 @@ use std::ops::Range;
 use frankensearch_core::DocId;
 use rayon::prelude::*;
 use thiserror::Error;
-use wide::u8x32;
 
 use crate::contract::fieldnorm_to_id;
 use crate::delta::DeltaSnapshot;
@@ -204,12 +203,14 @@ pub fn analyze_admitted<A: TokenAnalyzer + ?Sized>(
 /// enforce [`MAX_TERM_BYTES`]; admission belongs to document/query consumers
 /// so a dropped document token retains its position gap.
 ///
-/// Token boundaries are found in one pass by a portable 32-byte SIMD classifier
-/// on SSE2/AVX2, NEON, and wasm SIMD targets. Other targets retain the 8-byte
-/// SWAR path ([`skip_separators`]/[`scan_token_end`]). Non-ASCII spans fall back
-/// to the scalar char walk so Unicode semantics remain exact. The emitted stream
-/// is byte-parity-identical to [`analyze_default_scalar_reference`]. No
-/// `core::arch` intrinsics are used; the quill crate root remains
+/// Token boundaries are found by a SWAR (SIMD-within-a-register) byte
+/// classifier that visits eight ASCII bytes per 64-bit word
+/// ([`skip_separators`]/[`scan_token_end`]), falling back to the scalar
+/// char-walk for the span around each non-ASCII byte. The emitted stream is
+/// byte-parity-identical to [`analyze_default_scalar_reference`] — the retained
+/// scalar oracle — which the `swar_default_matches_scalar_reference_*` tests and
+/// the `tokenizer_simd_ab` bench pin (bd-quill-e1-scribe-bejd.1). No
+/// `core::arch` intrinsics are used; the quill crate root is
 /// `#![forbid(unsafe_code)]`.
 #[derive(Debug, Clone, Default)]
 pub struct FrankensearchTokenizer {
@@ -266,36 +267,6 @@ const SWAR_LANES: usize = 8;
 const SWAR_ONES: u64 = 0x0101_0101_0101_0101;
 /// SWAR broadcast of the byte `0x80` (per-lane high bit) into every lane.
 const SWAR_HIGH: u64 = 0x8080_8080_8080_8080;
-
-/// Bytes classified by the portable SIMD boundary scanner.
-const PORTABLE_SIMD_LANES: usize = 32;
-
-/// Whether `wide` maps its byte vectors to a native portable SIMD backend.
-///
-/// `wide::u8x32` becomes one AVX2 vector when enabled for the build, two SSE2
-/// vectors on baseline x86-64, two NEON vectors on AArch64, and two wasm SIMD
-/// vectors. Keep the SWAR implementation for architectures where `wide` would
-/// fall back to scalar arrays.
-const PORTABLE_SIMD_TOKENIZATION: bool = cfg!(any(
-    target_arch = "x86_64",
-    target_arch = "aarch64",
-    all(target_arch = "x86", target_feature = "sse2"),
-    all(target_arch = "wasm32", target_feature = "simd128")
-));
-
-/// Return one bit per input byte for ASCII alphanumeric and non-ASCII lanes.
-#[inline]
-fn portable_simd_ascii_masks(bytes: &[u8], at: usize) -> (u32, u32) {
-    let mut lanes = [0_u8; PORTABLE_SIMD_LANES];
-    lanes.copy_from_slice(&bytes[at..at + PORTABLE_SIMD_LANES]);
-    let input = u8x32::from(lanes);
-    let digits = input.simd_ge(b'0') & input.simd_le(b'9');
-    let upper = input.simd_ge(b'A') & input.simd_le(b'Z');
-    let lower = input.simd_ge(b'a') & input.simd_le(b'z');
-    let alphanumeric = (digits | upper | lower).to_bitmask();
-    let non_ascii = input.simd_ge(0x80_u8).to_bitmask();
-    (alphanumeric, non_ascii)
-}
 
 /// Per-lane marker (`0x80` in the lane) where `lo <= byte <= hi`.
 ///
@@ -548,119 +519,6 @@ impl TokenAnalyzer for BoundaryMaskTokenizer {
     }
 }
 
-impl FrankensearchTokenizer {
-    /// Classify ASCII bytes in 32-byte vectors and emit every boundary in one
-    /// pass. Unicode scalar values are handled individually without changing
-    /// the open token, offset, lowercase, or position contracts.
-    fn analyze_portable_simd(&mut self, text: &str, sink: &mut dyn FnMut(&AnalyzedToken)) {
-        const NO_TOKEN: usize = usize::MAX;
-        let bytes = text.as_bytes();
-        let len = bytes.len();
-        let mut cursor = 0;
-        let mut position = 0_u32;
-        let mut offset_from = NO_TOKEN;
-        let mut all_ascii = true;
-
-        while cursor < len {
-            if cursor + PORTABLE_SIMD_LANES <= len {
-                let (alphanumeric, non_ascii) = portable_simd_ascii_masks(bytes, cursor);
-                let ascii_lanes = if non_ascii == 0 {
-                    PORTABLE_SIMD_LANES
-                } else {
-                    non_ascii.trailing_zeros() as usize
-                };
-                if ascii_lanes != 0 {
-                    let lane_mask = if ascii_lanes == PORTABLE_SIMD_LANES {
-                        u32::MAX
-                    } else {
-                        (1_u32 << ascii_lanes) - 1
-                    };
-                    let alphanumeric = alphanumeric & lane_mask;
-                    let prior = u32::from(offset_from != NO_TOKEN);
-                    let mut transitions =
-                        (alphanumeric ^ ((alphanumeric << 1) | prior)) & lane_mask;
-                    while transitions != 0 {
-                        let lane = transitions.trailing_zeros() as usize;
-                        let lane_bit = 1_u32 << lane;
-                        transitions &= !lane_bit;
-                        let at = cursor + lane;
-
-                        if alphanumeric & lane_bit != 0 {
-                            debug_assert_eq!(offset_from, NO_TOKEN);
-                            offset_from = at;
-                            all_ascii = true;
-                        } else {
-                            debug_assert_ne!(offset_from, NO_TOKEN);
-                            self.emit_default_token(
-                                text,
-                                offset_from,
-                                at,
-                                all_ascii,
-                                position,
-                                sink,
-                            );
-                            position = next_token_position(position);
-                            offset_from = NO_TOKEN;
-                        }
-                    }
-                    cursor += ascii_lanes;
-                    if ascii_lanes == PORTABLE_SIMD_LANES {
-                        continue;
-                    }
-                }
-            }
-
-            let Some((ch, next)) = tokenizer_next_char(text, cursor) else {
-                break;
-            };
-            if tokenizer_is_alphanumeric(ch) {
-                if offset_from == NO_TOKEN {
-                    offset_from = cursor;
-                    all_ascii = ch.is_ascii();
-                } else {
-                    all_ascii &= ch.is_ascii();
-                }
-            } else if offset_from != NO_TOKEN {
-                self.emit_default_token(text, offset_from, cursor, all_ascii, position, sink);
-                position = next_token_position(position);
-                offset_from = NO_TOKEN;
-            }
-            cursor = next;
-        }
-
-        if offset_from != NO_TOKEN {
-            self.emit_default_token(text, offset_from, len, all_ascii, position, sink);
-        }
-    }
-
-    #[inline]
-    fn emit_default_token(
-        &mut self,
-        text: &str,
-        offset_from: usize,
-        offset_to: usize,
-        all_ascii: bool,
-        position: u32,
-        sink: &mut dyn FnMut(&AnalyzedToken),
-    ) {
-        self.token.text.clear();
-        let source = &text[offset_from..offset_to];
-        if all_ascii {
-            self.token.text.push_str(source);
-            self.token.text.make_ascii_lowercase();
-        } else {
-            for source_char in source.chars() {
-                self.token.text.extend(source_char.to_lowercase());
-            }
-        }
-        self.token.position = position;
-        self.token.offset_from = offset_from;
-        self.token.offset_to = offset_to;
-        self.token.position_length = 1;
-        sink(&self.token);
-    }
-}
-
 impl TokenAnalyzer for FrankensearchTokenizer {
     fn supports(&self, analyzer: AnalyzerKind) -> bool {
         analyzer == AnalyzerKind::FrankensearchDefault
@@ -673,10 +531,6 @@ impl TokenAnalyzer for FrankensearchTokenizer {
         sink: &mut dyn FnMut(&AnalyzedToken),
     ) {
         debug_assert_eq!(analyzer, AnalyzerKind::FrankensearchDefault);
-        if PORTABLE_SIMD_TOKENIZATION {
-            self.analyze_portable_simd(text, sink);
-            return;
-        }
         let len = text.len();
         let mut cursor = 0;
         let mut position = 0_u32;
