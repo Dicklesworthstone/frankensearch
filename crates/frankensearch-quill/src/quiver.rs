@@ -1362,14 +1362,6 @@ enum CursorState {
     Exhausted,
 }
 
-#[derive(Clone, Copy)]
-struct LoadedBitmap {
-    block: usize,
-    first_doc: u32,
-    byte_offset: usize,
-    current_relative: u16,
-}
-
 #[derive(Clone)]
 enum PostingCursorBlocks<'a> {
     Borrowed(&'a [PostingBlockMeta]),
@@ -1393,7 +1385,6 @@ pub struct PostingCursor<'a> {
     bytes: &'a [u8],
     blocks: PostingCursorBlocks<'a>,
     state: CursorState,
-    bitmap: Option<LoadedBitmap>,
     decoded_docs: [u32; POSTINGS_PER_BLOCK],
     decoded_freqs: [u32; POSTINGS_PER_BLOCK],
     decoded_count: usize,
@@ -1419,7 +1410,6 @@ impl<'a> PostingCursor<'a> {
             bytes,
             blocks,
             state: CursorState::Exhausted,
-            bitmap: None,
             decoded_docs: [0; POSTINGS_PER_BLOCK],
             decoded_freqs: [0; POSTINGS_PER_BLOCK],
             decoded_count: 0,
@@ -1435,135 +1425,42 @@ impl<'a> PostingCursor<'a> {
     }
 
     fn load_block(&mut self, block_index: usize) -> Result<(), PostingCodecError> {
-        let (kind, byte_offset, byte_len, posting_count, base_posting_ordinal) = {
-            let block = self.blocks.as_slice().get(block_index).ok_or(
-                PostingCodecError::ArithmeticOverflow {
-                    block_offset: self.bytes.len(),
-                    field: "cursor block index",
-                },
-            )?;
-            (
-                block.kind,
-                block.byte_offset,
-                block.byte_len,
-                block.posting_count,
-                block.base_posting_ordinal,
-            )
-        };
-        if kind == PostingBlockKind::Bitmap {
-            let block = self.blocks.as_slice().get(block_index).ok_or(
-                PostingCodecError::ArithmeticOverflow {
-                    block_offset: self.bytes.len(),
-                    field: "cursor bitmap block index",
-                },
-            )?;
-            let decoded = decode_bitmap_cursor_at(self.bytes, block)?;
-            self.bitmap = Some(LoadedBitmap {
-                block: block_index,
-                first_doc: decoded.first_doc,
-                byte_offset: decoded.bitmap_offset,
-                current_relative: 0,
-            });
-            self.decoded_freqs = decoded.freqs;
-            self.decoded_count = usize::from(posting_count);
-            return Ok(());
-        }
-
-        let base_posting_ordinal = usize::try_from(base_posting_ordinal).map_err(|_| {
+        let block = self.blocks.as_slice().get(block_index).ok_or(
             PostingCodecError::ArithmeticOverflow {
-                block_offset: byte_offset,
+                block_offset: self.bytes.len(),
+                field: "cursor block index",
+            },
+        )?;
+        let base_posting_ordinal = usize::try_from(block.base_posting_ordinal).map_err(|_| {
+            PostingCodecError::ArithmeticOverflow {
+                block_offset: block.byte_offset,
                 field: "posting ordinal",
             }
         })?;
-        let decoded = decode_block_at(self.bytes, byte_offset, base_posting_ordinal)?;
-        if decoded.byte_len != byte_len
-            || decoded.kind != kind
-            || decoded.posting_count != posting_count
+        let decoded = decode_block_at(self.bytes, block.byte_offset, base_posting_ordinal)?;
+        if decoded.byte_len != block.byte_len
+            || decoded.kind != block.kind
+            || decoded.posting_count != block.posting_count
         {
             return Err(PostingCodecError::ArithmeticOverflow {
-                block_offset: byte_offset,
+                block_offset: block.byte_offset,
                 field: "validated block metadata",
             });
         }
-        self.bitmap = None;
         self.decoded_docs = decoded.docs;
         self.decoded_freqs = decoded.freqs;
         self.decoded_count = usize::from(decoded.posting_count);
         Ok(())
     }
 
-    fn bitmap_bytes(&self) -> Option<&[u8]> {
-        let bitmap = self.bitmap?;
-        let end = bitmap.byte_offset.checked_add(64)?;
-        self.bytes.get(bitmap.byte_offset..end)
-    }
-
-    fn bitmap_word(bitmap: &[u8], word_index: usize) -> Option<u64> {
-        let word_bytes = std::mem::size_of::<u64>();
-        let start = word_index.checked_mul(word_bytes)?;
-        let end = start.checked_add(word_bytes)?;
-        Some(u64::from_le_bytes(bitmap.get(start..end)?.try_into().ok()?))
-    }
-
-    fn next_bitmap_relative(&self, start: usize) -> Option<u16> {
-        let bitmap = self.bitmap_bytes()?;
-        let bits_per_word = usize::try_from(u64::BITS).ok()?;
-        let bitmap_bits = bitmap.len().checked_mul(usize::try_from(u8::BITS).ok()?)?;
-        if start >= bitmap_bits {
-            return None;
-        }
-        let mut word_index = start / bits_per_word;
-        let mut bits =
-            Self::bitmap_word(bitmap, word_index)? & (u64::MAX << (start % bits_per_word));
-        loop {
-            if bits != 0 {
-                let relative = word_index
-                    .checked_mul(bits_per_word)?
-                    .checked_add(usize::try_from(bits.trailing_zeros()).ok()?)?;
-                return u16::try_from(relative).ok();
-            }
-            word_index += 1;
-            bits = Self::bitmap_word(bitmap, word_index)?;
-        }
-    }
-
-    fn bitmap_relative_and_rank_at_or_after(&self, start: usize) -> Option<(u16, usize)> {
-        let relative = self.next_bitmap_relative(start)?;
-        let relative = usize::from(relative);
-        let bitmap = self.bitmap_bytes()?;
-        let bits_per_word = usize::try_from(u64::BITS).ok()?;
-        let word_index = relative / bits_per_word;
-        let bit_index = relative % bits_per_word;
-        let preceding_words = (0..word_index).try_fold(0_usize, |count, index| {
-            count.checked_add(usize::try_from(Self::bitmap_word(bitmap, index)?.count_ones()).ok()?)
-        })?;
-        let preceding_bits = if bit_index == 0 {
-            0
-        } else {
-            let mask = u64::MAX >> (bits_per_word - bit_index);
-            usize::try_from((Self::bitmap_word(bitmap, word_index)? & mask).count_ones()).ok()?
-        };
-        Some((
-            u16::try_from(relative).ok()?,
-            preceding_words + preceding_bits,
-        ))
-    }
-
     /// Current posting, including a valid `u32::MAX` docid when present.
     #[must_use]
     pub fn current(&self) -> Option<Posting> {
-        let CursorState::Positioned { block, within } = self.state else {
+        let CursorState::Positioned { within, .. } = self.state else {
             return None;
         };
-        let doc_id = if let Some(bitmap) = self.bitmap.filter(|bitmap| bitmap.block == block) {
-            bitmap
-                .first_doc
-                .checked_add(u32::from(bitmap.current_relative))?
-        } else {
-            *self.decoded_docs.get(within)?
-        };
         Some(Posting {
-            doc_id,
+            doc_id: *self.decoded_docs.get(within)?,
             freq: *self.decoded_freqs.get(within)?,
         })
     }
@@ -1618,22 +1515,6 @@ impl<'a> PostingCursor<'a> {
             return Ok(None);
         };
         if within + 1 < self.decoded_count {
-            if let Some(bitmap) = self.bitmap.filter(|bitmap| bitmap.block == block) {
-                let relative = self
-                    .next_bitmap_relative(usize::from(bitmap.current_relative) + 1)
-                    .ok_or(PostingCodecError::ArithmeticOverflow {
-                        block_offset: bitmap.byte_offset,
-                        field: "validated bitmap next posting",
-                    })?;
-                let loaded = self
-                    .bitmap
-                    .as_mut()
-                    .ok_or(PostingCodecError::ArithmeticOverflow {
-                        block_offset: bitmap.byte_offset,
-                        field: "cursor bitmap loaded state",
-                    })?;
-                loaded.current_relative = relative;
-            }
             self.state = CursorState::Positioned {
                 block,
                 within: within + 1,
@@ -1644,7 +1525,6 @@ impl<'a> PostingCursor<'a> {
         let next_block = block + 1;
         if next_block >= self.blocks.as_slice().len() {
             self.state = CursorState::Exhausted;
-            self.bitmap = None;
             self.decoded_count = 0;
             return Ok(None);
         }
@@ -1672,76 +1552,31 @@ impl<'a> PostingCursor<'a> {
         else {
             return Ok(None);
         };
-        if self
-            .current()
-            .is_some_and(|posting| posting.doc_id >= target)
-        {
+        if self.decoded_docs[current_within] >= target {
             return Ok(self.current());
         }
 
-        if let Some(bitmap) = self.bitmap.filter(|bitmap| bitmap.block == current_block) {
-            let relative_target =
-                usize::try_from(target.saturating_sub(bitmap.first_doc)).unwrap_or(usize::MAX);
-            if let Some((relative, within)) =
-                self.bitmap_relative_and_rank_at_or_after(relative_target)
-            {
-                let loaded = self
-                    .bitmap
-                    .as_mut()
-                    .ok_or(PostingCodecError::ArithmeticOverflow {
-                        block_offset: bitmap.byte_offset,
-                        field: "cursor bitmap loaded state",
-                    })?;
-                loaded.current_relative = relative;
-                self.state = CursorState::Positioned {
-                    block: current_block,
-                    within,
-                };
-                return Ok(self.current());
-            }
-        } else {
-            let current_tail = &self.decoded_docs[current_within + 1..self.decoded_count];
-            let within_tail = current_tail.partition_point(|doc_id| *doc_id < target);
-            if within_tail < current_tail.len() {
-                self.state = CursorState::Positioned {
-                    block: current_block,
-                    within: current_within + 1 + within_tail,
-                };
-                return Ok(self.current());
-            }
+        let current_tail = &self.decoded_docs[current_within + 1..self.decoded_count];
+        let within_tail = current_tail.partition_point(|doc_id| *doc_id < target);
+        if within_tail < current_tail.len() {
+            self.state = CursorState::Positioned {
+                block: current_block,
+                within: current_within + 1 + within_tail,
+            };
+            return Ok(self.current());
         }
 
         let later = &self.blocks.as_slice()[current_block + 1..];
         let relative_block = later.partition_point(|block| block.last_doc < target);
         if relative_block == later.len() {
             self.state = CursorState::Exhausted;
-            self.bitmap = None;
             self.decoded_count = 0;
             return Ok(None);
         }
         let block = current_block + 1 + relative_block;
         self.load_block(block)?;
-        let within = if let Some(bitmap) = self.bitmap.filter(|bitmap| bitmap.block == block) {
-            let relative_target =
-                usize::try_from(target.saturating_sub(bitmap.first_doc)).unwrap_or(usize::MAX);
-            let (relative, within) = self
-                .bitmap_relative_and_rank_at_or_after(relative_target)
-                .ok_or(PostingCodecError::ArithmeticOverflow {
-                    block_offset: bitmap.byte_offset,
-                    field: "validated bitmap last_doc",
-                })?;
-            let loaded = self
-                .bitmap
-                .as_mut()
-                .ok_or(PostingCodecError::ArithmeticOverflow {
-                    block_offset: bitmap.byte_offset,
-                    field: "cursor bitmap loaded state",
-                })?;
-            loaded.current_relative = relative;
-            within
-        } else {
-            self.decoded_docs[..self.decoded_count].partition_point(|doc_id| *doc_id < target)
-        };
+        let within =
+            self.decoded_docs[..self.decoded_count].partition_point(|doc_id| *doc_id < target);
         if within == self.decoded_count {
             return Err(PostingCodecError::ArithmeticOverflow {
                 block_offset: self.blocks.as_slice()[block].byte_offset,
@@ -3152,78 +2987,6 @@ fn decode_for_payload(
         first_doc,
         last_doc: docs[POSTINGS_PER_BLOCK - 1],
         docs,
-        freqs,
-    })
-}
-
-struct BitmapCursorDecoded {
-    first_doc: u32,
-    bitmap_offset: usize,
-    freqs: [u32; POSTINGS_PER_BLOCK],
-}
-
-/// Re-open an already validated bitmap block without expanding its 128 set
-/// bits into a second docid array. The cursor walks the durable bitmap in
-/// place; only aligned frequencies are decoded because they are ordinal, not
-/// bit-addressable.
-fn decode_bitmap_cursor_at(
-    bytes: &[u8],
-    block: &PostingBlockMeta,
-) -> Result<BitmapCursorDecoded, PostingCodecError> {
-    let term_tail = bytes
-        .get(block.byte_offset..)
-        .ok_or(PostingCodecError::Truncated {
-            offset: block.byte_offset,
-            needed: BLOCK_HEADER_LEN,
-            remaining: 0,
-        })?;
-    let mut header = PayloadReader::new(term_tail, block.byte_offset, block.byte_offset);
-    let kind = PostingBlockKind::from_code(header.read_u8()?, block.byte_offset)?;
-    let posting_count = header.read_u8()?;
-    let payload_len = usize::from(header.read_u16()?);
-    let payload_start = block.byte_offset.checked_add(BLOCK_HEADER_LEN).ok_or(
-        PostingCodecError::ArithmeticOverflow {
-            block_offset: block.byte_offset,
-            field: "bitmap cursor payload start",
-        },
-    )?;
-    let payload = header.take(payload_len)?;
-    if kind != PostingBlockKind::Bitmap
-        || posting_count != block.posting_count
-        || BLOCK_HEADER_LEN.checked_add(payload_len) != Some(block.byte_len)
-    {
-        return Err(PostingCodecError::ArithmeticOverflow {
-            block_offset: block.byte_offset,
-            field: "validated bitmap block metadata",
-        });
-    }
-
-    let mut reader = PayloadReader::new(payload, payload_start, block.byte_offset);
-    let first_doc = reader.read_u32()?;
-    let span = reader.read_u16()?;
-    if !(128..512).contains(&span) {
-        return Err(PostingCodecError::InvalidBitmapSpan {
-            block_offset: block.byte_offset,
-            span,
-        });
-    }
-    let bitmap_offset = reader.absolute_position();
-    let _bitmap = reader.take(64)?;
-    if first_doc != block.first_doc
-        || first_doc.checked_add(u32::from(span).saturating_sub(1)) != Some(block.last_doc)
-    {
-        return Err(PostingCodecError::ArithmeticOverflow {
-            block_offset: block.byte_offset,
-            field: "validated bitmap doc bounds",
-        });
-    }
-    let freq_encoding = read_frequency_meta(&mut reader)?;
-    let mut freqs = [0_u32; POSTINGS_PER_BLOCK];
-    decode_frequencies(&mut reader, freq_encoding, POSTINGS_PER_BLOCK, &mut freqs)?;
-    reader.finish()?;
-    Ok(BitmapCursorDecoded {
-        first_doc,
-        bitmap_offset,
         freqs,
     })
 }
@@ -12470,24 +12233,6 @@ mod tests {
         let bitmap_list = bitmap.posting_list()?;
         assert_eq!(bitmap_list.blocks()[0].kind, PostingBlockKind::Bitmap);
         assert_eq!(bitmap_list.decode_all()?, bitmap_input);
-        let mut bitmap_cursor = bitmap_list.cursor()?;
-        for (ordinal, posting) in bitmap_input.iter().copied().enumerate() {
-            assert_eq!(bitmap_cursor.current(), Some(posting));
-            assert_eq!(
-                bitmap_cursor.posting_ordinal(),
-                Some(u32::try_from(ordinal)?)
-            );
-            bitmap_cursor.next()?;
-        }
-        assert_eq!(bitmap_cursor.current(), None);
-
-        for target in [1_000, 1_063, 1_127, 1_128, 1_509, 1_510, 1_511] {
-            let expected = bitmap_input
-                .iter()
-                .copied()
-                .find(|posting| posting.doc_id >= target);
-            assert_eq!(bitmap_list.cursor()?.advance(target)?, expected);
-        }
 
         let for_input = postings_with_span(512);
         let frame = EncodedPostingList::encode(&for_input)?;
