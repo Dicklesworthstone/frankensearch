@@ -2,8 +2,9 @@
 //!
 //! This producer owns one canonical host-global lease across benchmark
 //! compilation, start/end probes, and the measured child. It emits the required
-//! receipt last, only after the child exits successfully and every exact
-//! artifact re-verifies.
+//! bound evidence only after the child exits successfully and every exact
+//! artifact re-verifies. The sole process receipt is atomically published last
+//! and binds that evidence's exact bytes, so H4 completion requires the pair.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
@@ -15,9 +16,13 @@ use std::os::unix::fs::MetadataExt;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, ExitStatus, Stdio};
+use std::time::Duration;
 
-use rustix::fs::{FileType, FlockOperation, Mode, OFlags, flock, fstat, mkdirat, open, openat};
+use rustix::fs::{
+    FileType, FlockOperation, Mode, OFlags, RenameFlags, flock, fstat, mkdirat, open, openat,
+    renameat_with,
+};
 use rustix::io::{FdFlags, fcntl_getfd, fcntl_setfd};
 use rustix::process::geteuid;
 use serde::{Deserialize, Serialize};
@@ -33,7 +38,7 @@ use crate::machine_class_registry::{
     MachineProfileAvailability, MachineProfileKey, RUNNER_RECEIPT_SCHEMA_VERSION,
     RunnerArtifactManifest, RunnerBuild, RunnerCompletion, RunnerDurability, RunnerExecution,
     RunnerExecutionRequest, RunnerExecutionSnapshot, RunnerHardware, RunnerProducer, RunnerReceipt,
-    seal_runner_receipt, sha256_hex,
+    VerifiedRunnerIdentity, seal_runner_receipt, sha256_hex,
 };
 use crate::{
     EvidenceArtifactError, PerfApplicabilityPlan, PerfApplicabilityPlanBinding,
@@ -44,13 +49,16 @@ use crate::{PerfCellApplicability, PerfCellApplicabilityReason};
 
 const PRODUCER_CONTRACT_SCHEMA_VERSION: &str =
     "frankensearch.quill-local-perf-producer-contract.v1";
-const ATTEMPT_RECEIPT_SCHEMA_VERSION: &str = "frankensearch.perf-runner-attempt.v2";
+/// Strict wire schema for one local-run process-attempt receipt.
+pub const LOCAL_PERF_ATTEMPT_RECEIPT_SCHEMA_VERSION: &str = "frankensearch.perf-runner-attempt.v5";
 const MAX_IDENTITY_COMPONENT_BYTES: usize = 96;
 const MAX_OUTPUT_COMPONENT_BYTES: usize = 128;
 const MIN_MEASUREMENT_RUNS: usize = 10;
 const MAX_MEASUREMENT_RUNS: usize = 100;
 const MEASUREMENT_WARMUP_ROUNDS: &str = "1";
 const MEASUREMENT_BOOTSTRAP_SEED: &str = "5860671082138523204";
+const WAIT_RECOVERY_POLL_ATTEMPTS: usize = 100;
+const WAIT_RECOVERY_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const EMBEDDED_PRODUCER_CONTRACT_VERSION: &str = env!("QUILL_PERF_PRODUCER_CONTRACT_VERSION");
 const EMBEDDED_PRODUCER_GIT_REVISION: &str = env!("QUILL_PERF_PRODUCER_GIT_REVISION");
 const EMBEDDED_PRODUCER_GIT_DIRTY: &str = env!("QUILL_PERF_PRODUCER_GIT_DIRTY");
@@ -73,6 +81,39 @@ pub struct LocalPerfRunConfig {
     pub output_dir: PathBuf,
 }
 
+/// One exact canonical fixture selected for an isolated partial-shard run.
+///
+/// Construction validates only the closed text boundary. The selected-run
+/// entry point resolves this value against the frozen gate applicability plan,
+/// rejects unknown or non-applicable fixtures, and derives the exact ordered
+/// cell subset before any benchmark process starts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalPerfRunSelection {
+    fixture: String,
+}
+
+// The dependent H4 assembler consumes this public contract after the isolated
+// H2 slice lands.
+#[allow(dead_code)]
+impl LocalPerfRunSelection {
+    /// Construct an exact canonical fixture selector.
+    ///
+    /// # Errors
+    ///
+    /// Rejects empty, padded, non-ASCII, control-bearing, or overlong text.
+    pub fn for_fixture(fixture: impl Into<String>) -> Result<Self, LocalPerfRunError> {
+        let fixture = fixture.into();
+        validate_fixture_selector_syntax(&fixture)?;
+        Ok(Self { fixture })
+    }
+
+    /// Exact fixture string injected into the controlled child environment.
+    #[must_use]
+    pub fn fixture(&self) -> &str {
+        &self.fixture
+    }
+}
+
 /// Files emitted after a successful self-verifying finalization.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LocalPerfRunOutput {
@@ -84,6 +125,18 @@ pub struct LocalPerfRunOutput {
     pub environment_policy: PathBuf,
     /// Exact strict completion receipt.
     pub runner_receipt: PathBuf,
+    /// Exact canonical process-attempt receipt. A completed receipt binds the
+    /// SHA-256 of [`Self::bound_evidence`], while every failed attempt returns
+    /// this same schema through [`LocalPerfRunError::AttemptFailed`].
+    pub attempt_receipt: PathBuf,
+    /// Exact raw threshold artifact named by the runner artifact manifest.
+    pub threshold_artifact: PathBuf,
+    /// Exact pre-binding evidence artifact named by the runner manifest.
+    pub prebinding_evidence: PathBuf,
+    /// Exact admitted, runner-bound evidence artifact persisted by the
+    /// finalizer. This object independently re-admits its embedded runner
+    /// receipt and reconstructs the pre-binding evidence bytes on load.
+    pub bound_evidence: PathBuf,
     /// Pre-commit inventory written before the receipt commit boundary.
     pub precommit_inventory: PathBuf,
 }
@@ -111,6 +164,44 @@ pub enum LocalPerfRunError {
     /// A strict producer precondition failed.
     #[error("local performance runner rejected invocation: {0}")]
     Invalid(String),
+    /// A measured child attempt reached a durable typed terminal receipt.
+    #[error(
+        "local performance runner attempt ended as {outcome:?}; sealed receipt preserved at {}",
+        receipt_path.display()
+    )]
+    AttemptFailed {
+        /// Exact canonical attempt-receipt path.
+        receipt_path: PathBuf,
+        /// Typed terminal outcome preserved in the receipt.
+        outcome: LocalPerfAttemptOutcome,
+    },
+    /// The final strict attempt bytes were built and verified, but the atomic
+    /// no-replace publication itself could not establish the durable commit
+    /// boundary. No successful API result is returned.
+    #[error(
+        "local performance runner could not durably publish {outcome:?} receipt at {}: {detail}",
+        receipt_path.display()
+    )]
+    AttemptCommitFailed {
+        /// Intended final receipt path; it may be absent or nondurable.
+        receipt_path: PathBuf,
+        /// Typed producer-rejection boundary.
+        outcome: LocalPerfAttemptOutcome,
+        /// Bounded non-secret publication diagnostic.
+        detail: String,
+    },
+    /// `wait` failed and the bounded force-kill/reap recovery could not prove
+    /// a terminal status. No terminal attempt receipt is emitted while the
+    /// child might still mutate its log.
+    #[error(
+        "local performance runner could not prove child reap after wait error {wait_error_kind:?}: {recovery_error_kind:?}"
+    )]
+    UnreapedChild {
+        /// Error returned by the initial blocking wait.
+        wait_error_kind: LocalPerfIoErrorKind,
+        /// Error or bounded-deadline classification from kill/reap recovery.
+        recovery_error_kind: LocalPerfIoErrorKind,
+    },
 }
 
 #[derive(Debug)]
@@ -203,6 +294,12 @@ struct RunProfileContract {
     applicability_plan: PerfApplicabilityPlan,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResolvedRunSelection {
+    fixture: Option<String>,
+    selected_cell_ids: Vec<String>,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PrecommitInventory {
@@ -212,6 +309,8 @@ struct PrecommitInventory {
     execution_capacity: u64,
     max_exercised_cell_width: u64,
     applicability_plan: PerfApplicabilityPlanBinding,
+    fixture_selector: Option<String>,
+    selected_cell_ids: Vec<String>,
     run_id: String,
     run_window: String,
     run_log_sha256: String,
@@ -224,21 +323,231 @@ struct PrecommitInventory {
     environment_policy_sha256: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Terminal outcome of one runner process attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "kind")]
-enum RunnerAttemptTermination {
-    Exited { code: i64 },
+pub enum LocalPerfAttemptOutcome {
+    /// The child completed, its evidence was independently admitted, and the
+    /// exact bound-evidence digest is carried in the enclosing receipt.
+    Completed,
+    /// The benchmark image could not be spawned.
+    SpawnRejected { error_kind: LocalPerfIoErrorKind },
+    /// The first `wait` failed, after which the runner forced termination and
+    /// observed a bounded `try_wait` reap before sealing this receipt.
+    WaitRecoveredByKill { error_kind: LocalPerfIoErrorKind },
+    /// The child was reaped after returning a nonzero status.
+    ExitedNonzero { code: i64 },
+    /// The child was reaped after a terminating signal.
     Signaled { signal: i32 },
-    Unknown,
+    /// Unix returned a terminal status without an exit code or signal.
+    UnknownTerminal,
+    /// The child returned zero, but its output failed strict post-exit
+    /// verification before any promotion receipt was written.
+    PostExitRejected { stage: LocalPerfRejectionStage },
 }
 
+/// Bounded OS error class retained for a failed spawn without persisting a
+/// host-specific or secret-bearing error string.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LocalPerfIoErrorKind {
+    NotFound,
+    PermissionDenied,
+    ResourceBusy,
+    OutOfMemory,
+    Other,
+}
+
+/// Post-exit verification boundary that rejected a zero-exit child.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LocalPerfRejectionStage {
+    RunLogSync,
+    RunLogRead,
+    ExitStatusPersistence,
+    FinishedTimestamp,
+    EndPlatformCapture,
+    PostRunIdentity,
+    ArtifactRead,
+    ArtifactDurability,
+    ArtifactVerification,
+    ArtifactManifestSerialization,
+    RunnerReceiptSerialization,
+    RunnerAdmission,
+    BoundEvidenceSerialization,
+    PrecommitSerialization,
+    PrecommitPersistence,
+    RunnerReceiptPersistence,
+    AttemptReceiptPersistence,
+    BoundEvidencePersistence,
+    PersistedPairVerification,
+}
+
+/// Concrete typed retry predicate derived from the terminal outcome.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum LocalPerfRetryPredicate {
+    /// No retry is required for a completed, admitted attempt.
+    NotRequired,
+    RepairSpawn {
+        error_kind: LocalPerfIoErrorKind,
+    },
+    RepairWait {
+        error_kind: LocalPerfIoErrorKind,
+    },
+    DiagnoseNonzeroExit {
+        code: i64,
+    },
+    DiagnoseSignal {
+        signal: i32,
+    },
+    DiagnoseUnknownTerminal,
+    RepairRejectedEvidence {
+        stage: LocalPerfRejectionStage,
+    },
+}
+
+/// Outer child-process lifecycle facts directly observed by this runner.
+// These are independent receipt facts rather than mutually exclusive states;
+// retaining each observation prevents a coarse enum from implying facts the
+// runner did not witness.
+#[allow(clippy::struct_excessive_bools)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LocalPerfProcessLifecycle {
+    spawn_attempted: bool,
+    spawn_succeeded: bool,
+    wait_completed: bool,
+    child_reaped: bool,
+    run_log_synced: bool,
+    run_log_captured: bool,
+}
+
+// This public contract is consumed by the dependent H4 assembler slice; keep
+// the isolated H2 commit warning-clean before that re-export lands.
+#[allow(dead_code)]
+impl LocalPerfProcessLifecycle {
+    /// Whether `Command::spawn` was invoked.
+    #[must_use]
+    pub const fn spawn_attempted(self) -> bool {
+        self.spawn_attempted
+    }
+
+    /// Whether the child image was successfully spawned.
+    #[must_use]
+    pub const fn spawn_succeeded(self) -> bool {
+        self.spawn_succeeded
+    }
+
+    /// Whether `wait`, or bounded recovery through `try_wait`, observed a
+    /// terminal status.
+    #[must_use]
+    pub const fn wait_completed(self) -> bool {
+        self.wait_completed
+    }
+
+    /// Whether the terminal `wait` reaped the child.
+    #[must_use]
+    pub const fn child_reaped(self) -> bool {
+        self.child_reaped
+    }
+
+    /// Whether the exact combined run log was synced before receipt sealing.
+    #[must_use]
+    pub const fn run_log_synced(self) -> bool {
+        self.run_log_synced
+    }
+
+    /// Whether the exact combined run-log bytes were captured for hashing.
+    #[must_use]
+    pub const fn run_log_captured(self) -> bool {
+        self.run_log_captured
+    }
+}
+
+/// Why an engine-internal fact is absent from an outer runner attempt.
+// The repeated Child prefix is intentional in the serialized public contract:
+// H4 must not mistake an outer-runner observation for an engine-internal one.
+#[allow(clippy::enum_variant_names)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LocalPerfInternalLifecycleUnavailable {
+    ChildDidNotCompleteSuccessfully,
+    ChildEvidenceNotAdmitted,
+    /// The child evidence was admitted and cryptographically bound, but this
+    /// outer process runner did not independently observe engine internals.
+    ChildEvidenceAdmittedButNotIndependentlyObserved,
+}
+
+/// Explicit engine-internal receipt gaps. These fields prevent configured
+/// capacity or outer-process completion from being relabeled as actual work,
+/// queue activity, worker join, feed drain, or pending-zero evidence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LocalPerfInternalLifecycleGaps {
+    actual_work: LocalPerfInternalLifecycleUnavailable,
+    queue: LocalPerfInternalLifecycleUnavailable,
+    workers_joined: LocalPerfInternalLifecycleUnavailable,
+    feed_drained: LocalPerfInternalLifecycleUnavailable,
+    pending_zero: LocalPerfInternalLifecycleUnavailable,
+}
+
+// See the H4 integration note on `LocalPerfProcessLifecycle`.
+#[allow(dead_code)]
+impl LocalPerfInternalLifecycleGaps {
+    /// Typed absence of engine-internal actual-work counters.
+    #[must_use]
+    pub const fn actual_work(self) -> LocalPerfInternalLifecycleUnavailable {
+        self.actual_work
+    }
+
+    /// Typed absence of engine-internal queue observations.
+    #[must_use]
+    pub const fn queue(self) -> LocalPerfInternalLifecycleUnavailable {
+        self.queue
+    }
+
+    /// Typed absence of engine worker-join evidence.
+    #[must_use]
+    pub const fn workers_joined(self) -> LocalPerfInternalLifecycleUnavailable {
+        self.workers_joined
+    }
+
+    /// Typed absence of feed-drain evidence.
+    #[must_use]
+    pub const fn feed_drained(self) -> LocalPerfInternalLifecycleUnavailable {
+        self.feed_drained
+    }
+
+    /// Typed absence of pending-zero evidence.
+    #[must_use]
+    pub const fn pending_zero(self) -> LocalPerfInternalLifecycleUnavailable {
+        self.pending_zero
+    }
+}
+
+/// Runner controls unavailable in the current synchronous local producer.
+/// These name caller-scheduled controls; the bounded force-kill used only to
+/// recover from an OS `wait` error is a fail-closed reap mechanism, not a
+/// caller-requested cancellation outcome.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LocalPerfUnsupportedControl {
+    Timeout,
+    Cancellation,
+}
+
+/// Strict, canonical, independently verifiable process-attempt receipt.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RunnerAttemptReceipt {
+pub struct LocalPerfAttemptReceipt {
     schema_version: String,
     mode: String,
     gate: String,
     profile: MachineProfileKey,
+    applicability_plan: PerfApplicabilityPlanBinding,
+    fixture_selector: Option<String>,
+    selected_cell_ids: Vec<String>,
     run_id: String,
     run_window: String,
     registry_sha256: String,
@@ -248,13 +557,535 @@ struct RunnerAttemptReceipt {
     execution_end: Option<RunnerExecutionSnapshot>,
     end_capture_error: Option<String>,
     build: RunnerBuild,
+    durability: RunnerDurability,
     post_run_identity_verified: bool,
     post_run_identity_error: Option<String>,
-    termination: RunnerAttemptTermination,
-    run_log_sha256: String,
+    outcome: LocalPerfAttemptOutcome,
+    retry: LocalPerfRetryPredicate,
+    process_lifecycle: LocalPerfProcessLifecycle,
+    internal_lifecycle_gaps: LocalPerfInternalLifecycleGaps,
+    unsupported_controls: Vec<LocalPerfUnsupportedControl>,
+    run_log_sha256: Option<String>,
+    bound_evidence_sha256: Option<String>,
+    runner_receipt_sha256: Option<String>,
+    runner_artifact_manifest_sha256: Option<String>,
     started_at_utc: String,
     finished_at_utc: String,
+    finished_timestamp_error: Option<String>,
     seal_sha256: String,
+}
+
+// Same-crate H4 consumption lands separately on the protected train.
+#[allow(dead_code)]
+impl LocalPerfAttemptReceipt {
+    /// Parse exact canonical bytes and verify their self-seal, frozen
+    /// applicability plan, pre-spawn machine admission, terminal lifecycle,
+    /// retry predicate, and typed internal-evidence gaps.
+    ///
+    /// # Errors
+    ///
+    /// Rejects duplicate or unknown fields, noncanonical JSON, a stale plan,
+    /// malformed provenance, contradictory lifecycle facts, or any tamper.
+    pub fn from_verified_slice(contents: &[u8]) -> Result<Self, LocalPerfRunError> {
+        let probe =
+            crate::machine_class_registry::parse_strict_json(contents).map_err(|error| {
+                LocalPerfRunError::Invalid(format!("attempt receipt is not strict JSON: {error}"))
+            })?;
+        let receipt: Self = serde_json::from_value(probe.clone()).map_err(|error| {
+            LocalPerfRunError::Invalid(format!(
+                "attempt receipt does not decode as the current schema: {error}"
+            ))
+        })?;
+        if probe != serde_json::to_value(&receipt)?
+            || contents != receipt.to_json_bytes()?.as_slice()
+        {
+            return Err(LocalPerfRunError::Invalid(
+                "attempt receipt bytes are not the exact canonical encoding".to_owned(),
+            ));
+        }
+        receipt.verify()?;
+        Ok(receipt)
+    }
+
+    /// Load and independently verify one exact attempt receipt.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed I/O or receipt-verification error.
+    pub fn load_verified(path: &Path) -> Result<Self, LocalPerfRunError> {
+        Self::from_verified_slice(&fs::read(path)?)
+    }
+
+    /// Canonical compact JSON bytes used for persistence and exact hashing.
+    ///
+    /// # Errors
+    ///
+    /// Returns a JSON error only if the typed schema stops being encodable.
+    pub fn to_json_bytes(&self) -> Result<Vec<u8>, LocalPerfRunError> {
+        serde_json::to_vec(self).map_err(LocalPerfRunError::from)
+    }
+
+    /// SHA-256 of the exact canonical receipt bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns a JSON error only if the typed schema stops being encodable.
+    pub fn exact_sha256(&self) -> Result<String, LocalPerfRunError> {
+        Ok(sha256_hex(&self.to_json_bytes()?))
+    }
+
+    /// Prove that exact run-log bytes match the receipt.
+    ///
+    /// # Errors
+    ///
+    /// Rejects a substituted, truncated, or otherwise different log.
+    pub fn verify_run_log(&self, run_log_bytes: &[u8]) -> Result<(), LocalPerfRunError> {
+        let expected = self.run_log_sha256.as_deref().ok_or_else(|| {
+            LocalPerfRunError::Invalid(
+                "attempt did not capture exact run-log bytes for verification".to_owned(),
+            )
+        })?;
+        if sha256_hex(run_log_bytes) != expected {
+            return Err(LocalPerfRunError::Invalid(
+                "attempt run-log bytes differ from the sealed receipt".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Prove that exact completed bound-evidence bytes are the object named by
+    /// this process receipt.
+    ///
+    /// # Errors
+    ///
+    /// Rejects a failed-attempt receipt, or substituted, truncated, or
+    /// otherwise different bound-evidence bytes.
+    pub fn verify_bound_evidence(
+        &self,
+        bound_evidence_bytes: &[u8],
+    ) -> Result<(), LocalPerfRunError> {
+        let expected = self.bound_evidence_sha256.as_deref().ok_or_else(|| {
+            LocalPerfRunError::Invalid(
+                "failed attempt receipt cannot bind completed evidence".to_owned(),
+            )
+        })?;
+        if sha256_hex(bound_evidence_bytes) != expected {
+            return Err(LocalPerfRunError::Invalid(
+                "bound-evidence bytes differ from the sealed process receipt".to_owned(),
+            ));
+        }
+        let evidence = PerfEvidenceArtifact::from_verified_slice(bound_evidence_bytes)?;
+        if evidence.gate.label() != self.gate
+            || evidence.applicability_plan != self.applicability_plan
+            || evidence.provenance.run_id != self.run_id
+            || evidence.provenance.run_window != self.run_window
+            || evidence_cell_ids(&evidence) != self.selected_cell_ids
+        {
+            return Err(LocalPerfRunError::Invalid(
+                "bound evidence gate, plan, run identity, or cells differ from the sealed process receipt"
+                    .to_owned(),
+            ));
+        }
+        let identity = evidence.machine_class.identity().ok_or_else(|| {
+            LocalPerfRunError::Invalid(
+                "completed bound evidence has no admitted runner identity".to_owned(),
+            )
+        })?;
+        self.verify_completed_runner_identity(identity)?;
+        Ok(())
+    }
+
+    fn verify_completed_runner_identity(
+        &self,
+        identity: &VerifiedRunnerIdentity,
+    ) -> Result<(), LocalPerfRunError> {
+        identity.verify()?;
+        let expected_receipt_sha256 = self.runner_receipt_sha256.as_deref().ok_or_else(|| {
+            LocalPerfRunError::Invalid(
+                "completed attempt omits the exact admitted runner-receipt digest".to_owned(),
+            )
+        })?;
+        let expected_manifest_sha256 =
+            self.runner_artifact_manifest_sha256
+                .as_deref()
+                .ok_or_else(|| {
+                    LocalPerfRunError::Invalid(
+                        "completed attempt omits the exact runner artifact-manifest digest"
+                            .to_owned(),
+                    )
+                })?;
+        let manifest = identity.artifact_manifest().ok_or_else(|| {
+            LocalPerfRunError::Invalid(
+                "completed admitted runner identity has no artifact-manifest binding".to_owned(),
+            )
+        })?;
+        let execution_end = self.execution_end.as_ref().ok_or_else(|| {
+            LocalPerfRunError::Invalid(
+                "completed attempt has no terminal execution snapshot".to_owned(),
+            )
+        })?;
+        let run_log_sha256 = self.run_log_sha256.as_deref().ok_or_else(|| {
+            LocalPerfRunError::Invalid("completed attempt has no exact run-log digest".to_owned())
+        })?;
+        let runner_value =
+            crate::machine_class_registry::parse_strict_json(identity.receipt_json().as_bytes())?;
+        let runner: RunnerReceipt = serde_json::from_value(runner_value)?;
+        let expected_completion = RunnerCompletion {
+            verified: true,
+            exit_status: 0,
+            run_log_sha256: run_log_sha256.to_owned(),
+            artifact_manifest_sha256: expected_manifest_sha256.to_owned(),
+            artifact_digests_verified: true,
+            started_at_utc: self.started_at_utc.clone(),
+            finished_at_utc: self.finished_at_utc.clone(),
+        };
+        let expected_context = MachineClassAdmissionContext {
+            gate: self.gate.clone(),
+            expected_profile: self.profile,
+            destination_basename: self.profile.latest_basename(&self.gate)?,
+        };
+        if identity.receipt_sha256() != expected_receipt_sha256
+            || manifest.manifest_sha256() != expected_manifest_sha256
+            || identity.admission_context() != &expected_context
+            || identity.profile() != self.profile
+            || identity.hardware() != &serde_json::to_value(&self.hardware)?
+            || identity.execution_request() != &serde_json::to_value(&self.execution_request)?
+            || identity.execution_start() != &serde_json::to_value(&self.execution_start)?
+            || identity.execution_end() != &serde_json::to_value(execution_end)?
+            || identity.build() != &serde_json::to_value(&self.build)?
+            || identity.durability() != &serde_json::to_value(&self.durability)?
+            || identity.completion() != &serde_json::to_value(&expected_completion)?
+            || runner.requested_profile != self.profile
+            || runner.derived_profile != self.profile
+            || runner.registry_sha256 != self.registry_sha256
+            || runner.hardware != self.hardware
+            || runner.execution.request != self.execution_request
+            || runner.execution.start != self.execution_start
+            || runner.execution.end != *execution_end
+            || runner.build != self.build
+            || runner.durability != self.durability
+            || runner.completion != expected_completion
+        {
+            return Err(LocalPerfRunError::Invalid(
+                "completed attempt facts differ from its exact admitted nested runner receipt"
+                    .to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Gate selected by this attempt.
+    #[must_use]
+    pub fn gate(&self) -> &str {
+        &self.gate
+    }
+
+    /// Frozen machine/execution profile selected by this attempt.
+    #[must_use]
+    pub const fn profile(&self) -> MachineProfileKey {
+        self.profile
+    }
+
+    /// Exact frozen applicability-plan binding.
+    #[must_use]
+    pub const fn applicability_plan(&self) -> &PerfApplicabilityPlanBinding {
+        &self.applicability_plan
+    }
+
+    /// Exact typed fixture selector, or `None` for a full-gate invocation.
+    #[must_use]
+    pub fn fixture_selector(&self) -> Option<&str> {
+        self.fixture_selector.as_deref()
+    }
+
+    /// Canonically ordered runnable cells selected by the full-gate producer.
+    #[must_use]
+    pub fn selected_cell_ids(&self) -> &[String] {
+        &self.selected_cell_ids
+    }
+
+    /// Process-level run identity.
+    #[must_use]
+    pub fn run_id(&self) -> &str {
+        &self.run_id
+    }
+
+    /// Candidate/rerun window identity.
+    #[must_use]
+    pub fn run_window(&self) -> &str {
+        &self.run_window
+    }
+
+    /// Typed terminal outcome.
+    #[must_use]
+    pub const fn outcome(&self) -> LocalPerfAttemptOutcome {
+        self.outcome
+    }
+
+    /// Concrete typed retry predicate derived from [`Self::outcome`].
+    #[must_use]
+    pub const fn retry(&self) -> LocalPerfRetryPredicate {
+        self.retry
+    }
+
+    /// Directly observed outer child-process lifecycle.
+    #[must_use]
+    pub const fn process_lifecycle(&self) -> LocalPerfProcessLifecycle {
+        self.process_lifecycle
+    }
+
+    /// Explicit gaps for engine-internal facts the outer runner cannot prove.
+    #[must_use]
+    pub const fn internal_lifecycle_gaps(&self) -> LocalPerfInternalLifecycleGaps {
+        self.internal_lifecycle_gaps
+    }
+
+    /// Runner controls that are structurally unsupported in this schema.
+    #[must_use]
+    pub fn unsupported_controls(&self) -> &[LocalPerfUnsupportedControl] {
+        &self.unsupported_controls
+    }
+
+    /// SHA-256 of the exact synced combined child log.
+    #[must_use]
+    pub fn run_log_sha256(&self) -> Option<&str> {
+        self.run_log_sha256.as_deref()
+    }
+
+    /// SHA-256 of exact admitted bound-evidence bytes for a completed attempt.
+    /// Failed attempts carry `None` and cannot be joined to evidence by run ID.
+    #[must_use]
+    pub fn bound_evidence_sha256(&self) -> Option<&str> {
+        self.bound_evidence_sha256.as_deref()
+    }
+
+    /// SHA-256 of the exact strict runner-receipt bytes admitted inside a
+    /// completed bound-evidence artifact.
+    #[must_use]
+    pub fn runner_receipt_sha256(&self) -> Option<&str> {
+        self.runner_receipt_sha256.as_deref()
+    }
+
+    /// SHA-256 of the exact strict artifact-manifest bytes bound into the
+    /// completed runner identity.
+    #[must_use]
+    pub fn runner_artifact_manifest_sha256(&self) -> Option<&str> {
+        self.runner_artifact_manifest_sha256.as_deref()
+    }
+
+    /// Bounded clock-capture failure retained when a failed attempt had to use
+    /// its valid start timestamp as the conservative finish fallback.
+    #[must_use]
+    pub fn finished_timestamp_error(&self) -> Option<&str> {
+        self.finished_timestamp_error.as_deref()
+    }
+
+    fn verify(&self) -> Result<(), LocalPerfRunError> {
+        if self.schema_version != LOCAL_PERF_ATTEMPT_RECEIPT_SCHEMA_VERSION
+            || self.mode != "measurement"
+            || self.registry_sha256 != MACHINE_CLASS_REGISTRY_SHA256
+            || self
+                .run_log_sha256
+                .as_deref()
+                .is_some_and(|digest| !is_sha256(digest))
+            || !is_sha256(&self.seal_sha256)
+        {
+            return Err(LocalPerfRunError::Invalid(
+                "attempt receipt has an invalid schema, mode, registry, or digest".to_owned(),
+            ));
+        }
+        validate_component(&self.run_id, "attempt run ID")?;
+        validate_component(&self.run_window, "attempt run window")?;
+        let gate = self.gate.parse::<PerfGate>().map_err(|error| {
+            LocalPerfRunError::Invalid(format!("attempt receipt names an invalid gate: {error}"))
+        })?;
+        if gate != self.applicability_plan.gate || self.profile != self.applicability_plan.profile {
+            return Err(LocalPerfRunError::Invalid(
+                "attempt gate/profile differs from its applicability-plan binding".to_owned(),
+            ));
+        }
+        let registry = MachineClassRegistry::frozen()?;
+        let expected_plan = PerfMatrixSpec::complete()
+            .applicability_plan(&registry, self.profile, gate)
+            .map_err(|error| {
+                LocalPerfRunError::Invalid(format!(
+                    "attempt applicability plan cannot be reconstructed: {error}"
+                ))
+            })?;
+        let stored_selection = self
+            .fixture_selector
+            .as_deref()
+            .map(|fixture| LocalPerfRunSelection::for_fixture(fixture.to_owned()))
+            .transpose()?;
+        let expected_selection = resolve_run_selection(&expected_plan, stored_selection.as_ref())?;
+        if self.applicability_plan != *expected_plan.binding()
+            || self.fixture_selector != expected_selection.fixture
+            || self.selected_cell_ids != expected_selection.selected_cell_ids
+        {
+            return Err(LocalPerfRunError::Invalid(
+                "attempt fixture selector or cells differ from the frozen canonical selection"
+                    .to_owned(),
+            ));
+        }
+        let context = MachineClassAdmissionContext {
+            gate: self.gate.clone(),
+            expected_profile: self.profile,
+            destination_basename: self.profile.latest_basename(&self.gate)?,
+        };
+        registry.preflight(
+            self.profile,
+            self.hardware.clone(),
+            self.execution_request.clone(),
+            self.execution_start.clone(),
+            self.durability.clone(),
+            &context,
+        )?;
+        if let Some(end) = &self.execution_end {
+            registry.preflight(
+                self.profile,
+                self.hardware.clone(),
+                self.execution_request.clone(),
+                end.clone(),
+                self.durability.clone(),
+                &context,
+            )?;
+        }
+        if self.execution_end.is_some() == self.end_capture_error.is_some()
+            || self
+                .end_capture_error
+                .as_deref()
+                .is_some_and(|error| error.is_empty() || error.len() > 240)
+            || self.post_run_identity_verified == self.post_run_identity_error.is_some()
+            || self
+                .post_run_identity_error
+                .as_deref()
+                .is_some_and(|error| error.is_empty() || error.len() > 240)
+        {
+            return Err(LocalPerfRunError::Invalid(
+                "attempt end-capture or post-run identity evidence is contradictory".to_owned(),
+            ));
+        }
+        match self.outcome {
+            LocalPerfAttemptOutcome::PostExitRejected {
+                stage: LocalPerfRejectionStage::EndPlatformCapture,
+            } if self.execution_end.is_some() || self.end_capture_error.is_none() => {
+                return Err(LocalPerfRunError::Invalid(
+                    "end-platform-capture rejection must retain an explicit missing-end fact"
+                        .to_owned(),
+                ));
+            }
+            LocalPerfAttemptOutcome::PostExitRejected {
+                stage: LocalPerfRejectionStage::PostRunIdentity,
+            } if self.post_run_identity_verified || self.post_run_identity_error.is_none() => {
+                return Err(LocalPerfRunError::Invalid(
+                    "post-run-identity rejection must retain an explicit verification failure"
+                        .to_owned(),
+                ));
+            }
+            LocalPerfAttemptOutcome::PostExitRejected {
+                stage: LocalPerfRejectionStage::FinishedTimestamp,
+            } if self.finished_timestamp_error.is_none()
+                || self.finished_at_utc != self.started_at_utc =>
+            {
+                return Err(LocalPerfRunError::Invalid(
+                    "finish-timestamp rejection must retain the conservative start-time fallback"
+                        .to_owned(),
+                ));
+            }
+            _ => {}
+        }
+        validate_attempt_build(&self.build)?;
+        let (expected_retry, unavailable) = attempt_derived_facts(self.outcome)?;
+        match (
+            self.outcome,
+            self.bound_evidence_sha256.as_deref(),
+            self.runner_receipt_sha256.as_deref(),
+            self.runner_artifact_manifest_sha256.as_deref(),
+        ) {
+            (LocalPerfAttemptOutcome::Completed, Some(bound), Some(runner), Some(manifest))
+                if is_sha256(bound) && is_sha256(runner) && is_sha256(manifest) =>
+            {
+                if self.execution_end.is_none()
+                    || self.end_capture_error.is_some()
+                    || !self.post_run_identity_verified
+                    || self.post_run_identity_error.is_some()
+                    || self.run_log_sha256.is_none()
+                    || self.finished_timestamp_error.is_some()
+                {
+                    return Err(LocalPerfRunError::Invalid(
+                        "completed attempt requires a terminal snapshot, verified post-run identity, and exact run log"
+                            .to_owned(),
+                    ));
+                }
+            }
+            (LocalPerfAttemptOutcome::Completed, _, _, _) => {
+                return Err(LocalPerfRunError::Invalid(
+                    "completed attempt must bind exact bound-evidence, runner-receipt, and artifact-manifest bytes"
+                        .to_owned(),
+                ));
+            }
+            (_, None, None, None) => {}
+            (_, _, _, _) => {
+                return Err(LocalPerfRunError::Invalid(
+                    "failed attempt must not claim completed bound evidence or nested runner identities"
+                        .to_owned(),
+                ));
+            }
+        }
+        let expected_gaps = LocalPerfInternalLifecycleGaps {
+            actual_work: unavailable,
+            queue: unavailable,
+            workers_joined: unavailable,
+            feed_drained: unavailable,
+            pending_zero: unavailable,
+        };
+        if self.retry != expected_retry
+            || validate_process_lifecycle(
+                self.outcome,
+                self.process_lifecycle,
+                self.run_log_sha256.is_some(),
+            )
+            .is_err()
+            || self.internal_lifecycle_gaps != expected_gaps
+            || self.unsupported_controls
+                != [
+                    LocalPerfUnsupportedControl::Timeout,
+                    LocalPerfUnsupportedControl::Cancellation,
+                ]
+        {
+            return Err(LocalPerfRunError::Invalid(
+                "attempt terminal, retry, process lifecycle, internal gaps, or unsupported-control facts disagree"
+                    .to_owned(),
+            ));
+        }
+        validate_utc_timestamp(&self.started_at_utc, "attempt start")?;
+        validate_utc_timestamp(&self.finished_at_utc, "attempt finish")?;
+        if self.finished_at_utc < self.started_at_utc {
+            return Err(LocalPerfRunError::Invalid(
+                "attempt finish timestamp precedes its start timestamp".to_owned(),
+            ));
+        }
+        if self
+            .finished_timestamp_error
+            .as_deref()
+            .is_some_and(|error| error.is_empty() || error.len() > 240)
+            || (self.finished_timestamp_error.is_some()
+                && self.finished_at_utc != self.started_at_utc)
+        {
+            return Err(LocalPerfRunError::Invalid(
+                "attempt finish-timestamp fallback evidence is contradictory".to_owned(),
+            ));
+        }
+        let mut preimage = self.clone();
+        let expected_seal = preimage.seal_sha256.clone();
+        preimage.seal_sha256.clear();
+        if sha256_hex(&serde_json::to_vec(&preimage)?) != expected_seal {
+            return Err(LocalPerfRunError::Invalid(
+                "attempt receipt content seal does not verify".to_owned(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 /// Encode the strict producer contract advertised by the executing finalizer.
@@ -286,8 +1117,8 @@ pub fn local_perf_producer_contract_json(
 ///
 /// The producer derives and acquires the canonical host-global lease before
 /// validation or benchmark compilation and holds it until every output is
-/// synced. A nonzero or signaled child emits a separately sealed diagnostic
-/// attempt receipt that can never be admitted as promotion evidence.
+/// synced. Every completed or supported failed child emits the same strict
+/// process-attempt schema; only a completed receipt binds admitted evidence.
 ///
 /// # Errors
 ///
@@ -297,10 +1128,40 @@ pub fn local_perf_producer_contract_json(
 pub fn run_local_perf_command(
     config: &LocalPerfRunConfig,
 ) -> Result<LocalPerfRunOutput, LocalPerfRunError> {
+    run_local_perf_command_inner(config, None)
+}
+
+/// Execute and finalize one typed exact-fixture partial-shard invocation.
+///
+/// This is the only supported path that injects `QUILL_PERF_FIXTURE`. The
+/// selector is resolved by exact equality against the frozen canonical matrix;
+/// ambient selector state remains forbidden and is never inherited.
+///
+/// # Errors
+///
+/// Returns the same failures as [`run_local_perf_command`], plus a typed
+/// rejection for unknown or non-applicable fixture selection.
+#[allow(dead_code)]
+pub fn run_selected_local_perf_command(
+    config: &LocalPerfRunConfig,
+    selection: &LocalPerfRunSelection,
+) -> Result<LocalPerfRunOutput, LocalPerfRunError> {
+    run_local_perf_command_inner(config, Some(selection))
+}
+
+// Each Result match assigns a distinct typed receipt rejection stage. Keeping
+// the success value and its error-to-stage mapping together is auditability,
+// not an ad-hoc manual let/else conversion.
+#[allow(clippy::manual_let_else)]
+fn run_local_perf_command_inner(
+    config: &LocalPerfRunConfig,
+    selection: Option<&LocalPerfRunSelection>,
+) -> Result<LocalPerfRunOutput, LocalPerfRunError> {
     validate_bounded_inputs(config)?;
     validate_platform_gate_policy(config)?;
     let registry = MachineClassRegistry::frozen()?;
     let run_profile = resolve_run_profile(config, &registry)?;
+    let run_selection = resolve_run_selection(&run_profile.applicability_plan, selection)?;
     let lease_path = stable_lease_path(config.profile.hardware_class_id())?;
     validate_canonical_lease_parent(&lease_path)?;
     let (lease_file, lease_identity) = acquire_family_lease(&lease_path)?;
@@ -315,6 +1176,7 @@ pub fn run_local_perf_command(
     let artifact_dir = benchmark_artifact_directory_path(&run_directories.artifacts)?;
     let environments = controlled_environments(
         config,
+        &run_selection,
         &source_before,
         &external_paths.target,
         &artifact_dir,
@@ -371,60 +1233,308 @@ pub fn run_local_perf_command(
         .stdout(Stdio::from(run_log))
         .stderr(Stdio::from(run_log_stderr));
     configure_benchmark_child(&mut child, &captured_build.measurement_environment);
-    let status = child.spawn()?.wait()?;
-    run_log_sync.sync_all()?;
-    let run_log_bytes = read_file_at(&run_directories.run.handle, "run.log")?;
-    let exit_code = status.code().map_or(-1, i64::from);
-    write_new_sync_at(
-        &run_directories.run.handle,
-        "exit-status",
-        format!("{exit_code}\n").as_bytes(),
-    )?;
-    if !status.success() {
+    let mut child = match child.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            let run_log_synced = run_log_sync.sync_all().is_ok();
+            let run_log_bytes = read_file_at(&run_directories.run.handle, "run.log").ok();
+            let _ = write_new_sync_at(
+                &run_directories.run.handle,
+                "exit-status",
+                b"spawn-rejected\n",
+            );
+            let outcome = LocalPerfAttemptOutcome::SpawnRejected {
+                error_kind: local_perf_io_error_kind(&error),
+            };
+            let process_lifecycle = LocalPerfProcessLifecycle {
+                spawn_attempted: true,
+                spawn_succeeded: false,
+                wait_completed: false,
+                child_reaped: false,
+                run_log_synced,
+                run_log_captured: run_log_bytes.is_some(),
+            };
+            let attempt_path = write_failed_attempt_receipt(
+                config,
+                &run_profile,
+                &run_selection,
+                &durability,
+                &run_directories,
+                &captured_build,
+                &producer_before,
+                &external_paths,
+                &start,
+                outcome,
+                process_lifecycle,
+                run_log_bytes.as_deref(),
+                &started_at_utc,
+            )?;
+            return Err(LocalPerfRunError::AttemptFailed {
+                receipt_path: attempt_path,
+                outcome,
+            });
+        }
+    };
+    let (status, recovered_wait_error) = match child.wait() {
+        Ok(status) => (status, None),
+        Err(error) => {
+            let wait_error_kind = local_perf_io_error_kind(&error);
+            match force_kill_and_reap(&mut child) {
+                Ok(status) => (status, Some(wait_error_kind)),
+                Err(recovery_error_kind) => {
+                    return Err(LocalPerfRunError::UnreapedChild {
+                        wait_error_kind,
+                        recovery_error_kind,
+                    });
+                }
+            }
+        }
+    };
+    let run_log_synced = run_log_sync.sync_all().is_ok();
+    let run_log_result = read_file_at(&run_directories.run.handle, "run.log");
+    let process_lifecycle = LocalPerfProcessLifecycle {
+        spawn_attempted: true,
+        spawn_succeeded: true,
+        wait_completed: true,
+        child_reaped: true,
+        run_log_synced,
+        run_log_captured: run_log_result.is_ok(),
+    };
+    if !run_log_synced {
+        let outcome = LocalPerfAttemptOutcome::PostExitRejected {
+            stage: LocalPerfRejectionStage::RunLogSync,
+        };
         let attempt_path = write_failed_attempt_receipt(
             config,
+            &run_profile,
+            &run_selection,
+            &durability,
             &run_directories,
             &captured_build,
             &producer_before,
             &external_paths,
             &start,
-            status,
-            &run_log_bytes,
+            outcome,
+            process_lifecycle,
+            run_log_result.as_deref().ok(),
             &started_at_utc,
         )?;
-        return Err(LocalPerfRunError::Invalid(format!(
-            "benchmark child failed; sealed non-promotable attempt receipt preserved at {}",
-            attempt_path.display()
-        )));
+        return Err(LocalPerfRunError::AttemptFailed {
+            receipt_path: attempt_path,
+            outcome,
+        });
+    }
+    let run_log_bytes = match run_log_result {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            let outcome = LocalPerfAttemptOutcome::PostExitRejected {
+                stage: LocalPerfRejectionStage::RunLogRead,
+            };
+            let attempt_path = write_failed_attempt_receipt(
+                config,
+                &run_profile,
+                &run_selection,
+                &durability,
+                &run_directories,
+                &captured_build,
+                &producer_before,
+                &external_paths,
+                &start,
+                outcome,
+                process_lifecycle,
+                None,
+                &started_at_utc,
+            )?;
+            return Err(LocalPerfRunError::AttemptFailed {
+                receipt_path: attempt_path,
+                outcome,
+            });
+        }
+    };
+    let exit_code = status.code().map_or(-1, i64::from);
+    if write_new_sync_at(
+        &run_directories.run.handle,
+        "exit-status",
+        format!("{exit_code}\n").as_bytes(),
+    )
+    .is_err()
+    {
+        let outcome = LocalPerfAttemptOutcome::PostExitRejected {
+            stage: LocalPerfRejectionStage::ExitStatusPersistence,
+        };
+        let attempt_path = write_failed_attempt_receipt(
+            config,
+            &run_profile,
+            &run_selection,
+            &durability,
+            &run_directories,
+            &captured_build,
+            &producer_before,
+            &external_paths,
+            &start,
+            outcome,
+            process_lifecycle,
+            Some(&run_log_bytes),
+            &started_at_utc,
+        )?;
+        return Err(LocalPerfRunError::AttemptFailed {
+            receipt_path: attempt_path,
+            outcome,
+        });
+    }
+    if let Some(error_kind) = recovered_wait_error {
+        let outcome = LocalPerfAttemptOutcome::WaitRecoveredByKill { error_kind };
+        let attempt_path = write_failed_attempt_receipt(
+            config,
+            &run_profile,
+            &run_selection,
+            &durability,
+            &run_directories,
+            &captured_build,
+            &producer_before,
+            &external_paths,
+            &start,
+            outcome,
+            process_lifecycle,
+            Some(&run_log_bytes),
+            &started_at_utc,
+        )?;
+        return Err(LocalPerfRunError::AttemptFailed {
+            receipt_path: attempt_path,
+            outcome,
+        });
+    }
+    if !status.success() {
+        let outcome = status.code().map_or_else(
+            || {
+                status
+                    .signal()
+                    .map_or(LocalPerfAttemptOutcome::UnknownTerminal, |signal| {
+                        LocalPerfAttemptOutcome::Signaled { signal }
+                    })
+            },
+            |code| LocalPerfAttemptOutcome::ExitedNonzero {
+                code: i64::from(code),
+            },
+        );
+        let attempt_path = write_failed_attempt_receipt(
+            config,
+            &run_profile,
+            &run_selection,
+            &durability,
+            &run_directories,
+            &captured_build,
+            &producer_before,
+            &external_paths,
+            &start,
+            outcome,
+            process_lifecycle,
+            Some(&run_log_bytes),
+            &started_at_utc,
+        )?;
+        return Err(LocalPerfRunError::AttemptFailed {
+            receipt_path: attempt_path,
+            outcome,
+        });
     }
 
-    let end = capture_platform(config)?;
-    let finished_at_utc = utc_now()?;
-    verify_prepared_build(&captured_build, &producer_before, &external_paths.target)?;
+    let post_exit_rejection = |stage| -> Result<LocalPerfRunError, LocalPerfRunError> {
+        let outcome = LocalPerfAttemptOutcome::PostExitRejected { stage };
+        let receipt_path = write_failed_attempt_receipt(
+            config,
+            &run_profile,
+            &run_selection,
+            &durability,
+            &run_directories,
+            &captured_build,
+            &producer_before,
+            &external_paths,
+            &start,
+            outcome,
+            process_lifecycle,
+            Some(&run_log_bytes),
+            &started_at_utc,
+        )?;
+        Ok(LocalPerfRunError::AttemptFailed {
+            receipt_path,
+            outcome,
+        })
+    };
+    let end = match capture_platform(config) {
+        Ok(end) => end,
+        Err(_) => {
+            return Err(post_exit_rejection(
+                LocalPerfRejectionStage::EndPlatformCapture,
+            )?);
+        }
+    };
+    let finished_at_utc = match utc_now() {
+        Ok(timestamp) => timestamp,
+        Err(_) => {
+            return Err(post_exit_rejection(
+                LocalPerfRejectionStage::FinishedTimestamp,
+            )?);
+        }
+    };
+    if verify_prepared_build(&captured_build, &producer_before, &external_paths.target).is_err() {
+        return Err(post_exit_rejection(
+            LocalPerfRejectionStage::PostRunIdentity,
+        )?);
+    }
     if start.hardware != end.hardware
         || start.request != end.request
         || start.snapshot != end.snapshot
     {
-        return Err(LocalPerfRunError::Invalid(
-            "hardware, execution, or clean build identity drifted across the measured child"
-                .to_owned(),
-        ));
+        return Err(post_exit_rejection(
+            LocalPerfRejectionStage::PostRunIdentity,
+        )?);
     }
 
     let threshold_name = format!("{}.json", config.gate.label());
     let evidence_name = format!("{}.evidence.json", config.gate.label());
-    let threshold_bytes = read_file_at(&run_directories.artifacts.handle, &threshold_name)?;
-    let evidence_bytes = read_file_at(&run_directories.artifacts.handle, &evidence_name)?;
-    let threshold = read_canonical_threshold(&threshold_bytes)?;
-    let evidence = read_canonical_evidence(&evidence_bytes)?;
-    validate_child_artifacts(
+    let threshold_path = run_directories.artifacts.path.join(&threshold_name);
+    let prebinding_evidence_path = run_directories.artifacts.path.join(&evidence_name);
+    let durable_child_artifacts = match read_and_sync_child_artifacts(
+        &run_directories.artifacts.handle,
+        &threshold_name,
+        &evidence_name,
+    ) {
+        Ok(artifacts) => artifacts,
+        Err(stage) => return Err(post_exit_rejection(stage)?),
+    };
+    let threshold_bytes = durable_child_artifacts.threshold_bytes;
+    let evidence_bytes = durable_child_artifacts.evidence_bytes;
+    let threshold = match read_canonical_threshold(&threshold_bytes) {
+        Ok(threshold) => threshold,
+        Err(_) => {
+            return Err(post_exit_rejection(
+                LocalPerfRejectionStage::ArtifactVerification,
+            )?);
+        }
+    };
+    let evidence = match read_canonical_evidence(&evidence_bytes) {
+        Ok(evidence) => evidence,
+        Err(_) => {
+            return Err(post_exit_rejection(
+                LocalPerfRejectionStage::ArtifactVerification,
+            )?);
+        }
+    };
+    if validate_child_artifacts(
         config,
         &run_profile,
+        &run_selection,
         &captured_build,
         &start,
         &threshold,
         &evidence,
-    )?;
+    )
+    .is_err()
+    {
+        return Err(post_exit_rejection(
+            LocalPerfRejectionStage::ArtifactVerification,
+        )?);
+    }
 
     let artifact_manifest = RunnerArtifactManifest::from_artifacts(
         config.gate.label(),
@@ -435,16 +1545,33 @@ pub fn run_local_perf_command(
         &threshold_bytes,
         &evidence_bytes,
     );
-    let artifact_manifest_bytes = artifact_manifest.to_json_bytes()?;
-    verify_prepared_build(&captured_build, &producer_before, &external_paths.target)?;
-    let producer_identity_sha256 =
-        sha256_hex(&serde_json::to_vec(&captured_build.receipt.producer)?);
+    let artifact_manifest_bytes = match artifact_manifest.to_json_bytes() {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            return Err(post_exit_rejection(
+                LocalPerfRejectionStage::ArtifactManifestSerialization,
+            )?);
+        }
+    };
+    if verify_prepared_build(&captured_build, &producer_before, &external_paths.target).is_err() {
+        return Err(post_exit_rejection(
+            LocalPerfRejectionStage::PostRunIdentity,
+        )?);
+    }
+    let producer_identity_sha256 = match serde_json::to_vec(&captured_build.receipt.producer) {
+        Ok(bytes) => sha256_hex(&bytes),
+        Err(_) => {
+            return Err(post_exit_rejection(
+                LocalPerfRejectionStage::PrecommitSerialization,
+            )?);
+        }
+    };
     let receipt = RunnerReceipt {
         schema_version: RUNNER_RECEIPT_SCHEMA_VERSION.to_owned(),
         requested_profile: config.profile,
         derived_profile: config.profile,
         registry_sha256: MACHINE_CLASS_REGISTRY_SHA256.to_owned(),
-        hardware: start.hardware,
+        hardware: start.hardware.clone(),
         execution: RunnerExecution {
             request: start.request.clone(),
             start: start.snapshot.clone(),
@@ -452,33 +1579,69 @@ pub fn run_local_perf_command(
             identity_sha256: String::new(),
         },
         build: captured_build.receipt.clone(),
-        durability,
+        durability: durability.clone(),
         completion: RunnerCompletion {
             verified: true,
             exit_status: exit_code,
             run_log_sha256: sha256_hex(&run_log_bytes),
             artifact_manifest_sha256: sha256_hex(&artifact_manifest_bytes),
             artifact_digests_verified: true,
-            started_at_utc,
-            finished_at_utc,
+            started_at_utc: started_at_utc.clone(),
+            finished_at_utc: finished_at_utc.clone(),
         },
     };
-    let receipt_bytes = seal_runner_receipt(receipt)?;
-    let identity = registry.admit(&receipt_bytes, &context)?;
-    pre_spawn.verify_final(&identity)?;
-    let identity = identity.bind_artifact_manifest(
+    let receipt_bytes = match seal_runner_receipt(receipt) {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            return Err(post_exit_rejection(
+                LocalPerfRejectionStage::RunnerReceiptSerialization,
+            )?);
+        }
+    };
+    let identity = match registry.admit(&receipt_bytes, &context) {
+        Ok(identity) => identity,
+        Err(_) => {
+            return Err(post_exit_rejection(
+                LocalPerfRejectionStage::RunnerAdmission,
+            )?);
+        }
+    };
+    if pre_spawn.verify_final(&identity).is_err() {
+        return Err(post_exit_rejection(
+            LocalPerfRejectionStage::RunnerAdmission,
+        )?);
+    }
+    let identity = match identity.bind_artifact_manifest(
         &artifact_manifest_bytes,
         &run_log_bytes,
         &threshold_bytes,
         &evidence_bytes,
-    )?;
+    ) {
+        Ok(identity) => identity,
+        Err(_) => {
+            return Err(post_exit_rejection(
+                LocalPerfRejectionStage::RunnerAdmission,
+            )?);
+        }
+    };
     let mut bound_preview = evidence;
-    let bound_evidence_bytes = bound_preview.bind_machine_class_identity_and_seal(
+    let bound_evidence_bytes = match bound_preview.bind_machine_class_identity_and_seal(
         identity,
         &threshold_bytes,
         &evidence_bytes,
-    )?;
-    PerfEvidenceArtifact::from_verified_slice(&bound_evidence_bytes)?;
+    ) {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            return Err(post_exit_rejection(
+                LocalPerfRejectionStage::BoundEvidenceSerialization,
+            )?);
+        }
+    };
+    if PerfEvidenceArtifact::from_verified_slice(&bound_evidence_bytes).is_err() {
+        return Err(post_exit_rejection(
+            LocalPerfRejectionStage::ArtifactVerification,
+        )?);
+    }
 
     let manifest_path = config
         .output_dir
@@ -486,14 +1649,19 @@ pub fn run_local_perf_command(
     let receipt_path = config
         .output_dir
         .join(format!("{}.runner.json", config.gate.label()));
+    let bound_evidence_path = config
+        .output_dir
+        .join(format!("{}.bound.evidence.json", config.gate.label()));
     let inventory_path = config.output_dir.join("PRECOMMIT.json");
     let inventory = PrecommitInventory {
-        schema_version: "frankensearch.perf-run-precommit.v4".to_owned(),
+        schema_version: "frankensearch.perf-run-precommit.v5".to_owned(),
         gate: config.gate.label().to_owned(),
         profile: config.profile,
         execution_capacity: run_profile.execution_capacity,
         max_exercised_cell_width: run_profile.max_exercised_cell_width,
         applicability_plan: run_profile.applicability_plan.binding().clone(),
+        fixture_selector: run_selection.fixture.clone(),
+        selected_cell_ids: run_selection.selected_cell_ids.clone(),
         run_id: config.run_id.clone(),
         run_window: config.run_window.clone(),
         run_log_sha256: sha256_hex(&run_log_bytes),
@@ -505,41 +1673,220 @@ pub fn run_local_perf_command(
         bound_evidence_preview_sha256: sha256_hex(&bound_evidence_bytes),
         environment_policy_sha256: captured_build.receipt.environment_sha256.clone(),
     };
-    let inventory_bytes = serde_json::to_vec_pretty(&inventory)?;
+    let inventory_bytes = match serde_json::to_vec_pretty(&inventory) {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            return Err(post_exit_rejection(
+                LocalPerfRejectionStage::PrecommitSerialization,
+            )?);
+        }
+    };
+    let completed_attempt_bytes = match completed_attempt_receipt_bytes(
+        config,
+        &run_profile,
+        &run_selection,
+        &durability,
+        &captured_build,
+        &start,
+        &end,
+        &bound_evidence_bytes,
+        &run_log_bytes,
+        &started_at_utc,
+        &finished_at_utc,
+    ) {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            return Err(post_exit_rejection(
+                LocalPerfRejectionStage::AttemptReceiptPersistence,
+            )?);
+        }
+    };
 
-    // The receipt is the required commit boundary consumed by the ratchet.
-    // Everything it binds must be durable before it is created. A crash before
-    // the final write can leave diagnostics or PRECOMMIT.json, but cannot leave
-    // a promotable run.
-    let manifest_name = manifest_path
-        .file_name()
-        .ok_or_else(|| LocalPerfRunError::Invalid("manifest path has no basename".to_owned()))?;
-    let inventory_name = inventory_path
-        .file_name()
-        .ok_or_else(|| LocalPerfRunError::Invalid("inventory path has no basename".to_owned()))?;
-    let receipt_name = receipt_path
-        .file_name()
-        .ok_or_else(|| LocalPerfRunError::Invalid("receipt path has no basename".to_owned()))?;
-    write_new_sync_at(
+    // The child files and artifact directory were synced before the nested
+    // runner receipt was created. Raw diagnostic artifacts, the nested runner
+    // receipt, and exact bound evidence are then made durable in that order.
+    // Bound evidence alone is orphan-ineligible. The sole attempt receipt is
+    // atomically published last, so only the verified receipt/evidence pair is
+    // a complete H4 shard.
+    let Some(manifest_name) = manifest_path.file_name() else {
+        return Err(post_exit_rejection(
+            LocalPerfRejectionStage::PrecommitSerialization,
+        )?);
+    };
+    let Some(inventory_name) = inventory_path.file_name() else {
+        return Err(post_exit_rejection(
+            LocalPerfRejectionStage::PrecommitSerialization,
+        )?);
+    };
+    let Some(receipt_name) = receipt_path.file_name() else {
+        return Err(post_exit_rejection(
+            LocalPerfRejectionStage::RunnerReceiptPersistence,
+        )?);
+    };
+    let Some(bound_evidence_name) = bound_evidence_path.file_name() else {
+        return Err(post_exit_rejection(
+            LocalPerfRejectionStage::BoundEvidencePersistence,
+        )?);
+    };
+    if write_new_sync_at(
         &run_directories.run.handle,
         manifest_name,
         &artifact_manifest_bytes,
-    )?;
-    write_new_sync_at(
+    )
+    .and_then(|()| {
+        write_new_sync_at(
+            &run_directories.run.handle,
+            inventory_name,
+            &inventory_bytes,
+        )
+    })
+    .and_then(|()| {
+        run_directories
+            .run
+            .handle
+            .sync_all()
+            .map_err(LocalPerfRunError::from)
+    })
+    .is_err()
+    {
+        return Err(post_exit_rejection(
+            LocalPerfRejectionStage::PrecommitPersistence,
+        )?);
+    }
+    if verify_family_lease_path(&lease_path, &lease_identity)
+        .and_then(|()| verify_external_paths(&external_paths))
+        .and_then(|()| verify_run_directories(config, &run_directories))
+        .and_then(|()| {
+            verify_prepared_build(&captured_build, &producer_before, &external_paths.target)
+        })
+        .and_then(|()| verify_environment_policy(&run_directories.run.handle, &captured_build))
+        .is_err()
+    {
+        return Err(post_exit_rejection(
+            LocalPerfRejectionStage::PostRunIdentity,
+        )?);
+    }
+    if write_new_sync_at(&run_directories.run.handle, receipt_name, &receipt_bytes)
+        .and_then(|()| {
+            run_directories
+                .run
+                .handle
+                .sync_all()
+                .map_err(LocalPerfRunError::from)
+        })
+        .is_err()
+    {
+        return Err(post_exit_rejection(
+            LocalPerfRejectionStage::RunnerReceiptPersistence,
+        )?);
+    }
+    if verify_external_paths(&external_paths)
+        .and_then(|()| verify_run_directories(config, &run_directories))
+        .and_then(|()| {
+            verify_prepared_build(&captured_build, &producer_before, &external_paths.target)
+        })
+        .and_then(|()| verify_environment_policy(&run_directories.run.handle, &captured_build))
+        .is_err()
+    {
+        return Err(post_exit_rejection(
+            LocalPerfRejectionStage::PostRunIdentity,
+        )?);
+    }
+    if write_new_sync_at(
         &run_directories.run.handle,
-        inventory_name,
-        &inventory_bytes,
-    )?;
-    run_directories.run.handle.sync_all()?;
-    verify_family_lease_path(&lease_path, &lease_identity)?;
-    verify_external_paths(&external_paths)?;
-    verify_run_directories(config, &run_directories)?;
-    verify_prepared_build(&captured_build, &producer_before, &external_paths.target)?;
-    verify_environment_policy(&run_directories.run.handle, &captured_build)?;
-    write_new_sync_at(&run_directories.run.handle, receipt_name, &receipt_bytes)?;
-    run_directories.run.handle.sync_all()?;
-    verify_external_paths(&external_paths)?;
-    verify_run_directories(config, &run_directories)?;
+        bound_evidence_name,
+        &bound_evidence_bytes,
+    )
+    .and_then(|()| {
+        run_directories
+            .run
+            .handle
+            .sync_all()
+            .map_err(LocalPerfRunError::from)
+    })
+    .is_err()
+    {
+        return Err(post_exit_rejection(
+            LocalPerfRejectionStage::BoundEvidencePersistence,
+        )?);
+    }
+    let persisted_bound = match read_file_at(&run_directories.run.handle, bound_evidence_name) {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            return Err(post_exit_rejection(
+                LocalPerfRejectionStage::PersistedPairVerification,
+            )?);
+        }
+    };
+    if persisted_bound != bound_evidence_bytes
+        || PerfEvidenceArtifact::from_verified_slice(&persisted_bound).is_err()
+    {
+        return Err(post_exit_rejection(
+            LocalPerfRejectionStage::PersistedPairVerification,
+        )?);
+    }
+    let completed_attempt =
+        match LocalPerfAttemptReceipt::from_verified_slice(&completed_attempt_bytes) {
+            Ok(receipt) => receipt,
+            Err(_) => {
+                return Err(post_exit_rejection(
+                    LocalPerfRejectionStage::PersistedPairVerification,
+                )?);
+            }
+        };
+    if completed_attempt.verify_run_log(&run_log_bytes).is_err()
+        || completed_attempt
+            .verify_bound_evidence(&persisted_bound)
+            .is_err()
+        || verify_external_paths(&external_paths).is_err()
+        || verify_run_directories(config, &run_directories).is_err()
+    {
+        return Err(post_exit_rejection(
+            LocalPerfRejectionStage::PersistedPairVerification,
+        )?);
+    }
+    let attempt_receipt_path = config
+        .output_dir
+        .join(format!("{}.attempt.json", config.gate.label()));
+    let attempt_pending_name = format!("{}.attempt.pending", config.gate.label());
+    let attempt_name = format!("{}.attempt.json", config.gate.label());
+    if let Err(error) = atomically_publish_new_sync_at(
+        &run_directories.run.handle,
+        &attempt_pending_name,
+        &attempt_name,
+        &completed_attempt_bytes,
+    ) {
+        return Err(LocalPerfRunError::AttemptCommitFailed {
+            receipt_path: attempt_receipt_path,
+            outcome: LocalPerfAttemptOutcome::PostExitRejected {
+                stage: LocalPerfRejectionStage::AttemptReceiptPersistence,
+            },
+            detail: bounded_diagnostic(&error),
+        });
+    }
+    let persisted_attempt =
+        read_file_at(&run_directories.run.handle, &attempt_name).map_err(|error| {
+            LocalPerfRunError::AttemptCommitFailed {
+                receipt_path: attempt_receipt_path.clone(),
+                outcome: LocalPerfAttemptOutcome::PostExitRejected {
+                    stage: LocalPerfRejectionStage::PersistedPairVerification,
+                },
+                detail: bounded_diagnostic(&error),
+            }
+        })?;
+    if persisted_attempt != completed_attempt_bytes
+        || LocalPerfAttemptReceipt::from_verified_slice(&persisted_attempt)
+            .and_then(|receipt| receipt.verify_bound_evidence(&persisted_bound))
+            .is_err()
+    {
+        return Err(LocalPerfRunError::AttemptCommitFailed {
+            receipt_path: attempt_receipt_path.clone(),
+            outcome: LocalPerfAttemptOutcome::PostExitRejected {
+                stage: LocalPerfRejectionStage::PersistedPairVerification,
+            },
+            detail: "persisted final attempt/evidence pair failed exact verification".to_owned(),
+        });
+    }
 
     drop(lease_file);
     Ok(LocalPerfRunOutput {
@@ -547,6 +1894,10 @@ pub fn run_local_perf_command(
         artifact_manifest: manifest_path,
         environment_policy: environment_policy_path,
         runner_receipt: receipt_path,
+        attempt_receipt: attempt_receipt_path,
+        threshold_artifact: threshold_path,
+        prebinding_evidence: prebinding_evidence_path,
+        bound_evidence: bound_evidence_path,
         precommit_inventory: inventory_path,
     })
 }
@@ -1010,6 +2361,7 @@ fn ambient_variable_is_forbidden(name: &[u8]) -> bool {
 
 fn controlled_environments(
     config: &LocalPerfRunConfig,
+    selection: &ResolvedRunSelection,
     source: &CleanSourceSnapshot,
     target: &PinnedDirectory,
     artifact_dir: &Path,
@@ -1072,6 +2424,7 @@ fn controlled_environments(
         "QUILL_PERF_GATE",
         OsStr::new(config.gate.label()),
     );
+    apply_run_selection_environment(&mut measurement, selection);
     insert_environment(&mut measurement, "QUILL_PERF_SCALE", OsStr::new("full"));
     insert_environment(
         &mut measurement,
@@ -1458,6 +2811,16 @@ fn validate_absolute_path_list(path: &str) -> Result<(), LocalPerfRunError> {
 
 fn insert_environment(environment: &mut BTreeMap<OsString, OsString>, name: &str, value: &OsStr) {
     environment.insert(OsString::from(name), value.to_os_string());
+}
+
+fn apply_run_selection_environment(
+    environment: &mut BTreeMap<OsString, OsString>,
+    selection: &ResolvedRunSelection,
+) {
+    environment.remove(OsStr::new("QUILL_PERF_FIXTURE"));
+    if let Some(fixture) = &selection.fixture {
+        insert_environment(environment, "QUILL_PERF_FIXTURE", OsStr::new(fixture));
+    }
 }
 
 fn bind_build_rustc(environment: &mut BTreeMap<OsString, OsString>, rustc: &ResolvedTool) {
@@ -2269,6 +3632,7 @@ fn read_canonical_evidence(bytes: &[u8]) -> Result<PerfEvidenceArtifact, LocalPe
 fn validate_child_artifacts(
     config: &LocalPerfRunConfig,
     run_profile: &RunProfileContract,
+    run_selection: &ResolvedRunSelection,
     build: &CapturedBuild,
     platform: &PlatformCapture,
     threshold: &PerfGateArtifact,
@@ -2291,6 +3655,7 @@ fn validate_child_artifacts(
             != Some(build.receipt.cargo_lock_sha256.as_str())
         || threshold.applicability_plan.as_ref() != Some(run_profile.applicability_plan.binding())
         || evidence.applicability_plan != *run_profile.applicability_plan.binding()
+        || evidence_cell_ids(evidence) != run_selection.selected_cell_ids
         || threshold.execution.as_ref() != Some(&evidence.provenance.machine.execution)
         || evidence.provenance.machine.os != platform.hardware.os
         || evidence.provenance.machine.arch != platform.hardware.arch
@@ -2600,7 +3965,33 @@ fn write_new_sync_at(
     Ok(())
 }
 
+fn atomically_publish_new_sync_at(
+    directory: &File,
+    pending_name: impl AsRef<Path>,
+    final_name: impl AsRef<Path>,
+    bytes: &[u8],
+) -> Result<(), LocalPerfRunError> {
+    write_new_sync_at(directory, pending_name.as_ref(), bytes)?;
+    renameat_with(
+        directory,
+        pending_name.as_ref(),
+        directory,
+        final_name.as_ref(),
+        RenameFlags::NOREPLACE,
+    )
+    .map_err(std::io::Error::from)?;
+    directory.sync_all()?;
+    Ok(())
+}
+
 fn read_file_at(directory: &File, name: impl AsRef<Path>) -> Result<Vec<u8>, LocalPerfRunError> {
+    read_file_with_handle_at(directory, name).map(|(_, bytes)| bytes)
+}
+
+fn read_file_with_handle_at(
+    directory: &File,
+    name: impl AsRef<Path>,
+) -> Result<(File, Vec<u8>), LocalPerfRunError> {
     let file = openat(
         directory,
         name.as_ref(),
@@ -2620,7 +4011,39 @@ fn read_file_at(directory: &File, name: impl AsRef<Path>) -> Result<Vec<u8>, Loc
     }
     let mut bytes = Vec::new();
     file.read_to_end(&mut bytes)?;
-    Ok(bytes)
+    Ok((file, bytes))
+}
+
+#[derive(Debug)]
+struct DurableChildArtifacts {
+    threshold_bytes: Vec<u8>,
+    evidence_bytes: Vec<u8>,
+}
+
+fn read_and_sync_child_artifacts(
+    artifact_directory: &File,
+    threshold_name: &str,
+    evidence_name: &str,
+) -> Result<DurableChildArtifacts, LocalPerfRejectionStage> {
+    let (threshold_file, threshold_bytes) =
+        read_file_with_handle_at(artifact_directory, threshold_name)
+            .map_err(|_| LocalPerfRejectionStage::ArtifactRead)?;
+    threshold_file
+        .sync_all()
+        .map_err(|_| LocalPerfRejectionStage::ArtifactDurability)?;
+    let (evidence_file, evidence_bytes) =
+        read_file_with_handle_at(artifact_directory, evidence_name)
+            .map_err(|_| LocalPerfRejectionStage::ArtifactRead)?;
+    evidence_file
+        .sync_all()
+        .map_err(|_| LocalPerfRejectionStage::ArtifactDurability)?;
+    artifact_directory
+        .sync_all()
+        .map_err(|_| LocalPerfRejectionStage::ArtifactDurability)?;
+    Ok(DurableChildArtifacts {
+        threshold_bytes,
+        evidence_bytes,
+    })
 }
 
 fn verify_environment_policy(
@@ -2641,52 +4064,281 @@ fn verify_environment_policy(
 
 fn write_failed_attempt_receipt(
     config: &LocalPerfRunConfig,
+    run_profile: &RunProfileContract,
+    run_selection: &ResolvedRunSelection,
+    durability: &RunnerDurability,
     directories: &RunDirectories,
     build: &CapturedBuild,
     producer: &ExecutingProducer,
     paths: &ExternalRunPaths,
     start: &PlatformCapture,
-    status: std::process::ExitStatus,
-    run_log_bytes: &[u8],
+    outcome: LocalPerfAttemptOutcome,
+    process_lifecycle: LocalPerfProcessLifecycle,
+    run_log_bytes: Option<&[u8]>,
     started_at_utc: &str,
 ) -> Result<PathBuf, LocalPerfRunError> {
-    let finished_at_utc = utc_now()?;
-    let end = capture_platform(config);
-    let (execution_end, end_capture_error) = match end {
-        Ok(end) if end.hardware == start.hardware && end.request == start.request => {
-            (Some(end.snapshot), None)
+    let (finished_at_utc, finished_timestamp_error) = if matches!(
+        outcome,
+        LocalPerfAttemptOutcome::PostExitRejected {
+            stage: LocalPerfRejectionStage::FinishedTimestamp
         }
-        Ok(_) => (
+    ) {
+        (
+            started_at_utc.to_owned(),
+            Some("finish timestamp capture rejected before receipt finalization".to_owned()),
+        )
+    } else {
+        match utc_now() {
+            Ok(timestamp) => (timestamp, None),
+            Err(error) => (started_at_utc.to_owned(), Some(bounded_diagnostic(&error))),
+        }
+    };
+    let (execution_end, end_capture_error) = if matches!(
+        outcome,
+        LocalPerfAttemptOutcome::PostExitRejected {
+            stage: LocalPerfRejectionStage::EndPlatformCapture
+        }
+    ) {
+        (
             None,
-            Some("end hardware or execution request drifted".to_owned()),
-        ),
-        Err(error) => (None, Some(bounded_diagnostic(&error))),
+            Some("end platform capture rejected before receipt finalization".to_owned()),
+        )
+    } else {
+        match capture_platform(config) {
+            Ok(end) if end.hardware == start.hardware && end.request == start.request => {
+                (Some(end.snapshot), None)
+            }
+            Ok(_) => (
+                None,
+                Some("end hardware or execution request drifted".to_owned()),
+            ),
+            Err(error) => (None, Some(bounded_diagnostic(&error))),
+        }
     };
-    let post_identity = verify_external_paths(paths)
-        .and_then(|()| verify_run_directories(config, directories))
-        .and_then(|()| verify_prepared_build(build, producer, &paths.target))
-        .and_then(|()| verify_environment_policy(&directories.run.handle, build));
-    let (post_run_identity_verified, post_run_identity_error) = match post_identity {
-        Ok(()) => (true, None),
-        Err(error) => (false, Some(bounded_diagnostic(&error))),
+    let (post_run_identity_verified, post_run_identity_error) = if matches!(
+        outcome,
+        LocalPerfAttemptOutcome::PostExitRejected {
+            stage: LocalPerfRejectionStage::PostRunIdentity
+        }
+    ) {
+        (
+            false,
+            Some("post-run source or executable identity verification rejected".to_owned()),
+        )
+    } else {
+        let post_identity = verify_external_paths(paths)
+            .and_then(|()| verify_run_directories(config, directories))
+            .and_then(|()| verify_prepared_build(build, producer, &paths.target))
+            .and_then(|()| verify_environment_policy(&directories.run.handle, build));
+        match post_identity {
+            Ok(()) => (true, None),
+            Err(error) => (false, Some(bounded_diagnostic(&error))),
+        }
     };
-    let termination = status.code().map_or_else(
-        || {
-            status
-                .signal()
-                .map_or(RunnerAttemptTermination::Unknown, |signal| {
-                    RunnerAttemptTermination::Signaled { signal }
-                })
+    let receipt_path = config
+        .output_dir
+        .join(format!("{}.attempt.json", config.gate.label()));
+    persist_attempt_receipt(
+        config,
+        run_profile,
+        durability,
+        directories,
+        build,
+        start,
+        execution_end,
+        end_capture_error,
+        post_run_identity_verified,
+        post_run_identity_error,
+        outcome,
+        run_selection,
+        process_lifecycle,
+        run_log_bytes,
+        None,
+        started_at_utc,
+        &finished_at_utc,
+        finished_timestamp_error,
+    )
+    .map_err(|error| LocalPerfRunError::AttemptCommitFailed {
+        receipt_path,
+        outcome,
+        detail: bounded_diagnostic(&error),
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn completed_attempt_receipt_bytes(
+    config: &LocalPerfRunConfig,
+    run_profile: &RunProfileContract,
+    run_selection: &ResolvedRunSelection,
+    durability: &RunnerDurability,
+    build: &CapturedBuild,
+    start: &PlatformCapture,
+    end: &PlatformCapture,
+    bound_evidence_bytes: &[u8],
+    run_log_bytes: &[u8],
+    started_at_utc: &str,
+    finished_at_utc: &str,
+) -> Result<Vec<u8>, LocalPerfRunError> {
+    let evidence = PerfEvidenceArtifact::from_verified_slice(bound_evidence_bytes)?;
+    if evidence.gate != config.gate
+        || evidence.applicability_plan != *run_profile.applicability_plan.binding()
+        || evidence.provenance.run_id != config.run_id
+        || evidence.provenance.run_window != config.run_window
+    {
+        return Err(LocalPerfRunError::Invalid(
+            "completed bound evidence differs from the runner gate, plan, or run identity"
+                .to_owned(),
+        ));
+    }
+    let selected = evidence_cell_ids(&evidence);
+    validate_selected_cell_ids(
+        &selected,
+        &selected_cell_ids(&run_profile.applicability_plan),
+    )?;
+    if selected != run_selection.selected_cell_ids {
+        return Err(LocalPerfRunError::Invalid(
+            "completed bound evidence cells differ from the frozen typed selection".to_owned(),
+        ));
+    }
+    let identity = evidence.machine_class.identity().ok_or_else(|| {
+        LocalPerfRunError::Invalid(
+            "completed bound evidence has no admitted runner identity".to_owned(),
+        )
+    })?;
+    if identity.artifact_manifest().is_none() {
+        return Err(LocalPerfRunError::Invalid(
+            "completed bound evidence runner identity has no artifact manifest".to_owned(),
+        ));
+    }
+    build_attempt_receipt_bytes(
+        config,
+        run_profile,
+        durability,
+        build,
+        start,
+        Some(end.snapshot.clone()),
+        None,
+        true,
+        None,
+        LocalPerfAttemptOutcome::Completed,
+        run_selection,
+        LocalPerfProcessLifecycle {
+            spawn_attempted: true,
+            spawn_succeeded: true,
+            wait_completed: true,
+            child_reaped: true,
+            run_log_synced: true,
+            run_log_captured: true,
         },
-        |code| RunnerAttemptTermination::Exited {
-            code: i64::from(code),
-        },
-    );
-    let receipt = RunnerAttemptReceipt {
-        schema_version: ATTEMPT_RECEIPT_SCHEMA_VERSION.to_owned(),
+        Some(run_log_bytes),
+        Some(bound_evidence_bytes),
+        started_at_utc,
+        finished_at_utc,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn persist_attempt_receipt(
+    config: &LocalPerfRunConfig,
+    run_profile: &RunProfileContract,
+    durability: &RunnerDurability,
+    directories: &RunDirectories,
+    build: &CapturedBuild,
+    start: &PlatformCapture,
+    execution_end: Option<RunnerExecutionSnapshot>,
+    end_capture_error: Option<String>,
+    post_run_identity_verified: bool,
+    post_run_identity_error: Option<String>,
+    outcome: LocalPerfAttemptOutcome,
+    run_selection: &ResolvedRunSelection,
+    process_lifecycle: LocalPerfProcessLifecycle,
+    run_log_bytes: Option<&[u8]>,
+    completed_bound_evidence: Option<&[u8]>,
+    started_at_utc: &str,
+    finished_at_utc: &str,
+    finished_timestamp_error: Option<String>,
+) -> Result<PathBuf, LocalPerfRunError> {
+    let receipt_bytes = build_attempt_receipt_bytes(
+        config,
+        run_profile,
+        durability,
+        build,
+        start,
+        execution_end,
+        end_capture_error,
+        post_run_identity_verified,
+        post_run_identity_error,
+        outcome,
+        run_selection,
+        process_lifecycle,
+        run_log_bytes,
+        completed_bound_evidence,
+        started_at_utc,
+        finished_at_utc,
+        finished_timestamp_error,
+    )?;
+    let receipt_name = format!("{}.attempt.json", config.gate.label());
+    let pending_name = format!("{}.attempt.pending", config.gate.label());
+    atomically_publish_new_sync_at(
+        &directories.run.handle,
+        &pending_name,
+        &receipt_name,
+        &receipt_bytes,
+    )?;
+    Ok(config.output_dir.join(receipt_name))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_attempt_receipt_bytes(
+    config: &LocalPerfRunConfig,
+    run_profile: &RunProfileContract,
+    durability: &RunnerDurability,
+    build: &CapturedBuild,
+    start: &PlatformCapture,
+    execution_end: Option<RunnerExecutionSnapshot>,
+    end_capture_error: Option<String>,
+    post_run_identity_verified: bool,
+    post_run_identity_error: Option<String>,
+    outcome: LocalPerfAttemptOutcome,
+    run_selection: &ResolvedRunSelection,
+    process_lifecycle: LocalPerfProcessLifecycle,
+    run_log_bytes: Option<&[u8]>,
+    completed_bound_evidence: Option<&[u8]>,
+    started_at_utc: &str,
+    finished_at_utc: &str,
+    finished_timestamp_error: Option<String>,
+) -> Result<Vec<u8>, LocalPerfRunError> {
+    let (retry, unavailable) = attempt_derived_facts(outcome)?;
+    let (bound_evidence_sha256, runner_receipt_sha256, runner_artifact_manifest_sha256) =
+        if let Some(bound_evidence_bytes) = completed_bound_evidence {
+            let evidence = PerfEvidenceArtifact::from_verified_slice(bound_evidence_bytes)?;
+            let identity = evidence.machine_class.identity().ok_or_else(|| {
+                LocalPerfRunError::Invalid(
+                    "completed attempt evidence has no admitted runner identity".to_owned(),
+                )
+            })?;
+            let manifest = identity.artifact_manifest().ok_or_else(|| {
+                LocalPerfRunError::Invalid(
+                    "completed attempt runner identity has no artifact-manifest binding".to_owned(),
+                )
+            })?;
+            (
+                Some(sha256_hex(bound_evidence_bytes)),
+                Some(identity.receipt_sha256().to_owned()),
+                Some(manifest.manifest_sha256().to_owned()),
+            )
+        } else {
+            (None, None, None)
+        };
+    let receipt = LocalPerfAttemptReceipt {
+        schema_version: LOCAL_PERF_ATTEMPT_RECEIPT_SCHEMA_VERSION.to_owned(),
         mode: "measurement".to_owned(),
         gate: config.gate.label().to_owned(),
         profile: config.profile,
+        applicability_plan: run_profile.applicability_plan.binding().clone(),
+        fixture_selector: run_selection.fixture.clone(),
+        selected_cell_ids: run_selection.selected_cell_ids.clone(),
         run_id: config.run_id.clone(),
         run_window: config.run_window.clone(),
         registry_sha256: MACHINE_CLASS_REGISTRY_SHA256.to_owned(),
@@ -2696,20 +4348,351 @@ fn write_failed_attempt_receipt(
         execution_end,
         end_capture_error,
         build: build.receipt.clone(),
+        durability: durability.clone(),
         post_run_identity_verified,
         post_run_identity_error,
-        termination,
-        run_log_sha256: sha256_hex(run_log_bytes),
+        outcome,
+        retry,
+        process_lifecycle,
+        internal_lifecycle_gaps: LocalPerfInternalLifecycleGaps {
+            actual_work: unavailable,
+            queue: unavailable,
+            workers_joined: unavailable,
+            feed_drained: unavailable,
+            pending_zero: unavailable,
+        },
+        unsupported_controls: vec![
+            LocalPerfUnsupportedControl::Timeout,
+            LocalPerfUnsupportedControl::Cancellation,
+        ],
+        run_log_sha256: run_log_bytes.map(sha256_hex),
+        bound_evidence_sha256,
+        runner_receipt_sha256,
+        runner_artifact_manifest_sha256,
         started_at_utc: started_at_utc.to_owned(),
-        finished_at_utc,
+        finished_at_utc: finished_at_utc.to_owned(),
+        finished_timestamp_error,
         seal_sha256: String::new(),
     };
     let receipt_bytes = seal_attempt_receipt(receipt)?;
-    verify_attempt_receipt(&receipt_bytes)?;
-    let receipt_name = format!("{}.attempt.json", config.gate.label());
-    write_new_sync_at(&directories.run.handle, &receipt_name, &receipt_bytes)?;
-    directories.run.handle.sync_all()?;
-    Ok(config.output_dir.join(receipt_name))
+    let verified = LocalPerfAttemptReceipt::from_verified_slice(&receipt_bytes)?;
+    if let Some(run_log_bytes) = run_log_bytes {
+        verified.verify_run_log(run_log_bytes)?;
+    }
+    if let Some(bound_evidence_bytes) = completed_bound_evidence {
+        verified.verify_bound_evidence(bound_evidence_bytes)?;
+    }
+    Ok(receipt_bytes)
+}
+
+fn selected_cell_ids(plan: &PerfApplicabilityPlan) -> Vec<String> {
+    PerfMatrixSpec::complete()
+        .for_gate(plan.binding.gate)
+        .into_iter()
+        .zip(&plan.cells)
+        .filter(|(_, entry)| entry.applicability.is_runnable())
+        .map(|(cell, _)| format!("{}/{}/{}", plan.binding.gate, cell.fixture, cell.metric))
+        .collect()
+}
+
+fn validate_fixture_selector_syntax(fixture: &str) -> Result<(), LocalPerfRunError> {
+    if fixture.is_empty()
+        || fixture.len() > MAX_OUTPUT_COMPONENT_BYTES
+        || fixture.trim() != fixture
+        || !fixture.bytes().all(|byte| byte.is_ascii_graphic())
+    {
+        return Err(LocalPerfRunError::Invalid(
+            "fixture selector must be bounded nonempty canonical ASCII text".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn resolve_run_selection(
+    plan: &PerfApplicabilityPlan,
+    selection: Option<&LocalPerfRunSelection>,
+) -> Result<ResolvedRunSelection, LocalPerfRunError> {
+    let Some(selection) = selection else {
+        let selected_ids = selected_cell_ids(plan);
+        validate_selected_cell_ids(&selected_ids, &selected_ids)?;
+        return Ok(ResolvedRunSelection {
+            fixture: None,
+            selected_cell_ids: selected_ids,
+        });
+    };
+    validate_fixture_selector_syntax(selection.fixture())?;
+    let matrix = PerfMatrixSpec::complete();
+    let canonical = matrix.for_gate(plan.binding.gate);
+    if canonical.len() != plan.cells.len() {
+        return Err(LocalPerfRunError::Invalid(
+            "selection plan does not classify the complete canonical gate".to_owned(),
+        ));
+    }
+    let mut matched = false;
+    let mut selected_ids = Vec::new();
+    for (cell, classification) in canonical.into_iter().zip(&plan.cells) {
+        if cell.fixture != selection.fixture {
+            continue;
+        }
+        matched = true;
+        if !classification.applicability.is_runnable() {
+            return Err(LocalPerfRunError::Invalid(format!(
+                "fixture selector {:?} names a non-applicable {} cell",
+                selection.fixture, plan.binding.gate
+            )));
+        }
+        selected_ids.push(format!(
+            "{}/{}/{}",
+            plan.binding.gate, cell.fixture, cell.metric
+        ));
+    }
+    if !matched {
+        return Err(LocalPerfRunError::Invalid(format!(
+            "fixture selector {:?} names no canonical {} cell",
+            selection.fixture, plan.binding.gate
+        )));
+    }
+    validate_selected_cell_ids(&selected_ids, &selected_cell_ids(plan))?;
+    Ok(ResolvedRunSelection {
+        fixture: Some(selection.fixture.clone()),
+        selected_cell_ids: selected_ids,
+    })
+}
+
+fn evidence_cell_ids(evidence: &PerfEvidenceArtifact) -> Vec<String> {
+    evidence
+        .cells
+        .iter()
+        .map(|cell| cell.cell_id.clone())
+        .collect()
+}
+
+fn validate_selected_cell_ids(
+    selected: &[String],
+    runnable: &[String],
+) -> Result<(), LocalPerfRunError> {
+    if selected.is_empty() {
+        return Err(LocalPerfRunError::Invalid(
+            "process receipt must select at least one runnable cell".to_owned(),
+        ));
+    }
+    let selected_set = selected.iter().collect::<BTreeSet<_>>();
+    let runnable_set = runnable.iter().collect::<BTreeSet<_>>();
+    if selected_set.len() != selected.len() || !selected_set.is_subset(&runnable_set) {
+        return Err(LocalPerfRunError::Invalid(
+            "process receipt cells must be unique runnable canonical cells".to_owned(),
+        ));
+    }
+    let canonical_subset = runnable
+        .iter()
+        .filter(|cell_id| selected_set.contains(cell_id))
+        .cloned()
+        .collect::<Vec<_>>();
+    if selected != canonical_subset {
+        return Err(LocalPerfRunError::Invalid(
+            "process receipt cells are not in canonical matrix order".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn local_perf_io_error_kind(error: &std::io::Error) -> LocalPerfIoErrorKind {
+    match error.kind() {
+        std::io::ErrorKind::NotFound => LocalPerfIoErrorKind::NotFound,
+        std::io::ErrorKind::PermissionDenied => LocalPerfIoErrorKind::PermissionDenied,
+        std::io::ErrorKind::WouldBlock => LocalPerfIoErrorKind::ResourceBusy,
+        _ if error.raw_os_error() == Some(12) => LocalPerfIoErrorKind::OutOfMemory,
+        _ => LocalPerfIoErrorKind::Other,
+    }
+}
+
+fn force_kill_and_reap(child: &mut Child) -> Result<ExitStatus, LocalPerfIoErrorKind> {
+    let kill_error = child
+        .kill()
+        .err()
+        .map(|error| local_perf_io_error_kind(&error));
+    for _ in 0..WAIT_RECOVERY_POLL_ATTEMPTS {
+        match child.try_wait() {
+            Ok(Some(status)) => return Ok(status),
+            Ok(None) => std::thread::sleep(WAIT_RECOVERY_POLL_INTERVAL),
+            Err(error) => return Err(local_perf_io_error_kind(&error)),
+        }
+    }
+    Err(kill_error.unwrap_or(LocalPerfIoErrorKind::ResourceBusy))
+}
+
+fn attempt_derived_facts(
+    outcome: LocalPerfAttemptOutcome,
+) -> Result<
+    (
+        LocalPerfRetryPredicate,
+        LocalPerfInternalLifecycleUnavailable,
+    ),
+    LocalPerfRunError,
+> {
+    match outcome {
+        LocalPerfAttemptOutcome::Completed => Ok((
+            LocalPerfRetryPredicate::NotRequired,
+            LocalPerfInternalLifecycleUnavailable::ChildEvidenceAdmittedButNotIndependentlyObserved,
+        )),
+        LocalPerfAttemptOutcome::SpawnRejected { error_kind } => Ok((
+            LocalPerfRetryPredicate::RepairSpawn { error_kind },
+            LocalPerfInternalLifecycleUnavailable::ChildDidNotCompleteSuccessfully,
+        )),
+        LocalPerfAttemptOutcome::WaitRecoveredByKill { error_kind } => Ok((
+            LocalPerfRetryPredicate::RepairWait { error_kind },
+            LocalPerfInternalLifecycleUnavailable::ChildDidNotCompleteSuccessfully,
+        )),
+        LocalPerfAttemptOutcome::ExitedNonzero { code } if code > 0 => Ok((
+            LocalPerfRetryPredicate::DiagnoseNonzeroExit { code },
+            LocalPerfInternalLifecycleUnavailable::ChildDidNotCompleteSuccessfully,
+        )),
+        LocalPerfAttemptOutcome::ExitedNonzero { .. } => Err(LocalPerfRunError::Invalid(
+            "nonzero attempt outcome requires a positive exit code".to_owned(),
+        )),
+        LocalPerfAttemptOutcome::Signaled { signal } if (1..=255).contains(&signal) => Ok((
+            LocalPerfRetryPredicate::DiagnoseSignal { signal },
+            LocalPerfInternalLifecycleUnavailable::ChildDidNotCompleteSuccessfully,
+        )),
+        LocalPerfAttemptOutcome::Signaled { .. } => Err(LocalPerfRunError::Invalid(
+            "signaled attempt outcome requires a bounded positive signal".to_owned(),
+        )),
+        LocalPerfAttemptOutcome::UnknownTerminal => Ok((
+            LocalPerfRetryPredicate::DiagnoseUnknownTerminal,
+            LocalPerfInternalLifecycleUnavailable::ChildDidNotCompleteSuccessfully,
+        )),
+        LocalPerfAttemptOutcome::PostExitRejected { stage } => Ok((
+            LocalPerfRetryPredicate::RepairRejectedEvidence { stage },
+            LocalPerfInternalLifecycleUnavailable::ChildEvidenceNotAdmitted,
+        )),
+    }
+}
+
+fn validate_process_lifecycle(
+    outcome: LocalPerfAttemptOutcome,
+    lifecycle: LocalPerfProcessLifecycle,
+    has_run_log_digest: bool,
+) -> Result<(), LocalPerfRunError> {
+    if !lifecycle.spawn_attempted
+        || lifecycle.run_log_captured != has_run_log_digest
+        || lifecycle.child_reaped != lifecycle.wait_completed
+    {
+        return Err(LocalPerfRunError::Invalid(
+            "attempt process lifecycle contradicts its captured log or reap facts".to_owned(),
+        ));
+    }
+    let valid = match outcome {
+        LocalPerfAttemptOutcome::Completed
+        | LocalPerfAttemptOutcome::ExitedNonzero { .. }
+        | LocalPerfAttemptOutcome::Signaled { .. }
+        | LocalPerfAttemptOutcome::UnknownTerminal => {
+            lifecycle.spawn_succeeded
+                && lifecycle.wait_completed
+                && lifecycle.child_reaped
+                && lifecycle.run_log_synced
+                && lifecycle.run_log_captured
+        }
+        LocalPerfAttemptOutcome::SpawnRejected { .. } => {
+            !lifecycle.spawn_succeeded && !lifecycle.wait_completed && !lifecycle.child_reaped
+        }
+        LocalPerfAttemptOutcome::WaitRecoveredByKill { .. } => {
+            lifecycle.spawn_succeeded
+                && lifecycle.wait_completed
+                && lifecycle.child_reaped
+                && lifecycle.run_log_synced
+                && lifecycle.run_log_captured
+        }
+        LocalPerfAttemptOutcome::PostExitRejected { stage } => {
+            let terminal =
+                lifecycle.spawn_succeeded && lifecycle.wait_completed && lifecycle.child_reaped;
+            terminal
+                && match stage {
+                    LocalPerfRejectionStage::RunLogSync => !lifecycle.run_log_synced,
+                    LocalPerfRejectionStage::RunLogRead => {
+                        lifecycle.run_log_synced && !lifecycle.run_log_captured
+                    }
+                    _ => lifecycle.run_log_synced && lifecycle.run_log_captured,
+                }
+        }
+    };
+    if !valid {
+        return Err(LocalPerfRunError::Invalid(
+            "attempt process lifecycle disagrees with its typed terminal outcome".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_attempt_build(build: &RunnerBuild) -> Result<(), LocalPerfRunError> {
+    let producer = &build.producer;
+    if !is_git_revision(&build.git_revision)
+        || build.git_dirty
+        || build.worktree_state_sha256.is_some()
+        || !is_sha256(&build.cargo_lock_sha256)
+        || !is_sha256(&build.executable_sha256)
+        || !is_sha256(&build.command_sha256)
+        || !is_sha256(&build.environment_sha256)
+        || producer.contract_version != LOCAL_PERF_PRODUCER_CONTRACT_VERSION
+        || producer.source_git_revision != build.git_revision
+        || producer.source_git_dirty
+        || producer.cargo_lock_sha256 != build.cargo_lock_sha256
+        || !is_sha256(&producer.executable_sha256)
+    {
+        return Err(LocalPerfRunError::Invalid(
+            "attempt receipt carries a malformed or inconsistent clean build identity".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn validate_utc_timestamp(value: &str, field: &str) -> Result<(), LocalPerfRunError> {
+    let bytes = value.as_bytes();
+    let punctuation = [
+        (4, b'-'),
+        (7, b'-'),
+        (10, b'T'),
+        (13, b':'),
+        (16, b':'),
+        (19, b'Z'),
+    ];
+    if bytes.len() != 20
+        || punctuation
+            .iter()
+            .any(|(index, expected)| bytes[*index] != *expected)
+        || bytes.iter().enumerate().any(|(index, byte)| {
+            !punctuation.iter().any(|(position, _)| *position == index) && !byte.is_ascii_digit()
+        })
+    {
+        return Err(LocalPerfRunError::Invalid(format!(
+            "{field} timestamp is not bounded canonical UTC"
+        )));
+    }
+    let parse = |start: usize, end: usize| {
+        value[start..end]
+            .parse::<u32>()
+            .map_err(|_| LocalPerfRunError::Invalid(format!("{field} timestamp is not numeric")))
+    };
+    let year = parse(0, 4)?;
+    let month = parse(5, 7)?;
+    let day = parse(8, 10)?;
+    let hour = parse(11, 13)?;
+    let minute = parse(14, 16)?;
+    let second = parse(17, 19)?;
+    let leap_year =
+        year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400));
+    let days_in_month = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if leap_year => 29,
+        2 => 28,
+        _ => 0,
+    };
+    if year == 0 || day == 0 || day > days_in_month || hour >= 24 || minute >= 60 || second >= 60 {
+        return Err(LocalPerfRunError::Invalid(format!(
+            "{field} timestamp is outside canonical UTC calendar/time ranges"
+        )));
+    }
+    Ok(())
 }
 
 fn bounded_diagnostic<T: std::fmt::Display + ?Sized>(value: &T) -> String {
@@ -2722,35 +4705,13 @@ fn bounded_diagnostic<T: std::fmt::Display + ?Sized>(value: &T) -> String {
     message
 }
 
-fn seal_attempt_receipt(mut receipt: RunnerAttemptReceipt) -> Result<Vec<u8>, LocalPerfRunError> {
+fn seal_attempt_receipt(
+    mut receipt: LocalPerfAttemptReceipt,
+) -> Result<Vec<u8>, LocalPerfRunError> {
     receipt.seal_sha256.clear();
     let preimage = serde_json::to_vec(&receipt)?;
     receipt.seal_sha256 = sha256_hex(&preimage);
     serde_json::to_vec(&receipt).map_err(LocalPerfRunError::from)
-}
-
-fn verify_attempt_receipt(bytes: &[u8]) -> Result<RunnerAttemptReceipt, LocalPerfRunError> {
-    let receipt = serde_json::from_slice::<RunnerAttemptReceipt>(bytes)?;
-    if receipt.schema_version != ATTEMPT_RECEIPT_SCHEMA_VERSION
-        || receipt.mode != "measurement"
-        || !is_sha256(&receipt.run_log_sha256)
-        || !is_sha256(&receipt.seal_sha256)
-    {
-        return Err(LocalPerfRunError::Invalid(
-            "diagnostic attempt receipt has an invalid schema, mode, or digest".to_owned(),
-        ));
-    }
-    let mut preimage = receipt.clone();
-    let expected = preimage.seal_sha256.clone();
-    preimage.seal_sha256.clear();
-    if sha256_hex(&serde_json::to_vec(&preimage)?) != expected
-        || serde_json::to_vec(&receipt)? != bytes
-    {
-        return Err(LocalPerfRunError::Invalid(
-            "diagnostic attempt receipt seal or canonical bytes do not verify".to_owned(),
-        ));
-    }
-    Ok(receipt)
 }
 
 #[cfg(test)]
@@ -2758,6 +4719,30 @@ mod tests {
     use std::io::{BufRead, BufReader, Read};
 
     use super::*;
+
+    fn production_source() -> &'static str {
+        const TEST_MODULE_BOUNDARY: &str = "#[cfg(test)]\nmod tests {";
+
+        let source = include_str!("local_perf_runner.rs");
+        assert_eq!(
+            source.matches(TEST_MODULE_BOUNDARY).count(),
+            1,
+            "the production/test boundary must be unique"
+        );
+        let test_module_start = source
+            .find(TEST_MODULE_BOUNDARY)
+            .expect("unique production/test boundary");
+        &source[..test_module_start]
+    }
+
+    fn unique_marker_offset(source: &str, marker: &str) -> usize {
+        assert_eq!(
+            source.matches(marker).count(),
+            1,
+            "expected one production occurrence of {marker:?}"
+        );
+        source.find(marker).expect("unique production marker")
+    }
 
     fn profile(
         hardware_class_id: HardwareClassId,
@@ -2776,6 +4761,187 @@ mod tests {
             measurement_runs: MIN_MEASUREMENT_RUNS,
             output_dir: PathBuf::from("/tmp/frankensearch-perf-run"),
         }
+    }
+
+    fn physical_qg1_plan() -> PerfApplicabilityPlan {
+        PerfMatrixSpec::complete()
+            .applicability_plan(
+                &MachineClassRegistry::frozen().expect("frozen registry"),
+                profile(
+                    HardwareClassId::TrjZen35995wx,
+                    ExecutionProfileId::Physical64,
+                ),
+                PerfGate::Qg1,
+            )
+            .expect("physical-64 QG-1 plan")
+    }
+
+    fn first_runnable_qg1_selection(plan: &PerfApplicabilityPlan) -> ResolvedRunSelection {
+        let fixture = PerfMatrixSpec::complete()
+            .for_gate(PerfGate::Qg1)
+            .into_iter()
+            .zip(&plan.cells)
+            .find(|(_, classification)| classification.applicability.is_runnable())
+            .map(|(cell, _)| cell.fixture.clone())
+            .expect("runnable QG-1 fixture");
+        let selection =
+            LocalPerfRunSelection::for_fixture(fixture).expect("typed runnable fixture selection");
+        resolve_run_selection(plan, Some(&selection)).expect("resolved exact fixture selection")
+    }
+
+    fn attempt_runner_identity() -> VerifiedRunnerIdentity {
+        crate::machine_class_registry::admitted_test_identity_for_artifacts(
+            "QG-1",
+            &"e".repeat(40),
+            &"f".repeat(64),
+            &"a".repeat(64),
+            &"b".repeat(64),
+            &"c".repeat(64),
+            "local-perf-attempt",
+            "attempt-1",
+            "window-1",
+            b"threshold artifact",
+            b"prebinding evidence artifact",
+        )
+    }
+
+    fn attempt_fixture(
+        outcome: LocalPerfAttemptOutcome,
+        bound_evidence_bytes: Option<&[u8]>,
+    ) -> (LocalPerfAttemptReceipt, Vec<u8>, Vec<u8>) {
+        let run_label = "local-perf-attempt";
+        let run_log_bytes = format!("runner-log:{run_label}").into_bytes();
+        let identity = attempt_runner_identity();
+        let runner: RunnerReceipt =
+            serde_json::from_str(identity.receipt_json()).expect("admitted runner fixture");
+        let registry = MachineClassRegistry::frozen().expect("frozen registry");
+        let plan = PerfMatrixSpec::complete()
+            .applicability_plan(&registry, runner.derived_profile, PerfGate::Qg1)
+            .expect("canonical QG-1 plan");
+        let (retry, unavailable) = attempt_derived_facts(outcome).expect("valid outcome");
+        let process_lifecycle = match outcome {
+            LocalPerfAttemptOutcome::SpawnRejected { .. } => LocalPerfProcessLifecycle {
+                spawn_attempted: true,
+                spawn_succeeded: false,
+                wait_completed: false,
+                child_reaped: false,
+                run_log_synced: true,
+                run_log_captured: true,
+            },
+            LocalPerfAttemptOutcome::WaitRecoveredByKill { .. } => LocalPerfProcessLifecycle {
+                spawn_attempted: true,
+                spawn_succeeded: true,
+                wait_completed: true,
+                child_reaped: true,
+                run_log_synced: true,
+                run_log_captured: true,
+            },
+            LocalPerfAttemptOutcome::PostExitRejected {
+                stage: LocalPerfRejectionStage::RunLogSync,
+            } => LocalPerfProcessLifecycle {
+                spawn_attempted: true,
+                spawn_succeeded: true,
+                wait_completed: true,
+                child_reaped: true,
+                run_log_synced: false,
+                run_log_captured: true,
+            },
+            LocalPerfAttemptOutcome::PostExitRejected {
+                stage: LocalPerfRejectionStage::RunLogRead,
+            } => LocalPerfProcessLifecycle {
+                spawn_attempted: true,
+                spawn_succeeded: true,
+                wait_completed: true,
+                child_reaped: true,
+                run_log_synced: true,
+                run_log_captured: false,
+            },
+            _ => LocalPerfProcessLifecycle {
+                spawn_attempted: true,
+                spawn_succeeded: true,
+                wait_completed: true,
+                child_reaped: true,
+                run_log_synced: true,
+                run_log_captured: true,
+            },
+        };
+        let completed = outcome == LocalPerfAttemptOutcome::Completed;
+        let manifest_sha256 = identity
+            .artifact_manifest()
+            .expect("artifact-bound runner fixture")
+            .manifest_sha256()
+            .to_owned();
+        let (execution_end, end_capture_error) = match outcome {
+            LocalPerfAttemptOutcome::PostExitRejected {
+                stage: LocalPerfRejectionStage::EndPlatformCapture,
+            } => (None, Some("end capture failed".to_owned())),
+            _ => (Some(runner.execution.end.clone()), None),
+        };
+        let (post_run_identity_verified, post_run_identity_error) = match outcome {
+            LocalPerfAttemptOutcome::PostExitRejected {
+                stage: LocalPerfRejectionStage::PostRunIdentity,
+            } => (false, Some("post-run identity failed".to_owned())),
+            _ => (true, None),
+        };
+        let started_at_utc = runner.completion.started_at_utc.clone();
+        let (finished_at_utc, finished_timestamp_error) = match outcome {
+            LocalPerfAttemptOutcome::PostExitRejected {
+                stage: LocalPerfRejectionStage::FinishedTimestamp,
+            } => (
+                started_at_utc.clone(),
+                Some("finish timestamp failed".to_owned()),
+            ),
+            _ => (runner.completion.finished_at_utc.clone(), None),
+        };
+        let receipt = LocalPerfAttemptReceipt {
+            schema_version: LOCAL_PERF_ATTEMPT_RECEIPT_SCHEMA_VERSION.to_owned(),
+            mode: "measurement".to_owned(),
+            gate: "QG-1".to_owned(),
+            profile: runner.derived_profile,
+            applicability_plan: plan.binding().clone(),
+            fixture_selector: None,
+            selected_cell_ids: selected_cell_ids(&plan),
+            run_id: "attempt-1".to_owned(),
+            run_window: "window-1".to_owned(),
+            registry_sha256: MACHINE_CLASS_REGISTRY_SHA256.to_owned(),
+            hardware: runner.hardware,
+            execution_request: runner.execution.request,
+            execution_start: runner.execution.start,
+            execution_end,
+            end_capture_error,
+            build: runner.build,
+            durability: runner.durability,
+            post_run_identity_verified,
+            post_run_identity_error,
+            outcome,
+            retry,
+            process_lifecycle,
+            internal_lifecycle_gaps: LocalPerfInternalLifecycleGaps {
+                actual_work: unavailable,
+                queue: unavailable,
+                workers_joined: unavailable,
+                feed_drained: unavailable,
+                pending_zero: unavailable,
+            },
+            unsupported_controls: vec![
+                LocalPerfUnsupportedControl::Timeout,
+                LocalPerfUnsupportedControl::Cancellation,
+            ],
+            run_log_sha256: process_lifecycle
+                .run_log_captured
+                .then(|| sha256_hex(&run_log_bytes)),
+            bound_evidence_sha256: bound_evidence_bytes.map(sha256_hex),
+            runner_receipt_sha256: completed.then(|| identity.receipt_sha256().to_owned()),
+            runner_artifact_manifest_sha256: completed.then_some(manifest_sha256),
+            started_at_utc,
+            finished_at_utc,
+            finished_timestamp_error,
+            seal_sha256: String::new(),
+        };
+        let bytes = seal_attempt_receipt(receipt).expect("seal attempt fixture");
+        let verified =
+            LocalPerfAttemptReceipt::from_verified_slice(&bytes).expect("verify attempt fixture");
+        (verified, bytes, run_log_bytes)
     }
 
     #[test]
@@ -3006,12 +5172,13 @@ mod tests {
 
     #[test]
     fn registry_preflight_precedes_log_creation_and_child_spawn() {
-        let source = include_str!("local_perf_runner.rs");
-        let preflight = source.find(".preflight(").expect("registry preflight");
-        let log_creation = source
-            .find("create_new_file_at(&run_directories.run.handle, \"run.log\")")
-            .expect("run-log creation");
-        let child_spawn = source.find("child.spawn()?").expect("measured child spawn");
+        let source = production_source();
+        let preflight = unique_marker_offset(source, "let pre_spawn = registry.preflight(");
+        let log_creation = unique_marker_offset(
+            source,
+            "create_new_file_at(&run_directories.run.handle, \"run.log\")",
+        );
+        let child_spawn = unique_marker_offset(source, "let mut child = match child.spawn()");
         assert!(preflight < log_creation);
         assert!(log_creation < child_spawn);
     }
@@ -3540,102 +5707,456 @@ mod tests {
     }
 
     #[test]
-    fn diagnostic_attempt_receipt_is_sealed_and_never_registry_admissible() {
-        let receipt = RunnerAttemptReceipt {
-            schema_version: ATTEMPT_RECEIPT_SCHEMA_VERSION.to_owned(),
-            mode: "measurement".to_owned(),
-            gate: "QG-2".to_owned(),
-            profile: profile(
-                HardwareClassId::TrjZen35995wx,
-                ExecutionProfileId::Physical64,
-            ),
-            run_id: "failed-1".to_owned(),
-            run_window: "window-1".to_owned(),
-            registry_sha256: MACHINE_CLASS_REGISTRY_SHA256.to_owned(),
-            hardware: RunnerHardware {
-                os: "linux".to_owned(),
-                arch: "x86_64".to_owned(),
-                cpu_vendor: "AuthenticAMD".to_owned(),
-                cpu_family: Some(25),
-                cpu_model: Some(1),
-                cpu_stepping: Some(1),
-                cpu_model_name: "test".to_owned(),
-                physical_cores: 64,
-                logical_cpus: 128,
-                numa_nodes: 1,
-                memory_bytes: 1,
-                page_size_bytes: 4096,
-                performance_cores: None,
-                efficiency_cores: None,
-                runtime_detected_isa: vec!["scalar".to_owned()],
-                topology_sha256: "a".repeat(64),
-                fingerprint_sha256: "b".repeat(64),
+    fn process_receipts_cover_completed_and_every_supported_failure_outcome() {
+        let bound = b"exact completed bound evidence";
+        let outcomes = [
+            LocalPerfAttemptOutcome::Completed,
+            LocalPerfAttemptOutcome::SpawnRejected {
+                error_kind: LocalPerfIoErrorKind::PermissionDenied,
             },
-            execution_request: RunnerExecutionRequest {
-                capacity_semantics: ExecutionCapacitySemantics::PhysicalCores,
-                execution_capacity: 64,
-                max_exercised_cell_width: 1,
-                requested_logical_cpu_ids: vec![0],
-                requested_physical_core_width: Some(64),
-                requested_worker_pool_width: 64,
-                requested_qos: "not-applicable".to_owned(),
+            LocalPerfAttemptOutcome::WaitRecoveredByKill {
+                error_kind: LocalPerfIoErrorKind::Other,
             },
-            execution_start: RunnerExecutionSnapshot {
-                observed_logical_cpu_ids: vec![0],
-                effective_physical_core_ids: vec!["0:0".to_owned()],
-                cpu_assignment_observability: "affinity-enforced".to_owned(),
-                effective_cpuset_sha256: "c".repeat(64),
-                threads_per_core: 1,
-                smt_state: "off".to_owned(),
-                numa_node_ids: vec![0],
-                numa_policy: "bind:0".to_owned(),
-                governor: "performance".to_owned(),
-                thermal_pressure: false,
-                exclusive_lease: true,
-                exclusive_lease_id: "trj-zen3-exclusive".to_owned(),
-                local_execution: true,
-                observed_hardware_fingerprint_sha256: "b".repeat(64),
-                snapshot_sha256: "d".repeat(64),
+            LocalPerfAttemptOutcome::ExitedNonzero { code: 17 },
+            LocalPerfAttemptOutcome::Signaled { signal: 9 },
+            LocalPerfAttemptOutcome::UnknownTerminal,
+            LocalPerfAttemptOutcome::PostExitRejected {
+                stage: LocalPerfRejectionStage::EndPlatformCapture,
             },
-            execution_end: None,
-            end_capture_error: Some("child failed before terminal probe".to_owned()),
-            build: RunnerBuild {
-                git_revision: "e".repeat(40),
-                git_dirty: false,
-                worktree_state_sha256: None,
-                cargo_lock_sha256: "f".repeat(64),
-                executable_sha256: "a".repeat(64),
-                command_sha256: "b".repeat(64),
-                environment_sha256: "c".repeat(64),
-                producer: RunnerProducer {
-                    contract_version: LOCAL_PERF_PRODUCER_CONTRACT_VERSION.to_owned(),
-                    source_git_revision: "e".repeat(40),
-                    source_git_dirty: false,
-                    cargo_lock_sha256: "f".repeat(64),
-                    executable_sha256: "c".repeat(64),
-                },
+            LocalPerfAttemptOutcome::PostExitRejected {
+                stage: LocalPerfRejectionStage::FinishedTimestamp,
             },
-            post_run_identity_verified: true,
-            post_run_identity_error: None,
-            termination: RunnerAttemptTermination::Exited { code: 17 },
-            run_log_sha256: "d".repeat(64),
-            started_at_utc: "2026-07-29T00:00:00Z".to_owned(),
-            finished_at_utc: "2026-07-29T00:00:01Z".to_owned(),
-            seal_sha256: String::new(),
-        };
-        let bytes = seal_attempt_receipt(receipt).expect("seal attempt receipt");
-        verify_attempt_receipt(&bytes).expect("verify sealed attempt receipt");
+            LocalPerfAttemptOutcome::PostExitRejected {
+                stage: LocalPerfRejectionStage::PostRunIdentity,
+            },
+            LocalPerfAttemptOutcome::PostExitRejected {
+                stage: LocalPerfRejectionStage::ArtifactRead,
+            },
+            LocalPerfAttemptOutcome::PostExitRejected {
+                stage: LocalPerfRejectionStage::ArtifactVerification,
+            },
+        ];
+        for outcome in outcomes {
+            let completed = outcome == LocalPerfAttemptOutcome::Completed;
+            let (receipt, bytes, run_log) =
+                attempt_fixture(outcome, completed.then_some(bound.as_slice()));
+            assert_eq!(receipt.outcome(), outcome);
+            assert_eq!(receipt.applicability_plan().gate, PerfGate::Qg1);
+            assert!(receipt.fixture_selector().is_none());
+            assert!(!receipt.selected_cell_ids().is_empty());
+            assert_eq!(receipt.run_id(), "attempt-1");
+            assert_eq!(receipt.run_window(), "window-1");
+            let expected_log_sha256 = sha256_hex(&run_log);
+            assert_eq!(receipt.run_log_sha256(), Some(expected_log_sha256.as_str()));
+            assert_eq!(
+                receipt.exact_sha256().expect("exact receipt digest"),
+                sha256_hex(&bytes)
+            );
+            receipt.verify_run_log(&run_log).expect("exact run log");
+            let lifecycle = receipt.process_lifecycle();
+            assert!(lifecycle.spawn_attempted());
+            assert_eq!(
+                lifecycle.spawn_succeeded(),
+                !matches!(outcome, LocalPerfAttemptOutcome::SpawnRejected { .. })
+            );
+            assert_eq!(lifecycle.wait_completed(), lifecycle.spawn_succeeded());
+            assert_eq!(lifecycle.child_reaped(), lifecycle.wait_completed());
+            assert!(lifecycle.run_log_synced());
+            assert!(lifecycle.run_log_captured());
+            assert_eq!(receipt.unsupported_controls().len(), 2);
+            assert_eq!(
+                receipt.internal_lifecycle_gaps().actual_work(),
+                receipt.internal_lifecycle_gaps().queue()
+            );
+            assert_eq!(
+                receipt.internal_lifecycle_gaps().queue(),
+                receipt.internal_lifecycle_gaps().workers_joined()
+            );
+            assert_eq!(
+                receipt.internal_lifecycle_gaps().workers_joined(),
+                receipt.internal_lifecycle_gaps().feed_drained()
+            );
+            assert_eq!(
+                receipt.internal_lifecycle_gaps().feed_drained(),
+                receipt.internal_lifecycle_gaps().pending_zero()
+            );
+            if completed {
+                assert_eq!(receipt.retry(), LocalPerfRetryPredicate::NotRequired);
+                assert!(receipt.runner_receipt_sha256().is_some());
+                assert!(receipt.runner_artifact_manifest_sha256().is_some());
+                let expected_bound_sha256 = sha256_hex(bound);
+                assert_eq!(
+                    receipt.bound_evidence_sha256(),
+                    Some(expected_bound_sha256.as_str())
+                );
+                assert!(
+                    receipt.verify_bound_evidence(bound).is_err(),
+                    "a digest-matching non-artifact must still fail strict evidence verification"
+                );
+                assert!(receipt.verify_bound_evidence(b"substitute").is_err());
+            } else {
+                assert!(receipt.bound_evidence_sha256().is_none());
+                assert!(receipt.runner_receipt_sha256().is_none());
+                assert!(receipt.runner_artifact_manifest_sha256().is_none());
+                assert!(receipt.verify_bound_evidence(bound).is_err());
+            }
+        }
+    }
 
-        let registry = MachineClassRegistry::frozen().expect("frozen registry");
-        let expected_profile = profile(
-            HardwareClassId::TrjZen35995wx,
-            ExecutionProfileId::Physical64,
+    #[test]
+    fn process_receipt_rejects_resealed_semantic_tamper() {
+        let bound = b"exact completed bound evidence";
+        let (receipt, _, _) = attempt_fixture(LocalPerfAttemptOutcome::Completed, Some(bound));
+
+        let mut retry_tamper = receipt.clone();
+        retry_tamper.retry = LocalPerfRetryPredicate::DiagnoseUnknownTerminal;
+        let bytes = seal_attempt_receipt(retry_tamper).expect("reseal retry tamper");
+        assert!(LocalPerfAttemptReceipt::from_verified_slice(&bytes).is_err());
+
+        let mut plan_tamper = receipt.clone();
+        plan_tamper
+            .selected_cell_ids
+            .push(plan_tamper.selected_cell_ids[0].clone());
+        let bytes = seal_attempt_receipt(plan_tamper).expect("reseal plan tamper");
+        assert!(LocalPerfAttemptReceipt::from_verified_slice(&bytes).is_err());
+
+        let mut selector_tamper = receipt.clone();
+        selector_tamper.fixture_selector = Some("bulk/medium/8/on".to_owned());
+        let bytes = seal_attempt_receipt(selector_tamper).expect("reseal selector tamper");
+        assert!(LocalPerfAttemptReceipt::from_verified_slice(&bytes).is_err());
+
+        let mut binding_tamper = receipt.clone();
+        binding_tamper.bound_evidence_sha256 = None;
+        let bytes = seal_attempt_receipt(binding_tamper).expect("reseal binding tamper");
+        assert!(LocalPerfAttemptReceipt::from_verified_slice(&bytes).is_err());
+
+        let mut missing_end = receipt.clone();
+        missing_end.execution_end = None;
+        missing_end.end_capture_error = Some("capture failed".to_owned());
+        let bytes = seal_attempt_receipt(missing_end).expect("reseal missing completed end");
+        assert!(LocalPerfAttemptReceipt::from_verified_slice(&bytes).is_err());
+
+        let mut unverified_identity = receipt.clone();
+        unverified_identity.post_run_identity_verified = false;
+        unverified_identity.post_run_identity_error = Some("identity failed".to_owned());
+        let bytes =
+            seal_attempt_receipt(unverified_identity).expect("reseal unverified completion");
+        assert!(LocalPerfAttemptReceipt::from_verified_slice(&bytes).is_err());
+
+        let mut unreaped_completion = receipt.clone();
+        unreaped_completion.process_lifecycle.wait_completed = false;
+        unreaped_completion.process_lifecycle.child_reaped = false;
+        let bytes = seal_attempt_receipt(unreaped_completion).expect("reseal unreaped completion");
+        assert!(LocalPerfAttemptReceipt::from_verified_slice(&bytes).is_err());
+
+        let mut timestamp_fallback = receipt.clone();
+        timestamp_fallback.finished_at_utc = timestamp_fallback.started_at_utc.clone();
+        timestamp_fallback.finished_timestamp_error = Some("clock failed".to_owned());
+        let bytes = seal_attempt_receipt(timestamp_fallback).expect("reseal clock fallback");
+        assert!(LocalPerfAttemptReceipt::from_verified_slice(&bytes).is_err());
+
+        let mut timestamp_tamper = receipt.clone();
+        timestamp_tamper.finished_at_utc = "0001-01-01T00:00:00Z".to_owned();
+        let bytes = seal_attempt_receipt(timestamp_tamper).expect("reseal timestamp tamper");
+        assert!(LocalPerfAttemptReceipt::from_verified_slice(&bytes).is_err());
+
+        let mut window_tamper = receipt;
+        window_tamper.run_window = "x".repeat(MAX_IDENTITY_COMPONENT_BYTES + 1);
+        let bytes = seal_attempt_receipt(window_tamper).expect("reseal window tamper");
+        assert!(LocalPerfAttemptReceipt::from_verified_slice(&bytes).is_err());
+
+        for outcome in [
+            LocalPerfAttemptOutcome::ExitedNonzero { code: 0 },
+            LocalPerfAttemptOutcome::ExitedNonzero { code: -1 },
+            LocalPerfAttemptOutcome::Signaled { signal: 0 },
+            LocalPerfAttemptOutcome::Signaled { signal: 256 },
+        ] {
+            assert!(attempt_derived_facts(outcome).is_err());
+        }
+    }
+
+    #[test]
+    fn log_sync_and_capture_failures_are_typed_without_false_durability_claims() {
+        let (sync_failure, _, run_log) = attempt_fixture(
+            LocalPerfAttemptOutcome::PostExitRejected {
+                stage: LocalPerfRejectionStage::RunLogSync,
+            },
+            None,
         );
+        assert!(!sync_failure.process_lifecycle().run_log_synced());
+        assert!(sync_failure.process_lifecycle().run_log_captured());
+        sync_failure
+            .verify_run_log(&run_log)
+            .expect("captured but unsynced diagnostic log bytes");
+
+        let (read_failure, _, run_log) = attempt_fixture(
+            LocalPerfAttemptOutcome::PostExitRejected {
+                stage: LocalPerfRejectionStage::RunLogRead,
+            },
+            None,
+        );
+        assert!(read_failure.process_lifecycle().run_log_synced());
+        assert!(!read_failure.process_lifecycle().run_log_captured());
+        assert!(read_failure.run_log_sha256().is_none());
+        assert!(read_failure.verify_run_log(&run_log).is_err());
+
+        let mut contradictory_read_failure = read_failure;
+        contradictory_read_failure.process_lifecycle.run_log_synced = false;
+        let bytes = seal_attempt_receipt(contradictory_read_failure)
+            .expect("reseal contradictory run-log read failure");
+        assert!(LocalPerfAttemptReceipt::from_verified_slice(&bytes).is_err());
+    }
+
+    #[test]
+    fn completed_receipt_rejects_nested_runner_substitution_even_after_outer_reseal() {
+        let bound = b"exact completed bound evidence";
+        let (receipt, _, _) = attempt_fixture(LocalPerfAttemptOutcome::Completed, Some(bound));
+        let identity = attempt_runner_identity();
+        receipt
+            .verify_completed_runner_identity(&identity)
+            .expect("exact admitted nested runner identity");
+        assert_eq!(
+            receipt.runner_receipt_sha256(),
+            Some(identity.receipt_sha256())
+        );
+        assert_eq!(
+            receipt.runner_artifact_manifest_sha256(),
+            Some(
+                identity
+                    .artifact_manifest()
+                    .expect("bound manifest")
+                    .manifest_sha256()
+            )
+        );
+
+        let mut build_substitution = receipt.clone();
+        build_substitution.build.environment_sha256 = "d".repeat(64);
+        let bytes = seal_attempt_receipt(build_substitution).expect("reseal build substitution");
+        let resealed = LocalPerfAttemptReceipt::from_verified_slice(&bytes)
+            .expect("outer receipt remains internally canonical");
+        assert!(
+            resealed
+                .verify_completed_runner_identity(&identity)
+                .is_err()
+        );
+
+        let mut completion_timestamp_substitution = receipt.clone();
+        completion_timestamp_substitution.finished_at_utc = "2026-07-31T23:59:59Z".to_owned();
+        let bytes = seal_attempt_receipt(completion_timestamp_substitution)
+            .expect("reseal completion timestamp substitution");
+        let resealed = LocalPerfAttemptReceipt::from_verified_slice(&bytes)
+            .expect("outer receipt accepts a valid later finish timestamp");
+        assert!(
+            resealed
+                .verify_completed_runner_identity(&identity)
+                .is_err()
+        );
+
+        let mut nested_receipt_substitution = receipt.clone();
+        nested_receipt_substitution.runner_receipt_sha256 = Some("d".repeat(64));
+        let bytes = seal_attempt_receipt(nested_receipt_substitution)
+            .expect("reseal nested receipt substitution");
+        let resealed = LocalPerfAttemptReceipt::from_verified_slice(&bytes)
+            .expect("syntactically valid nested receipt digest");
+        assert!(
+            resealed
+                .verify_completed_runner_identity(&identity)
+                .is_err()
+        );
+
+        let mut nested_manifest_substitution = receipt;
+        nested_manifest_substitution.runner_artifact_manifest_sha256 = Some("d".repeat(64));
+        let bytes = seal_attempt_receipt(nested_manifest_substitution)
+            .expect("reseal nested manifest substitution");
+        let resealed = LocalPerfAttemptReceipt::from_verified_slice(&bytes)
+            .expect("syntactically valid nested manifest digest");
+        assert!(
+            resealed
+                .verify_completed_runner_identity(&identity)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn completed_and_failed_receipts_accept_only_the_exact_typed_fixture_subset() {
+        let bound = b"exact completed bound evidence";
+        let (receipt, _, _) = attempt_fixture(LocalPerfAttemptOutcome::Completed, Some(bound));
+        let plan = physical_qg1_plan();
+        let selected = first_runnable_qg1_selection(&plan);
+
+        let mut partial = receipt.clone();
+        partial.fixture_selector = selected.fixture.clone();
+        partial.selected_cell_ids = selected.selected_cell_ids.clone();
+        let bytes = seal_attempt_receipt(partial).expect("seal canonical partial receipt");
+        let verified = LocalPerfAttemptReceipt::from_verified_slice(&bytes)
+            .expect("canonical runnable partial receipt");
+        assert_eq!(verified.fixture_selector(), selected.fixture.as_deref());
+        assert_eq!(verified.selected_cell_ids(), selected.selected_cell_ids);
+
+        let mut duplicate = verified.clone();
+        duplicate
+            .selected_cell_ids
+            .push(duplicate.selected_cell_ids[0].clone());
+        let bytes = seal_attempt_receipt(duplicate).expect("reseal duplicate selection");
+        assert!(LocalPerfAttemptReceipt::from_verified_slice(&bytes).is_err());
+
+        let mut noncanonical = verified.clone();
+        noncanonical.selected_cell_ids[0] = "QG-1/not/a/canonical/cell".to_owned();
+        let bytes = seal_attempt_receipt(noncanonical).expect("reseal noncanonical selection");
+        assert!(LocalPerfAttemptReceipt::from_verified_slice(&bytes).is_err());
+
+        let mut failed_partial = verified.clone();
+        failed_partial.outcome = LocalPerfAttemptOutcome::ExitedNonzero { code: 17 };
+        failed_partial.retry = LocalPerfRetryPredicate::DiagnoseNonzeroExit { code: 17 };
+        failed_partial.internal_lifecycle_gaps = LocalPerfInternalLifecycleGaps {
+            actual_work: LocalPerfInternalLifecycleUnavailable::ChildDidNotCompleteSuccessfully,
+            queue: LocalPerfInternalLifecycleUnavailable::ChildDidNotCompleteSuccessfully,
+            workers_joined: LocalPerfInternalLifecycleUnavailable::ChildDidNotCompleteSuccessfully,
+            feed_drained: LocalPerfInternalLifecycleUnavailable::ChildDidNotCompleteSuccessfully,
+            pending_zero: LocalPerfInternalLifecycleUnavailable::ChildDidNotCompleteSuccessfully,
+        };
+        failed_partial.bound_evidence_sha256 = None;
+        failed_partial.runner_receipt_sha256 = None;
+        failed_partial.runner_artifact_manifest_sha256 = None;
+        let bytes = seal_attempt_receipt(failed_partial).expect("reseal failed partial");
+        let failed = LocalPerfAttemptReceipt::from_verified_slice(&bytes)
+            .expect("failed attempt keeps the exact typed fixture subset");
+        assert_eq!(failed.fixture_selector(), selected.fixture.as_deref());
+        assert_eq!(failed.selected_cell_ids(), selected.selected_cell_ids);
+
+        let mut mismatched_failed = failed;
+        mismatched_failed.fixture_selector = Some("bulk/medium/8/on".to_owned());
+        let bytes = seal_attempt_receipt(mismatched_failed).expect("reseal mismatched failure");
+        assert!(LocalPerfAttemptReceipt::from_verified_slice(&bytes).is_err());
+    }
+
+    #[test]
+    fn typed_fixture_selection_is_exact_and_rejects_unknown_or_not_applicable() {
+        let plan = physical_qg1_plan();
+        let matrix = PerfMatrixSpec::complete();
+        let selected = first_runnable_qg1_selection(&plan);
+        let fixture = selected.fixture.as_deref().expect("partial fixture");
+        assert!(
+            matrix
+                .for_gate(PerfGate::Qg1)
+                .into_iter()
+                .zip(&plan.cells)
+                .filter(|(cell, _)| cell.fixture == fixture)
+                .all(|(_, classification)| classification.applicability.is_runnable())
+        );
+        assert!(
+            resolve_run_selection(
+                &plan,
+                Some(
+                    &LocalPerfRunSelection::for_fixture("not/a/canonical/fixture")
+                        .expect("syntactically valid unknown fixture"),
+                ),
+            )
+            .is_err()
+        );
+        let prefix = fixture
+            .rsplit_once('/')
+            .map_or("not-a-fixture", |(prefix, _)| prefix);
+        assert!(
+            resolve_run_selection(
+                &plan,
+                Some(
+                    &LocalPerfRunSelection::for_fixture(prefix)
+                        .expect("syntactically valid fixture prefix"),
+                ),
+            )
+            .is_err(),
+            "fixture selection must never use substring or prefix matching"
+        );
+
+        let not_applicable_fixture = matrix
+            .for_gate(PerfGate::Qg1)
+            .into_iter()
+            .zip(&plan.cells)
+            .find(|(_, classification)| {
+                classification.applicability == PerfCellApplicability::NotApplicable
+            })
+            .map(|(cell, _)| cell.fixture.clone())
+            .expect("physical-64 QG-1 must include a NotApplicable fixture");
+        assert!(
+            resolve_run_selection(
+                &plan,
+                Some(
+                    &LocalPerfRunSelection::for_fixture(not_applicable_fixture)
+                        .expect("syntactically valid NotApplicable fixture"),
+                ),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn controlled_fixture_environment_replaces_ambient_and_full_gate_removes_it() {
+        let plan = physical_qg1_plan();
+        let selected = first_runnable_qg1_selection(&plan);
+        let mut environment = BTreeMap::from([(
+            OsString::from("QUILL_PERF_FIXTURE"),
+            OsString::from("hostile-ambient-substring"),
+        )]);
+        apply_run_selection_environment(&mut environment, &selected);
+        assert_eq!(
+            environment
+                .get(OsStr::new("QUILL_PERF_FIXTURE"))
+                .and_then(|value| value.to_str()),
+            selected.fixture.as_deref()
+        );
+
+        let full = resolve_run_selection(&plan, None).expect("full-gate selection");
+        apply_run_selection_environment(&mut environment, &full);
+        assert!(!environment.contains_key(OsStr::new("QUILL_PERF_FIXTURE")));
+    }
+
+    #[test]
+    fn process_receipt_rejects_noncanonical_duplicate_unknown_and_corrupt_bytes() {
+        let (_, bytes, _) =
+            attempt_fixture(LocalPerfAttemptOutcome::ExitedNonzero { code: 17 }, None);
+        let directory = tempfile::tempdir().expect("attempt receipt directory");
+        let path = directory.path().join("attempt.json");
+        fs::write(&path, &bytes).expect("persist attempt receipt");
+        LocalPerfAttemptReceipt::load_verified(&path).expect("strict path reload");
+        let receipt: LocalPerfAttemptReceipt =
+            serde_json::from_slice(&bytes).expect("typed receipt");
+        let pretty = serde_json::to_vec_pretty(&receipt).expect("pretty receipt");
+        assert!(LocalPerfAttemptReceipt::from_verified_slice(&pretty).is_err());
+
+        let text = std::str::from_utf8(&bytes).expect("receipt UTF-8");
+        let duplicate = format!(
+            "{{\"schema_version\":\"{}\",{}",
+            LOCAL_PERF_ATTEMPT_RECEIPT_SCHEMA_VERSION,
+            &text[1..]
+        );
+        assert!(LocalPerfAttemptReceipt::from_verified_slice(duplicate.as_bytes()).is_err());
+
+        let mut value: serde_json::Value = serde_json::from_slice(&bytes).expect("receipt value");
+        value
+            .as_object_mut()
+            .expect("receipt object")
+            .insert("unknown".to_owned(), serde_json::Value::Bool(true));
+        let unknown = serde_json::to_vec(&value).expect("unknown-field bytes");
+        assert!(LocalPerfAttemptReceipt::from_verified_slice(&unknown).is_err());
+
+        let mut corrupt = bytes;
+        let offset = corrupt.len() / 2;
+        corrupt[offset] ^= 1;
+        assert!(LocalPerfAttemptReceipt::from_verified_slice(&corrupt).is_err());
+    }
+
+    #[test]
+    fn failed_process_receipt_can_never_be_registry_promotion_evidence() {
+        let (receipt, bytes, _) =
+            attempt_fixture(LocalPerfAttemptOutcome::ExitedNonzero { code: 17 }, None);
+        let registry = MachineClassRegistry::frozen().expect("frozen registry");
         let context = MachineClassAdmissionContext {
-            gate: "QG-2".to_owned(),
-            expected_profile,
-            destination_basename: expected_profile
-                .latest_basename("QG-2")
+            gate: receipt.gate().to_owned(),
+            expected_profile: receipt.profile(),
+            destination_basename: receipt
+                .profile()
+                .latest_basename(receipt.gate())
                 .expect("typed latest destination"),
         };
         let write_count = std::cell::Cell::new(0_u64);
@@ -3645,11 +6166,147 @@ mod tests {
                 .is_err()
         );
         assert_eq!(write_count.get(), 0);
+    }
 
-        let mut tampered = bytes;
-        let offset = tampered.len() / 2;
-        tampered[offset] ^= 1;
-        assert!(verify_attempt_receipt(&tampered).is_err());
+    #[test]
+    fn completed_shard_syncs_inputs_then_publishes_verified_attempt_evidence_pair_last() {
+        let source = production_source();
+        let child_inputs_durable = unique_marker_offset(
+            source,
+            "let durable_child_artifacts = match read_and_sync_child_artifacts(",
+        );
+        let nested_runner = unique_marker_offset(source, "let receipt = RunnerReceipt {");
+        let bound_write = unique_marker_offset(
+            source,
+            "bound_evidence_name,\n        &bound_evidence_bytes,",
+        );
+        let bound_reload =
+            unique_marker_offset(source, "let persisted_bound = match read_file_at(");
+        let final_attempt_publish = unique_marker_offset(
+            source,
+            "&attempt_pending_name,\n        &attempt_name,\n        &completed_attempt_bytes,",
+        );
+        let final_pair_reload = unique_marker_offset(
+            source,
+            "let persisted_attempt =\n        read_file_at(&run_directories.run.handle",
+        );
+        assert!(child_inputs_durable < nested_runner);
+        assert!(nested_runner < bound_write);
+        assert!(bound_write < bound_reload);
+        assert!(bound_reload < final_attempt_publish);
+        assert!(final_attempt_publish < final_pair_reload);
+    }
+
+    #[test]
+    fn child_artifact_durability_boundary_reads_and_syncs_exact_owned_files() {
+        let directory = tempfile::tempdir().expect("child artifact directory");
+        fs::write(directory.path().join("QG-1.json"), b"threshold").expect("threshold fixture");
+        fs::write(directory.path().join("QG-1.evidence.json"), b"evidence")
+            .expect("evidence fixture");
+        let handle = File::open(directory.path()).expect("directory handle");
+        let durable = read_and_sync_child_artifacts(&handle, "QG-1.json", "QG-1.evidence.json")
+            .expect("durable exact child artifacts");
+        assert_eq!(durable.threshold_bytes, b"threshold");
+        assert_eq!(durable.evidence_bytes, b"evidence");
+        assert_eq!(
+            read_and_sync_child_artifacts(&handle, "missing", "QG-1.evidence.json")
+                .expect_err("missing threshold must fail closed"),
+            LocalPerfRejectionStage::ArtifactRead
+        );
+    }
+
+    #[test]
+    fn attempt_receipt_publication_is_atomic_and_never_replaces_a_final_name() {
+        let directory = tempfile::tempdir().expect("attempt publication directory");
+        let handle = File::open(directory.path()).expect("directory handle");
+        atomically_publish_new_sync_at(
+            &handle,
+            "QG-1.attempt.pending",
+            "QG-1.attempt.json",
+            b"first receipt",
+        )
+        .expect("first atomic attempt publication");
+        assert!(!directory.path().join("QG-1.attempt.pending").exists());
+        assert_eq!(
+            fs::read(directory.path().join("QG-1.attempt.json")).expect("published receipt"),
+            b"first receipt"
+        );
+        assert!(
+            atomically_publish_new_sync_at(
+                &handle,
+                "QG-1.second.pending",
+                "QG-1.attempt.json",
+                b"replacement",
+            )
+            .is_err()
+        );
+        assert_eq!(
+            fs::read(directory.path().join("QG-1.attempt.json")).expect("original receipt"),
+            b"first receipt"
+        );
+    }
+
+    #[test]
+    fn wait_error_cannot_publish_a_terminal_receipt_before_bounded_kill_and_reap() {
+        let source = production_source();
+        let wait_start = unique_marker_offset(
+            source,
+            "let (status, recovered_wait_error) = match child.wait()",
+        );
+        let wait_tail = &source[wait_start..];
+        let log_capture = wait_start
+            + unique_marker_offset(
+                wait_tail,
+                "let run_log_synced = run_log_sync.sync_all().is_ok();",
+            );
+        let wait_slice = &source[wait_start..log_capture];
+        assert_eq!(
+            wait_slice
+                .matches("force_kill_and_reap(&mut child)")
+                .count(),
+            1
+        );
+        assert_eq!(
+            wait_slice
+                .matches("LocalPerfRunError::UnreapedChild")
+                .count(),
+            1
+        );
+        assert_eq!(
+            wait_slice.matches("write_failed_attempt_receipt(").count(),
+            0
+        );
+
+        let recovered = LocalPerfAttemptOutcome::WaitRecoveredByKill {
+            error_kind: LocalPerfIoErrorKind::Other,
+        };
+        let reaped = LocalPerfProcessLifecycle {
+            spawn_attempted: true,
+            spawn_succeeded: true,
+            wait_completed: true,
+            child_reaped: true,
+            run_log_synced: true,
+            run_log_captured: true,
+        };
+        assert!(validate_process_lifecycle(recovered, reaped, true).is_ok());
+        let mut unreaped = reaped;
+        unreaped.wait_completed = false;
+        unreaped.child_reaped = false;
+        assert!(validate_process_lifecycle(recovered, unreaped, true).is_err());
+    }
+
+    #[test]
+    fn bounded_wait_recovery_forces_a_real_child_to_a_reaped_terminal_status() {
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", "exec sleep 60"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn wait-recovery child");
+        let status = force_kill_and_reap(&mut child).expect("bounded kill and reap");
+        assert!(!status.success());
+        assert!(child.try_wait().expect("post-recovery try_wait").is_some());
     }
 
     #[test]
@@ -3658,5 +6315,24 @@ mod tests {
         let bounded = bounded_diagnostic(&error);
         assert!(bounded.len() <= 240);
         assert!(std::str::from_utf8(bounded.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn utc_timestamp_validation_rejects_impossible_calendar_and_clock_values() {
+        validate_utc_timestamp("2024-02-29T23:59:59Z", "leap timestamp")
+            .expect("valid leap-day UTC timestamp");
+        for invalid in [
+            "0000-01-01T00:00:00Z",
+            "2026-00-01T00:00:00Z",
+            "2026-13-01T00:00:00Z",
+            "2026-01-00T00:00:00Z",
+            "2026-04-31T00:00:00Z",
+            "2026-02-29T00:00:00Z",
+            "2026-01-01T24:00:00Z",
+            "2026-01-01T00:60:00Z",
+            "2026-01-01T00:00:60Z",
+        ] {
+            assert!(validate_utc_timestamp(invalid, "hostile timestamp").is_err());
+        }
     }
 }
