@@ -3,14 +3,16 @@
 //! FSLX TERMDICT sections use field-namespaced, prefix-compressed blocks. The
 //! durable bytes contain a block-first-key index and full restart keys every
 //! [`TERM_RESTART_INTERVAL`] entries. Opening a dictionary validates the whole
-//! section and builds a bounded in-memory restart directory; exact lookup then
-//! decodes at most one restart group while ordered scans reuse one key buffer.
+//! section and builds bounded restart metadata plus a deterministic CHD-style
+//! minimal perfect hash for collision-verified exact lookup. Ordered scans keep
+//! using the compact prefix blocks and one reusable key buffer.
 
 use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::ops::{Bound, Range};
 
 use thiserror::Error;
+use xxhash_rust::xxh3::xxh3_64;
 
 use crate::schema::{FieldKind, SchemaDescriptor};
 
@@ -35,6 +37,14 @@ const BLOCK_COUNT_BYTES: usize = 4;
 const BLOCK_ENTRY_COUNT_BYTES: usize = 2;
 const MIN_WIRE_BYTES_PER_BLOCK: usize = 14;
 const MIN_WIRE_BYTES_PER_ENTRY: usize = 7;
+const MPHF_DIRECT_SLOT: u32 = 1 << 31;
+const MPHF_EMPTY_BUCKET: u32 = u32::MAX;
+const MPHF_EMPTY_SLOT: u32 = u32::MAX;
+const MPHF_TARGET_BUCKET_LOAD: usize = 4;
+const MPHF_MAX_DISPLACEMENT_ATTEMPTS: u32 = 1 << 20;
+const MPHF_MAX_TOTAL_ATTEMPTS_PER_TERM: usize = 64;
+const MPHF_PRIMARY_SALT: u64 = 0x9e37_79b9_7f4a_7c15;
+const MPHF_SECONDARY_SALT: u64 = 0xd6e8_feb8_6659_fd93;
 
 /// One byte range inside another FSLX section.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -899,6 +909,304 @@ struct IndexRecord {
     relative_offset: u64,
 }
 
+#[derive(Clone, Debug)]
+struct ExactTermEntry {
+    hash: u64,
+    key_range: Range<usize>,
+    term_match: TermMatch,
+}
+
+#[derive(Clone, Debug)]
+struct ExactTermIndex {
+    displacements: Vec<u32>,
+    slots: Vec<u32>,
+    entries: Vec<ExactTermEntry>,
+    keys: Vec<u8>,
+}
+
+impl ExactTermIndex {
+    const fn empty() -> Self {
+        Self {
+            displacements: Vec::new(),
+            slots: Vec::new(),
+            entries: Vec::new(),
+            keys: Vec::new(),
+        }
+    }
+
+    fn build(builder: ExactTermIndexBuilder) -> Result<Option<Self>, TermDictionaryError> {
+        let ExactTermIndexBuilder { entries, keys } = builder;
+        let entry_count = entries.len();
+        if entry_count == 0 {
+            return Ok(Some(Self::empty()));
+        }
+
+        let bucket_count = entry_count.div_ceil(MPHF_TARGET_BUCKET_LOAD).max(1);
+        let mut bucket_counts = try_filled_vec(bucket_count, 0_usize, "MPHF bucket counts")?;
+        for entry in &entries {
+            let bucket = mphf_primary_bucket(entry.hash, bucket_count);
+            bucket_counts[bucket] =
+                bucket_counts[bucket]
+                    .checked_add(1)
+                    .ok_or(TermDictionaryError::SizeOverflow {
+                        field: "MPHF bucket population",
+                    })?;
+        }
+
+        let mut bucket_offsets = try_filled_vec(
+            bucket_count.saturating_add(1),
+            0_usize,
+            "MPHF bucket offsets",
+        )?;
+        for bucket in 0..bucket_count {
+            bucket_offsets[bucket + 1] = bucket_offsets[bucket]
+                .checked_add(bucket_counts[bucket])
+                .ok_or(TermDictionaryError::SizeOverflow {
+                    field: "MPHF bucket offsets",
+                })?;
+        }
+        let mut next_offset = try_filled_vec(bucket_count, 0_usize, "MPHF fill offsets")?;
+        next_offset.copy_from_slice(&bucket_offsets[..bucket_count]);
+        let mut members = try_filled_vec(entry_count, 0_u32, "MPHF bucket members")?;
+        for (entry_index, entry) in entries.iter().enumerate() {
+            let bucket = mphf_primary_bucket(entry.hash, bucket_count);
+            let member_offset = next_offset[bucket];
+            members[member_offset] =
+                u32::try_from(entry_index).map_err(|_| TermDictionaryError::ValueOutOfRange {
+                    field: "MPHF entry index",
+                    value: u64::try_from(entry_index).unwrap_or(u64::MAX),
+                    offset: 0,
+                })?;
+            next_offset[bucket] = member_offset.saturating_add(1);
+        }
+
+        let mut bucket_order = Vec::new();
+        bucket_order.try_reserve_exact(bucket_count).map_err(|_| {
+            TermDictionaryError::Allocation {
+                context: "MPHF bucket order",
+                count: bucket_count,
+            }
+        })?;
+        bucket_order.extend((0..bucket_count).filter(|bucket| bucket_counts[*bucket] != 0));
+        bucket_order.sort_unstable_by(|left, right| {
+            bucket_counts[*right]
+                .cmp(&bucket_counts[*left])
+                .then_with(|| left.cmp(right))
+        });
+
+        let mut displacements =
+            try_filled_vec(bucket_count, MPHF_EMPTY_BUCKET, "MPHF displacements")?;
+        let mut slots = try_filled_vec(entry_count, MPHF_EMPTY_SLOT, "MPHF slots")?;
+        let largest_bucket = bucket_order
+            .first()
+            .map_or(0, |bucket| bucket_counts[*bucket]);
+        let mut candidate_slots = Vec::new();
+        candidate_slots
+            .try_reserve_exact(largest_bucket)
+            .map_err(|_| TermDictionaryError::Allocation {
+                context: "MPHF candidate slots",
+                count: largest_bucket,
+            })?;
+        let total_attempt_budget = entry_count
+            .saturating_mul(MPHF_MAX_TOTAL_ATTEMPTS_PER_TERM)
+            .max(1_024);
+        let mut total_attempts = 0_usize;
+
+        for &bucket in bucket_order
+            .iter()
+            .take_while(|bucket| bucket_counts[**bucket] > 1)
+        {
+            let members = &members[bucket_offsets[bucket]..bucket_offsets[bucket + 1]];
+            let mut displacement = 0_u32;
+            let chosen = loop {
+                total_attempts = total_attempts.saturating_add(1);
+                candidate_slots.clear();
+                let mut collision = false;
+                for &entry_index in members {
+                    let entry_index = usize::try_from(entry_index).map_err(|_| {
+                        TermDictionaryError::ValueOutOfRange {
+                            field: "MPHF entry index",
+                            value: u64::from(entry_index),
+                            offset: 0,
+                        }
+                    })?;
+                    let entry = &entries[entry_index];
+                    let slot = mphf_secondary_slot(entry.hash, displacement, entry_count);
+                    if slots[slot] != MPHF_EMPTY_SLOT || candidate_slots.contains(&slot) {
+                        collision = true;
+                        break;
+                    }
+                    candidate_slots.push(slot);
+                }
+                if !collision {
+                    break true;
+                }
+                displacement = displacement.saturating_add(1);
+                if displacement >= MPHF_MAX_DISPLACEMENT_ATTEMPTS
+                    || total_attempts >= total_attempt_budget
+                {
+                    break false;
+                }
+            };
+            if !chosen {
+                return Ok(None);
+            }
+            displacements[bucket] = displacement;
+            for (&entry_index, &slot) in members.iter().zip(&candidate_slots) {
+                slots[slot] = entry_index;
+            }
+        }
+
+        let mut free_slot = 0_usize;
+        for &bucket in bucket_order
+            .iter()
+            .skip_while(|bucket| bucket_counts[**bucket] > 1)
+        {
+            while free_slot < slots.len() && slots[free_slot] != MPHF_EMPTY_SLOT {
+                free_slot = free_slot.saturating_add(1);
+            }
+            if free_slot == slots.len() {
+                return Ok(None);
+            }
+            let entry_index = members[bucket_offsets[bucket]];
+            slots[free_slot] = entry_index;
+            let direct_slot =
+                u32::try_from(free_slot).map_err(|_| TermDictionaryError::ValueOutOfRange {
+                    field: "MPHF direct slot",
+                    value: u64::try_from(free_slot).unwrap_or(u64::MAX),
+                    offset: 0,
+                })?;
+            displacements[bucket] = MPHF_DIRECT_SLOT | direct_slot;
+            free_slot = free_slot.saturating_add(1);
+        }
+
+        debug_assert!(slots.iter().all(|slot| *slot != MPHF_EMPTY_SLOT));
+        Ok(Some(Self {
+            displacements,
+            slots,
+            entries,
+            keys,
+        }))
+    }
+
+    fn lookup(&self, field_ord: u16, term: &[u8]) -> Option<TermMatch> {
+        if self.slots.is_empty() {
+            return None;
+        }
+        let hash = exact_term_hash(field_ord, term);
+        let bucket = mphf_primary_bucket(hash, self.displacements.len());
+        let displacement = self.displacements[bucket];
+        if displacement == MPHF_EMPTY_BUCKET {
+            return None;
+        }
+        let slot = if displacement & MPHF_DIRECT_SLOT != 0 {
+            usize::try_from(displacement & !MPHF_DIRECT_SLOT).ok()?
+        } else {
+            mphf_secondary_slot(hash, displacement, self.slots.len())
+        };
+        let entry = self.entries.get(*self.slots.get(slot)? as usize)?;
+        if entry.hash != hash || !self.entry_matches(entry, field_ord, term) {
+            return None;
+        }
+        Some(entry.term_match)
+    }
+
+    fn entry_matches(&self, entry: &ExactTermEntry, field_ord: u16, term: &[u8]) -> bool {
+        let key = &self.keys[entry.key_range.clone()];
+        key.len() == term.len().saturating_add(2)
+            && key.get(..2) == Some(field_ord.to_be_bytes().as_slice())
+            && key.get(2..) == Some(term)
+    }
+}
+
+#[derive(Debug, Default)]
+struct ExactTermIndexBuilder {
+    entries: Vec<ExactTermEntry>,
+    keys: Vec<u8>,
+}
+
+impl ExactTermIndexBuilder {
+    fn push(
+        &mut self,
+        composite_key: &[u8],
+        term_match: TermMatch,
+    ) -> Result<(), TermDictionaryError> {
+        self.entries
+            .try_reserve(1)
+            .map_err(|_| TermDictionaryError::Allocation {
+                context: "MPHF entries",
+                count: self.entries.len().saturating_add(1),
+            })?;
+        self.keys.try_reserve(composite_key.len()).map_err(|_| {
+            TermDictionaryError::Allocation {
+                context: "MPHF verification keys",
+                count: self.keys.len().saturating_add(composite_key.len()),
+            }
+        })?;
+        let key_start = self.keys.len();
+        self.keys.extend_from_slice(composite_key);
+        let key_end = self.keys.len();
+        let field_ord = u16::from_be_bytes([composite_key[0], composite_key[1]]);
+        self.entries.push(ExactTermEntry {
+            hash: exact_term_hash(field_ord, &composite_key[2..]),
+            key_range: key_start..key_end,
+            term_match,
+        });
+        Ok(())
+    }
+}
+
+fn try_filled_vec<T: Clone>(
+    len: usize,
+    value: T,
+    context: &'static str,
+) -> Result<Vec<T>, TermDictionaryError> {
+    let mut output = Vec::new();
+    output
+        .try_reserve_exact(len)
+        .map_err(|_| TermDictionaryError::Allocation {
+            context,
+            count: len,
+        })?;
+    output.resize(len, value);
+    Ok(output)
+}
+
+fn exact_term_hash(field_ord: u16, term: &[u8]) -> u64 {
+    mix_mphf_hash(
+        xxh3_64(term)
+            ^ u64::from(field_ord).wrapping_mul(MPHF_PRIMARY_SALT)
+            ^ u64::try_from(term.len())
+                .unwrap_or(u64::MAX)
+                .rotate_left(17),
+    )
+}
+
+const fn mix_mphf_hash(mut value: u64) -> u64 {
+    value ^= value >> 30;
+    value = value.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    value ^= value >> 27;
+    value = value.wrapping_mul(0x94d0_49bb_1331_11eb);
+    value ^ (value >> 31)
+}
+
+fn mphf_primary_bucket(hash: u64, bucket_count: usize) -> usize {
+    reduce_mphf_hash(mix_mphf_hash(hash ^ MPHF_PRIMARY_SALT), bucket_count)
+}
+
+fn mphf_secondary_slot(hash: u64, displacement: u32, slot_count: usize) -> usize {
+    let displaced = hash
+        ^ u64::from(displacement)
+            .wrapping_add(1)
+            .wrapping_mul(MPHF_SECONDARY_SALT);
+    reduce_mphf_hash(mix_mphf_hash(displaced), slot_count)
+}
+
+fn reduce_mphf_hash(hash: u64, modulus: usize) -> usize {
+    let modulus_u64 = u64::try_from(modulus).unwrap_or(u64::MAX);
+    usize::try_from(hash % modulus_u64).unwrap_or(usize::MAX)
+}
+
 /// Owned, allocation-bounded metadata produced by one complete TERMDICT
 /// validation.
 ///
@@ -914,6 +1222,7 @@ pub(crate) struct ValidatedTermDictionaryMetadata {
     sections: TermSectionLengths,
     blocks: Vec<BlockMeta>,
     restarts: Vec<RestartMeta>,
+    exact_index: Option<ExactTermIndex>,
     term_count: u32,
 }
 
@@ -931,6 +1240,7 @@ pub struct TermDictionary<'a> {
     sections: TermSectionLengths,
     blocks: Cow<'a, [BlockMeta]>,
     restarts: Cow<'a, [RestartMeta]>,
+    exact_index: Option<Cow<'a, ExactTermIndex>>,
     term_count: u32,
 }
 
@@ -1009,6 +1319,7 @@ impl<'a> TermDictionary<'a> {
                 sections,
                 blocks: Cow::Owned(Vec::new()),
                 restarts: Cow::Owned(Vec::new()),
+                exact_index: Some(Cow::Owned(ExactTermIndex::empty())),
                 term_count: 0,
             });
         }
@@ -1105,6 +1416,7 @@ impl<'a> TermDictionary<'a> {
         let mut references = ReferenceValidator::new(schema, sections)?;
         let mut previous_key = Vec::new();
         let mut decode_key = Vec::new();
+        let mut exact_index = ExactTermIndexBuilder::default();
         let mut previous_tail = None;
         let mut term_count = 0_usize;
 
@@ -1134,6 +1446,7 @@ impl<'a> TermDictionary<'a> {
                 &mut references,
                 &mut decode_key,
                 &mut previous_key,
+                &mut exact_index,
                 previous_tail.as_ref(),
             )?;
             blocks
@@ -1146,6 +1459,7 @@ impl<'a> TermDictionary<'a> {
             previous_tail = Some(tail);
         }
         references.finish()?;
+        let exact_index = ExactTermIndex::build(exact_index)?;
         let term_count_u32 =
             u32::try_from(term_count).map_err(|_| TermDictionaryError::ValueOutOfRange {
                 field: "term_count",
@@ -1158,6 +1472,7 @@ impl<'a> TermDictionary<'a> {
             sections,
             blocks: Cow::Owned(blocks),
             restarts: Cow::Owned(restarts),
+            exact_index: exact_index.map(Cow::Owned),
             term_count: term_count_u32,
         })
     }
@@ -1178,6 +1493,7 @@ impl<'a> TermDictionary<'a> {
             sections,
             blocks,
             restarts,
+            exact_index,
             term_count,
         } = parsed;
         Ok(ValidatedTermDictionaryMetadata {
@@ -1187,6 +1503,7 @@ impl<'a> TermDictionary<'a> {
             sections,
             blocks: blocks.into_owned(),
             restarts: restarts.into_owned(),
+            exact_index: exact_index.map(Cow::into_owned),
             term_count,
         })
     }
@@ -1209,6 +1526,7 @@ impl<'a> TermDictionary<'a> {
             sections: metadata.sections,
             blocks: Cow::Borrowed(&metadata.blocks),
             restarts: Cow::Borrowed(&metadata.restarts),
+            exact_index: metadata.exact_index.as_ref().map(Cow::Borrowed),
             term_count: metadata.term_count,
         })
     }
@@ -1253,8 +1571,9 @@ impl<'a> TermDictionary<'a> {
 
     /// Exact lookup reusing caller-owned key buffers.
     ///
-    /// The block and restart indexes are binary-searched, then no more than 16
-    /// entries are decoded.
+    /// Validated static dictionaries use a collision-verified minimal perfect
+    /// hash. The bounded legacy restart decoder remains the fallback if a
+    /// pathological keyset exhausts the deterministic displacement budget.
     ///
     /// # Errors
     ///
@@ -1267,6 +1586,9 @@ impl<'a> TermDictionary<'a> {
         scratch: &mut TermScratch,
     ) -> Result<Option<TermMatch>, TermDictionaryError> {
         validate_query_term(self.schema, field_ord, term)?;
+        if let Some(exact_index) = self.exact_index.as_deref() {
+            return Ok(exact_index.lookup(field_ord, term));
+        }
         build_composite_in(&mut scratch.target, field_ord, term, "lookup target")?;
         let target = scratch.target.as_slice();
         let Some(block_index) = self.block_for_key(target) else {
@@ -1929,6 +2251,7 @@ fn validate_block(
     references: &mut ReferenceValidator,
     block_key: &mut Vec<u8>,
     previous_key: &mut Vec<u8>,
+    exact_index: &mut ExactTermIndexBuilder,
     previous_tail: Option<&BlockTail>,
 ) -> Result<(BlockMeta, BlockTail), TermDictionaryError> {
     let block_len = byte_range.end.saturating_sub(byte_range.start);
@@ -2031,16 +2354,23 @@ fn validate_block(
         if !previous_key.is_empty() && block_key.as_slice() <= previous_key.as_slice() {
             return Err(TermDictionaryError::NonAscendingKey { term_ordinal });
         }
+        let term_ordinal_u32 =
+            u32::try_from(term_ordinal).map_err(|_| TermDictionaryError::ValueOutOfRange {
+                field: "term ordinal",
+                value: u64::try_from(term_ordinal).unwrap_or(u64::MAX),
+                offset: entry_offset,
+            })?;
+        exact_index.push(
+            block_key,
+            TermMatch {
+                term_ord: term_ordinal_u32,
+                metadata: decoded.metadata,
+            },
+        )?;
         if let Some(marker) = decoded.full_key_range {
             restarts.push(RestartMeta {
                 entry_ordinal,
-                term_ordinal: u32::try_from(term_ordinal).map_err(|_| {
-                    TermDictionaryError::ValueOutOfRange {
-                        field: "term ordinal",
-                        value: u64::try_from(term_ordinal).unwrap_or(u64::MAX),
-                        offset: entry_offset,
-                    }
-                })?,
+                term_ordinal: term_ordinal_u32,
                 entry_offset,
                 key_range: marker.into_range(),
             });
@@ -3182,6 +3512,7 @@ mod tests {
         let second = TermDictionary::from_validated_metadata(encoded.as_bytes(), &metadata)?;
         assert!(matches!(&first.blocks, Cow::Borrowed(_)));
         assert!(matches!(&first.restarts, Cow::Borrowed(_)));
+        assert!(matches!(&first.exact_index, Some(Cow::Borrowed(_))));
         assert_eq!(first.term_count(), 33);
         assert_eq!(first.block_count(), second.block_count());
         assert_eq!(first.restart_count(), second.restart_count());
@@ -3206,6 +3537,37 @@ mod tests {
             Err(TermDictionaryError::InvalidSchema { detail })
                 if detail.contains("different byte source")
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn minimal_perfect_hash_serves_every_exact_term_across_blocks() -> TestResult {
+        let keys = sorted_numbered_keys(4_097);
+        let (encoded, inputs, sections) = encode_fixture(KEYWORD_SCHEMA, &keys)?;
+        let dictionary = encoded.dictionary(KEYWORD_SCHEMA, sections)?;
+        let exact_index = dictionary
+            .exact_index
+            .as_deref()
+            .expect("ordinary static keyset should admit the MPHF path");
+        assert_eq!(exact_index.slots.len(), keys.len());
+        assert!(
+            exact_index
+                .slots
+                .iter()
+                .all(|slot| *slot != MPHF_EMPTY_SLOT)
+        );
+
+        for (ordinal, (_, term)) in keys.iter().enumerate() {
+            assert_eq!(
+                dictionary.lookup(0, term)?,
+                Some(TermMatch {
+                    term_ord: u32::try_from(ordinal)?,
+                    metadata: inputs[ordinal].metadata,
+                })
+            );
+        }
+        assert_eq!(dictionary.lookup(0, b"term-04097")?, None);
+        assert_eq!(dictionary.lookup(0, b"not-present")?, None);
         Ok(())
     }
 
