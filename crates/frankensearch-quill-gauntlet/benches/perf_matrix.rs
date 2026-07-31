@@ -34,22 +34,30 @@ use frankensearch_quill::{
     QuillIndex, SchemaDescriptor, SegmentStatsProvider,
 };
 use frankensearch_quill_gauntlet::{
-    BuildIdentity, ColdCacheEvidence, ComparatorConfig, ComparisonStatus, CorpusIdentity,
-    CorpusManifest, CountState, DistributionSummary, EngineConcurrencyObservation,
-    EngineObservation, EvidenceCell, EvidenceCellSpec, EvidencePolicy, EvidenceProvenance,
-    EvidenceRole, ExecutionProfileId, HardwareClassId, MachineClassRegistry, MachineIdentity,
-    MachineProfileKey, NativeTieKey, PERF_ARTIFACT_SCHEMA_VERSION, PERF_MIN_RUNS,
-    PairedEstimatorConfig, PeakRssEvidence, PerfApplicabilityPlan, PerfCellApplicability,
-    PerfCellResult, PerfCellSpec, PerfConcurrencyEngine, PerfConcurrencyObserver,
-    PerfConcurrencyWitness, PerfCorpus, PerfEvidenceArtifact, PerfGate, PerfGateArtifact,
-    PerfInputIdentity, PerfMatrixSpec, PerfMetricSemantics, PerfOperationScope, PerfQueryClass,
-    PerfRawSample, PerfSampleArm, PerfSampleOrder, PerfSamplePhase, PerfSampleProvenance,
-    PerfTopology, PositionMode, QG6_QUERY_GROUP_IDS, QG6_QUERY_GROUPS, Qg6ArmRole, Qg6Comparison,
-    Qg6Phase, Qg6PreparedExperiment, Qg6QuerySpec, Qg6SampleBinding, Qg6SampleOrder, Qg6SearchHit,
-    Qg6SearchResult, Qg6SemanticContract, RankClass, RankedHit, ScoreEpsilonReason,
-    SyntheticCorpus, SyntheticCorpusSpec, ZipfExponent, command_sha256_from_argv,
-    compare_observations, estimate_paired_experiment, machine_fingerprint, oracle_version_contract,
-    peak_rss_bytes, perf_manifest_contract_sha256, seeded_balanced_pair_order, validate_matrix,
+    BuildIdentity, ByteStageObservation, CONTINUOUS_TIMING_SCHEMA_VERSION, ColdCacheEvidence,
+    CollectorBinding, ComparatorConfig, ComparisonStatus, ContinuousCellEvidence,
+    ContinuousCorpusManifest, ContinuousPhaseTimeline, ContinuousSampleIdentity,
+    ContinuousSampleWindow, ContinuousTimingEvidence, ContinuousWindowReceipt, CorpusIdentity,
+    CorpusManifest, CountState, DistributionSummary, EngineByteObservation,
+    EngineConcurrencyObservation, EngineObservation, EngineQuiescence, EvidenceCell,
+    EvidenceCellSpec, EvidencePolicy, EvidenceProvenance, EvidenceRole, ExecutionProfileId,
+    HardwareClassId, LifecycleObserver, LifecyclePhase, MachineClassRegistry, MachineIdentity,
+    MachineProfileKey, NativeTieKey, NoopLifecycleObserver, PERF_ARTIFACT_SCHEMA_VERSION,
+    PERF_MIN_RUNS, PairedEstimatorConfig, PeakRssEvidence, PerfApplicabilityPlan,
+    PerfCellApplicability, PerfCellResult, PerfCellSpec, PerfConcurrencyEngine,
+    PerfConcurrencyObserver, PerfConcurrencyWitness, PerfCorpus, PerfEvidenceArtifact, PerfGate,
+    PerfGateArtifact, PerfInputIdentity, PerfMatrixSpec, PerfMetricSemantics, PerfOperationScope,
+    PerfQueryClass, PerfRawSample, PerfSampleArm, PerfSampleOrder, PerfSamplePhase,
+    PerfSampleProvenance, PerfTopology, PositionMode, QG6_QUERY_GROUP_IDS, QG6_QUERY_GROUPS,
+    Qg6ArmRole, Qg6Comparison, Qg6Phase, Qg6PreparedExperiment, Qg6QuerySpec, Qg6SampleBinding,
+    Qg6SampleOrder, Qg6SearchHit, Qg6SearchResult, Qg6SemanticContract, QueueObservation,
+    RankClass, RankedHit, ScoreEpsilonReason, SyntheticCorpus, SyntheticCorpusSpec, TerminalJoin,
+    TimingMode, TimingSource, WORK_RECEIPT_SCHEMA_VERSION, WidthObservation, WorkReceipt,
+    WorkReceiptCellEvidence, WorkReceiptCollector, WorkReceiptEvidence, WorkReceiptExpectation,
+    WorkReceiptMode, ZipfExponent, command_sha256_from_argv, compare_observations,
+    continuous_raw_sample, continuous_throughput_scope, document_bytes, estimate_paired_experiment,
+    machine_fingerprint, oracle_version_contract, peak_rss_bytes, perf_manifest_contract_sha256,
+    seeded_balanced_pair_order, validate_matrix,
 };
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -102,6 +110,26 @@ fn validate_qg6_queries_per_class(manifest: &str) -> Result<(), String> {
 static SCRATCH_COUNTER: AtomicU64 = AtomicU64::new(0);
 static LIFECYCLE_RECEIPT_COUNTER: AtomicU64 = AtomicU64::new(0);
 static LIFECYCLE_RECEIPTS: OnceLock<Mutex<Vec<serde_json::Value>>> = OnceLock::new();
+/// Invocation-wide timing mode (QG-1 H1). Read once; per-call by default.
+static TIMING_MODE: OnceLock<TimingMode> = OnceLock::new();
+/// Continuous-mode per-fixture evidence accumulator.
+static CONTINUOUS_CELL_STATE: OnceLock<Mutex<BTreeMap<String, ContinuousCellState>>> =
+    OnceLock::new();
+/// Hand-off slot: the continuous window measured by the innermost bulk runner,
+/// consumed by the paired-stream sample builder on the coordinating thread.
+static CONTINUOUS_SAMPLE_CAPTURE: OnceLock<Mutex<Option<ContinuousSampleCapture>>> =
+    OnceLock::new();
+/// Invocation-wide work-receipt mode (QG-1 H2). Read once; off by default.
+static WORK_RECEIPT_MODE: OnceLock<WorkReceiptMode> = OnceLock::new();
+/// Monotonic anchor all receipt windows are expressed against.
+static WORK_RECEIPT_ORIGIN: OnceLock<Instant> = OnceLock::new();
+/// Run identity sealed by `bench_matrix` before any receipted collection.
+static WORK_RECEIPT_IDENTITY: OnceLock<WorkReceiptRunIdentity> = OnceLock::new();
+/// Per-fixture work-receipt accumulator (bounded: counts + last per arm).
+static WORK_RECEIPT_STATE: OnceLock<Mutex<BTreeMap<String, WorkReceiptCellState>>> =
+    OnceLock::new();
+/// Every sealed receipt of the invocation, flushed as JSONL post-collection.
+static WORK_RECEIPT_LOG: OnceLock<Mutex<Vec<serde_json::Value>>> = OnceLock::new();
 static CONCURRENCY_OBSERVATIONS: OnceLock<
     Mutex<BTreeMap<(String, String), ConcurrencyAccumulator>>,
 > = OnceLock::new();
@@ -932,7 +960,11 @@ fn fence_tantivy_lifecycle(
     (index, Duration::from_nanos(receipt.join_elapsed_ns))
 }
 
-fn finish_tantivy_lifecycle(index: TantivyIndex, spec: &PerfCellSpec, phase: &str) -> Duration {
+fn finish_tantivy_lifecycle(
+    index: TantivyIndex,
+    spec: &PerfCellSpec,
+    phase: &str,
+) -> (Duration, BenchmarkWriterJoinReceipt) {
     let receipt = index
         .benchmark_join_workers()
         .expect("join Tantivy benchmark workers without rearming");
@@ -941,7 +973,895 @@ fn finish_tantivy_lifecycle(index: TantivyIndex, spec: &PerfCellSpec, phase: &st
         "terminal Tantivy lifecycle fence unexpectedly rearmed a writer"
     );
     emit_tantivy_lifecycle_receipt(spec, phase, &receipt);
-    Duration::from_nanos(receipt.join_elapsed_ns)
+    (Duration::from_nanos(receipt.join_elapsed_ns), receipt)
+}
+
+// ─── QG-1 H2: actual-work, queue, worker-role, and lifecycle receipts ────────
+//
+// Opt-in via `QUILL_PERF_WORK_RECEIPTS=on`, scoped to QG-1 docs_per_second
+// cells (the only cells with a prepared immutable corpus to bind against).
+// The collector observes at the harness↔engine boundary and through the
+// engines' real accessors; anything no seam exposes stays a typed gap. The
+// same collector implements the H1 `LifecycleObserver` seam and plugs into
+// `bulk_metric_continuous` with the same phase clock and
+// `timing_mode: "continuous"`.
+
+/// Run identity every receipt binds (sealed once per invocation).
+struct WorkReceiptRunIdentity {
+    run_id: String,
+    machine_fingerprint: String,
+    build_profile: String,
+    executable_sha256: String,
+    git_rev: String,
+}
+
+/// Bounded per-fixture accumulator entry.
+struct WorkReceiptCellState {
+    gate: PerfGate,
+    rounds_quill: u64,
+    rounds_tantivy: u64,
+    last_quill: Option<WorkReceipt>,
+    last_tantivy: Option<WorkReceipt>,
+    all_validated: bool,
+}
+
+fn work_receipt_mode() -> WorkReceiptMode {
+    *WORK_RECEIPT_MODE
+        .get_or_init(|| WorkReceiptMode::from_env().expect("QUILL_PERF_WORK_RECEIPTS"))
+}
+
+/// Whether this cell collects H2 work receipts.
+fn work_receipt_cell(spec: &PerfCellSpec) -> bool {
+    work_receipt_mode().is_enabled()
+        && spec.gate == PerfGate::Qg1
+        && spec.metric == "docs_per_second"
+}
+
+fn work_receipt_origin_elapsed_ns() -> u64 {
+    u64::try_from(
+        WORK_RECEIPT_ORIGIN
+            .get_or_init(Instant::now)
+            .elapsed()
+            .as_nanos(),
+    )
+    .expect("monotonic ns")
+}
+
+/// First alphanumeric token of the prepared corpus, lowercased with the same
+/// folding the analyzers apply: a term guaranteed searchable after the
+/// terminal commit.
+fn work_receipt_probe_term(documents: &[IndexableDocument]) -> String {
+    documents
+        .iter()
+        .find_map(|document| {
+            document
+                .content
+                .split(|c: char| !c.is_alphanumeric())
+                .find(|token| !token.is_empty())
+        })
+        .expect("prepared corpus contains at least one searchable token")
+        .to_ascii_lowercase()
+}
+
+/// Build the receipt collector for one window of one arm.
+fn work_receipt_collector(
+    spec: &PerfCellSpec,
+    arm: EngineArm,
+    prefix: &PreparedQg1Prefix,
+) -> WorkReceiptCollector {
+    let identity = WORK_RECEIPT_IDENTITY
+        .get()
+        .expect("work-receipt identity sealed before any receipted collection");
+    WorkReceiptCollector::new(
+        CollectorBinding {
+            run_id: identity.run_id.clone(),
+            machine_fingerprint: identity.machine_fingerprint.clone(),
+            build_profile: identity.build_profile.clone(),
+            executable_sha256: identity.executable_sha256.clone(),
+            git_rev: identity.git_rev.clone(),
+            gate: spec.gate.to_string(),
+            fixture: spec.fixture.clone(),
+            metric: spec.metric.clone(),
+            engine: arm.label().to_owned(),
+            timing_mode: timing_mode().label().to_owned(),
+            corpus_identity: format!(
+                "qg1-native/prepared-prefix-v1/{}",
+                prefix.indexed_content_sha256
+            ),
+            corpus_manifest_sha256: prefix.manifest_sha256.clone(),
+        },
+        u64::try_from(spec.threads.expect("QG-1 bulk cell thread width")).expect("width fits u64"),
+    )
+}
+
+fn lifecycle_observer<'a>(
+    collector: Option<&'a mut WorkReceiptCollector>,
+    noop: &'a mut NoopLifecycleObserver,
+) -> &'a mut dyn LifecycleObserver {
+    collector.map_or(noop as &mut dyn LifecycleObserver, |collector| {
+        collector as &mut dyn LifecycleObserver
+    })
+}
+
+/// Quill's honest engine-reported footprint: exact FSLX byte lengths from
+/// the published manifest (backend-independent — `managed_disk_bytes` is
+/// hard-zero on the in-memory backend and must not be used here).
+fn quill_index_footprint(index: &QuillIndex) -> (EngineByteObservation, EngineByteObservation) {
+    let snapshot = index.snapshot();
+    let manifest = &snapshot.loaded_manifest().manifest;
+    let bytes: u64 = manifest
+        .segments
+        .iter()
+        .map(|segment| segment.file_len)
+        .sum();
+    (
+        EngineByteObservation::Observed {
+            bytes,
+            seam: "quill KeeperSnapshot::loaded_manifest().manifest.segments[].file_len \
+                   (exact FSLX lengths, backend-independent)"
+                .to_owned(),
+        },
+        EngineByteObservation::Observed {
+            bytes: manifest.segments.len() as u64,
+            seam: "quill KeeperSnapshot::loaded_manifest().manifest.segments.len()".to_owned(),
+        },
+    )
+}
+
+/// Tantivy's honest engine-reported footprint via the bench layout seam.
+fn tantivy_index_footprint(index: &TantivyIndex) -> (EngineByteObservation, EngineByteObservation) {
+    match index.benchmark_index_layout() {
+        Ok((segments, bytes)) => (
+            EngineByteObservation::Observed {
+                bytes,
+                seam: "TantivyIndex::benchmark_index_layout (managed segment files via \
+                       Directory::open_read)"
+                    .to_owned(),
+            },
+            EngineByteObservation::Observed {
+                bytes: segments as u64,
+                seam: "TantivyIndex::benchmark_index_layout searchable segment count".to_owned(),
+            },
+        ),
+        Err(error) => {
+            let seam = format!("TantivyIndex::benchmark_index_layout failed: {error}");
+            (
+                EngineByteObservation::StructurallyUnobservable { seam: seam.clone() },
+                EngineByteObservation::StructurallyUnobservable { seam },
+            )
+        }
+    }
+}
+
+/// Finish, validate fail-closed, log, and record one receipt.
+fn finalize_work_receipt(
+    collector: WorkReceiptCollector,
+    spec: &PerfCellSpec,
+    arm: EngineArm,
+    expected_docs: u64,
+    expected_bytes: u64,
+    window_started_rel_ns: u64,
+    expected_wall_ns: Option<u64>,
+) {
+    let receipt = collector
+        .finish(window_started_rel_ns)
+        .expect("assemble QG-1 work receipt");
+    if let Some(expected_wall_ns) = expected_wall_ns {
+        assert_eq!(
+            receipt.concurrency.wall_ns, expected_wall_ns,
+            "H1 continuous window and H2 work receipt used different wall clocks"
+        );
+    }
+    let expectation = WorkReceiptExpectation {
+        engine: arm.label().to_owned(),
+        doc_count: expected_docs,
+        total_bytes: expected_bytes,
+        configured_threads: u64::try_from(spec.threads.expect("QG-1 bulk cell thread width"))
+            .expect("width fits u64"),
+    };
+    let validated = receipt.validate(&expectation);
+    eprintln!("{}", receipt.bounded_log_line());
+    let mut state = WORK_RECEIPT_STATE
+        .get_or_init(|| Mutex::new(BTreeMap::new()))
+        .lock()
+        .expect("lock work-receipt state");
+    let cell = state
+        .entry(spec.fixture.clone())
+        .or_insert_with(|| WorkReceiptCellState {
+            gate: spec.gate,
+            rounds_quill: 0,
+            rounds_tantivy: 0,
+            last_quill: None,
+            last_tantivy: None,
+            all_validated: true,
+        });
+    cell.all_validated &= validated.is_ok();
+    match arm {
+        EngineArm::Quill => {
+            cell.rounds_quill += 1;
+            cell.last_quill = Some(receipt.clone());
+        }
+        EngineArm::Tantivy => {
+            cell.rounds_tantivy += 1;
+            cell.last_tantivy = Some(receipt.clone());
+        }
+    }
+    drop(state);
+    WORK_RECEIPT_LOG
+        .get_or_init(|| Mutex::new(Vec::new()))
+        .lock()
+        .expect("lock work-receipt log")
+        .push(serde_json::to_value(&receipt).expect("serialize work receipt"));
+    validated.expect("work receipt violated the H2 contract");
+}
+
+/// Drain the accumulator into per-gate additive artifact evidence.
+fn take_work_receipt_evidence() -> BTreeMap<PerfGate, WorkReceiptEvidence> {
+    let Some(state) = WORK_RECEIPT_STATE.get() else {
+        return BTreeMap::new();
+    };
+    let drained = {
+        let mut state = state.lock().expect("lock work-receipt state for drain");
+        std::mem::take(&mut *state)
+    };
+    let mut by_gate: BTreeMap<PerfGate, WorkReceiptEvidence> = BTreeMap::new();
+    for (fixture, cell) in drained {
+        by_gate
+            .entry(cell.gate)
+            .or_insert_with(|| WorkReceiptEvidence {
+                schema_version: WORK_RECEIPT_SCHEMA_VERSION.to_owned(),
+                mode: work_receipt_mode().label().to_owned(),
+                cells: Vec::new(),
+            })
+            .cells
+            .push(WorkReceiptCellEvidence {
+                schema_version: WORK_RECEIPT_SCHEMA_VERSION.to_owned(),
+                fixture,
+                rounds_quill: cell.rounds_quill,
+                rounds_tantivy: cell.rounds_tantivy,
+                last_quill_receipt: cell.last_quill,
+                last_tantivy_receipt: cell.last_tantivy,
+                all_receipts_validated: cell.all_validated,
+            });
+    }
+    by_gate
+}
+
+/// Flush every sealed receipt as JSONL alongside the lifecycle receipts.
+fn flush_work_receipts(output_dir: &Path) {
+    let Some(log) = WORK_RECEIPT_LOG.get() else {
+        return;
+    };
+    let (payload, receipt_count) = {
+        let log = log.lock().expect("lock work-receipt log for flush");
+        if log.is_empty() {
+            return;
+        }
+        let mut payload = Vec::new();
+        for row in log.iter() {
+            serde_json::to_writer(&mut payload, row).expect("serialize work receipt row");
+            payload.push(b'\n');
+        }
+        (payload, log.len())
+    };
+    std::fs::create_dir_all(output_dir).expect("create work-receipt directory");
+    let path = output_dir.join("work-receipts.jsonl");
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .expect("open work-receipt JSONL");
+    file.write_all(&payload).expect("write work receipts");
+    eprintln!(
+        "[qg1-work-receipts] receipts={} sha256={} path={}",
+        receipt_count,
+        lower_hex(&Sha256::digest(&payload)),
+        display_path(&path),
+    );
+}
+
+// ─── QG-1 H1: continuous first-feed-to-quiescence timing ────────────────────
+//
+// Corpus immutability is provided by the prepared QG-1 corpus (bd-6oiq): one
+// Arc-backed materialization, exact prefix manifests, and a domain-separated
+// SHA-256 over the actual indexed documents, all fail-closed rechecked before
+// evidence collection. This block adds the remaining H1 contract on top: one
+// continuous monotonic window per sample (first feed → terminal searchable
+// commit → engine quiescence join), accepted/processed/committed/searchable
+// work-equality receipts, and derived-throughput samples — opt-in via
+// `QUILL_PERF_TIMING_MODE=continuous`.
+
+/// Continuous-mode per-fixture accumulator entry.
+struct ContinuousCellState {
+    gate: PerfGate,
+    document_count: u64,
+    manifest: ContinuousCorpusManifest,
+    rounds_quill: u64,
+    rounds_tantivy: u64,
+    last_quill: Option<ContinuousWindowReceipt>,
+    last_tantivy: Option<ContinuousWindowReceipt>,
+    all_windows_validated: bool,
+}
+
+/// One measured continuous window, handed from the bulk runner to the
+/// paired-stream sample builder.
+#[derive(Clone, Copy)]
+struct ContinuousSampleCapture {
+    started: Instant,
+    ended: Instant,
+    work_units: u64,
+    byte_count: u64,
+}
+
+fn timing_mode() -> TimingMode {
+    *TIMING_MODE.get_or_init(|| TimingMode::from_env().expect("QUILL_PERF_TIMING_MODE"))
+}
+
+/// Whether this cell measures bulk indexing under the continuous H1 contract.
+///
+/// Scoped to QG-1 engine-indexing cells: only QG-1 has the prepared immutable
+/// corpus this window feeds from, and the tokenizer-only null keeps gauge
+/// semantics because it exercises no engine with background workers.
+fn continuous_bulk_cell(spec: &PerfCellSpec) -> bool {
+    timing_mode().is_continuous() && spec.gate == PerfGate::Qg1 && spec.metric == "docs_per_second"
+}
+
+fn elapsed_ns(since: Instant) -> u64 {
+    u64::try_from(since.elapsed().as_nanos()).expect("monotonic ns")
+}
+
+fn duration_ns(duration: Duration) -> u64 {
+    u64::try_from(duration.as_nanos()).expect("duration ns")
+}
+
+/// Seal (first use) or fetch the continuous receipt manifest for one fixture.
+///
+/// The manifest binds document count, byte totals, field occurrences, order,
+/// and an xxh3 digest over the exact prepared prefix this cell feeds; its
+/// identity embeds the prepared corpus's indexed-content SHA-256 so the
+/// receipt chain is anchored to the same bytes bd-6oiq verified.
+fn continuous_manifest(
+    spec: &PerfCellSpec,
+    indexed_content_sha256: &str,
+    documents: &[IndexableDocument],
+) -> ContinuousCorpusManifest {
+    let mut state = CONTINUOUS_CELL_STATE
+        .get_or_init(|| Mutex::new(BTreeMap::new()))
+        .lock()
+        .expect("lock continuous cell state");
+    state
+        .entry(spec.fixture.clone())
+        .or_insert_with(|| {
+            let manifest = ContinuousCorpusManifest::seal(
+                &format!("qg1-native/prepared-prefix-v1/{indexed_content_sha256}"),
+                CORPUS_SEED,
+                spec.positions.unwrap_or(PositionMode::On).label(),
+                documents,
+            )
+            .expect("seal QG-1-native continuous corpus manifest");
+            eprintln!(
+                "[qg1-continuous-corpus] fixture={} identity={} docs={} bytes={} xxh3={}",
+                spec.fixture,
+                manifest.identity,
+                manifest.doc_count,
+                manifest.total_bytes,
+                manifest.corpus_xxh3,
+            );
+            ContinuousCellState {
+                gate: spec.gate,
+                document_count: manifest.doc_count,
+                manifest,
+                rounds_quill: 0,
+                rounds_tantivy: 0,
+                last_quill: None,
+                last_tantivy: None,
+                all_windows_validated: true,
+            }
+        })
+        .manifest
+        .clone()
+}
+
+fn record_continuous_window(spec: &PerfCellSpec, arm: EngineArm, receipt: ContinuousWindowReceipt) {
+    let mut state = CONTINUOUS_CELL_STATE
+        .get_or_init(|| Mutex::new(BTreeMap::new()))
+        .lock()
+        .expect("lock continuous cell state");
+    let cell = state
+        .get_mut(&spec.fixture)
+        .expect("continuous window recorded before its manifest was sealed");
+    match arm {
+        EngineArm::Quill => {
+            cell.rounds_quill += 1;
+            cell.last_quill = Some(receipt);
+        }
+        EngineArm::Tantivy => {
+            cell.rounds_tantivy += 1;
+            cell.last_tantivy = Some(receipt);
+        }
+    }
+    drop(state);
+}
+
+/// Drain the continuous accumulator into per-gate artifact evidence.
+///
+/// Post-collection bookend to the prepared corpus's pre-collection identity
+/// recheck: every fixture's manifest is re-verified against the live prefix
+/// slice after all windows ran, fail-closed.
+fn take_continuous_evidence(
+    context: &BenchContext,
+) -> BTreeMap<PerfGate, ContinuousTimingEvidence> {
+    let Some(state) = CONTINUOUS_CELL_STATE.get() else {
+        return BTreeMap::new();
+    };
+    let drained = {
+        let mut state = state.lock().expect("lock continuous cell state for drain");
+        std::mem::take(&mut *state)
+    };
+    let mut by_gate: BTreeMap<PerfGate, ContinuousTimingEvidence> = BTreeMap::new();
+    for (fixture, cell) in drained {
+        let (_, documents) = context.qg1_prefix(cell.document_count);
+        cell.manifest
+            .verify(documents)
+            .expect("continuous corpus mutated between first window and evidence drain");
+        by_gate
+            .entry(cell.gate)
+            .or_insert_with(|| ContinuousTimingEvidence {
+                schema_version: CONTINUOUS_TIMING_SCHEMA_VERSION.to_owned(),
+                timing_mode: timing_mode().label().to_owned(),
+                cells: Vec::new(),
+            })
+            .cells
+            .push(ContinuousCellEvidence {
+                schema_version: CONTINUOUS_TIMING_SCHEMA_VERSION.to_owned(),
+                fixture,
+                timing_mode: timing_mode().label().to_owned(),
+                corpus: cell.manifest,
+                rounds_quill: cell.rounds_quill,
+                rounds_tantivy: cell.rounds_tantivy,
+                last_quill_receipt: cell.last_quill,
+                last_tantivy_receipt: cell.last_tantivy,
+                all_windows_validated: cell.all_windows_validated,
+            });
+    }
+    by_gate
+}
+
+fn clear_continuous_capture() {
+    CONTINUOUS_SAMPLE_CAPTURE
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .expect("lock continuous sample capture")
+        .take();
+}
+
+fn store_continuous_capture(capture: ContinuousSampleCapture) {
+    // Warmup rounds and Criterion presentation iterations measure without
+    // consuming the capture, so replacement is deliberate; the paired stream
+    // guards pairing by clearing before and take-expecting after each
+    // measurement.
+    CONTINUOUS_SAMPLE_CAPTURE
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .expect("lock continuous sample capture")
+        .replace(capture);
+}
+
+fn take_continuous_capture() -> Option<ContinuousSampleCapture> {
+    CONTINUOUS_SAMPLE_CAPTURE
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .expect("lock continuous sample capture")
+        .take()
+}
+
+/// First alphanumeric token found in the corpus (documents may include
+/// pathology anchors with no tokenizable content), lowercased with the same
+/// folding the analyzer applies: a term guaranteed searchable after the
+/// terminal commit.
+fn continuous_probe_term(documents: &[IndexableDocument]) -> String {
+    documents
+        .iter()
+        .find_map(|document| {
+            document
+                .content
+                .split(|c: char| !c.is_alphanumeric())
+                .find(|token| !token.is_empty())
+        })
+        .expect("prepared corpus contains at least one searchable token")
+        .to_ascii_lowercase()
+}
+
+/// Feed totals accumulated inside one continuous window.
+struct ContinuousFeedTotals {
+    feed_calls: u64,
+    accepted_docs: u64,
+    processed_docs: u64,
+    accepted_bytes: u64,
+    processed_bytes: u64,
+    percall_ns: u64,
+    periodic_commits: u64,
+}
+
+/// Feed every prepared batch back-to-back inside the timed window.
+///
+/// There is no generation between calls; the only work between two feed
+/// calls is the loop bookkeeping itself, so the continuous clock never
+/// credits either engine with untimed progress. Per-call durations are still
+/// recorded (into `percall_ns`) purely as the side-by-side legacy view.
+fn continuous_feed<E: LexicalWrite>(
+    context: &BenchContext,
+    index: &E,
+    documents: &[IndexableDocument],
+    visibility_cadence: Option<Duration>,
+    observer: &mut dyn LifecycleObserver,
+) -> ContinuousFeedTotals {
+    let mut totals = ContinuousFeedTotals {
+        feed_calls: 0,
+        accepted_docs: 0,
+        processed_docs: 0,
+        accepted_bytes: 0,
+        processed_bytes: 0,
+        percall_ns: 0,
+        periodic_commits: 0,
+    };
+    let mut unpublished_since: Option<Instant> = None;
+    for chunk in documents.chunks(context.scale.batch_documents()) {
+        // Observed at hand-off: bytes summed over the actual documents of
+        // this batch, not copied from the manifest denominator.
+        let chunk_bytes: u64 = chunk.iter().map(document_bytes).sum();
+        totals.feed_calls += 1;
+        totals.accepted_docs += chunk.len() as u64;
+        totals.accepted_bytes += chunk_bytes;
+        let call = Instant::now();
+        let publish_started = *unpublished_since.get_or_insert(call);
+        context.runtime.block_on(async {
+            index
+                .index_documents(&context.cx, chunk)
+                .await
+                .expect("QG continuous feed batch");
+        });
+        totals.percall_ns += duration_ns(call.elapsed());
+        totals.processed_docs += chunk.len() as u64;
+        totals.processed_bytes += chunk_bytes;
+        observer.on_feed_batch(chunk.len() as u64, chunk_bytes);
+        if let Some(cadence) = visibility_cadence
+            && publish_started.elapsed() >= cadence
+        {
+            let commit_call = Instant::now();
+            context.runtime.block_on(async {
+                index
+                    .commit(&context.cx)
+                    .await
+                    .expect("QG continuous visibility commit");
+            });
+            totals.percall_ns += duration_ns(commit_call.elapsed());
+            totals.periodic_commits += 1;
+            unpublished_since = None;
+        }
+    }
+    totals
+}
+
+/// Phase results of the engine-generic window segment (feed through
+/// searchable verification). Quiescence is arm-specific and completed by the
+/// caller before the clock stops.
+struct ContinuousWindowCore {
+    feed: ContinuousFeedTotals,
+    feed_complete_ns: u64,
+    commit_complete_ns: u64,
+    committed_docs: u64,
+    searchable_docs: u64,
+    searchable_verified_ns: u64,
+    probe_hits: u64,
+    percall_ns: u64,
+}
+
+fn continuous_window_core<E: LexicalWrite + LexicalRead>(
+    context: &BenchContext,
+    index: &E,
+    documents: &[IndexableDocument],
+    visibility_cadence: Option<Duration>,
+    probe: &str,
+    window_started: Instant,
+    observer: &mut dyn LifecycleObserver,
+    post_feed: &mut dyn FnMut(),
+) -> ContinuousWindowCore {
+    observer.on_phase(LifecyclePhase::FirstFeed, 0);
+    let feed = continuous_feed(context, index, documents, visibility_cadence, observer);
+    // Pre-terminal sampling point: arm-specific state (Quill's snapshot
+    // generation) must be read here so the terminal commit below is never
+    // miscounted as a periodic visibility commit.
+    post_feed();
+    let feed_complete_ns = elapsed_ns(window_started);
+    observer.on_phase(LifecyclePhase::FeedComplete, feed_complete_ns);
+    let commit_call = Instant::now();
+    context.runtime.block_on(async {
+        index
+            .commit(&context.cx)
+            .await
+            .expect("QG continuous terminal commit");
+    });
+    let commit_ns = duration_ns(commit_call.elapsed());
+    let commit_complete_ns = elapsed_ns(window_started);
+    observer.on_phase(LifecyclePhase::CommitComplete, commit_complete_ns);
+    let committed_docs = u64::try_from(LexicalRead::doc_count(index)).expect("doc count fits u64");
+    let probe_hits = context.runtime.block_on(async {
+        index
+            .search(&context.cx, probe, 1)
+            .await
+            .expect("QG continuous terminal searchable probe")
+            .len() as u64
+    });
+    let searchable_docs = u64::try_from(LexicalRead::doc_count(index)).expect("doc count fits u64");
+    let searchable_verified_ns = elapsed_ns(window_started);
+    observer.on_phase(LifecyclePhase::SearchableVerified, searchable_verified_ns);
+    ContinuousWindowCore {
+        percall_ns: feed.percall_ns + commit_ns,
+        feed,
+        feed_complete_ns,
+        commit_complete_ns,
+        committed_docs,
+        searchable_docs,
+        searchable_verified_ns,
+        probe_hits,
+    }
+}
+
+/// Run one complete continuous bulk window for one arm and return the
+/// derived docs/s rate. The window covers first feed through terminal
+/// searchable commit *and* engine quiescence; the receipt is validated
+/// fail-closed against the sealed corpus manifest before the rate is used.
+fn bulk_metric_continuous(context: &BenchContext, spec: &PerfCellSpec, arm: EngineArm) -> f64 {
+    let requested = spec.document_count.expect("bulk document count");
+    let count = context.scale.document_count(requested);
+    let (prefix, documents) = context.qg1_prefix(count);
+    let manifest = continuous_manifest(spec, &prefix.indexed_content_sha256, documents);
+    let probe = continuous_probe_term(documents);
+    let mut collector = work_receipt_cell(spec).then(|| work_receipt_collector(spec, arm, prefix));
+    let mut noop_observer = NoopLifecycleObserver;
+
+    // Committed/searchable byte totals are structurally unobservable at the
+    // LexicalRead seam, which exposes only a document count; the typed gap is
+    // recorded explicitly and H1 stays open behind it (H2 receipts territory).
+    let byte_stage_gap = || ByteStageObservation::StructurallyUnobservable {
+        seam: "LexicalRead exposes doc_count only; engine-side committed/searchable byte \
+               totals await the H2 actual-work receipts seam"
+            .to_owned(),
+    };
+    let (window_started, window, core, quiescence, periodic_commits, extra_percall_ns) = match arm {
+        EngineArm::Quill => {
+            let index = quill_in_memory(spec);
+            let generation_before = index.snapshot().loaded_manifest().manifest.generation;
+            // Sampled by the post-feed hook, before the terminal commit, so
+            // the terminal publication is never counted as periodic.
+            let generation_after_feed = std::cell::Cell::new(generation_before);
+            let window_started_rel_ns = collector
+                .as_ref()
+                .map_or(0, |_| work_receipt_origin_elapsed_ns());
+            let window_started = Instant::now();
+            let core = continuous_window_core(
+                context,
+                &index,
+                documents,
+                None,
+                &probe,
+                window_started,
+                lifecycle_observer(collector.as_mut(), &mut noop_observer),
+                &mut || {
+                    generation_after_feed
+                        .set(index.snapshot().loaded_manifest().manifest.generation);
+                },
+            );
+            let periodic_commits = generation_after_feed
+                .get()
+                .saturating_sub(generation_before);
+            if let Some(c) = collector.as_mut() {
+                for _ in 0..periodic_commits {
+                    c.record_periodic_commit();
+                }
+                let (index_bytes, segment_count) = quill_index_footprint(&index);
+                c.record_committed(core.committed_docs, index_bytes, segment_count);
+                c.record_searchable(core.searchable_docs);
+                c.record_queue(QueueObservation::SynchronousNoQueue {
+                    seam: "QuillIndex::index_documents/commit are synchronous; the ingest \
+                           hand-off has no queue"
+                        .to_owned(),
+                });
+                c.record_width(WidthObservation::Observed {
+                    threads: u64::try_from(rayon::current_num_threads()).expect("width fits u64"),
+                    seam: "rayon::current_num_threads inside the bench-pinned Quill pool"
+                        .to_owned(),
+                });
+                c.record_measured_sum_ns(core.percall_ns);
+                c.record_terminal(TerminalJoin::QuillSynchronousCommit, "completed", false);
+            }
+            // Quill quiescence: the terminal commit is synchronous; when it
+            // returned, shards were sealed and the searchable snapshot was
+            // published with no background worker still running.
+            let window = window_started.elapsed();
+            lifecycle_observer(collector.as_mut(), &mut noop_observer)
+                .on_phase(LifecyclePhase::QuiescenceJoined, duration_ns(window));
+            if let Some(c) = collector.take() {
+                finalize_work_receipt(
+                    c,
+                    spec,
+                    arm,
+                    count,
+                    manifest.total_bytes,
+                    window_started_rel_ns,
+                    Some(duration_ns(window)),
+                );
+            }
+            eprintln!(
+                "[qg-commit-parity] gate={} fixture={} arm=quill cadence_ms={} \
+                 periodic_commits={periodic_commits} terminal_commit_calls=1 \
+                 durability=in_memory timing_mode=continuous",
+                spec.gate,
+                spec.fixture,
+                quill_config(spec).max_visibility_lag_ms,
+            );
+            (
+                window_started,
+                window,
+                core,
+                EngineQuiescence::QuillSealedSynchronousCommit,
+                periodic_commits,
+                0_u64,
+            )
+        }
+        EngineArm::Tantivy => {
+            let index = tantivy_in_memory(spec);
+            let observed_threads = index
+                .benchmark_materialized_writer_threads()
+                .expect("scaling Tantivy arm uses the benchmark writer constructor");
+            record_concurrency(spec, arm, observed_threads);
+            let visibility_cadence =
+                Duration::from_millis(quill_config(spec).max_visibility_lag_ms);
+            let window_started_rel_ns = collector
+                .as_ref()
+                .map_or(0, |_| work_receipt_origin_elapsed_ns());
+            let window_started = Instant::now();
+            let core = continuous_window_core(
+                context,
+                &index,
+                documents,
+                Some(visibility_cadence),
+                &probe,
+                window_started,
+                lifecycle_observer(collector.as_mut(), &mut noop_observer),
+                &mut || {},
+            );
+            let periodic_commits = core.feed.periodic_commits;
+            if let Some(c) = collector.as_mut() {
+                for _ in 0..periodic_commits {
+                    c.record_periodic_commit();
+                }
+                let (index_bytes, segment_count) = tantivy_index_footprint(&index);
+                c.record_committed(core.committed_docs, index_bytes, segment_count);
+                c.record_searchable(core.searchable_docs);
+                c.record_queue(QueueObservation::StructurallyUnobservable {
+                    seam: "tantivy 0.26.1 IndexWriter AddOperation channel \
+                           (crossbeam bounded(10_000)) exposes no depth accessor; observing \
+                           occupancy requires patching tantivy"
+                        .to_owned(),
+                });
+                c.record_width(WidthObservation::Observed {
+                    threads: u64::try_from(observed_threads).expect("width fits u64"),
+                    seam: "TantivyIndex::benchmark_materialized_writer_threads".to_owned(),
+                });
+            }
+            // Tantivy quiescence: join every indexing worker and the merging
+            // thread inside the window, so background merge work started by
+            // this workload is charged to this workload.
+            let (join, join_receipt) = finish_tantivy_lifecycle(index, spec, "continuous_window");
+            if let Some(c) = collector.as_mut() {
+                c.record_measured_sum_ns(core.percall_ns + duration_ns(join));
+                c.record_terminal(
+                    TerminalJoin::TantivyWorkersJoined {
+                        join_elapsed_ns: join_receipt.join_elapsed_ns,
+                        searchable_segments_before: join_receipt.searchable_segments_before as u64,
+                        searchable_segments_after: join_receipt.searchable_segments_after as u64,
+                        writer_rearmed: join_receipt.writer_rearmed,
+                    },
+                    "completed",
+                    false,
+                );
+            }
+            let window = window_started.elapsed();
+            lifecycle_observer(collector.as_mut(), &mut noop_observer)
+                .on_phase(LifecyclePhase::QuiescenceJoined, duration_ns(window));
+            if let Some(c) = collector.take() {
+                finalize_work_receipt(
+                    c,
+                    spec,
+                    arm,
+                    count,
+                    manifest.total_bytes,
+                    window_started_rel_ns,
+                    Some(duration_ns(window)),
+                );
+            }
+            eprintln!(
+                "[qg-commit-parity] gate={} fixture={} arm=tantivy cadence_ms={} \
+                 periodic_commits={periodic_commits} terminal_commit_calls=1 \
+                 durability=in_memory timing_mode=continuous",
+                spec.gate,
+                spec.fixture,
+                quill_config(spec).max_visibility_lag_ms,
+            );
+            (
+                window_started,
+                window,
+                core,
+                EngineQuiescence::TantivyMergingThreadsJoined,
+                periodic_commits,
+                duration_ns(join),
+            )
+        }
+    };
+
+    let window_total_ns = duration_ns(window);
+    let receipt = ContinuousWindowReceipt {
+        schema_version: CONTINUOUS_TIMING_SCHEMA_VERSION.to_owned(),
+        engine: arm.label().to_owned(),
+        timing_source: TimingSource::ContinuousMonotonicWindow,
+        quiescence,
+        feed_calls: core.feed.feed_calls,
+        accepted_docs: core.feed.accepted_docs,
+        processed_docs: core.feed.processed_docs,
+        committed_docs: core.committed_docs,
+        searchable_docs: core.searchable_docs,
+        accepted_bytes: core.feed.accepted_bytes,
+        processed_bytes: core.feed.processed_bytes,
+        committed_bytes: byte_stage_gap(),
+        searchable_bytes: byte_stage_gap(),
+        periodic_commits,
+        percall_sum_ns: core.percall_ns + extra_percall_ns,
+        timeline: ContinuousPhaseTimeline {
+            feed_complete_ns: core.feed_complete_ns,
+            commit_complete_ns: core.commit_complete_ns,
+            searchable_verified_ns: core.searchable_verified_ns,
+            quiescence_joined_ns: window_total_ns,
+            window_total_ns,
+        },
+        terminal_probe_query: probe,
+        terminal_probe_hits: core.probe_hits,
+    };
+    receipt
+        .validate(&manifest)
+        .expect("continuous window receipt violated the H1 contract");
+    let rate = receipt.docs_per_second();
+    eprintln!(
+        "[qg1-continuous] fixture={} arm={} docs={} accepted_bytes={} processed_bytes={} \
+         window_ns={} percall_sum_ns={} feed_calls={} periodic_commits={} committed={} \
+         searchable={} probe={} probe_hits={} quiescence={} manifest_sha256={} \
+         indexed_content_sha256={}",
+        spec.fixture,
+        arm.label(),
+        receipt.accepted_docs,
+        receipt.accepted_bytes,
+        receipt.processed_bytes,
+        window_total_ns,
+        receipt.percall_sum_ns,
+        receipt.feed_calls,
+        receipt.periodic_commits,
+        receipt.committed_docs,
+        receipt.searchable_docs,
+        receipt.terminal_probe_query,
+        receipt.terminal_probe_hits,
+        receipt.quiescence.label(),
+        prefix.manifest_sha256,
+        prefix.indexed_content_sha256,
+    );
+    record_continuous_window(spec, arm, receipt);
+    store_continuous_capture(ContinuousSampleCapture {
+        started: window_started,
+        ended: window_started + window,
+        work_units: count,
+        byte_count: manifest.total_bytes,
+    });
+    rate
 }
 
 fn preflight_index<E: LexicalRead + LexicalWrite>(
@@ -1110,6 +2030,7 @@ fn index_prepared_qg1_batches<E: LexicalWrite>(
     context: &BenchContext,
     index: &E,
     documents: &[IndexableDocument],
+    observe_batch: &mut dyn FnMut(&[IndexableDocument]),
 ) -> Duration {
     let mut measured = Duration::ZERO;
     for batch in documents.chunks(context.scale.batch_documents()) {
@@ -1121,6 +2042,8 @@ fn index_prepared_qg1_batches<E: LexicalWrite>(
                 .expect("QG-1 prepared index batch");
         });
         measured += timer.elapsed();
+        // Observed at the hand-off boundary, after the call returned.
+        observe_batch(batch);
     }
     measured
 }
@@ -1130,6 +2053,7 @@ fn index_prepared_qg1_batches_with_visibility_commits<E: LexicalWrite>(
     index: &E,
     documents: &[IndexableDocument],
     commit_cadence: Duration,
+    observe_batch: &mut dyn FnMut(&[IndexableDocument]),
 ) -> (Duration, usize) {
     let mut measured = Duration::ZERO;
     let mut unpublished_since = None;
@@ -1144,6 +2068,7 @@ fn index_prepared_qg1_batches_with_visibility_commits<E: LexicalWrite>(
                 .expect("QG-1 prepared index batch");
         });
         measured += timer.elapsed();
+        observe_batch(batch);
         if unpublished_started.elapsed() >= commit_cadence {
             measured += commit(context, index);
             periodic_commits = periodic_commits.saturating_add(1);
@@ -1161,15 +2086,45 @@ fn commit<E: LexicalWrite>(context: &BenchContext, index: &E) -> Duration {
     timer.elapsed()
 }
 
+#[allow(clippy::too_many_lines)]
 fn bulk_metric_unpooled(context: &BenchContext, spec: &PerfCellSpec, arm: EngineArm) -> f64 {
+    if continuous_bulk_cell(spec) {
+        return bulk_metric_continuous(context, spec, arm);
+    }
     let requested = spec.document_count.expect("bulk document count");
     let count = context.scale.document_count(requested);
-    let prepared_qg1_documents = (spec.gate == PerfGate::Qg1).then(|| context.qg1_prefix(count).1);
+    let prepared_qg1 = (spec.gate == PerfGate::Qg1).then(|| context.qg1_prefix(count));
+    let prepared_qg1_documents = prepared_qg1.map(|(_, documents)| documents);
     let generated_corpus = (spec.gate != PerfGate::Qg1).then(|| corpus_for(count));
+    // QG-1 H2 receipts (opt-in): the collector observes at the hand-off
+    // boundary and through engine accessors, strictly between the timed
+    // regions, identically for both arms.
+    let mut collector = work_receipt_cell(spec).then(|| {
+        let (prefix, _) = prepared_qg1.expect("QG-1 receipted cell has a prepared corpus");
+        work_receipt_collector(spec, arm, prefix)
+    });
+    let expected_bytes: u64 = collector.as_ref().map_or(0, |_| {
+        prepared_qg1_documents
+            .expect("QG-1 receipted cell has prepared documents")
+            .iter()
+            .map(document_bytes)
+            .sum()
+    });
+    let mut window_started_rel_ns = 0_u64;
+    let win_ns =
+        |origin: Instant| u64::try_from(origin.elapsed().as_nanos()).expect("monotonic ns");
     let elapsed = match arm {
         EngineArm::Quill => {
             let index = quill_in_memory(spec);
             let generation_before = index.snapshot().loaded_manifest().manifest.generation;
+            if let Some(c) = collector.as_mut() {
+                window_started_rel_ns = work_receipt_origin_elapsed_ns();
+                c.begin_window();
+            }
+            let window_origin = Instant::now();
+            if let Some(c) = collector.as_mut() {
+                c.on_phase(LifecyclePhase::FirstFeed, 0);
+            }
             let mut elapsed = prepared_qg1_documents.map_or_else(
                 || {
                     index_batches(
@@ -1182,29 +2137,106 @@ fn bulk_metric_unpooled(context: &BenchContext, spec: &PerfCellSpec, arm: Engine
                         None,
                     )
                 },
-                |documents| index_prepared_qg1_batches(context, &index, documents),
+                |documents| {
+                    index_prepared_qg1_batches(context, &index, documents, &mut |batch| {
+                        if let Some(c) = collector.as_mut() {
+                            c.record_feed_batch(
+                                batch.len() as u64,
+                                batch.iter().map(document_bytes).sum(),
+                            );
+                        }
+                    })
+                },
             );
             let generation_after = index.snapshot().loaded_manifest().manifest.generation;
+            if let Some(c) = collector.as_mut() {
+                c.on_phase(LifecyclePhase::FeedComplete, win_ns(window_origin));
+            }
             elapsed += commit(context, &index);
+            if let Some(c) = collector.as_mut() {
+                c.on_phase(LifecyclePhase::CommitComplete, win_ns(window_origin));
+            }
+            let periodic_commits = generation_after.saturating_sub(generation_before);
             if spec.gate == PerfGate::Qg1 {
                 eprintln!(
                     "[qg-commit-parity] gate={} fixture={} arm=quill cadence_ms={} \
-                     periodic_commits={} terminal_commit_calls=1 durability=in_memory",
+                     periodic_commits={periodic_commits} terminal_commit_calls=1 \
+                     durability=in_memory",
                     spec.gate,
                     spec.fixture,
                     quill_config(spec).max_visibility_lag_ms,
-                    generation_after.saturating_sub(generation_before),
+                );
+            }
+            if let Some(mut c) = collector.take() {
+                let committed =
+                    u64::try_from(LexicalRead::doc_count(&index)).expect("doc count fits u64");
+                let (index_bytes, segment_count) = quill_index_footprint(&index);
+                c.record_committed(committed, index_bytes, segment_count);
+                let documents =
+                    prepared_qg1_documents.expect("QG-1 receipted cell has prepared documents");
+                let probe = work_receipt_probe_term(documents);
+                let probe_hits = context.runtime.block_on(async {
+                    index
+                        .search(&context.cx, &probe, 1)
+                        .await
+                        .expect("QG-1 receipt terminal searchable probe")
+                        .len()
+                });
+                assert!(probe_hits > 0, "terminal searchable probe returned no hits");
+                let searchable =
+                    u64::try_from(LexicalRead::doc_count(&index)).expect("doc count fits u64");
+                c.record_searchable(searchable);
+                c.on_phase(LifecyclePhase::SearchableVerified, win_ns(window_origin));
+                for _ in 0..periodic_commits {
+                    c.record_periodic_commit();
+                }
+                c.record_queue(QueueObservation::SynchronousNoQueue {
+                    seam: "QuillIndex::index_documents/commit are synchronous; the ingest \
+                           hand-off has no queue"
+                        .to_owned(),
+                });
+                c.record_width(WidthObservation::Observed {
+                    threads: u64::try_from(rayon::current_num_threads()).expect("width fits u64"),
+                    seam: "rayon::current_num_threads inside the bench-pinned Quill pool"
+                        .to_owned(),
+                });
+                // Quill quiescence: the terminal commit is synchronous; when
+                // it returned there was no background worker left to join.
+                c.record_terminal(TerminalJoin::QuillSynchronousCommit, "completed", false);
+                c.on_phase(LifecyclePhase::QuiescenceJoined, win_ns(window_origin));
+                c.record_measured_sum_ns(
+                    u64::try_from(elapsed.as_nanos()).expect("measured ns fits u64"),
+                );
+                finalize_work_receipt(
+                    c,
+                    spec,
+                    arm,
+                    count,
+                    expected_bytes,
+                    window_started_rel_ns,
+                    None,
                 );
             }
             elapsed
         }
         EngineArm::Tantivy => {
             let index = tantivy_in_memory(spec);
-            if matches!(spec.gate, PerfGate::Qg1 | PerfGate::Qg8) {
-                let observed_threads = index
+            let observed_threads = if matches!(spec.gate, PerfGate::Qg1 | PerfGate::Qg8) {
+                let threads = index
                     .benchmark_materialized_writer_threads()
                     .expect("scaling Tantivy arm uses the benchmark writer constructor");
-                record_concurrency(spec, arm, observed_threads);
+                record_concurrency(spec, arm, threads);
+                Some(threads)
+            } else {
+                None
+            };
+            if let Some(c) = collector.as_mut() {
+                window_started_rel_ns = work_receipt_origin_elapsed_ns();
+                c.begin_window();
+            }
+            let window_origin = Instant::now();
+            if let Some(c) = collector.as_mut() {
+                c.on_phase(LifecyclePhase::FirstFeed, 0);
             }
             let (mut elapsed, periodic_commits) = if spec.gate == PerfGate::Qg1 {
                 index_prepared_qg1_batches_with_visibility_commits(
@@ -1212,6 +2244,14 @@ fn bulk_metric_unpooled(context: &BenchContext, spec: &PerfCellSpec, arm: Engine
                     &index,
                     prepared_qg1_documents.expect("QG-1 bulk cell has a prepared immutable corpus"),
                     Duration::from_millis(quill_config(spec).max_visibility_lag_ms),
+                    &mut |batch| {
+                        if let Some(c) = collector.as_mut() {
+                            c.record_feed_batch(
+                                batch.len() as u64,
+                                batch.iter().map(document_bytes).sum(),
+                            );
+                        }
+                    },
                 )
             } else {
                 (
@@ -1227,7 +2267,13 @@ fn bulk_metric_unpooled(context: &BenchContext, spec: &PerfCellSpec, arm: Engine
                     0,
                 )
             };
+            if let Some(c) = collector.as_mut() {
+                c.on_phase(LifecyclePhase::FeedComplete, win_ns(window_origin));
+            }
             elapsed += commit(context, &index);
+            if let Some(c) = collector.as_mut() {
+                c.on_phase(LifecyclePhase::CommitComplete, win_ns(window_origin));
+            }
             if spec.gate == PerfGate::Qg1 {
                 eprintln!(
                     "[qg-commit-parity] gate={} fixture={} arm=tantivy cadence_ms={} \
@@ -1238,7 +2284,72 @@ fn bulk_metric_unpooled(context: &BenchContext, spec: &PerfCellSpec, arm: Engine
                     quill_config(spec).max_visibility_lag_ms,
                 );
             }
-            elapsed += finish_tantivy_lifecycle(index, spec, "measured_work");
+            if let Some(c) = collector.as_mut() {
+                // Pre-join observations: the post-commit worker generation,
+                // segment updater, and merge threads are still alive here.
+                let committed =
+                    u64::try_from(LexicalRead::doc_count(&index)).expect("doc count fits u64");
+                let (index_bytes, segment_count) = tantivy_index_footprint(&index);
+                c.record_committed(committed, index_bytes, segment_count);
+                let documents =
+                    prepared_qg1_documents.expect("QG-1 receipted cell has prepared documents");
+                let probe = work_receipt_probe_term(documents);
+                let probe_hits = context.runtime.block_on(async {
+                    index
+                        .search(&context.cx, &probe, 1)
+                        .await
+                        .expect("QG-1 receipt terminal searchable probe")
+                        .len()
+                });
+                assert!(probe_hits > 0, "terminal searchable probe returned no hits");
+                let searchable =
+                    u64::try_from(LexicalRead::doc_count(&index)).expect("doc count fits u64");
+                c.record_searchable(searchable);
+                c.on_phase(LifecyclePhase::SearchableVerified, win_ns(window_origin));
+                for _ in 0..periodic_commits {
+                    c.record_periodic_commit();
+                }
+                c.record_queue(QueueObservation::StructurallyUnobservable {
+                    seam: "tantivy 0.26.1 IndexWriter AddOperation channel \
+                           (crossbeam bounded(10_000)) exposes no depth accessor; observing \
+                           occupancy requires patching tantivy"
+                        .to_owned(),
+                });
+                c.record_width(WidthObservation::Observed {
+                    threads: u64::try_from(
+                        observed_threads.expect("QG-1 Tantivy arm recorded its writer width"),
+                    )
+                    .expect("width fits u64"),
+                    seam: "TantivyIndex::benchmark_materialized_writer_threads".to_owned(),
+                });
+            }
+            let (join, join_receipt) = finish_tantivy_lifecycle(index, spec, "measured_work");
+            elapsed += join;
+            if let Some(mut c) = collector.take() {
+                c.record_terminal(
+                    TerminalJoin::TantivyWorkersJoined {
+                        join_elapsed_ns: join_receipt.join_elapsed_ns,
+                        searchable_segments_before: join_receipt.searchable_segments_before as u64,
+                        searchable_segments_after: join_receipt.searchable_segments_after as u64,
+                        writer_rearmed: join_receipt.writer_rearmed,
+                    },
+                    "completed",
+                    false,
+                );
+                c.on_phase(LifecyclePhase::QuiescenceJoined, win_ns(window_origin));
+                c.record_measured_sum_ns(
+                    u64::try_from(elapsed.as_nanos()).expect("measured ns fits u64"),
+                );
+                finalize_work_receipt(
+                    c,
+                    spec,
+                    arm,
+                    count,
+                    expected_bytes,
+                    window_started_rel_ns,
+                    None,
+                );
+            }
             elapsed
         }
     };
@@ -1253,6 +2364,14 @@ fn bulk_metric(context: &BenchContext, spec: &PerfCellSpec, arm: EngineArm) -> f
     let threads = spec.threads.expect("QG-1/QG-8 thread count");
     rayon::ThreadPoolBuilder::new()
         .num_threads(threads)
+        // Named so the H2 worker-role census can attribute pool threads
+        // honestly; rayon threads are otherwise anonymous in /proc comm.
+        .thread_name(|index| {
+            format!(
+                "{}{index}",
+                frankensearch_quill_gauntlet::BENCH_RAYON_THREAD_PREFIX
+            )
+        })
         .build()
         .expect("build QG-1/QG-8 Quill thread pool")
         .install(|| {
@@ -2072,6 +3191,7 @@ fn paired_raw_stream(
                        sample_arm: PerfSampleArm,
                        sample_order: PerfSampleOrder,
                        sample_id: u64| {
+            clear_continuous_capture();
             let started_ns = u64::try_from(origin.elapsed().as_nanos()).expect("monotonic ns");
             let value = black_box(measure_metric_with_query(
                 context,
@@ -2082,6 +3202,33 @@ fn paired_raw_stream(
             let mut ended_ns = u64::try_from(origin.elapsed().as_nanos()).expect("monotonic ns");
             if ended_ns <= started_ns {
                 ended_ns = started_ns + 1;
+            }
+            if scope.semantics == PerfMetricSemantics::Throughput {
+                // Continuous H1 cell: the sample's own interval is the exact
+                // first-feed-to-quiescence window, and the estimator derives
+                // the rate from equal work units over it. A gauge value is
+                // structurally impossible on this path.
+                let capture = take_continuous_capture()
+                    .expect("continuous bulk cell produced no window capture");
+                black_box(value);
+                let window = ContinuousSampleWindow {
+                    started_ns: duration_ns(capture.started.duration_since(origin)),
+                    ended_ns: duration_ns(capture.ended.duration_since(origin)),
+                    work_units: capture.work_units,
+                    byte_count: capture.byte_count,
+                };
+                return continuous_raw_sample(
+                    ContinuousSampleIdentity {
+                        block_id,
+                        sample_id,
+                        arm: sample_arm,
+                        order: sample_order,
+                    },
+                    scope,
+                    &evidence.sample_provenance,
+                    &window,
+                )
+                .expect("continuous raw sample construction");
             }
             PerfRawSample {
                 block_id,
@@ -2131,11 +3278,26 @@ fn paired_raw_stream(
     samples
 }
 
+/// Presentation value of one raw sample: the stored gauge for legacy cells,
+/// or the rate derived from equal work units over the continuous window for
+/// Throughput cells (mirroring the estimator's own derivation).
+fn sample_value(sample: &PerfRawSample) -> f64 {
+    sample.observed_value.unwrap_or_else(|| {
+        #[allow(clippy::cast_precision_loss)]
+        let work_units = sample
+            .work_units
+            .expect("throughput sample carries work units") as f64;
+        #[allow(clippy::cast_precision_loss)]
+        let elapsed_ns = sample.ended_ns.saturating_sub(sample.started_ns).max(1) as f64;
+        work_units * 1_000_000_000.0 / elapsed_ns
+    })
+}
+
 fn arm_values(samples: &[PerfRawSample], arm: PerfSampleArm) -> Vec<f64> {
     samples
         .iter()
         .filter(|sample| sample.arm == arm)
-        .map(|sample| sample.observed_value.expect("gauge sample value"))
+        .map(sample_value)
         .collect()
 }
 
@@ -2144,8 +3306,8 @@ fn block_ratios_treatment_over_control(samples: &[PerfRawSample]) -> Vec<f64> {
     for sample in samples {
         let entry = by_block.entry(sample.block_id).or_default();
         match sample.arm {
-            PerfSampleArm::Control => entry.0 = sample.observed_value,
-            PerfSampleArm::Treatment => entry.1 = sample.observed_value,
+            PerfSampleArm::Control => entry.0 = Some(sample_value(sample)),
+            PerfSampleArm::Treatment => entry.1 = Some(sample_value(sample)),
         }
     }
     by_block
@@ -2162,11 +3324,7 @@ fn block_ratios_treatment_over_control(samples: &[PerfRawSample]) -> Vec<f64> {
 fn values_checksum(samples: &[PerfRawSample]) -> u64 {
     let mut checksum = 0xcbf2_9ce4_8422_2325_u64;
     for sample in samples {
-        checksum ^= sample
-            .observed_value
-            .expect("gauge sample value")
-            .to_bits()
-            .rotate_left(13);
+        checksum ^= sample_value(sample).to_bits().rotate_left(13);
         checksum = checksum.wrapping_mul(0x0000_0100_0000_01b3);
     }
     checksum
@@ -2889,7 +4047,17 @@ fn collect_cell(
         };
     }
 
-    let scope = operation_scope(spec);
+    // Continuous H1 bulk cells carry an independent Throughput scope identity
+    // (`.continuous`, version 2): continuous and summed-call sample streams
+    // can never be merged or substituted for one another.
+    let scope = if continuous_bulk_cell(spec) {
+        continuous_throughput_scope(
+            &format!("{}.{}.{}", spec.gate, spec.fixture, spec.metric),
+            unit(spec),
+        )
+    } else {
+        operation_scope(spec)
+    };
     let origin = Instant::now();
     let cell_seed = evidence.config.bootstrap_seed ^ fixture_seed(&spec.fixture);
 
@@ -3518,8 +4686,15 @@ fn register_criterion_cell(c: &mut Criterion, context: &BenchContext, spec: &Per
     // the workload after the decision artifact is sealed, without retaining
     // those samples or their A/A control. Keep Criterion's presentation lane
     // for smoke runs only.
+    //
+    // Continuous H1 and receipted H2 cells skip the presentation lane
+    // entirely: each Criterion iteration would run another full window and
+    // overwrite the recorded final-measurement-round receipt after the
+    // evidence was described.
     if context.scale.is_full()
         || matches!(spec.gate, PerfGate::Qg6 | PerfGate::Qg7 | PerfGate::Qg10)
+        || continuous_bulk_cell(spec)
+        || work_receipt_cell(spec)
     {
         return;
     }
@@ -3616,6 +4791,20 @@ fn bench_matrix(c: &mut Criterion, bench_elf_sha256: &str) {
         "[quill-perf-policy] warmup_rounds={}",
         evidence_policy.warmup_rounds
     );
+    // QG-1 H1: opt-in continuous first-feed-to-quiescence timing. Per-call
+    // remains the artifact-compatible default until the fleet flips it.
+    eprintln!("[quill-perf-timing-mode] mode={}", timing_mode().label());
+    // QG-1 H2: opt-in actual-work/queue/worker-role/lifecycle receipts.
+    // Off by default: the artifact byte shape and the measured lanes are
+    // untouched until a run opts in.
+    eprintln!("[quill-work-receipts] mode={}", work_receipt_mode().label());
+    let _ = WORK_RECEIPT_IDENTITY.set(WorkReceiptRunIdentity {
+        run_id: run_id.clone(),
+        machine_fingerprint: machine_fingerprint(),
+        build_profile: build_profile.clone(),
+        executable_sha256: bench_elf_sha256.to_owned(),
+        git_rev: revision.clone(),
+    });
     let evidence_context = EvidenceContext {
         config: PairedEstimatorConfig::predeclared(bootstrap_seed),
         policy: evidence_policy,
@@ -3657,6 +4846,23 @@ fn bench_matrix(c: &mut Criterion, bench_elf_sha256: &str) {
     }
     machine.finish();
     flush_tantivy_lifecycle_receipts(&output_dir);
+    flush_work_receipts(&output_dir);
+    let mut continuous_by_gate = take_continuous_evidence(&context);
+    for (gate, evidence) in &continuous_by_gate {
+        eprintln!(
+            "[qg1-continuous-summary] gate={gate} timing_mode={} cells={}",
+            evidence.timing_mode,
+            evidence.cells.len(),
+        );
+    }
+    let mut work_receipts_by_gate = take_work_receipt_evidence();
+    for (gate, evidence) in &work_receipts_by_gate {
+        eprintln!(
+            "[qg1-work-receipt-summary] gate={gate} mode={} cells={}",
+            evidence.mode,
+            evidence.cells.len(),
+        );
+    }
 
     let provenance = EvidenceProvenance {
         run_id: run_id.clone(),
@@ -3677,12 +4883,52 @@ fn bench_matrix(c: &mut Criterion, bench_elf_sha256: &str) {
             cells,
         )
         .expect("assemble QG evidence artifact");
+        let mut admission_no_claims = Vec::new();
         if !selection_complete {
-            artifact.force_no_claim(
+            admission_no_claims.push((
                 "evidence.incomplete_gate_selection",
                 "the invocation selected only part of the normative gate; durable pre-admission \
                  evidence cannot support a publication or ratchet claim",
-            );
+            ));
+        }
+        // Unconditional guard, not convention: the ratchet does not yet bind
+        // timing mode, the `.continuous` operation identity, or the
+        // continuous_timing schema, so no continuous-mode invocation may
+        // support a claim until a distinct end-to-end mode is validated.
+        if timing_mode().is_continuous() {
+            admission_no_claims.push((
+                "evidence.continuous_timing_mode_unratcheted",
+                "QUILL_PERF_TIMING_MODE=continuous emits pre-admission diagnostics only: the \
+                 ratchet does not yet bind timing mode, continuous operation identity, or the \
+                 continuous_timing schema end-to-end",
+            ));
+        }
+        // Unconditional guard, not convention: receipts are provenance, and
+        // enabling them adds observation probes between measured regions
+        // (symmetric across arms, but unratcheted), so a receipted run can
+        // never support a claim until the ratchet binds the receipts mode.
+        if work_receipt_mode().is_enabled() {
+            admission_no_claims.push((
+                "evidence.work_receipts_mode_unratcheted",
+                "QUILL_PERF_WORK_RECEIPTS=on adds symmetric observation probes between \
+                 measured regions; the ratchet does not bind the receipts mode, so receipt \
+                 runs are provenance only",
+            ));
+        }
+        match admission_no_claims.as_slice() {
+            [] => {}
+            [(code, message)] => artifact.force_no_claim(code, *message),
+            reasons => {
+                let codes = reasons
+                    .iter()
+                    .map(|(code, _)| *code)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                artifact.force_no_claim(
+                    "evidence.multiple_pre_admission_no_claims",
+                    format!("multiple pre-admission no-claim conditions apply: {codes}"),
+                );
+            }
         }
         let paths = artifact
             .write_atomic(&output_dir)
@@ -3709,7 +4955,12 @@ fn bench_matrix(c: &mut Criterion, bench_elf_sha256: &str) {
             corpus_manifest_hash: corpus_hash.clone(),
             manifest_sha256: manifest_hash.clone(),
             cells,
-            laws_attested: selection_complete,
+            // Continuous mode can never attest the laws: the ratchet does not
+            // yet bind the continuous stream identity (see the matching
+            // evidence.continuous_timing_mode_unratcheted force_no_claim).
+            laws_attested: selection_complete && !timing_mode().is_continuous(),
+            continuous_timing: continuous_by_gate.remove(&gate),
+            work_receipts: work_receipts_by_gate.remove(&gate),
         };
         let (json, table) = artifact.write_to(&output_dir).expect("write QG artifacts");
         eprintln!("{}", artifact.human_table());
@@ -4387,5 +5638,47 @@ mod tests {
             )
                 .is_err()
         );
+    }
+
+    #[test]
+    fn continuous_quill_periodic_commits_exclude_the_terminal_commit() {
+        let cell = super::PerfCellSpec {
+            gate: super::PerfGate::Qg1,
+            fixture: "bulk/test-periodic-pin/1/positions_on".to_owned(),
+            metric: "docs_per_second".to_owned(),
+            corpus: Some(super::PerfCorpus::Tiny),
+            document_count: Some(12),
+            threads: Some(1),
+            writer_heap_bytes: Some(50_000_000),
+            positions: Some(super::PositionMode::On),
+            tombstone_density_pct: None,
+            query_class: None,
+            k: None,
+            topology: None,
+        };
+        let context = super::BenchContext::for_selected(super::MatrixScale::Smoke, &[cell.clone()]);
+        let rate = super::bulk_metric_continuous(&context, &cell, super::EngineArm::Quill);
+        assert!(rate > 0.0, "continuous window produced a derived rate");
+
+        let state = super::CONTINUOUS_CELL_STATE
+            .get()
+            .expect("continuous state recorded")
+            .lock()
+            .expect("lock continuous state");
+        let recorded = state.get(&cell.fixture).expect("cell state recorded");
+        let receipt = recorded
+            .last_quill
+            .as_ref()
+            .expect("quill continuous receipt recorded");
+        // A 12-document feed completes far below the visibility cadence, so
+        // no periodic publish can occur during the feed phase. Before the
+        // pre-terminal sampling fix, the terminal commit's snapshot
+        // generation bump leaked into this count and made it nonzero.
+        assert_eq!(
+            receipt.periodic_commits, 0,
+            "the terminal commit must never be counted as a periodic visibility commit"
+        );
+        assert_eq!(receipt.committed_docs, 12);
+        assert_eq!(receipt.searchable_docs, 12);
     }
 }

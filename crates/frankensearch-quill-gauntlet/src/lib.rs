@@ -11,6 +11,7 @@
 
 mod artifact;
 mod comparator;
+mod continuous;
 mod engine;
 mod generator;
 mod local_perf_runner;
@@ -21,6 +22,7 @@ mod perf_ratchet;
 mod qg6_prepared;
 mod runner;
 mod version_contract;
+mod work_receipt;
 
 use std::path::PathBuf;
 
@@ -55,6 +57,13 @@ pub use comparator::{
     ScoreEpsilonReason, SensitiveValueObservation, compare_lexical_contracts,
     compare_lexical_observations, compare_observations, observe_lexical_outcome,
     observe_live_quill_cancellation_receipt,
+};
+pub use continuous::{
+    CONTINUOUS_TIMING_SCHEMA_VERSION, ContinuousCellEvidence, ContinuousCorpusManifest,
+    ContinuousPhaseTimeline, ContinuousSampleIdentity, ContinuousSampleWindow,
+    ContinuousTimingError, ContinuousTimingEvidence, ContinuousWindowReceipt, EngineQuiescence,
+    QG1_NATIVE_CORPUS_IDENTITY_PREFIX, TimingMode, TimingSource, continuous_raw_sample,
+    continuous_throughput_scope,
 };
 pub use engine::{
     CASS_TANTIVY_ORACLE_CONFIG_HASH, ComparisonMode, DifferentialCase, DifferentialCaseMetadata,
@@ -155,6 +164,19 @@ pub use runner::{
 pub use version_contract::{
     InternalDifferentialFixture, OracleVersionContract, Q1Fixture, Q1FixtureCatalog,
     oracle_version_contract, q1_fixture_catalog, run_q1_live_fixtures,
+};
+pub use work_receipt::{
+    ActiveConcurrencyIntegral, BENCH_RAYON_THREAD_PREFIX, ByteStageObservation,
+    CENSUS_SLACK_THREADS, CensusCaveat, CollectionOverhead, CollectorBinding, ConcurrencyReceipt,
+    CpuTimeObservation, EngineByteObservation, IndexFootprint, LifecycleObserver, LifecyclePhase,
+    MAX_CENSUS_SAMPLES_IN_WINDOW, MAX_CENSUS_THREADS, NoopLifecycleObserver, PROCESS_CPU_SEAM,
+    PhaseSample, QueueObservation, ROLE_CENSUS_SEAM, RawCensus, RawCpuReading, RawThreadReading,
+    ReceiptBinding, RoleCensus, RoleCensusSample, TerminalJoin, TerminalLifecycle,
+    ThreadRoleSample, WORK_RECEIPT_SCHEMA_VERSION, WidthObservation, WorkCounters, WorkReceipt,
+    WorkReceiptCellEvidence, WorkReceiptCollector, WorkReceiptError, WorkReceiptEvidence,
+    WorkReceiptExpectation, WorkReceiptMode, WorkerRole, classify_thread_role,
+    corpus_byte_stage_gap, current_tid, document_bytes, parse_stat_cpu_ticks, resolve_role_census,
+    sample_process_cpu, sample_raw_census, ticks_to_ns,
 };
 
 /// Typed failure surface for harness setup, execution, comparison, and storage.
