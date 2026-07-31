@@ -225,7 +225,8 @@ fn total_len(segments: &[EncodedSegment]) -> u64 {
 /// competing for cores". CPU/wall is the achieved parallelism and is stable
 /// under neighbour load even when wall time is not.
 fn cpu_seconds() -> f64 {
-    let stat = std::fs::read_to_string("/proc/self/stat").expect("/proc/self/stat must be readable");
+    let stat =
+        std::fs::read_to_string("/proc/self/stat").expect("/proc/self/stat must be readable");
     // Fields after the parenthesised comm: utime is 14th, stime 15th (1-based
     // over the whole line), so index 11 and 12 after the closing paren.
     let tail = &stat[stat.rfind(')').expect("stat always has a comm field") + 2..];
