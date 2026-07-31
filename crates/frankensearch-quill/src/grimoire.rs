@@ -814,8 +814,7 @@ impl EncodedTermDictionary {
             max_terms: terms.len(),
             max_restarts: restart_count,
         };
-        let parsed =
-            TermDictionary::parse_with_limits_mode(&bytes, schema, sections, owned_limits, false)?;
+        let parsed = TermDictionary::parse_with_limits(&bytes, schema, sections, owned_limits)?;
         debug_assert_eq!(parsed.restart_count(), restart_count);
         debug_assert_eq!(parsed.term_count(), term_count);
         Ok(Self {
@@ -1272,16 +1271,6 @@ impl<'a> TermDictionary<'a> {
         sections: TermSectionLengths,
         limits: TermDictionaryLimits,
     ) -> Result<Self, TermDictionaryError> {
-        Self::parse_with_limits_mode(bytes, schema, sections, limits, true)
-    }
-
-    fn parse_with_limits_mode(
-        bytes: &'a [u8],
-        schema: SchemaDescriptor,
-        sections: TermSectionLengths,
-        limits: TermDictionaryLimits,
-        build_exact_index: bool,
-    ) -> Result<Self, TermDictionaryError> {
         validate_schema(schema)?;
         validate_positions_section(schema, sections)?;
         if bytes.len() > limits.max_bytes {
@@ -1330,7 +1319,7 @@ impl<'a> TermDictionary<'a> {
                 sections,
                 blocks: Cow::Owned(Vec::new()),
                 restarts: Cow::Owned(Vec::new()),
-                exact_index: build_exact_index.then(|| Cow::Owned(ExactTermIndex::empty())),
+                exact_index: Some(Cow::Owned(ExactTermIndex::empty())),
                 term_count: 0,
             });
         }
@@ -1427,7 +1416,7 @@ impl<'a> TermDictionary<'a> {
         let mut references = ReferenceValidator::new(schema, sections)?;
         let mut previous_key = Vec::new();
         let mut decode_key = Vec::new();
-        let mut exact_index = build_exact_index.then(ExactTermIndexBuilder::default);
+        let mut exact_index = ExactTermIndexBuilder::default();
         let mut previous_tail = None;
         let mut term_count = 0_usize;
 
@@ -1457,7 +1446,7 @@ impl<'a> TermDictionary<'a> {
                 &mut references,
                 &mut decode_key,
                 &mut previous_key,
-                exact_index.as_mut(),
+                &mut exact_index,
                 previous_tail.as_ref(),
             )?;
             blocks
@@ -1470,10 +1459,7 @@ impl<'a> TermDictionary<'a> {
             previous_tail = Some(tail);
         }
         references.finish()?;
-        let exact_index = match exact_index {
-            Some(builder) => ExactTermIndex::build(builder)?,
-            None => None,
-        };
+        let exact_index = ExactTermIndex::build(exact_index)?;
         let term_count_u32 =
             u32::try_from(term_count).map_err(|_| TermDictionaryError::ValueOutOfRange {
                 field: "term_count",
@@ -2265,7 +2251,7 @@ fn validate_block(
     references: &mut ReferenceValidator,
     block_key: &mut Vec<u8>,
     previous_key: &mut Vec<u8>,
-    mut exact_index: Option<&mut ExactTermIndexBuilder>,
+    exact_index: &mut ExactTermIndexBuilder,
     previous_tail: Option<&BlockTail>,
 ) -> Result<(BlockMeta, BlockTail), TermDictionaryError> {
     let block_len = byte_range.end.saturating_sub(byte_range.start);
@@ -2374,15 +2360,13 @@ fn validate_block(
                 value: u64::try_from(term_ordinal).unwrap_or(u64::MAX),
                 offset: entry_offset,
             })?;
-        if let Some(builder) = exact_index.as_mut() {
-            builder.push(
-                block_key,
-                TermMatch {
-                    term_ord: term_ordinal_u32,
-                    metadata: decoded.metadata,
-                },
-            )?;
-        }
+        exact_index.push(
+            block_key,
+            TermMatch {
+                term_ord: term_ordinal_u32,
+                metadata: decoded.metadata,
+            },
+        )?;
         if let Some(marker) = decoded.full_key_range {
             restarts.push(RestartMeta {
                 entry_ordinal,
