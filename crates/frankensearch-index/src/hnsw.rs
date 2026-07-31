@@ -14,15 +14,20 @@
 //! save truncates the pair named by installed metadata. A persistent advisory
 //! save lock and durable in-generation READY receipt serialize writers and let
 //! publication retries reuse complete generations without deleting them.
+//! Format v6 attests the native graph's point and layer topology, invalidating
+//! graphs produced by `hnsw_rs` versions that could misfile reverse edges.
 //! Legacy sidecars and any load failure fall back to the
 //! rebuild-from-`VectorIndex` path.
 
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
+use frankensearch_core::config::ZeroSignalReason;
 use frankensearch_core::{SearchError, SearchResult, VectorHit};
-use hnsw_rs::prelude::{AnnT, DistDot, Hnsw, HnswIo};
+use hnsw_rs::prelude::{AnnT, DistDot, Hnsw, HnswIo, Neighbour, PointId};
 use serde::{Deserialize, Serialize};
 
 use crate::VectorIndex;
@@ -36,6 +41,11 @@ pub const HNSW_DEFAULT_EF_CONSTRUCTION: usize = 200;
 pub const HNSW_DEFAULT_EF_SEARCH: usize = 100;
 /// Default HNSW max layer depth.
 pub const HNSW_DEFAULT_MAX_LAYER: usize = 16;
+
+// `hnsw_rs` documents parallel insertion as efficient only for batches of
+// roughly 1,000 points per Rayon worker. Small batches also have no useful
+// parallel speedup, so keep their construction deterministic and serial.
+const HNSW_PARALLEL_INSERT_MIN_POINTS_PER_THREAD: usize = 1_000;
 
 /// ANN construction/runtime parameters.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -65,9 +75,10 @@ impl Default for HnswConfig {
 /// (`*.hnsw.graph` + `*.hnsw.data`) alongside the JSON metadata; v3 records
 /// graphs built with the dimension-aware `DistDot` roundoff budget; v4 replaces
 /// the sampled source fingerprint with a digest of every live vector; v5 records
-/// the exact native sidecar generation and basename selected during publication.
-/// Older native graphs must be rebuilt under the current persistence contract.
-pub(crate) const HNSW_META_FORMAT_CURRENT: u32 = 5;
+/// the exact native sidecar generation and basename selected during publication;
+/// v6 attests point/layer invariants after build and native load. Older native
+/// graphs must be rebuilt under the current persistence contract.
+pub(crate) const HNSW_META_FORMAT_CURRENT: u32 = 6;
 
 const HNSW_GENERATION_RECEIPT_VERSION: u32 = 1;
 const HNSW_GENERATION_RECEIPT_FILENAME: &str = ".frankensearch-hnsw-ready.json";
@@ -150,6 +161,13 @@ struct HnswSidecarDigest {
     fnv1a64: u64,
 }
 
+#[derive(Debug)]
+struct ValidatedHnswGeneration {
+    generation: String,
+    basename: String,
+    graph: PathBuf,
+}
+
 /// How an HNSW load obtained its in-memory graph.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum HnswLoadDisposition {
@@ -176,6 +194,8 @@ pub struct AnnSearchStats {
     pub search_time_us: u64,
     /// Whether this path is approximate ANN.
     pub is_approximate: bool,
+    /// Why the query fell back to an exact scan, if it did.
+    pub fallback_reason: Option<AnnFallbackReason>,
     /// Estimated recall@k from the ef/k ratio (see [`estimate_recall`]).
     ///
     /// This is a heuristic point estimate with NO guarantee. For a certified,
@@ -184,17 +204,63 @@ pub struct AnnSearchStats {
     /// [`crate::recall_certificate::conformal_recall_lower_bound`] over a measured
     /// calibration sample instead.
     pub estimated_recall: f64,
+    /// Typed classification when the query produced zero hits.
+    ///
+    /// `Some(reason)` if and only if the returned hit list is empty. Present
+    /// so the ANN lane classifies zero-signal states with the same
+    /// [`ZeroSignalReason`] vocabulary as the exact lane (bd-tqhc).
+    pub zero_signal: Option<ZeroSignalReason>,
+}
+
+/// Reason an ANN query returned exact rather than approximate results.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AnnFallbackReason {
+    /// The native HNSW search returned fewer unique neighbors than exist for
+    /// the requested `k`, so an exact scan repaired the result set.
+    Underfilled,
+    /// The native HNSW search returned zero candidates although the graph
+    /// indexes points. Stronger anomaly signal than a partial underfill:
+    /// the graph produced no signal at all and an exact scan repaired it.
+    EmptyDespiteIndexedPoints,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HnswHitResolution {
+    CanonicalPublic,
+    RawPhysical,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone)]
+struct HnswTopologyPoint {
+    origin_id: usize,
+    point_id: PointId,
+    neighborhoods: Vec<Vec<Neighbour>>,
 }
 
 /// HNSW ANN index over vectors aligned to `VectorIndex` row order.
 pub struct HnswIndex {
     hnsw: Hnsw<'static, f32, DistDot>,
     doc_ids: Vec<String>,
+    /// Maps compact HNSW origin ids to canonical persisted `VectorIndex` rows.
+    source_positions: Vec<u32>,
+    /// Physical main-slab extent at construction/load time.
+    ///
+    /// Soft deletion leaves this unchanged and is supported between rebuilds.
+    /// A different extent means the borrowed exact-repair source is no longer
+    /// the immutable main slab this graph indexes.
+    source_record_count: usize,
     dimension: usize,
     config: HnswConfig,
     /// Fingerprint of the vectors the graph was built from. See
     /// [`HnswMeta::vector_fingerprint`].
     vector_fingerprint: u64,
+    /// Whether this graph instance has already warned about an underfill.
+    ///
+    /// Graph instances are per-generation (rebuilt on reload), so gating the
+    /// warning here yields the required once-per-generation bound; repeat
+    /// underfills log at debug (bd-tqhc no-warn-storm policy).
+    underfill_warned: AtomicBool,
 }
 
 impl std::fmt::Debug for HnswIndex {
@@ -220,14 +286,28 @@ impl HnswIndex {
         let dimension = index.dimension();
         let mut doc_ids = Vec::with_capacity(index.record_count());
         let mut vectors = Vec::with_capacity(index.record_count());
+        let mut live_positions = Vec::with_capacity(index.record_count());
         for i in 0..index.record_count() {
             if index.is_deleted(i) {
                 continue;
             }
             doc_ids.push(index.doc_id_at(i)?.to_owned());
             vectors.push(index.vector_at_f32(i)?);
+            live_positions.push(i);
         }
-        Self::build_from_parts(doc_ids, vectors, dimension, config)
+        let mut ann = Self::build_from_parts(doc_ids, vectors, dimension, config)?;
+        ann.source_record_count = index.record_count();
+        ann.source_positions = live_positions
+            .into_iter()
+            .map(|position| {
+                u32::try_from(position).map_err(|_| SearchError::InvalidConfig {
+                    field: "source_position".to_owned(),
+                    value: position.to_string(),
+                    reason: "VectorIndex row exceeds u32".to_owned(),
+                })
+            })
+            .collect::<SearchResult<Vec<_>>>()?;
+        Ok(ann)
     }
 
     /// Load an ANN index from disk, rebuilding the graph from `source_index` when
@@ -320,6 +400,40 @@ impl HnswIndex {
         if !native_sidecar_pair_is_local(path, &sidecar_parent, &graph, &data) {
             return None;
         }
+        let metadata_file_name = hnsw_metadata_file_name(path).ok()?;
+        let validated_generation = match validate_hnsw_generation_receipt(
+            path,
+            &sidecar_parent,
+            &metadata_file_name,
+            &meta.doc_ids,
+            meta.vector_fingerprint,
+            meta.dimension,
+            meta.config,
+        ) {
+            Ok(Some(validated)) => validated,
+            Ok(None) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    "HNSW native sidecars lack a matching digest receipt; rebuilding"
+                );
+                return None;
+            }
+            Err(error) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    ?error,
+                    "HNSW native sidecar receipt validation failed; rebuilding"
+                );
+                return None;
+            }
+        };
+        if validated_generation.basename != basename || validated_generation.graph != graph {
+            tracing::warn!(
+                path = %path.display(),
+                "HNSW metadata and digest receipt name different native sidecars; rebuilding"
+            );
+            return None;
+        }
 
         // Validate doc-id sequence against the live VectorIndex *before*
         // touching the (potentially expensive) hnsw_rs load.
@@ -361,9 +475,33 @@ impl HnswIndex {
         // is the simplest sound way to obtain a `'static` graph, and the cost
         // is negligible because a persisted load happens about once per
         // process.
-        let hnsw = Box::leak(Box::new(HnswIo::new(&sidecar_parent, &basename)))
-            .load_hnsw::<f32, DistDot>()
-            .ok()?;
+        let native_io: &'static mut HnswIo =
+            Box::leak(Box::new(HnswIo::new(&sidecar_parent, &basename)));
+        let hnsw = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            // Moving the leaked mutable reference into a closure-local binding
+            // makes this closure `FnOnce` and lets the parser's returned graph
+            // carry the same `'static` lifetime as its deliberately leaked
+            // owner.
+            let native_io = native_io;
+            native_io.load_hnsw::<'static, 'static, f32, DistDot>()
+        })) {
+            Ok(Ok(hnsw)) => hnsw,
+            Ok(Err(error)) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    ?error,
+                    "HNSW native sidecar parser rejected the installed generation; rebuilding"
+                );
+                return None;
+            }
+            Err(_) => {
+                tracing::warn!(
+                    path = %path.display(),
+                    "HNSW native sidecar parser panicked on the installed generation; rebuilding"
+                );
+                return None;
+            }
+        };
 
         // Guard against a graph that doesn't match the metadata it shipped with
         // (e.g. truncated dump, mismatched sidecars). The caller additionally
@@ -371,10 +509,25 @@ impl HnswIndex {
         if hnsw.get_nb_point() != meta.doc_ids.len() {
             return None;
         }
+        if let Err(detail) = validate_hnsw_topology(&hnsw, meta.doc_ids.len()) {
+            tracing::warn!(
+                path = %path.display(),
+                %detail,
+                "HNSW native sidecar failed topology attestation; rebuilding"
+            );
+            return None;
+        }
 
         Some(Self {
             hnsw,
+            underfill_warned: AtomicBool::new(false),
             doc_ids: meta.doc_ids.clone(),
+            source_positions: live_vector_positions(source_index)
+                .into_iter()
+                .map(u32::try_from)
+                .collect::<Result<Vec<_>, _>>()
+                .ok()?,
+            source_record_count: source_index.record_count(),
             dimension: meta.dimension,
             config: meta.config,
             vector_fingerprint: meta.vector_fingerprint,
@@ -512,13 +665,105 @@ impl HnswIndex {
     ///
     /// # Errors
     ///
-    /// Returns `SearchError::DimensionMismatch` if query dimension differs.
+    /// Returns `SearchError::DimensionMismatch` if query dimension differs,
+    /// and a subsystem error when a malformed/underfilled native graph cannot
+    /// be repaired because no authoritative source was supplied.
     pub fn knn_search_with_stats(
         &self,
         query: &[f32],
         k: usize,
         ef_search: usize,
     ) -> SearchResult<(Vec<VectorHit>, AnnSearchStats)> {
+        self.knn_search_with_optional_source(
+            None,
+            query,
+            k,
+            ef_search,
+            HnswHitResolution::CanonicalPublic,
+        )
+    }
+
+    /// Run ANN query with an authoritative `VectorIndex` available for exact
+    /// underfill repair.
+    ///
+    /// The source is borrowed only for this query. It verifies the physical
+    /// main-slab extent and returned row identities, filters post-build
+    /// tombstones, and supplies an exact scan when the native graph underfills.
+    /// This avoids retaining a second mmap or depending on a path that may be
+    /// renamed/replaced after the caller opened the canonical index.
+    ///
+    /// # Errors
+    ///
+    /// Returns `SearchError::DimensionMismatch` for incompatible vectors and
+    /// rejects source-extent or returned-row identity divergence. The caller
+    /// must supply the same immutable main slab used to build/load this graph;
+    /// a full vector fingerprint is intentionally recomputed only before exact
+    /// repair, avoiding an O(n) check on every successful ANN query.
+    pub fn knn_search_with_stats_against(
+        &self,
+        source: &VectorIndex,
+        query: &[f32],
+        k: usize,
+        ef_search: usize,
+    ) -> SearchResult<(Vec<VectorHit>, AnnSearchStats)> {
+        self.knn_search_with_optional_source(
+            Some(source),
+            query,
+            k,
+            ef_search,
+            HnswHitResolution::CanonicalPublic,
+        )
+    }
+
+    /// Return raw physical main-slab candidates for `TwoTierIndex`.
+    ///
+    /// Document-ID deduplication and WAL supersession are deliberately deferred
+    /// until `TwoTierIndex` has ranked the main and resident-WAL physical
+    /// candidates together. Exact underfill repair uses the same raw contract.
+    pub(crate) fn knn_search_raw_with_stats_against(
+        &self,
+        source: &VectorIndex,
+        query: &[f32],
+        k: usize,
+        ef_search: usize,
+    ) -> SearchResult<(Vec<VectorHit>, AnnSearchStats)> {
+        self.knn_search_with_optional_source(
+            Some(source),
+            query,
+            k,
+            ef_search,
+            HnswHitResolution::RawPhysical,
+        )
+    }
+
+    fn knn_search_with_optional_source(
+        &self,
+        source: Option<&VectorIndex>,
+        query: &[f32],
+        k: usize,
+        ef_search: usize,
+        resolution: HnswHitResolution,
+    ) -> SearchResult<(Vec<VectorHit>, AnnSearchStats)> {
+        if let Some(source) = source
+            && source.dimension() != self.dimension
+        {
+            return Err(SearchError::DimensionMismatch {
+                expected: self.dimension,
+                found: source.dimension(),
+            });
+        }
+        if let Some(source) = source
+            && source.record_count() != self.source_record_count
+        {
+            return Err(ann_corrupted(
+                &source.path,
+                format!(
+                    "canonical VectorIndex has {} physical rows, but HNSW was built against {}",
+                    source.record_count(),
+                    self.source_record_count
+                ),
+            ));
+        }
         if query.len() != self.dimension {
             return Err(SearchError::DimensionMismatch {
                 expected: self.dimension,
@@ -535,6 +780,14 @@ impl HnswIndex {
         }
 
         if k == 0 || self.doc_ids.is_empty() {
+            // k = 0 and empty-graph are distinct zero-signal states and must
+            // not collapse into one indistinguishable empty result (bd-tqhc).
+            // k = 0 takes precedence: it is request-scoped.
+            let zero_signal = if k == 0 {
+                ZeroSignalReason::CallerRequestedZeroK
+            } else {
+                ZeroSignalReason::NewlyCreatedEmpty
+            };
             let stats = AnnSearchStats {
                 index_size: self.len(),
                 dimension: self.dimension,
@@ -543,7 +796,9 @@ impl HnswIndex {
                 k_returned: 0,
                 search_time_us: 0,
                 is_approximate: true,
+                fallback_reason: None,
                 estimated_recall: 1.0,
+                zero_signal: Some(zero_signal),
             };
             return Ok((Vec::new(), stats));
         }
@@ -557,41 +812,295 @@ impl HnswIndex {
         let neighbors = self
             .hnsw
             .search(&normalized_query, effective_k, effective_ef);
-        let elapsed = start.elapsed();
-        let search_time_us = u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX);
+        self.finish_search_with_neighbors_resolution(
+            source,
+            query,
+            k,
+            effective_k,
+            effective_ef,
+            neighbors,
+            budget,
+            start,
+            resolution,
+        )
+    }
 
-        let mut hits = Vec::with_capacity(neighbors.len());
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)]
+    fn finish_search_with_neighbors(
+        &self,
+        source: Option<&VectorIndex>,
+        canonical_query: &[f32],
+        k_requested: usize,
+        effective_k: usize,
+        effective_ef: usize,
+        neighbors: Vec<Neighbour>,
+        budget: DistDotBudget,
+        start: Instant,
+    ) -> SearchResult<(Vec<VectorHit>, AnnSearchStats)> {
+        self.finish_search_with_neighbors_resolution(
+            source,
+            canonical_query,
+            k_requested,
+            effective_k,
+            effective_ef,
+            neighbors,
+            budget,
+            start,
+            HnswHitResolution::CanonicalPublic,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn finish_search_with_neighbors_resolution(
+        &self,
+        source: Option<&VectorIndex>,
+        canonical_query: &[f32],
+        k_requested: usize,
+        effective_k: usize,
+        effective_ef: usize,
+        neighbors: Vec<Neighbour>,
+        budget: DistDotBudget,
+        start: Instant,
+        resolution: HnswHitResolution,
+    ) -> SearchResult<(Vec<VectorHit>, AnnSearchStats)> {
+        let (hits, fallback_reason) = self.resolve_neighbors_with_fallback(
+            source,
+            canonical_query,
+            effective_k,
+            neighbors,
+            budget,
+            resolution,
+        )?;
+        let search_time_us = u64::try_from(start.elapsed().as_micros()).unwrap_or(u64::MAX);
+
+        // An empty result here means the exact repair also found nothing, so
+        // classify from the authoritative source census. When the census says
+        // usable vectors exist yet even exact repair produced nothing, that is
+        // the ANN-availability anomaly rather than a benign state.
+        let zero_signal = if hits.is_empty() {
+            source.map(|source_index| {
+                let state = source_index.zero_signal_state();
+                state.state_reason().unwrap_or_else(|| {
+                    if state.is_wal_only() {
+                        ZeroSignalReason::WalOnlyNoLiveRecords
+                    } else {
+                        ZeroSignalReason::AnnReturnedEmptyDespiteUsableVectors
+                    }
+                })
+            })
+        } else {
+            None
+        };
+
+        let stats = AnnSearchStats {
+            index_size: self.len(),
+            dimension: self.dimension,
+            ef_search: effective_ef,
+            k_requested,
+            k_returned: hits.len(),
+            search_time_us,
+            is_approximate: fallback_reason.is_none(),
+            fallback_reason,
+            estimated_recall: if fallback_reason.is_some() {
+                1.0
+            } else {
+                estimate_recall(effective_ef, effective_k)
+            },
+            zero_signal,
+        };
+        Ok((hits, stats))
+    }
+
+    fn resolve_neighbors_with_fallback(
+        &self,
+        source: Option<&VectorIndex>,
+        canonical_query: &[f32],
+        effective_k: usize,
+        neighbors: Vec<Neighbour>,
+        budget: DistDotBudget,
+        resolution: HnswHitResolution,
+    ) -> SearchResult<(Vec<VectorHit>, Option<AnnFallbackReason>)> {
+        let native_returned = neighbors.len();
+        let mut seen_neighbors = HashSet::with_capacity(native_returned);
+        let mut eligible_neighbors = Vec::with_capacity(native_returned);
         for neighbor in neighbors {
+            if !seen_neighbors.insert(neighbor.d_id) {
+                continue;
+            }
+            if let Some(source) = source {
+                let physical_position = self
+                    .source_positions
+                    .get(neighbor.d_id)
+                    .copied()
+                    .and_then(|position| usize::try_from(position).ok())
+                    .ok_or_else(|| {
+                        ann_corrupted(
+                            &source.path,
+                            format!(
+                                "native neighbor {} has no compact-to-physical source row",
+                                neighbor.d_id
+                            ),
+                        )
+                    })?;
+                if physical_position >= source.record_count() {
+                    return Err(ann_corrupted(
+                        &source.path,
+                        format!(
+                            "native neighbor {} maps to source row {physical_position}, \
+                             beyond {} rows",
+                            neighbor.d_id,
+                            source.record_count()
+                        ),
+                    ));
+                }
+                let expected_doc_id = self.doc_ids.get(neighbor.d_id).ok_or_else(|| {
+                    ann_corrupted(
+                        &source.path,
+                        format!("native neighbor {} has no document identity", neighbor.d_id),
+                    )
+                })?;
+                if source.doc_id_at(physical_position)? != expected_doc_id {
+                    return Err(ann_corrupted(
+                        &source.path,
+                        format!(
+                            "native neighbor {} maps to source row {physical_position} with a \
+                             different document identity",
+                            neighbor.d_id
+                        ),
+                    ));
+                }
+                if source.is_deleted(physical_position) {
+                    continue;
+                }
+            }
+            eligible_neighbors.push(neighbor);
+        }
+        if eligible_neighbors.len() < effective_k {
+            // First underfill on this graph instance warns; repeats log at
+            // debug. Instances are per-generation, giving the required
+            // once-per-generation warning bound (bd-tqhc).
+            if self.underfill_warned.swap(true, Ordering::Relaxed) {
+                tracing::debug!(
+                    index_size = self.len(),
+                    effective_k,
+                    native_returned,
+                    native_unique_live = eligible_neighbors.len(),
+                    "HNSW search underfilled; returning exact top-k"
+                );
+            } else {
+                tracing::warn!(
+                    index_size = self.len(),
+                    effective_k,
+                    native_returned,
+                    native_unique_live = eligible_neighbors.len(),
+                    "HNSW search underfilled; returning exact top-k \
+                     (repeat underfills for this graph instance log at debug)"
+                );
+            }
+            let source = source.ok_or_else(|| SearchError::SubsystemError {
+                subsystem: "hnsw",
+                source: Box::new(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "HNSW search underfilled; call knn_search_with_stats_against with the \
+                     authoritative VectorIndex to permit canonical exact repair",
+                )),
+            })?;
+            let hits = self.exact_scan(source, canonical_query, effective_k, resolution)?;
+            // A graph that yields zero candidates despite indexing points is a
+            // stronger anomaly than a partial underfill; record it distinctly.
+            let reason = if native_returned == 0 && !self.doc_ids.is_empty() {
+                AnnFallbackReason::EmptyDespiteIndexedPoints
+            } else {
+                AnnFallbackReason::Underfilled
+            };
+            return Ok((hits, Some(reason)));
+        }
+
+        self.hits_from_distances(
+            eligible_neighbors
+                .into_iter()
+                .map(|neighbor| (neighbor.d_id, neighbor.distance)),
+            budget,
+            resolution,
+        )
+        .map(|hits| (hits, None))
+    }
+
+    fn exact_scan(
+        &self,
+        source: &VectorIndex,
+        canonical_query: &[f32],
+        effective_k: usize,
+        resolution: HnswHitResolution,
+    ) -> SearchResult<Vec<VectorHit>> {
+        if source.dimension() != self.dimension {
+            return Err(SearchError::DimensionMismatch {
+                expected: self.dimension,
+                found: source.dimension(),
+            });
+        }
+        let source_fingerprint = fingerprint_vector_index_positions(
+            source,
+            &self.source_positions,
+            &self.doc_ids,
+            self.dimension,
+        )?;
+        if source_fingerprint != self.vector_fingerprint {
+            return Err(ann_corrupted(
+                &source.path,
+                "canonical VectorIndex source rows changed after HNSW construction",
+            ));
+        }
+        match resolution {
+            HnswHitResolution::CanonicalPublic => {
+                source.search_main_top_k(canonical_query, effective_k)
+            }
+            HnswHitResolution::RawPhysical => {
+                source.search_main_top_k_raw(canonical_query, effective_k)
+            }
+        }
+    }
+
+    fn hits_from_distances(
+        &self,
+        distances: impl IntoIterator<Item = (usize, f32)>,
+        budget: DistDotBudget,
+        resolution: HnswHitResolution,
+    ) -> SearchResult<Vec<VectorHit>> {
+        let scores = distances
+            .into_iter()
+            .map(|(neighbor_id, distance)| {
+                restore_dist_dot_score(distance, budget).map(|score| (neighbor_id, score))
+            })
+            .collect::<SearchResult<Vec<_>>>()?;
+        self.hits_from_scores(scores, resolution)
+    }
+
+    fn hits_from_scores(
+        &self,
+        scores: impl IntoIterator<Item = (usize, f32)>,
+        resolution: HnswHitResolution,
+    ) -> SearchResult<Vec<VectorHit>> {
+        let mut hits = Vec::new();
+        for (neighbor_id, score) in scores {
             let doc_id =
                 self.doc_ids
-                    .get(neighbor.d_id)
+                    .get(neighbor_id)
                     .ok_or_else(|| SearchError::InvalidConfig {
                         field: "neighbor_id".to_owned(),
-                        value: neighbor.d_id.to_string(),
+                        value: neighbor_id.to_string(),
                         reason: "neighbor id exceeds doc_id table".to_owned(),
                     })?;
-            let index = u32::try_from(neighbor.d_id).map_err(|_| SearchError::InvalidConfig {
-                field: "neighbor_id".to_owned(),
-                value: neighbor.d_id.to_string(),
-                reason: "neighbor id exceeds u32 range for VectorHit".to_owned(),
-            })?;
-            let restored_score = (1.0 - neighbor.distance) / budget.radius_squared;
-            let score_envelope = -1.0 - budget.score_tolerance..=1.0 + budget.score_tolerance;
-            if !restored_score.is_finite() || !score_envelope.contains(&restored_score) {
-                return Err(SearchError::SubsystemError {
-                    subsystem: "hnsw",
-                    source: Box::new(std::io::Error::new(
-                        std::io::ErrorKind::InvalidData,
-                        format!(
-                            "DistDot returned distance {} (restored score {restored_score}); \
-                             expected a score within [{}, {}]",
-                            neighbor.distance,
-                            score_envelope.start(),
-                            score_envelope.end()
-                        ),
-                    )),
-                });
-            }
+            let index = self
+                .source_positions
+                .get(neighbor_id)
+                .copied()
+                .ok_or_else(|| SearchError::InvalidConfig {
+                    field: "neighbor_id".to_owned(),
+                    value: neighbor_id.to_string(),
+                    reason: "neighbor id exceeds compact-to-physical row map".to_owned(),
+                })?;
             hits.push(VectorHit {
                 index,
                 // Graph and query vectors use the same deterministic radius.
@@ -599,7 +1108,7 @@ impl HnswIndex {
                 // similarity rather than a dimension-dependent proxy score.
                 // Clamp only after proving the deviation is inside the derived
                 // floating-point envelope; materially invalid distances fail.
-                score: restored_score.clamp(-1.0, 1.0),
+                score,
                 doc_id: doc_id.as_str().into(),
             });
         }
@@ -607,25 +1116,20 @@ impl HnswIndex {
             left.cmp_by_score(right)
                 .then_with(|| left.index.cmp(&right.index))
         });
-
-        let stats = AnnSearchStats {
-            index_size: self.len(),
-            dimension: self.dimension,
-            ef_search: effective_ef,
-            k_requested: k,
-            k_returned: hits.len(),
-            search_time_us,
-            is_approximate: true,
-            estimated_recall: estimate_recall(effective_ef, effective_k),
-        };
-        Ok((hits, stats))
+        if resolution == HnswHitResolution::CanonicalPublic {
+            let mut seen_doc_ids = HashSet::with_capacity(hits.len());
+            hits.retain(|hit| seen_doc_ids.insert(hit.doc_id.clone()));
+        }
+        Ok(hits)
     }
 
     /// Run ANN query and return only the hits.
     ///
     /// # Errors
     ///
-    /// Returns `SearchError::DimensionMismatch` if query dimension differs.
+    /// Returns `SearchError::DimensionMismatch` if query dimension differs,
+    /// and a subsystem error when a malformed/underfilled native graph cannot
+    /// be repaired because no authoritative source was supplied.
     pub fn knn_search(
         &self,
         query: &[f32],
@@ -633,6 +1137,24 @@ impl HnswIndex {
         ef_search: usize,
     ) -> SearchResult<Vec<VectorHit>> {
         self.knn_search_with_stats(query, k, ef_search)
+            .map(|(hits, _)| hits)
+    }
+
+    /// Run ANN query with an authoritative source available for exact
+    /// underfill repair, returning only hits.
+    ///
+    /// # Errors
+    ///
+    /// Propagates dimension, source-identity, native-search, or exact-repair
+    /// errors from [`Self::knn_search_with_stats_against`].
+    pub fn knn_search_against(
+        &self,
+        source: &VectorIndex,
+        query: &[f32],
+        k: usize,
+        ef_search: usize,
+    ) -> SearchResult<Vec<VectorHit>> {
+        self.knn_search_with_stats_against(source, query, k, ef_search)
             .map(|(hits, _)| hits)
     }
 
@@ -654,9 +1176,10 @@ impl HnswIndex {
     /// # Errors
     ///
     /// Propagates any error from the exact [`VectorIndex::search_top_k`] pass. A
-    /// failed ANN search for a single (query, ef) is treated as recall `0.0` for that
-    /// query — the conservative direction, which can only *lower* a certified bound
-    /// (never over-certify).
+    /// failed ANN search or exact-underfill fallback for a single (query, ef)
+    /// is treated as recall `0.0` for that query. This conservative direction
+    /// prevents calibration from selecting an `ef` whose apparent recall came
+    /// from repeatedly abandoning ANN for a full scan.
     pub fn certify_ef_search(
         &self,
         exact_index: &VectorIndex,
@@ -679,8 +1202,10 @@ impl HnswIndex {
                     .iter()
                     .zip(&exact)
                     .map(|(q, exact_hits)| {
-                        let approx = self.knn_search(q, k, ef).unwrap_or_default();
-                        recall_at_k_of(&approx, exact_hits)
+                        certified_ann_recall_sample(
+                            self.knn_search_with_stats_against(exact_index, q, k, ef),
+                            exact_hits,
+                        )
                     })
                     .collect()
             },
@@ -691,9 +1216,10 @@ impl HnswIndex {
 
     /// Returns true when this ANN index matches row order and shape of a `VectorIndex`.
     ///
-    /// Since `HnswIndex` no longer stores vectors, this only checks:
+    /// Since `HnswIndex` no longer stores vectors, this checks:
     /// 1. Dimension match.
-    /// 2. `doc_id` sequence match (ignoring tombstones in `VectorIndex`).
+    /// 2. Live physical-row and `doc_id` sequence match.
+    /// 3. The fingerprint of every live vector.
     ///
     /// # Errors
     ///
@@ -714,12 +1240,18 @@ impl HnswIndex {
             if expected_doc_id != index.doc_id_at(i)? {
                 return Ok(false);
             }
-            // We implicitly assume vectors match if doc_ids match, as HNSW
-            // is built *from* the VectorIndex on load.
+            if self.source_positions.get(live_position).copied() != u32::try_from(i).ok() {
+                return Ok(false);
+            }
             live_position = live_position.saturating_add(1);
         }
-        // Check if HNSW has extra docs
-        Ok(live_position == self.doc_ids.len())
+        if live_position != self.doc_ids.len() {
+            return Ok(false);
+        }
+        Ok(
+            fingerprint_live_vector_index(index, self.doc_ids.len(), self.dimension)?
+                == self.vector_fingerprint,
+        )
     }
 
     /// Number of indexed vectors.
@@ -794,30 +1326,437 @@ impl HnswIndex {
             normalized_vectors.push(normalize_for_dist_dot(vector, budget));
         }
 
-        let hnsw = Hnsw::new(
-            config.m,
-            doc_ids.len().max(1),
-            config.max_layer,
-            config.ef_construction,
-            DistDot,
-        );
-        if !normalized_vectors.is_empty() {
-            let vectors_with_ids: Vec<(&Vec<f32>, usize)> = normalized_vectors
-                .iter()
-                .enumerate()
-                .map(|(index, vector)| (vector, index))
-                .collect();
-            hnsw.parallel_insert(&vectors_with_ids);
-        }
+        let use_parallel_insert = should_use_parallel_insert(normalized_vectors.len());
+        let initial_hnsw = construct_hnsw_graph(&normalized_vectors, config, use_parallel_insert);
+        let hnsw = attest_or_rebuild_serial(
+            initial_hnsw,
+            use_parallel_insert,
+            doc_ids.len(),
+            |graph| validate_hnsw_topology(graph, doc_ids.len()),
+            || construct_hnsw_graph(&normalized_vectors, config, false),
+        )
+        .map_err(|detail| ann_topology_error(&detail))?;
 
         Ok(Self {
             hnsw,
+            underfill_warned: AtomicBool::new(false),
             doc_ids,
-            // vectors: source_vectors, // Removed!
+            source_positions: (0..normalized_vectors.len())
+                .map(|position| {
+                    u32::try_from(position).map_err(|_| SearchError::InvalidConfig {
+                        field: "source_position".to_owned(),
+                        value: position.to_string(),
+                        reason: "HNSW row exceeds u32".to_owned(),
+                    })
+                })
+                .collect::<SearchResult<Vec<_>>>()?,
+            source_record_count: normalized_vectors.len(),
             dimension,
             config,
             vector_fingerprint,
         })
+    }
+}
+
+fn should_use_parallel_insert(point_count: usize) -> bool {
+    let remaining_points = point_count.saturating_sub(1);
+    let minimum_parallel_batch =
+        rayon::current_num_threads().saturating_mul(HNSW_PARALLEL_INSERT_MIN_POINTS_PER_THREAD);
+    remaining_points >= minimum_parallel_batch
+}
+
+fn construct_hnsw_graph(
+    vectors: &[Vec<f32>],
+    config: HnswConfig,
+    parallel: bool,
+) -> Hnsw<'static, f32, DistDot> {
+    let hnsw = Hnsw::new(
+        config.m,
+        vectors.len().max(1),
+        config.max_layer,
+        config.ef_construction,
+        DistDot,
+    );
+    let Some((first, remaining)) = vectors.split_first() else {
+        return hnsw;
+    };
+
+    // Seed the entry point serially. The upstream implementation admits a new
+    // point into shared tables before reverse-edge updates are complete, so an
+    // established entry point is required before any concurrent insertion.
+    hnsw.insert((first, 0));
+    if parallel {
+        let vectors_with_ids = remaining
+            .iter()
+            .enumerate()
+            .map(|(index, vector)| (vector, index.saturating_add(1)))
+            .collect::<Vec<_>>();
+        hnsw.parallel_insert(&vectors_with_ids);
+    } else {
+        for (index, vector) in remaining.iter().enumerate() {
+            hnsw.insert((vector, index.saturating_add(1)));
+        }
+    }
+    hnsw
+}
+
+fn attest_or_rebuild_serial<T>(
+    initial_graph: T,
+    attempted_parallel: bool,
+    point_count: usize,
+    mut validate: impl FnMut(&T) -> Result<(), String>,
+    rebuild_serial: impl FnOnce() -> T,
+) -> Result<T, String> {
+    let Err(initial_detail) = validate(&initial_graph) else {
+        return Ok(initial_graph);
+    };
+    if !attempted_parallel {
+        return Err(initial_detail);
+    }
+
+    // Never publish a graph whose concurrent construction violated the
+    // searchable-topology contract. Drop it before allocating the replacement:
+    // parallel mode is reserved for large indexes, where retaining both full
+    // graphs could turn a recoverable topology fault into an OOM.
+    tracing::warn!(
+        point_count,
+        parallel_error = %initial_detail,
+        "parallel HNSW construction failed topology attestation; rebuilding serially"
+    );
+    drop(initial_graph);
+
+    let serial_graph = rebuild_serial();
+    if let Err(serial_detail) = validate(&serial_graph) {
+        return Err(format!(
+            "parallel construction failed ({initial_detail}); \
+             serial rebuild also failed ({serial_detail})"
+        ));
+    }
+    Ok(serial_graph)
+}
+
+fn restore_dist_dot_score(distance: f32, budget: DistDotBudget) -> SearchResult<f32> {
+    let restored_score = (1.0 - distance) / budget.radius_squared;
+    let score_envelope = -1.0 - budget.score_tolerance..=1.0 + budget.score_tolerance;
+    if !restored_score.is_finite() || !score_envelope.contains(&restored_score) {
+        return Err(SearchError::SubsystemError {
+            subsystem: "hnsw",
+            source: Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "DistDot returned distance {distance} (restored score {restored_score}); \
+                     expected a score within [{}, {}]",
+                    score_envelope.start(),
+                    score_envelope.end()
+                ),
+            )),
+        });
+    }
+    Ok(restored_score.clamp(-1.0, 1.0))
+}
+
+fn validate_hnsw_topology(
+    hnsw: &Hnsw<'_, f32, DistDot>,
+    expected_points: usize,
+) -> Result<(), String> {
+    let observed_count = hnsw.get_nb_point();
+    if observed_count != expected_points {
+        return Err(format!(
+            "point count mismatch: expected {expected_points}, observed {observed_count}"
+        ));
+    }
+    if expected_points == 0 {
+        return hnsw
+            .get_entry_point_id()
+            .is_none()
+            .then_some(())
+            .ok_or_else(|| "empty graph unexpectedly exposes an entry point".to_owned());
+    }
+
+    // Retain one Arc per point, indexed below by origin id. Neighborhoods are
+    // still cloned only one point at a time, so reachability does not require a
+    // second O(edges) adjacency graph.
+    let points = hnsw.get_point_indexation().into_iter().collect::<Vec<_>>();
+    let identities = points
+        .iter()
+        .map(|point| (point.get_origin_id(), point.get_point_id()))
+        .collect::<Vec<_>>();
+    let point_by_internal_id = validate_hnsw_identity_table(&identities, expected_points)?;
+    let entry_origin = validate_hnsw_entry_point(
+        hnsw.get_entry_point_id(),
+        &identities,
+        &point_by_internal_id,
+    )?;
+    let mut points_by_origin = std::iter::repeat_with(|| None)
+        .take(expected_points)
+        .collect::<Vec<_>>();
+    for point in points {
+        let origin_id = point.get_origin_id();
+        points_by_origin[origin_id] = Some(point);
+    }
+    for point in points_by_origin.iter().flatten() {
+        let neighborhoods = point.get_neighborhood_id();
+        validate_hnsw_point_neighborhoods(
+            point.get_origin_id(),
+            point.get_point_id(),
+            &neighborhoods,
+            expected_points,
+            &point_by_internal_id,
+        )?;
+    }
+    validate_directed_base_reachability(entry_origin, expected_points, |origin_id| {
+        let point = points_by_origin[origin_id]
+            .as_ref()
+            .ok_or_else(|| format!("missing origin id {origin_id} during reachability walk"))?;
+        Ok(point
+            .get_neighborhood_id()
+            .first()
+            .into_iter()
+            .flatten()
+            .map(|neighbor| neighbor.d_id)
+            .collect())
+    })
+}
+
+#[cfg(test)]
+fn validate_hnsw_topology_observations(
+    points: &[HnswTopologyPoint],
+    expected_points: usize,
+    entry_point: Option<(usize, PointId)>,
+) -> Result<(), String> {
+    if points.len() != expected_points {
+        return Err(format!(
+            "point iterator yielded {} entries for {expected_points} expected points",
+            points.len()
+        ));
+    }
+
+    let identities = points
+        .iter()
+        .map(|point| (point.origin_id, point.point_id))
+        .collect::<Vec<_>>();
+    let point_by_internal_id = validate_hnsw_identity_table(&identities, expected_points)?;
+    if expected_points == 0 {
+        return entry_point
+            .is_none()
+            .then_some(())
+            .ok_or_else(|| "empty graph unexpectedly exposes an entry point".to_owned());
+    }
+    let entry_origin = validate_hnsw_entry_point(entry_point, &identities, &point_by_internal_id)?;
+    let mut points_by_origin = vec![None; expected_points];
+    for point in points {
+        points_by_origin[point.origin_id] = Some(point);
+        validate_hnsw_point_neighborhoods(
+            point.origin_id,
+            point.point_id,
+            &point.neighborhoods,
+            expected_points,
+            &point_by_internal_id,
+        )?;
+    }
+    validate_directed_base_reachability(entry_origin, expected_points, |origin_id| {
+        let point = points_by_origin[origin_id]
+            .ok_or_else(|| format!("missing origin id {origin_id} during reachability walk"))?;
+        Ok(point
+            .neighborhoods
+            .first()
+            .into_iter()
+            .flatten()
+            .map(|neighbor| neighbor.d_id)
+            .collect())
+    })
+}
+
+fn validate_hnsw_entry_point(
+    entry_point: Option<(usize, PointId)>,
+    identities: &[(usize, PointId)],
+    point_by_internal_id: &HashMap<PointId, usize>,
+) -> Result<usize, String> {
+    let (entry_origin, entry_point_id) =
+        entry_point.ok_or_else(|| "non-empty graph has no search entry point".to_owned())?;
+    let mapped_origin = point_by_internal_id
+        .get(&entry_point_id)
+        .copied()
+        .ok_or_else(|| format!("entry point {entry_point_id:?} is absent from the point table"))?;
+    if mapped_origin != entry_origin {
+        return Err(format!(
+            "entry point {entry_point_id:?} maps to origin {mapped_origin}, \
+             not advertised origin {entry_origin}"
+        ));
+    }
+    let max_layer = identities
+        .iter()
+        .map(|(_, point_id)| point_id.0)
+        .max()
+        .ok_or_else(|| "non-empty graph has no point identities".to_owned())?;
+    if entry_point_id.0 != max_layer {
+        return Err(format!(
+            "entry point {entry_point_id:?} is below maximum sampled layer {max_layer}"
+        ));
+    }
+    Ok(entry_origin)
+}
+
+fn validate_directed_base_reachability(
+    entry_origin: usize,
+    expected_points: usize,
+    mut base_neighbors: impl FnMut(usize) -> Result<Vec<usize>, String>,
+) -> Result<(), String> {
+    let mut reached = vec![false; expected_points];
+    let mut queue = VecDeque::with_capacity(expected_points.min(4_096));
+    reached[entry_origin] = true;
+    queue.push_back(entry_origin);
+    let mut reached_count = 1_usize;
+
+    while let Some(origin_id) = queue.pop_front() {
+        for neighbor_id in base_neighbors(origin_id)? {
+            if neighbor_id >= expected_points {
+                return Err(format!(
+                    "origin id {origin_id} reaches out-of-range base neighbor {neighbor_id}"
+                ));
+            }
+            if !reached[neighbor_id] {
+                reached[neighbor_id] = true;
+                reached_count += 1;
+                queue.push_back(neighbor_id);
+            }
+        }
+    }
+
+    if reached_count != expected_points {
+        let first_unreachable = reached
+            .iter()
+            .position(|is_reached| !is_reached)
+            .unwrap_or(expected_points);
+        return Err(format!(
+            "search entry origin {entry_origin} reaches only {reached_count}/{expected_points} \
+             points at the base layer; first unreachable origin is {first_unreachable}"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_hnsw_identity_table(
+    identities: &[(usize, PointId)],
+    expected_points: usize,
+) -> Result<HashMap<PointId, usize>, String> {
+    if identities.len() != expected_points {
+        return Err(format!(
+            "point iterator yielded {} entries for {expected_points} expected points",
+            identities.len()
+        ));
+    }
+
+    let mut point_by_internal_id = HashMap::with_capacity(identities.len());
+    let mut origin_ids = HashSet::with_capacity(identities.len());
+    for &(origin_id, point_id) in identities {
+        if origin_id >= expected_points {
+            return Err(format!(
+                "origin id {} is outside 0..{expected_points}",
+                origin_id
+            ));
+        }
+        if !origin_ids.insert(origin_id) {
+            return Err(format!("duplicate origin id {origin_id}"));
+        }
+        if point_id.1 < 0 {
+            return Err(format!(
+                "origin id {} has negative internal slot {:?}",
+                origin_id, point_id
+            ));
+        }
+        if point_by_internal_id.insert(point_id, origin_id).is_some() {
+            return Err(format!("duplicate internal point id {point_id:?}"));
+        }
+    }
+
+    for expected_origin_id in 0..expected_points {
+        if !origin_ids.contains(&expected_origin_id) {
+            return Err(format!("missing origin id {expected_origin_id}"));
+        }
+    }
+    Ok(point_by_internal_id)
+}
+
+fn validate_hnsw_point_neighborhoods(
+    origin_id: usize,
+    point_id: PointId,
+    neighborhoods: &[Vec<Neighbour>],
+    expected_points: usize,
+    point_by_internal_id: &HashMap<PointId, usize>,
+) -> Result<(), String> {
+    let source_max_layer = usize::from(point_id.0);
+    if source_max_layer >= neighborhoods.len() {
+        return Err(format!(
+            "origin id {origin_id} sampled layer {} but exposes only {} neighborhoods",
+            point_id.0,
+            neighborhoods.len()
+        ));
+    }
+    for (layer, neighbors) in neighborhoods.iter().enumerate() {
+        if layer > source_max_layer && !neighbors.is_empty() {
+            return Err(format!(
+                "origin id {origin_id} has {} neighbors in layer {layer} above sampled layer \
+                 {source_max_layer}",
+                neighbors.len()
+            ));
+        }
+
+        let mut seen_neighbors = HashSet::with_capacity(neighbors.len());
+        for neighbor in neighbors {
+            if !neighbor.distance.is_finite() {
+                return Err(format!(
+                    "origin id {origin_id} has a non-finite distance in layer {layer}"
+                ));
+            }
+            if neighbor.d_id >= expected_points {
+                return Err(format!(
+                    "origin id {origin_id} references out-of-range neighbor {} in layer {layer}",
+                    neighbor.d_id
+                ));
+            }
+            if !seen_neighbors.insert(neighbor.d_id) {
+                return Err(format!(
+                    "origin id {origin_id} repeats neighbor {} in layer {layer}",
+                    neighbor.d_id
+                ));
+            }
+            if neighbor.d_id == origin_id {
+                return Err(format!(
+                    "origin id {origin_id} references itself in layer {layer}"
+                ));
+            }
+            let Some(&internal_origin_id) = point_by_internal_id.get(&neighbor.p_id) else {
+                return Err(format!(
+                    "origin id {origin_id} references missing internal point {:?} in layer {layer}",
+                    neighbor.p_id
+                ));
+            };
+            if internal_origin_id != neighbor.d_id {
+                return Err(format!(
+                    "neighbor {:?} maps to origin {internal_origin_id}, not advertised origin {}",
+                    neighbor.p_id, neighbor.d_id
+                ));
+            }
+            if usize::from(neighbor.p_id.0) < layer {
+                return Err(format!(
+                    "origin id {origin_id} references neighbor {} at layer {layer}, above the \
+                     neighbor's sampled layer {}",
+                    neighbor.d_id, neighbor.p_id.0
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn ann_topology_error(detail: &str) -> SearchError {
+    SearchError::SubsystemError {
+        subsystem: "hnsw",
+        source: Box::new(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("graph topology attestation failed: {detail}"),
+        )),
     }
 }
 
@@ -1035,6 +1974,55 @@ fn reusable_hnsw_generation(
     generation_path: &Path,
     metadata_file_name: &str,
 ) -> SearchResult<Option<HnswMeta>> {
+    let Some(validated) = validate_hnsw_generation_receipt(
+        metadata_path,
+        generation_path,
+        metadata_file_name,
+        &index.doc_ids,
+        index.vector_fingerprint,
+        index.dimension,
+        index.config,
+    )?
+    else {
+        return Ok(None);
+    };
+
+    // Byte identity alone is not enough: a complete pair can still be
+    // semantically unreadable after a native-format change or a faulty dump.
+    // Republishing such a receipt would make every fallback rebuild select the
+    // same broken generation again. Prove that the current reader can load the
+    // pair before treating it as reusable.
+    if !hnsw_generation_is_loadable(
+        generation_path,
+        &validated.basename,
+        &validated.graph,
+        index.doc_ids.len(),
+        index.dimension,
+    ) {
+        tracing::debug!(
+            path = %metadata_path.display(),
+            generation = %generation_path.display(),
+            "ignoring digest-valid but unloadable HNSW READY generation"
+        );
+        return Ok(None);
+    }
+
+    Ok(Some(index.metadata_for_generation(
+        &validated.generation,
+        &validated.basename,
+    )))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn validate_hnsw_generation_receipt(
+    metadata_path: &Path,
+    generation_path: &Path,
+    metadata_file_name: &str,
+    doc_ids: &[String],
+    vector_fingerprint: u64,
+    dimension: usize,
+    config: HnswConfig,
+) -> SearchResult<Option<ValidatedHnswGeneration>> {
     let Some(generation_name) = generation_path.file_name().and_then(|name| name.to_str()) else {
         return Ok(None);
     };
@@ -1089,11 +2077,11 @@ fn reusable_hnsw_generation(
         || receipt.metadata_file_name != metadata_file_name
         || receipt.format_version != HNSW_META_FORMAT_CURRENT
         || receipt.generation.as_str().ne(generation_name.as_str())
-        || receipt.doc_count != index.doc_ids.len()
-        || receipt.doc_ids_fingerprint != fingerprint_doc_ids(&index.doc_ids)
-        || receipt.vector_fingerprint != index.vector_fingerprint
-        || receipt.dimension != index.dimension
-        || receipt.config != index.config
+        || receipt.doc_count != doc_ids.len()
+        || receipt.doc_ids_fingerprint != fingerprint_doc_ids(doc_ids)
+        || receipt.vector_fingerprint != vector_fingerprint
+        || receipt.dimension != dimension
+        || receipt.config != config
     {
         return Ok(None);
     }
@@ -1110,29 +2098,11 @@ fn reusable_hnsw_generation(
         return Ok(None);
     }
 
-    // Byte identity alone is not enough: a complete pair can still be
-    // semantically unreadable after a native-format change or a faulty dump.
-    // Republishing such a receipt would make every fallback rebuild select the
-    // same broken generation again. Prove that the current reader can load the
-    // pair before treating it as reusable.
-    if !hnsw_generation_is_loadable(
-        generation_path,
-        &basename,
-        &graph,
-        index.doc_ids.len(),
-        index.dimension,
-    ) {
-        tracing::debug!(
-            path = %metadata_path.display(),
-            generation = %generation_path.display(),
-            "ignoring digest-valid but unloadable HNSW READY generation"
-        );
-        return Ok(None);
-    }
-
-    Ok(Some(
-        index.metadata_for_generation(&generation_name, &basename),
-    ))
+    Ok(Some(ValidatedHnswGeneration {
+        generation: generation_name,
+        basename,
+        graph,
+    }))
 }
 
 fn hnsw_generation_is_loadable(
@@ -1162,14 +2132,14 @@ fn hnsw_generation_is_loadable(
     // corrupt retained generations on the normal reject-and-redump path rather
     // than letting a validation-only reuse probe unwind through `save()`.
     let mut native_io = HnswIo::new(generation_path, basename);
-    matches!(
-        std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            native_io
-                .load_hnsw::<f32, DistDot>()
-                .map(|candidate| candidate.get_nb_point())
-        })),
-        Ok(Ok(points)) if points == expected_points
-    )
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let Ok(candidate) = native_io.load_hnsw::<f32, DistDot>() else {
+            return false;
+        };
+        candidate.get_nb_point() == expected_points
+            && validate_hnsw_topology(&candidate, expected_points).is_ok()
+    }))
+    .unwrap_or(false)
 }
 
 fn write_hnsw_generation_receipt(
@@ -1486,6 +2456,75 @@ fn fingerprint_live_vector_index(
     Ok(h)
 }
 
+/// Recompute a graph fingerprint from its original physical source rows.
+///
+/// Unlike [`fingerprint_live_vector_index`], this deliberately includes rows
+/// that were tombstoned after the graph was built. Soft deletion is a valid
+/// in-process state transition: native candidates for those rows are filtered,
+/// while an exact underfill repair scans the source's current live set. A row
+/// move, document-identity change, or vector mutation still changes the digest
+/// and fails closed.
+fn fingerprint_vector_index_positions(
+    index: &VectorIndex,
+    positions: &[u32],
+    expected_doc_ids: &[String],
+    expected_dim: usize,
+) -> SearchResult<u64> {
+    if positions.len() != expected_doc_ids.len() {
+        return Err(ann_corrupted(
+            &index.path,
+            format!(
+                "HNSW source map has {} rows for {} document identities",
+                positions.len(),
+                expected_doc_ids.len()
+            ),
+        ));
+    }
+    let mut h = fnv1a_update(FNV_OFFSET_BASIS_64, &(positions.len() as u64).to_le_bytes());
+    for (logical_index, (&physical_position, expected_doc_id)) in
+        positions.iter().zip(expected_doc_ids).enumerate()
+    {
+        let physical_position = usize::try_from(physical_position).map_err(|_| {
+            ann_corrupted(
+                &index.path,
+                format!("HNSW source row {physical_position} does not fit usize"),
+            )
+        })?;
+        if physical_position >= index.record_count() {
+            return Err(ann_corrupted(
+                &index.path,
+                format!(
+                    "HNSW source row {physical_position} exceeds {} physical records",
+                    index.record_count()
+                ),
+            ));
+        }
+        if index.doc_id_at(physical_position)? != expected_doc_id {
+            return Err(ann_corrupted(
+                &index.path,
+                format!("HNSW source row {physical_position} has a different document identity"),
+            ));
+        }
+        let vector = index.vector_at_f32(physical_position)?;
+        if vector.len() != expected_dim {
+            return Err(SearchError::DimensionMismatch {
+                expected: expected_dim,
+                found: vector.len(),
+            });
+        }
+        h = fnv1a_update(h, &(logical_index as u64).to_le_bytes());
+        h = fnv1a_update(h, expected_doc_id.as_bytes());
+        h = fnv1a_update_f32(h, &vector);
+    }
+    Ok(h)
+}
+
+fn live_vector_positions(index: &VectorIndex) -> Vec<usize> {
+    (0..index.record_count())
+        .filter(|&position| !index.is_deleted(position))
+        .collect()
+}
+
 /// Verify the metadata `doc_ids` sequence matches the live `VectorIndex`'s
 /// live (non-tombstoned) doc IDs in row order. Same semantics as the public
 /// `matches_vector_index` but doesn't need a constructed `HnswIndex`, so we
@@ -1518,11 +2557,11 @@ fn validate_config(config: HnswConfig) -> SearchResult<()> {
             reason: "hnsw_m must be greater than zero".to_owned(),
         });
     }
-    if config.m > 256 {
+    if config.m > usize::from(u8::MAX) {
         return Err(SearchError::InvalidConfig {
             field: "hnsw_m".to_owned(),
             value: config.m.to_string(),
-            reason: "hnsw_m must be <= 256".to_owned(),
+            reason: format!("hnsw_m must be <= {}", u8::MAX),
         });
     }
     if config.ef_construction == 0 {
@@ -1544,6 +2583,13 @@ fn validate_config(config: HnswConfig) -> SearchResult<()> {
             field: "hnsw_max_layer".to_owned(),
             value: "0".to_owned(),
             reason: "hnsw_max_layer must be greater than zero".to_owned(),
+        });
+    }
+    if config.max_layer > HNSW_DEFAULT_MAX_LAYER {
+        return Err(SearchError::InvalidConfig {
+            field: "hnsw_max_layer".to_owned(),
+            value: config.max_layer.to_string(),
+            reason: format!("hnsw_max_layer must be <= {HNSW_DEFAULT_MAX_LAYER}"),
         });
     }
     Ok(())
@@ -1671,14 +2717,56 @@ fn recall_at_k_of(approx: &[VectorHit], exact: &[VectorHit]) -> f64 {
     ratio
 }
 
+fn certified_ann_recall_sample(
+    result: SearchResult<(Vec<VectorHit>, AnnSearchStats)>,
+    exact: &[VectorHit],
+) -> f64 {
+    match result {
+        Ok((approx, stats)) if stats.fallback_reason.is_none() => recall_at_k_of(&approx, exact),
+        Ok(_) | Err(_) => 0.0,
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
     use std::collections::HashSet;
     use std::path::PathBuf;
+    use std::rc::Rc;
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[cfg(feature = "hnsw-patch-ab")]
+    use hnsw_rs_034::prelude::{
+        AnnT as BaselineAnnT, DistDot as BaselineDistDot, Hnsw as BaselineHnsw,
+    };
 
     use super::*;
     use crate::Quantization;
+
+    #[derive(Debug)]
+    struct GraphRepairProbe {
+        label: &'static str,
+        valid: bool,
+        live_graphs: Rc<Cell<usize>>,
+    }
+
+    impl GraphRepairProbe {
+        fn new(label: &'static str, valid: bool, live_graphs: &Rc<Cell<usize>>) -> Self {
+            live_graphs.set(live_graphs.get().saturating_add(1));
+            Self {
+                label,
+                valid,
+                live_graphs: Rc::clone(live_graphs),
+            }
+        }
+    }
+
+    impl Drop for GraphRepairProbe {
+        fn drop(&mut self) {
+            self.live_graphs
+                .set(self.live_graphs.get().saturating_sub(1));
+        }
+    }
 
     fn temp_path(label: &str, extension: &str) -> PathBuf {
         let now = SystemTime::now()
@@ -1717,9 +2805,17 @@ mod tests {
     }
 
     fn write_index(path: &Path, vectors: &[Vec<f32>]) -> SearchResult<VectorIndex> {
+        write_index_with_quantization(path, vectors, Quantization::F32)
+    }
+
+    fn write_index_with_quantization(
+        path: &Path,
+        vectors: &[Vec<f32>],
+        quantization: Quantization,
+    ) -> SearchResult<VectorIndex> {
         let dimension = vectors.first().map_or(8, Vec::len);
         let mut writer =
-            VectorIndex::create_with_revision(path, "hash", "test", dimension, Quantization::F32)?;
+            VectorIndex::create_with_revision(path, "hash", "test", dimension, quantization)?;
         for (idx, vector) in vectors.iter().enumerate() {
             writer.write_record(&format!("doc-{idx:04}"), vector)?;
         }
@@ -1767,6 +2863,90 @@ mod tests {
         paths
     }
 
+    fn install_digest_valid_unloadable_data(generation_path: &Path, basename: &str) {
+        let data_path = generation_path.join(format!("{basename}.hnsw.data"));
+        std::fs::write(&data_path, b"not loadable HNSW vector data")
+            .expect("corrupt native data fixture");
+        let receipt_path = generation_path.join(HNSW_GENERATION_RECEIPT_FILENAME);
+        let mut receipt: HnswGenerationReceipt =
+            serde_json::from_slice(&std::fs::read(&receipt_path).expect("read receipt"))
+                .expect("parse receipt");
+        receipt.data = fingerprint_hnsw_sidecar(&data_path).expect("fingerprint corrupt data");
+        std::fs::write(
+            receipt_path,
+            serde_json::to_vec(&receipt).expect("serialize updated receipt"),
+        )
+        .expect("make corrupt pair digest-valid");
+    }
+
+    #[cfg(feature = "hnsw-patch-ab")]
+    fn install_digest_valid_wrong_layer_generation(
+        generation_path: &Path,
+        installed_basename: &str,
+        vectors: Vec<Vec<f32>>,
+    ) {
+        let installed_graph = generation_path.join(format!("{installed_basename}.hnsw.graph"));
+        let installed_data = generation_path.join(format!("{installed_basename}.hnsw.data"));
+        let malformed_directory = tempfile::tempdir().expect("malformed fixture directory");
+        let budget = dist_dot_budget(vectors[0].len()).expect("distance budget");
+        let normalized = vectors
+            .into_iter()
+            .map(|vector| normalize_for_dist_dot(vector, budget))
+            .collect::<Vec<_>>();
+
+        let mut malformed_basename = None;
+        for attempt in 0..4_096 {
+            let baseline = BaselineHnsw::new(16, normalized.len(), 16, 200, BaselineDistDot);
+            for (origin_id, vector) in normalized.iter().enumerate() {
+                baseline.insert((vector, origin_id));
+            }
+            let malformed = baseline.get_point_indexation().into_iter().any(|point| {
+                let max_layer = usize::from(point.get_point_id().0);
+                point
+                    .get_neighborhood_id()
+                    .iter()
+                    .skip(max_layer.saturating_add(1))
+                    .any(|neighbors| !neighbors.is_empty())
+            });
+            if malformed {
+                malformed_basename = Some(
+                    baseline
+                        .file_dump(malformed_directory.path(), &format!("malformed-{attempt}"))
+                        .expect("dump malformed baseline graph"),
+                );
+                break;
+            }
+        }
+        let malformed_basename =
+            malformed_basename.expect("published 0.3.4 must reproduce the wrong-layer topology");
+        std::fs::copy(
+            malformed_directory
+                .path()
+                .join(format!("{malformed_basename}.hnsw.graph")),
+            &installed_graph,
+        )
+        .expect("install malformed graph");
+        std::fs::copy(
+            malformed_directory
+                .path()
+                .join(format!("{malformed_basename}.hnsw.data")),
+            &installed_data,
+        )
+        .expect("install malformed data");
+
+        let receipt_path = generation_path.join(HNSW_GENERATION_RECEIPT_FILENAME);
+        let mut receipt: HnswGenerationReceipt =
+            serde_json::from_slice(&std::fs::read(&receipt_path).expect("receipt"))
+                .expect("parse receipt");
+        receipt.graph = fingerprint_hnsw_sidecar(&installed_graph).expect("graph digest");
+        receipt.data = fingerprint_hnsw_sidecar(&installed_data).expect("data digest");
+        std::fs::write(
+            receipt_path,
+            serde_json::to_vec(&receipt).expect("serialize updated receipt"),
+        )
+        .expect("update receipt");
+    }
+
     fn recall_at_k(approx: &[VectorHit], exact: &[VectorHit]) -> f64 {
         if exact.is_empty() {
             return 1.0;
@@ -1806,6 +2986,161 @@ mod tests {
             .expect("search");
         assert_eq!(hits.len(), 1);
         assert_eq!(hits[0].doc_id, "doc-0000");
+    }
+
+    #[test]
+    fn small_serial_builds_preserve_topology_and_return_every_available_hit() {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .expect("four-thread test pool");
+        pool.install(|| {
+            for round in 0..32 {
+                for count in [0_usize, 1, 2, 3, HNSW_DEFAULT_M, HNSW_DEFAULT_M + 1] {
+                    let doc_ids = (0..count)
+                        .map(|index| format!("round-{round}-doc-{index}"))
+                        .collect::<Vec<_>>();
+                    let vectors = (0..count)
+                        .map(|index| normalized_vector(round * 100 + index, 16))
+                        .collect::<Vec<_>>();
+                    let ann = HnswIndex::build_from_parts(
+                        doc_ids,
+                        vectors.clone(),
+                        16,
+                        HnswConfig::default(),
+                    )
+                    .expect("small graph build");
+                    validate_hnsw_topology(&ann.hnsw, count).expect("topology attestation");
+
+                    for query in &vectors {
+                        let (hits, stats) = ann
+                            .knn_search_with_stats(query, count, HNSW_DEFAULT_EF_SEARCH)
+                            .expect("full small-graph search");
+                        assert_eq!(hits.len(), count, "round={round}, count={count}");
+                        assert_eq!(stats.fallback_reason, None);
+                    }
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn parallel_insert_threshold_scales_with_the_active_rayon_pool() {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .expect("four-thread test pool");
+        pool.install(|| {
+            let threshold = 4 * HNSW_PARALLEL_INSERT_MIN_POINTS_PER_THREAD;
+            // One point is seeded serially, so the decision is based on the
+            // remaining insertion batch rather than total graph size.
+            assert!(!should_use_parallel_insert(threshold));
+            assert!(should_use_parallel_insert(threshold + 1));
+        });
+    }
+
+    #[test]
+    fn failed_parallel_attestation_drops_graph_then_repairs_once_serially() {
+        let live_graphs = Rc::new(Cell::new(0_usize));
+        let rebuilds = Cell::new(0_usize);
+        let initial = GraphRepairProbe::new("parallel-invalid", false, &live_graphs);
+
+        let repaired = attest_or_rebuild_serial(
+            initial,
+            true,
+            50_000,
+            |graph| {
+                graph
+                    .valid
+                    .then_some(())
+                    .ok_or_else(|| graph.label.to_owned())
+            },
+            || {
+                assert_eq!(
+                    live_graphs.get(),
+                    0,
+                    "invalid graph must be dropped before allocating its replacement"
+                );
+                rebuilds.set(rebuilds.get().saturating_add(1));
+                GraphRepairProbe::new("serial-valid", true, &live_graphs)
+            },
+        )
+        .expect("serial repair");
+
+        assert_eq!(repaired.label, "serial-valid");
+        assert_eq!(rebuilds.get(), 1);
+        assert_eq!(live_graphs.get(), 1);
+        drop(repaired);
+        assert_eq!(live_graphs.get(), 0);
+    }
+
+    #[test]
+    fn failed_serial_repair_reports_both_attestations_and_fails_closed() {
+        let live_graphs = Rc::new(Cell::new(0_usize));
+        let rebuilds = Cell::new(0_usize);
+        let initial = GraphRepairProbe::new("parallel-invalid", false, &live_graphs);
+
+        let error = attest_or_rebuild_serial(
+            initial,
+            true,
+            50_000,
+            |graph| {
+                graph
+                    .valid
+                    .then_some(())
+                    .ok_or_else(|| graph.label.to_owned())
+            },
+            || {
+                assert_eq!(live_graphs.get(), 0);
+                rebuilds.set(rebuilds.get().saturating_add(1));
+                GraphRepairProbe::new("serial-invalid", false, &live_graphs)
+            },
+        )
+        .expect_err("both invalid graphs must fail closed");
+
+        assert!(error.contains("parallel-invalid"), "{error}");
+        assert!(error.contains("serial-invalid"), "{error}");
+        assert_eq!(rebuilds.get(), 1);
+        assert_eq!(live_graphs.get(), 0);
+
+        let serial_only = GraphRepairProbe::new("serial-only-invalid", false, &live_graphs);
+        let error = attest_or_rebuild_serial(
+            serial_only,
+            false,
+            3,
+            |graph| Err(graph.label.to_owned()),
+            || panic!("a serial build must never recursively rebuild"),
+        )
+        .expect_err("serial construction failure");
+        assert_eq!(error, "serial-only-invalid");
+        assert_eq!(rebuilds.get(), 1);
+        assert_eq!(live_graphs.get(), 0);
+    }
+
+    #[test]
+    fn two_vector_queries_return_both_directions_without_fallback() {
+        let vectors = vec![vec![1.0_f32, 0.0], vec![0.0_f32, 1.0]];
+        for _ in 0..128 {
+            let ann = HnswIndex::build_from_parts(
+                vec!["east".to_owned(), "north".to_owned()],
+                vectors.clone(),
+                2,
+                HnswConfig::default(),
+            )
+            .expect("two-vector graph");
+            for (expected_first, query) in vectors.iter().enumerate() {
+                let (hits, stats) = ann
+                    .knn_search_with_stats(query, 2, HNSW_DEFAULT_EF_SEARCH)
+                    .expect("two-vector search");
+                assert_eq!(hits.len(), 2);
+                assert_eq!(
+                    usize::try_from(hits[0].index).expect("hit index"),
+                    expected_first
+                );
+                assert_eq!(stats.fallback_reason, None);
+                assert!(stats.is_approximate);
+            }
+        }
     }
 
     #[test]
@@ -1928,9 +3263,9 @@ mod tests {
     }
 
     #[test]
-    fn validate_config_rejects_m_over_256() {
+    fn validate_config_rejects_m_256_that_cannot_round_trip_through_u8() {
         let config = HnswConfig {
-            m: 257,
+            m: 256,
             ..HnswConfig::default()
         };
         let error = validate_config(config).unwrap_err();
@@ -1980,12 +3315,42 @@ mod tests {
     }
 
     #[test]
-    fn validate_config_accepts_m_256_boundary() {
+    fn validate_config_rejects_max_layer_above_native_limit() {
         let config = HnswConfig {
-            m: 256,
+            max_layer: HNSW_DEFAULT_MAX_LAYER + 1,
             ..HnswConfig::default()
         };
-        assert!(validate_config(config).is_ok());
+        let error = validate_config(config).unwrap_err();
+        assert!(
+            matches!(
+                error,
+                SearchError::InvalidConfig { ref field, .. } if field == "hnsw_max_layer"
+            ),
+            "expected InvalidConfig for hnsw_max_layer, got {error:?}"
+        );
+    }
+
+    #[test]
+    fn native_storage_boundaries_validate_and_round_trip() {
+        let source_path = temp_path("config-boundary-source", "fsvi");
+        let source =
+            write_index(&source_path, &[vec![1.0_f32, 0.0], vec![0.0_f32, 1.0]]).expect("source");
+        let config = HnswConfig {
+            m: usize::from(u8::MAX),
+            max_layer: HNSW_DEFAULT_MAX_LAYER,
+            ..HnswConfig::default()
+        };
+        validate_config(config).expect("native storage boundaries must validate");
+
+        let ann = HnswIndex::build_from_vector_index(&source, config)
+            .expect("build at native storage boundaries");
+        let metadata_path = temp_path("config-boundary-sidecar", "hnsw");
+        ann.save(&metadata_path)
+            .expect("persist native storage boundaries");
+        let (loaded, disposition) = HnswIndex::load_with_disposition(&metadata_path, &source)
+            .expect("load native storage boundaries");
+        assert_eq!(disposition, HnswLoadDisposition::Native);
+        assert_eq!(loaded.config(), config);
     }
 
     // ── build_from_parts error paths ────────────────────────────────────
@@ -2123,6 +3488,7 @@ mod tests {
         assert_eq!(stats.k_requested, 0);
         assert_eq!(stats.k_returned, 0);
         assert!(stats.is_approximate);
+        assert_eq!(stats.fallback_reason, None);
         assert!((stats.estimated_recall - 1.0).abs() < f64::EPSILON);
     }
 
@@ -2161,8 +3527,607 @@ mod tests {
         assert_eq!(stats.k_requested, 5);
         assert_eq!(stats.k_returned, hits.len());
         assert!(stats.is_approximate);
+        assert_eq!(stats.fallback_reason, None);
         assert!(stats.estimated_recall > 0.0);
         assert!(stats.estimated_recall <= 1.0);
+    }
+
+    #[test]
+    fn underfilled_native_result_falls_back_to_exact_top_k() {
+        let vectors = vec![vec![1.0_f32, 0.0], vec![0.0_f32, 1.0], vec![-1.0_f32, 0.0]];
+        let source_path = temp_path("underfill-exact", "fsvi");
+        let source = write_index(&source_path, &vectors).expect("source index");
+        let ann =
+            HnswIndex::build_from_vector_index(&source, HnswConfig::default()).expect("ANN index");
+        let budget = dist_dot_budget(2).expect("distance budget");
+        let canonical_query = vec![1.0_f32, 0.0];
+
+        let (hits, stats) = ann
+            .finish_search_with_neighbors(
+                Some(&source),
+                &canonical_query,
+                2,
+                2,
+                HNSW_DEFAULT_EF_SEARCH,
+                Vec::new(),
+                budget,
+                Instant::now(),
+            )
+            .expect("exact underfill fallback");
+
+        // The injected native result is empty over a populated graph, which
+        // classifies as the stronger empty-despite-points anomaly (bd-tqhc).
+        assert_eq!(
+            stats.fallback_reason,
+            Some(AnnFallbackReason::EmptyDespiteIndexedPoints)
+        );
+        assert!(!stats.is_approximate);
+        assert_eq!(stats.k_returned, 2);
+        assert_eq!(stats.estimated_recall.to_bits(), 1.0_f64.to_bits());
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].doc_id, "doc-0000");
+        assert_eq!(hits[1].doc_id, "doc-0001");
+    }
+
+    #[test]
+    fn underfilled_native_result_without_source_fails_closed() {
+        let source_path = temp_path("underfill-no-source", "fsvi");
+        let source = write_index(&source_path, &[vec![1.0_f32, 0.0], vec![0.0_f32, 1.0]])
+            .expect("source index");
+        let ann =
+            HnswIndex::build_from_vector_index(&source, HnswConfig::default()).expect("ANN index");
+        let budget = dist_dot_budget(2).expect("distance budget");
+        let error = ann
+            .finish_search_with_neighbors(
+                None,
+                &[1.0_f32, 0.0],
+                2,
+                2,
+                HNSW_DEFAULT_EF_SEARCH,
+                Vec::new(),
+                budget,
+                Instant::now(),
+            )
+            .expect_err("underfill without canonical source must not claim exact repair");
+        assert!(
+            error.to_string().contains("knn_search_with_stats_against"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn public_main_only_search_ignores_wal_consistently_before_and_after_underfill() {
+        use crate::wal::WalEntry;
+
+        let source_path = temp_path("underfill-public-main-only", "fsvi");
+        let mut source = write_index(&source_path, &[vec![1.0_f32, 0.0], vec![0.0_f32, 1.0]])
+            .expect("source index");
+        let ann =
+            HnswIndex::build_from_vector_index(&source, HnswConfig::default()).expect("ANN index");
+        source.wal_entries.push(WalEntry {
+            doc_id: "doc-0000".into(),
+            doc_id_hash: crate::fnv1a_hash(b"doc-0000"),
+            embedding: vec![-1.0, 0.0],
+        });
+        let query = [1.0_f32, 0.0];
+
+        let (normal, normal_stats) = ann
+            .knn_search_with_stats_against(&source, &query, 1, HNSW_DEFAULT_EF_SEARCH)
+            .expect("normal public main-only ANN");
+        assert_eq!(normal_stats.fallback_reason, None);
+        assert_eq!(normal.len(), 1);
+        assert_eq!(normal[0].doc_id, "doc-0000");
+
+        let budget = dist_dot_budget(2).expect("distance budget");
+        let (fallback, fallback_stats) = ann
+            .finish_search_with_neighbors(
+                Some(&source),
+                &query,
+                1,
+                1,
+                HNSW_DEFAULT_EF_SEARCH,
+                Vec::new(),
+                budget,
+                Instant::now(),
+            )
+            .expect("public main-only exact repair");
+        assert_eq!(
+            fallback_stats.fallback_reason,
+            Some(AnnFallbackReason::EmptyDespiteIndexedPoints)
+        );
+        assert_eq!(fallback, normal);
+    }
+
+    #[test]
+    fn bounded_underfill_scan_matches_flat_exact_top_k() {
+        let vectors = (0..256)
+            .map(|seed| normalized_vector(seed, 32))
+            .collect::<Vec<_>>();
+        let source_path = temp_path("underfill-flat-oracle", "fsvi");
+        let source = write_index(&source_path, &vectors).expect("flat source");
+        let ann =
+            HnswIndex::build_from_vector_index(&source, HnswConfig::default()).expect("ANN index");
+        let query = normalized_vector(10_000, 32);
+        let exact = source.search_top_k(&query, 7, None).expect("flat exact");
+        let budget = dist_dot_budget(32).expect("distance budget");
+        let (fallback, stats) = ann
+            .finish_search_with_neighbors(
+                Some(&source),
+                &query,
+                7,
+                7,
+                HNSW_DEFAULT_EF_SEARCH,
+                Vec::new(),
+                budget,
+                Instant::now(),
+            )
+            .expect("bounded exact fallback");
+
+        assert_eq!(
+            stats.fallback_reason,
+            Some(AnnFallbackReason::EmptyDespiteIndexedPoints)
+        );
+        assert_eq!(fallback, exact);
+    }
+
+    #[test]
+    fn f16_non_unit_underfill_fallback_is_bit_exact_with_canonical_scan() {
+        let vectors = vec![
+            vec![8.0_f32, 0.25, -0.5],
+            vec![0.5_f32, 0.5, 0.5],
+            vec![1.25_f32, 2.5, -0.75],
+            vec![-3.0_f32, 0.125, 4.0],
+        ];
+        let source_path = temp_path("underfill-f16-non-unit", "fsvi");
+        let source = write_index_with_quantization(&source_path, &vectors, Quantization::F16)
+            .expect("F16 source");
+        let ann =
+            HnswIndex::build_from_vector_index(&source, HnswConfig::default()).expect("ANN index");
+        let canonical_query = vec![2.0_f32, -0.5, 0.25];
+        let exact = source
+            .search_main_top_k(&canonical_query, 3)
+            .expect("canonical persisted scan");
+        let budget = dist_dot_budget(3).expect("distance budget");
+        let (fallback, stats) = ann
+            .finish_search_with_neighbors(
+                Some(&source),
+                &canonical_query,
+                3,
+                3,
+                HNSW_DEFAULT_EF_SEARCH,
+                Vec::new(),
+                budget,
+                Instant::now(),
+            )
+            .expect("F16 canonical fallback");
+
+        assert_eq!(
+            stats.fallback_reason,
+            Some(AnnFallbackReason::EmptyDespiteIndexedPoints)
+        );
+        assert_eq!(fallback, exact);
+        assert!(
+            fallback
+                .iter()
+                .zip(&exact)
+                .all(|(actual, expected)| actual.score.to_bits() == expected.score.to_bits())
+        );
+
+        let metadata_path = temp_path("underfill-f16-native", "hnsw");
+        ann.save(&metadata_path).expect("save native graph");
+        let (loaded, disposition) =
+            HnswIndex::load_with_disposition(&metadata_path, &source).expect("load native graph");
+        assert_eq!(disposition, HnswLoadDisposition::Native);
+        let (native_fallback, native_stats) = loaded
+            .finish_search_with_neighbors(
+                Some(&source),
+                &canonical_query,
+                3,
+                3,
+                HNSW_DEFAULT_EF_SEARCH,
+                Vec::new(),
+                budget,
+                Instant::now(),
+            )
+            .expect("native F16 canonical fallback");
+        assert_eq!(
+            native_stats.fallback_reason,
+            Some(AnnFallbackReason::EmptyDespiteIndexedPoints)
+        );
+        assert_eq!(native_fallback, exact);
+    }
+
+    #[test]
+    fn underfill_fallback_excludes_wal_for_single_merge_in_two_tier() {
+        let vectors = vec![vec![0.5_f32, 0.0], vec![0.25_f32, 0.0], vec![-0.5_f32, 0.0]];
+        let source_path = temp_path("underfill-wal", "fsvi");
+        let mut source = write_index(&source_path, &vectors).expect("source");
+        let ann =
+            HnswIndex::build_from_vector_index(&source, HnswConfig::default()).expect("ANN index");
+        source
+            .append("wal-top", &[1.0_f32, 0.0])
+            .expect("append resident WAL entry");
+        let canonical_query = vec![1.0_f32, 0.0];
+        let expected_main = source
+            .search_main_top_k(&canonical_query, 2)
+            .expect("persisted-only oracle");
+        let full = source
+            .search_top_k(&canonical_query, 2, None)
+            .expect("main plus WAL oracle");
+        assert_eq!(full[0].doc_id, "wal-top");
+        let budget = dist_dot_budget(2).expect("distance budget");
+        let (fallback, stats) = ann
+            .finish_search_with_neighbors(
+                Some(&source),
+                &canonical_query,
+                2,
+                2,
+                HNSW_DEFAULT_EF_SEARCH,
+                Vec::new(),
+                budget,
+                Instant::now(),
+            )
+            .expect("main-only fallback");
+
+        assert_eq!(
+            stats.fallback_reason,
+            Some(AnnFallbackReason::EmptyDespiteIndexedPoints)
+        );
+        assert_eq!(fallback, expected_main);
+        assert!(
+            fallback.iter().all(|hit| hit.doc_id != "wal-top"),
+            "resident WAL must be merged exactly once by TwoTierIndex"
+        );
+    }
+
+    #[test]
+    fn duplicate_doc_ids_and_tombstone_gaps_keep_distinct_physical_rows() {
+        let source_path = temp_path("duplicate-id-gap", "fsvi");
+        let mut writer =
+            VectorIndex::create_with_revision(&source_path, "hash", "test", 2, Quantization::F32)
+                .expect("writer");
+        writer
+            .write_record("duplicate", &[1.0_f32, 0.0])
+            .expect("first duplicate");
+        writer.write_record("gap", &[0.0_f32, 1.0]).expect("gap");
+        writer
+            .write_record("duplicate", &[-1.0_f32, 0.0])
+            .expect("second duplicate");
+        writer.finish().expect("finish source");
+        let mut source = VectorIndex::open(&source_path).expect("open source");
+        assert!(source.soft_delete("gap").expect("tombstone gap"));
+        let ann =
+            HnswIndex::build_from_vector_index(&source, HnswConfig::default()).expect("ANN index");
+        let expected_duplicate_positions = (0..source.record_count())
+            .filter(|&position| {
+                !source.is_deleted(position)
+                    && source.doc_id_at(position).expect("source doc ID") == "duplicate"
+            })
+            .map(|position| u32::try_from(position).expect("test position fits u32"))
+            .collect::<Vec<_>>();
+        assert_eq!(ann.source_positions, expected_duplicate_positions);
+        assert_eq!(ann.source_record_count, 3);
+        let mut selected_positions = Vec::new();
+        for query in [[1.0_f32, 0.0], [-1.0_f32, 0.0]] {
+            let expected = source
+                .search_main_top_k(&query, 1)
+                .expect("canonical physical row");
+            assert_eq!(expected.len(), 1);
+            assert_eq!(expected[0].doc_id, "duplicate");
+
+            let (ann_hits, ann_stats) = ann
+                .knn_search_with_stats_against(&source, &query, 1, HNSW_DEFAULT_EF_SEARCH)
+                .expect("normal ANN search");
+            assert_eq!(ann_stats.fallback_reason, None);
+            assert_eq!(
+                ann_hits, expected,
+                "ANN must preserve the winning duplicate's physical identity"
+            );
+
+            let budget = dist_dot_budget(2).expect("distance budget");
+            let (fallback, fallback_stats) = ann
+                .finish_search_with_neighbors(
+                    Some(&source),
+                    &query,
+                    1,
+                    1,
+                    HNSW_DEFAULT_EF_SEARCH,
+                    Vec::new(),
+                    budget,
+                    Instant::now(),
+                )
+                .expect("canonical fallback");
+            assert_eq!(
+                fallback_stats.fallback_reason,
+                Some(AnnFallbackReason::EmptyDespiteIndexedPoints)
+            );
+            assert_eq!(fallback, expected);
+            selected_positions.push(expected[0].index);
+        }
+        assert_ne!(
+            selected_positions[0], selected_positions[1],
+            "opposing queries must retain the two duplicate-ID physical rows instead of \
+             remapping both through the first matching document ID"
+        );
+
+        let expected = source
+            .search_main_top_k(&[1.0_f32, 0.0], 2)
+            .expect("canonical duplicate-ID semantics");
+        assert_eq!(
+            expected.len(),
+            1,
+            "canonical search selects two physical winners, then deduplicates public doc IDs"
+        );
+        let (raw_hits, raw_stats) = ann
+            .knn_search_raw_with_stats_against(&source, &[1.0_f32, 0.0], 2, HNSW_DEFAULT_EF_SEARCH)
+            .expect("raw duplicate-ID ANN search");
+        assert_eq!(raw_stats.fallback_reason, None);
+        assert_eq!(raw_hits.len(), 2);
+        assert!(
+            raw_hits.iter().all(|hit| hit.doc_id == "duplicate"),
+            "raw TwoTier candidates must retain both physical duplicate-ID winners"
+        );
+        assert_ne!(
+            raw_hits[0].index, raw_hits[1].index,
+            "raw candidates must preserve distinct physical rows"
+        );
+        let (ann_hits, ann_stats) = ann
+            .knn_search_with_stats_against(&source, &[1.0_f32, 0.0], 2, HNSW_DEFAULT_EF_SEARCH)
+            .expect("duplicate-ID ANN search");
+        assert_eq!(ann_stats.fallback_reason, None);
+        assert_eq!(
+            ann_hits, expected,
+            "ANN must preserve physical identity internally while matching canonical \
+             duplicate-ID result semantics"
+        );
+    }
+
+    #[test]
+    fn post_build_tombstone_is_filtered_and_underfill_uses_current_exact_source() {
+        let source_path = temp_path("post-build-tombstone", "fsvi");
+        let mut source = write_index(
+            &source_path,
+            &[
+                vec![1.0_f32, 0.0, 0.0],
+                vec![0.0_f32, 1.0, 0.0],
+                vec![0.0_f32, 0.0, 1.0],
+            ],
+        )
+        .expect("source");
+        let ann = HnswIndex::build_from_vector_index(&source, HnswConfig::default()).expect("ANN");
+        assert!(source.soft_delete("doc-0000").expect("post-build delete"));
+        let query = [1.0_f32, 0.0, 0.0];
+        let expected = source
+            .search_main_top_k(&query, 3)
+            .expect("current exact source");
+        assert_eq!(expected.len(), 2);
+        assert!(expected.iter().all(|hit| hit.doc_id != "doc-0000"));
+
+        let (hits, stats) = ann
+            .knn_search_with_stats_against(&source, &query, 3, HNSW_DEFAULT_EF_SEARCH)
+            .expect("tombstone-aware ANN search");
+        assert_eq!(stats.fallback_reason, Some(AnnFallbackReason::Underfilled));
+        assert_eq!(hits, expected);
+
+        let budget = dist_dot_budget(3).expect("distance budget");
+        let (forced, forced_stats) = ann
+            .finish_search_with_neighbors(
+                Some(&source),
+                &query,
+                3,
+                3,
+                HNSW_DEFAULT_EF_SEARCH,
+                Vec::new(),
+                budget,
+                Instant::now(),
+            )
+            .expect("forced exact repair after tombstone");
+        assert_eq!(
+            forced_stats.fallback_reason,
+            Some(AnnFallbackReason::EmptyDespiteIndexedPoints)
+        );
+        assert_eq!(forced, expected);
+    }
+
+    #[test]
+    fn borrowed_source_fallback_survives_path_rename_after_open() {
+        let source_path = temp_path("borrowed-source-before-rename", "fsvi");
+        let renamed_path = temp_path("borrowed-source-after-rename", "fsvi");
+        let source =
+            write_index(&source_path, &[vec![1.0_f32, 0.0], vec![0.0_f32, 1.0]]).expect("source");
+        let ann =
+            HnswIndex::build_from_vector_index(&source, HnswConfig::default()).expect("ANN index");
+        std::fs::rename(&source_path, &renamed_path).expect("rename open source file");
+        let expected = source
+            .search_main_top_k(&[1.0_f32, 0.0], 2)
+            .expect("open mmap remains authoritative after rename");
+        let budget = dist_dot_budget(2).expect("distance budget");
+        let (fallback, stats) = ann
+            .finish_search_with_neighbors(
+                Some(&source),
+                &[1.0_f32, 0.0],
+                2,
+                2,
+                HNSW_DEFAULT_EF_SEARCH,
+                Vec::new(),
+                budget,
+                Instant::now(),
+            )
+            .expect("borrowed-source fallback after rename");
+        assert_eq!(
+            stats.fallback_reason,
+            Some(AnnFallbackReason::EmptyDespiteIndexedPoints)
+        );
+        assert_eq!(fallback, expected);
+    }
+
+    #[test]
+    fn topology_validator_accepts_valid_layers_and_rejects_captured_wrong_layer() {
+        let point_zero_id = PointId(0, 0);
+        let point_one_id = PointId(1, 0);
+        let valid = vec![
+            HnswTopologyPoint {
+                origin_id: 0,
+                point_id: point_zero_id,
+                neighborhoods: vec![vec![Neighbour::new(1, 1.0, point_one_id)], Vec::new()],
+            },
+            HnswTopologyPoint {
+                origin_id: 1,
+                point_id: point_one_id,
+                neighborhoods: vec![vec![Neighbour::new(0, 1.0, point_zero_id)], Vec::new()],
+            },
+        ];
+        validate_hnsw_topology_observations(&valid, 2, Some((1, point_one_id)))
+            .expect("valid topology");
+
+        let mut wrong_layer = valid;
+        wrong_layer[0].neighborhoods[1].push(Neighbour::new(1, 1.0, point_one_id));
+        let detail = validate_hnsw_topology_observations(&wrong_layer, 2, Some((1, point_one_id)))
+            .expect_err("neighbor above source sampled layer must fail");
+        assert!(detail.contains("above sampled layer"), "{detail}");
+    }
+
+    #[test]
+    fn topology_validator_rejects_duplicate_and_out_of_range_origin_ids() {
+        let duplicate = vec![
+            HnswTopologyPoint {
+                origin_id: 0,
+                point_id: PointId(0, 0),
+                neighborhoods: vec![Vec::new()],
+            },
+            HnswTopologyPoint {
+                origin_id: 0,
+                point_id: PointId(0, 1),
+                neighborhoods: vec![Vec::new()],
+            },
+        ];
+        let detail = validate_hnsw_topology_observations(&duplicate, 2, Some((0, PointId(0, 0))))
+            .expect_err("duplicate origin must fail");
+        assert!(detail.contains("duplicate origin id"), "{detail}");
+
+        let out_of_range = vec![HnswTopologyPoint {
+            origin_id: 1,
+            point_id: PointId(0, 0),
+            neighborhoods: vec![Vec::new()],
+        }];
+        let detail =
+            validate_hnsw_topology_observations(&out_of_range, 1, Some((1, PointId(0, 0))))
+                .expect_err("out-of-range origin must fail");
+        assert!(detail.contains("outside 0..1"), "{detail}");
+    }
+
+    #[test]
+    fn topology_validator_rejects_edgeless_multi_point_graph() {
+        let edgeless = vec![
+            HnswTopologyPoint {
+                origin_id: 0,
+                point_id: PointId(0, 0),
+                neighborhoods: vec![Vec::new()],
+            },
+            HnswTopologyPoint {
+                origin_id: 1,
+                point_id: PointId(0, 1),
+                neighborhoods: vec![Vec::new()],
+            },
+        ];
+        let detail = validate_hnsw_topology_observations(&edgeless, 2, Some((0, PointId(0, 0))))
+            .expect_err("edgeless multi-point graph must fail");
+        assert!(detail.contains("unreachable"), "{detail}");
+    }
+
+    #[test]
+    fn topology_validator_rejects_edge_above_target_sampled_layer() {
+        let low_id = PointId(0, 0);
+        let high_id = PointId(1, 0);
+        let points = vec![
+            HnswTopologyPoint {
+                origin_id: 0,
+                point_id: low_id,
+                neighborhoods: vec![vec![Neighbour::new(1, 1.0, high_id)]],
+            },
+            HnswTopologyPoint {
+                origin_id: 1,
+                point_id: high_id,
+                neighborhoods: vec![
+                    vec![Neighbour::new(0, 1.0, low_id)],
+                    vec![Neighbour::new(0, 1.0, low_id)],
+                ],
+            },
+        ];
+        let detail = validate_hnsw_topology_observations(&points, 2, Some((1, high_id)))
+            .expect_err("edge above target sampled layer must fail");
+        assert!(detail.contains("neighbor's sampled layer"), "{detail}");
+    }
+
+    #[test]
+    fn topology_validator_rejects_disconnected_nonempty_components() {
+        let ids = [PointId(0, 0), PointId(0, 1), PointId(0, 2), PointId(0, 3)];
+        let points = vec![
+            HnswTopologyPoint {
+                origin_id: 0,
+                point_id: ids[0],
+                neighborhoods: vec![vec![Neighbour::new(1, 1.0, ids[1])]],
+            },
+            HnswTopologyPoint {
+                origin_id: 1,
+                point_id: ids[1],
+                neighborhoods: vec![vec![Neighbour::new(0, 1.0, ids[0])]],
+            },
+            HnswTopologyPoint {
+                origin_id: 2,
+                point_id: ids[2],
+                neighborhoods: vec![vec![Neighbour::new(3, 1.0, ids[3])]],
+            },
+            HnswTopologyPoint {
+                origin_id: 3,
+                point_id: ids[3],
+                neighborhoods: vec![vec![Neighbour::new(2, 1.0, ids[2])]],
+            },
+        ];
+
+        let detail = validate_hnsw_topology_observations(&points, 4, Some((0, ids[0])))
+            .expect_err("two locally valid components must fail entry-point reachability");
+        assert!(detail.contains("reaches only 2/4"), "{detail}");
+        assert!(detail.contains("first unreachable origin is 2"), "{detail}");
+    }
+
+    #[test]
+    fn topology_validator_rejects_mismatched_entry_identity() {
+        let id = PointId(0, 0);
+        let points = vec![HnswTopologyPoint {
+            origin_id: 0,
+            point_id: id,
+            neighborhoods: vec![Vec::new()],
+        }];
+
+        let detail = validate_hnsw_topology_observations(&points, 1, Some((1, id)))
+            .expect_err("entry origin must agree with its internal point identity");
+        assert!(detail.contains("not advertised origin 1"), "{detail}");
+    }
+
+    #[test]
+    fn calibration_rejects_fallback_tainted_exact_results() {
+        let exact = vec![VectorHit {
+            index: 0,
+            score: 1.0,
+            doc_id: "doc".into(),
+        }];
+        let stats = AnnSearchStats {
+            index_size: 1,
+            dimension: 2,
+            ef_search: 1,
+            k_requested: 1,
+            k_returned: 1,
+            search_time_us: 10,
+            is_approximate: false,
+            fallback_reason: Some(AnnFallbackReason::Underfilled),
+            estimated_recall: 1.0,
+            zero_signal: None,
+        };
+        assert_eq!(
+            certified_ann_recall_sample(Ok((exact.clone(), stats)), &exact).to_bits(),
+            0.0_f64.to_bits()
+        );
     }
 
     #[test]
@@ -2204,11 +4169,10 @@ mod tests {
     }
 
     #[test]
-    fn matches_returns_true_when_vectors_change_but_doc_ids_match() {
-        // After the HNSW refactoring (vectors no longer stored in metadata),
-        // matches_vector_index only checks doc_ids and dimension. When doc_ids
-        // match, vectors are assumed correct because HNSW is rebuilt from the
-        // VectorIndex's current vectors on load.
+    fn matches_returns_false_when_vectors_change_but_doc_ids_match() {
+        // Matching document IDs and dimensions are insufficient: serving a
+        // graph built from different vectors would silently return stale ANN
+        // results. The full live-vector fingerprint must reject that source.
         let path_a = temp_path("match-vec-a", "fsvi");
         let path_b = temp_path("match-vec-b", "fsvi");
         let index_a = write_index(
@@ -2222,8 +4186,7 @@ mod tests {
         )
         .expect("index_b");
         let ann = HnswIndex::build_from_vector_index(&index_a, HnswConfig::default()).expect("ann");
-        // Same doc_ids (doc-0000, doc-0001) + same dimension → matches
-        assert!(ann.matches_vector_index(&index_b).expect("matches"));
+        assert!(!ann.matches_vector_index(&index_b).expect("matches"));
     }
 
     #[test]
@@ -2691,18 +4654,11 @@ mod tests {
             .expect("generation name")
             .to_owned();
         let receipt_path = before[0].join(HNSW_GENERATION_RECEIPT_FILENAME);
-        let mut receipt: HnswGenerationReceipt =
+        let receipt: HnswGenerationReceipt =
             serde_json::from_slice(&std::fs::read(&receipt_path).expect("read receipt"))
                 .expect("parse receipt");
         let corrupt_basename = &receipt.sidecar_basename;
-        let data_path = before[0].join(format!("{corrupt_basename}.hnsw.data"));
-        std::fs::write(&data_path, b"not loadable HNSW vector data").expect("corrupt data fixture");
-        receipt.data = fingerprint_hnsw_sidecar(&data_path).expect("fingerprint corrupt data");
-        std::fs::write(
-            &receipt_path,
-            serde_json::to_vec(&receipt).expect("serialize updated receipt"),
-        )
-        .expect("make corrupt pair digest-valid");
+        install_digest_valid_unloadable_data(&before[0], corrupt_basename);
 
         ann.save(&metadata_path)
             .expect("save past unloadable retained generation");
@@ -2721,6 +4677,61 @@ mod tests {
         );
         let (_, disposition) = HnswIndex::load_with_disposition(&metadata_path, &source_index)
             .expect("native load after rejecting unloadable generation");
+        assert_eq!(disposition, HnswLoadDisposition::Native);
+    }
+
+    #[cfg(feature = "hnsw-patch-ab")]
+    #[test]
+    fn save_ignores_digest_valid_but_topologically_invalid_ready_generation() {
+        let vectors = vec![vec![1.0_f32, 0.0], vec![0.0_f32, 1.0]];
+        let source_path = temp_path("ready-topology-source", "fsvi");
+        let source_index = write_index(&source_path, &vectors).expect("source index");
+        let ann = HnswIndex::build_from_vector_index(&source_index, HnswConfig::default())
+            .expect("ANN index");
+        let metadata_path = temp_path("ready-topology", "hnsw");
+        ann.save_with_metadata_publisher(&metadata_path, reject_hnsw_metadata_publish)
+            .expect_err("retain unpublished READY generation");
+        let before = ready_generation_paths(&metadata_path, ann.vector_fingerprint);
+        assert_eq!(before.len(), 1);
+        let rejected_generation = before[0]
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("generation name")
+            .to_owned();
+        let receipt_path = before[0].join(HNSW_GENERATION_RECEIPT_FILENAME);
+        let receipt: HnswGenerationReceipt =
+            serde_json::from_slice(&std::fs::read(&receipt_path).expect("read receipt"))
+                .expect("parse receipt");
+        install_digest_valid_wrong_layer_generation(&before[0], &receipt.sidecar_basename, vectors);
+        let graph_path = before[0].join(format!("{}.hnsw.graph", receipt.sidecar_basename));
+        assert!(
+            !hnsw_generation_is_loadable(
+                &before[0],
+                &receipt.sidecar_basename,
+                &graph_path,
+                ann.len(),
+                ann.dimension(),
+            ),
+            "loadable but topologically invalid READY generation must not be reusable"
+        );
+
+        ann.save(&metadata_path)
+            .expect("save past topologically invalid retained generation");
+        let after = ready_generation_paths(&metadata_path, ann.vector_fingerprint);
+        assert_eq!(
+            after.len(),
+            2,
+            "invalid retained generation must remain untouched while a fresh one is published"
+        );
+        let metadata: HnswMeta =
+            serde_json::from_slice(&std::fs::read(&metadata_path).expect("read metadata"))
+                .expect("parse metadata");
+        assert_ne!(
+            metadata.sidecar_generation.as_deref(),
+            Some(rejected_generation.as_str())
+        );
+        let (_, disposition) = HnswIndex::load_with_disposition(&metadata_path, &source_index)
+            .expect("native load after rejecting invalid retained generation");
         assert_eq!(disposition, HnswLoadDisposition::Native);
     }
 
@@ -2837,7 +4848,9 @@ mod tests {
         );
 
         // Load goes through the native graph path and still answers correctly.
-        let loaded = HnswIndex::load(&save_path, &index).expect("native load");
+        let (loaded, disposition) =
+            HnswIndex::load_with_disposition(&save_path, &index).expect("native load");
+        assert_eq!(disposition, HnswLoadDisposition::Native);
         assert_eq!(loaded.len(), 64);
         let query = normalized_vector(7, 32);
         let hits = loaded
@@ -3108,41 +5121,152 @@ mod tests {
     }
 
     #[test]
-    fn load_never_treats_v4_native_graph_as_v5() {
+    fn load_never_treats_v5_native_graph_as_v6() {
         // The source index says doc-0000 is e0 and doc-0001 is e1.
-        let source_path = temp_path("persist_v4_source", "fsvi");
+        let source_path = temp_path("persist_v5_source", "fsvi");
         let source_index = write_index(&source_path, &[vec![1.0_f32, 0.0], vec![0.0_f32, 1.0]])
             .expect("source index");
 
         // Build a valid native graph with the same document IDs but the two
-        // vectors swapped, then mark its metadata as v4 while forging the live
+        // vectors swapped, then mark its metadata as v5 while forging the live
         // source fingerprint. That makes the format boundary the sole guard: if
-        // load accepts v4 as current, an e0 query returns doc-0001. Correct
-        // v5-only loading rebuilds from source and returns doc-0000.
-        let swapped_path = temp_path("persist_v4_swapped", "fsvi");
+        // load accepts v5 as current, an e0 query returns doc-0001. Correct
+        // v6-only loading rebuilds from source and returns doc-0000.
+        let swapped_path = temp_path("persist_v5_swapped", "fsvi");
         let swapped_index = write_index(&swapped_path, &[vec![0.0_f32, 1.0], vec![1.0_f32, 0.0]])
             .expect("swapped index");
         let swapped_ann = HnswIndex::build_from_vector_index(&swapped_index, HnswConfig::default())
             .expect("swapped ann");
-        let save_path = temp_path("persist_v4_native", "hnsw");
+        let save_path = temp_path("persist_v5_native", "hnsw");
         swapped_ann.save(&save_path).expect("save native graph");
 
         let mut meta: HnswMeta =
             serde_json::from_slice(&std::fs::read(&save_path).expect("meta")).expect("parse");
-        meta.format_version = 4;
+        meta.format_version = 5;
         meta.vector_fingerprint =
             fingerprint_live_vector_index(&source_index, 2, 2).expect("live source fingerprint");
-        std::fs::write(&save_path, serde_json::to_vec(&meta).expect("serialize v4"))
-            .expect("write v4 metadata");
+        std::fs::write(&save_path, serde_json::to_vec(&meta).expect("serialize v5"))
+            .expect("write v5 metadata");
 
-        let loaded = HnswIndex::load(&save_path, &source_index).expect("rebuild v4");
+        let (loaded, disposition) =
+            HnswIndex::load_with_disposition(&save_path, &source_index).expect("rebuild v5");
+        assert_eq!(disposition, HnswLoadDisposition::Rebuilt);
         let hits = loaded
             .knn_search(&[1.0, 0.0], 1, HNSW_DEFAULT_EF_SEARCH)
             .expect("search rebuilt graph");
         assert_eq!(
             hits[0].doc_id, "doc-0000",
-            "v4 metadata without the v5 generation publication contract must rebuild"
+            "v5 graph without topology attestation must rebuild under v6"
         );
+    }
+
+    #[cfg(feature = "hnsw-patch-ab")]
+    #[test]
+    fn current_digest_valid_malformed_native_graph_rebuilds_instead_of_serving() {
+        let vectors = vec![vec![1.0_f32, 0.0], vec![0.0_f32, 1.0]];
+        let source_path = temp_path("malformed-v6-source", "fsvi");
+        let source_index = write_index(&source_path, &vectors).expect("source index");
+        let ann = HnswIndex::build_from_vector_index(&source_index, HnswConfig::default())
+            .expect("candidate graph");
+        let metadata_path = temp_path("malformed-v6", "hnsw");
+        ann.save(&metadata_path).expect("save candidate graph");
+
+        let meta: HnswMeta =
+            serde_json::from_slice(&std::fs::read(&metadata_path).expect("metadata"))
+                .expect("parse metadata");
+        let (generation_path, installed_basename) =
+            persisted_hnsw_sidecar_location(&metadata_path, &meta).expect("sidecar location");
+        // Keep the fixture cryptographically self-consistent. Receipt/digest
+        // validation alone must pass so topology attestation is the reason the
+        // current-format native pair is rejected.
+        install_digest_valid_wrong_layer_generation(&generation_path, &installed_basename, vectors);
+
+        let (loaded, disposition) = HnswIndex::load_with_disposition(&metadata_path, &source_index)
+            .expect("malformed native graph must rebuild");
+        assert_eq!(disposition, HnswLoadDisposition::Rebuilt);
+        let (hits, stats) = loaded
+            .knn_search_with_stats(&[1.0, 0.0], 2, HNSW_DEFAULT_EF_SEARCH)
+            .expect("search rebuilt graph");
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].doc_id, "doc-0000");
+        assert_eq!(stats.fallback_reason, None);
+    }
+
+    #[test]
+    fn current_digest_valid_parser_panic_rebuilds_in_fresh_process() {
+        const CHILD_ROOT_ENV: &str = "FRANKENSEARCH_HNSW_PARSER_PANIC_CHILD_ROOT";
+        const TEST_NAME: &str =
+            "hnsw::tests::current_digest_valid_parser_panic_rebuilds_in_fresh_process";
+
+        if let Some(root) = std::env::var_os(CHILD_ROOT_ENV) {
+            let root = PathBuf::from(root);
+            let source_path = root.join("source.fsvi");
+            let source_index = write_index(&source_path, &[vec![1.0_f32, 0.0], vec![0.0_f32, 1.0]])
+                .expect("source index");
+            let ann = HnswIndex::build_from_vector_index(&source_index, HnswConfig::default())
+                .expect("ANN graph");
+            let metadata_path = root.join("current.hnsw");
+            ann.save(&metadata_path).expect("save native generation");
+            let meta: HnswMeta =
+                serde_json::from_slice(&std::fs::read(&metadata_path).expect("metadata"))
+                    .expect("parse metadata");
+            let (generation_path, basename) =
+                persisted_hnsw_sidecar_location(&metadata_path, &meta)
+                    .expect("installed generation");
+            install_digest_valid_unloadable_data(&generation_path, &basename);
+
+            let (loaded, disposition) =
+                HnswIndex::load_with_disposition(&metadata_path, &source_index)
+                    .expect("parser panic must degrade to a source rebuild");
+            assert_eq!(disposition, HnswLoadDisposition::Rebuilt);
+            let hits = loaded
+                .knn_search(&[1.0, 0.0], 2, HNSW_DEFAULT_EF_SEARCH)
+                .expect("search rebuilt graph");
+            assert_eq!(hits.len(), 2);
+            assert_eq!(hits[0].doc_id, "doc-0000");
+            return;
+        }
+
+        let root = temp_path("parser-panic-child", "dir");
+        std::fs::create_dir_all(&root).expect("create child fixture root");
+        let status = std::process::Command::new(std::env::current_exe().expect("current test exe"))
+            .arg("--exact")
+            .arg(TEST_NAME)
+            .arg("--nocapture")
+            .env(CHILD_ROOT_ENV, &root)
+            .status()
+            .expect("run isolated malformed-parser child");
+        assert!(
+            status.success(),
+            "digest-valid malformed native generation escaped the rebuild boundary: {status}"
+        );
+    }
+
+    #[test]
+    fn current_native_graph_with_stale_digest_receipt_rebuilds_before_load() {
+        let vectors = vec![vec![1.0_f32, 0.0], vec![0.0_f32, 1.0]];
+        let source_path = temp_path("stale-receipt-source", "fsvi");
+        let source_index = write_index(&source_path, &vectors).expect("source index");
+        let ann = HnswIndex::build_from_vector_index(&source_index, HnswConfig::default())
+            .expect("ANN graph");
+        let metadata_path = temp_path("stale-receipt", "hnsw");
+        ann.save(&metadata_path).expect("save ANN graph");
+        let meta: HnswMeta =
+            serde_json::from_slice(&std::fs::read(&metadata_path).expect("metadata"))
+                .expect("parse metadata");
+        let (generation_path, basename) =
+            persisted_hnsw_sidecar_location(&metadata_path, &meta).expect("sidecar location");
+        let graph_path = generation_path.join(format!("{basename}.hnsw.graph"));
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(&graph_path)
+            .expect("open graph for corruption")
+            .write_all(&[0])
+            .expect("append unreceipted byte");
+
+        let (_, disposition) = HnswIndex::load_with_disposition(&metadata_path, &source_index)
+            .expect("stale digest must rebuild");
+        assert_eq!(disposition, HnswLoadDisposition::Rebuilt);
     }
 
     #[test]

@@ -13,6 +13,7 @@ autobenches = false
 [features]
 default = []
 ann = ["dep:hnsw_rs", "dep:serde_json"]
+hnsw-patch-ab = ["ann", "dep:hnsw_rs_034", "dep:sha2"]
 # Shared null-control bench harness (frankensearch_core::bench_support). Never a shipping profile.
 bench-internals = ["frankensearch-core/bench-internals"]
 
@@ -27,12 +28,16 @@ rayon = { workspace = true }
 ahash = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true, optional = true }
+sha2 = { workspace = true, optional = true }
 same-file = { workspace = true }
 tracing = { workspace = true }
 tempfile = "3"
 
 # Optional ANN
 hnsw_rs = { workspace = true, optional = true }
+# Exact published baseline for malformed-graph regression fixtures and the
+# same-ELF bd-u3wt A/B runner. Never enabled by shipping feature aggregates.
+hnsw_rs_034 = { package = "hnsw_rs", version = "=0.3.4", optional = true }
 
 [dev-dependencies]
 asupersync = { workspace = true }
@@ -42,6 +47,9 @@ criterion = { workspace = true }
 # For the head-to-head baseline kernels inside benches/dot_product.rs.
 half = { workspace = true }
 wide = { workspace = true }
+
+[build-dependencies]
+sha2 = { workspace = true }
 
 # SIMD dot-product hot-loop benchmarks (brute-force vector top-k inner loop).
 [[bench]]
@@ -115,6 +123,13 @@ path = "benches/int8_vs_f16_fast_ab.rs"
 test = false
 bench = false
 required-features = ["bench-internals"]
+
+[[bin]]
+name = "hnsw_patch_ab"
+path = "src/bin/hnsw_patch_ab.rs"
+test = true
+bench = false
+required-features = ["hnsw-patch-ab"]
 
 [[bench]]
 name = "fsvi_int8_two_pass"
