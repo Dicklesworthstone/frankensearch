@@ -97,7 +97,10 @@ bytemuck = "1"
 
 # SIMD and f16 quantization (unconditional for frankensearch-index)
 half = "2.4"
-wide = "1.1.1"
+# Floor 1.6.0 is load-bearing: simd.rs/in_memory.rs call `widening_mul`, which only
+# exists in wide >= 1.6.0 (1.5.0 has only the pre-rename `mul_widen`). A lower floor
+# lets a consumer's stale lockfile resolve 1.1.1-1.5.0 and fail mid-compile (bd-efe5y).
+wide = "1.6.0"
 
 # Memory-mapped I/O
 memmap2 = "0.9"
