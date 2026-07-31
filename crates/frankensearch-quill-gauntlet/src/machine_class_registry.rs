@@ -4373,6 +4373,30 @@ mod tests {
     }
 
     #[test]
+    fn every_profile_and_gate_has_a_unique_latest_destination() {
+        let registry = MachineClassRegistry::frozen().expect("frozen registry");
+        let mut destinations = BTreeSet::new();
+        for profile in &registry.execution_profiles {
+            for gate in 1..=10 {
+                let gate = format!("QG-{gate}");
+                let destination = profile
+                    .key()
+                    .latest_basename(&gate)
+                    .expect("registered profile and normative gate destination");
+                assert!(
+                    destinations.insert(destination.clone()),
+                    "profile-qualified destination collision: {destination}"
+                );
+            }
+        }
+        assert_eq!(
+            destinations.len(),
+            registry.execution_profiles.len() * 10,
+            "five profiles times ten normative gates must produce fifty destinations"
+        );
+    }
+
+    #[test]
     fn execution_profile_resolution_rejects_unknown_and_cross_class_substitution() {
         assert_eq!(
             MachineProfileKey::new(HardwareClassId::M5Macos, ExecutionProfileId::Scheduler10)
