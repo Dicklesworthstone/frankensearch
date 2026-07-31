@@ -1279,7 +1279,6 @@ pub(crate) struct ValidatedTermPruningMetadata {
     doc_freq: u32,
     posting_blocks: Vec<PostingBlockMeta>,
     block_max: Vec<BlockMaxEntry>,
-    term_score_bound_inputs: Option<(u32, u8)>,
 }
 
 impl ValidatedTermPruningMetadata {
@@ -1289,20 +1288,11 @@ impl ValidatedTermPruningMetadata {
             u64::try_from(postings.as_bytes().len()).ok(),
             Some(block_max.posting_bytes_len())
         );
-        let mut maximum_frequency = 0_u32;
-        let mut minimum_fieldnorm_id = u8::MAX;
-        for entry in &block_max.entries {
-            maximum_frequency = maximum_frequency.max(entry.max_frequency());
-            minimum_fieldnorm_id = minimum_fieldnorm_id.min(entry.min_fieldnorm_id());
-        }
-        let term_score_bound_inputs =
-            (!block_max.entries.is_empty()).then_some((maximum_frequency, minimum_fieldnorm_id));
         Self {
             postings_bytes_len: postings.bytes.len(),
             doc_freq: postings.doc_freq,
             posting_blocks: postings.blocks,
             block_max: block_max.entries,
-            term_score_bound_inputs,
         }
     }
 
@@ -1314,7 +1304,6 @@ impl ValidatedTermPruningMetadata {
             doc_freq: 0,
             posting_blocks: Vec::new(),
             block_max: Vec::new(),
-            term_score_bound_inputs: None,
         }
     }
 
@@ -1350,16 +1339,6 @@ impl ValidatedTermPruningMetadata {
     #[must_use]
     pub(crate) fn block_max(&self) -> &[BlockMaxEntry] {
         &self.block_max
-    }
-
-    /// Componentwise conservative inputs for a whole-term BM25 ceiling.
-    ///
-    /// Maximum frequency and minimum fieldnorm need not occur in the same
-    /// block. Combining them therefore produces a possibly loose, but never
-    /// understated, envelope while avoiding a query-time scan of every row.
-    #[must_use]
-    pub(crate) const fn term_score_bound_inputs(&self) -> Option<(u32, u8)> {
-        self.term_score_bound_inputs
     }
 
     /// Retained heap payload used by this cache entry, excluding `Arc` and
@@ -13708,15 +13687,6 @@ mod tests {
             BlockMaxList::parse(&understated, &posting_list, fieldnorms),
             Err(BlockMaxError::MinimumFieldnormMismatch { .. })
         ));
-        let expected_minimum = fieldnorms
-            .fieldnorm_id(128)
-            .ok_or("first fieldnorm")?
-            .min(fieldnorms.fieldnorm_id(130).ok_or("last fieldnorm")?);
-        let metadata = ValidatedTermPruningMetadata::from_validated(posting_list, validated);
-        assert_eq!(
-            metadata.term_score_bound_inputs(),
-            Some((7, expected_minimum))
-        );
 
         let maximum_length = [Some(u32::MAX)];
         let maximum_input = [DocLenFieldInput::new(7, &maximum_length)];
