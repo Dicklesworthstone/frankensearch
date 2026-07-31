@@ -558,9 +558,15 @@ impl TwoTierIndex {
     pub fn open_with_paths(paths: &TwoTierIndexPaths, config: TwoTierConfig) -> SearchResult<Self> {
         let paths = paths.clone().into_absolute()?;
         validate_index_paths(&paths)?;
-        let fast_source = TierSource::PathOpened(VectorIndex::open(paths.fast_index())?);
+        let fast_index = VectorIndex::open(paths.fast_index())?;
+        warn_if_wal_rows_replayed("fast", paths.fast_index(), &fast_index);
+        let fast_source = TierSource::PathOpened(fast_index);
         let quality_source = match paths.quality_index() {
-            Some(quality_path) => Some(TierSource::PathOpened(VectorIndex::open(quality_path)?)),
+            Some(quality_path) => {
+                let quality_index = VectorIndex::open(quality_path)?;
+                warn_if_wal_rows_replayed("quality", quality_path, &quality_index);
+                Some(TierSource::PathOpened(quality_index))
+            }
             None => None,
         };
         Self::assemble_opened(fast_source, quality_source, &paths, config)
@@ -1960,44 +1966,30 @@ impl TwoTierIndexBuilder {
 
         let fast_path = self.dir.join(VECTOR_INDEX_FAST_FILENAME);
         // `create(path, id, dim)` is `create_with_revision(path, id, "", dim,
-        // F16)`, so this is byte-identical to the former `create` call for
-        // builders that declared no identity (empty default revision).
-        let mut fast_writer = VectorIndex::create_with_revision(
+        // F16)`, so the written bytes are identical to the former `create`
+        // call for builders that declared no identity (empty default
+        // revision). Each tier is written at a sibling staging path and only
+        // installed over the canonical name AFTER the adjacent WAL sidecar
+        // has been retired durably — see
+        // `write_tier_with_durable_wal_retirement` for the crash algebra
+        // (bd-9xuj C4-write r3; dual audit #8366/#8367).
+        write_tier_with_durable_wal_retirement(
             &fast_path,
             &self.fast_embedder_id,
             &self.fast_embedder_revision,
             fast_dimension,
-            Quantization::F16,
+            &self.fast_records,
         )?;
-        for (doc_id, embedding) in &self.fast_records {
-            fast_writer.write_record(doc_id, embedding)?;
-        }
-        fast_writer.finish()?;
-        // A WAL sidecar adjacent to a tier THIS build just rewrote describes
-        // the replaced bytes and is dead by definition. Remove it here, in
-        // the write path, so no pre-write classification step ever needs to:
-        // read-only inspection (`observe_tier`) deliberately never deletes a
-        // stale WAL, and without this write-side cleanup a leftover sidecar
-        // whose compaction generation happens to match the freshly written
-        // main slab (generation counters are mod-256 wrapping) could
-        // resurrect foreign rows into the new generation at the next open.
-        let _ = fs::remove_file(crate::wal::wal_path_for(&fast_path));
 
         if let Some(quality_dimension) = self.quality_dimension {
             let quality_path = self.dir.join(VECTOR_INDEX_QUALITY_FILENAME);
-            let mut quality_writer = VectorIndex::create_with_revision(
+            write_tier_with_durable_wal_retirement(
                 &quality_path,
                 &self.quality_embedder_id,
                 &self.quality_embedder_revision,
                 quality_dimension,
-                Quantization::F16,
+                &self.quality_records,
             )?;
-            for (doc_id, embedding) in &self.quality_records {
-                quality_writer.write_record(doc_id, embedding)?;
-            }
-            quality_writer.finish()?;
-            // Same write-side cleanup as the fast tier above.
-            let _ = fs::remove_file(crate::wal::wal_path_for(&quality_path));
         }
 
         let mut index = TwoTierIndex::open(&self.dir, self.config)?;
@@ -2028,6 +2020,129 @@ impl TwoTierIndexBuilder {
         }
         Ok(index)
     }
+}
+
+/// Test-only fault injection for the builder's durable WAL retirement
+/// (bd-9xuj C4-write r3, fault test iii). A genuine fsync failure on a
+/// directory handle is not constructible on an ordinary filesystem without
+/// privileged mounts, so the directory-sync step exposes this seam. It sits
+/// BETWEEN the sidecar unlink and the real `sync_parent_directory` call:
+/// when armed, retirement reports failure exactly where an fsync error
+/// would surface — after the unlink, before the retirement is durable, and
+/// strictly before any replacement publication. The flag is consumed on
+/// first use so a single armed failure can never leak into a later build on
+/// the same thread.
+#[cfg(test)]
+pub(crate) mod builder_fault_injection {
+    use std::cell::Cell;
+
+    use frankensearch_core::{SearchError, SearchResult};
+
+    thread_local! {
+        static FAIL_WAL_DIRECTORY_SYNC: Cell<bool> = const { Cell::new(false) };
+    }
+
+    /// Arm a one-shot injected directory-sync failure for the next
+    /// `TwoTierIndexBuilder::finish` WAL retirement on this thread.
+    pub fn arm_wal_directory_sync_failure() {
+        FAIL_WAL_DIRECTORY_SYNC.with(|flag| flag.set(true));
+    }
+
+    /// Consume the armed flag, failing as the directory fsync would.
+    pub fn maybe_fail_wal_directory_sync() -> SearchResult<()> {
+        if FAIL_WAL_DIRECTORY_SYNC.with(Cell::take) {
+            return Err(SearchError::Io(std::io::Error::other(
+                "injected directory-sync failure after WAL removal \
+                 (two_tier builder fault seam)",
+            )));
+        }
+        Ok(())
+    }
+}
+
+/// Durably retire the WAL sidecar adjacent to `canonical_path`
+/// (bd-9xuj C4-write r3; dual audit #8366/#8367).
+///
+/// Removal errors PROPAGATE typed — never best-effort — and the parent
+/// directory is synced so the retirement itself survives a crash. Callers
+/// MUST complete this BEFORE publishing a replacement main over
+/// `canonical_path`: fresh legacy mains start at compaction generation 1
+/// and generation counters wrap mod 255, so a leftover sidecar can be
+/// generation-compatible with a freshly published main
+/// (`next_generation(1) == 2`) and resurrect foreign rows at the next open.
+fn retire_wal_sidecar_durably(canonical_path: &Path) -> SearchResult<()> {
+    let wal_path = crate::wal::wal_path_for(canonical_path);
+    crate::wal::remove_wal(&wal_path)?;
+    #[cfg(test)]
+    builder_fault_injection::maybe_fail_wal_directory_sync()?;
+    crate::sync_parent_directory(&wal_path)?;
+    Ok(())
+}
+
+/// Write one replacement tier and install it over `canonical_path` with
+/// durable WAL retirement ordered strictly BEFORE publication
+/// (bd-9xuj C4-write r3; dual audit #8366/#8367).
+///
+/// Protocol — deliberately the same shape, and at least the same strength,
+/// as `VectorIndex::replace_with_empty` / `VectorIndex::install_replacement`
+/// (the route both auditors named):
+/// 1. The replacement is FULLY written and durably published at a sibling
+///    staging path (`temporary_output_path`), never at the canonical name.
+/// 2. The canonical tier's WAL sidecar is retired durably
+///    ([`retire_wal_sidecar_durably`]): removal and directory-sync errors
+///    propagate typed; nothing is published when retirement fails, so the
+///    old generation (main AND sidecar bytes) stays intact on failure.
+/// 3. Only then is the replacement installed over the canonical main via
+///    [`VectorIndex::install_replacement`], which validates the staged
+///    artifact, re-runs the same retire-then-rename ordering as an
+///    idempotent second pass, renames atomically, and syncs the parent.
+///
+/// Crash algebra: at every interruption point the on-disk state is one of
+/// {old main + old WAL} (retirement not yet durable), {old main, no WAL}
+/// (retired, not yet published), or {new main, no WAL} (published). The r2
+/// hazard state {new main + old WAL} — whose leftover generation-2 sidecar
+/// reads as ACTIVE against a fresh generation-1 main — is unreachable
+/// through this path because the rename strictly follows the durable
+/// retirement. A crash may leave a stray staging file; it lives under a
+/// `.tmp.<pid>.<nanos>` name that no open or discovery path resolves.
+fn write_tier_with_durable_wal_retirement(
+    canonical_path: &Path,
+    embedder_id: &str,
+    embedder_revision: &str,
+    dimension: usize,
+    records: &[(String, Vec<f32>)],
+) -> SearchResult<()> {
+    let staging_path = crate::temporary_output_path(canonical_path);
+    let result = (|| {
+        let mut writer = VectorIndex::create_with_revision(
+            &staging_path,
+            embedder_id,
+            embedder_revision,
+            dimension,
+            Quantization::F16,
+        )?;
+        for (doc_id, embedding) in records {
+            writer.write_record(doc_id, embedding)?;
+        }
+        writer.finish()?;
+        retire_wal_sidecar_durably(canonical_path)?;
+        VectorIndex::install_replacement(canonical_path, &staging_path).map(drop)
+    })();
+    if result.is_err()
+        && staging_path.exists()
+        && let Err(cleanup_err) = fs::remove_file(&staging_path)
+    {
+        // Best-effort cleanup of the staged artifact only — the staging file
+        // is this function's own product under a name no open path resolves,
+        // never the canonical main or its WAL (mirrors the error path of
+        // `VectorIndexWriter::finish`).
+        warn!(
+            staging_path = %staging_path.display(),
+            ?cleanup_err,
+            "failed to clean up staged tier replacement after error"
+        );
+    }
+    result
 }
 
 /// Reject a declared producing identity whose space dimension does not
@@ -2092,6 +2207,36 @@ fn admission_error_to_search_error(
             value: path.display().to_string(),
             reason: other.to_string(),
         },
+    }
+}
+
+/// Loudly surface v1 WAL replay at two-tier reopen (bd-9xuj C4-write r3,
+/// fault test iv — a generation-collision sidecar must never be treated as
+/// active rows SILENTLY).
+///
+/// In the v1 format a WAL whose generation equals `next_generation(main)`
+/// is byte-indistinguishable from legitimate incremental appends — and that
+/// includes a FOREIGN sidecar left beside a freshly republished main by a
+/// pre-r3 crash: fresh legacy mains start at compaction generation 1, so a
+/// leftover generation-2 sidecar collides exactly.
+/// `TwoTierIndexBuilder::finish` now retires sidecars durably BEFORE
+/// publication and can no longer manufacture that state; this warning keeps
+/// any residual legacy state (pre-r3 crash artifacts, external
+/// manipulation) from being replayed silently. Read-side classification
+/// cannot refuse here without breaking the legitimate v1
+/// incremental-append reopen contract, which external `VectorIndex`
+/// consumers rely on.
+fn warn_if_wal_rows_replayed(tier: &str, path: &Path, index: &VectorIndex) {
+    let replayed = index.wal_record_count();
+    if replayed > 0 {
+        warn!(
+            tier,
+            path = %path.display(),
+            replayed_wal_records = replayed,
+            "two-tier v1 open replayed WAL sidecar rows; if this main was \
+             just republished, the rows may belong to a replaced foreign \
+             generation (generation counters wrap mod 255)"
+        );
     }
 }
 
@@ -5826,6 +5971,301 @@ mod tests {
         assert!(
             !ids.iter().any(|id| id == "wal-resident" || id == "old-doc"),
             "no row from the replaced generation may leak into the rebuild: {ids:?}"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Directory entries under `dir` whose names carry the sibling staging
+    /// marker (`.tmp.<pid>.<nanos>`), for asserting staged replacements
+    /// never leak.
+    fn staging_leftovers(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(dir)
+            .expect("read dir")
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.contains(".tmp."))
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// r3 fault test (i) — WAL removal failure (bd-9xuj C4-write r3;
+    /// audits #8366/#8367).
+    ///
+    /// Real fs-level injection, no seam: a DIRECTORY occupying the sidecar
+    /// name makes `remove_file` fail (EISDIR-class) exactly where a
+    /// permission or I/O failure would surface. `finish()` must propagate a
+    /// typed error WITHOUT having published the replacement main: the old
+    /// generation's canonical bytes stay intact and readable.
+    ///
+    /// RED on r2 (7095b1da): the old ordering published the replacement
+    /// main first and only then ran `let _ = fs::remove_file(..)`, so the
+    /// canonical bytes CHANGED even though `finish()` errored later — the
+    /// bytes-unchanged assertion below fails there. That same
+    /// publish-before-retire ordering is the crash window: a crash between
+    /// the rename and the removal left {new main + old WAL}.
+    #[test]
+    fn finish_propagates_wal_removal_failure_without_publishing_replacement() {
+        let dir = temp_index_dir("r3-wal-removal-failure");
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let fast_path = dir.join(VECTOR_INDEX_FAST_FILENAME);
+        write_index_file(&fast_path, &[("old-doc", &[1.0, 0.0, 0.0, 0.0])])
+            .expect("write prior generation");
+        let old_main_bytes = fs::read(&fast_path).expect("snapshot old main");
+
+        // Inject: occupy the sidecar name with a directory so unlink fails.
+        let wal_path = crate::wal::wal_path_for(&fast_path);
+        fs::create_dir_all(&wal_path).expect("occupy WAL name with a directory");
+
+        let mut builder = TwoTierIndex::create(&dir, TwoTierConfig::default()).expect("builder");
+        builder
+            .add_fast_record("new-doc", &[0.0, 0.0, 1.0, 0.0])
+            .expect("add rebuild row");
+        let error = builder
+            .finish()
+            .expect_err("WAL retirement failure must fail finish() closed");
+        assert!(
+            matches!(error, SearchError::Io(_)),
+            "removal failure must propagate as the typed I/O error, got {error:?}"
+        );
+
+        assert_eq!(
+            fs::read(&fast_path).expect("reread canonical"),
+            old_main_bytes,
+            "the replacement must NOT be published when WAL retirement fails: \
+             the old canonical main must be byte-identical"
+        );
+        assert!(
+            wal_path.is_dir(),
+            "the injected obstruction is left exactly as found"
+        );
+        assert_eq!(
+            staging_leftovers(&dir),
+            Vec::<String>::new(),
+            "the staged replacement is cleaned up on the error path"
+        );
+
+        // Clear the injected obstruction: the old generation is fully
+        // intact and readable.
+        fs::remove_dir(&wal_path).expect("clear injected obstruction");
+        let reopened = TwoTierIndex::open(&dir, TwoTierConfig::default())
+            .expect("old generation must reopen after a failed rebuild");
+        let ids: Vec<String> = reopened.iter_doc_ids().filter_map(Result::ok).collect();
+        assert_eq!(ids, vec!["old-doc".to_owned()]);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// r3 fault tests (ii) + (iv) — the crash-after-main-rename state under
+    /// the OLD r2 ordering, and the generation-2 collision reopen
+    /// (bd-9xuj C4-write r3; audits #8366/#8367).
+    ///
+    /// Constructs on disk exactly what a crash between r2's
+    /// `writer.finish()` rename and its best-effort WAL removal left:
+    /// a fresh generation-1 main REPLACED over the canonical name with the
+    /// old generation's generation-2 WAL still adjacent. Pins, exactly:
+    /// - the observer reports the sidecar PRESENT and its rows ACTIVE
+    ///   (`next_generation(1) == 2` — byte-indistinguishable from
+    ///   legitimate incremental appends), so `retains_content()` holds and
+    ///   observation-driven admission seams fail closed on this state
+    ///   instead of consuming it (the refresh-side refusal is pinned in
+    ///   `frankensearch-fusion/src/refresh.rs`);
+    /// - the plain v1 reopen REPLAYS the foreign row (the frozen
+    ///   `VectorIndex::open` v1 contract; `lib.rs` is not editable in this
+    ///   train) — this resurrection is precisely why the r3 protocol makes
+    ///   the state unconstructable, and the two-tier open path now surfaces
+    ///   the replay with a warning rather than silence;
+    /// - `finish()` over ANY WAL-bearing directory exits with
+    ///   {new main, no WAL}: together with fault tests (i)/(iii) — which
+    ///   pin that retirement failure aborts BEFORE publication — the hazard
+    ///   state {new main + old WAL} is unreachable through `finish()` at
+    ///   every interruption point.
+    #[test]
+    fn crash_after_rename_state_is_pinned_and_unconstructable_through_finish() {
+        let dir = temp_index_dir("r3-crash-after-rename");
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let fast_path = dir.join(VECTOR_INDEX_FAST_FILENAME);
+
+        // Old generation: fresh legacy main (compaction generation 1) plus
+        // one incremental append, which creates a generation-2 WAL sidecar.
+        write_index_file(&fast_path, &[("old-doc", &[1.0, 0.0, 0.0, 0.0])])
+            .expect("write old generation");
+        {
+            let mut old = VectorIndex::open(&fast_path).expect("open old generation");
+            old.append("foreign-doc", &[0.0, 1.0, 0.0, 0.0])
+                .expect("append WAL resident");
+        }
+        let wal_path = crate::wal::wal_path_for(&fast_path);
+        let (entries, wal_gen, valid_len) =
+            crate::wal::read_wal(&wal_path, 4, Quantization::F16).expect("read fixture WAL");
+        assert_eq!(entries.len(), 1, "fixture WAL carries the foreign row");
+        assert!(valid_len > 0);
+        assert_eq!(
+            wal_gen,
+            crate::next_generation(1),
+            "fixture WAL generation must be 2 = next(1): the exact collision"
+        );
+
+        // Simulate r2's crash point: a replacement generation-1 main is
+        // renamed over the canonical name; the WAL removal never ran.
+        let scratch = dir.join("replacement.scratch");
+        write_index_file(&scratch, &[("new-doc", &[0.0, 0.0, 1.0, 0.0])])
+            .expect("write replacement main");
+        fs::rename(&scratch, &fast_path).expect("simulate crash after rename");
+        assert!(wal_path.exists(), "crash state: gen-2 WAL still adjacent");
+
+        // Pin (iv), observer half: the sidecar is REPORTED, its rows count
+        // as ACTIVE against the fresh generation-1 main, and the state
+        // therefore reads as content-retaining — the conservative signal
+        // admission seams refuse on. Nothing is silently dropped and
+        // nothing on disk is touched.
+        let observation = observe_tier(&fast_path).expect("observe crash state");
+        let FsviTierObservation::V1(observed) = observation else {
+            panic!("crash state must observe as V1, got {observation:?}");
+        };
+        assert_eq!(observed.record_count, 1);
+        assert_eq!(
+            observed.active_wal_records, 1,
+            "a generation-2 WAL is byte-indistinguishable from legitimate \
+             incremental appends against a generation-1 main"
+        );
+        assert!(observed.wal_sidecar_present);
+        assert!(observed.retains_content());
+        assert!(wal_path.exists(), "observation never deletes the sidecar");
+
+        // Pin (iv), reopen half: the plain v1 open REPLAYS the foreign row
+        // (frozen `VectorIndex::open` contract). This is the resurrection
+        // the r3 ordering exists to make unmanufacturable; the two-tier
+        // reopen surfaces it via `warn_if_wal_rows_replayed` rather than
+        // silence.
+        {
+            let reopened = VectorIndex::open(&fast_path).expect("v1 reopen of crash state");
+            assert_eq!(reopened.record_count(), 1, "main slab rows");
+            assert_eq!(
+                reopened.wal_record_count(),
+                1,
+                "the foreign WAL row IS replayed by the frozen v1 open path"
+            );
+            let wal_ids: Vec<&str> = reopened.wal_records().map(|(id, _)| id).collect();
+            assert_eq!(
+                wal_ids,
+                vec!["foreign-doc"],
+                "the replayed resident row is exactly the foreign append"
+            );
+        }
+        let two_tier = TwoTierIndex::open(&dir, TwoTierConfig::default()).expect("two-tier reopen");
+        assert_eq!(
+            two_tier.doc_count(),
+            1,
+            "the doc-id surface counts the main slab only"
+        );
+        let hits = two_tier
+            .search_fast(&[0.0, 0.8, 0.6, 0.0], 4)
+            .expect("search crash state");
+        let hit_ids: Vec<&str> = hits.iter().map(|hit| hit.doc_id.as_str()).collect();
+        assert_eq!(
+            hit_ids,
+            vec!["foreign-doc", "new-doc"],
+            "pinned: the legacy crash state resurrects the foreign row \
+             through the SEARCH surface on plain reopen — unreachable \
+             through finish() after r3"
+        );
+        drop(two_tier);
+
+        // Pin (ii): the NEW protocol cannot leave this state. A full
+        // rebuild over the WAL-bearing directory retires the sidecar
+        // durably BEFORE publication and exits with {new main, no WAL}.
+        let mut builder = TwoTierIndex::create(&dir, TwoTierConfig::default()).expect("builder");
+        builder
+            .add_fast_record("rebuilt-doc", &[0.5, 0.5, 0.0, 0.0])
+            .expect("add rebuild row");
+        let rebuilt = builder.finish().expect("rebuild over crash state");
+        assert!(
+            !wal_path.exists(),
+            "finish() must never exit with a published main and a live WAL"
+        );
+        let ids: Vec<String> = rebuilt.iter_doc_ids().filter_map(Result::ok).collect();
+        assert_eq!(ids, vec!["rebuilt-doc".to_owned()]);
+        assert_eq!(
+            staging_leftovers(&dir),
+            Vec::<String>::new(),
+            "no staged replacement survives a successful finish()"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// r3 fault test (iii) — directory-sync failure during WAL retirement
+    /// propagates typed, before any publication (bd-9xuj C4-write r3;
+    /// audits #8366/#8367).
+    ///
+    /// A genuine directory-fsync failure is not constructible on an
+    /// ordinary filesystem, so this uses the documented test seam
+    /// (`builder_fault_injection`), which fails between the sidecar unlink
+    /// and the real `sync_parent_directory` call — exactly where an fsync
+    /// error would surface. The post-state is the SAFE intermediate of the
+    /// protocol's crash algebra: {old main intact, WAL removed}, i.e. the
+    /// condemned foreign rows are gone and nothing was published; the
+    /// hazard state {new main + old WAL} remains unreachable.
+    #[test]
+    fn finish_propagates_wal_directory_sync_failure_without_publishing() {
+        let dir = temp_index_dir("r3-wal-dirsync-failure");
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let fast_path = dir.join(VECTOR_INDEX_FAST_FILENAME);
+        write_index_file(&fast_path, &[("old-doc", &[1.0, 0.0, 0.0, 0.0])])
+            .expect("write old generation");
+        {
+            let mut old = VectorIndex::open(&fast_path).expect("open old generation");
+            old.append("wal-doc", &[0.0, 1.0, 0.0, 0.0])
+                .expect("append WAL resident");
+        }
+        let wal_path = crate::wal::wal_path_for(&fast_path);
+        assert!(wal_path.exists(), "fixture WAL must exist");
+        let old_main_bytes = fs::read(&fast_path).expect("snapshot old main");
+
+        builder_fault_injection::arm_wal_directory_sync_failure();
+        let mut builder = TwoTierIndex::create(&dir, TwoTierConfig::default()).expect("builder");
+        builder
+            .add_fast_record("new-doc", &[0.0, 0.0, 1.0, 0.0])
+            .expect("add rebuild row");
+        let error = builder
+            .finish()
+            .expect_err("directory-sync failure must fail finish() closed");
+        assert!(
+            matches!(error, SearchError::Io(_)),
+            "directory-sync failure must propagate as the typed I/O error, got {error:?}"
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("injected directory-sync failure"),
+            "the propagated error is the seam's, got: {error}"
+        );
+
+        assert_eq!(
+            fs::read(&fast_path).expect("reread canonical"),
+            old_main_bytes,
+            "nothing is published when retirement cannot be made durable"
+        );
+        assert!(
+            !wal_path.exists(),
+            "post-state is the protocol's safe intermediate: the unlink \
+             preceded the failed sync, so the condemned WAL is gone"
+        );
+        assert_eq!(
+            staging_leftovers(&dir),
+            Vec::<String>::new(),
+            "the staged replacement is cleaned up on the error path"
+        );
+
+        let reopened = TwoTierIndex::open(&dir, TwoTierConfig::default())
+            .expect("old generation must reopen after the failed rebuild");
+        let ids: Vec<String> = reopened.iter_doc_ids().filter_map(Result::ok).collect();
+        assert_eq!(
+            ids,
+            vec!["old-doc".to_owned()],
+            "old main intact; no resurrection, no replacement rows"
         );
 
         let _ = fs::remove_dir_all(&dir);
