@@ -476,7 +476,7 @@ fn main() {
     let _ = run_cand(None);
     let _ = run_ours_flat();
 
-    let mut arms: Vec<Arm> = subject_names.iter().map(|n| Arm::new(n)).collect();
+    let mut arms: Vec<Arm> = subject_names.iter().map(|n| Arm::new(*n)).collect();
     let mut inc_arm = Arm::new("incumbent_batch32_bracket");
     let mut ratios: Vec<Vec<f64>> = vec![Vec::new(); SUBJECTS];
 
