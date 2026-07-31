@@ -9492,19 +9492,13 @@ fn stat_old_enough(stat: &rustix::fs::Stat, now: SystemTime, grace_period: Durat
 #[cfg(unix)]
 #[allow(dead_code, reason = "wired by the dependent writer-lock milestone")]
 fn stat_modified_time(stat: &rustix::fs::Stat) -> Option<SystemTime> {
-    unix_system_time(
-        i64::try_from(stat.st_mtime).ok()?,
-        u32::try_from(stat.st_mtime_nsec).ok()?,
-    )
+    unix_system_time(stat.st_mtime, u32::try_from(stat.st_mtime_nsec).ok()?)
 }
 
 #[cfg(unix)]
 #[allow(dead_code, reason = "wired by the dependent writer-lock milestone")]
 fn stat_change_time(stat: &rustix::fs::Stat) -> Option<SystemTime> {
-    unix_system_time(
-        i64::try_from(stat.st_ctime).ok()?,
-        u32::try_from(stat.st_ctime_nsec).ok()?,
-    )
+    unix_system_time(stat.st_ctime, u32::try_from(stat.st_ctime_nsec).ok()?)
 }
 
 #[cfg(unix)]
