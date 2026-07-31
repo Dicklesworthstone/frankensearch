@@ -145,6 +145,7 @@ pub struct BoundQueryEmbedding {
     vector: Vec<f32>,
     identity: EmbeddingIdentityBundleV1,
     identity_fingerprint: String,
+    space_fingerprint: String,
 }
 
 impl BoundQueryEmbedding {
@@ -165,10 +166,12 @@ impl BoundQueryEmbedding {
             });
         }
         let identity_fingerprint = identity.fingerprint();
+        let space_fingerprint = identity.space.fingerprint();
         Ok(Self {
             vector,
             identity,
             identity_fingerprint,
+            space_fingerprint,
         })
     }
 
@@ -191,7 +194,27 @@ impl BoundQueryEmbedding {
         &self.identity_fingerprint
     }
 
-    /// Verify this embedding was produced in the space a consumer expects.
+    /// Lowercase SHA-256 fingerprint of the *space* component only
+    /// ([`EmbeddingIdentityBundleV1::space`]), computed once at bind time.
+    ///
+    /// This is the join key at every index seam: a query-side bundle binds
+    /// in-memory `f32` storage while an index-side bundle binds its
+    /// persisted storage format (for example `fsvi-v2`), so their
+    /// full-bundle fingerprints legitimately differ even when both were
+    /// produced by the same model in the same mathematical space.
+    #[must_use]
+    pub fn space_fingerprint(&self) -> &str {
+        &self.space_fingerprint
+    }
+
+    /// Verify this embedding's complete identity bundle — space, producer,
+    /// input contract, *and* storage — matches what a consumer expects.
+    ///
+    /// This is an embedder-to-embedder comparison: use it only when both
+    /// sides bind the same storage identity. At an index seam the storage
+    /// components legitimately differ (query-side `in-memory-*` versus the
+    /// index's persisted format), so full-bundle fingerprints can never
+    /// match there — use [`Self::verify_space_identity`] instead.
     ///
     /// # Errors
     ///
@@ -208,6 +231,44 @@ impl BoundQueryEmbedding {
             reason: format!(
                 "query embedding was produced in a different embedding space than the \
                  {tier} index expects (expected identity fingerprint {expected_fingerprint})"
+            ),
+        })
+    }
+
+    /// Verify this embedding belongs to the mathematical embedding space a
+    /// consumer expects, joining on the space fingerprint only.
+    ///
+    /// This is the verifier for index seams (bd-9xuj T2-C1): the index side
+    /// stores [`EmbeddingSpaceIdentityV1::fingerprint`] of the space that
+    /// produced its vectors, and a query embedding is admissible exactly
+    /// when it was produced in that same space — regardless of how either
+    /// side physically encodes vectors. Producer, input-contract, and
+    /// storage differences are deliberately not compared here; the space
+    /// fingerprint already binds model, revision, dimension, and the input
+    /// contract via [`EmbeddingSpaceIdentityV1::input_contract_fingerprint`].
+    ///
+    /// [`EmbeddingSpaceIdentityV1::fingerprint`]: crate::generation::EmbeddingSpaceIdentityV1::fingerprint
+    /// [`EmbeddingSpaceIdentityV1::input_contract_fingerprint`]: crate::generation::EmbeddingSpaceIdentityV1::input_contract_fingerprint
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError::InvalidConfig`] naming `tier` when the space
+    /// fingerprints differ — including the same-dimension wrong-space case
+    /// that raw vector APIs silently accept.
+    pub fn verify_space_identity(
+        &self,
+        expected_space_fingerprint: &str,
+        tier: &str,
+    ) -> SearchResult<()> {
+        if self.space_fingerprint == expected_space_fingerprint {
+            return Ok(());
+        }
+        Err(SearchError::InvalidConfig {
+            field: format!("query_embedding.{tier}.space_identity"),
+            value: self.space_fingerprint.clone(),
+            reason: format!(
+                "query embedding was produced in a different embedding space than the \
+                 {tier} index expects (expected space fingerprint {expected_space_fingerprint})"
             ),
         })
     }
@@ -688,6 +749,105 @@ mod tests {
             .verify_space(&expected, "fast")
             .expect("same space must verify");
         assert_eq!(bound.vector().len(), 8);
+    }
+
+    /// Pins the T2-C1 impedance mismatch (readiness map §0.1): a query-side
+    /// bundle binds `in-memory-*` storage while an index-side bundle binds
+    /// `fsvi-v2`, so for the SAME mathematical space the full-bundle
+    /// fingerprints can never match — `verify_space` fails closed on
+    /// legitimate traffic at every index seam, while the space-scoped
+    /// `verify_space_identity` joins on the space fingerprint and admits it.
+    #[test]
+    fn space_scoped_verify_joins_across_storage_formats() {
+        // Query side: explicit test identity, in-memory f32 storage.
+        let query_side = identity("shared-model", 8);
+        // Index side: the SAME space, persisted as fsvi-v2 little-endian.
+        let mut index_side = identity("shared-model", 8);
+        index_side.storage.format = "fsvi-v2".to_owned();
+        index_side.storage.endianness = "little-endian".to_owned();
+        index_side
+            .validate()
+            .expect("index-side bundle must be a legitimate, validating bundle");
+
+        assert_eq!(
+            query_side.space.fingerprint(),
+            index_side.space.fingerprint(),
+            "same model + dimension is the same mathematical space"
+        );
+        assert_ne!(
+            query_side.fingerprint(),
+            index_side.fingerprint(),
+            "storage difference must alter the full-bundle fingerprint"
+        );
+
+        let bound = BoundQueryEmbedding::new(vec![0.5; 8], query_side).expect("bind");
+        assert_eq!(
+            bound.space_fingerprint(),
+            bound.identity().space.fingerprint(),
+            "bind-time space fingerprint must match the bundled space"
+        );
+
+        // Full-bundle verify: fails closed on this legitimate pairing (§0.1).
+        bound
+            .verify_space(&index_side.fingerprint(), "quality")
+            .expect_err("full-bundle fingerprints never match across storage formats");
+        // Space-scoped verify: the correct join key at the index seam.
+        bound
+            .verify_space_identity(&index_side.space.fingerprint(), "quality")
+            .expect("same space must verify space-scoped across storage formats");
+    }
+
+    #[test]
+    fn same_dimension_wrong_space_is_rejected_by_space_fingerprint() {
+        // The defining bd-9xuj case through the NEW seam verifier: identical
+        // dimensions, different models. Dimension checks cannot tell these
+        // apart; the space fingerprint must.
+        let bound =
+            BoundQueryEmbedding::new(vec![0.5; 8], identity("fast-model", 8)).expect("bind fast");
+        let quality_space = identity("quality-model", 8);
+        let error = bound
+            .verify_space_identity(&quality_space.space.fingerprint(), "quality")
+            .expect_err("fast vector must not enter the quality space");
+        match error {
+            SearchError::InvalidConfig {
+                field,
+                value,
+                reason,
+            } => {
+                assert_eq!(field, "query_embedding.quality.space_identity");
+                assert_eq!(value, bound.space_fingerprint());
+                assert!(reason.contains("different embedding space"));
+                assert!(reason.contains(&quality_space.space.fingerprint()));
+            }
+            other => panic!("expected InvalidConfig, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn distinct_models_at_equal_dimension_always_reject_space_scoped() {
+        // Readiness-map §3.3(10) property at C1 scope: explicit_test_model(a, d)
+        // vs (b, d) with a != b must always reject, for every tier label.
+        let dims = [8_u32, 384];
+        let models = ["model-a", "model-b", "model-c"];
+        for dim in dims {
+            for (i, a) in models.iter().enumerate() {
+                for b in &models[i + 1..] {
+                    let bound =
+                        BoundQueryEmbedding::new(vec![0.25; dim as usize], identity(a, dim))
+                            .expect("bind");
+                    let other = identity(b, dim);
+                    for tier in ["fast", "quality"] {
+                        bound
+                            .verify_space_identity(&other.space.fingerprint(), tier)
+                            .expect_err("distinct models must never share a space");
+                    }
+                    // Reflexive: a model always verifies against its own space.
+                    bound
+                        .verify_space_identity(&identity(a, dim).space.fingerprint(), "fast")
+                        .expect("own space must verify");
+                }
+            }
+        }
     }
 
     #[test]
