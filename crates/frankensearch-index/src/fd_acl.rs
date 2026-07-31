@@ -93,13 +93,26 @@ mod imp {
     //
     // AUTHORIZATION (Rule-0): these two named Darwin FFI seams —
     // `acl_get_fd_np` and `acl_free` — are the only in-scope way to read a
-    // macOS extended ACL through a retained fd without an external crate
-    // (which project policy prohibits) or shelling out. The project owner
-    // explicitly authorized this specific unsafe FFI on 2026-07-31, in
-    // preference to reintroducing the `exacl` dependency. Landing it into
-    // the generation-root ACL gate remains subject to the campaign's
-    // physical-M4 proof; nothing beyond these two declarations and their
-    // two call sites below is covered by this authorization.
+    // macOS extended ACL through a retained fd. The owner authorized this
+    // specific unsafe FFI on 2026-07-31 *conditional on it being strictly
+    // necessary*, and it was proven so before use:
+    //   * the `libc` crate ships no Darwin ACL bindings (no acl_get_fd_np,
+    //     no acl_t, no ACL_TYPE_EXTENDED) — verified against libc 0.2.184;
+    //   * unlike Linux (where POSIX ACLs surface as the
+    //     `system.posix_acl_access` xattr, which this module reads via a
+    //     safe `libc::fgetxattr` binding), macOS does NOT expose ACLs
+    //     through the readable xattr namespace: an empirical test on arm64
+    //     macOS showed `fgetxattr(fd, "com.apple.system.Security", ...)`
+    //     returning -1 in every state — clean, +ALLOW, +DENY, cleared —
+    //     i.e. zero signal about ACL presence, while `acl_get_fd_np` tracked
+    //     it exactly;
+    //   * the remaining alternatives are the prohibited external crate
+    //     (exacl) or shelling out (path-based, TOCTOU-unsafe, cannot operate
+    //     on a retained fd).
+    // So no safe or external-free substitute exists. Landing into the
+    // generation-root ACL gate remains subject to the campaign's physical-M4
+    // proof; nothing beyond these two declarations and their two call sites
+    // below is covered by this authorization.
     #[allow(unsafe_code)] // FFI prototypes for Darwin's libc ACL API (owner-authorized, see above).
     unsafe extern "C" {
         fn acl_get_fd_np(fd: c_int, acl_type: c_uint) -> *mut c_void;
