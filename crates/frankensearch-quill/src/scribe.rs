@@ -311,8 +311,52 @@ fn swar_load(bytes: &[u8], at: usize) -> u64 {
     u64::from_le_bytes(lanes)
 }
 
+/// Longest all-ASCII token span, in bytes, emitted through the fused per-byte
+/// [`push_ascii_lowercase`] path; longer spans keep the original bulk
+/// `push_str` + `make_ascii_lowercase` emit (one libc `memcpy` plus one
+/// vectorized lowercase sweep).
+///
+/// Sixteen bytes = two full SWAR words, chosen from two in-situ measurements
+/// (release-perf ELFs, real analyze loop, shipping-arm speed triangulated
+/// through the unchanged `BoundaryMaskTokenizer` yardstick; full tables in
+/// this commit's message):
+///
+/// * Real variable-length corpora bracket the effect from both sides: the
+///   fused emit is ~1.03x faster on the word-mix corpus (tokens 2-15 bytes,
+///   mostly <= 9) and ~1.42x SLOWER on the 24-48B+ token corpus, where one
+///   bulk `memcpy` plus one vectorized sweep beats per-byte stores.
+/// * A fixed-width sweep (single-width corpora, widths 6-32) shows the bulk
+///   emit winning at EVERY width: with a constant span length, `memcpy`'s
+///   size dispatch and the lowercase sweep's tail handling become perfectly
+///   predictable, erasing the per-token penalty that the fused path avoids on
+///   real variable-length text. The fused path's short-token win therefore
+///   comes from length variance, not from any fixed width, and the fixed-width
+///   sweep is a bulk-favorable bound rather than a crossover locator.
+///
+/// The dispatch keeps every span of the winning short-corpus region (<= 15
+/// bytes, rounded up to the two-word boundary) on the fused path and routes
+/// the unambiguous >= 24-byte regression region to the bulk path.
+const ASCII_EMIT_FUSED_MAX_LEN: usize = 16;
+
+#[cfg(test)]
+thread_local! {
+    /// Per-thread count of all-ASCII token emits dispatched to the fused
+    /// [`push_ascii_lowercase`] path. Together with [`ASCII_EMIT_BULK_HITS`]
+    /// this proves the length dispatch exercises BOTH emit arms (the arms are
+    /// byte-identical by construction, so output parity alone cannot catch a
+    /// flipped comparison).
+    static ASCII_EMIT_FUSED_HITS: std::cell::Cell<u64> =
+        const { std::cell::Cell::new(0) };
+    /// Per-thread count of all-ASCII token emits dispatched to the bulk
+    /// `push_str` + `make_ascii_lowercase` path. See
+    /// [`ASCII_EMIT_FUSED_HITS`].
+    static ASCII_EMIT_BULK_HITS: std::cell::Cell<u64> =
+        const { std::cell::Cell::new(0) };
+}
+
 /// Append `source` (all-ASCII by the caller's `all_ascii` guarantee) to `dst`
-/// lowercased in one fused pass, replacing the two-pass
+/// lowercased in one fused pass, replacing — for spans of at most
+/// [`ASCII_EMIT_FUSED_MAX_LEN`] bytes — the two-pass
 /// `push_str` + `make_ascii_lowercase` emit whose per-token libc `memcpy` call
 /// and second lowercase sweep dominated the analyze leaf in the Round-2
 /// instruction-level profile.
@@ -590,7 +634,22 @@ impl TokenAnalyzer for FrankensearchTokenizer {
             self.token.text.clear();
             let source = &text[offset_from..offset_to];
             if all_ascii {
-                push_ascii_lowercase(&mut self.token.text, source);
+                // Length-dispatched hybrid emit: short spans win with the
+                // fused per-byte lowered push (no libc memcpy call), long
+                // spans win with one bulk memcpy plus one vectorized
+                // make_ascii_lowercase sweep. Both arms implement
+                // u8::to_ascii_lowercase per byte, so the dispatch is
+                // byte-identical by construction.
+                if source.len() <= ASCII_EMIT_FUSED_MAX_LEN {
+                    #[cfg(test)]
+                    ASCII_EMIT_FUSED_HITS.with(|hits| hits.set(hits.get() + 1));
+                    push_ascii_lowercase(&mut self.token.text, source);
+                } else {
+                    #[cfg(test)]
+                    ASCII_EMIT_BULK_HITS.with(|hits| hits.set(hits.get() + 1));
+                    self.token.text.push_str(source);
+                    self.token.text.make_ascii_lowercase();
+                }
             } else {
                 for source_char in source.chars() {
                     self.token.text.extend(source_char.to_lowercase());
@@ -5582,22 +5641,41 @@ mod tests {
     #[test]
     fn fused_ascii_lowercase_emit_word_boundary_sweep_matches_reference() {
         // Fused single-pass lowercase emit regression: uppercase-heavy tokens
-        // whose spans start at every alignment 0..=8 and whose lengths 1..=25
-        // cross the 8-byte SWAR word boundary at every offset (0..3 full words
-        // x every tail width). A distinguishing marker byte slides across every
-        // position: '0' pins digit passthrough, 'z' pins already-lowercase
-        // passthrough, and 'B' pins the A-Z case flip, in every lane of both
-        // the full-word path and the scalar tail. Token text must be
+        // whose spans start at every alignment 0..=8 and whose lengths
+        // 1..=ASCII_EMIT_FUSED_MAX_LEN+9 cross both the 8-byte SWAR word
+        // boundary at every offset (full words x every tail width) AND the
+        // fused/bulk dispatch threshold (lengths from well below
+        // ASCII_EMIT_FUSED_MAX_LEN-2 through ASCII_EMIT_FUSED_MAX_LEN+9). A
+        // distinguishing marker byte slides across every position: '0' pins
+        // digit passthrough, 'z' pins already-lowercase passthrough, and 'B'
+        // pins the A-Z case flip, in every lane of both the full-word path and
+        // the scalar tail, on BOTH sides of the dispatch. Token text must be
         // byte-identical to the `str::to_ascii_lowercase` reference and the
         // whole stream byte-identical to the scalar char-walk oracle.
+        //
+        // The two emit arms are byte-identical by construction, so output
+        // parity alone cannot catch a flipped dispatch comparison; the
+        // per-thread hit counters pin the exact number of emits routed to each
+        // arm (a flipped `<=` swaps the two counts and fails here).
+        let fused_hits_before = ASCII_EMIT_FUSED_HITS.with(std::cell::Cell::get);
+        let bulk_hits_before = ASCII_EMIT_BULK_HITS.with(std::cell::Cell::get);
+        let mut expected_fused = 0_u64;
+        let mut expected_bulk = 0_u64;
         for pad in 0..=8_usize {
-            for len in 1..=25_usize {
+            for len in 1..=(ASCII_EMIT_FUSED_MAX_LEN + 9) {
                 for marker_at in 0..len {
                     for marker in ['0', 'z', 'B'] {
                         let mut input = " ".repeat(pad);
                         let token_start = input.len();
                         for at in 0..len {
                             input.push(if at == marker_at { marker } else { 'A' });
+                        }
+                        // One all-ASCII token per input, so exactly one emit
+                        // is dispatched by span length.
+                        if len <= ASCII_EMIT_FUSED_MAX_LEN {
+                            expected_fused += 1;
+                        } else {
+                            expected_bulk += 1;
                         }
                         let tokens = analyzed_tokens(&input);
                         assert_eq!(tokens.len(), 1, "for {input:?}");
@@ -5617,6 +5695,14 @@ mod tests {
                 }
             }
         }
+        let fused_hits = ASCII_EMIT_FUSED_HITS.with(std::cell::Cell::get) - fused_hits_before;
+        let bulk_hits = ASCII_EMIT_BULK_HITS.with(std::cell::Cell::get) - bulk_hits_before;
+        assert!(expected_fused > 0 && expected_bulk > 0);
+        assert_eq!(
+            (fused_hits, bulk_hits),
+            (expected_fused, expected_bulk),
+            "length dispatch routed emits to the wrong arm"
+        );
     }
 
     #[cfg(feature = "tantivy-oracle")]
