@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicBool, AtomicU8};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use arc_swap::{ArcSwap, ArcSwapOption};
+use arc_swap::ArcSwap;
 use asupersync::Cx;
 use asupersync::runtime::spawn_blocking;
 use asupersync::sync::{LockError, Mutex, OwnedMutexGuard, TryLockError};
@@ -54,9 +54,9 @@ use crate::keeper::{
     plan_tier_merge, validate_manifest_successor,
 };
 use crate::query::{
-    BooleanOperator, DefaultQueryParser, Occur, Query, QueryCanonicalizationReport,
-    QueryCapabilityError, QueryDiagnostic, QueryExplanation, QueryParserConfigError, QueryValue,
-    canonicalize_query, classify_query, validate_index_capabilities,
+    BooleanOperator, DefaultQueryParser, Occur, Query, QueryCapabilityError, QueryDiagnostic,
+    QueryExplanation, QueryParserConfigError, QueryValue, canonicalize_query, classify_query,
+    validate_index_capabilities,
 };
 use crate::quiver::{
     BlockMaxError, DocLenCodecError, DocLenField, DocLenSection, EncodedNumericSection,
@@ -1594,17 +1594,9 @@ struct QuillReader {
     config: QuillConfig,
     schema: SchemaDescriptor,
     parser: Option<DefaultQueryParser>,
-    parsed_query_cache: Arc<ArcSwapOption<CachedParsedQuery>>,
     published_snapshot: Arc<SnapshotPublisher>,
     #[cfg(feature = "conformance-internals")]
     conformance_controller: Arc<ConformanceCancellationController>,
-}
-
-struct CachedParsedQuery {
-    source: Box<str>,
-    query: Query,
-    diagnostics: Vec<QueryDiagnostic>,
-    canonicalization: QueryCanonicalizationReport,
 }
 
 /// Shared Quill index handle with lock-free readers and one cancel-aware writer.
@@ -2002,7 +1994,6 @@ impl QuillWriterState {
                 config,
                 schema,
                 parser,
-                parsed_query_cache: Arc::new(ArcSwapOption::empty()),
                 published_snapshot,
                 #[cfg(feature = "conformance-internals")]
                 conformance_controller: Arc::default(),
@@ -3598,25 +3589,6 @@ impl QuillReader {
         })
     }
 
-    fn parse_query_cached(&self, source: &str) -> Result<Arc<CachedParsedQuery>, QuillIndexError> {
-        if let Some(cached) = self.parsed_query_cache.load_full()
-            && cached.source.as_ref() == source
-        {
-            return Ok(cached);
-        }
-
-        let mut parsed = self.default_parser()?.parse_lenient(source);
-        let canonicalization = canonicalize_query(&mut parsed.query);
-        let cached = Arc::new(CachedParsedQuery {
-            source: source.into(),
-            query: parsed.query,
-            diagnostics: parsed.diagnostics,
-            canonicalization,
-        });
-        self.parsed_query_cache.store(Some(Arc::clone(&cached)));
-        Ok(cached)
-    }
-
     /// Parse and exhaustively execute one query over the published composite
     /// Keeper-plus-Delta snapshot.
     ///
@@ -3690,7 +3662,8 @@ impl QuillReader {
             );
             let _parse_timer = crate::tracing_conventions::StageTimer::new(&parse_span);
             let _parse_entered = parse_span.enter();
-            let parsed = self.parse_query_cached(query)?;
+            let mut parsed = self.default_parser()?.parse_lenient(query);
+            let report = canonicalize_query(&mut parsed.query);
             parse_span.record(
                 "diagnostic_count",
                 u64::try_from(parsed.diagnostics.len()).unwrap_or(u64::MAX),
@@ -3699,11 +3672,11 @@ impl QuillReader {
             record_query_trace_shape(&parse_span, &parsed.query);
             tracing::debug!(
                 target: crate::tracing_conventions::TARGET,
-                must_not_duplicates_removed = parsed.canonicalization.must_not_duplicates_removed,
-                filter_duplicates_removed = parsed.canonicalization.filter_duplicates_removed,
-                duplicate_fields_removed = parsed.canonicalization.duplicate_fields_removed,
-                boolean_levels_sorted = parsed.canonicalization.boolean_levels_sorted,
-                glob_fields_canonicalized = parsed.canonicalization.glob_fields_canonicalized,
+                must_not_duplicates_removed = report.must_not_duplicates_removed,
+                filter_duplicates_removed = report.filter_duplicates_removed,
+                duplicate_fields_removed = report.duplicate_fields_removed,
+                boolean_levels_sorted = report.boolean_levels_sorted,
+                glob_fields_canonicalized = report.glob_fields_canonicalized,
                 "canonicalized parsed Quill query"
             );
             parsed
@@ -3715,7 +3688,7 @@ impl QuillReader {
             limit,
             offset,
             exact_count,
-            parsed.diagnostics.clone(),
+            parsed.diagnostics,
         )?;
         let result_count = u64::try_from(result.hits.len()).unwrap_or(u64::MAX);
         query_span.record("result_count", result_count);
@@ -4515,7 +4488,6 @@ impl PreparsedQuillIndex {
                 config,
                 schema,
                 parser: None,
-                parsed_query_cache: Arc::new(ArcSwapOption::empty()),
                 published_snapshot,
                 #[cfg(feature = "conformance-internals")]
                 conformance_controller: Arc::default(),
@@ -4575,7 +4547,6 @@ impl QuillSearchIndex {
                 parser: Some(DefaultQueryParser::new(DEFAULT_SCHEMA)?),
                 config,
                 schema: DEFAULT_SCHEMA,
-                parsed_query_cache: Arc::new(ArcSwapOption::empty()),
                 published_snapshot,
                 #[cfg(feature = "conformance-internals")]
                 conformance_controller: Arc::default(),
@@ -9761,29 +9732,13 @@ mod tests {
                 .and_then(|cursor| cursor.collect_bounded(term_count))
                 .expect("collect cached cursor");
             assert!(!cursor_rows.is_empty());
-            assert!(index.reader.parsed_query_cache.load().is_none());
 
-            let first_hits = index
-                .search_doc_ids(&cx, "shared", 10)
-                .expect("first cached search");
-            assert_eq!(first_hits.len(), 2);
-            let first_plan = index
-                .reader
-                .parsed_query_cache
-                .load_full()
-                .expect("first search publishes its parsed plan");
-            for _ in 1..32 {
+            for _ in 0..32 {
                 let hits = index
                     .search_doc_ids(&cx, "shared", 10)
                     .expect("repeat cached search");
                 assert_eq!(hits.len(), 2);
             }
-            let repeated_plan = index
-                .reader
-                .parsed_query_cache
-                .load_full()
-                .expect("repeated search retains its parsed plan");
-            assert!(Arc::ptr_eq(&first_plan, &repeated_plan));
             let (full_validations_after, borrowed_views_after) =
                 segment.term_dictionary_cache_counts();
             assert_eq!(
