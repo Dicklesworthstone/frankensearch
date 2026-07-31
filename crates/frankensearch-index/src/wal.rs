@@ -1120,6 +1120,11 @@ pub(crate) fn append_wal_batch(
                 file.set_len(0)?;
                 file.seek(std::io::SeekFrom::Start(0))?;
                 write_wal_header(&mut file, dimension, quantization, compaction_gen)?;
+                // `.create(true)` above may have re-created a dirent that a
+                // concurrent delete removed after our `create_new` failed, or
+                // repaired one a crashed creator never durably linked; either
+                // way the dirent needs the same parent sync as a fresh create.
+                created_fresh = true;
             } else {
                 // Seek to end so the batch is appended after existing data.
                 file.seek(std::io::SeekFrom::End(0))?;
