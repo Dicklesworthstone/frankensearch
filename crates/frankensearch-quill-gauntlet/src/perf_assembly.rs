@@ -46,7 +46,7 @@ pub const PERF_EVIDENCE_ASSEMBLY_MATRIX_SCHEMA_VERSION: &str =
 /// Wire version of the run-label-independent semantic cell-set seal.
 pub const PERF_EVIDENCE_SEMANTIC_CELL_SET_SCHEMA_VERSION: &str =
     "quill-perf-evidence-semantic-cell-set-v1";
-/// The sole source-level NoClaim code assembly may discharge after exact
+/// The sole source-level `NoClaim` code assembly may discharge after exact
 /// disjoint coverage proves that a producer intentionally emitted one shard.
 pub const PERF_ASSEMBLY_PARTIAL_SHARD_NO_CLAIM_CODE: &str = "qg1.partial_shard";
 /// Exact producer diagnostic assembly may discharge only after the H2 receipt
@@ -394,10 +394,10 @@ pub struct PerfEvidenceAssemblyNoClaimCell {
     reasons: Vec<EvidenceReason>,
 }
 
-/// Source-level NoClaim input that assembly must preserve and propagate.
+/// Source-level `NoClaim` input that assembly must preserve and propagate.
 ///
 /// Only [`PERF_ASSEMBLY_PARTIAL_SHARD_NO_CLAIM_CODE`] on an actually partial
-/// source is assembly-neutral. Every other authentic source NoClaim is stored
+/// source is assembly-neutral. Every other authentic source `NoClaim` is stored
 /// here and blocks downstream adjudication.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -421,7 +421,7 @@ impl PerfEvidenceAssemblyNoClaimSource {
         &self.run_id
     }
 
-    /// Canonical cells whose source scope carried this NoClaim.
+    /// Canonical cells whose source scope carried this `NoClaim`.
     #[must_use]
     pub fn cell_ids(&self) -> &[String] {
         &self.cell_ids
@@ -541,7 +541,7 @@ impl PerfEvidenceAssemblyMatrixManifest {
         Ok(manifest)
     }
 
-    /// Exact ordered canonical cells, including typed NotApplicable entries.
+    /// Exact ordered canonical cells, including typed `NotApplicable` entries.
     #[must_use]
     pub fn cells(&self) -> &[PerfEvidenceAssemblyMatrixCell] {
         &self.cells
@@ -623,11 +623,13 @@ impl PerfEvidenceAssemblyMatrixManifest {
     }
 }
 
-/// Explicit semantic seal whose preimage excludes opaque source run IDs and
-/// invocation-local timestamps/log or artifact-file seals, while retaining
-/// measurement samples, verdict inputs, build/ELF/lock/command/environment,
-/// machine, fixture/corpus, estimator, cell coordinates, terminal states, and
-/// source-level NoClaim semantics.
+/// Explicit semantic seal for the run-label-independent evidence projection.
+///
+/// Its preimage excludes opaque source run IDs and invocation-local timestamps,
+/// logs, and artifact-file seals. It retains measurement samples, verdict
+/// inputs, build/ELF/lock/command/environment identity, machine and fixture
+/// identity, estimator inputs, cell coordinates, terminal states, and
+/// source-level `NoClaim` semantics.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PerfEvidenceSemanticCellSetSeal {
@@ -1458,7 +1460,7 @@ pub struct PerfEvidenceAssemblyCounts {
 }
 
 impl PerfEvidenceAssemblyCounts {
-    /// Total canonical QG-1 cells, including typed NotApplicable entries.
+    /// Total canonical QG-1 cells, including typed `NotApplicable` entries.
     #[must_use]
     pub const fn canonical_cells(&self) -> usize {
         self.canonical_cells
@@ -1482,7 +1484,7 @@ impl PerfEvidenceAssemblyCounts {
         self.measured_cells
     }
 
-    /// Number of canonical cells classified NotApplicable by the frozen plan.
+    /// Number of canonical cells classified `NotApplicable` by the frozen plan.
     #[must_use]
     pub const fn not_applicable_cells(&self) -> usize {
         self.not_applicable_cells
@@ -1664,7 +1666,7 @@ impl PerfEvidenceAssemblyArtifact {
         &self.non_adjudicable_cells
     }
 
-    /// Authentic source-level NoClaim inputs that assembly cannot discharge.
+    /// Authentic source-level `NoClaim` inputs that assembly cannot discharge.
     #[must_use]
     pub fn non_adjudicable_sources(&self) -> &[PerfEvidenceAssemblyNoClaimSource] {
         &self.non_adjudicable_sources
@@ -1807,7 +1809,7 @@ impl PerfEvidenceAssemblyArtifact {
     /// # Errors
     ///
     /// Returns the ordinary incomplete error for holes, or a typed durable
-    /// NoClaim error carrying exact cell/status/reason diagnostics.
+    /// `NoClaim` error carrying exact cell/status/reason diagnostics.
     pub fn require_adjudicable(&self) -> Result<(), PerfEvidenceAssemblyError> {
         self.require_complete()?;
         if self.readiness == PerfEvidenceAssemblyReadiness::ReadyForAdjudication {
@@ -3381,7 +3383,7 @@ pub enum PerfEvidenceAssemblyError {
     NonAdjudicableAssembly {
         /// Number of exact Required-cell diagnostics.
         cells: usize,
-        /// Number of source-level NoClaims affecting Required cells.
+        /// Number of source-level `NoClaims` affecting Required cells.
         sources: usize,
         /// Concrete bounded rerun condition.
         retry_predicate: String,
@@ -3468,20 +3470,20 @@ mod tests {
 
     #[derive(Clone, Copy)]
     struct TestIdentity {
-        executable_byte: char,
-        source_revision_byte: char,
-        cargo_lock_byte: char,
-        manifest_byte: Option<char>,
-        corpus_byte: char,
+        executable: char,
+        source_revision: char,
+        cargo_lock: char,
+        manifest: Option<char>,
+        corpus: char,
     }
 
     impl TestIdentity {
         const PRIMARY: Self = Self {
-            executable_byte: 'a',
-            source_revision_byte: 'd',
-            cargo_lock_byte: 'c',
-            manifest_byte: None,
-            corpus_byte: 'b',
+            executable: 'a',
+            source_revision: 'd',
+            cargo_lock: 'c',
+            manifest: None,
+            corpus: 'b',
         };
     }
 
@@ -3517,11 +3519,11 @@ mod tests {
 
     fn build_identity(identity: TestIdentity) -> BuildIdentity {
         BuildIdentity {
-            executable_sha256: identity.executable_byte.to_string().repeat(64),
-            git_revision: identity.source_revision_byte.to_string().repeat(40),
+            executable_sha256: identity.executable.to_string().repeat(64),
+            git_revision: identity.source_revision.to_string().repeat(40),
             git_dirty: false,
             worktree_state_sha256: None,
-            cargo_lock_sha256: Some(identity.cargo_lock_byte.to_string().repeat(64)),
+            cargo_lock_sha256: Some(identity.cargo_lock.to_string().repeat(64)),
             command_sha256: "f".repeat(64),
             environment_sha256: Some("e".repeat(64)),
             rustc_version: "rustc 1.91.0-nightly".to_owned(),
@@ -3543,7 +3545,7 @@ mod tests {
         EvidenceProvenance {
             run_id: run_id.to_owned(),
             run_window: RUN_WINDOW.to_owned(),
-            manifest_sha256: identity.manifest_byte.map_or_else(
+            manifest_sha256: identity.manifest.map_or_else(
                 || test_plan().normalized_perf_manifest_sha256,
                 |byte| byte.to_string().repeat(64),
             ),
@@ -3575,7 +3577,7 @@ mod tests {
                 bytes: Some(4_096 + u64::from(run_variation)),
             },
             corpus: CorpusIdentity {
-                corpus_sha256: identity.corpus_byte.to_string().repeat(64),
+                corpus_sha256: identity.corpus.to_string().repeat(64),
                 query_set_sha256: None,
                 qrels_sha256: None,
                 document_count,
@@ -3589,8 +3591,8 @@ mod tests {
     fn sample_provenance(run_id: &str, identity: TestIdentity) -> PerfSampleProvenance {
         PerfSampleProvenance {
             run_id: run_id.to_owned(),
-            executable_sha256: identity.executable_byte.to_string().repeat(64),
-            corpus_sha256: identity.corpus_byte.to_string().repeat(64),
+            executable_sha256: identity.executable.to_string().repeat(64),
+            corpus_sha256: identity.corpus.to_string().repeat(64),
             input_identity: None,
             worker_id: "test-machine".to_owned(),
             build_profile: "test".to_owned(),
@@ -3804,7 +3806,7 @@ mod tests {
             partial_no_claim_code,
             false,
             test_policy(),
-            estimator_config(),
+            &estimator_config(),
         )
     }
 
@@ -3818,12 +3820,12 @@ mod tests {
         partial_no_claim_code: &str,
         force_source_no_claim: bool,
         policy: EvidencePolicy,
-        estimator: PairedEstimatorConfig,
+        estimator: &PairedEstimatorConfig,
     ) -> PerfEvidenceArtifact {
         let contract = PlanContract::reconstruct(&test_plan()).expect("test plan contract");
         let (valid_paired, valid_treatment_null) =
-            paired_results(run_id, identity, false, &estimator);
-        let invalid = invalid_ordinal.map(|_| paired_results(run_id, identity, true, &estimator));
+            paired_results(run_id, identity, false, estimator);
+        let invalid = invalid_ordinal.map(|_| paired_results(run_id, identity, true, estimator));
         let cells = ordinals
             .iter()
             .map(|ordinal| {
@@ -4112,18 +4114,18 @@ mod tests {
         directory
     }
 
-    fn test_attempt_bundle(artifact: PerfEvidenceArtifact) -> VerifiedLocalPerfAttemptBundle {
+    fn test_attempt_bundle(artifact: &PerfEvidenceArtifact) -> VerifiedLocalPerfAttemptBundle {
         static CACHE: OnceLock<Mutex<BTreeMap<String, VerifiedLocalPerfAttemptBundle>>> =
             OnceLock::new();
         let key = sha256_hex(
-            &canonical_evidence_bytes(&artifact).expect("canonical cache-key evidence bytes"),
+            &canonical_evidence_bytes(artifact).expect("canonical cache-key evidence bytes"),
         );
         let cache = CACHE.get_or_init(|| Mutex::new(BTreeMap::new()));
         let mut cache = cache.lock().expect("test attempt cache lock");
         if let Some(bundle) = cache.get(&key).cloned() {
             return bundle;
         }
-        let directory = completed_test_attempt_directory(&artifact);
+        let directory = completed_test_attempt_directory(artifact);
         let bundle = VerifiedLocalPerfAttemptBundle::load_verified(directory.path())
             .expect("load exact completed H2 test bundle through production boundary");
         cache.insert(key, bundle.clone());
@@ -4137,7 +4139,7 @@ mod tests {
         let mut attempts = completed
             .into_iter()
             .flat_map(normalize_h2_test_artifact)
-            .map(test_attempt_bundle)
+            .map(|artifact| test_attempt_bundle(&artifact))
             .collect::<Vec<_>>();
         attempts.extend(failed);
         PerfEvidenceAssemblyArtifact::assemble(attempts)
@@ -5066,7 +5068,7 @@ mod tests {
             "exec-runner-b",
             None,
             TestIdentity {
-                executable_byte: '9',
+                executable: '9',
                 ..TestIdentity::PRIMARY
             },
         );
@@ -5097,7 +5099,7 @@ mod tests {
             "source-drift-runner",
             None,
             TestIdentity {
-                source_revision_byte: '7',
+                source_revision: '7',
                 ..TestIdentity::PRIMARY
             },
         );
@@ -5112,7 +5114,7 @@ mod tests {
             "lock-drift-runner",
             None,
             TestIdentity {
-                cargo_lock_byte: '8',
+                cargo_lock: '8',
                 ..TestIdentity::PRIMARY
             },
         );
@@ -5127,7 +5129,7 @@ mod tests {
             "corpus-drift-runner",
             None,
             TestIdentity {
-                corpus_byte: '6',
+                corpus: '6',
                 ..TestIdentity::PRIMARY
             },
         );
@@ -5147,7 +5149,7 @@ mod tests {
             PERF_ASSEMBLY_PARTIAL_SHARD_NO_CLAIM_CODE,
             false,
             policy,
-            estimator_config(),
+            &estimator_config(),
         );
         assert_incompatible_field(
             assemble_test(vec![first.clone(), policy_drift], Vec::new()),
@@ -5165,7 +5167,7 @@ mod tests {
             PERF_ASSEMBLY_PARTIAL_SHARD_NO_CLAIM_CODE,
             false,
             test_policy(),
-            estimator,
+            &estimator,
         );
         assert_incompatible_field(
             assemble_test(vec![first, estimator_drift], Vec::new()),
@@ -5235,7 +5237,7 @@ mod tests {
             PERF_ASSEMBLY_PARTIAL_SHARD_NO_CLAIM_CODE,
             true,
             test_policy(),
-            estimator_config(),
+            &estimator_config(),
         );
         let assembly = assemble_test(vec![source], Vec::new()).unwrap();
 
@@ -5260,7 +5262,7 @@ mod tests {
             "stale-manifest-runner",
             None,
             TestIdentity {
-                manifest_byte: Some('8'),
+                manifest: Some('8'),
                 ..TestIdentity::PRIMARY
             },
         );

@@ -91,7 +91,8 @@ fn run() -> Result<FinalizeOutcome, Box<dyn Error>> {
     let mut values = env::args_os().skip(1);
     let first = values.next();
     if first.as_deref() == Some(OsStr::new("assemble")) {
-        return run_assembly(parse_assembly_args(values)?);
+        let args = parse_assembly_args(values)?;
+        return run_assembly(&args);
     }
     let args = parse_args(first.into_iter().chain(values))?;
     let config = LocalPerfRunConfig {
@@ -168,7 +169,7 @@ where
     })
 }
 
-fn run_assembly(args: AssemblyArgs) -> Result<FinalizeOutcome, Box<dyn Error>> {
+fn run_assembly(args: &AssemblyArgs) -> Result<FinalizeOutcome, Box<dyn Error>> {
     let attempts = args
         .attempt_dirs
         .iter()
@@ -198,7 +199,7 @@ fn emit_assembly_logs(
     let profile = plan.profile;
     let counts = assembly.counts();
     let compatibility = assembly.compatibility();
-    emit_json_log(serde_json::json!({
+    emit_json_log(&serde_json::json!({
         "event": "qg1_assembly_summary",
         "gate": "QG-1",
         "hardware_class": profile.hardware_class_id().as_str(),
@@ -232,7 +233,7 @@ fn emit_assembly_logs(
         "output": bounded_log_value(&output_path.display().to_string()),
     }))?;
     for (index, source) in assembly.source_shards().iter().enumerate() {
-        emit_json_log(serde_json::json!({
+        emit_json_log(&serde_json::json!({
             "event": "qg1_assembly_shard",
             "shard_index": index,
             "terminal": "completed",
@@ -246,7 +247,7 @@ fn emit_assembly_logs(
         }))?;
     }
     for cell in assembly.cell_sources() {
-        emit_json_log(serde_json::json!({
+        emit_json_log(&serde_json::json!({
             "event": "qg1_assembly_cell",
             "ordinal": cell.ordinal(),
             "cell_id": cell.cell_id(),
@@ -261,7 +262,7 @@ fn emit_assembly_logs(
     for (index, attempt) in assembly.failed_shards().iter().enumerate() {
         let process = attempt.process();
         let receipt = process.receipt();
-        emit_json_log(serde_json::json!({
+        emit_json_log(&serde_json::json!({
             "event": "qg1_assembly_shard",
             "shard_index": assembly.source_shards().len() + index,
             "terminal": receipt.outcome(),
@@ -273,7 +274,7 @@ fn emit_assembly_logs(
         }))?;
     }
     for cell_id in assembly.missing_required_cell_ids() {
-        emit_json_log(serde_json::json!({
+        emit_json_log(&serde_json::json!({
             "event": "qg1_assembly_set_difference",
             "cell_id": cell_id,
             "role": "required",
@@ -281,7 +282,7 @@ fn emit_assembly_logs(
         }))?;
     }
     for cell_id in assembly.missing_diagnostic_cell_ids() {
-        emit_json_log(serde_json::json!({
+        emit_json_log(&serde_json::json!({
             "event": "qg1_assembly_set_difference",
             "cell_id": cell_id,
             "role": "diagnostic",
@@ -300,7 +301,7 @@ fn emit_assembly_logs(
                 })
             })
             .collect::<Vec<_>>();
-        emit_json_log(serde_json::json!({
+        emit_json_log(&serde_json::json!({
             "event": "qg1_assembly_non_adjudicable_cell",
             "cell_id": diagnostic.cell_id(),
             "ordinal": diagnostic.ordinal(),
@@ -310,7 +311,7 @@ fn emit_assembly_logs(
         }))?;
     }
     for diagnostic in assembly.non_adjudicable_sources() {
-        emit_json_log(serde_json::json!({
+        emit_json_log(&serde_json::json!({
             "event": "qg1_assembly_non_adjudicable_source",
             "run_id": bounded_log_value(diagnostic.run_id()),
             "evidence_artifact_sha256": diagnostic.evidence_artifact_sha256(),
@@ -330,7 +331,7 @@ fn emit_assembly_logs(
         let Some(retry) = retry else {
             continue;
         };
-        emit_json_log(serde_json::json!({
+        emit_json_log(&serde_json::json!({
             "event": "qg1_assembly_retry",
             "scope": scope,
             "terminal": assembly.readiness(),
@@ -340,8 +341,8 @@ fn emit_assembly_logs(
     Ok(())
 }
 
-fn emit_json_log(value: serde_json::Value) -> Result<(), serde_json::Error> {
-    println!("{}", serde_json::to_string(&value)?);
+fn emit_json_log(value: &serde_json::Value) -> Result<(), serde_json::Error> {
+    println!("{}", serde_json::to_string(value)?);
     Ok(())
 }
 

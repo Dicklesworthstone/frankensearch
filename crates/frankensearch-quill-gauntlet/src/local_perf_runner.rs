@@ -479,9 +479,11 @@ pub enum LocalPerfInternalLifecycleUnavailable {
     ChildEvidenceAdmittedButNotIndependentlyObserved,
 }
 
-/// Explicit engine-internal receipt gaps. These fields prevent configured
-/// capacity or outer-process completion from being relabeled as actual work,
-/// queue activity, worker join, feed drain, or pending-zero evidence.
+/// Explicit engine-internal receipt gaps.
+///
+/// These fields prevent configured capacity or outer-process completion from
+/// being relabeled as actual work, queue activity, worker join, feed drain, or
+/// pending-zero evidence.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LocalPerfInternalLifecycleGaps {
@@ -527,6 +529,7 @@ impl LocalPerfInternalLifecycleGaps {
 }
 
 /// Runner controls unavailable in the current synchronous local producer.
+///
 /// These name caller-scheduled controls; the bounded force-kill used only to
 /// recover from an OS `wait` error is a fail-closed reap mechanism, not a
 /// caller-requested cancellation outcome.
@@ -4715,7 +4718,7 @@ fn seal_attempt_receipt(
 }
 
 #[cfg(test)]
-pub(crate) fn completed_attempt_receipt_for_test(
+pub fn completed_attempt_receipt_for_test(
     artifact: &PerfEvidenceArtifact,
     fixture_selector: Option<&str>,
     run_log_bytes: &[u8],
@@ -4825,7 +4828,7 @@ pub(crate) fn completed_attempt_receipt_for_test(
 }
 
 #[cfg(test)]
-pub(crate) fn failed_attempt_receipt_for_test(
+pub fn failed_attempt_receipt_for_test(
     artifact: &PerfEvidenceArtifact,
     fixture_selector: Option<&str>,
     run_log_bytes: &[u8],
