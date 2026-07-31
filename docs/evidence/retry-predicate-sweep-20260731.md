@@ -153,7 +153,8 @@ this card.** Until that section carries numbers, `bd-3srq` remains
 
 The ISA re-test therefore needs **no** further propagation: its stale "small
 ceiling" language at `:10955` is already superseded in-ledger at `:15308`. Both
-rows should be read together; a cross-reference is the only outstanding gap.
+rows should be read together. That cross-reference was the only outstanding gap
+in this class and was added to `:10955` in this session's commit.
 
 ---
 

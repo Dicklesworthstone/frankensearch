@@ -10994,6 +10994,14 @@ signed-dot transform or a packed transposed slab) remain separate veins.
 
 ### 2026-07-10 — cc_fse — ISA baseline check for -search: the "+avx2 build = free 2× on int8 ADC" fix does NOT apply — the hot int8 kernel is already AVX2 via RUNTIME DISPATCH, not the compile baseline (frankenscipy's 1.745× came from AUTOVECTORIZED code; this is explicit intrinsics)
 
+> **2026-07-31 cross-reference (BlackThrush):** the "Residual, non-zero
+> opportunity" paragraph below calls the `wide::f32x8` ceiling *small*. That
+> estimate was measured and **revised upward** on 2026-07-16 — see
+> *"REVISES 'expected SMALL': x86-64-v3 gives ~3.4-4.9x on the wide::f32x8
+> reduction SITE (`bd-yt8m`)"* later in this file. The site-level upside is
+> LARGE; only the end-to-end query gain stays bounded by the rescore-tail
+> fraction. Read the two rows together.
+
 **The hypothesis** (frankenredis popcount 3.14×, frankenscipy cholesky 1.745×): the workspace has no
 `.cargo/config.toml`, no `RUSTFLAGS`, no `target-cpu` — verified — so it builds at the **generic x86-64 baseline
 = SSE2 only**. If the int8 ADC scan were autovectorized SIMD, that would emit 128-bit SSE2 on AVX2 workers and a
