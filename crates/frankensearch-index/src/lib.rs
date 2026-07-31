@@ -42,6 +42,8 @@
 //! └───────────────────────────────────────────┘
 //! ```
 
+#[cfg(unix)]
+pub mod fd_acl;
 #[cfg(feature = "ann")]
 pub mod hnsw;
 pub mod in_memory;
