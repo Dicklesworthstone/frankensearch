@@ -2255,7 +2255,7 @@ impl PerfEvidenceArtifact {
         Ok(serde_json::to_string_pretty(&sealed)?)
     }
 
-    fn reconstructed_prebinding_bytes(&self) -> Result<Vec<u8>, EvidenceArtifactError> {
+    pub(crate) fn reconstructed_prebinding_bytes(&self) -> Result<Vec<u8>, EvidenceArtifactError> {
         let mut source = self.clone();
         source.machine_class =
             MachineClassEvidenceBinding::unverified("sealed runner receipt has not been bound");

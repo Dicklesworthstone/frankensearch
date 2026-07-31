@@ -4715,6 +4715,160 @@ fn seal_attempt_receipt(
 }
 
 #[cfg(test)]
+pub(crate) fn completed_attempt_receipt_for_test(
+    artifact: &PerfEvidenceArtifact,
+    fixture_selector: Option<&str>,
+    run_log_bytes: &[u8],
+    threshold_bytes: &[u8],
+    prebinding_bytes: &[u8],
+    bound_bytes: &[u8],
+) -> Vec<u8> {
+    let identity = artifact
+        .machine_class
+        .identity()
+        .expect("test evidence has an admitted runner identity");
+    let manifest = identity
+        .artifact_manifest()
+        .expect("test runner identity has an artifact manifest");
+    let canonical_bound = artifact
+        .canonical_json()
+        .expect("canonical test bound evidence");
+    assert_eq!(bound_bytes, canonical_bound.as_bytes());
+    assert_eq!(
+        prebinding_bytes,
+        artifact
+            .reconstructed_prebinding_bytes()
+            .expect("reconstructed test prebinding evidence")
+    );
+    identity
+        .verify_artifact_inputs(run_log_bytes, threshold_bytes, prebinding_bytes)
+        .expect("test runner identity binds exact artifact inputs");
+    let runner: RunnerReceipt =
+        serde_json::from_str(identity.receipt_json()).expect("test runner receipt JSON");
+    let registry = MachineClassRegistry::frozen().expect("frozen test registry");
+    let plan = PerfMatrixSpec::complete()
+        .applicability_plan(&registry, runner.derived_profile, PerfGate::Qg1)
+        .expect("canonical QG-1 test plan");
+    let selection = fixture_selector
+        .map(|fixture| LocalPerfRunSelection::for_fixture(fixture.to_owned()))
+        .transpose()
+        .expect("valid test fixture selector");
+    let resolved =
+        resolve_run_selection(&plan, selection.as_ref()).expect("resolved test run selection");
+    let artifact_cell_ids = evidence_cell_ids(artifact);
+    assert_eq!(
+        artifact_cell_ids, resolved.selected_cell_ids,
+        "test artifact must exactly equal its typed H2 selection"
+    );
+    let (retry, unavailable) =
+        attempt_derived_facts(LocalPerfAttemptOutcome::Completed).expect("completed test outcome");
+    let receipt = LocalPerfAttemptReceipt {
+        schema_version: LOCAL_PERF_ATTEMPT_RECEIPT_SCHEMA_VERSION.to_owned(),
+        mode: "measurement".to_owned(),
+        gate: PerfGate::Qg1.label().to_owned(),
+        profile: runner.derived_profile,
+        applicability_plan: plan.binding().clone(),
+        fixture_selector: resolved.fixture,
+        selected_cell_ids: resolved.selected_cell_ids,
+        run_id: artifact.provenance.run_id.clone(),
+        run_window: artifact.provenance.run_window.clone(),
+        registry_sha256: MACHINE_CLASS_REGISTRY_SHA256.to_owned(),
+        hardware: runner.hardware,
+        execution_request: runner.execution.request,
+        execution_start: runner.execution.start,
+        execution_end: Some(runner.execution.end),
+        end_capture_error: None,
+        build: runner.build,
+        durability: runner.durability,
+        post_run_identity_verified: true,
+        post_run_identity_error: None,
+        outcome: LocalPerfAttemptOutcome::Completed,
+        retry,
+        process_lifecycle: LocalPerfProcessLifecycle {
+            spawn_attempted: true,
+            spawn_succeeded: true,
+            wait_completed: true,
+            child_reaped: true,
+            run_log_synced: true,
+            run_log_captured: true,
+        },
+        internal_lifecycle_gaps: LocalPerfInternalLifecycleGaps {
+            actual_work: unavailable,
+            queue: unavailable,
+            workers_joined: unavailable,
+            feed_drained: unavailable,
+            pending_zero: unavailable,
+        },
+        unsupported_controls: vec![
+            LocalPerfUnsupportedControl::Timeout,
+            LocalPerfUnsupportedControl::Cancellation,
+        ],
+        run_log_sha256: Some(sha256_hex(run_log_bytes)),
+        bound_evidence_sha256: Some(sha256_hex(bound_bytes)),
+        runner_receipt_sha256: Some(identity.receipt_sha256().to_owned()),
+        runner_artifact_manifest_sha256: Some(manifest.manifest_sha256().to_owned()),
+        started_at_utc: runner.completion.started_at_utc,
+        finished_at_utc: runner.completion.finished_at_utc,
+        finished_timestamp_error: None,
+        seal_sha256: String::new(),
+    };
+    let bytes = seal_attempt_receipt(receipt).expect("seal completed H2 test receipt");
+    let verified =
+        LocalPerfAttemptReceipt::from_verified_slice(&bytes).expect("verify H2 test receipt");
+    verified
+        .verify_run_log(run_log_bytes)
+        .expect("verify H2 test run log");
+    verified
+        .verify_bound_evidence(bound_bytes)
+        .expect("verify H2 test bound evidence");
+    bytes
+}
+
+#[cfg(test)]
+pub(crate) fn failed_attempt_receipt_for_test(
+    artifact: &PerfEvidenceArtifact,
+    fixture_selector: Option<&str>,
+    run_log_bytes: &[u8],
+    threshold_bytes: &[u8],
+    prebinding_bytes: &[u8],
+    bound_bytes: &[u8],
+    code: i64,
+) -> Vec<u8> {
+    let completed_bytes = completed_attempt_receipt_for_test(
+        artifact,
+        fixture_selector,
+        run_log_bytes,
+        threshold_bytes,
+        prebinding_bytes,
+        bound_bytes,
+    );
+    let mut receipt = LocalPerfAttemptReceipt::from_verified_slice(&completed_bytes)
+        .expect("parse completed H2 test receipt");
+    let outcome = LocalPerfAttemptOutcome::ExitedNonzero { code };
+    let (retry, unavailable) =
+        attempt_derived_facts(outcome).expect("nonzero test outcome has a typed retry");
+    receipt.outcome = outcome;
+    receipt.retry = retry;
+    receipt.internal_lifecycle_gaps = LocalPerfInternalLifecycleGaps {
+        actual_work: unavailable,
+        queue: unavailable,
+        workers_joined: unavailable,
+        feed_drained: unavailable,
+        pending_zero: unavailable,
+    };
+    receipt.bound_evidence_sha256 = None;
+    receipt.runner_receipt_sha256 = None;
+    receipt.runner_artifact_manifest_sha256 = None;
+    let bytes = seal_attempt_receipt(receipt).expect("seal failed H2 test receipt");
+    let verified = LocalPerfAttemptReceipt::from_verified_slice(&bytes)
+        .expect("verify failed H2 test receipt");
+    verified
+        .verify_run_log(run_log_bytes)
+        .expect("verify failed H2 test run log");
+    bytes
+}
+
+#[cfg(test)]
 mod tests {
     use std::io::{BufRead, BufReader, Read};
 
