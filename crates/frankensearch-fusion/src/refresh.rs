@@ -36,11 +36,26 @@
 //! Installing a staged fast/quality pair over the canonical filenames is a
 //! SPLIT publication — two renames with no atomic pair authority. Until the
 //! composite generation-authority primitive lands (bd-xomn.1/.3), canonical
-//! publication of an identity-admissible v2 replacement is refused with the
-//! typed `composite-generation-authority-unavailable` reason, *before any
-//! queue drain*, so the permanent condition can never consume retry budget or
+//! publication of a fully admitted v2 replacement is refused with the typed
+//! `composite-generation-authority-unavailable` reason, *before any queue
+//! drain*, so the permanent condition can never consume retry budget or
 //! drop queued documents. [`RefreshWorker::publish_staged_canonical`] pins
 //! the same refusal at the staged seam.
+//!
+//! # Pre-drain classification is read-only and performs real admission (r2)
+//!
+//! The r2 successor of the NO-GO'd C4-write slice (868c0801) repairs the
+//! pre-drain seam in both directions:
+//! - what it CLAIMS it now PERFORMS: attested v2 tiers are fully admitted at
+//!   classification ([`VectorIndex::open_admitted_v2`]: exact binding,
+//!   recomputed content/docset digests) with the sealed owners retained, so
+//!   a header-valid/content-corrupt artifact fails with its own typed
+//!   corruption error instead of the composite-authority refusal;
+//! - what it MUST NOT do it no longer does: v1 tiers are classified through
+//!   the read-only [`frankensearch_index::two_tier::observe_tier`] — the
+//!   mutable [`VectorIndex::open`] (stale-WAL deletion, corrupt-trailer
+//!   truncation) never runs during classification, so a mixed v2+v1
+//!   generation can never mutate while being classified for refusal.
 //!
 //! # Lifecycle
 //!
@@ -64,9 +79,10 @@ use frankensearch_core::generation::{
 };
 use frankensearch_core::traits::{Embedder, IdentityBoundEmbedding};
 use frankensearch_core::{BoundQueryEmbedding, SpaceIdentityAdmission};
+use frankensearch_index::two_tier::{FsviTierObservation, observe_tier};
 use frankensearch_index::{
-    FsviAdmissionError, FsviInspection, FsviV2IdentityBinding, FsviV2IdentityMetadata,
-    TwoTierIndex, TwoTierIndexPaths, VECTOR_INDEX_FALLBACK_FILENAME, VECTOR_INDEX_FAST_FILENAME,
+    FsviAdmissionError, FsviV2IdentityBinding, FsviV2IdentityMetadata, TwoTierIndex,
+    TwoTierIndexPaths, VECTOR_INDEX_FALLBACK_FILENAME, VECTOR_INDEX_FAST_FILENAME,
     VECTOR_INDEX_QUALITY_FILENAME, ValidatedFsviBytes, VectorIndex, VectorMetadata,
 };
 
@@ -223,33 +239,46 @@ const STAGED_V2_DIR_NAME: &str = "v2-staged";
 enum TierState {
     /// No artifact at the tier's path.
     Missing,
-    /// Recognized legacy FSVI v1 bytes; `live` is true when the tier retains
-    /// a live main-slab row or a WAL-resident append.
-    LegacyV1 { live: bool },
+    /// Recognized legacy FSVI v1 bytes, established by READ-ONLY observation
+    /// only (r2 repair: classification never runs the mutable
+    /// [`VectorIndex::open`], which deletes stale WAL sidecars and truncates
+    /// corrupt WAL trailers). `retains_content` is
+    /// [`frankensearch_index::two_tier::FsviV1Observation::retains_content`]:
+    /// conservative — the main slab's `record_count` counts tombstoned rows
+    /// too, so an all-tombstoned v1 tier fails CLOSED here instead of
+    /// classifying as bootstrap-replaceable. Flag-level precision returns
+    /// when a read-only record-table inspector lands in the index crate root
+    /// (the observational-open train).
+    LegacyV1 { retains_content: bool },
     /// Identity-complete FSVI v2 header (attested identity available from
-    /// the artifact's own bytes). Content admission still happens through
-    /// [`VectorIndex::open_admitted_v2`].
+    /// the artifact's own bytes). Header recognition only: content admission
+    /// (digest recomputation, sealed-owner retention) is performed by
+    /// [`RefreshWorker::admit_existing_generation`] through
+    /// [`VectorIndex::open_admitted_v2`] before any admissibility claim is
+    /// made.
     V2 { metadata: Box<VectorMetadata> },
 }
 
-/// Inspect one tier artifact without mutating anything.
+/// Inspect one tier artifact without mutating anything — including its WAL
+/// sidecar and its timestamps, to the extent the platform allows.
 ///
-/// v2 recognition happens through [`VectorIndex::inspect`] because plain
-/// [`VectorIndex::open`] is strictly v1: any refresh branch keyed on
-/// `identity_v2()` from a plain open would be unreachable for on-disk v2.
+/// All recognition goes through the read-only
+/// [`frankensearch_index::two_tier::observe_tier`]: v2 because plain
+/// [`VectorIndex::open`] is strictly v1 (any refresh branch keyed on
+/// `identity_v2()` from a plain open would be unreachable for on-disk v2),
+/// and v1 because the mutable open's WAL side effects
+/// (stale-sidecar deletion, corrupt-trailer truncation) must never fire
+/// during classification (NO-GO item 2, 868c0801 refresh.rs:244-250).
 fn inspect_tier(path: &Path) -> SearchResult<TierState> {
     if !path.exists() {
         return Ok(TierState::Missing);
     }
-    match VectorIndex::inspect(path)? {
-        FsviInspection::V2IdentityComplete(metadata) => Ok(TierState::V2 { metadata }),
-        FsviInspection::ReindexRequired(_) => {
-            let index = VectorIndex::open(path)?;
-            Ok(TierState::LegacyV1 {
-                live: index_has_live_vectors(&index),
-            })
-        }
-        FsviInspection::UpgradeRequired(upgrade) => Err(SearchError::InvalidConfig {
+    match observe_tier(path)? {
+        FsviTierObservation::V2IdentityComplete(metadata) => Ok(TierState::V2 { metadata }),
+        FsviTierObservation::V1(observation) => Ok(TierState::LegacyV1 {
+            retains_content: observation.retains_content(),
+        }),
+        FsviTierObservation::UpgradeRequired(upgrade) => Err(SearchError::InvalidConfig {
             field: "refresh.index_format".to_owned(),
             value: format!("fsvi-v{}", upgrade.found_version),
             reason: format!(
@@ -259,11 +288,6 @@ fn inspect_tier(path: &Path) -> SearchResult<TierState> {
             ),
         }),
     }
-}
-
-fn index_has_live_vectors(index: &VectorIndex) -> bool {
-    index.wal_records().next().is_some()
-        || (0..index.record_count()).any(|record_index| !index.is_deleted(record_index))
 }
 
 /// The landed generation-containment refusal for identityless legacy tiers
@@ -293,9 +317,14 @@ fn quality_republication_unavailable() -> SearchError {
     }
 }
 
-/// The bd-xomn composite-generation-authority gate (C4-write disposition).
+/// The bd-xomn composite-generation-authority gate (C4-write disposition,
+/// r2 wording).
 ///
-/// The identity gates PASSED — the merge itself is admissible — but
+/// This refusal is only reachable AFTER the existing generation was FULLY
+/// ADMITTED ([`RefreshWorker::admit_existing_generation`]): header identity
+/// gates joined, content and docset digests recomputed byte-for-byte via
+/// [`VectorIndex::open_admitted_v2`], and the sealed owners retained through
+/// the check. What remains unavailable is only canonical INSTALLATION:
 /// installing a fast/quality replacement over the canonical filenames is a
 /// split two-rename publication with no atomic pair authority. This slice
 /// deliberately does not invent one; canonical publication reopens when the
@@ -307,11 +336,12 @@ fn composite_authority_refusal(index_dir: &Path) -> SearchError {
         field: "refresh.canonical_publication".to_owned(),
         value: "composite-generation-authority-unavailable".to_owned(),
         reason: format!(
-            "the identity-bound v2 replacement for {} is admissible (and can be staged and \
-             proven via stage_identity_bound_generation), but canonical installation of a \
-             split fast/quality generation pair is refused until the composite \
-             generation-authority primitive lands (bd-xomn.1/.3); no per-tier rename \
-             sequence can make the pair atomic",
+            "the existing generation for {} was fully admitted (header identity gates plus \
+             recomputed content/docset digests via exact v2 admission), and an identity-bound \
+             replacement can be staged and proven via stage_identity_bound_generation, but \
+             canonical installation of a split fast/quality generation pair is refused until \
+             the composite generation-authority primitive lands (bd-xomn.1/.3); no per-tier \
+             rename sequence can make the pair atomic",
             index_dir.display()
         ),
     }
@@ -575,7 +605,20 @@ fn admit_attested_tier(
     Ok(())
 }
 
-/// Admit one existing attested canonical tier exactly and return the sealed
+/// One existing canonical tier admitted IN FULL at classification time:
+/// binding reconstructed from the artifact's own header, content and docset
+/// digests recomputed via [`VectorIndex::open_admitted_v2`], and the sealed
+/// owner retained (never peeled).
+struct AdmittedCanonicalTier {
+    /// The retained sealed admission owner. Its `Arc`'d bytes — not the
+    /// canonical pathname — are the authority for every subsequent read.
+    owner: ValidatedFsviBytes,
+    /// Attested space fingerprint (lowercase hex) read from the artifact's
+    /// own validated header.
+    attested_space_hex: String,
+}
+
+/// Admit one existing attested canonical tier exactly and retain the sealed
 /// owner plus the attested space fingerprint (lowercase hex) read from the
 /// artifact's own header.
 fn admit_existing_tier(
@@ -583,12 +626,15 @@ fn admit_existing_tier(
     metadata: &VectorMetadata,
     embedder: &dyn Embedder,
     tier: &str,
-) -> SearchResult<(ValidatedFsviBytes, String)> {
+) -> SearchResult<AdmittedCanonicalTier> {
     let attested_space_hex = fingerprint_hex(&v2_identity_of(metadata, tier)?.space_fingerprint);
     let binding = reconstruct_admission_binding(metadata, embedder.identity()?, tier)?;
     let owner = VectorIndex::open_admitted_v2(path, &binding)
         .map_err(|error| admission_error_to_refresh_error(error, tier, path))?;
-    Ok((owner, attested_space_hex))
+    Ok(AdmittedCanonicalTier {
+        owner,
+        attested_space_hex,
+    })
 }
 
 /// Next generation sequence for a staged replacement: the attested prior
@@ -612,14 +658,31 @@ fn next_generation_sequence(prior: Option<&ValidatedFsviBytes>) -> SearchResult<
 }
 
 /// Classification of the existing canonical generation after all identity
-/// gates have been applied.
+/// gates AND full content admission have been applied
+/// ([`RefreshWorker::admit_existing_generation`]).
+// One value exists per classification and it lives for one cycle step; the
+// variant-size asymmetry (retained sealed owners vs. no data) is the point
+// of the r2 repair, not an allocation concern worth a Box indirection.
+#[allow(clippy::large_enum_variant)]
 enum ExistingGenerationClass {
     /// Nothing is retained on disk (missing artifacts or empty legacy v1
     /// seeds): a bootstrap replacement cannot mix vector spaces.
     BootstrapReplaceable,
-    /// At least one tier is an attested FSVI v2 artifact and every gate
-    /// (space join, `SameProducer`, quality republication capability) passed.
-    AttestedV2,
+    /// At least one tier is an attested FSVI v2 artifact, every gate (space
+    /// join, `SameProducer`, quality republication capability) passed, and
+    /// every attested tier was FULLY ADMITTED through
+    /// [`VectorIndex::open_admitted_v2`] — content and docset digests
+    /// recomputed — with the sealed owners RETAINED here. A header-valid but
+    /// content-corrupt artifact can never reach this variant (it fails
+    /// admission with its own typed corruption error instead).
+    AttestedV2 {
+        /// Retained admission owner of the canonical fast tier, when it is
+        /// an attested v2 artifact.
+        fast: Option<AdmittedCanonicalTier>,
+        /// Retained admission owner of the canonical quality tier, when it
+        /// is an attested v2 artifact.
+        quality: Option<AdmittedCanonicalTier>,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -627,17 +690,23 @@ enum ExistingGenerationClass {
 // ---------------------------------------------------------------------------
 
 /// A proven, non-canonical identity-bound v2 replacement generation
-/// (bd-9xuj T2 C4-write).
+/// (bd-9xuj T2 C4-write, owner retention per r2).
 ///
 /// Produced by [`RefreshWorker::stage_identity_bound_generation`]: the tiers
 /// live under the `v2-staged/` subdirectory of the index dir — never the
 /// canonical filenames — and `index` is the staged pair re-admitted through
 /// [`TwoTierIndex::open_admitted_v2_with_paths`], so its identity is
-/// header-ATTESTED (`index.fast_identity_is_attested()`). Canonical
-/// installation is refused by [`RefreshWorker::publish_staged_canonical`]
-/// until the composite generation-authority primitive lands.
+/// header-ATTESTED (`index.fast_identity_is_attested()`) and the sealed
+/// [`ValidatedFsviBytes`] admission owners are RETAINED inside it
+/// ([`Self::fast_admitted_owner`] / [`Self::quality_admitted_owner`]): the
+/// `Arc`'d bytes, complete witness, and publication state stay the authority
+/// for every read — replacing or renaming the staged files afterwards cannot
+/// alter what this generation serves. Canonical installation is refused by
+/// [`RefreshWorker::publish_staged_canonical`] until the composite
+/// generation-authority primitive lands.
 pub struct StagedIdentityBoundGeneration {
-    /// The staged generation, opened through exact v2 admission.
+    /// The staged generation, opened through exact v2 admission with its
+    /// sealed owners retained.
     pub index: TwoTierIndex,
     /// Staged fast-tier artifact path.
     pub fast_path: PathBuf,
@@ -647,6 +716,26 @@ pub struct StagedIdentityBoundGeneration {
     pub fast_binding: FsviV2IdentityBinding,
     /// Exact binding the staged quality tier was written and admitted under.
     pub quality_binding: Option<FsviV2IdentityBinding>,
+}
+
+impl StagedIdentityBoundGeneration {
+    /// The retained sealed admission owner of the staged fast tier.
+    ///
+    /// Always `Some` for a value produced by
+    /// [`RefreshWorker::stage_identity_bound_generation`] (the staged pair
+    /// is opened exclusively through exact v2 admission); typed as `Option`
+    /// only because `index` is a public field.
+    #[must_use]
+    pub fn fast_admitted_owner(&self) -> Option<&ValidatedFsviBytes> {
+        self.index.fast_admitted_owner()
+    }
+
+    /// The retained sealed admission owner of the staged quality tier, when
+    /// a quality tier was staged.
+    #[must_use]
+    pub fn quality_admitted_owner(&self) -> Option<&ValidatedFsviBytes> {
+        self.index.quality_admitted_owner()
+    }
 }
 
 impl std::fmt::Debug for StagedIdentityBoundGeneration {
@@ -682,16 +771,22 @@ impl std::fmt::Debug for StagedIdentityBoundGeneration {
 /// 3. Rebuilds the `TwoTierIndex` (bootstrap lane) or refuses typed
 /// 4. Atomically replaces the cached index via [`IndexCache::replace`]
 ///
-/// # Identity admission boundary
+/// # Identity admission boundary (r2)
 ///
 /// A canonical generation that retains content is admissible for replacement
-/// only when its identity is ATTESTED (FSVI v2 header) and joins the
-/// executing embedders' identity as the same space and the same producer.
-/// Live v1 tiers keep the landed containment refusal
-/// (`identityless-fsvi-v1`). Admissible v2 replacements can be staged and
-/// proven ([`Self::stage_identity_bound_generation`]) but canonical
-/// installation is refused pre-drain until composite generation authority
-/// lands (see the module docs).
+/// only when its identity is ATTESTED (FSVI v2 header), joins the executing
+/// embedders' identity as the same space and the same producer, AND fully
+/// admits through [`VectorIndex::open_admitted_v2`] — content and docset
+/// digests recomputed, sealed owners retained. Pre-drain classification is
+/// strictly READ-ONLY on the canonical artifacts: v1 tiers are observed
+/// header-only (never the mutable [`VectorIndex::open`], which deletes stale
+/// WAL sidecars and truncates corrupt trailers), and content-retaining v1
+/// tiers keep the landed containment refusal (`identityless-fsvi-v1`),
+/// applied conservatively (an all-tombstoned v1 slab fails closed). Fully
+/// admitted v2 replacements can be staged and proven
+/// ([`Self::stage_identity_bound_generation`]) but canonical installation is
+/// refused pre-drain until composite generation authority lands (see the
+/// module docs).
 ///
 /// # Cancellation
 ///
@@ -1126,24 +1221,44 @@ impl RefreshWorker {
     }
 
     /// Apply the full identity admission law to the existing canonical
-    /// generation (guards 2, 7, 8).
+    /// generation (guards 2, 7, 8) and PERFORM the admission it claims
+    /// (r2 repair of NO-GO item 1: the r1 revision stopped at header
+    /// inspection, so a header-valid/content-corrupt v2 artifact sailed past
+    /// to the wrong refusal).
     ///
-    /// - live legacy v1 tiers keep the landed containment refusal, the fast
-    ///   tier named first (matching origin 5386b39e);
+    /// - content-retaining legacy v1 tiers keep the landed containment
+    ///   refusal, the fast tier named first (matching origin 5386b39e);
+    ///   liveness is the conservative READ-ONLY observation (see
+    ///   [`TierState::LegacyV1`]) — classification never mutably opens a v1
+    ///   tier;
     /// - attested v2 tiers are gated per tier: space join against the
     ///   artifact's OWN header fingerprints, then SameProducer-only producer
-    ///   conformance; an attested quality tier additionally requires a
-    ///   quality embedder capable of republishing it;
+    ///   conformance (cheap, typed refusals first); an attested quality tier
+    ///   additionally requires a quality embedder capable of republishing
+    ///   it; then each attested tier is FULLY ADMITTED via
+    ///   [`VectorIndex::open_admitted_v2`] — exact binding reconstruction,
+    ///   content/docset digest recomputation — and the sealed owner is
+    ///   RETAINED in the returned classification;
     /// - only a content-free generation (missing artifacts or empty v1
     ///   seeds) classifies as bootstrap-replaceable.
-    fn classify_existing_generation(
+    fn admit_existing_generation(
         &self,
         fast_state: &TierState,
         quality_state: &TierState,
     ) -> SearchResult<ExistingGenerationClass> {
-        let fast_v1_live = matches!(fast_state, TierState::LegacyV1 { live: true });
-        let quality_v1_live = matches!(quality_state, TierState::LegacyV1 { live: true });
-        if fast_v1_live || quality_v1_live {
+        let fast_v1_retains = matches!(
+            fast_state,
+            TierState::LegacyV1 {
+                retains_content: true
+            }
+        );
+        let quality_v1_retains = matches!(
+            quality_state,
+            TierState::LegacyV1 {
+                retains_content: true
+            }
+        );
+        if fast_v1_retains || quality_v1_retains {
             // Name the fast tier whenever it is identityless, else quality —
             // the same attribution the landed containment refusal used.
             let tier = if matches!(fast_state, TierState::LegacyV1 { .. }) {
@@ -1160,29 +1275,55 @@ impl RefreshWorker {
             return Ok(ExistingGenerationClass::BootstrapReplaceable);
         }
 
-        if let TierState::V2 { metadata } = fast_state {
+        let fast = if let TierState::V2 { metadata } = fast_state {
             let bundle = artifact_identity_for(self.fast_embedder.as_ref())?;
             admit_attested_tier("fast", metadata, &bundle)?;
-        }
-        if let TierState::V2 { metadata } = quality_state {
+            let path =
+                self.resolve_existing_fast_path()
+                    .ok_or_else(|| SearchError::IndexNotFound {
+                        path: self.config.index_dir.join(VECTOR_INDEX_FAST_FILENAME),
+                    })?;
+            Some(admit_existing_tier(
+                &path,
+                metadata,
+                self.fast_embedder.as_ref(),
+                "fast",
+            )?)
+        } else {
+            None
+        };
+        let quality = if let TierState::V2 { metadata } = quality_state {
             let Some(quality_embedder) = &self.quality_embedder else {
                 return Err(quality_republication_unavailable());
             };
             let bundle = artifact_identity_for(quality_embedder.as_ref())?;
             admit_attested_tier("quality", metadata, &bundle)?;
-        }
-        Ok(ExistingGenerationClass::AttestedV2)
+            let path = self.config.index_dir.join(VECTOR_INDEX_QUALITY_FILENAME);
+            Some(admit_existing_tier(
+                &path,
+                metadata,
+                quality_embedder.as_ref(),
+                "quality",
+            )?)
+        } else {
+            None
+        };
+        Ok(ExistingGenerationClass::AttestedV2 { fast, quality })
     }
 
     /// Pre-drain admission for the canonical cycle: only the bootstrap lane
-    /// may proceed; an identity-admissible attested v2 replacement refuses
-    /// with the composite generation-authority reason (see the module docs
-    /// and [`composite_authority_refusal`]).
+    /// may proceed; a FULLY ADMITTED attested v2 generation (content digests
+    /// recomputed, owners retained through the check) refuses with the
+    /// composite generation-authority reason (see the module docs and
+    /// [`composite_authority_refusal`]). The retained owners are dropped
+    /// here because the refusal aborts the cycle before any consumer exists;
+    /// [`Self::stage_identity_bound_generation`] is the path that carries
+    /// them forward.
     fn ensure_canonical_cycle_admissible(&self) -> SearchResult<()> {
         let (fast_state, quality_state) = self.canonical_tier_states()?;
-        match self.classify_existing_generation(&fast_state, &quality_state)? {
+        match self.admit_existing_generation(&fast_state, &quality_state)? {
             ExistingGenerationClass::BootstrapReplaceable => Ok(()),
-            ExistingGenerationClass::AttestedV2 => {
+            ExistingGenerationClass::AttestedV2 { .. } => {
                 Err(composite_authority_refusal(&self.config.index_dir))
             }
         }
@@ -1379,46 +1520,23 @@ impl RefreshWorker {
         cx: &Cx,
         jobs: &[EmbeddingJob],
     ) -> SearchResult<StagedIdentityBoundGeneration> {
-        // 1. Gates over the existing canonical generation (typed refusals,
-        //    fast-first, identical to the canonical lane).
+        // 1+3 (merged in r2). Gates over the existing canonical generation
+        //    (typed refusals, fast-first, identical to the canonical lane)
+        //    AND exact admission of the existing attested tiers in the same
+        //    step: the reconstructed binding re-proves space/producer/input
+        //    equality bit-for-bit against the artifact's own header, the
+        //    content/docset digests are recomputed, and the sealed owners
+        //    are RETAINED — the same owners the pre-drain check proves, not
+        //    a second open.
         let (fast_state, quality_state) = self.canonical_tier_states()?;
-        self.classify_existing_generation(&fast_state, &quality_state)?;
+        let (fast_admitted, quality_admitted) =
+            match self.admit_existing_generation(&fast_state, &quality_state)? {
+                ExistingGenerationClass::BootstrapReplaceable => (None, None),
+                ExistingGenerationClass::AttestedV2 { fast, quality } => (fast, quality),
+            };
 
         // 2. Harvest identity-bound records (strict; no queue interaction).
         let records = self.embed_jobs_bound_strict(cx, jobs).await?;
-
-        // 3. Exact admission of the existing attested tiers. The
-        //    reconstructed binding re-proves space/producer/input equality
-        //    bit-for-bit against the artifact's own header.
-        let fast_admitted = if let TierState::V2 { metadata } = &fast_state {
-            let path =
-                self.resolve_existing_fast_path()
-                    .ok_or_else(|| SearchError::IndexNotFound {
-                        path: self.config.index_dir.join(VECTOR_INDEX_FAST_FILENAME),
-                    })?;
-            Some(admit_existing_tier(
-                &path,
-                metadata,
-                self.fast_embedder.as_ref(),
-                "fast",
-            )?)
-        } else {
-            None
-        };
-        let quality_admitted = if let TierState::V2 { metadata } = &quality_state {
-            let Some(quality_embedder) = &self.quality_embedder else {
-                return Err(quality_republication_unavailable());
-            };
-            let path = self.config.index_dir.join(VECTOR_INDEX_QUALITY_FILENAME);
-            Some(admit_existing_tier(
-                &path,
-                metadata,
-                quality_embedder.as_ref(),
-                "quality",
-            )?)
-        } else {
-            None
-        };
 
         // 4. Per-embedding seam verification (C1r2 verifiers): each bound
         //    embedding must be the same producer as the identity being
@@ -1439,7 +1557,10 @@ impl RefreshWorker {
         };
         for record in &records {
             require_same_producer(&record.fast_embedding, &fast_expected, "fast")?;
-            if let Some((_, attested_space_hex)) = &fast_admitted {
+            if let Some(AdmittedCanonicalTier {
+                attested_space_hex, ..
+            }) = &fast_admitted
+            {
                 record
                     .fast_embedding
                     .verify_space_identity(attested_space_hex, "fast")?;
@@ -1454,7 +1575,10 @@ impl RefreshWorker {
                     });
                 };
                 require_same_producer(quality_embedding, expected, "quality")?;
-                if let Some((_, attested_space_hex)) = &quality_admitted {
+                if let Some(AdmittedCanonicalTier {
+                    attested_space_hex, ..
+                }) = &quality_admitted
+                {
                     quality_embedding.verify_space_identity(attested_space_hex, "quality")?;
                 }
             }
@@ -1463,9 +1587,16 @@ impl RefreshWorker {
         // 5. Merge: carried live rows first (tombstones stay dead), then the
         //    new records override per doc_id (last write in the batch wins).
         let mut merged: HashMap<String, (Vec<f32>, Option<Vec<f32>>)> = HashMap::new();
-        if let Some((fast_owner, _)) = &fast_admitted {
+        if let Some(AdmittedCanonicalTier {
+            owner: fast_owner, ..
+        }) = &fast_admitted
+        {
             let mut quality_lookup: HashMap<String, Vec<f32>> = HashMap::new();
-            if let Some((quality_owner, _)) = &quality_admitted {
+            if let Some(AdmittedCanonicalTier {
+                owner: quality_owner,
+                ..
+            }) = &quality_admitted
+            {
                 for i in 0..quality_owner.record_count() {
                     let row = quality_owner.row(i)?;
                     if !row.flags().is_live() {
@@ -1521,7 +1652,7 @@ impl RefreshWorker {
         let _ = std::fs::remove_file(&staged_quality);
 
         let fast_sequence =
-            next_generation_sequence(fast_admitted.as_ref().map(|(owner, _)| owner))?;
+            next_generation_sequence(fast_admitted.as_ref().map(|tier| &tier.owner))?;
         let fast_artifact_bundle = artifact_identity_for(self.fast_embedder.as_ref())?;
         let fast_generation = ArtifactGenerationIdentityV1::new(
             fast_sequence,
@@ -1550,7 +1681,7 @@ impl RefreshWorker {
                 });
             };
             let quality_sequence =
-                next_generation_sequence(quality_admitted.as_ref().map(|(owner, _)| owner))?;
+                next_generation_sequence(quality_admitted.as_ref().map(|tier| &tier.owner))?;
             let quality_bundle = artifact_identity_for(quality_embedder.as_ref())?;
             let quality_generation = ArtifactGenerationIdentityV1::new(
                 quality_sequence,
@@ -3470,6 +3601,542 @@ mod tests {
                 "identity-bound-republication-unavailable",
             );
             assert_eq!(queue.pending_count(), 1, "pre-drain refusal");
+        });
+    }
+
+    // ─── C4-write r2: read-only pre-drain classification + retained owners ──
+
+    /// Sorted (name, byte length, mtime) manifest of a directory's entries —
+    /// the invariance witness for "classification touched nothing here".
+    /// atime is deliberately NOT asserted (relatime makes it flaky and the
+    /// no-atime open is best-effort by platform).
+    fn dir_manifest(dir: &Path) -> Vec<(String, u64, std::time::SystemTime)> {
+        let mut entries: Vec<(String, u64, std::time::SystemTime)> = std::fs::read_dir(dir)
+            .expect("read dir")
+            .map(|entry| {
+                let entry = entry.expect("dir entry");
+                let metadata = entry.metadata().expect("entry metadata");
+                (
+                    entry.file_name().to_string_lossy().into_owned(),
+                    metadata.len(),
+                    metadata.modified().expect("entry mtime"),
+                )
+            })
+            .collect();
+        entries.sort();
+        entries
+    }
+
+    /// Plant a WAL sidecar beside `target_main` whose compaction generation
+    /// cannot match the target's generation-0 main slab: the donor index is
+    /// compacted once (main generation 0 -> 1) before the donor WAL is
+    /// written, so the transplanted WAL carries generation next(1) = 2 while
+    /// the target expects next(0) = 1.
+    ///
+    /// A control copy proves the staleness precondition the hazardous way:
+    /// mutable `VectorIndex::open` on a copy of the pair DELETES the WAL.
+    fn transplant_stale_wal(label: &str, target_main: &Path, dimension: usize) {
+        use frankensearch_index::wal::wal_path_for;
+
+        let donor_dir = temp_index_dir(&format!("{label}-wal-donor"));
+        let donor_main = donor_dir.join("donor.idx");
+        let mut writer =
+            VectorIndex::create(&donor_main, "stub-fast", dimension).expect("create donor");
+        writer
+            .write_record("donor-seed", &normalized(dimension, 0.91))
+            .expect("write donor seed");
+        writer.finish().expect("finish donor");
+        {
+            let mut donor = VectorIndex::open(&donor_main).expect("open donor");
+            donor
+                .append("donor-wal-pre", &normalized(dimension, 0.81))
+                .expect("append pre-compaction");
+            donor.compact().expect("compact donor to bump generation");
+            donor
+                .append("donor-wal-resident", &normalized(dimension, 0.71))
+                .expect("append post-compaction");
+        }
+        let donor_wal = wal_path_for(&donor_main);
+        assert!(donor_wal.exists(), "donor WAL must exist");
+        std::fs::copy(&donor_wal, wal_path_for(target_main)).expect("transplant WAL");
+
+        // Control arm: prove the transplanted WAL is stale for a
+        // generation-0 main slab by demonstrating the exact hazard on a
+        // throwaway copy — the mutable v1 open deletes it.
+        let control_dir = temp_index_dir(&format!("{label}-wal-control"));
+        let control_main = control_dir.join("control.idx");
+        std::fs::copy(target_main, &control_main).expect("copy control main");
+        std::fs::copy(&donor_wal, wal_path_for(&control_main)).expect("copy control wal");
+        let _ = VectorIndex::open(&control_main).expect("control open");
+        assert!(
+            !wal_path_for(&control_main).exists(),
+            "control precondition: the transplanted WAL must be STALE for the target \
+             (mutable VectorIndex::open deletes it)"
+        );
+    }
+
+    /// Required test (i), stale-WAL v1 case — RED on 868c0801: the r1
+    /// pre-drain classification routed v1 tiers through the mutable
+    /// `VectorIndex::open` (refresh.rs:244-250 there), which DELETES a stale
+    /// WAL sidecar during what claims to be classification. r2 classifies
+    /// read-only: refusal fires with the canonical directory byte-identical.
+    #[test]
+    fn classification_never_deletes_a_stale_wal_v1() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let dir = temp_index_dir("r2-stale-wal-invariance");
+            let queue = make_queue(100);
+            let (worker, _cache) = make_worker(queue.clone(), &dir, 256);
+
+            submit(&queue, "doc-1", "First document");
+            worker.run_cycle(&cx).await.expect("bootstrap cycle");
+
+            let fast_path = dir.join(VECTOR_INDEX_FAST_FILENAME);
+            transplant_stale_wal("r2-stale", &fast_path, 256);
+            let wal_path = frankensearch_index::wal::wal_path_for(&fast_path);
+            let fast_bytes = std::fs::read(&fast_path).expect("read fast");
+            let wal_bytes = std::fs::read(&wal_path).expect("read wal");
+            let manifest_before = dir_manifest(&dir);
+
+            submit(&queue, "doc-2", "Second document");
+            let error = worker
+                .run_cycle(&cx)
+                .await
+                .expect_err("content-retaining v1 must refuse identityless");
+            assert_invalid_config(
+                &error,
+                "refresh.fast_index_identity",
+                "identityless-fsvi-v1",
+            );
+
+            assert!(
+                wal_path.exists(),
+                "read-only classification must NEVER delete a stale WAL sidecar"
+            );
+            assert_eq!(
+                std::fs::read(&wal_path).expect("reread wal"),
+                wal_bytes,
+                "WAL bytes must be untouched by classification"
+            );
+            assert_eq!(
+                std::fs::read(&fast_path).expect("reread fast"),
+                fast_bytes,
+                "main artifact bytes must be untouched by classification"
+            );
+            assert_eq!(
+                dir_manifest(&dir),
+                manifest_before,
+                "no file in the canonical directory may change (names, sizes, mtimes)"
+            );
+            assert_eq!(queue.pending_count(), 1, "refusal fires before drain");
+        });
+    }
+
+    /// Required test (i), corrupt-trailer v1 case — RED on 868c0801: the
+    /// mutable open TRUNCATES a corrupt WAL trailer during classification.
+    /// r2 leaves the trailer bytes exactly in place.
+    #[test]
+    fn classification_never_truncates_a_corrupt_wal_trailer_v1() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let dir = temp_index_dir("r2-corrupt-trailer-invariance");
+            let queue = make_queue(100);
+            let (worker, _cache) = make_worker(queue.clone(), &dir, 256);
+
+            submit(&queue, "doc-1", "First document");
+            worker.run_cycle(&cx).await.expect("bootstrap cycle");
+
+            let fast_path = dir.join(VECTOR_INDEX_FAST_FILENAME);
+            {
+                let mut index = VectorIndex::open(&fast_path).expect("fixture open");
+                index
+                    .append("doc-wal", &normalized(256, 0.55))
+                    .expect("append fresh WAL resident");
+            }
+            let wal_path = frankensearch_index::wal::wal_path_for(&fast_path);
+            {
+                use std::io::Write as _;
+                let mut wal_file = std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(&wal_path)
+                    .expect("open wal for corruption");
+                wal_file
+                    .write_all(&[0xAB; 32])
+                    .expect("append corrupt trailer");
+            }
+            let wal_bytes = std::fs::read(&wal_path).expect("read wal");
+            let manifest_before = dir_manifest(&dir);
+
+            // Control arm: the mutable open truncates this trailer.
+            {
+                let control_dir = temp_index_dir("r2-corrupt-trailer-control");
+                let control_main = control_dir.join("control.idx");
+                std::fs::copy(&fast_path, &control_main).expect("copy control main");
+                let control_wal = frankensearch_index::wal::wal_path_for(&control_main);
+                std::fs::copy(&wal_path, &control_wal).expect("copy control wal");
+                let _ = VectorIndex::open(&control_main).expect("control open");
+                assert!(
+                    std::fs::metadata(&control_wal)
+                        .expect("stat control wal")
+                        .len()
+                        < wal_bytes.len() as u64,
+                    "control precondition: mutable open truncates the corrupt trailer"
+                );
+            }
+
+            submit(&queue, "doc-2", "Second document");
+            let error = worker
+                .run_cycle(&cx)
+                .await
+                .expect_err("content-retaining v1 must refuse identityless");
+            assert_invalid_config(
+                &error,
+                "refresh.fast_index_identity",
+                "identityless-fsvi-v1",
+            );
+
+            assert_eq!(
+                std::fs::read(&wal_path).expect("reread wal"),
+                wal_bytes,
+                "read-only classification must NEVER truncate a corrupt WAL trailer"
+            );
+            assert_eq!(
+                dir_manifest(&dir),
+                manifest_before,
+                "no file in the canonical directory may change"
+            );
+            assert_eq!(queue.pending_count(), 1, "refusal fires before drain");
+        });
+    }
+
+    /// Required test (ii) — RED on 868c0801: a mixed v2-fast + v1-quality
+    /// generation must classify (and refuse, on the quality tier) without
+    /// mutating EITHER tier. Under r1, classifying the v1 quality tier ran
+    /// the mutable open, which deleted its stale WAL before the refusal.
+    #[test]
+    fn mixed_v2_fast_v1_quality_classifies_without_mutating_either() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let embedder = Arc::new(StubEmbedder::new("v2-stub", V2_DIM));
+            let (dir, cache, _binding, fast_path) = v2_canonical_fixture(
+                "r2-mixed-generation",
+                embedder.identity_bundle(),
+                &[("doc-old", normalized(V2_DIM, 0.5))],
+                4,
+            );
+
+            // Content-retaining v1 quality tier with a stale WAL beside it.
+            let quality_path = dir.join(VECTOR_INDEX_QUALITY_FILENAME);
+            let mut writer =
+                VectorIndex::create(&quality_path, "stub-quality", 256).expect("create quality");
+            writer
+                .write_record("q-doc", &normalized(256, 0.4))
+                .expect("write quality row");
+            writer.finish().expect("finish quality");
+            transplant_stale_wal("r2-mixed", &quality_path, 256);
+            let quality_wal = frankensearch_index::wal::wal_path_for(&quality_path);
+
+            let fast_bytes = std::fs::read(&fast_path).expect("read v2 fast");
+            let quality_bytes = std::fs::read(&quality_path).expect("read v1 quality");
+            let wal_bytes = std::fs::read(&quality_wal).expect("read quality wal");
+            let manifest_before = dir_manifest(&dir);
+
+            let queue = make_queue(100);
+            submit(&queue, "doc-new", "new document");
+            let worker = RefreshWorker::new(
+                RefreshWorkerConfig::new(&dir),
+                queue.clone(),
+                embedder,
+                cache,
+            );
+            let error = worker
+                .run_cycle(&cx)
+                .await
+                .expect_err("mixed generation with content-retaining v1 quality must refuse");
+            assert_invalid_config(
+                &error,
+                "refresh.quality_index_identity",
+                "identityless-fsvi-v1",
+            );
+
+            assert_eq!(
+                std::fs::read(&fast_path).expect("reread v2 fast"),
+                fast_bytes,
+                "the v2 fast tier must be untouched"
+            );
+            assert_eq!(
+                std::fs::read(&quality_path).expect("reread v1 quality"),
+                quality_bytes,
+                "the v1 quality tier must be untouched"
+            );
+            assert!(
+                quality_wal.exists(),
+                "classification must not delete the v1 quality tier's stale WAL"
+            );
+            assert_eq!(
+                std::fs::read(&quality_wal).expect("reread quality wal"),
+                wal_bytes,
+                "the quality WAL must be byte-identical"
+            );
+            assert_eq!(dir_manifest(&dir), manifest_before);
+            assert_eq!(queue.pending_count(), 1, "refusal fires before drain");
+            let drained = queue.drain_batch();
+            assert_eq!(drained[0].retry_count, 0, "no retry budget consumed");
+        });
+    }
+
+    /// Required test (iii) — RED on 868c0801: a header-valid but
+    /// content-corrupt v2 artifact must fail ADMISSION with its own typed
+    /// corruption error, not sail past a header-only check to the
+    /// composite-authority refusal (which would falsely certify the
+    /// generation as fully admitted). Option-A choice: pre-drain performs
+    /// full `open_admitted_v2` admission, so the digest recomputation
+    /// catches the corruption.
+    #[test]
+    fn header_valid_content_corrupt_v2_refuses_admission_not_composite() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let embedder = Arc::new(StubEmbedder::new("v2-stub", V2_DIM));
+            let (dir, cache, _binding, fast_path) = v2_canonical_fixture(
+                "r2-content-corrupt-v2",
+                embedder.identity_bundle(),
+                &[("doc-old", normalized(V2_DIM, 0.5))],
+                6,
+            );
+
+            // Flip one byte in the vector slab (the file tail): the header —
+            // including its CRC — stays valid, so header-only inspection
+            // still reports identity-complete v2.
+            let mut bytes = std::fs::read(&fast_path).expect("read canonical");
+            let last = bytes.len() - 1;
+            bytes[last] ^= 0xFF;
+            std::fs::write(&fast_path, &bytes).expect("plant content corruption");
+
+            let queue = make_queue(100);
+            submit(&queue, "doc-new", "new document");
+            let worker = RefreshWorker::new(
+                RefreshWorkerConfig::new(&dir),
+                queue.clone(),
+                embedder,
+                cache,
+            );
+            let error = worker
+                .run_cycle(&cx)
+                .await
+                .expect_err("content-corrupt v2 must fail admission");
+
+            assert!(
+                matches!(error, SearchError::IndexCorrupted { .. }),
+                "the refusal must be the admission's own typed corruption error, got {error:?}"
+            );
+            assert!(
+                error.to_string().contains("digest mismatch"),
+                "the corruption must be caught by digest recomputation, got: {error}"
+            );
+            assert!(
+                !error.to_string().contains("composite-generation-authority"),
+                "a content-corrupt artifact must never reach the composite-authority refusal"
+            );
+            assert_eq!(queue.pending_count(), 1, "refusal fires before drain");
+            let drained = queue.drain_batch();
+            assert_eq!(drained[0].retry_count, 0, "no retry budget consumed");
+        });
+    }
+
+    /// Required test (i), v2 case: the full pre-drain admission (option A)
+    /// itself has zero side effects on the canonical directory — names,
+    /// sizes, and mtimes are all invariant across the refused cycle, and no
+    /// WAL sidecar or staging directory appears.
+    #[test]
+    fn pre_drain_full_admission_leaves_canonical_directory_invariant() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let embedder = Arc::new(StubEmbedder::new("v2-stub", V2_DIM));
+            let (dir, cache, _binding, fast_path) = v2_canonical_fixture(
+                "r2-v2-dir-invariance",
+                embedder.identity_bundle(),
+                &[("doc-old", normalized(V2_DIM, 0.5))],
+                3,
+            );
+            let fast_bytes = std::fs::read(&fast_path).expect("read canonical");
+            let manifest_before = dir_manifest(&dir);
+
+            let queue = make_queue(100);
+            submit(&queue, "doc-new", "new document");
+            let worker = RefreshWorker::new(
+                RefreshWorkerConfig::new(&dir),
+                queue.clone(),
+                embedder,
+                cache,
+            );
+            let error = worker
+                .run_cycle(&cx)
+                .await
+                .expect_err("fully admitted v2 still refuses canonical publication");
+            assert_invalid_config(
+                &error,
+                "refresh.canonical_publication",
+                "composite-generation-authority-unavailable",
+            );
+
+            assert_eq!(
+                std::fs::read(&fast_path).expect("reread canonical"),
+                fast_bytes
+            );
+            assert_eq!(
+                dir_manifest(&dir),
+                manifest_before,
+                "full admission must not change names, sizes, or mtimes"
+            );
+            assert!(
+                !frankensearch_index::wal::wal_path_for(&fast_path).exists(),
+                "admission must not materialize a WAL sidecar"
+            );
+            assert!(!dir.join(STAGED_V2_DIR_NAME).exists());
+        });
+    }
+
+    /// Required test (iv), integration form — RED on 868c0801 at compile
+    /// time: `fast_admitted_owner` does not exist there because the r1
+    /// two-tier open peeled `validated.index` and dropped the owner. After
+    /// the r2 owner-retention rework, the staged generation retains its
+    /// sealed admission owners, and replacing the staged file on disk does
+    /// not affect what the retained owner serves.
+    #[test]
+    fn staged_generation_retains_admission_owners() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let embedder = Arc::new(StubEmbedder::new("v2-stub", V2_DIM));
+            let (dir, cache, _binding, _fast_path) = v2_canonical_fixture(
+                "r2-staged-owner-retention",
+                embedder.identity_bundle(),
+                &[("old-1", normalized(V2_DIM, 0.25))],
+                7,
+            );
+            let queue = make_queue(100);
+            submit(&queue, "doc-2", "a brand new document");
+            let jobs = queue.drain_batch();
+            let worker = RefreshWorker::new(
+                RefreshWorkerConfig::new(&dir),
+                queue.clone(),
+                embedder,
+                cache,
+            );
+            let staged = worker
+                .stage_identity_bound_generation(&cx, &jobs)
+                .await
+                .expect("staging must succeed");
+
+            let owner = staged
+                .fast_admitted_owner()
+                .expect("staged generation must retain its fast admission owner");
+            assert!(
+                owner.published_wal_absent(),
+                "staged pathname admission proves WAL absence into the retained owner"
+            );
+            assert_eq!(owner.witness().record_count, 2, "old-1 + doc-2");
+            let witness_before = owner.witness().clone();
+            let hits_before = staged
+                .index
+                .search_fast(&normalized(V2_DIM, 0.25), 1)
+                .expect("search staged");
+            assert_eq!(hits_before.len(), 1);
+
+            // Replace the staged file with garbage: the retained owner's
+            // Arc'd bytes are the authority, not the pathname.
+            std::fs::write(&staged.fast_path, b"garbage-not-an-index")
+                .expect("clobber staged file");
+            let owner = staged
+                .fast_admitted_owner()
+                .expect("owner remains retained");
+            assert_eq!(
+                owner.witness(),
+                &witness_before,
+                "the witness lives in the sealed owner, not the pathname"
+            );
+            let hits_after = staged
+                .index
+                .search_fast(&normalized(V2_DIM, 0.25), 1)
+                .expect("search staged after clobber");
+            assert_eq!(
+                hits_after[0].doc_id, hits_before[0].doc_id,
+                "reads must serve the admitted bytes, never the pathname"
+            );
+        });
+    }
+
+    /// Deliberate fail-closed narrowing (r2, documented on the card): an
+    /// all-tombstoned v1 tier previously classified as bootstrap-replaceable
+    /// because the mutable open could read record flags. Read-only
+    /// classification counts record slots conservatively, so this now takes
+    /// the identityless refusal instead of silently replacing the artifact.
+    /// Flag-level precision returns with the read-only record-table
+    /// inspector (observational-open train, index crate root).
+    #[test]
+    fn all_tombstoned_v1_fails_closed_as_retaining_content() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let dir = temp_index_dir("r2-all-tombstoned-fail-closed");
+            let queue = make_queue(100);
+            let (worker, _cache) = make_worker(queue.clone(), &dir, 256);
+
+            submit(&queue, "doc-1", "First document");
+            worker.run_cycle(&cx).await.expect("bootstrap cycle");
+
+            let fast_path = dir.join(VECTOR_INDEX_FAST_FILENAME);
+            {
+                let mut index = VectorIndex::open(&fast_path).expect("fixture open");
+                assert!(index.soft_delete("doc-1").expect("tombstone the only row"));
+                assert_eq!(index.live_count(), 0);
+            }
+            let fast_bytes = std::fs::read(&fast_path).expect("read tombstoned artifact");
+
+            submit(&queue, "doc-2", "Second document");
+            let error = worker
+                .run_cycle(&cx)
+                .await
+                .expect_err("all-tombstoned v1 fails closed under read-only classification");
+            assert_invalid_config(
+                &error,
+                "refresh.fast_index_identity",
+                "identityless-fsvi-v1",
+            );
+            assert_eq!(
+                std::fs::read(&fast_path).expect("reread artifact"),
+                fast_bytes,
+                "the refused artifact must not be replaced"
+            );
+            assert_eq!(queue.pending_count(), 1);
+        });
+    }
+
+    /// Guard for the r2 flow change: classification no longer deletes a
+    /// stale WAL beside an EMPTY v1 seed, so the bootstrap rebuild must not
+    /// let that leftover sidecar resurrect foreign rows into the new
+    /// generation (`TwoTierIndexBuilder::finish` removes sidecars of tiers it
+    /// rewrites).
+    #[test]
+    fn bootstrap_over_empty_seed_with_stale_wal_does_not_resurrect_foreign_rows() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let dir = temp_index_dir("r2-bootstrap-stale-wal");
+            let queue = make_queue(100);
+            let (worker, cache) = make_worker(queue.clone(), &dir, 256);
+
+            // Empty v1 seed (from make_worker) + transplanted stale WAL.
+            let fast_path = dir.join(VECTOR_INDEX_FAST_FILENAME);
+            transplant_stale_wal("r2-bootstrap", &fast_path, 256);
+
+            submit(&queue, "doc-1", "First document");
+            let embedded = worker
+                .run_cycle(&cx)
+                .await
+                .expect("empty seed with stale WAL stays bootstrap-replaceable");
+            assert_eq!(embedded, 1);
+
+            let current = cache.current();
+            let ids: Vec<String> = current.iter_doc_ids().filter_map(Result::ok).collect();
+            assert_eq!(ids, vec!["doc-1".to_owned()]);
+            assert!(
+                !ids.iter().any(|id| id.starts_with("donor-")),
+                "no row from the transplanted WAL may leak into the bootstrap: {ids:?}"
+            );
+            assert!(
+                !frankensearch_index::wal::wal_path_for(&fast_path).exists(),
+                "the write path must have cleared the dead sidecar during rebuild"
+            );
         });
     }
 }
