@@ -16,9 +16,14 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::GauntletError;
+use crate::machine_class_registry::{
+    DefaultFlipDisposition, ExecutionCapacitySemantics, MACHINE_CLASS_REGISTRY_SCHEMA_VERSION,
+    MACHINE_CLASS_REGISTRY_SHA256, MachineClassError, MachineClassRegistry,
+    MachineExecutionProfile, MachineProfileAvailability, MachineProfileKey,
+};
 
 /// Version of the JSON emitted by the QG matrix harness.
-pub const PERF_ARTIFACT_SCHEMA_VERSION: &str = "quill-perf-artifact-v5";
+pub const PERF_ARTIFACT_SCHEMA_VERSION: &str = "quill-perf-artifact-v6";
 /// Read-only schema identifier for historical gate artifacts that lack
 /// auditable host topology and effective-thread provenance.
 pub const LEGACY_PERF_ARTIFACT_SCHEMA_VERSION_V3: &str = "quill-perf-artifact-v3";
@@ -323,6 +328,311 @@ impl PerfCellSpec {
     }
 }
 
+/// Wire schema for a profile-qualified projection of one canonical gate matrix.
+pub const PERF_APPLICABILITY_PLAN_SCHEMA_VERSION: &str =
+    "frankensearch.quill-perf-applicability-plan.v1";
+
+/// Whether one canonical cell is required, diagnostic, or impossible for one
+/// immutable execution profile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PerfCellApplicability {
+    /// The cell must be measured to satisfy this profile's default-flip gate.
+    Required,
+    /// The cell may be measured but can never satisfy a release requirement.
+    Diagnostic,
+    /// The cell is outside the profile's frozen execution envelope.
+    NotApplicable,
+}
+
+impl PerfCellApplicability {
+    /// Whether the benchmark may execute this cell under the profile.
+    #[must_use]
+    pub const fn is_runnable(self) -> bool {
+        !matches!(self, Self::NotApplicable)
+    }
+
+    const fn contract_label(self) -> &'static str {
+        match self {
+            Self::Required => "required",
+            Self::Diagnostic => "diagnostic",
+            Self::NotApplicable => "not_applicable",
+        }
+    }
+}
+
+/// Stable reason for one profile-specific cell classification.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PerfCellApplicabilityReason {
+    /// The profile and gate require this ordinary measurement cell.
+    RequiredForDefaultFlip,
+    /// The complete profile is diagnostic-only for this gate.
+    DiagnosticProfile,
+    /// The canonical matrix defines this cell as diagnostic for every profile.
+    DiagnosticCell,
+    /// The cell's configured width exceeds the profile's frozen gate maximum.
+    ExceedsProfileMaximum,
+}
+
+impl PerfCellApplicabilityReason {
+    const fn contract_label(self) -> &'static str {
+        match self {
+            Self::RequiredForDefaultFlip => "required_for_default_flip",
+            Self::DiagnosticProfile => "diagnostic_profile",
+            Self::DiagnosticCell => "diagnostic_cell",
+            Self::ExceedsProfileMaximum => "exceeds_profile_maximum",
+        }
+    }
+}
+
+/// One ordered classification inside a profile applicability plan.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PerfCellApplicabilityEntry {
+    /// Zero-based ordinal in the unchanged canonical gate matrix.
+    pub ordinal: usize,
+    /// Domain-separated contract hash of the exact canonical cell.
+    pub cell_contract_sha256: String,
+    /// Configured engine width frozen in that cell.
+    pub configured_threads: usize,
+    /// Profile-specific classification.
+    pub applicability: PerfCellApplicability,
+    /// Stable explanation for the classification.
+    pub reason: PerfCellApplicabilityReason,
+}
+
+/// Compact identity downstream artifacts carry to name one exact plan.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PerfApplicabilityPlanBinding {
+    /// Applicability-plan wire schema.
+    pub schema_version: String,
+    /// Immutable hardware and execution-profile identity.
+    pub profile: MachineProfileKey,
+    /// Frozen machine-registry schema interpreted by the planner.
+    pub registry_schema_version: String,
+    /// SHA-256 of the exact frozen machine-registry bytes.
+    pub registry_sha256: String,
+    /// Domain-separated hash of the exact profile contract object.
+    pub profile_contract_sha256: String,
+    /// Gate whose complete canonical slice is classified.
+    pub gate: PerfGate,
+    /// Schema of the canonical gate-matrix hash contract.
+    pub matrix_contract_schema_version: String,
+    /// Ordered hash of every canonical cell in this gate.
+    pub gate_matrix_contract_sha256: String,
+    /// Ordered hash of the complete profile-specific plan preimage.
+    pub applicability_plan_sha256: String,
+}
+
+/// Exhaustive, immutable classification of one canonical gate for one profile.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PerfApplicabilityPlan {
+    /// Content-addressed profile, registry, matrix, and plan identity.
+    pub binding: PerfApplicabilityPlanBinding,
+    /// Meaning of this profile's admitted execution capacity.
+    pub capacity_semantics: ExecutionCapacitySemantics,
+    /// Maximum admitted capacity, if the registered profile freezes one.
+    pub execution_capacity: Option<u64>,
+    /// Whether this profile is required or diagnostic for the gate.
+    pub default_flip_disposition: DefaultFlipDisposition,
+    /// Widest canonical cell this profile may exercise for the gate.
+    pub max_exercised_cell_width: Option<u64>,
+    /// Every canonical gate cell, in unchanged matrix order.
+    pub cells: Vec<PerfCellApplicabilityEntry>,
+}
+
+impl PerfApplicabilityPlan {
+    /// Borrow the compact identity suitable for threshold/evidence artifacts.
+    #[must_use]
+    pub const fn binding(&self) -> &PerfApplicabilityPlanBinding {
+        &self.binding
+    }
+
+    /// Count cells with one exact applicability classification.
+    #[must_use]
+    pub fn cell_count(&self, applicability: PerfCellApplicability) -> usize {
+        self.cells
+            .iter()
+            .filter(|cell| cell.applicability == applicability)
+            .count()
+    }
+
+    /// Widest runnable canonical cell in the plan.
+    #[must_use]
+    pub fn max_runnable_cell_width(&self) -> Option<usize> {
+        self.cells
+            .iter()
+            .filter(|cell| cell.applicability.is_runnable())
+            .map(|cell| cell.configured_threads)
+            .max()
+    }
+
+    /// Rebuild this plan from the frozen registry and canonical matrix.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed planning error if the profile is unavailable, the
+    /// matrix or registry changed, or any stored plan field was modified.
+    pub fn verify_against(
+        &self,
+        matrix: &PerfMatrixSpec,
+        registry: &MachineClassRegistry,
+    ) -> Result<(), PerfApplicabilityPlanError> {
+        let expected =
+            matrix.applicability_plan(registry, self.binding.profile, self.binding.gate)?;
+        if *self != expected {
+            return Err(PerfApplicabilityPlanError::PlanMismatch {
+                profile: self.binding.profile,
+                gate: self.binding.gate,
+            });
+        }
+        Ok(())
+    }
+
+    fn contract_sha256(&self) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(b"frankensearch.quill.perf-applicability-plan.v1\0");
+        update_length_framed(&mut hasher, self.binding.schema_version.as_bytes());
+        update_length_framed(
+            &mut hasher,
+            self.binding.profile.hardware_class_id().as_str().as_bytes(),
+        );
+        update_length_framed(
+            &mut hasher,
+            self.binding
+                .profile
+                .execution_profile_id()
+                .as_str()
+                .as_bytes(),
+        );
+        update_length_framed(&mut hasher, self.binding.registry_schema_version.as_bytes());
+        update_length_framed(&mut hasher, self.binding.registry_sha256.as_bytes());
+        update_length_framed(&mut hasher, self.binding.profile_contract_sha256.as_bytes());
+        update_length_framed(&mut hasher, self.binding.gate.label().as_bytes());
+        update_length_framed(
+            &mut hasher,
+            self.binding.matrix_contract_schema_version.as_bytes(),
+        );
+        update_length_framed(
+            &mut hasher,
+            self.binding.gate_matrix_contract_sha256.as_bytes(),
+        );
+        update_length_framed(
+            &mut hasher,
+            capacity_semantics_contract_label(self.capacity_semantics).as_bytes(),
+        );
+        update_optional_u64(&mut hasher, self.execution_capacity);
+        update_length_framed(
+            &mut hasher,
+            default_flip_disposition_contract_label(self.default_flip_disposition).as_bytes(),
+        );
+        update_optional_u64(&mut hasher, self.max_exercised_cell_width);
+        update_length_framed(&mut hasher, self.cells.len().to_string().as_bytes());
+        for cell in &self.cells {
+            update_length_framed(&mut hasher, cell.ordinal.to_string().as_bytes());
+            update_length_framed(&mut hasher, cell.cell_contract_sha256.as_bytes());
+            update_length_framed(&mut hasher, cell.configured_threads.to_string().as_bytes());
+            update_length_framed(&mut hasher, cell.applicability.contract_label().as_bytes());
+            update_length_framed(&mut hasher, cell.reason.contract_label().as_bytes());
+        }
+        finish_sha256_hex(hasher)
+    }
+}
+
+/// Fail-closed applicability-plan construction or verification error.
+#[derive(Debug, Clone, PartialEq, Eq, Error)]
+pub enum PerfApplicabilityPlanError {
+    /// The frozen registry rejected the requested profile.
+    #[error(transparent)]
+    Registry(#[from] MachineClassError),
+    /// Only the exact complete matrix may be projected.
+    #[error("applicability plans require the exact canonical performance matrix")]
+    NonCanonicalMatrix,
+    /// An unavailable required profile cannot manufacture an all-NA plan.
+    #[error("execution profile {profile:?} is unavailable for {gate}")]
+    ProfileUnavailable {
+        /// Unavailable profile key.
+        profile: MachineProfileKey,
+        /// Gate that cannot be planned.
+        gate: PerfGate,
+    },
+    /// The profile omitted the selected gate policy.
+    #[error("execution profile {profile:?} has no policy for {gate}")]
+    MissingGatePolicy {
+        /// Profile with the incomplete contract.
+        profile: MachineProfileKey,
+        /// Missing gate.
+        gate: PerfGate,
+    },
+    /// A required profile omitted its maximum runnable cell width.
+    #[error("required execution profile {profile:?} has no maximum width for {gate}")]
+    RequiredProfileWithoutMaximum {
+        /// Profile with the incomplete contract.
+        profile: MachineProfileKey,
+        /// Gate with no maximum.
+        gate: PerfGate,
+    },
+    /// Profile capacity and per-gate maximum contradict one another.
+    #[error("execution profile {profile:?} has an invalid capacity envelope for {gate}")]
+    InvalidCapacityEnvelope {
+        /// Profile with the invalid envelope.
+        profile: MachineProfileKey,
+        /// Gate whose maximum is invalid.
+        gate: PerfGate,
+    },
+    /// A canonical cell lacks a representable positive configured width.
+    #[error("canonical {gate} cell ordinal {ordinal} has no representable positive width")]
+    InvalidCellWidth {
+        /// Gate containing the cell.
+        gate: PerfGate,
+        /// Gate-local canonical ordinal.
+        ordinal: usize,
+    },
+    /// A matrix or cell identity could not be computed.
+    #[error("cannot hash the canonical applicability input: {detail}")]
+    ContractIdentity {
+        /// Underlying bounded contract error.
+        detail: String,
+    },
+    /// Stored plan contents differ from a fresh reconstruction.
+    #[error("stored applicability plan for {profile:?} {gate} does not recompute")]
+    PlanMismatch {
+        /// Profile named by the stale plan.
+        profile: MachineProfileKey,
+        /// Gate named by the stale plan.
+        gate: PerfGate,
+    },
+}
+
+const fn capacity_semantics_contract_label(value: ExecutionCapacitySemantics) -> &'static str {
+    match value {
+        ExecutionCapacitySemantics::PhysicalCores => "physical_cores",
+        ExecutionCapacitySemantics::LogicalThreads => "logical_threads",
+        ExecutionCapacitySemantics::SchedulerWorkers => "scheduler_workers",
+        ExecutionCapacitySemantics::DiagnosticWorkerBudget => "diagnostic_worker_budget",
+    }
+}
+
+const fn default_flip_disposition_contract_label(value: DefaultFlipDisposition) -> &'static str {
+    match value {
+        DefaultFlipDisposition::RequiredForDefaultFlip => "required_for_default_flip",
+        DefaultFlipDisposition::DiagnosticOnly => "diagnostic_only",
+    }
+}
+
+fn update_optional_u64(hasher: &mut Sha256, value: Option<u64>) {
+    match value {
+        Some(value) => {
+            update_length_framed(hasher, b"some");
+            update_length_framed(hasher, value.to_string().as_bytes());
+        }
+        None => update_length_framed(hasher, b"none"),
+    }
+}
+
 /// Complete, deterministic QG-1..QG-10 execution matrix.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PerfMatrixSpec {
@@ -575,6 +885,173 @@ impl PerfMatrixSpec {
         }
         Ok(finish_sha256_hex(hasher))
     }
+
+    /// Project one complete canonical gate through an immutable execution
+    /// profile.
+    ///
+    /// This method deliberately accepts neither a caller-selected cell slice
+    /// nor an ad hoc width. The frozen registry supplies release disposition
+    /// and maximum width, while the unchanged complete matrix supplies every
+    /// ordered cell and its contract identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed error for a noncanonical matrix, unknown or unavailable
+    /// profile, incomplete profile policy, contradictory capacity envelope, or
+    /// non-hashable cell contract.
+    pub fn applicability_plan(
+        &self,
+        registry: &MachineClassRegistry,
+        profile_key: MachineProfileKey,
+        gate: PerfGate,
+    ) -> Result<PerfApplicabilityPlan, PerfApplicabilityPlanError> {
+        if self != &Self::complete() {
+            return Err(PerfApplicabilityPlanError::NonCanonicalMatrix);
+        }
+        validate_matrix(self).map_err(|error| PerfApplicabilityPlanError::ContractIdentity {
+            detail: error.to_string(),
+        })?;
+        let profile = registry.execution_profile(profile_key)?;
+        self.applicability_plan_for_profile(profile, gate)
+    }
+
+    /// Build one exhaustive plan for every normative gate.
+    ///
+    /// Concatenating the returned plans' cell entries classifies the complete
+    /// unchanged [`PerfMatrixSpec`] universe exactly once.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first typed planning error in normative gate order.
+    pub fn applicability_plans(
+        &self,
+        registry: &MachineClassRegistry,
+        profile_key: MachineProfileKey,
+    ) -> Result<Vec<PerfApplicabilityPlan>, PerfApplicabilityPlanError> {
+        PerfGate::ALL
+            .into_iter()
+            .map(|gate| self.applicability_plan(registry, profile_key, gate))
+            .collect()
+    }
+
+    fn applicability_plan_for_profile(
+        &self,
+        profile: &MachineExecutionProfile,
+        gate: PerfGate,
+    ) -> Result<PerfApplicabilityPlan, PerfApplicabilityPlanError> {
+        let profile_key = profile.key();
+        if profile.availability() == MachineProfileAvailability::Unavailable {
+            return Err(PerfApplicabilityPlanError::ProfileUnavailable {
+                profile: profile_key,
+                gate,
+            });
+        }
+        let policy = profile.gate_policy(gate.label()).ok_or(
+            PerfApplicabilityPlanError::MissingGatePolicy {
+                profile: profile_key,
+                gate,
+            },
+        )?;
+        let disposition = policy.default_flip_disposition();
+        let max_exercised_cell_width = policy.max_exercised_cell_width();
+        if disposition == DefaultFlipDisposition::RequiredForDefaultFlip
+            && max_exercised_cell_width.is_none()
+        {
+            return Err(PerfApplicabilityPlanError::RequiredProfileWithoutMaximum {
+                profile: profile_key,
+                gate,
+            });
+        }
+        if profile.execution_capacity() == Some(0)
+            || max_exercised_cell_width == Some(0)
+            || profile.execution_capacity().is_some_and(|capacity| {
+                max_exercised_cell_width.is_some_and(|maximum| maximum > capacity)
+            })
+        {
+            return Err(PerfApplicabilityPlanError::InvalidCapacityEnvelope {
+                profile: profile_key,
+                gate,
+            });
+        }
+
+        let mut entries = Vec::new();
+        for (ordinal, cell) in self.for_gate(gate).into_iter().enumerate() {
+            let configured_threads = cell
+                .threads
+                .filter(|threads| *threads > 0)
+                .ok_or(PerfApplicabilityPlanError::InvalidCellWidth { gate, ordinal })?;
+            let configured_width = u64::try_from(configured_threads)
+                .map_err(|_| PerfApplicabilityPlanError::InvalidCellWidth { gate, ordinal })?;
+            let (applicability, reason) =
+                if max_exercised_cell_width.is_some_and(|maximum| configured_width > maximum) {
+                    (
+                        PerfCellApplicability::NotApplicable,
+                        PerfCellApplicabilityReason::ExceedsProfileMaximum,
+                    )
+                } else if disposition == DefaultFlipDisposition::DiagnosticOnly {
+                    (
+                        PerfCellApplicability::Diagnostic,
+                        PerfCellApplicabilityReason::DiagnosticProfile,
+                    )
+                } else if canonical_cell_is_diagnostic(cell) {
+                    (
+                        PerfCellApplicability::Diagnostic,
+                        PerfCellApplicabilityReason::DiagnosticCell,
+                    )
+                } else {
+                    (
+                        PerfCellApplicability::Required,
+                        PerfCellApplicabilityReason::RequiredForDefaultFlip,
+                    )
+                };
+            entries.push(PerfCellApplicabilityEntry {
+                ordinal,
+                cell_contract_sha256: cell.contract_sha256().map_err(|error| {
+                    PerfApplicabilityPlanError::ContractIdentity {
+                        detail: error.to_string(),
+                    }
+                })?,
+                configured_threads,
+                applicability,
+                reason,
+            });
+        }
+        if entries.is_empty() {
+            return Err(PerfApplicabilityPlanError::ContractIdentity {
+                detail: format!("{gate} has no canonical cells"),
+            });
+        }
+
+        let gate_matrix_contract_sha256 = self.gate_contract_sha256(gate).map_err(|error| {
+            PerfApplicabilityPlanError::ContractIdentity {
+                detail: error.to_string(),
+            }
+        })?;
+        let mut plan = PerfApplicabilityPlan {
+            binding: PerfApplicabilityPlanBinding {
+                schema_version: PERF_APPLICABILITY_PLAN_SCHEMA_VERSION.to_owned(),
+                profile: profile_key,
+                registry_schema_version: MACHINE_CLASS_REGISTRY_SCHEMA_VERSION.to_owned(),
+                registry_sha256: MACHINE_CLASS_REGISTRY_SHA256.to_owned(),
+                profile_contract_sha256: profile.contract_sha256().to_owned(),
+                gate,
+                matrix_contract_schema_version: Self::CONTRACT_SCHEMA_VERSION.to_owned(),
+                gate_matrix_contract_sha256,
+                applicability_plan_sha256: String::new(),
+            },
+            capacity_semantics: profile.capacity_semantics(),
+            execution_capacity: profile.execution_capacity(),
+            default_flip_disposition: disposition,
+            max_exercised_cell_width,
+            cells: entries,
+        };
+        plan.binding.applicability_plan_sha256 = plan.contract_sha256();
+        Ok(plan)
+    }
+}
+
+fn canonical_cell_is_diagnostic(cell: &PerfCellSpec) -> bool {
+    cell.gate == PerfGate::Qg10 || cell.metric == "tokenize_docs_per_second"
 }
 
 /// Distribution summary required for every timed cell.
@@ -2274,11 +2751,15 @@ pub struct PerfCellResult {
 pub struct PerfGateArtifact {
     pub schema_version: String,
     pub gate: PerfGate,
+    /// Required on every measured v6 artifact. `None` exists only for the
+    /// exact unmeasured v6 sentinel and explicit read-only legacy loaders.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub applicability_plan: Option<PerfApplicabilityPlanBinding>,
     /// SHA-256 emitted by the benchmark process for its own executing ELF.
     pub bench_elf_sha256: String,
     pub machine_fingerprint: String,
-    /// Required on measured v5 artifacts. `None` exists only for the exact
-    /// unmeasured v5 sentinel and the explicit read-only v3 loader.
+    /// Required on measured v6 artifacts. `None` exists only for the exact
+    /// unmeasured v6 sentinel and the explicit read-only v3 loader.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub execution: Option<PerfExecutionProvenance>,
     pub git_rev: String,
@@ -2570,8 +3051,38 @@ fn validate_qg6_matrix(matrix: &PerfMatrixSpec) -> Result<(), GauntletError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::machine_class_registry::{ExecutionProfileId, HardwareClassId};
 
     const PERF_MANIFEST: &str = include_str!("../../../docs/contracts/quill-perf-gates.toml");
+
+    fn profile_key(
+        hardware_class_id: HardwareClassId,
+        execution_profile_id: ExecutionProfileId,
+    ) -> MachineProfileKey {
+        MachineProfileKey::new(hardware_class_id, execution_profile_id)
+            .expect("canonical profile key")
+    }
+
+    fn qg1_plan(
+        registry: &MachineClassRegistry,
+        execution_profile_id: ExecutionProfileId,
+    ) -> PerfApplicabilityPlan {
+        let hardware_class_id = match execution_profile_id {
+            ExecutionProfileId::Physical64 | ExecutionProfileId::Smt2_128 => {
+                HardwareClassId::TrjZen35995wx
+            }
+            ExecutionProfileId::Scheduler10 => HardwareClassId::M4Macos,
+            ExecutionProfileId::X86Diagnostic => HardwareClassId::X86VpsOvh,
+            ExecutionProfileId::Scheduler14 => HardwareClassId::M5Macos,
+        };
+        PerfMatrixSpec::complete()
+            .applicability_plan(
+                registry,
+                profile_key(hardware_class_id, execution_profile_id),
+                PerfGate::Qg1,
+            )
+            .expect("canonical QG-1 applicability plan")
+    }
 
     #[test]
     fn prepared_input_fingerprint_binds_each_component_independently() {
@@ -3224,6 +3735,171 @@ mod tests {
     }
 
     #[test]
+    fn qg1_profile_plans_have_frozen_exhaustive_applicability_counts() {
+        let registry = MachineClassRegistry::frozen().expect("frozen machine registry");
+        let cases = [
+            (
+                ExecutionProfileId::Physical64,
+                56,
+                2,
+                16,
+                Some(64),
+                Some(64),
+            ),
+            (ExecutionProfileId::Smt2_128, 72, 2, 0, Some(128), Some(128)),
+            (
+                ExecutionProfileId::Scheduler10,
+                32,
+                2,
+                40,
+                Some(10),
+                Some(8),
+            ),
+        ];
+        let mut plan_hashes = BTreeSet::new();
+        for (
+            profile,
+            required,
+            diagnostic,
+            not_applicable,
+            execution_capacity,
+            max_exercised_cell_width,
+        ) in cases
+        {
+            let plan = qg1_plan(&registry, profile);
+            assert_eq!(plan.cells.len(), 74);
+            assert_eq!(plan.cell_count(PerfCellApplicability::Required), required);
+            assert_eq!(
+                plan.cell_count(PerfCellApplicability::Diagnostic),
+                diagnostic
+            );
+            assert_eq!(
+                plan.cell_count(PerfCellApplicability::NotApplicable),
+                not_applicable
+            );
+            assert_eq!(plan.execution_capacity, execution_capacity);
+            assert_eq!(plan.max_exercised_cell_width, max_exercised_cell_width);
+            assert_eq!(
+                plan.binding.gate_matrix_contract_sha256,
+                PerfMatrixSpec::QG1_CANONICAL_SHA256
+            );
+            assert_eq!(
+                plan.binding.registry_schema_version,
+                MACHINE_CLASS_REGISTRY_SCHEMA_VERSION
+            );
+            assert_eq!(plan.binding.registry_sha256, MACHINE_CLASS_REGISTRY_SHA256);
+            assert!(is_lower_hex_digest(&plan.binding.profile_contract_sha256));
+            assert!(is_lower_hex_digest(&plan.binding.applicability_plan_sha256));
+            assert!(
+                plan.cells
+                    .iter()
+                    .enumerate()
+                    .all(|(ordinal, cell)| cell.ordinal == ordinal
+                        && is_lower_hex_digest(&cell.cell_contract_sha256))
+            );
+            plan.verify_against(&PerfMatrixSpec::complete(), &registry)
+                .expect("recompute canonical plan");
+            assert!(
+                plan_hashes.insert(plan.binding.applicability_plan_sha256),
+                "each execution profile requires a distinct plan hash"
+            );
+        }
+    }
+
+    #[test]
+    fn m4_scheduler_capacity_does_not_invent_a_width_ten_cell() {
+        let registry = MachineClassRegistry::frozen().expect("frozen machine registry");
+        let plan = qg1_plan(&registry, ExecutionProfileId::Scheduler10);
+        assert_eq!(plan.execution_capacity, Some(10));
+        assert_eq!(plan.max_exercised_cell_width, Some(8));
+        assert_eq!(plan.max_runnable_cell_width(), Some(8));
+        assert!(plan.cells.iter().all(|cell| cell.configured_threads != 10));
+        assert!(
+            plan.cells
+                .iter()
+                .filter(|cell| cell.configured_threads > 8)
+                .all(|cell| {
+                    cell.applicability == PerfCellApplicability::NotApplicable
+                        && cell.reason == PerfCellApplicabilityReason::ExceedsProfileMaximum
+                })
+        );
+    }
+
+    #[test]
+    fn required_but_unavailable_m5_returns_typed_error_not_all_na_plan() {
+        let registry = MachineClassRegistry::frozen().expect("frozen machine registry");
+        let key = profile_key(HardwareClassId::M5Macos, ExecutionProfileId::Scheduler14);
+        let profile = registry
+            .execution_profile(key)
+            .expect("reserved M5 profile resolves");
+        assert_eq!(
+            profile.availability(),
+            MachineProfileAvailability::Unavailable
+        );
+        assert_eq!(
+            profile
+                .gate_policy(PerfGate::Qg1.label())
+                .expect("M5 QG-1 policy")
+                .default_flip_disposition(),
+            DefaultFlipDisposition::RequiredForDefaultFlip
+        );
+        assert!(matches!(
+            PerfMatrixSpec::complete().applicability_plan(&registry, key, PerfGate::Qg1),
+            Err(PerfApplicabilityPlanError::ProfileUnavailable {
+                profile,
+                gate: PerfGate::Qg1,
+            }) if profile == key
+        ));
+    }
+
+    #[test]
+    fn profile_plans_cover_the_complete_matrix_and_reject_plan_or_matrix_drift() {
+        let registry = MachineClassRegistry::frozen().expect("frozen machine registry");
+        let matrix = PerfMatrixSpec::complete();
+        let key = profile_key(
+            HardwareClassId::TrjZen35995wx,
+            ExecutionProfileId::Physical64,
+        );
+        let plans = matrix
+            .applicability_plans(&registry, key)
+            .expect("all physical-core plans");
+        assert_eq!(plans.len(), PerfGate::ALL.len());
+        assert_eq!(
+            plans.iter().map(|plan| plan.cells.len()).sum::<usize>(),
+            matrix.cells.len()
+        );
+        assert_eq!(
+            plans
+                .iter()
+                .map(|plan| plan.binding.gate)
+                .collect::<Vec<_>>(),
+            PerfGate::ALL
+        );
+
+        let encoded = serde_json::to_vec(&plans[0]).expect("serialize applicability plan");
+        let decoded: PerfApplicabilityPlan =
+            serde_json::from_slice(&encoded).expect("deserialize applicability plan");
+        assert_eq!(decoded, plans[0]);
+        decoded
+            .verify_against(&matrix, &registry)
+            .expect("round-tripped plan recomputes");
+
+        let mut reordered = plans[0].clone();
+        reordered.cells.swap(0, 1);
+        assert!(matches!(
+            reordered.verify_against(&matrix, &registry),
+            Err(PerfApplicabilityPlanError::PlanMismatch { .. })
+        ));
+
+        let mut incomplete = matrix.clone();
+        incomplete.cells.remove(0);
+        assert!(matches!(
+            incomplete.applicability_plan(&registry, key, PerfGate::Qg1),
+            Err(PerfApplicabilityPlanError::NonCanonicalMatrix)
+        ));
+    }
+
+    #[test]
     fn cell_identity_binds_every_serialized_contract_field() {
         let cell = PerfCellSpec {
             gate: PerfGate::Qg6,
@@ -3416,12 +4092,17 @@ mod tests {
     }
 
     #[test]
-    fn artifact_json_and_table_retain_required_e06_fields() {
+    fn artifact_v6_json_roundtrips_and_binds_profile_and_plan_identity() {
         let distribution = DistributionSummary::from_samples(&[1.0; PERF_MIN_RUNS])
             .expect("constant distribution");
+        let registry = MachineClassRegistry::frozen().expect("frozen machine registry");
+        let applicability_plan = qg1_plan(&registry, ExecutionProfileId::Physical64)
+            .binding()
+            .clone();
         let artifact = PerfGateArtifact {
             schema_version: PERF_ARTIFACT_SCHEMA_VERSION.to_owned(),
             gate: PerfGate::Qg1,
+            applicability_plan: Some(applicability_plan.clone()),
             bench_elf_sha256: "c".repeat(64),
             machine_fingerprint: "linux-x86_64-test".to_owned(),
             execution: Some(PerfExecutionProvenance {
@@ -3451,9 +4132,15 @@ mod tests {
         };
         let json = artifact.to_json_pretty().expect("artifact JSON");
         let value: serde_json::Value = serde_json::from_str(&json).expect("decode artifact");
+        assert_eq!(PERF_ARTIFACT_SCHEMA_VERSION, "quill-perf-artifact-v6");
+        assert_eq!(
+            value["schema_version"].as_str(),
+            Some(PERF_ARTIFACT_SCHEMA_VERSION)
+        );
         for key in [
             "schema_version",
             "gate",
+            "applicability_plan",
             "bench_elf_sha256",
             "machine_fingerprint",
             "execution",
@@ -3467,6 +4154,45 @@ mod tests {
         ] {
             assert!(value.get(key).is_some(), "missing required field {key}");
         }
+        let decoded: PerfGateArtifact =
+            serde_json::from_str(&json).expect("round-trip typed v6 artifact");
+        assert_eq!(decoded, artifact);
+        assert_eq!(
+            decoded.applicability_plan.as_ref(),
+            Some(&applicability_plan)
+        );
+
+        let artifact_sha256 = lower_sha256_hex(json.as_bytes());
+        let mut profile_drift = artifact.clone();
+        profile_drift
+            .applicability_plan
+            .as_mut()
+            .expect("measured v6 binding")
+            .profile = profile_key(HardwareClassId::TrjZen35995wx, ExecutionProfileId::Smt2_128);
+        let profile_drift_json = profile_drift
+            .to_json_pretty()
+            .expect("serialize profile-drifted artifact");
+        assert_ne!(profile_drift_json, json);
+        assert_ne!(
+            lower_sha256_hex(profile_drift_json.as_bytes()),
+            artifact_sha256
+        );
+
+        let mut plan_drift = artifact.clone();
+        plan_drift
+            .applicability_plan
+            .as_mut()
+            .expect("measured v6 binding")
+            .applicability_plan_sha256 = "d".repeat(64);
+        let plan_drift_json = plan_drift
+            .to_json_pretty()
+            .expect("serialize plan-drifted artifact");
+        assert_ne!(plan_drift_json, json);
+        assert_ne!(
+            lower_sha256_hex(plan_drift_json.as_bytes()),
+            artifact_sha256
+        );
+
         let table = artifact.human_table();
         assert!(table.contains("cv_pct"));
         assert!(table.contains("median_ci95"));

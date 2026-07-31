@@ -3,18 +3,18 @@
 
 use std::env;
 use std::error::Error;
-use std::ffi::OsString;
-use std::fs::{self, OpenOptions};
+use std::ffi::{OsStr, OsString};
+use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use frankensearch_quill_gauntlet::{
-    MachineClassAdmissionContext, MachineClassRegistry, PerfEvidenceArtifact, PerfEvidenceFile,
-    PerfGate, PerfGateArtifact, PerfGateDecision, PerfRatchetMode, PerfRatchetRequest,
-    VerifiedRunnerIdentity, evaluate_perf_ratchet, is_explicit_bootstrap_for,
-    perf_manifest_contract_sha256,
+    ExecutionProfileId, HardwareClassId, MachineClassAdmissionContext, MachineClassRegistry,
+    MachineProfileKey, PerfEvidenceArtifact, PerfEvidenceFile, PerfGate, PerfGateArtifact,
+    PerfGateDecision, PerfRatchetMode, PerfRatchetRequest, VerifiedRunnerIdentity,
+    evaluate_perf_ratchet, is_explicit_bootstrap_for, perf_manifest_contract_sha256,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -23,7 +23,7 @@ const USAGE: &str = "\
 Usage:
   quill-perf-ratchet \\
     --manifest <docs/contracts/quill-perf-gates.toml> \\
-    --baseline <latest-pointer-or-bootstrap/legacy-threshold.json> \\
+    --baseline <authoritative-latest-pointer-or-bootstrap.json> \\
     [--baseline-evidence <legacy-direct-threshold.evidence.json>] \\
     --candidate <QG-N.json> \\
     [--candidate-evidence <QG-N.evidence.json>] \\
@@ -35,20 +35,21 @@ Usage:
     [--rerun-artifact-manifest <rerun.artifacts.json>] \\
     [--candidate-run-log <candidate/run.log>] \\
     [--rerun-run-log <rerun/run.log>] \\
-    [--machine-class <expected-canonical-class>] \\
+    [--hardware-class <expected-canonical-hardware>] \\
+    [--execution-profile <expected-canonical-profile>] \\
     --output <ratchet.json> \\
     --mode <promotion|regression-alarm> \\
     [--promote-dir <.bench-history> --date <YYYY-MM-DD>]
 
 Exact unmeasured bootstrap: omit baseline evidence.
 Current measured pointer: omit baseline evidence; the pointer binds and resolves it.
-Legacy direct measured threshold: supply its already-bound evidence explicitly.
+Direct current-schema measured threshold: regression-alarm only; supply its bound evidence.
 Exit status: 0=Allow, 1=Block, 2=Quarantine, 64=invalid invocation.";
 
 type LoadedEvidence = (PerfEvidenceArtifact, Vec<u8>);
 type AdmittedRunnerReceipt = (VerifiedRunnerIdentity, Vec<u8>, Vec<u8>, Vec<u8>);
 
-const HISTORY_POINTER_SCHEMA_VERSION: &str = "frankensearch.perf-history-pointer.v1";
+const HISTORY_POINTER_SCHEMA_VERSION: &str = "frankensearch.perf-history-pointer.v2";
 
 #[derive(Debug)]
 struct Args {
@@ -68,7 +69,7 @@ struct Args {
     output: PathBuf,
     mode: PerfRatchetMode,
     promote_dir: Option<PathBuf>,
-    machine_class: Option<String>,
+    machine_profile: Option<MachineProfileKey>,
     date: Option<String>,
 }
 
@@ -77,7 +78,7 @@ struct Args {
 struct HistoryPointer {
     schema_version: String,
     gate: PerfGate,
-    machine_class: String,
+    profile: MachineProfileKey,
     run_id: String,
     threshold_file: String,
     threshold_sha256: String,
@@ -128,6 +129,7 @@ fn run() -> Result<PerfGateDecision, Box<dyn Error>> {
     let manifest_sha256 = perf_manifest_contract_sha256(manifest_text);
     let manifest = toml::from_str::<toml::Value>(manifest_text)?;
 
+    let _history_lock = acquire_promotion_history_lock(&args)?;
     let loaded_baseline = read_baseline(&args.baseline, args.baseline_evidence.as_deref())?;
     let baseline = loaded_baseline.artifact;
     let baseline_bytes = loaded_baseline.artifact_bytes;
@@ -143,6 +145,12 @@ fn run() -> Result<PerfGateDecision, Box<dyn Error>> {
         .transpose()?;
     let baseline_is_bootstrap =
         is_explicit_bootstrap_for(&baseline, candidate.gate, &manifest_sha256);
+    validate_promotion_baseline_authority(
+        &args,
+        candidate.gate,
+        baseline_is_bootstrap,
+        baseline_pointer.is_some(),
+    )?;
     validate_baseline_identity_inputs(
         args.mode,
         baseline_is_bootstrap,
@@ -164,7 +172,7 @@ fn run() -> Result<PerfGateDecision, Box<dyn Error>> {
         args.candidate_artifact_manifest.as_deref(),
         args.candidate_run_log.as_deref(),
         candidate.gate,
-        args.machine_class.as_deref(),
+        args.machine_profile,
         Some(&candidate_bytes),
         candidate_evidence
             .as_ref()
@@ -176,7 +184,7 @@ fn run() -> Result<PerfGateDecision, Box<dyn Error>> {
         args.rerun_artifact_manifest.as_deref(),
         args.rerun_run_log.as_deref(),
         candidate.gate,
-        args.machine_class.as_deref(),
+        args.machine_profile,
         rerun.as_ref().map(|(_, bytes)| bytes.as_slice()),
         rerun_evidence.as_ref().map(|(_, bytes)| bytes.as_slice()),
     )?;
@@ -297,7 +305,7 @@ fn run() -> Result<PerfGateDecision, Box<dyn Error>> {
         rerun: rerun.as_ref().map(|(artifact, _)| artifact),
         candidate_evidence: candidate_evidence.as_ref().map(|(artifact, _)| artifact),
         rerun_evidence: rerun_evidence.as_ref().map(|(artifact, _)| artifact),
-        expected_machine_class: args.machine_class.as_deref(),
+        expected_machine_profile: args.machine_profile,
         candidate_runner_identity: candidate_runner
             .as_ref()
             .map(|(identity, _, _, _)| identity),
@@ -318,7 +326,7 @@ fn run() -> Result<PerfGateDecision, Box<dyn Error>> {
             .map(|(_, bytes)| bytes.as_slice()),
         candidate_runner
             .as_ref()
-            .map(|(identity, _, _, _)| identity.class_id()),
+            .map(|(identity, _, _, _)| identity.profile()),
         &mut evaluation,
     )?;
 
@@ -360,7 +368,8 @@ where
     let mut output = None;
     let mut mode = None;
     let mut promote_dir = None;
-    let mut machine_class = None;
+    let mut hardware_class = None;
+    let mut execution_profile = None;
     let mut date = None;
 
     while let Some(flag) = values.next() {
@@ -432,12 +441,17 @@ where
             "--promote-dir" => {
                 promote_dir = Some(PathBuf::from(next_value(&mut values, "--promote-dir")?));
             }
-            "--machine-class" => {
-                machine_class = Some(
-                    next_value(&mut values, "--machine-class")?
-                        .to_string_lossy()
-                        .into_owned(),
-                );
+            "--hardware-class" => {
+                hardware_class = Some(parse_hardware_class(&next_value(
+                    &mut values,
+                    "--hardware-class",
+                )?)?);
+            }
+            "--execution-profile" => {
+                execution_profile = Some(parse_execution_profile(&next_value(
+                    &mut values,
+                    "--execution-profile",
+                )?)?);
             }
             "--date" => {
                 date = Some(
@@ -468,6 +482,18 @@ where
     if rerun_evidence.is_some() && rerun.is_none() {
         return Err("--rerun-evidence requires --rerun".into());
     }
+    let machine_profile = match (hardware_class, execution_profile) {
+        (Some(hardware_class), Some(execution_profile)) => {
+            Some(MachineProfileKey::new(hardware_class, execution_profile)?)
+        }
+        (None, None) => None,
+        (Some(_), None) => {
+            return Err("--hardware-class requires --execution-profile".into());
+        }
+        (None, Some(_)) => {
+            return Err("--execution-profile requires --hardware-class".into());
+        }
+    };
     if mode == PerfRatchetMode::Promotion {
         let missing = [
             (candidate_evidence.is_none(), "--candidate-evidence"),
@@ -488,7 +514,10 @@ where
             ),
             (candidate_run_log.is_none(), "--candidate-run-log"),
             (rerun_run_log.is_none(), "--rerun-run-log"),
-            (machine_class.is_none(), "--machine-class"),
+            (hardware_class.is_none(), "--hardware-class"),
+            (execution_profile.is_none(), "--execution-profile"),
+            (promote_dir.is_none(), "--promote-dir"),
+            (date.is_none(), "--date"),
         ]
         .into_iter()
         .filter_map(|(missing, flag)| missing.then_some(flag))
@@ -501,16 +530,13 @@ where
             .into());
         }
     } else if promote_dir.is_some()
-        || machine_class.is_some()
+        || machine_profile.is_some()
         || receipt_fields.iter().any(|present| *present)
     {
         return Err(
             "regression-alarm mode cannot receive promotion history or runner identity inputs"
                 .into(),
         );
-    }
-    if let Some(label) = machine_class.as_deref() {
-        validate_component(label, "machine class")?;
     }
     if let Some(value) = date.as_deref() {
         validate_component(value, "date")?;
@@ -533,7 +559,7 @@ where
         output: output.ok_or("missing --output")?,
         mode,
         promote_dir,
-        machine_class,
+        machine_profile,
         date,
     })
 }
@@ -545,6 +571,29 @@ where
     values
         .next()
         .ok_or_else(|| format!("{flag} requires a value").into())
+}
+
+fn parse_hardware_class(value: &OsStr) -> Result<HardwareClassId, Box<dyn Error>> {
+    match value.to_str() {
+        Some("x86-vps-ovh") => Ok(HardwareClassId::X86VpsOvh),
+        Some("trj-zen3-5995wx") => Ok(HardwareClassId::TrjZen35995wx),
+        Some("m4-macos") => Ok(HardwareClassId::M4Macos),
+        Some("m5-macos") => Ok(HardwareClassId::M5Macos),
+        Some(other) => Err(format!("invalid --hardware-class {other:?}").into()),
+        None => Err("--hardware-class must be valid UTF-8".into()),
+    }
+}
+
+fn parse_execution_profile(value: &OsStr) -> Result<ExecutionProfileId, Box<dyn Error>> {
+    match value.to_str() {
+        Some("x86-diagnostic") => Ok(ExecutionProfileId::X86Diagnostic),
+        Some("physical-64") => Ok(ExecutionProfileId::Physical64),
+        Some("smt2-128") => Ok(ExecutionProfileId::Smt2_128),
+        Some("scheduler-10") => Ok(ExecutionProfileId::Scheduler10),
+        Some("scheduler-14") => Ok(ExecutionProfileId::Scheduler14),
+        Some(other) => Err(format!("invalid --execution-profile {other:?}").into()),
+        None => Err("--execution-profile must be valid UTF-8".into()),
+    }
 }
 
 fn validate_component(value: &str, field: &str) -> Result<(), Box<dyn Error>> {
@@ -633,6 +682,106 @@ fn normalize_path(path: &Path) -> Result<PathBuf, Box<dyn Error>> {
     Ok(normalized)
 }
 
+fn acquire_promotion_history_lock(args: &Args) -> Result<Option<File>, Box<dyn Error>> {
+    if args.mode != PerfRatchetMode::Promotion {
+        return Ok(None);
+    }
+    let history_dir = args
+        .promote_dir
+        .as_deref()
+        .ok_or("promotion requires --promote-dir")?;
+    let directory = File::open(history_dir).map_err(|error| {
+        format!(
+            "cannot open promotion history directory {}: {error}",
+            history_dir.display()
+        )
+    })?;
+    #[cfg(unix)]
+    {
+        use rustix::fs::{FlockOperation, flock};
+
+        flock(&directory, FlockOperation::LockExclusive).map_err(|error| {
+            format!(
+                "cannot lock promotion history directory {}: {}",
+                history_dir.display(),
+                std::io::Error::from(error)
+            )
+        })?;
+        Ok(Some(directory))
+    }
+    #[cfg(not(unix))]
+    {
+        drop(directory);
+        Err("performance history promotion requires Unix advisory directory locking".into())
+    }
+}
+
+fn validate_promotion_baseline_authority(
+    args: &Args,
+    gate: PerfGate,
+    baseline_is_bootstrap: bool,
+    baseline_is_history_pointer: bool,
+) -> Result<(), Box<dyn Error>> {
+    if args.mode != PerfRatchetMode::Promotion {
+        return Ok(());
+    }
+    let history_dir = args
+        .promote_dir
+        .as_deref()
+        .ok_or("promotion requires --promote-dir")?;
+    let profile = args
+        .machine_profile
+        .ok_or("promotion requires a complete machine profile")?;
+    let supplied_baseline = normalize_path(&args.baseline)?;
+    let authoritative_latest = history_dir.join(profile.latest_basename(gate.label())?);
+    let latest_exists = match fs::symlink_metadata(&authoritative_latest) {
+        Ok(_) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(error) => {
+            return Err(format!(
+                "cannot inspect authoritative latest pointer {}: {error}",
+                authoritative_latest.display()
+            )
+            .into());
+        }
+    };
+
+    if latest_exists {
+        if supplied_baseline != normalize_path(&authoritative_latest)? {
+            return Err(format!(
+                "promotion baseline {} is stale or nonauthoritative; use current pointer {}",
+                args.baseline.display(),
+                authoritative_latest.display()
+            )
+            .into());
+        }
+        if !baseline_is_history_pointer || baseline_is_bootstrap {
+            return Err(format!(
+                "authoritative promotion baseline {} must be a measured v2 history pointer",
+                authoritative_latest.display()
+            )
+            .into());
+        }
+        return Ok(());
+    }
+
+    let authoritative_bootstrap =
+        history_dir.join(format!("{}.unmeasured.latest.json", gate.label()));
+    if supplied_baseline != normalize_path(&authoritative_bootstrap)?
+        || !baseline_is_bootstrap
+        || baseline_is_history_pointer
+    {
+        return Err(format!(
+            "profile {}/{} has no measured latest pointer; first promotion must use exact bootstrap {}",
+            profile.hardware_class_id().as_str(),
+            profile.execution_profile_id().as_str(),
+            authoritative_bootstrap.display()
+        )
+        .into());
+    }
+    Ok(())
+}
+
 fn read_baseline(
     path: &Path,
     explicit_evidence_path: Option<&Path>,
@@ -668,7 +817,6 @@ fn read_baseline(
         )
         .into());
     }
-    validate_component(&pointer.machine_class, "history pointer machine class")?;
     validate_component(&pointer.run_id, "history pointer run ID")?;
     validate_filename_component(
         &pointer.threshold_file,
@@ -676,14 +824,10 @@ fn read_baseline(
         240,
     )?;
     validate_filename_component(&pointer.evidence_file, "history pointer evidence file", 240)?;
-    let expected_pointer_name = format!(
-        "{}.{}.latest.json",
-        pointer.gate.label(),
-        pointer.machine_class
-    );
+    let expected_pointer_name = pointer.profile.latest_basename(pointer.gate.label())?;
     if path.file_name().and_then(|name| name.to_str()) != Some(expected_pointer_name.as_str()) {
         return Err(format!(
-            "history pointer {} does not use canonical gate/class latest basename {}",
+            "history pointer {} does not use canonical gate/profile latest basename {}",
             path.display(),
             expected_pointer_name
         )
@@ -703,6 +847,11 @@ fn read_baseline(
         || artifact.run_id != pointer.run_id
         || evidence.0.gate != pointer.gate
         || evidence.0.provenance.run_id != pointer.run_id
+        || artifact
+            .applicability_plan
+            .as_ref()
+            .is_none_or(|binding| binding.profile != pointer.profile)
+        || evidence.0.applicability_plan.profile != pointer.profile
     {
         return Err(format!(
             "history pointer {} does not bind its exact threshold/evidence generation",
@@ -754,7 +903,7 @@ fn read_runner_identity(
     artifact_manifest_path: Option<&Path>,
     run_log_path: Option<&Path>,
     gate: PerfGate,
-    expected_class: Option<&str>,
+    expected_profile: Option<MachineProfileKey>,
     threshold_artifact_bytes: Option<&[u8]>,
     evidence_artifact_bytes: Option<&[u8]>,
 ) -> Result<Option<AdmittedRunnerReceipt>, Box<dyn Error>> {
@@ -762,7 +911,7 @@ fn read_runner_identity(
         && receipt_path.is_none()
         && artifact_manifest_path.is_none()
         && run_log_path.is_none()
-        && expected_class.is_none()
+        && expected_profile.is_none()
     {
         return Ok(None);
     }
@@ -771,7 +920,7 @@ fn read_runner_identity(
         Some(receipt_path),
         Some(artifact_manifest_path),
         Some(run_log_path),
-        Some(expected_class),
+        Some(expected_profile),
         Some(threshold_artifact_bytes),
         Some(evidence_artifact_bytes),
     ) = (
@@ -779,7 +928,7 @@ fn read_runner_identity(
         receipt_path,
         artifact_manifest_path,
         run_log_path,
-        expected_class,
+        expected_profile,
         threshold_artifact_bytes,
         evidence_artifact_bytes,
     )
@@ -792,7 +941,8 @@ fn read_runner_identity(
     let gate = gate.label();
     let context = MachineClassAdmissionContext {
         gate: gate.to_owned(),
-        destination_basename: format!("{gate}.{expected_class}.latest.json"),
+        expected_profile,
+        destination_basename: expected_profile.latest_basename(gate)?,
     };
     let identity = registry
         .admit(&receipt_bytes, &context)?
@@ -802,10 +952,10 @@ fn read_runner_identity(
             threshold_artifact_bytes,
             evidence_artifact_bytes,
         )?;
-    if identity.class_id() != expected_class {
+    if identity.profile() != expected_profile {
         return Err(format!(
-            "runner receipt derives machine class {:?}, expected {expected_class:?}",
-            identity.class_id()
+            "runner receipt derives machine profile {:?}, expected {expected_profile:?}",
+            identity.profile()
         )
         .into());
     }
@@ -898,12 +1048,12 @@ fn plan_history_if_requested(
     candidate_run_id: &str,
     candidate_bytes: &[u8],
     candidate_evidence_bytes: Option<&[u8]>,
-    verified_machine_class: Option<&str>,
+    verified_machine_profile: Option<MachineProfileKey>,
     updates: &mut Vec<PerfEvidenceFile>,
 ) -> Result<Option<HistoryPublicationPlan>, Box<dyn Error>> {
-    let (Some(history_dir), Some(machine_class), Some(date)) = (
+    let (Some(history_dir), Some(profile), Some(date)) = (
         args.promote_dir.as_deref(),
-        verified_machine_class,
+        verified_machine_profile,
         args.date.as_deref(),
     ) else {
         return Ok(None);
@@ -912,7 +1062,12 @@ fn plan_history_if_requested(
         candidate_evidence_bytes.ok_or("allowed promotion is missing receipt-bound evidence")?;
     validate_component(candidate_run_id, "candidate run ID")?;
 
-    let stem = format!("{}.{}", gate.label(), machine_class);
+    let stem = format!(
+        "{}.{}.{}",
+        gate.label(),
+        profile.hardware_class_id().as_str(),
+        profile.execution_profile_id().as_str()
+    );
     let rolling_stem = format!("{stem}.{date}.{candidate_run_id}");
     let threshold_file = format!("{rolling_stem}.json");
     let evidence_file = format!("{rolling_stem}.evidence.json");
@@ -924,7 +1079,7 @@ fn plan_history_if_requested(
     let pointer = HistoryPointer {
         schema_version: HISTORY_POINTER_SCHEMA_VERSION.to_owned(),
         gate,
-        machine_class: machine_class.to_owned(),
+        profile,
         run_id: candidate_run_id.to_owned(),
         threshold_file,
         threshold_sha256: sha256_hex(candidate_bytes),
@@ -963,7 +1118,7 @@ fn plan_history_if_allowed(
     candidate_run_id: &str,
     candidate_bytes: &[u8],
     candidate_evidence_bytes: Option<&[u8]>,
-    verified_machine_class: Option<&str>,
+    verified_machine_profile: Option<MachineProfileKey>,
     evaluation: &mut frankensearch_quill_gauntlet::PerfRatchetEvaluation,
 ) -> Result<Option<HistoryPublicationPlan>, Box<dyn Error>> {
     if evaluation.decision != PerfGateDecision::Allow {
@@ -975,7 +1130,7 @@ fn plan_history_if_allowed(
         candidate_run_id,
         candidate_bytes,
         candidate_evidence_bytes,
-        verified_machine_class,
+        verified_machine_profile,
         &mut evaluation.history_updates,
     )
 }
@@ -1057,6 +1212,11 @@ mod tests {
     use super::*;
     use std::collections::BTreeMap;
 
+    fn test_profile() -> MachineProfileKey {
+        MachineProfileKey::new(HardwareClassId::TrjZen35995wx, ExecutionProfileId::Smt2_128)
+            .expect("registered Threadripper SMT profile")
+    }
+
     fn test_args(history_dir: &Path) -> Args {
         Args {
             manifest: PathBuf::from("manifest.toml"),
@@ -1075,7 +1235,7 @@ mod tests {
             output: PathBuf::from("ratchet.json"),
             mode: PerfRatchetMode::Promotion,
             promote_dir: Some(history_dir.to_path_buf()),
-            machine_class: Some("trj-zen3-16c-smt2".to_owned()),
+            machine_profile: Some(test_profile()),
             date: Some("2026-07-29".to_owned()),
         }
     }
@@ -1098,9 +1258,9 @@ mod tests {
 
     fn history_files(history_dir: &Path) -> [PathBuf; 3] {
         [
-            history_dir.join("QG-6.trj-zen3-16c-smt2.2026-07-29.candidate-1.json"),
-            history_dir.join("QG-6.trj-zen3-16c-smt2.2026-07-29.candidate-1.evidence.json"),
-            history_dir.join("QG-6.trj-zen3-16c-smt2.latest.json"),
+            history_dir.join("QG-6.trj-zen3-5995wx.smt2-128.2026-07-29.candidate-1.json"),
+            history_dir.join("QG-6.trj-zen3-5995wx.smt2-128.2026-07-29.candidate-1.evidence.json"),
+            history_dir.join("QG-6.trj-zen3-5995wx.smt2-128.latest.json"),
         ]
     }
 
@@ -1142,9 +1302,53 @@ mod tests {
 
     #[test]
     fn history_components_reject_path_traversal() {
-        assert!(validate_component("../worker", "machine class").is_err());
-        assert!(validate_component("github-ubuntu", "machine class").is_ok());
+        assert!(validate_component("../worker", "run ID").is_err());
+        assert!(validate_component("candidate-1", "run ID").is_ok());
         assert!(validate_component("2026-07-23", "date").is_ok());
+    }
+
+    #[test]
+    fn cli_profile_parsers_are_closed_and_reject_obsolete_width_classes() {
+        assert_eq!(
+            parse_hardware_class(OsStr::new("trj-zen3-5995wx")).unwrap(),
+            HardwareClassId::TrjZen35995wx
+        );
+        assert_eq!(
+            parse_execution_profile(OsStr::new("smt2-128")).unwrap(),
+            ExecutionProfileId::Smt2_128
+        );
+        for obsolete in ["trj-zen3-1c", "trj-zen3-64c", "trj-zen3-64c-smt2"] {
+            assert!(
+                parse_hardware_class(OsStr::new(obsolete)).is_err(),
+                "{obsolete} admitted"
+            );
+        }
+        assert!(
+            MachineProfileKey::new(HardwareClassId::M4Macos, ExecutionProfileId::Smt2_128).is_err()
+        );
+    }
+
+    #[test]
+    fn legacy_machine_class_flag_is_rejected() {
+        let result = parse_args(
+            [
+                "--manifest",
+                "manifest.toml",
+                "--baseline",
+                "baseline.json",
+                "--candidate",
+                "candidate.json",
+                "--output",
+                "out.json",
+                "--mode",
+                "regression-alarm",
+                "--machine-class",
+                "trj-zen3-64c-smt2",
+            ]
+            .into_iter()
+            .map(OsString::from),
+        );
+        assert!(result.is_err());
     }
 
     #[test]
@@ -1198,8 +1402,14 @@ mod tests {
                 "candidate/run.log",
                 "--rerun-run-log",
                 "rerun/run.log",
-                "--machine-class",
-                "trj-zen3-16c-smt2",
+                "--hardware-class",
+                "trj-zen3-5995wx",
+                "--execution-profile",
+                "smt2-128",
+                "--promote-dir",
+                ".bench-history",
+                "--date",
+                "2026-07-30",
                 "--output",
                 "out.json",
                 "--mode",
@@ -1217,6 +1427,108 @@ mod tests {
         assert!(result.rerun_artifact_manifest.is_some());
         assert!(result.candidate_run_log.is_some());
         assert!(result.rerun_run_log.is_some());
+        assert_eq!(result.machine_profile, Some(test_profile()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn promotion_history_lock_serializes_the_entire_history_directory() {
+        use rustix::fs::{FlockOperation, flock};
+
+        let directory = tempfile::tempdir().expect("history directory");
+        let args = test_args(directory.path());
+        let first = acquire_promotion_history_lock(&args)
+            .expect("first lock")
+            .expect("promotion lock");
+        let second = File::open(directory.path()).expect("second directory descriptor");
+
+        assert!(
+            flock(&second, FlockOperation::NonBlockingLockExclusive).is_err(),
+            "a second promoter must not resolve a baseline concurrently"
+        );
+        drop(first);
+        flock(&second, FlockOperation::NonBlockingLockExclusive)
+            .expect("lock becomes available only after the first promoter exits");
+    }
+
+    #[test]
+    fn promotion_baseline_authority_rejects_copies_stale_bootstrap_and_direct_latest() {
+        let bootstrap_directory = tempfile::tempdir().expect("bootstrap history directory");
+        let canonical_bootstrap = bootstrap_directory
+            .path()
+            .join("QG-2.unmeasured.latest.json");
+        let bootstrap_bytes =
+            include_bytes!("../../../../.bench-history/QG-2.unmeasured.latest.json");
+        fs::write(&canonical_bootstrap, bootstrap_bytes).expect("canonical bootstrap");
+        let mut bootstrap_args = test_args(bootstrap_directory.path());
+        bootstrap_args.baseline = canonical_bootstrap.clone();
+        assert!(
+            validate_promotion_baseline_authority(&bootstrap_args, PerfGate::Qg2, true, false)
+                .is_ok()
+        );
+
+        let copied_bootstrap = bootstrap_directory.path().join("copied-bootstrap.json");
+        fs::write(&copied_bootstrap, bootstrap_bytes).expect("copied bootstrap");
+        bootstrap_args.baseline = copied_bootstrap;
+        let before_copy_rejection = snapshot(bootstrap_directory.path());
+        assert!(
+            validate_promotion_baseline_authority(&bootstrap_args, PerfGate::Qg2, true, false)
+                .is_err()
+        );
+        assert_eq!(
+            snapshot(bootstrap_directory.path()),
+            before_copy_rejection,
+            "rejecting a copied bootstrap must not mutate history"
+        );
+
+        let measured_directory = tempfile::tempdir().expect("measured history directory");
+        let profile = test_profile();
+        let latest = measured_directory
+            .path()
+            .join(profile.latest_basename(PerfGate::Qg2.label()).unwrap());
+        fs::write(&latest, b"new-authoritative-pointer").expect("latest pointer");
+        let stale_pointer_copy = measured_directory.path().join("stale-pointer-copy.json");
+        fs::write(&stale_pointer_copy, b"old-authoritative-pointer").expect("stale pointer copy");
+        let measured_bootstrap = measured_directory
+            .path()
+            .join("QG-2.unmeasured.latest.json");
+        fs::write(&measured_bootstrap, bootstrap_bytes).expect("retained bootstrap");
+        let mut measured_args = test_args(measured_directory.path());
+
+        measured_args.baseline = stale_pointer_copy;
+        let before_stale_rejection = snapshot(measured_directory.path());
+        assert!(
+            validate_promotion_baseline_authority(&measured_args, PerfGate::Qg2, false, true)
+                .is_err()
+        );
+        assert_eq!(
+            snapshot(measured_directory.path()),
+            before_stale_rejection,
+            "rejecting a stale copied pointer must leave current history byte-identical"
+        );
+
+        measured_args.baseline = measured_bootstrap;
+        let before_bootstrap_rejection = snapshot(measured_directory.path());
+        assert!(
+            validate_promotion_baseline_authority(&measured_args, PerfGate::Qg2, true, false)
+                .is_err()
+        );
+        assert_eq!(
+            snapshot(measured_directory.path()),
+            before_bootstrap_rejection,
+            "bootstrap replay after first activation must not mutate history"
+        );
+
+        measured_args.baseline = latest;
+        assert!(
+            validate_promotion_baseline_authority(&measured_args, PerfGate::Qg2, false, true)
+                .is_ok()
+        );
+        assert!(
+            validate_promotion_baseline_authority(&measured_args, PerfGate::Qg2, false, false)
+                .is_err(),
+            "a direct threshold cannot masquerade at the authoritative pointer path"
+        );
     }
 
     #[test]
@@ -1268,7 +1580,7 @@ mod tests {
             "candidate-1",
             b"forbidden-candidate",
             Some(b"forbidden-evidence"),
-            Some("trj-zen3-16c-smt2"),
+            Some(test_profile()),
             &mut evaluation,
         )
         .expect("denial must be a no-op");
@@ -1320,7 +1632,7 @@ mod tests {
             "candidate-1",
             b"forbidden-candidate",
             Some(b"forbidden-receipt-bound-evidence"),
-            Some("trj-zen3-16c-smt2"),
+            Some(test_profile()),
             &mut evaluation,
         )
         .expect("denial must not open history");
@@ -1345,7 +1657,7 @@ mod tests {
             "candidate-1",
             candidate,
             Some(receipt_bound_evidence),
-            Some("trj-zen3-16c-smt2"),
+            Some(test_profile()),
             &mut evaluation,
         )
         .expect("valid durable promotion")
@@ -1367,13 +1679,14 @@ mod tests {
         let pointer =
             serde_json::from_slice::<HistoryPointer>(&pointer_bytes).expect("typed latest pointer");
         assert_eq!(pointer.run_id, "candidate-1");
+        assert_eq!(pointer.profile, test_profile());
         assert_eq!(
             pointer.threshold_file,
-            "QG-6.trj-zen3-16c-smt2.2026-07-29.candidate-1.json"
+            "QG-6.trj-zen3-5995wx.smt2-128.2026-07-29.candidate-1.json"
         );
         assert_eq!(
             pointer.evidence_file,
-            "QG-6.trj-zen3-16c-smt2.2026-07-29.candidate-1.evidence.json"
+            "QG-6.trj-zen3-5995wx.smt2-128.2026-07-29.candidate-1.evidence.json"
         );
         assert!(
             snapshot(directory.path())
@@ -1412,7 +1725,7 @@ mod tests {
             "candidate-1",
             b"threshold",
             Some(b"bound-evidence"),
-            Some("trj-zen3-16c-smt2"),
+            Some(test_profile()),
             &mut evaluation,
         )
         .unwrap()
@@ -1435,7 +1748,7 @@ mod tests {
             "candidate-1",
             b"threshold-one",
             Some(b"evidence-one"),
-            Some("trj-zen3-16c-smt2"),
+            Some(test_profile()),
             &mut first_evaluation,
         )
         .unwrap()
@@ -1450,7 +1763,7 @@ mod tests {
             "candidate-1",
             b"threshold-two",
             Some(b"evidence-two"),
-            Some("trj-zen3-16c-smt2"),
+            Some(test_profile()),
             &mut second_evaluation,
         )
         .unwrap()
@@ -1477,7 +1790,7 @@ mod tests {
                     run_id,
                     b"threshold",
                     Some(b"evidence"),
-                    Some("trj-zen3-16c-smt2"),
+                    Some(test_profile()),
                     &mut evaluation,
                 )
                 .is_err()

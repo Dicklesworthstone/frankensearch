@@ -32,15 +32,16 @@ use thiserror::Error;
 use crate::perf::{
     DistributionSummary, LEGACY_PERF_ARTIFACT_SCHEMA_VERSION_V3, PairedClaimState,
     PairedEstimatorConfig, PairedEstimatorError, PairedEvidenceStatus, PairedExperimentResult,
-    PerfExecutionProvenance, PerfGate, PerfGateArtifact, PerfInputIdentity, PerfRawSample,
-    PerfSampleArm, QG6_QUERY_GROUP_IDS, QG6_QUERY_GROUPS, median_sorted, percentile, splitmix64,
-    validate_paired_blocks,
+    PerfApplicabilityPlan, PerfApplicabilityPlanBinding, PerfCellApplicability,
+    PerfExecutionProvenance, PerfGate, PerfGateArtifact, PerfInputIdentity, PerfMatrixSpec,
+    PerfRawSample, PerfSampleArm, QG6_QUERY_GROUP_IDS, QG6_QUERY_GROUPS, median_sorted, percentile,
+    splitmix64, validate_paired_blocks,
 };
 use crate::qg6_prepared::{
     Qg6ArmRole, Qg6QueryIdentityReceipt, Qg6QuerySpec, Qg6SemanticContract,
     qg6_result_sequence_sha256,
 };
-use crate::{MachineClassEvidenceBinding, VerifiedRunnerIdentity};
+use crate::{MachineClassEvidenceBinding, MachineClassRegistry, VerifiedRunnerIdentity};
 
 /// Version of the evidence artifact emitted by this module.
 ///
@@ -49,7 +50,7 @@ use crate::{MachineClassEvidenceBinding, VerifiedRunnerIdentity};
 /// [`EvidenceArtifactError::SchemaMismatch`], and legacy v3 gate artifacts are
 /// only readable through the explicit, read-only
 /// [`load_legacy_gate_artifact_v3`].
-pub const PERF_EVIDENCE_SCHEMA_VERSION: &str = "quill-perf-evidence-v3";
+pub const PERF_EVIDENCE_SCHEMA_VERSION: &str = "quill-perf-evidence-v4";
 /// Version of the hierarchical latency estimate carried by latency cells.
 pub const HIERARCHICAL_LATENCY_SCHEMA_VERSION: &str = "quill-hierarchical-latency-v1";
 /// Upper bound on retained reasons per artifact or cell.
@@ -1662,6 +1663,10 @@ pub struct PerfEvidenceArtifact {
     pub schema_version: String,
     /// Gate this artifact certifies.
     pub gate: PerfGate,
+    /// Exact profile-qualified projection of the complete canonical gate
+    /// matrix. Current evidence cannot be assembled or verified from a
+    /// class-only identity.
+    pub applicability_plan: PerfApplicabilityPlanBinding,
     /// Predeclared evidence-layer thresholds used for every cell.
     pub policy: EvidencePolicy,
     /// Complete run provenance.
@@ -1691,13 +1696,65 @@ pub struct PerfEvidenceArtifact {
 }
 
 impl PerfEvidenceArtifact {
+    fn reconstruct_applicability_plan(
+        gate: PerfGate,
+        binding: &PerfApplicabilityPlanBinding,
+    ) -> Result<(PerfMatrixSpec, PerfApplicabilityPlan), EvidenceArtifactError> {
+        if binding.gate != gate {
+            return Err(EvidenceArtifactError::InconsistentArtifact {
+                reason: format!(
+                    "applicability plan names gate {} instead of artifact gate {gate}",
+                    binding.gate
+                ),
+            });
+        }
+        let registry = MachineClassRegistry::frozen().map_err(|error| {
+            EvidenceArtifactError::InvalidProvenance {
+                reason: format!("frozen machine registry rejected applicability planning: {error}"),
+            }
+        })?;
+        let matrix = PerfMatrixSpec::complete();
+        let plan = matrix
+            .applicability_plan(&registry, binding.profile, gate)
+            .map_err(|error| EvidenceArtifactError::InconsistentArtifact {
+                reason: format!(
+                    "cannot reconstruct applicability plan for {:?} {gate}: {error}",
+                    binding.profile
+                ),
+            })?;
+        if plan.binding != *binding {
+            return Err(EvidenceArtifactError::InconsistentArtifact {
+                reason: format!(
+                    "stored applicability-plan binding for {:?} {gate} does not equal the frozen \
+                     registry and canonical matrix projection",
+                    binding.profile
+                ),
+            });
+        }
+        Ok((matrix, plan))
+    }
+
     fn validate_cell_set(
         gate: PerfGate,
         cells: &[EvidenceCell],
+        matrix: &PerfMatrixSpec,
+        plan: &PerfApplicabilityPlan,
     ) -> Result<(), EvidenceArtifactError> {
         if cells.is_empty() {
             return Err(EvidenceArtifactError::InconsistentArtifact {
                 reason: "an evidence artifact requires at least one cell".to_owned(),
+            });
+        }
+        if plan.binding.gate != gate {
+            return Err(EvidenceArtifactError::InconsistentArtifact {
+                reason: "applicability plan and evidence artifact name different gates".to_owned(),
+            });
+        }
+        let canonical_cells = matrix.for_gate(gate);
+        if canonical_cells.len() != plan.cells.len() {
+            return Err(EvidenceArtifactError::InconsistentArtifact {
+                reason: "applicability plan does not classify the complete canonical gate"
+                    .to_owned(),
             });
         }
         let mut cell_ids = BTreeSet::new();
@@ -1724,6 +1781,53 @@ impl PerfEvidenceArtifact {
                     reason: format!("evidence artifact repeats cell {}", cell.cell_id),
                 });
             }
+
+            let mut matching = canonical_cells.iter().enumerate().filter(|(_, canonical)| {
+                canonical.fixture == cell.spec.fixture && canonical.metric == cell.spec.metric
+            });
+            let Some((ordinal, _)) = matching.next() else {
+                return Err(EvidenceArtifactError::InconsistentArtifact {
+                    reason: format!(
+                        "measured cell {} is not in the complete canonical {gate} matrix",
+                        cell.cell_id
+                    ),
+                });
+            };
+            if matching.next().is_some() {
+                return Err(EvidenceArtifactError::InconsistentArtifact {
+                    reason: format!(
+                        "measured cell {} resolves ambiguously in the canonical {gate} matrix",
+                        cell.cell_id
+                    ),
+                });
+            }
+            let classification = plan.cells.get(ordinal).ok_or_else(|| {
+                EvidenceArtifactError::InconsistentArtifact {
+                    reason: format!(
+                        "applicability plan omits canonical {gate} cell ordinal {ordinal}"
+                    ),
+                }
+            })?;
+            let expected_role = match classification.applicability {
+                PerfCellApplicability::Required => EvidenceRole::Required,
+                PerfCellApplicability::Diagnostic => EvidenceRole::Diagnostic,
+                PerfCellApplicability::NotApplicable => {
+                    return Err(EvidenceArtifactError::InconsistentArtifact {
+                        reason: format!(
+                            "measured cell {} is not applicable to profile {:?}",
+                            cell.cell_id, plan.binding.profile
+                        ),
+                    });
+                }
+            };
+            if cell.spec.role != expected_role {
+                return Err(EvidenceArtifactError::InconsistentArtifact {
+                    reason: format!(
+                        "measured cell {} has role {:?}; applicability plan requires {:?}",
+                        cell.cell_id, cell.spec.role, expected_role
+                    ),
+                });
+            }
         }
         Ok(())
     }
@@ -1736,18 +1840,22 @@ impl PerfEvidenceArtifact {
     /// set, or a cell belonging to a different gate.
     pub fn assemble(
         gate: PerfGate,
+        applicability_plan: PerfApplicabilityPlanBinding,
         policy: EvidencePolicy,
         provenance: EvidenceProvenance,
         cells: Vec<EvidenceCell>,
     ) -> Result<Self, EvidenceArtifactError> {
         policy.validate()?;
         provenance.validate()?;
-        Self::validate_cell_set(gate, &cells)?;
+        let (matrix, reconstructed_plan) =
+            Self::reconstruct_applicability_plan(gate, &applicability_plan)?;
+        Self::validate_cell_set(gate, &cells, &matrix, &reconstructed_plan)?;
         let admission_no_claim = None;
         let (gate_status, reasons) = Self::fold(&cells, admission_no_claim.as_ref());
         Ok(Self {
             schema_version: PERF_EVIDENCE_SCHEMA_VERSION.to_owned(),
             gate,
+            applicability_plan,
             policy,
             provenance,
             machine_class: MachineClassEvidenceBinding::unverified(
@@ -1818,12 +1926,57 @@ impl PerfEvidenceArtifact {
         (status, reasons)
     }
 
+    fn has_exact_runnable_plan_coverage(&self) -> bool {
+        let Ok((matrix, plan)) =
+            Self::reconstruct_applicability_plan(self.gate, &self.applicability_plan)
+        else {
+            return false;
+        };
+        if Self::validate_cell_set(self.gate, &self.cells, &matrix, &plan).is_err() {
+            return false;
+        }
+        let expected = matrix
+            .for_gate(self.gate)
+            .into_iter()
+            .zip(&plan.cells)
+            .filter(|(_, classification)| classification.applicability.is_runnable())
+            .map(|(cell, _)| format!("{}/{}/{}", self.gate, cell.fixture, cell.metric))
+            .collect::<BTreeSet<_>>();
+        let measured = self
+            .cells
+            .iter()
+            .map(|cell| cell.cell_id.clone())
+            .collect::<BTreeSet<_>>();
+        self.cells.len() == measured.len() && measured == expected
+    }
+
+    fn verify_runner_plan_envelope(
+        identity: &VerifiedRunnerIdentity,
+        plan: &PerfApplicabilityPlan,
+    ) -> Result<(), EvidenceArtifactError> {
+        if identity.profile() != plan.binding.profile
+            || identity.capacity_semantics() != plan.capacity_semantics
+            || plan.execution_capacity != Some(identity.execution_capacity())
+            || plan.max_exercised_cell_width != Some(identity.max_exercised_cell_width())
+        {
+            return Err(EvidenceArtifactError::InvalidProvenance {
+                reason: format!(
+                    "verified runner profile/capacity/maximum envelope does not equal \
+                     applicability plan {:?} {}",
+                    plan.binding.profile, plan.binding.gate
+                ),
+            });
+        }
+        Ok(())
+    }
+
     /// Whether this artifact may establish or move a ratchet baseline.
     ///
     /// Invalid runs remain durable but can never ratchet.
     #[must_use]
     pub fn ratchet_admissible(&self) -> bool {
         self.gate_status == EvidenceDecisionStatus::MeasuredProvisional
+            && self.has_exact_runnable_plan_coverage()
             && self
                 .machine_class
                 .identity()
@@ -1863,6 +2016,9 @@ impl PerfEvidenceArtifact {
             .map_err(|error| EvidenceArtifactError::InvalidProvenance {
                 reason: format!("machine-class binding rejected: {error}"),
             })?;
+        let (_, reconstructed_plan) =
+            Self::reconstruct_applicability_plan(self.gate, &self.applicability_plan)?;
+        Self::verify_runner_plan_envelope(&identity, &reconstructed_plan)?;
         identity
             .verify_threshold_artifact(threshold_artifact_bytes)
             .and_then(|()| identity.verify_evidence_artifact(prebinding_evidence_bytes))
@@ -1893,7 +2049,13 @@ impl PerfEvidenceArtifact {
         }
         let context = identity.admission_context();
         let gate_label = self.gate.label();
-        let expected_destination = format!("{gate_label}.{}.latest.json", identity.class_id());
+        let expected_destination =
+            identity
+                .profile()
+                .latest_basename(gate_label)
+                .map_err(|error| EvidenceArtifactError::InvalidProvenance {
+                    reason: format!("machine-profile destination rejected: {error}"),
+                })?;
         if context.gate != gate_label || context.destination_basename != expected_destination {
             return Err(EvidenceArtifactError::InvalidProvenance {
                 reason: format!(
@@ -2132,12 +2294,15 @@ impl PerfEvidenceArtifact {
         }
         self.policy.validate()?;
         self.provenance.validate()?;
+        let (matrix, reconstructed_plan) =
+            Self::reconstruct_applicability_plan(self.gate, &self.applicability_plan)?;
         self.machine_class.validate().map_err(|error| {
             EvidenceArtifactError::InvalidProvenance {
                 reason: format!("machine-class binding rejected: {error}"),
             }
         })?;
         if let Some(identity) = self.machine_class.identity() {
+            Self::verify_runner_plan_envelope(identity, &reconstructed_plan)?;
             let prebinding_bytes = self.reconstructed_prebinding_bytes()?;
             identity
                 .verify_evidence_artifact(&prebinding_bytes)
@@ -2158,7 +2323,7 @@ impl PerfEvidenceArtifact {
                 });
             }
         }
-        Self::validate_cell_set(self.gate, &self.cells)?;
+        Self::validate_cell_set(self.gate, &self.cells, &matrix, &reconstructed_plan)?;
         if let Some(reason) = self.admission_no_claim.as_ref()
             && (reason.severity != EvidenceSeverity::NoClaim
                 || reason.code.trim().is_empty()
@@ -2446,7 +2611,7 @@ pub enum EvidenceArtifactError {
         reason: String,
     },
     /// The artifact carries a non-current schema version.
-    #[error("evidence artifact schema is {found}; current is quill-perf-evidence-v3")]
+    #[error("evidence artifact schema is {found}; current is quill-perf-evidence-v4")]
     SchemaMismatch {
         /// The version string found in the file.
         found: String,
@@ -2761,6 +2926,28 @@ mod tests {
         EvidencePolicy::predeclared()
     }
 
+    fn test_profile() -> crate::MachineProfileKey {
+        crate::MachineProfileKey::new(
+            crate::HardwareClassId::TrjZen35995wx,
+            crate::ExecutionProfileId::Physical64,
+        )
+        .expect("canonical test profile")
+    }
+
+    fn applicability_plan(gate: PerfGate) -> PerfApplicabilityPlan {
+        PerfMatrixSpec::complete()
+            .applicability_plan(
+                &MachineClassRegistry::frozen().expect("frozen machine registry"),
+                test_profile(),
+                gate,
+            )
+            .expect("canonical test applicability plan")
+    }
+
+    fn plan_binding(gate: PerfGate) -> PerfApplicabilityPlanBinding {
+        applicability_plan(gate).binding
+    }
+
     fn build_identity() -> BuildIdentity {
         BuildIdentity {
             executable_sha256: "a".repeat(64),
@@ -2791,13 +2978,15 @@ mod tests {
                 execution: PerfExecutionProvenance {
                     host_identity: "test-machine".to_owned(),
                     producer_os: crate::PerfProducerOs::Linux,
-                    physical_cores: 4,
-                    logical_threads: 8,
-                    process_available_threads: 8,
+                    physical_cores: 64,
+                    logical_threads: 128,
+                    process_available_threads: 64,
                     configured_engine_thread_widths: vec![1],
                     runtime_detected_isa: vec!["avx2".to_owned()],
-                    cpu_affinity_allowed_list: Some("0-7".to_owned()),
-                    affinity_or_cpuset_cap: None,
+                    cpu_affinity_allowed_list: Some("0-63".to_owned()),
+                    affinity_or_cpuset_cap: Some(
+                        "physical-64 profile: one hardware thread per physical core".to_owned(),
+                    ),
                 },
                 cpu_governor: None,
                 load_average_start: Some(0.5),
@@ -2871,17 +3060,70 @@ mod tests {
         artifact.artifact_sha256.clear();
     }
 
+    fn reseal_json_value(mut value: serde_json::Value) -> Vec<u8> {
+        value["artifact_sha256"] = serde_json::Value::String(String::new());
+        let unsealed = serde_json::to_string_pretty(&value).expect("serialize unsealed JSON");
+        value["artifact_sha256"] =
+            serde_json::Value::String(lower_hex(&Sha256::digest(unsealed.as_bytes())));
+        serde_json::to_vec_pretty(&value).expect("serialize sealed JSON")
+    }
+
     fn cell_spec(gate: PerfGate, role: EvidenceRole) -> EvidenceCellSpec {
-        let (input_identity, qg6_semantic_contract, fixture) = if gate == PerfGate::Qg6 {
-            let (identity, contract) =
-                qg6_test_fixture::contract(crate::PerfQueryClass::Identifier);
-            (
-                Some(identity),
-                Some(contract),
-                "query/identifier/k10/100k".to_owned(),
-            )
-        } else {
-            (None, None, "bulk/synthetic/1".to_owned())
+        let (input_identity, qg6_semantic_contract, fixture, metric) = match gate {
+            PerfGate::Qg1 => (
+                None,
+                None,
+                "bulk/tiny/1/positions_on".to_owned(),
+                "docs_per_second".to_owned(),
+            ),
+            PerfGate::Qg2 => (
+                None,
+                None,
+                "bulk/medium/1/positions_on".to_owned(),
+                "docs_per_second".to_owned(),
+            ),
+            PerfGate::Qg6 => {
+                let (identity, contract) =
+                    qg6_test_fixture::contract(crate::PerfQueryClass::Identifier);
+                (
+                    Some(identity),
+                    Some(contract),
+                    "query/identifier/k10/100k".to_owned(),
+                    "latency_ms".to_owned(),
+                )
+            }
+            PerfGate::Qg8 => (
+                None,
+                None,
+                "scaling/xlarge/1/positions_on".to_owned(),
+                "docs_per_second".to_owned(),
+            ),
+            PerfGate::Qg9 => (
+                None,
+                None,
+                "cold_open/xlarge/default".to_owned(),
+                "open_latency_ms".to_owned(),
+            ),
+            PerfGate::Qg10 => (
+                None,
+                None,
+                "dependency_surface/default_lexical".to_owned(),
+                "tantivy_nodes".to_owned(),
+            ),
+            _ => {
+                let matrix = PerfMatrixSpec::complete();
+                let canonical = matrix
+                    .for_gate(gate)
+                    .into_iter()
+                    .next()
+                    .expect("canonical gate cell");
+                (
+                    None,
+                    None,
+                    canonical.fixture.clone(),
+                    canonical.metric.clone(),
+                )
+            }
         };
         let concurrency_witness = (gate == PerfGate::Qg8
             || (gate == PerfGate::Qg1 && role == EvidenceRole::Required))
@@ -2907,7 +3149,7 @@ mod tests {
         EvidenceCellSpec {
             gate,
             fixture,
-            metric: "latency_ms".to_owned(),
+            metric,
             unit: "ms".to_owned(),
             role,
             input_identity,
@@ -2929,19 +3171,29 @@ mod tests {
         cell
     }
 
+    fn provisional_qg2_cell() -> EvidenceCell {
+        EvidenceCell::evaluate(
+            cell_spec(PerfGate::Qg2, EvidenceRole::Required),
+            valid_experiment(1.10),
+            &policy(),
+        )
+        .expect("provisional QG-2 cell")
+    }
+
     fn provisional_artifact() -> PerfEvidenceArtifact {
         let mut artifact = PerfEvidenceArtifact::assemble(
-            PerfGate::Qg1,
+            PerfGate::Qg2,
+            plan_binding(PerfGate::Qg2),
             policy(),
             evidence_provenance(),
-            vec![provisional_cell()],
+            vec![provisional_qg2_cell()],
         )
         .expect("provisional artifact");
         bind_test_identity(
             &mut artifact,
-            PerfGate::Qg1,
-            b"qg1-threshold",
-            "qg1-primary",
+            PerfGate::Qg2,
+            b"qg2-threshold",
+            "qg2-primary",
         );
         artifact
     }
@@ -2962,9 +3214,14 @@ mod tests {
         let cell = EvidenceCell::evaluate(spec, paired, &policy()).expect("QG-6 evidence cell");
         let mut provenance = evidence_provenance();
         provenance.corpus.query_set_sha256 = Some("d".repeat(64));
-        let mut artifact =
-            PerfEvidenceArtifact::assemble(PerfGate::Qg6, policy(), provenance, vec![cell])
-                .expect("QG-6 artifact");
+        let mut artifact = PerfEvidenceArtifact::assemble(
+            PerfGate::Qg6,
+            plan_binding(PerfGate::Qg6),
+            policy(),
+            provenance,
+            vec![cell],
+        )
+        .expect("QG-6 artifact");
         bind_test_identity(
             &mut artifact,
             PerfGate::Qg6,
@@ -3174,6 +3431,7 @@ mod tests {
 
         let mut artifact = PerfEvidenceArtifact::assemble(
             PerfGate::Qg1,
+            plan_binding(PerfGate::Qg1),
             policy(),
             evidence_provenance(),
             vec![cell],
@@ -3198,6 +3456,7 @@ mod tests {
     fn unverified_machine_binding_is_explicit_durable_and_nonpromotable() {
         let artifact = PerfEvidenceArtifact::assemble(
             PerfGate::Qg1,
+            plan_binding(PerfGate::Qg1),
             policy(),
             evidence_provenance(),
             vec![provisional_cell()],
@@ -3225,16 +3484,17 @@ mod tests {
     #[test]
     fn post_exit_binding_returns_exact_verified_receipt_bound_bytes() {
         let mut artifact = PerfEvidenceArtifact::assemble(
-            PerfGate::Qg1,
+            PerfGate::Qg2,
+            plan_binding(PerfGate::Qg2),
             policy(),
             evidence_provenance(),
-            vec![provisional_cell()],
+            vec![provisional_qg2_cell()],
         )
         .expect("unverified producer evidence");
-        let threshold_bytes = b"qg1-threshold";
+        let threshold_bytes = b"qg2-threshold";
         let source = seal_unbound_artifact(&mut artifact);
         let identity =
-            admitted_identity(PerfGate::Qg1, threshold_bytes, &source, "post-exit-primary");
+            admitted_identity(PerfGate::Qg2, threshold_bytes, &source, "post-exit-primary");
         let bytes = artifact
             .bind_machine_class_identity_and_seal(identity, threshold_bytes, &source)
             .expect("post-exit receipt binding");
@@ -3255,17 +3515,18 @@ mod tests {
     #[test]
     fn nul_delimited_argv_digest_drift_rejects_post_exit_binding() {
         let mut artifact = PerfEvidenceArtifact::assemble(
-            PerfGate::Qg1,
+            PerfGate::Qg2,
+            plan_binding(PerfGate::Qg2),
             policy(),
             evidence_provenance(),
-            vec![provisional_cell()],
+            vec![provisional_qg2_cell()],
         )
         .expect("unverified producer evidence");
-        let threshold_bytes = b"qg1-threshold";
+        let threshold_bytes = b"qg2-threshold";
         let source = seal_unbound_artifact(&mut artifact);
         let drifted_argv_identity =
             crate::machine_class_registry::admitted_test_identity_for_artifacts(
-                PerfGate::Qg1.label(),
+                PerfGate::Qg2.label(),
                 &"d".repeat(40),
                 &"c".repeat(64),
                 &"a".repeat(64),
@@ -3295,6 +3556,51 @@ mod tests {
     }
 
     #[test]
+    fn runner_binding_and_integrity_reject_plan_maximum_envelope_drift() {
+        let mut artifact = PerfEvidenceArtifact::assemble(
+            PerfGate::Qg2,
+            plan_binding(PerfGate::Qg2),
+            policy(),
+            evidence_provenance(),
+            vec![provisional_qg2_cell()],
+        )
+        .expect("unverified QG-2 producer evidence");
+        let source = seal_unbound_artifact(&mut artifact);
+        let wrong_maximum_identity = admitted_identity(
+            PerfGate::Qg1,
+            b"qg1-envelope-threshold",
+            &source,
+            "wrong-maximum",
+        );
+
+        assert!(matches!(
+            artifact.bind_machine_class_identity(
+                wrong_maximum_identity.clone(),
+                b"qg1-envelope-threshold",
+                &source,
+            ),
+            Err(EvidenceArtifactError::InvalidProvenance { reason })
+                if reason.contains("profile/capacity/maximum envelope")
+        ));
+
+        artifact.machine_class = MachineClassEvidenceBinding::verified(wrong_maximum_identity);
+        let directory = tempfile::tempdir().expect("runner envelope directory");
+        let path = directory.path().join("wrong-runner-envelope.json");
+        fs::write(
+            &path,
+            artifact
+                .sealed_json()
+                .expect("reseal wrong-runner-envelope artifact"),
+        )
+        .expect("persist wrong-runner-envelope artifact");
+        assert!(matches!(
+            PerfEvidenceArtifact::load_verified(&path),
+            Err(EvidenceArtifactError::InvalidProvenance { reason })
+                if reason.contains("profile/capacity/maximum envelope")
+        ));
+    }
+
+    #[test]
     fn verified_runner_binding_cannot_be_reassigned_to_another_receipt() {
         let mut artifact = provisional_artifact();
         let original = artifact.machine_class.clone();
@@ -3302,7 +3608,7 @@ mod tests {
             .reconstructed_prebinding_bytes()
             .expect("reconstruct pre-binding source");
         let different_receipt = crate::machine_class_registry::admitted_test_identity_for_artifacts(
-            PerfGate::Qg1.label(),
+            PerfGate::Qg2.label(),
             &"d".repeat(40),
             &"c".repeat(64),
             &"a".repeat(64),
@@ -3311,14 +3617,14 @@ mod tests {
             "different-completion",
             "run-a",
             "window-1",
-            b"qg1-threshold",
+            b"qg2-threshold",
             &source,
         );
 
         assert!(matches!(
             artifact.bind_machine_class_identity_and_seal(
                 different_receipt,
-                b"qg1-threshold",
+                b"qg2-threshold",
                 &source,
             ),
             Err(EvidenceArtifactError::InvalidProvenance { reason })
@@ -3805,11 +4111,6 @@ mod tests {
         contract.contract_sha256 = contract.canonical_sha256();
         let semantic_contract_sha256 = contract.contract_sha256.clone();
 
-        cell.spec.fixture = "query/identifier/k99/100k".to_owned();
-        cell.cell_id = format!(
-            "{}/{}/{}",
-            cell.spec.gate, cell.spec.fixture, cell.spec.metric
-        );
         let identity = cell
             .spec
             .input_identity
@@ -4186,6 +4487,7 @@ mod tests {
 
         let mut artifact = PerfEvidenceArtifact::assemble(
             PerfGate::Qg6,
+            plan_binding(PerfGate::Qg6),
             policy(),
             evidence_provenance(),
             vec![cell],
@@ -4262,6 +4564,7 @@ mod tests {
 
         let mut artifact = PerfEvidenceArtifact::assemble(
             PerfGate::Qg6,
+            plan_binding(PerfGate::Qg6),
             policy(),
             evidence_provenance(),
             vec![cell],
@@ -4354,6 +4657,7 @@ mod tests {
 
         let artifact = PerfEvidenceArtifact::assemble(
             PerfGate::Qg10,
+            plan_binding(PerfGate::Qg10),
             policy(),
             evidence_provenance(),
             vec![cell],
@@ -4507,7 +4811,7 @@ mod tests {
 
         let mut wrong_gate = provisional_artifact();
         unbind_test_artifact(&mut wrong_gate);
-        wrong_gate.gate = PerfGate::Qg2;
+        wrong_gate.gate = PerfGate::Qg1;
         let wrong_gate_path = directory.path().join("wrong-gate.json");
         fs::write(
             &wrong_gate_path,
@@ -4567,6 +4871,176 @@ mod tests {
     }
 
     #[test]
+    fn v4_rejects_resealed_applicability_binding_profile_plan_hash_and_gate_mutations() {
+        let directory = tempfile::tempdir().expect("applicability mutation directory");
+
+        let mut wrong_profile = provisional_artifact();
+        unbind_test_artifact(&mut wrong_profile);
+        wrong_profile.applicability_plan.profile = crate::MachineProfileKey::new(
+            crate::HardwareClassId::TrjZen35995wx,
+            crate::ExecutionProfileId::Smt2_128,
+        )
+        .expect("canonical alternate profile");
+        let wrong_profile_path = directory.path().join("wrong-profile.json");
+        fs::write(
+            &wrong_profile_path,
+            wrong_profile
+                .sealed_json()
+                .expect("reseal wrong-profile artifact"),
+        )
+        .expect("persist wrong-profile artifact");
+        assert!(matches!(
+            PerfEvidenceArtifact::load_verified(&wrong_profile_path),
+            Err(EvidenceArtifactError::InconsistentArtifact { reason })
+                if reason.contains("does not equal the frozen registry")
+        ));
+
+        let mut wrong_plan_hash = provisional_artifact();
+        unbind_test_artifact(&mut wrong_plan_hash);
+        wrong_plan_hash.applicability_plan.applicability_plan_sha256 = "0".repeat(64);
+        let wrong_plan_hash_path = directory.path().join("wrong-plan-hash.json");
+        fs::write(
+            &wrong_plan_hash_path,
+            wrong_plan_hash
+                .sealed_json()
+                .expect("reseal wrong-plan-hash artifact"),
+        )
+        .expect("persist wrong-plan-hash artifact");
+        assert!(matches!(
+            PerfEvidenceArtifact::load_verified(&wrong_plan_hash_path),
+            Err(EvidenceArtifactError::InconsistentArtifact { reason })
+                if reason.contains("does not equal the frozen registry")
+        ));
+
+        let mut wrong_gate = provisional_artifact();
+        unbind_test_artifact(&mut wrong_gate);
+        wrong_gate.applicability_plan.gate = PerfGate::Qg1;
+        let wrong_gate_path = directory.path().join("wrong-plan-gate.json");
+        fs::write(
+            &wrong_gate_path,
+            wrong_gate
+                .sealed_json()
+                .expect("reseal wrong-plan-gate artifact"),
+        )
+        .expect("persist wrong-plan-gate artifact");
+        assert!(matches!(
+            PerfEvidenceArtifact::load_verified(&wrong_gate_path),
+            Err(EvidenceArtifactError::InconsistentArtifact { reason })
+                if reason.contains("instead of artifact gate")
+        ));
+    }
+
+    #[test]
+    fn v4_rejects_resealed_role_and_not_applicable_cell_mutations() {
+        let directory = tempfile::tempdir().expect("applicability cell mutation directory");
+
+        let mut wrong_role = provisional_artifact();
+        unbind_test_artifact(&mut wrong_role);
+        wrong_role.cells[0].spec.role = EvidenceRole::Diagnostic;
+        let wrong_role_path = directory.path().join("wrong-role.json");
+        fs::write(
+            &wrong_role_path,
+            wrong_role
+                .sealed_json()
+                .expect("reseal wrong-role artifact"),
+        )
+        .expect("persist wrong-role artifact");
+        assert!(matches!(
+            PerfEvidenceArtifact::load_verified(&wrong_role_path),
+            Err(EvidenceArtifactError::InconsistentArtifact { reason })
+                if reason.contains("applicability plan requires Required")
+        ));
+
+        let mut not_applicable = PerfEvidenceArtifact::assemble(
+            PerfGate::Qg1,
+            plan_binding(PerfGate::Qg1),
+            policy(),
+            evidence_provenance(),
+            vec![provisional_cell()],
+        )
+        .expect("applicable QG-1 artifact");
+        not_applicable.cells[0].spec.fixture = "bulk/tiny/96/positions_on".to_owned();
+        not_applicable.cells[0].cell_id = format!(
+            "{}/{}/{}",
+            PerfGate::Qg1,
+            not_applicable.cells[0].spec.fixture,
+            not_applicable.cells[0].spec.metric
+        );
+        let not_applicable_path = directory.path().join("not-applicable-cell.json");
+        fs::write(
+            &not_applicable_path,
+            not_applicable
+                .sealed_json()
+                .expect("reseal not-applicable artifact"),
+        )
+        .expect("persist not-applicable artifact");
+        assert!(matches!(
+            PerfEvidenceArtifact::load_verified(&not_applicable_path),
+            Err(EvidenceArtifactError::InconsistentArtifact { reason })
+                if reason.contains("is not applicable to profile")
+        ));
+    }
+
+    #[test]
+    fn partial_plan_evidence_is_durable_but_never_ratchet_admissible() {
+        let mut partial_required = PerfEvidenceArtifact::assemble(
+            PerfGate::Qg1,
+            plan_binding(PerfGate::Qg1),
+            policy(),
+            evidence_provenance(),
+            vec![provisional_cell()],
+        )
+        .expect("partial required QG-1 evidence");
+        let threshold_bytes = b"qg1-partial-threshold";
+        let prebinding_bytes = seal_unbound_artifact(&mut partial_required);
+        let identity = admitted_identity(
+            PerfGate::Qg1,
+            threshold_bytes,
+            &prebinding_bytes,
+            "qg1-partial-primary",
+        );
+        partial_required
+            .bind_machine_class_identity_and_seal(identity, threshold_bytes, &prebinding_bytes)
+            .expect("bind and seal partial required evidence");
+        partial_required
+            .verify_integrity()
+            .expect("partial required evidence remains durable");
+        assert_eq!(
+            partial_required.gate_status,
+            EvidenceDecisionStatus::MeasuredProvisional
+        );
+        assert!(!partial_required.ratchet_admissible());
+
+        let mut diagnostic_spec = cell_spec(PerfGate::Qg1, EvidenceRole::Diagnostic);
+        diagnostic_spec.fixture = "tokenize_only/medium".to_owned();
+        diagnostic_spec.metric = "tokenize_docs_per_second".to_owned();
+        let diagnostic_cell =
+            EvidenceCell::evaluate(diagnostic_spec, valid_experiment(1.10), &policy())
+                .expect("partial diagnostic cell");
+        let partial_diagnostic = PerfEvidenceArtifact::assemble(
+            PerfGate::Qg1,
+            plan_binding(PerfGate::Qg1),
+            policy(),
+            evidence_provenance(),
+            vec![diagnostic_cell],
+        )
+        .expect("partial diagnostic QG-1 evidence");
+        assert_eq!(
+            partial_diagnostic.gate_status,
+            EvidenceDecisionStatus::NoDecision
+        );
+        assert!(!partial_diagnostic.ratchet_admissible());
+
+        let directory = tempfile::tempdir().expect("partial evidence directory");
+        let paths = partial_diagnostic
+            .write_atomic(directory.path())
+            .expect("persist partial diagnostic evidence");
+        let reloaded = PerfEvidenceArtifact::load_verified(&paths.json)
+            .expect("partial diagnostic evidence remains loadable");
+        assert!(!reloaded.ratchet_admissible());
+    }
+
+    #[test]
     fn schema_rejects_missing_required_fields() {
         let artifact = provisional_artifact();
         let dir = tempfile::tempdir().expect("tempdir");
@@ -4574,6 +5048,7 @@ mod tests {
         let contents = fs::read_to_string(&paths.json).expect("read");
 
         for field in [
+            "applicability_plan",
             "provenance",
             "machine_class",
             "cells",
@@ -4605,6 +5080,20 @@ mod tests {
     }
 
     #[test]
+    fn v4_rejects_class_only_applicability_identity_even_when_outer_seal_is_valid() {
+        let artifact = provisional_artifact();
+        let mut value = serde_json::to_value(artifact).expect("artifact JSON");
+        value["applicability_plan"] = serde_json::json!({
+            "hardware_class_id": "trj-zen3-5995wx"
+        });
+        let bytes = reseal_json_value(value);
+        assert!(matches!(
+            PerfEvidenceArtifact::from_verified_slice(&bytes),
+            Err(EvidenceArtifactError::Malformed { .. })
+        ));
+    }
+
+    #[test]
     fn old_schema_never_masquerades_and_legacy_load_is_explicit() {
         let legacy = PerfGateArtifact {
             schema_version: LEGACY_PERF_ARTIFACT_SCHEMA_VERSION_V3.to_owned(),
@@ -4617,6 +5106,7 @@ mod tests {
             run_id: "legacy-run".to_owned(),
             corpus_manifest_hash: "b".repeat(64),
             manifest_sha256: "e".repeat(64),
+            applicability_plan: None,
             cells: vec![PerfCellResult {
                 fixture: "bulk/synthetic/1".to_owned(),
                 metric: "docs_per_second".to_owned(),
@@ -4673,6 +5163,32 @@ mod tests {
             load_legacy_gate_artifact_v3(&path),
             Err(EvidenceArtifactError::SchemaMismatch { found })
                 if found == "quill-perf-evidence-v1"
+        ));
+    }
+
+    #[test]
+    fn prior_v3_evidence_is_read_only_and_has_no_current_upgrade_path() {
+        let mut legacy_v3 = provisional_artifact();
+        legacy_v3.schema_version = "quill-perf-evidence-v3".to_owned();
+        let directory = tempfile::tempdir().expect("legacy v3 directory");
+        let path = directory.path().join("legacy-v3.evidence.json");
+        fs::write(
+            &path,
+            legacy_v3
+                .sealed_json()
+                .expect("seal exact legacy-v3-shaped evidence"),
+        )
+        .expect("persist legacy v3 evidence");
+
+        assert!(matches!(
+            PerfEvidenceArtifact::load_verified(&path),
+            Err(EvidenceArtifactError::SchemaMismatch { found })
+                if found == "quill-perf-evidence-v3"
+        ));
+        assert!(matches!(
+            load_legacy_gate_artifact_v3(&path),
+            Err(EvidenceArtifactError::SchemaMismatch { found })
+                if found == "quill-perf-evidence-v3"
         ));
     }
 
@@ -4771,6 +5287,7 @@ mod tests {
         assert!(matches!(
             PerfEvidenceArtifact::assemble(
                 PerfGate::Qg1,
+                plan_binding(PerfGate::Qg1),
                 policy(),
                 provenance,
                 vec![provisional_cell()],
@@ -4786,6 +5303,7 @@ mod tests {
         assert!(matches!(
             PerfEvidenceArtifact::assemble(
                 PerfGate::Qg1,
+                plan_binding(PerfGate::Qg1),
                 policy(),
                 zeroed,
                 vec![provisional_cell()],

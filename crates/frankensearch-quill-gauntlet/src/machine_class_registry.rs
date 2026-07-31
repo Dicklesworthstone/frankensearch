@@ -6,7 +6,7 @@
 //! identity from a duplicate-key-rejecting, unknown-field-rejecting runner
 //! receipt, then compares an optional caller expectation.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::{Component, Path};
 
@@ -19,22 +19,22 @@ use thiserror::Error;
 /// Reviewed commit containing the normative registry.
 pub const MACHINE_CLASS_REGISTRY_SPEC_COMMIT: &str = "cc94cb772908dc3efdd69d010d172037160c6847";
 /// Exact Git blob of the normative registry.
-pub const MACHINE_CLASS_REGISTRY_GIT_BLOB: &str = "1fa886f13857e8dbca0d182e8c6ccc5a83952d83";
+pub const MACHINE_CLASS_REGISTRY_GIT_BLOB: &str = "04eabf6a9daa6ec3239f1f8e5ccb2256921c7a72";
 /// SHA-256 of the exact normative registry file bytes.
 pub const MACHINE_CLASS_REGISTRY_SHA256: &str =
-    "1fa701e17f4266f92edb56970efe2780b2ab25d2de611f1850b2f91cdde37443";
+    "c1f7d209a50de2ff22df73d177797c27e3f3c448e8859f268bb858cf83a04fe6";
 /// Registry schema accepted by this consumer.
 pub const MACHINE_CLASS_REGISTRY_SCHEMA_VERSION: &str =
-    "frankensearch.quill-machine-class-registry.v1";
+    "frankensearch.quill-machine-class-registry.v2";
 /// Schema for the exact post-exit artifact manifest bound into one runner
 /// completion receipt.
 pub const RUNNER_ARTIFACT_MANIFEST_SCHEMA_VERSION: &str =
-    "frankensearch.perf-runner-artifact-manifest.v1";
+    "frankensearch.perf-runner-artifact-manifest.v2";
 /// Strict schema carried by every typed runner-completion receipt.
-pub const RUNNER_RECEIPT_SCHEMA_VERSION: &str = "frankensearch.perf-runner-completion.v5";
+pub const RUNNER_RECEIPT_SCHEMA_VERSION: &str = "frankensearch.perf-runner-completion.v6";
 /// Build-time and executing-ELF identity required from the typed local
 /// performance producer.
-pub const LOCAL_PERF_PRODUCER_CONTRACT_VERSION: &str = "frankensearch.quill-local-perf-producer.v3";
+pub const LOCAL_PERF_PRODUCER_CONTRACT_VERSION: &str = "frankensearch.quill-local-perf-producer.v4";
 
 const REGISTRY_BYTES: &[u8] = include_bytes!("../../../docs/contracts/quill-machine-classes.json");
 const TRJ_PROVENANCE_BYTES: &[u8] =
@@ -64,6 +64,14 @@ pub enum MachineClassReason {
     ObsoleteClassId,
     /// More than one class rule matches an ID.
     AmbiguousClassId,
+    /// No execution profile matches the requested hardware class and profile ID.
+    UnknownExecutionProfile,
+    /// The named profile belongs to a different immutable hardware class.
+    ExecutionProfileClassMismatch,
+    /// The named profile is registered as unavailable.
+    ExecutionProfileUnavailable,
+    /// The execution-profile contract is internally inconsistent.
+    ExecutionProfileContractInvalid,
     /// JSON repeats an object key.
     DuplicateKey,
     /// JSON contains a field outside the strict schema.
@@ -151,6 +159,10 @@ impl MachineClassReason {
             Self::UnknownClassId => "unknown-class-id",
             Self::ObsoleteClassId => "obsolete-class-id",
             Self::AmbiguousClassId => "ambiguous-class-id",
+            Self::UnknownExecutionProfile => "unknown-execution-profile",
+            Self::ExecutionProfileClassMismatch => "execution-profile-class-mismatch",
+            Self::ExecutionProfileUnavailable => "execution-profile-unavailable",
+            Self::ExecutionProfileContractInvalid => "execution-profile-contract-invalid",
             Self::DuplicateKey => "duplicate-key",
             Self::UnknownField => "unknown-field",
             Self::MissingField => "missing-field",
@@ -239,10 +251,305 @@ pub enum MachineClassDecision {
 pub struct MachineClassLookup {
     /// Terminal lookup decision.
     pub decision: MachineClassDecision,
-    /// Canonical class ID when one class was identified.
-    pub class_id: Option<String>,
+    /// Canonical immutable hardware-class ID when one class was identified.
+    pub hardware_class_id: Option<String>,
     /// Stable reason code.
     pub reason: MachineClassReason,
+}
+
+/// Meaning of one profile's admitted execution capacity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExecutionCapacitySemantics {
+    /// One admitted worker per physical core with one hardware thread per core.
+    PhysicalCores,
+    /// Admitted logical hardware threads, including explicit SMT siblings.
+    LogicalThreads,
+    /// Scheduler-managed worker capacity without an affinity or residency claim.
+    SchedulerWorkers,
+    /// Deliberately bounded diagnostic worker budget on a heterogeneous class.
+    DiagnosticWorkerBudget,
+}
+
+/// Closed immutable hardware identities admitted by the normative registry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum HardwareClassId {
+    /// Heterogeneous x86 VPS diagnostic workers.
+    #[serde(rename = "x86-vps-ovh")]
+    X86VpsOvh,
+    /// AMD Ryzen Threadripper PRO 5995WX host.
+    #[serde(rename = "trj-zen3-5995wx")]
+    TrjZen35995wx,
+    /// Apple M4 Pro host.
+    #[serde(rename = "m4-macos")]
+    M4Macos,
+    /// Reserved Apple M5 host identity.
+    #[serde(rename = "m5-macos")]
+    M5Macos,
+}
+
+impl HardwareClassId {
+    /// Stable registry spelling.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::X86VpsOvh => "x86-vps-ovh",
+            Self::TrjZen35995wx => "trj-zen3-5995wx",
+            Self::M4Macos => "m4-macos",
+            Self::M5Macos => "m5-macos",
+        }
+    }
+}
+
+/// Closed execution-profile identities.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum ExecutionProfileId {
+    /// Runtime-observed single-worker diagnostic lane.
+    #[serde(rename = "x86-diagnostic")]
+    X86Diagnostic,
+    /// One worker per physical Threadripper core.
+    #[serde(rename = "physical-64")]
+    Physical64,
+    /// Two sibling workers per physical Threadripper core.
+    #[serde(rename = "smt2-128")]
+    Smt2_128,
+    /// Scheduler-managed ten-worker Apple M4 lane.
+    #[serde(rename = "scheduler-10")]
+    Scheduler10,
+    /// Reserved scheduler-managed fourteen-worker Apple M5 lane.
+    #[serde(rename = "scheduler-14")]
+    Scheduler14,
+}
+
+impl ExecutionProfileId {
+    /// Stable registry spelling.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::X86Diagnostic => "x86-diagnostic",
+            Self::Physical64 => "physical-64",
+            Self::Smt2_128 => "smt2-128",
+            Self::Scheduler10 => "scheduler-10",
+            Self::Scheduler14 => "scheduler-14",
+        }
+    }
+}
+
+/// One collision-free hardware/profile execution identity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize)]
+pub struct MachineProfileKey {
+    hardware_class_id: HardwareClassId,
+    execution_profile_id: ExecutionProfileId,
+}
+
+impl<'de> Deserialize<'de> for MachineProfileKey {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct RawMachineProfileKey {
+            hardware_class_id: HardwareClassId,
+            execution_profile_id: ExecutionProfileId,
+        }
+
+        let raw = RawMachineProfileKey::deserialize(deserializer)?;
+        Self::new(raw.hardware_class_id, raw.execution_profile_id).map_err(de::Error::custom)
+    }
+}
+
+impl MachineProfileKey {
+    /// Construct a canonical typed profile key.
+    ///
+    /// # Errors
+    ///
+    /// Rejects cross-hardware profile substitutions.
+    pub fn new(
+        hardware_class_id: HardwareClassId,
+        execution_profile_id: ExecutionProfileId,
+    ) -> Result<Self, MachineClassError> {
+        let key = Self {
+            hardware_class_id,
+            execution_profile_id,
+        };
+        if matches!(
+            key,
+            Self {
+                hardware_class_id: HardwareClassId::X86VpsOvh,
+                execution_profile_id: ExecutionProfileId::X86Diagnostic,
+            } | Self {
+                hardware_class_id: HardwareClassId::TrjZen35995wx,
+                execution_profile_id: ExecutionProfileId::Physical64 | ExecutionProfileId::Smt2_128,
+            } | Self {
+                hardware_class_id: HardwareClassId::M4Macos,
+                execution_profile_id: ExecutionProfileId::Scheduler10,
+            } | Self {
+                hardware_class_id: HardwareClassId::M5Macos,
+                execution_profile_id: ExecutionProfileId::Scheduler14,
+            }
+        ) {
+            Ok(key)
+        } else {
+            Err(MachineClassError::new(
+                MachineClassReason::ExecutionProfileClassMismatch,
+                format!(
+                    "execution profile {:?} is not registered for hardware class {:?}",
+                    execution_profile_id.as_str(),
+                    hardware_class_id.as_str()
+                ),
+            ))
+        }
+    }
+
+    /// Immutable hardware identity.
+    #[must_use]
+    pub const fn hardware_class_id(self) -> HardwareClassId {
+        self.hardware_class_id
+    }
+
+    /// Immutable execution-profile identity.
+    #[must_use]
+    pub const fn execution_profile_id(self) -> ExecutionProfileId {
+        self.execution_profile_id
+    }
+
+    /// Collision-free profile-qualified latest-pointer basename.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MachineClassReason::DestinationIdentityMismatch`] when `gate`
+    /// is not one of the ten frozen Quill performance gates.
+    pub fn latest_basename(self, gate: &str) -> Result<String, MachineClassError> {
+        if !matches!(
+            gate,
+            "QG-1"
+                | "QG-2"
+                | "QG-3"
+                | "QG-4"
+                | "QG-5"
+                | "QG-6"
+                | "QG-7"
+                | "QG-8"
+                | "QG-9"
+                | "QG-10"
+        ) {
+            return Err(MachineClassError::new(
+                MachineClassReason::DestinationIdentityMismatch,
+                format!("unsupported performance gate {gate:?}"),
+            ));
+        }
+        Ok(format!(
+            "{gate}.{}.{}.latest.json",
+            self.hardware_class_id.as_str(),
+            self.execution_profile_id.as_str()
+        ))
+    }
+}
+
+/// Release requirement independent of whether the hardware is currently available.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DefaultFlipDisposition {
+    /// This profile remains mandatory even when its hardware is unavailable.
+    RequiredForDefaultFlip,
+    /// The profile may produce diagnostics but cannot satisfy a release gate.
+    DiagnosticOnly,
+}
+
+/// Availability of the execution-profile identity itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MachineProfileAvailability {
+    /// The hardware/profile identity is registered.
+    Registered,
+    /// No admissible real identity exists yet.
+    Unavailable,
+}
+
+/// Frozen release policy for one profile and one performance gate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MachineProfileGatePolicy {
+    default_flip_disposition: DefaultFlipDisposition,
+    max_exercised_cell_width: Option<u64>,
+}
+
+impl MachineProfileGatePolicy {
+    /// Whether the profile is mandatory or diagnostic for this gate.
+    #[must_use]
+    pub const fn default_flip_disposition(self) -> DefaultFlipDisposition {
+        self.default_flip_disposition
+    }
+
+    /// Widest canonical cell this profile may exercise for this gate.
+    #[must_use]
+    pub const fn max_exercised_cell_width(self) -> Option<u64> {
+        self.max_exercised_cell_width
+    }
+}
+
+/// Immutable hardware class plus an independently registered execution profile.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MachineExecutionProfile {
+    key: MachineProfileKey,
+    availability: MachineProfileAvailability,
+    capacity_semantics: ExecutionCapacitySemantics,
+    execution_capacity: Option<u64>,
+    required_scheduler_or_affinity_facts: Vec<String>,
+    forbidden_claims: Vec<String>,
+    gate_policies: BTreeMap<String, MachineProfileGatePolicy>,
+    contract_sha256: String,
+}
+
+impl MachineExecutionProfile {
+    /// Immutable hardware/profile key.
+    #[must_use]
+    pub const fn key(&self) -> MachineProfileKey {
+        self.key
+    }
+
+    /// Whether the profile has an admissible real identity.
+    #[must_use]
+    pub const fn availability(&self) -> MachineProfileAvailability {
+        self.availability
+    }
+
+    /// Meaning of `execution_capacity`.
+    #[must_use]
+    pub const fn capacity_semantics(&self) -> ExecutionCapacitySemantics {
+        self.capacity_semantics
+    }
+
+    /// Maximum admitted execution capacity, absent for runtime-derived or
+    /// unavailable profiles.
+    #[must_use]
+    pub const fn execution_capacity(&self) -> Option<u64> {
+        self.execution_capacity
+    }
+
+    /// Scheduler or affinity facts that every receipt must prove.
+    #[must_use]
+    pub fn required_scheduler_or_affinity_facts(&self) -> &[String] {
+        &self.required_scheduler_or_affinity_facts
+    }
+
+    /// Claims this profile can never derive from its observable facts.
+    #[must_use]
+    pub fn forbidden_claims(&self) -> &[String] {
+        &self.forbidden_claims
+    }
+
+    /// Frozen per-gate release and maximum-width policy.
+    #[must_use]
+    pub fn gate_policy(&self, gate: &str) -> Option<MachineProfileGatePolicy> {
+        self.gate_policies.get(gate).copied()
+    }
+
+    /// Domain-separated hash of the exact profile contract object.
+    #[must_use]
+    pub fn contract_sha256(&self) -> &str {
+        &self.contract_sha256
+    }
 }
 
 /// External ratchet context that cannot relabel a receipt.
@@ -251,6 +558,8 @@ pub struct MachineClassLookup {
 pub struct MachineClassAdmissionContext {
     /// Canonical gate label such as `QG-2`.
     pub gate: String,
+    /// Expected profile identity checked against, never copied into, a receipt.
+    pub expected_profile: MachineProfileKey,
     /// Exact destination basename proposed for the latest pointer.
     pub destination_basename: String,
 }
@@ -315,7 +624,10 @@ pub struct VerifiedRunnerIdentity {
     receipt_sha256: String,
     admission_context: MachineClassAdmissionContext,
     canonicalization: MachineClassCanonicalizationBinding,
-    canonical_class_id: String,
+    profile: MachineProfileKey,
+    capacity_semantics: ExecutionCapacitySemantics,
+    execution_capacity: u64,
+    max_exercised_cell_width: u64,
     hardware: Value,
     execution_request: Value,
     execution_start: Value,
@@ -332,7 +644,7 @@ pub struct VerifiedRunnerIdentity {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PreSpawnAdmission {
     admission_context: MachineClassAdmissionContext,
-    canonical_class_id: String,
+    profile: MachineProfileKey,
     hardware_sha256: String,
     execution_identity_sha256: String,
     durability: Value,
@@ -343,7 +655,7 @@ impl PreSpawnAdmission {
     /// hardware, execution, durability, gate, and class identity.
     pub fn verify_final(&self, identity: &VerifiedRunnerIdentity) -> Result<(), MachineClassError> {
         if identity.admission_context != self.admission_context
-            || identity.canonical_class_id != self.canonical_class_id
+            || identity.profile != self.profile
             || identity.derived_sha256.hardware != self.hardware_sha256
             || identity.derived_sha256.identity != self.execution_identity_sha256
             || identity.durability != self.durability
@@ -363,6 +675,7 @@ impl PreSpawnAdmission {
 pub struct RunnerArtifactManifest {
     schema_version: String,
     gate: String,
+    profile: MachineProfileKey,
     run_id: String,
     run_window: String,
     run_log_sha256: String,
@@ -378,6 +691,7 @@ impl RunnerArtifactManifest {
     #[must_use]
     pub fn from_artifacts(
         gate: impl Into<String>,
+        profile: MachineProfileKey,
         run_id: impl Into<String>,
         run_window: impl Into<String>,
         run_log_bytes: &[u8],
@@ -387,6 +701,7 @@ impl RunnerArtifactManifest {
         Self {
             schema_version: RUNNER_ARTIFACT_MANIFEST_SCHEMA_VERSION.to_owned(),
             gate: gate.into(),
+            profile,
             run_id: run_id.into(),
             run_window: run_window.into(),
             run_log_sha256: sha256_hex(run_log_bytes),
@@ -409,6 +724,12 @@ impl RunnerArtifactManifest {
     #[must_use]
     pub fn gate(&self) -> &str {
         &self.gate
+    }
+
+    /// Hardware/profile identity sealed by this manifest.
+    #[must_use]
+    pub const fn profile(&self) -> MachineProfileKey {
+        self.profile
     }
 
     /// Producer run ID sealed by this manifest.
@@ -448,10 +769,28 @@ impl RunnerArtifactManifestBinding {
 }
 
 impl VerifiedRunnerIdentity {
-    /// Canonical class derived from strict receipt facts.
+    /// Canonical hardware/profile identity derived from strict receipt facts.
     #[must_use]
-    pub fn class_id(&self) -> &str {
-        &self.canonical_class_id
+    pub const fn profile(&self) -> MachineProfileKey {
+        self.profile
+    }
+
+    /// Meaning of the bound execution capacity.
+    #[must_use]
+    pub const fn capacity_semantics(&self) -> ExecutionCapacitySemantics {
+        self.capacity_semantics
+    }
+
+    /// Exact admitted execution capacity.
+    #[must_use]
+    pub const fn execution_capacity(&self) -> u64 {
+        self.execution_capacity
+    }
+
+    /// Widest canonical cell admitted for this profile and gate.
+    #[must_use]
+    pub const fn max_exercised_cell_width(&self) -> u64 {
+        self.max_exercised_cell_width
     }
 
     /// SHA-256 of the exact sealed runner receipt bytes.
@@ -694,13 +1033,16 @@ impl VerifiedRunnerIdentity {
         Ok(())
     }
 
-    /// Whether two receipts name the same registry, hardware, class, and
-    /// stable execution identity. Exact receipt digests may differ across
-    /// independent runs.
+    /// Whether two receipts name the same registry, hardware/profile,
+    /// capacity, durability, and stable execution identity. Exact receipt
+    /// digests may differ across independent runs.
     #[must_use]
     pub fn same_execution_identity(&self, other: &Self) -> bool {
         self.canonicalization == other.canonicalization
-            && self.canonical_class_id == other.canonical_class_id
+            && self.profile == other.profile
+            && self.capacity_semantics == other.capacity_semantics
+            && self.execution_capacity == other.execution_capacity
+            && self.max_exercised_cell_width == other.max_exercised_cell_width
             && self.derived_sha256.hardware == other.derived_sha256.hardware
             && self.derived_sha256.identity == other.derived_sha256.identity
             && self.durability == other.durability
@@ -789,6 +1131,7 @@ fn validate_artifact_manifest_binding(
     if binding.manifest_sha256 != completion_string("artifact_manifest_sha256")?
         || manifest.run_log_sha256 != completion_string("run_log_sha256")?
         || manifest.gate != identity.admission_context.gate
+        || manifest.profile != identity.profile
     {
         return Err(MachineClassError::new(
             MachineClassReason::CompletionUnverified,
@@ -867,23 +1210,40 @@ struct SourceFingerprint {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RegistryClassRule {
+struct RegistryHardwareClassRule {
+    hardware_class_id: HardwareClassId,
     family: String,
-    id_kind: String,
-    #[serde(default)]
-    id: Option<String>,
-    #[serde(default)]
-    id_pattern: Option<String>,
-    #[serde(default)]
-    width_capture: Option<u64>,
-    admission_state: String,
+    availability: MachineProfileAvailability,
     admission_reason: MachineClassReason,
     hardware_predicates: Map<String, Value>,
-    #[serde(default)]
-    execution_predicates: Option<Map<String, Value>>,
     source_fingerprints: Vec<SourceFingerprint>,
     #[serde(default, rename = "notes")]
     _notes: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RegistryExecutionProfileRule {
+    key: MachineProfileKey,
+    availability: MachineProfileAvailability,
+    capacity_semantics: ExecutionCapacitySemantics,
+    execution_capacity: RequiredNullableU64,
+    required_scheduler_or_affinity_facts: Vec<String>,
+    forbidden_claims: Vec<String>,
+    gate_policies: BTreeMap<String, RegistryProfileGatePolicy>,
+    #[serde(default, rename = "notes")]
+    _notes: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(transparent)]
+struct RequiredNullableU64(Option<u64>);
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RegistryProfileGatePolicy {
+    default_flip_disposition: DefaultFlipDisposition,
+    max_exercised_cell_width: RequiredNullableU64,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -923,10 +1283,13 @@ pub struct RunnerHardware {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RunnerExecutionRequest {
+    pub(crate) capacity_semantics: ExecutionCapacitySemantics,
+    pub(crate) execution_capacity: u64,
+    pub(crate) max_exercised_cell_width: u64,
     pub(crate) requested_logical_cpu_ids: Vec<u64>,
-    pub(crate) requested_physical_core_width: u64,
-    pub(crate) thread_budget: u64,
-    pub(crate) apple_execution_mode: String,
+    pub(crate) requested_physical_core_width: Option<u64>,
+    pub(crate) requested_worker_pool_width: u64,
+    pub(crate) requested_qos: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1006,8 +1369,8 @@ pub struct RunnerCompletion {
 #[serde(deny_unknown_fields)]
 pub struct RunnerReceipt {
     pub(crate) schema_version: String,
-    pub(crate) requested_class_id: String,
-    pub(crate) derived_class_id: String,
+    pub(crate) requested_profile: MachineProfileKey,
+    pub(crate) derived_profile: MachineProfileKey,
     pub(crate) registry_sha256: String,
     pub(crate) hardware: RunnerHardware,
     pub(crate) execution: RunnerExecution,
@@ -1233,12 +1596,272 @@ fn safe_relative_source_path(path: &str) -> bool {
             .all(|component| matches!(component, Component::Normal(_)))
 }
 
+fn string_set_equals(actual: &[String], expected: &[&str]) -> bool {
+    actual.len() == expected.len()
+        && actual.iter().collect::<BTreeSet<_>>().len() == actual.len()
+        && actual.iter().map(String::as_str).collect::<BTreeSet<_>>()
+            == expected.iter().copied().collect::<BTreeSet<_>>()
+}
+
+fn profile_facts_are(profile: &MachineExecutionProfile, expected: &[&str]) -> bool {
+    string_set_equals(&profile.required_scheduler_or_affinity_facts, expected)
+}
+
+fn profile_forbidden_are(profile: &MachineExecutionProfile, expected: &[&str]) -> bool {
+    string_set_equals(&profile.forbidden_claims, expected)
+}
+
+fn profile_all_gates_have_disposition(
+    profile: &MachineExecutionProfile,
+    expected: DefaultFlipDisposition,
+) -> bool {
+    profile
+        .gate_policies
+        .values()
+        .all(|policy| policy.default_flip_disposition == expected)
+}
+
+fn profile_gate_widths_match(
+    profile: &MachineExecutionProfile,
+    expected_widths: [Option<u64>; 10],
+) -> bool {
+    expected_widths
+        .into_iter()
+        .enumerate()
+        .all(|(index, expected)| {
+            let gate = index + 1;
+            profile
+                .gate_policies
+                .get(&format!("QG-{gate}"))
+                .is_some_and(|policy| policy.max_exercised_cell_width == expected)
+        })
+}
+
+fn validate_canonical_execution_profile(
+    profile: &MachineExecutionProfile,
+) -> Result<(), MachineClassError> {
+    let valid = match profile.key {
+        MachineProfileKey {
+            hardware_class_id: HardwareClassId::X86VpsOvh,
+            execution_profile_id: ExecutionProfileId::X86Diagnostic,
+        } => {
+            profile.availability == MachineProfileAvailability::Registered
+                && profile.capacity_semantics == ExecutionCapacitySemantics::DiagnosticWorkerBudget
+                && profile.execution_capacity.is_none()
+                && profile_all_gates_have_disposition(
+                    profile,
+                    DefaultFlipDisposition::DiagnosticOnly,
+                )
+                && profile_gate_widths_match(profile, [None; 10])
+                && profile_facts_are(
+                    profile,
+                    &[
+                        "requested-worker-budget",
+                        "observable-worker-activity",
+                        "local-execution",
+                        "exclusive-lease",
+                    ],
+                )
+                && profile_forbidden_are(
+                    profile,
+                    &[
+                        "hardware-homogeneity",
+                        "default-flip-authority",
+                        "cross-worker-pooling",
+                    ],
+                )
+        }
+        MachineProfileKey {
+            hardware_class_id: HardwareClassId::TrjZen35995wx,
+            execution_profile_id: ExecutionProfileId::Physical64,
+        } => {
+            profile.availability == MachineProfileAvailability::Registered
+                && profile.capacity_semantics == ExecutionCapacitySemantics::PhysicalCores
+                && profile.execution_capacity == Some(64)
+                && profile_all_gates_have_disposition(
+                    profile,
+                    DefaultFlipDisposition::RequiredForDefaultFlip,
+                )
+                && profile_gate_widths_match(
+                    profile,
+                    [
+                        Some(64),
+                        Some(1),
+                        Some(1),
+                        Some(1),
+                        Some(1),
+                        Some(1),
+                        Some(8),
+                        Some(32),
+                        Some(1),
+                        Some(1),
+                    ],
+                )
+                && profile_facts_are(
+                    profile,
+                    &[
+                        "effective-cpuset",
+                        "physical-core-sibling-map",
+                        "one-thread-per-core",
+                        "smt-state",
+                        "numa-policy",
+                        "governor",
+                        "observable-worker-activity",
+                        "local-execution",
+                        "exclusive-lease",
+                    ],
+                )
+                && profile_forbidden_are(
+                    profile,
+                    &[
+                        "logical-thread-capacity-128",
+                        "cross-profile-evidence-reuse",
+                    ],
+                )
+        }
+        MachineProfileKey {
+            hardware_class_id: HardwareClassId::TrjZen35995wx,
+            execution_profile_id: ExecutionProfileId::Smt2_128,
+        } => {
+            profile.availability == MachineProfileAvailability::Registered
+                && profile.capacity_semantics == ExecutionCapacitySemantics::LogicalThreads
+                && profile.execution_capacity == Some(128)
+                && profile_all_gates_have_disposition(
+                    profile,
+                    DefaultFlipDisposition::RequiredForDefaultFlip,
+                )
+                && profile_gate_widths_match(
+                    profile,
+                    [
+                        Some(128),
+                        Some(1),
+                        Some(1),
+                        Some(1),
+                        Some(1),
+                        Some(1),
+                        Some(8),
+                        Some(32),
+                        Some(1),
+                        Some(1),
+                    ],
+                )
+                && profile_facts_are(
+                    profile,
+                    &[
+                        "effective-cpuset",
+                        "physical-core-sibling-map",
+                        "two-threads-per-core",
+                        "smt-state",
+                        "numa-policy",
+                        "governor",
+                        "observable-worker-activity",
+                        "local-execution",
+                        "exclusive-lease",
+                    ],
+                )
+                && profile_forbidden_are(
+                    profile,
+                    &["physical-only-residency", "cross-profile-evidence-reuse"],
+                )
+        }
+        MachineProfileKey {
+            hardware_class_id: HardwareClassId::M4Macos,
+            execution_profile_id: ExecutionProfileId::Scheduler10,
+        } => {
+            profile.availability == MachineProfileAvailability::Registered
+                && profile.capacity_semantics == ExecutionCapacitySemantics::SchedulerWorkers
+                && profile.execution_capacity == Some(10)
+                && profile_all_gates_have_disposition(
+                    profile,
+                    DefaultFlipDisposition::RequiredForDefaultFlip,
+                )
+                && profile_gate_widths_match(
+                    profile,
+                    [
+                        Some(8),
+                        Some(1),
+                        Some(1),
+                        Some(1),
+                        Some(1),
+                        Some(1),
+                        Some(8),
+                        Some(8),
+                        Some(1),
+                        Some(1),
+                    ],
+                )
+                && profile_facts_are(
+                    profile,
+                    &[
+                        "requested-pool-width",
+                        "requested-qos",
+                        "observable-worker-activity",
+                        "thermal-pressure",
+                        "page-size",
+                        "local-execution",
+                        "exclusive-lease",
+                        "executing-image-attestation",
+                    ],
+                )
+                && profile_forbidden_are(
+                    profile,
+                    &[
+                        "p-core-affinity",
+                        "e-core-affinity",
+                        "p-core-residency",
+                        "e-core-residency",
+                        "invented-width-10-cell",
+                    ],
+                )
+        }
+        MachineProfileKey {
+            hardware_class_id: HardwareClassId::M5Macos,
+            execution_profile_id: ExecutionProfileId::Scheduler14,
+        } => {
+            profile.availability == MachineProfileAvailability::Unavailable
+                && profile.capacity_semantics == ExecutionCapacitySemantics::SchedulerWorkers
+                && profile.execution_capacity.is_none()
+                && profile_all_gates_have_disposition(
+                    profile,
+                    DefaultFlipDisposition::RequiredForDefaultFlip,
+                )
+                && profile_gate_widths_match(profile, [None; 10])
+                && profile_facts_are(profile, &[])
+                && profile_forbidden_are(
+                    profile,
+                    &[
+                        "m4-substitution",
+                        "fabricated-hardware-fingerprint",
+                        "fabricated-capacity",
+                        "all-not-applicable-plan",
+                    ],
+                )
+        }
+        _ => false,
+    };
+    if !valid
+        || !is_sha256(&profile.contract_sha256)
+        || unique_string_count(&profile.forbidden_claims) != profile.forbidden_claims.len()
+    {
+        return Err(MachineClassError::new(
+            MachineClassReason::ExecutionProfileContractInvalid,
+            format!(
+                "canonical execution profile {}.{} violates its frozen contract",
+                profile.key.hardware_class_id.as_str(),
+                profile.key.execution_profile_id.as_str()
+            ),
+        ));
+    }
+    Ok(())
+}
+
 /// Loaded, self-consistent exact machine-class registry.
 #[derive(Debug, Clone)]
 pub struct MachineClassRegistry {
     #[cfg(test)]
     raw: Value,
-    classes: Vec<RegistryClassRule>,
+    hardware_classes: Vec<RegistryHardwareClassRule>,
+    execution_profiles: Vec<MachineExecutionProfile>,
     receipt_shapes: Vec<Value>,
     canonical_hash_contract_sha256: String,
 }
@@ -1280,7 +1903,8 @@ impl MachineClassRegistry {
             "canonical_hash_contract",
             "receipt_contract",
             "artifact_manifest_contract",
-            "classes",
+            "hardware_classes",
+            "execution_profiles",
             "fact_templates",
             "requirements",
             "class_lookup_vectors",
@@ -1310,21 +1934,105 @@ impl MachineClassRegistry {
         validate_registry_receipt_contract(&raw)?;
         validate_registry_artifact_manifest_contract(&raw)?;
 
-        let classes = required_array(&raw, "classes")?
+        let hardware_classes = required_array(&raw, "hardware_classes")?
             .iter()
             .map(|value| {
-                serde_json::from_value::<RegistryClassRule>(value.clone()).map_err(|error| {
-                    let reason = if error.to_string().contains("unknown field") {
-                        MachineClassReason::UnknownField
-                    } else {
-                        MachineClassReason::MissingField
-                    };
-                    MachineClassError::new(reason, error.to_string())
-                })
+                serde_json::from_value::<RegistryHardwareClassRule>(value.clone()).map_err(
+                    |error| {
+                        let reason = if error.to_string().contains("unknown field") {
+                            MachineClassReason::UnknownField
+                        } else {
+                            MachineClassReason::MissingField
+                        };
+                        MachineClassError::new(reason, error.to_string())
+                    },
+                )
             })
             .collect::<Result<Vec<_>, _>>()?;
 
-        Self::validate_class_rules(&classes, &source)?;
+        Self::validate_hardware_class_rules(&hardware_classes, &source)?;
+        let execution_profiles = required_array(&raw, "execution_profiles")?
+            .iter()
+            .map(|value| {
+                let profile = value.as_object().ok_or_else(|| {
+                    MachineClassError::new(
+                        MachineClassReason::MissingField,
+                        "each execution profile must be an object",
+                    )
+                })?;
+                if !profile.contains_key("execution_capacity") {
+                    return Err(MachineClassError::new(
+                        MachineClassReason::MissingField,
+                        "execution profile is missing required field \"execution_capacity\"",
+                    ));
+                }
+                let gate_policies = profile
+                    .get("gate_policies")
+                    .and_then(Value::as_object)
+                    .ok_or_else(|| {
+                        MachineClassError::new(
+                            MachineClassReason::MissingField,
+                            "execution profile field \"gate_policies\" must be an object",
+                        )
+                    })?;
+                for (gate, policy) in gate_policies {
+                    let policy = policy.as_object().ok_or_else(|| {
+                        MachineClassError::new(
+                            MachineClassReason::MissingField,
+                            format!("execution profile gate policy {gate:?} must be an object"),
+                        )
+                    })?;
+                    if !policy.contains_key("max_exercised_cell_width") {
+                        return Err(MachineClassError::new(
+                            MachineClassReason::MissingField,
+                            format!(
+                                "execution profile gate policy {gate:?} is missing required field \
+                                 \"max_exercised_cell_width\""
+                            ),
+                        ));
+                    }
+                }
+                let rule = serde_json::from_value::<RegistryExecutionProfileRule>(value.clone())
+                    .map_err(|error| {
+                        let detail = error.to_string();
+                        let reason = if detail.contains("unknown field") {
+                            MachineClassReason::UnknownField
+                        } else if detail.contains("missing field") {
+                            MachineClassReason::MissingField
+                        } else if detail
+                            .starts_with(MachineClassReason::ExecutionProfileClassMismatch.as_str())
+                        {
+                            MachineClassReason::ExecutionProfileClassMismatch
+                        } else {
+                            MachineClassReason::ExecutionProfileContractInvalid
+                        };
+                        MachineClassError::new(reason, detail)
+                    })?;
+                Ok(MachineExecutionProfile {
+                    key: rule.key,
+                    availability: rule.availability,
+                    capacity_semantics: rule.capacity_semantics,
+                    execution_capacity: rule.execution_capacity.0,
+                    required_scheduler_or_affinity_facts: rule.required_scheduler_or_affinity_facts,
+                    forbidden_claims: rule.forbidden_claims,
+                    gate_policies: rule
+                        .gate_policies
+                        .into_iter()
+                        .map(|(gate, policy)| {
+                            (
+                                gate,
+                                MachineProfileGatePolicy {
+                                    default_flip_disposition: policy.default_flip_disposition,
+                                    max_exercised_cell_width: policy.max_exercised_cell_width.0,
+                                },
+                            )
+                        })
+                        .collect(),
+                    contract_sha256: hash_profile_contract(value)?,
+                })
+            })
+            .collect::<Result<Vec<_>, MachineClassError>>()?;
+        Self::validate_execution_profiles(&hardware_classes, &execution_profiles)?;
         let receipt_shapes = required_object(&raw, "fact_templates")?
             .values()
             .cloned()
@@ -1352,42 +2060,53 @@ impl MachineClassRegistry {
         Ok(Self {
             #[cfg(test)]
             raw,
-            classes,
+            hardware_classes,
+            execution_profiles,
             receipt_shapes,
             canonical_hash_contract_sha256,
         })
     }
 
-    fn validate_class_rules(
-        classes: &[RegistryClassRule],
+    fn validate_hardware_class_rules(
+        hardware_classes: &[RegistryHardwareClassRule],
         source: &impl Fn(&str) -> Option<&'static [u8]>,
     ) -> Result<(), MachineClassError> {
-        if classes.is_empty() {
+        if hardware_classes.is_empty() {
             return Err(MachineClassError::new(
                 MachineClassReason::MissingField,
-                "registry has no class rules",
+                "registry has no hardware-class rules",
             ));
         }
-        for class in classes {
-            validate_hardware_predicate_contract(class)?;
-            match class.id_kind.as_str() {
-                "exact" if class.id.is_some() && class.id_pattern.is_none() => {}
-                "pattern"
-                    if class.id.is_none()
-                        && class.id_pattern.as_deref()
-                            == Some("^trj-zen3-([1-9]|[1-5][0-9]|6[0-4])c(?:-smt2)?$")
-                        && class.width_capture == Some(1) => {}
-                _ => {
-                    return Err(MachineClassError::new(
-                        MachineClassReason::SourceIdentityInvalid,
-                        format!("class family {:?} has an invalid ID rule", class.family),
-                    ));
-                }
+        let expected = [
+            HardwareClassId::X86VpsOvh,
+            HardwareClassId::TrjZen35995wx,
+            HardwareClassId::M4Macos,
+            HardwareClassId::M5Macos,
+        ]
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+        let mut identities = BTreeSet::new();
+        for class in hardware_classes {
+            if !identities.insert(class.hardware_class_id) {
+                return Err(MachineClassError::new(
+                    MachineClassReason::AmbiguousClassId,
+                    format!(
+                        "duplicate hardware class {:?}",
+                        class.hardware_class_id.as_str()
+                    ),
+                ));
             }
-            if class.admission_state == "registered" && class.source_fingerprints.is_empty() {
+            validate_hardware_predicate_contract(class)?;
+            if class.availability == MachineProfileAvailability::Registered
+                && !matches!(class.hardware_class_id, HardwareClassId::X86VpsOvh)
+                && class.source_fingerprints.is_empty()
+            {
                 return Err(MachineClassError::new(
                     MachineClassReason::SourceIdentityInvalid,
-                    format!("registered class {:?} has no provenance", class.family),
+                    format!(
+                        "registered hardware class {:?} has no provenance",
+                        class.hardware_class_id.as_str()
+                    ),
                 ));
             }
             for fingerprint in &class.source_fingerprints {
@@ -1412,84 +2131,266 @@ impl MachineClassRegistry {
                 }
             }
         }
-
-        let mut representatives = classes
-            .iter()
-            .filter_map(|class| class.id.as_deref())
-            .map(str::to_owned)
-            .collect::<Vec<_>>();
-        for width in 1..=64 {
-            representatives.push(format!("trj-zen3-{width}c"));
-            representatives.push(format!("trj-zen3-{width}c-smt2"));
+        if identities != expected {
+            return Err(MachineClassError::new(
+                MachineClassReason::SourceIdentityInvalid,
+                "registry must contain exactly the four canonical hardware classes",
+            ));
         }
-        for representative in representatives {
-            let matches = classes
-                .iter()
-                .filter(|class| class_matches_id(class, &representative))
-                .count();
-            if matches > 1 {
+        Ok(())
+    }
+
+    fn validate_execution_profiles(
+        hardware_classes: &[RegistryHardwareClassRule],
+        profiles: &[MachineExecutionProfile],
+    ) -> Result<(), MachineClassError> {
+        if profiles.is_empty() {
+            return Err(MachineClassError::new(
+                MachineClassReason::ExecutionProfileContractInvalid,
+                "registry has no execution profiles",
+            ));
+        }
+
+        let expected_gates = (1..=10)
+            .map(|gate| format!("QG-{gate}"))
+            .collect::<BTreeSet<_>>();
+        let expected_identities = [
+            MachineProfileKey {
+                hardware_class_id: HardwareClassId::X86VpsOvh,
+                execution_profile_id: ExecutionProfileId::X86Diagnostic,
+            },
+            MachineProfileKey {
+                hardware_class_id: HardwareClassId::TrjZen35995wx,
+                execution_profile_id: ExecutionProfileId::Physical64,
+            },
+            MachineProfileKey {
+                hardware_class_id: HardwareClassId::TrjZen35995wx,
+                execution_profile_id: ExecutionProfileId::Smt2_128,
+            },
+            MachineProfileKey {
+                hardware_class_id: HardwareClassId::M4Macos,
+                execution_profile_id: ExecutionProfileId::Scheduler10,
+            },
+            MachineProfileKey {
+                hardware_class_id: HardwareClassId::M5Macos,
+                execution_profile_id: ExecutionProfileId::Scheduler14,
+            },
+        ]
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+        let mut identities = BTreeSet::new();
+        for profile in profiles {
+            if !identities.insert(profile.key) {
                 return Err(MachineClassError::new(
-                    MachineClassReason::AmbiguousClassId,
-                    format!("class ID {representative:?} matches {matches} rules"),
+                    MachineClassReason::ExecutionProfileContractInvalid,
+                    format!(
+                        "duplicate execution-profile identity {}.{}",
+                        profile.key.hardware_class_id.as_str(),
+                        profile.key.execution_profile_id.as_str()
+                    ),
                 ));
             }
+
+            let matching_classes = hardware_classes
+                .iter()
+                .filter(|class| class.hardware_class_id == profile.key.hardware_class_id)
+                .collect::<Vec<_>>();
+            let [hardware_class] = matching_classes.as_slice() else {
+                return Err(MachineClassError::new(
+                    MachineClassReason::ExecutionProfileClassMismatch,
+                    format!(
+                        "execution profile {}.{} does not resolve to exactly one hardware class",
+                        profile.key.hardware_class_id.as_str(),
+                        profile.key.execution_profile_id.as_str()
+                    ),
+                ));
+            };
+            let profile_gates = profile
+                .gate_policies
+                .keys()
+                .cloned()
+                .collect::<BTreeSet<_>>();
+            if profile_gates != expected_gates {
+                return Err(MachineClassError::new(
+                    MachineClassReason::ExecutionProfileContractInvalid,
+                    format!(
+                        "execution profile {}.{} must classify exactly QG-1 through QG-10",
+                        profile.key.hardware_class_id.as_str(),
+                        profile.key.execution_profile_id.as_str()
+                    ),
+                ));
+            }
+
+            match profile.availability {
+                MachineProfileAvailability::Registered => {
+                    if profile.execution_capacity == Some(0)
+                        || hardware_class.availability == MachineProfileAvailability::Unavailable
+                        || profile.required_scheduler_or_affinity_facts.is_empty()
+                        || unique_string_count(&profile.required_scheduler_or_affinity_facts)
+                            != profile.required_scheduler_or_affinity_facts.len()
+                        || profile.gate_policies.values().any(|policy| {
+                            policy.max_exercised_cell_width == Some(0)
+                                || profile.execution_capacity.is_some_and(|capacity| {
+                                    policy
+                                        .max_exercised_cell_width
+                                        .is_some_and(|width| width > capacity)
+                                })
+                        })
+                    {
+                        return Err(MachineClassError::new(
+                            MachineClassReason::ExecutionProfileContractInvalid,
+                            format!(
+                                "registered execution profile {}.{} has inconsistent capacity, facts, class, or gate policy",
+                                profile.key.hardware_class_id.as_str(),
+                                profile.key.execution_profile_id.as_str()
+                            ),
+                        ));
+                    }
+                }
+                MachineProfileAvailability::Unavailable => {
+                    if profile.execution_capacity.is_some()
+                        || profile.gate_policies.values().any(|policy| {
+                            policy.max_exercised_cell_width.is_some()
+                                || policy.default_flip_disposition
+                                    != DefaultFlipDisposition::RequiredForDefaultFlip
+                        })
+                    {
+                        return Err(MachineClassError::new(
+                            MachineClassReason::ExecutionProfileContractInvalid,
+                            format!(
+                                "unavailable execution profile {}.{} must remain required without fabricating capacity or gate widths",
+                                profile.key.hardware_class_id.as_str(),
+                                profile.key.execution_profile_id.as_str()
+                            ),
+                        ));
+                    }
+                }
+            }
+            validate_canonical_execution_profile(profile)?;
+        }
+        if identities != expected_identities {
+            return Err(MachineClassError::new(
+                MachineClassReason::ExecutionProfileContractInvalid,
+                "registry must contain exactly the five canonical execution profiles",
+            ));
         }
         Ok(())
     }
 
     /// Resolve a class without admitting a runner receipt.
     #[must_use]
-    pub fn lookup(&self, requested_class_id: &str) -> MachineClassLookup {
-        match self.resolve(requested_class_id) {
-            Ok(resolved) => {
-                if resolved.rule.admission_state == "registered" {
-                    MachineClassLookup {
-                        decision: MachineClassDecision::Allow,
-                        class_id: Some(requested_class_id.to_owned()),
-                        reason: MachineClassReason::Admitted,
-                    }
-                } else {
-                    MachineClassLookup {
-                        decision: MachineClassDecision::DiagnosticOnly,
-                        class_id: Some(requested_class_id.to_owned()),
-                        reason: resolved.rule.admission_reason,
-                    }
+    pub fn lookup(&self, requested_hardware_class_id: &str) -> MachineClassLookup {
+        match parse_hardware_class_id(requested_hardware_class_id)
+            .and_then(|class_id| self.resolve_hardware(class_id))
+        {
+            Ok(rule) if rule.availability == MachineProfileAvailability::Registered => {
+                MachineClassLookup {
+                    decision: MachineClassDecision::Allow,
+                    hardware_class_id: Some(requested_hardware_class_id.to_owned()),
+                    reason: MachineClassReason::Admitted,
                 }
             }
+            Ok(rule) => MachineClassLookup {
+                decision: MachineClassDecision::DiagnosticOnly,
+                hardware_class_id: Some(requested_hardware_class_id.to_owned()),
+                reason: rule.admission_reason,
+            },
             Err(error) => MachineClassLookup {
                 decision: MachineClassDecision::Reject,
-                class_id: None,
+                hardware_class_id: None,
                 reason: error.reason,
             },
         }
     }
 
-    fn resolve(&self, requested_class_id: &str) -> Result<ResolvedClass<'_>, MachineClassError> {
-        if requested_class_id == "trj-zen-128c" {
-            return Err(MachineClassError::new(
-                MachineClassReason::ObsoleteClassId,
-                "trj-zen-128c is historical fingerprint provenance only",
-            ));
-        }
+    /// Resolve one immutable hardware class and execution-profile identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed rejection for an unknown profile or a profile attached
+    /// to another hardware class. Unavailable profiles remain resolvable so a
+    /// caller can report their exact typed disposition without inventing a
+    /// capacity or applicability plan.
+    pub fn execution_profile(
+        &self,
+        key: MachineProfileKey,
+    ) -> Result<&MachineExecutionProfile, MachineClassError> {
         let matches = self
-            .classes
+            .execution_profiles
             .iter()
-            .filter(|class| class_matches_id(class, requested_class_id))
+            .filter(|profile| profile.key == key)
+            .collect::<Vec<_>>();
+        match matches.as_slice() {
+            [profile] => Ok(profile),
+            [] if self
+                .execution_profiles
+                .iter()
+                .any(|profile| profile.key.execution_profile_id == key.execution_profile_id) =>
+            {
+                Err(MachineClassError::new(
+                    MachineClassReason::ExecutionProfileClassMismatch,
+                    format!(
+                        "execution profile {:?} is not registered for hardware class {:?}",
+                        key.execution_profile_id.as_str(),
+                        key.hardware_class_id.as_str()
+                    ),
+                ))
+            }
+            [] => Err(MachineClassError::new(
+                MachineClassReason::UnknownExecutionProfile,
+                format!(
+                    "no execution profile {:?}.{:?} is registered",
+                    key.hardware_class_id.as_str(),
+                    key.execution_profile_id.as_str()
+                ),
+            )),
+            _ => Err(MachineClassError::new(
+                MachineClassReason::ExecutionProfileContractInvalid,
+                format!(
+                    "multiple execution profiles match {:?}.{:?}",
+                    key.hardware_class_id.as_str(),
+                    key.execution_profile_id.as_str()
+                ),
+            )),
+        }
+    }
+
+    fn resolve_hardware(
+        &self,
+        hardware_class_id: HardwareClassId,
+    ) -> Result<&RegistryHardwareClassRule, MachineClassError> {
+        let matches = self
+            .hardware_classes
+            .iter()
+            .filter(|class| class.hardware_class_id == hardware_class_id)
             .collect::<Vec<_>>();
         match matches.as_slice() {
             [] => Err(MachineClassError::new(
                 MachineClassReason::UnknownClassId,
-                format!("no class rule matches {requested_class_id:?}"),
+                format!(
+                    "no hardware-class rule matches {:?}",
+                    hardware_class_id.as_str()
+                ),
             )),
-            [rule] => {
-                let trj = parse_trj_class_id(requested_class_id);
-                Ok(ResolvedClass { rule, trj })
-            }
+            [rule] => Ok(rule),
             _ => Err(MachineClassError::new(
                 MachineClassReason::AmbiguousClassId,
-                format!("multiple class rules match {requested_class_id:?}"),
+                format!(
+                    "multiple hardware-class rules match {:?}",
+                    hardware_class_id.as_str()
+                ),
             )),
         }
+    }
+
+    fn resolve_profile(
+        &self,
+        key: MachineProfileKey,
+    ) -> Result<ResolvedProfile<'_>, MachineClassError> {
+        Ok(ResolvedProfile {
+            hardware: self.resolve_hardware(key.hardware_class_id)?,
+            profile: self.execution_profile(key)?,
+        })
     }
 
     /// Validate the exact hardware/execution envelope before a measured child
@@ -1501,7 +2402,7 @@ impl MachineClassRegistry {
     /// final commit boundary.
     pub(crate) fn preflight(
         &self,
-        requested_class_id: &str,
+        requested_profile: MachineProfileKey,
         hardware: RunnerHardware,
         request: RunnerExecutionRequest,
         snapshot: RunnerExecutionSnapshot,
@@ -1510,8 +2411,8 @@ impl MachineClassRegistry {
     ) -> Result<PreSpawnAdmission, MachineClassError> {
         let receipt = RunnerReceipt {
             schema_version: RUNNER_RECEIPT_SCHEMA_VERSION.to_owned(),
-            requested_class_id: requested_class_id.to_owned(),
-            derived_class_id: requested_class_id.to_owned(),
+            requested_profile,
+            derived_profile: requested_profile,
             registry_sha256: MACHINE_CLASS_REGISTRY_SHA256.to_owned(),
             hardware,
             execution: RunnerExecution {
@@ -1551,15 +2452,15 @@ impl MachineClassRegistry {
         let receipt = serde_json::from_slice::<RunnerReceipt>(&sealed).map_err(|error| {
             MachineClassError::new(MachineClassReason::SourceIdentityInvalid, error.to_string())
         })?;
-        let resolved = self.resolve(&receipt.requested_class_id)?;
-        validate_admission_envelope(&receipt, &resolved)?;
+        let resolved = self.resolve_profile(receipt.requested_profile)?;
+        validate_admission_envelope(&receipt, &resolved, context)?;
         validate_durability(&receipt.durability)?;
-        validate_gate_class_policy(&resolved, context)?;
-        validate_destination(context, &receipt.derived_class_id)?;
+        validate_gate_profile_policy(&resolved, context)?;
+        validate_destination(context, receipt.derived_profile)?;
         let derived = derive_hashes(&receipt)?;
         Ok(PreSpawnAdmission {
             admission_context: context.clone(),
-            canonical_class_id: receipt.derived_class_id,
+            profile: receipt.derived_profile,
             hardware_sha256: derived.hardware,
             execution_identity_sha256: derived.identity,
             durability: serde_json::to_value(receipt.durability).map_err(|error| {
@@ -1624,13 +2525,13 @@ impl MachineClassRegistry {
             ));
         }
 
-        let resolved = self.resolve(&receipt.requested_class_id)?;
-        validate_admission_envelope(&receipt, &resolved)?;
+        let resolved = self.resolve_profile(receipt.requested_profile)?;
+        validate_admission_envelope(&receipt, &resolved, context)?;
         validate_source_identity(&receipt)?;
         validate_durability(&receipt.durability)?;
         validate_completion(&receipt.completion)?;
-        validate_gate_class_policy(&resolved, context)?;
-        validate_destination(context, &receipt.derived_class_id)?;
+        validate_gate_profile_policy(&resolved, context)?;
+        validate_destination(context, receipt.derived_profile)?;
 
         let receipt_json = std::str::from_utf8(receipt_bytes)
             .map_err(|error| {
@@ -1647,7 +2548,10 @@ impl MachineClassRegistry {
                 registry_git_blob: MACHINE_CLASS_REGISTRY_GIT_BLOB.to_owned(),
                 canonical_hash_contract_sha256: self.canonical_hash_contract_sha256.clone(),
             },
-            canonical_class_id: receipt.derived_class_id.clone(),
+            profile: receipt.derived_profile,
+            capacity_semantics: receipt.execution.request.capacity_semantics,
+            execution_capacity: receipt.execution.request.execution_capacity,
+            max_exercised_cell_width: receipt.execution.request.max_exercised_cell_width,
             hardware: serde_json::to_value(&receipt.hardware).map_err(|error| {
                 MachineClassError::new(MachineClassReason::DerivedHashMismatch, error.to_string())
             })?,
@@ -1734,15 +2638,20 @@ fn validate_registry_receipt_contract(registry: &Value) -> Result<(), MachineCla
         .and_then(Value::as_array)
         .is_some_and(|requirements| {
             requirements.iter().any(|requirement| {
-                requirement.get("id").and_then(Value::as_str) == Some("MC-MUST-021")
+                requirement.get("id").and_then(Value::as_str) == Some("MC-MUST-022")
                     && requirement.get("level").and_then(Value::as_str) == Some("MUST")
                     && requirement
                         .get("text")
                         .and_then(Value::as_str)
                         .is_some_and(|text| {
-                            text.contains("finalizer")
-                                && text.contains("Cargo.lock")
-                                && text.contains("immediate rerun")
+                            text.contains("Every fresh candidate and rerun")
+                                && text.contains("typed producer contract v4")
+                                && text.contains("build-time Git revision and dirty posture")
+                                && text.contains("build-time Cargo.lock SHA-256")
+                                && text.contains("independently attested executing finalizer image")
+                                && text.contains(
+                                    "Producer revision and lock equal the benchmark build",
+                                )
                         })
             })
         });
@@ -1750,8 +2659,8 @@ fn validate_registry_receipt_contract(registry: &Value) -> Result<(), MachineCla
         || required_sections
             != [
                 "schema_version",
-                "requested_class_id",
-                "derived_class_id",
+                "requested_profile",
+                "derived_profile",
                 "registry_sha256",
                 "hardware",
                 "execution",
@@ -1785,10 +2694,13 @@ fn validate_registry_receipt_contract(registry: &Value) -> Result<(), MachineCla
             != ["request", "start", "end", "identity_sha256"].map(str::to_owned)
         || required_execution_request_fields
             != [
+                "capacity_semantics",
+                "execution_capacity",
+                "max_exercised_cell_width",
                 "requested_logical_cpu_ids",
                 "requested_physical_core_width",
-                "thread_budget",
-                "apple_execution_mode",
+                "requested_worker_pool_width",
+                "requested_qos",
             ]
             .map(str::to_owned)
         || required_execution_snapshot_fields
@@ -1907,6 +2819,7 @@ fn validate_registry_artifact_manifest_contract(registry: &Value) -> Result<(), 
     let expected_fields = [
         "schema_version",
         "gate",
+        "profile",
         "run_id",
         "run_window",
         "run_log_sha256",
@@ -1927,15 +2840,22 @@ fn validate_registry_artifact_manifest_contract(registry: &Value) -> Result<(), 
         .and_then(Value::as_array)
         .is_some_and(|requirements| {
             requirements.iter().any(|requirement| {
-                requirement.get("id").and_then(Value::as_str) == Some("MC-MUST-020")
+                requirement.get("id").and_then(Value::as_str) == Some("MC-MUST-021")
                     && requirement.get("level").and_then(Value::as_str) == Some("MUST")
                     && requirement
                         .get("text")
                         .and_then(Value::as_str)
                         .is_some_and(|text| {
-                            text.contains("actual run log")
-                                && text.contains("pre-binding evidence")
-                                && text.contains("rejected before history opens")
+                            text.contains("Every fresh candidate and rerun")
+                                && text.contains("exact v2 artifact manifest")
+                                && text.contains("profile key")
+                                && text.contains("actual run log")
+                                && text.contains("canonical threshold bytes")
+                                && text.contains("exact pre-binding evidence bytes")
+                                && text.contains("gate")
+                                && text.contains("run ID")
+                                && text.contains("run window")
+                                && text.contains("before history opens")
                         })
             })
         });
@@ -1958,38 +2878,42 @@ fn validate_registry_artifact_manifest_contract(registry: &Value) -> Result<(), 
     Ok(())
 }
 
-struct ResolvedClass<'a> {
-    rule: &'a RegistryClassRule,
-    trj: Option<TrjClass>,
+struct ResolvedProfile<'a> {
+    hardware: &'a RegistryHardwareClassRule,
+    profile: &'a MachineExecutionProfile,
 }
 
-#[derive(Debug, Clone, Copy)]
-struct TrjClass {
-    width: u64,
-    threads_per_core: u64,
-}
-
-fn parse_trj_class_id(value: &str) -> Option<TrjClass> {
-    let suffix = value.strip_prefix("trj-zen3-")?;
-    let (width, threads_per_core) = suffix.strip_suffix("c-smt2").map_or_else(
-        || suffix.strip_suffix('c').map(|width| (width, 1)),
-        |width| Some((width, 2)),
-    )?;
-    if width.starts_with('0') {
-        return None;
-    }
-    let width = width.parse::<u64>().ok()?;
-    (1..=64).contains(&width).then_some(TrjClass {
-        width,
-        threads_per_core,
-    })
-}
-
-fn class_matches_id(class: &RegistryClassRule, value: &str) -> bool {
-    match class.id_kind.as_str() {
-        "exact" => class.id.as_deref() == Some(value),
-        "pattern" => class.id_pattern.is_some() && parse_trj_class_id(value).is_some(),
-        _ => false,
+fn parse_hardware_class_id(value: &str) -> Result<HardwareClassId, MachineClassError> {
+    match value {
+        "x86-vps-ovh" => Ok(HardwareClassId::X86VpsOvh),
+        "trj-zen3-5995wx" => Ok(HardwareClassId::TrjZen35995wx),
+        "m4-macos" => Ok(HardwareClassId::M4Macos),
+        "m5-macos" => Ok(HardwareClassId::M5Macos),
+        "p-plus-e" | "trj-zen-128c" => Err(MachineClassError::new(
+            MachineClassReason::ObsoleteClassId,
+            format!("{value:?} is a legacy execution label, not a hardware class"),
+        )),
+        _ => {
+            let legacy_width = value.strip_prefix("trj-zen3-").and_then(|suffix| {
+                suffix
+                    .strip_suffix("c-smt2")
+                    .or_else(|| suffix.strip_suffix('c'))
+                    .filter(|width| !width.starts_with('0'))
+                    .and_then(|width| width.parse::<u64>().ok())
+                    .filter(|width| (1..=64).contains(width))
+            });
+            if legacy_width.is_some() {
+                Err(MachineClassError::new(
+                    MachineClassReason::ObsoleteClassId,
+                    format!("{value:?} is a width-encoded legacy execution label"),
+                ))
+            } else {
+                Err(MachineClassError::new(
+                    MachineClassReason::UnknownClassId,
+                    format!("no hardware-class rule matches {value:?}"),
+                ))
+            }
+        }
     }
 }
 
@@ -2090,6 +3014,12 @@ fn hash_value(value: &Value) -> Result<String, MachineClassError> {
     Ok(sha256_hex(&canonical_json_bytes(value)?))
 }
 
+fn hash_profile_contract(value: &Value) -> Result<String, MachineClassError> {
+    let mut preimage = b"frankensearch.machine-execution-profile.v1\0".to_vec();
+    preimage.extend(canonical_json_bytes(value)?);
+    Ok(sha256_hex(&preimage))
+}
+
 fn derive_hashes(receipt: &RunnerReceipt) -> Result<MachineClassDerivedHashes, MachineClassError> {
     let mut hardware = serde_json::to_value(&receipt.hardware).map_err(|error| {
         MachineClassError::new(MachineClassReason::DerivedHashMismatch, error.to_string())
@@ -2188,8 +3118,8 @@ fn derive_execution_identity_hash(receipt: &RunnerReceipt) -> Result<String, Mac
     stable_start.remove("thermal_pressure");
     stable_start.remove("snapshot_sha256");
     let value = serde_json::json!({
-        "requested_class_id": receipt.requested_class_id,
-        "derived_class_id": receipt.derived_class_id,
+        "requested_profile": receipt.requested_profile,
+        "derived_profile": receipt.derived_profile,
         "request": receipt.execution.request,
         "stable_execution": stable_start,
     });
@@ -2215,7 +3145,7 @@ fn predicate_matches(
 
 fn validate_hardware(
     hardware: &RunnerHardware,
-    class: &RegistryClassRule,
+    class: &RegistryHardwareClassRule,
 ) -> Result<(), MachineClassError> {
     let value = serde_json::to_value(hardware).map_err(|error| {
         MachineClassError::new(MachineClassReason::SourceIdentityInvalid, error.to_string())
@@ -2300,7 +3230,7 @@ fn validate_hardware(
 }
 
 fn validate_hardware_predicate_contract(
-    class: &RegistryClassRule,
+    class: &RegistryHardwareClassRule,
 ) -> Result<(), MachineClassError> {
     const CONSUMED_FIELDS: &[&str] = &[
         "os",
@@ -2386,26 +3316,55 @@ fn validate_runtime_isa(features: &[String]) -> Result<(), MachineClassError> {
 
 fn validate_execution(
     receipt: &RunnerReceipt,
-    resolved: &ResolvedClass<'_>,
+    resolved: &ResolvedProfile<'_>,
+    context: &MachineClassAdmissionContext,
 ) -> Result<(), MachineClassError> {
     let request = &receipt.execution.request;
     let start = &receipt.execution.start;
     let end = &receipt.execution.end;
+    let profile = resolved.profile;
+    let gate_policy = profile.gate_policy(&context.gate).ok_or_else(|| {
+        MachineClassError::new(
+            MachineClassReason::ExecutionProfileContractInvalid,
+            format!("profile has no policy for {:?}", context.gate),
+        )
+    })?;
     if start.thermal_pressure || end.thermal_pressure {
         return Err(MachineClassError::new(
             MachineClassReason::ThermalPressure,
             "observed thermal pressure invalidates timed evidence",
         ));
     }
-    let expected_lease_id = if resolved.trj.is_some() {
-        "trj-zen3-exclusive"
-    } else if resolved.rule.family == "m4-macos" {
-        "m4-macos-exclusive"
-    } else {
+    if request.capacity_semantics != profile.capacity_semantics
+        || request.execution_capacity == 0
+        || request.requested_worker_pool_width != request.execution_capacity
+        || request.max_exercised_cell_width == 0
+        || request.max_exercised_cell_width > request.execution_capacity
+        || profile
+            .execution_capacity
+            .is_some_and(|capacity| capacity != request.execution_capacity)
+        || gate_policy
+            .max_exercised_cell_width
+            .is_some_and(|width| width != request.max_exercised_cell_width)
+        || (gate_policy.max_exercised_cell_width.is_none()
+            && gate_policy.default_flip_disposition
+                == DefaultFlipDisposition::RequiredForDefaultFlip)
+    {
         return Err(MachineClassError::new(
-            MachineClassReason::ExclusiveLeaseMissing,
-            "registered class has no canonical host-family lease identity",
+            MachineClassReason::ExecutionThreadBudgetInvalid,
+            "receipt capacity semantics, execution capacity, worker pool, or gate maximum differs from the registered profile",
         ));
+    }
+    let expected_lease_id = match resolved.hardware.family.as_str() {
+        "trj-zen3" => "trj-zen3-exclusive",
+        "m4-macos" => "m4-macos-exclusive",
+        "x86-vps-ovh" => "x86-vps-ovh-exclusive",
+        _ => {
+            return Err(MachineClassError::new(
+                MachineClassReason::ExclusiveLeaseMissing,
+                "registered hardware has no canonical host-family lease identity",
+            ));
+        }
     };
     if !start.exclusive_lease
         || !end.exclusive_lease
@@ -2416,170 +3375,175 @@ fn validate_execution(
             MachineClassReason::ExclusiveLeaseMissing,
             format!(
                 "timed evidence for {} requires canonical lease identity {expected_lease_id:?}",
-                resolved.rule.family
+                resolved.hardware.family
             ),
         ));
     }
-    if let Some(trj) = resolved.trj {
-        if start.threads_per_core != trj.threads_per_core
-            || end.threads_per_core != trj.threads_per_core
-            || start.smt_state
-                != if trj.threads_per_core == 2 {
-                    "on"
+    match profile.key.execution_profile_id {
+        ExecutionProfileId::Physical64 | ExecutionProfileId::Smt2_128 => {
+            let threads_per_core =
+                if profile.key.execution_profile_id == ExecutionProfileId::Smt2_128 {
+                    2
                 } else {
-                    "off"
-                }
-            || end.smt_state != start.smt_state
-        {
-            return Err(MachineClassError::new(
-                MachineClassReason::ExecutionSmtMismatch,
-                "Threadripper class suffix, SMT state, and threads-per-core disagree",
-            ));
-        }
-        validate_cpu_ids(
-            &request.requested_logical_cpu_ids,
-            receipt.hardware.logical_cpus,
-        )?;
-        validate_cpu_ids(
-            &start.observed_logical_cpu_ids,
-            receipt.hardware.logical_cpus,
-        )?;
-        validate_cpu_ids(&end.observed_logical_cpu_ids, receipt.hardware.logical_cpus)?;
-        let expected_logical = trj.width * trj.threads_per_core;
-        let physical_count = unique_string_count(&start.effective_physical_core_ids);
-        if request.requested_physical_core_width != trj.width
-            || request.requested_logical_cpu_ids.len()
-                != usize::try_from(expected_logical).unwrap_or(usize::MAX)
-            || start.observed_logical_cpu_ids.len()
-                != usize::try_from(expected_logical).unwrap_or(usize::MAX)
-            || physical_count != usize::try_from(trj.width).unwrap_or(usize::MAX)
-        {
-            return Err(MachineClassError::new(
-                MachineClassReason::ExecutionWidthMismatch,
-                "Threadripper class width does not match requested and observed CPUs",
-            ));
-        }
-        if start.cpu_assignment_observability != "affinity-enforced"
-            || end.cpu_assignment_observability != "affinity-enforced"
-            || request.requested_logical_cpu_ids != start.observed_logical_cpu_ids
-            || request.requested_logical_cpu_ids != end.observed_logical_cpu_ids
-        {
-            return Err(MachineClassError::new(
-                MachineClassReason::ExecutionCpusetInvalid,
-                "Threadripper requested and observed affinity must be explicit and equal",
-            ));
-        }
-        if request.thread_budget == 0 || request.thread_budget > expected_logical {
-            return Err(MachineClassError::new(
-                MachineClassReason::ExecutionThreadBudgetInvalid,
-                "thread budget is outside the admitted CPU pool",
-            ));
-        }
-        if request.apple_execution_mode != "not-applicable" {
-            return Err(MachineClassError::new(
-                MachineClassReason::ExecutionModeMismatch,
-                "Threadripper receipt must use not-applicable Apple mode",
-            ));
-        }
-        if start.numa_node_ids != [0]
-            || end.numa_node_ids != [0]
-            || start.numa_policy != "bind:0"
-            || end.numa_policy != "bind:0"
-        {
-            return Err(MachineClassError::new(
-                MachineClassReason::ExecutionNumaMismatch,
-                "Threadripper evidence requires NUMA bind:0",
-            ));
-        }
-        if start.governor != "performance" || end.governor != "performance" {
-            return Err(MachineClassError::new(
-                MachineClassReason::ExecutionGovernorMismatch,
-                "Threadripper evidence requires the performance governor",
-            ));
-        }
-    } else if resolved.rule.family == "m4-macos" {
-        let max_width = match request.apple_execution_mode.as_str() {
-            "p-plus-e" => 14,
-            _ => {
+                    1
+                };
+            let logical_width = 64 * threads_per_core;
+            if start.threads_per_core != threads_per_core
+                || end.threads_per_core != threads_per_core
+                || start.smt_state != if threads_per_core == 2 { "on" } else { "off" }
+                || end.smt_state != start.smt_state
+            {
                 return Err(MachineClassError::new(
-                    MachineClassReason::ExecutionModeMismatch,
-                    "M4 hardware-envelope validation recognizes only p-plus-e; every gate remains promotion-unavailable pending actual-executing-image attestation",
+                    MachineClassReason::ExecutionSmtMismatch,
+                    "Threadripper profile, SMT state, and threads-per-core disagree",
                 ));
             }
-        };
-        if request.requested_physical_core_width != max_width {
-            return Err(MachineClassError::new(
-                MachineClassReason::ExecutionWidthMismatch,
-                "M4 requested width does not match execution mode",
-            ));
+            validate_cpu_ids(
+                &request.requested_logical_cpu_ids,
+                receipt.hardware.logical_cpus,
+            )?;
+            validate_cpu_ids(
+                &start.observed_logical_cpu_ids,
+                receipt.hardware.logical_cpus,
+            )?;
+            validate_cpu_ids(&end.observed_logical_cpu_ids, receipt.hardware.logical_cpus)?;
+            if request.requested_physical_core_width != Some(64)
+                || request.requested_logical_cpu_ids.len()
+                    != usize::try_from(logical_width).unwrap_or(usize::MAX)
+                || start.observed_logical_cpu_ids.len()
+                    != usize::try_from(logical_width).unwrap_or(usize::MAX)
+                || unique_string_count(&start.effective_physical_core_ids) != 64
+                || request.requested_qos != "not-applicable"
+            {
+                return Err(MachineClassError::new(
+                    MachineClassReason::ExecutionWidthMismatch,
+                    "Threadripper profile does not match its exact logical and physical execution width",
+                ));
+            }
+            if start.cpu_assignment_observability != "affinity-enforced"
+                || end.cpu_assignment_observability != "affinity-enforced"
+                || request.requested_logical_cpu_ids != start.observed_logical_cpu_ids
+                || request.requested_logical_cpu_ids != end.observed_logical_cpu_ids
+            {
+                return Err(MachineClassError::new(
+                    MachineClassReason::ExecutionCpusetInvalid,
+                    "Threadripper requested and observed affinity must be explicit and equal",
+                ));
+            }
+            if start.numa_node_ids != [0]
+                || end.numa_node_ids != [0]
+                || start.numa_policy != "bind:0"
+                || end.numa_policy != "bind:0"
+            {
+                return Err(MachineClassError::new(
+                    MachineClassReason::ExecutionNumaMismatch,
+                    "Threadripper evidence requires NUMA bind:0",
+                ));
+            }
+            if start.governor != "performance" || end.governor != "performance" {
+                return Err(MachineClassError::new(
+                    MachineClassReason::ExecutionGovernorMismatch,
+                    "Threadripper evidence requires the performance governor",
+                ));
+            }
         }
-        if request.thread_budget == 0 || request.thread_budget > max_width {
-            return Err(MachineClassError::new(
-                MachineClassReason::ExecutionThreadBudgetInvalid,
-                "M4 thread budget is outside the requested pool",
-            ));
+        ExecutionProfileId::Scheduler10 => {
+            if request.requested_physical_core_width.is_some()
+                || !request.requested_logical_cpu_ids.is_empty()
+                || request.requested_qos != "inherit-process-default"
+                || !start.effective_physical_core_ids.is_empty()
+                || !end.effective_physical_core_ids.is_empty()
+                || start.cpu_assignment_observability == "affinity-enforced"
+                || end.cpu_assignment_observability == "affinity-enforced"
+            {
+                return Err(MachineClassError::new(
+                    MachineClassReason::ExecutionModeMismatch,
+                    "M4 scheduler profile cannot claim logical-CPU affinity, physical-core width, or P/E residency",
+                ));
+            }
+            if start.threads_per_core != 1
+                || end.threads_per_core != 1
+                || start.smt_state != "not-applicable"
+                || end.smt_state != "not-applicable"
+            {
+                return Err(MachineClassError::new(
+                    MachineClassReason::ExecutionSmtMismatch,
+                    "M4 scheduler receipts cannot claim SMT",
+                ));
+            }
+            if !["unavailable", "scheduler-observed"]
+                .contains(&start.cpu_assignment_observability.as_str())
+                || start.cpu_assignment_observability != end.cpu_assignment_observability
+            {
+                return Err(MachineClassError::new(
+                    MachineClassReason::ExecutionCpusetInvalid,
+                    "M4 assignment observability is invalid, drifted, or fabricates affinity",
+                ));
+            }
+            if start.numa_node_ids != [0]
+                || end.numa_node_ids != [0]
+                || start.numa_policy != "system"
+                || end.numa_policy != "system"
+            {
+                return Err(MachineClassError::new(
+                    MachineClassReason::ExecutionNumaMismatch,
+                    "M4 evidence requires system NUMA policy",
+                ));
+            }
+            if start.governor != "not-applicable" || end.governor != "not-applicable" {
+                return Err(MachineClassError::new(
+                    MachineClassReason::ExecutionGovernorMismatch,
+                    "M4 receipts must use not-applicable governor",
+                ));
+            }
         }
-        if start.threads_per_core != 1
-            || end.threads_per_core != 1
-            || start.smt_state != "not-applicable"
-            || end.smt_state != "not-applicable"
-        {
-            return Err(MachineClassError::new(
-                MachineClassReason::ExecutionSmtMismatch,
-                "M4 receipts cannot claim SMT",
-            ));
+        ExecutionProfileId::X86Diagnostic => {
+            if request.requested_physical_core_width.is_some()
+                || request.requested_qos != "not-applicable"
+            {
+                return Err(MachineClassError::new(
+                    MachineClassReason::ExecutionModeMismatch,
+                    "x86 diagnostic profile uses runtime worker capacity without topology claims",
+                ));
+            }
         }
-        if !["unavailable", "scheduler-observed", "affinity-enforced"]
-            .contains(&start.cpu_assignment_observability.as_str())
-            || start.cpu_assignment_observability != end.cpu_assignment_observability
-        {
+        ExecutionProfileId::Scheduler14 => {
             return Err(MachineClassError::new(
-                MachineClassReason::ExecutionCpusetInvalid,
-                "M4 CPU assignment observability is invalid or drifted",
-            ));
-        }
-        if start.numa_node_ids != [0]
-            || end.numa_node_ids != [0]
-            || start.numa_policy != "system"
-            || end.numa_policy != "system"
-        {
-            return Err(MachineClassError::new(
-                MachineClassReason::ExecutionNumaMismatch,
-                "M4 evidence requires system NUMA policy",
-            ));
-        }
-        if start.governor != "not-applicable" || end.governor != "not-applicable" {
-            return Err(MachineClassError::new(
-                MachineClassReason::ExecutionGovernorMismatch,
-                "M4 receipts must use not-applicable governor",
+                MachineClassReason::ExecutionProfileUnavailable,
+                "M5 scheduler-14 has no registered real hardware identity",
             ));
         }
     }
-    let _ = &resolved.rule.execution_predicates;
     Ok(())
 }
 
 fn validate_admission_envelope(
     receipt: &RunnerReceipt,
-    resolved: &ResolvedClass<'_>,
+    resolved: &ResolvedProfile<'_>,
+    context: &MachineClassAdmissionContext,
 ) -> Result<(), MachineClassError> {
-    if resolved.rule.admission_state != "registered" {
+    if resolved.hardware.availability != MachineProfileAvailability::Registered
+        || resolved.profile.availability != MachineProfileAvailability::Registered
+    {
         return Err(MachineClassError::new(
-            resolved.rule.admission_reason,
-            format!(
-                "class {:?} is {}",
-                receipt.requested_class_id, resolved.rule.admission_state
-            ),
+            MachineClassReason::ExecutionProfileUnavailable,
+            "hardware/profile identity is unavailable",
         ));
     }
-    if receipt.derived_class_id != receipt.requested_class_id {
+    if receipt.requested_profile != receipt.derived_profile {
         return Err(MachineClassError::new(
             MachineClassReason::ReceiptClassMismatch,
-            "requested and derived class IDs differ",
+            "requested, derived, and externally expected profile identities differ",
         ));
     }
-    validate_hardware(&receipt.hardware, resolved.rule)?;
-    validate_execution(receipt, resolved)?;
+    if receipt.derived_profile != context.expected_profile {
+        return Err(MachineClassError::new(
+            MachineClassReason::ReceiptClassMismatch,
+            "requested, derived, and externally expected profile identities differ",
+        ));
+    }
+    validate_hardware(&receipt.hardware, resolved.hardware)?;
+    validate_execution(receipt, resolved, context)?;
     if receipt.execution.start != receipt.execution.end {
         return Err(MachineClassError::new(
             MachineClassReason::PrePostIdentityDrift,
@@ -2603,26 +3567,51 @@ fn validate_admission_envelope(
     Ok(())
 }
 
-fn validate_gate_class_policy(
-    resolved: &ResolvedClass<'_>,
+fn validate_gate_profile_policy(
+    resolved: &ResolvedProfile<'_>,
     context: &MachineClassAdmissionContext,
 ) -> Result<(), MachineClassError> {
-    if matches!(context.gate.as_str(), "QG-3" | "QG-4" | "QG-5") {
+    let policy = resolved.profile.gate_policy(&context.gate).ok_or_else(|| {
+        MachineClassError::new(
+            MachineClassReason::ExecutionProfileContractInvalid,
+            format!("profile has no policy for {:?}", context.gate),
+        )
+    })?;
+    if resolved.profile.availability != MachineProfileAvailability::Registered
+        || resolved.hardware.availability != MachineProfileAvailability::Registered
+    {
         return Err(MachineClassError::new(
-            MachineClassReason::ClassUnavailable,
+            MachineClassReason::ExecutionProfileUnavailable,
             format!(
-                "{} is not promotion-admissible on any class until both arms emit a non-declarative symmetric durability-treatment witness",
+                "{}.{} is required but unavailable for {}",
+                resolved.profile.key.hardware_class_id.as_str(),
+                resolved.profile.key.execution_profile_id.as_str(),
                 context.gate
             ),
         ));
     }
-    if resolved.rule.family != "m4-macos" {
+    if policy.default_flip_disposition == DefaultFlipDisposition::DiagnosticOnly {
+        return Err(MachineClassError::new(
+            MachineClassReason::ClassHomogeneityUnproven,
+            "diagnostic-only execution profiles cannot promote history",
+        ));
+    }
+    if matches!(context.gate.as_str(), "QG-3" | "QG-4" | "QG-5") {
+        return Err(MachineClassError::new(
+            MachineClassReason::ClassUnavailable,
+            format!(
+                "{} is not promotion-admissible until both arms emit a non-declarative symmetric durability-treatment witness",
+                context.gate
+            ),
+        ));
+    }
+    if resolved.profile.key.hardware_class_id != HardwareClassId::M4Macos {
         return Ok(());
     }
     Err(MachineClassError::new(
         MachineClassReason::ClassUnavailable,
         format!(
-            "{} is not promotion-admissible on M4 until the producer can attest the actual executing image through a supported O_EXEC or loaded-image mechanism",
+            "{} is not promotion-admissible on M4 until the producer attests the actual executing image",
             context.gate,
         ),
     ))
@@ -2710,9 +3699,9 @@ fn validate_completion(completion: &RunnerCompletion) -> Result<(), MachineClass
 
 fn validate_destination(
     context: &MachineClassAdmissionContext,
-    class_id: &str,
+    profile: MachineProfileKey,
 ) -> Result<(), MachineClassError> {
-    let expected = format!("{}.{}.latest.json", context.gate, class_id);
+    let expected = profile.latest_basename(&context.gate)?;
     if context.destination_basename != expected {
         return Err(MachineClassError::new(
             MachineClassReason::DestinationIdentityMismatch,
@@ -2736,7 +3725,7 @@ pub fn admitted_test_identity_for_run(
     run_label: &str,
 ) -> VerifiedRunnerIdentity {
     admitted_test_identity_from_vector_for_run(
-        "MCV-001-trj-registered",
+        "MCV-001-trj-physical-64-admitted",
         gate,
         git_revision,
         cargo_lock_sha256,
@@ -2773,116 +3762,6 @@ pub fn admitted_test_identity_for_artifacts(
     );
     bind_test_identity_to_artifacts(
         &bare,
-        gate,
-        run_id,
-        run_window,
-        format!("runner-log:{run_label}").as_bytes(),
-        threshold_artifact_bytes,
-        evidence_artifact_bytes,
-    )
-}
-
-#[cfg(test)]
-#[allow(clippy::too_many_arguments)]
-pub fn admitted_test_identity_for_artifacts_with_trj_width(
-    physical_width: u64,
-    gate: &str,
-    git_revision: &str,
-    cargo_lock_sha256: &str,
-    executable_sha256: &str,
-    command_sha256: &str,
-    environment_sha256: &str,
-    run_label: &str,
-    run_id: &str,
-    run_window: &str,
-    threshold_artifact_bytes: &[u8],
-    evidence_artifact_bytes: &[u8],
-) -> VerifiedRunnerIdentity {
-    assert!((1..=64).contains(&physical_width));
-    let bare = admitted_test_identity_for_run(
-        gate,
-        git_revision,
-        cargo_lock_sha256,
-        executable_sha256,
-        command_sha256,
-        environment_sha256,
-        run_label,
-    );
-    let mut receipt =
-        serde_json::from_str::<Value>(bare.receipt_json()).expect("test runner receipt JSON");
-    let class_id = format!("trj-zen3-{physical_width}c-smt2");
-    let logical_cpu_ids = (0..physical_width)
-        .chain(64..64 + physical_width)
-        .map(Value::from)
-        .collect::<Vec<_>>();
-    let physical_core_ids = (0..physical_width)
-        .map(|core| Value::String(format!("0:{core}")))
-        .collect::<Vec<_>>();
-    set_path(
-        &mut receipt,
-        "requested_class_id",
-        Value::String(class_id.clone()),
-    );
-    set_path(
-        &mut receipt,
-        "derived_class_id",
-        Value::String(class_id.clone()),
-    );
-    set_path(
-        &mut receipt,
-        "execution.request.requested_logical_cpu_ids",
-        Value::Array(logical_cpu_ids.clone()),
-    );
-    set_path(
-        &mut receipt,
-        "execution.request.requested_physical_core_width",
-        Value::from(physical_width),
-    );
-    for side in ["start", "end"] {
-        set_path(
-            &mut receipt,
-            &format!("execution.{side}.observed_logical_cpu_ids"),
-            Value::Array(logical_cpu_ids.clone()),
-        );
-        set_path(
-            &mut receipt,
-            &format!("execution.{side}.effective_physical_core_ids"),
-            Value::Array(physical_core_ids.clone()),
-        );
-        set_path(
-            &mut receipt,
-            &format!("execution.{side}.effective_cpuset_sha256"),
-            Value::String(format!(
-                "$DERIVE_{}_CPUSET_SHA256",
-                side.to_ascii_uppercase()
-            )),
-        );
-        set_path(
-            &mut receipt,
-            &format!("execution.{side}.snapshot_sha256"),
-            Value::String(format!(
-                "$DERIVE_{}_SNAPSHOT_SHA256",
-                side.to_ascii_uppercase()
-            )),
-        );
-    }
-    set_path(
-        &mut receipt,
-        "execution.identity_sha256",
-        Value::String("$DERIVE_EXECUTION_IDENTITY_SHA256".to_owned()),
-    );
-    derive_receipt_placeholders(&mut receipt);
-    let context = MachineClassAdmissionContext {
-        gate: gate.to_owned(),
-        destination_basename: format!("{gate}.{class_id}.latest.json"),
-    };
-    let receipt_bytes = serde_json::to_vec(&receipt).expect("test runner receipt bytes");
-    let registry = MachineClassRegistry::frozen().expect("frozen registry");
-    let width_bound = registry
-        .admit(&receipt_bytes, &context)
-        .expect("alternate-width TRJ test runner receipt admission");
-    bind_test_identity_to_artifacts(
-        &width_bound,
         gate,
         run_id,
         run_window,
@@ -2958,6 +3837,7 @@ fn bind_test_identity_to_artifacts(
     assert_eq!(receipt_run_log_sha256, sha256_hex(run_log_bytes));
     let manifest = RunnerArtifactManifest::from_artifacts(
         gate,
+        bare.profile(),
         run_id,
         run_window,
         run_log_bytes,
@@ -3057,12 +3937,28 @@ pub fn admitted_test_identity_from_vector_for_run(
             format!("artifact-manifest:{run_label}").as_bytes(),
         )),
     );
-    let class_id = receipt["derived_class_id"]
-        .as_str()
-        .expect("fixture class")
-        .to_owned();
+    let profile = serde_json::from_value::<MachineProfileKey>(receipt["derived_profile"].clone())
+        .expect("fixture profile");
+    let max_exercised_cell_width = registry
+        .execution_profile(profile)
+        .expect("fixture execution profile")
+        .gate_policy(gate)
+        .and_then(MachineProfileGatePolicy::max_exercised_cell_width)
+        .expect("fixture gate maximum");
+    set_path(
+        &mut receipt,
+        "execution.request.max_exercised_cell_width",
+        Value::from(max_exercised_cell_width),
+    );
+    set_path(
+        &mut receipt,
+        "execution.identity_sha256",
+        Value::String("$DERIVE_EXECUTION_IDENTITY_SHA256".to_owned()),
+    );
+    derive_receipt_placeholders(&mut receipt);
     context.gate = gate.to_owned();
-    context.destination_basename = format!("{gate}.{class_id}.latest.json");
+    context.expected_profile = profile;
+    context.destination_basename = profile.latest_basename(gate).expect("fixture destination");
     let bytes = serde_json::to_vec(&receipt).expect("serialize customized fixture");
     registry.admit(&bytes, &context).expect("admitted fixture")
 }
@@ -3190,8 +4086,8 @@ fn derive_receipt_placeholders(value: &mut Value) {
             .expect("start object")
             .remove("snapshot_sha256");
         let identity = serde_json::json!({
-            "requested_class_id": value["requested_class_id"],
-            "derived_class_id": value["derived_class_id"],
+            "requested_profile": value["requested_profile"],
+            "derived_profile": value["derived_profile"],
             "request": value["execution"]["request"],
             "stable_execution": stable_start,
         });
@@ -3205,14 +4101,15 @@ fn materialize_receipt_vector(
     registry: &Value,
     vector: &Value,
 ) -> (Vec<u8>, MachineClassAdmissionContext) {
+    let context = serde_json::from_value(
+        vector
+            .get("admission_context")
+            .expect("receipt vector admission context")
+            .clone(),
+    )
+    .expect("admission context");
     if let Some(raw) = vector.get("raw_json").and_then(Value::as_str) {
-        return (
-            raw.as_bytes().to_vec(),
-            MachineClassAdmissionContext {
-                gate: "QG-2".to_owned(),
-                destination_basename: "QG-2.trj-zen3-16c.latest.json".to_owned(),
-            },
-        );
+        return (raw.as_bytes().to_vec(), context);
     }
     let template = vector
         .get("template")
@@ -3230,16 +4127,6 @@ fn materialize_receipt_vector(
         set_path(&mut receipt, path, replacement.clone());
     }
     derive_receipt_placeholders(&mut receipt);
-    let context = vector.get("admission_context").map_or_else(
-        || MachineClassAdmissionContext {
-            gate: "QG-2".to_owned(),
-            destination_basename: format!(
-                "QG-2.{}.latest.json",
-                receipt["derived_class_id"].as_str().unwrap_or("unknown")
-            ),
-        },
-        |value| serde_json::from_value(value.clone()).expect("admission context"),
-    );
     (serde_json::to_vec(&receipt).expect("receipt JSON"), context)
 }
 
@@ -3258,25 +4145,312 @@ mod tests {
         assert_eq!(sha256_hex(REGISTRY_BYTES), MACHINE_CLASS_REGISTRY_SHA256);
         assert_eq!(
             MACHINE_CLASS_REGISTRY_GIT_BLOB,
-            "1fa886f13857e8dbca0d182e8c6ccc5a83952d83"
+            "04eabf6a9daa6ec3239f1f8e5ccb2256921c7a72"
         );
         let registry = MachineClassRegistry::frozen().expect("frozen registry");
-        assert_eq!(registry.raw()["classes"].as_array().unwrap().len(), 4);
+        assert_eq!(
+            registry.raw()["hardware_classes"].as_array().unwrap().len(),
+            4
+        );
+        assert_eq!(
+            registry.raw()["execution_profiles"]
+                .as_array()
+                .unwrap()
+                .len(),
+            5
+        );
         assert_eq!(
             registry.raw()["class_lookup_vectors"]
                 .as_array()
                 .unwrap()
                 .len(),
-            2
+            6
         );
-        assert_eq!(registry.raw()["test_vectors"].as_array().unwrap().len(), 71);
+        assert_eq!(registry.raw()["test_vectors"].as_array().unwrap().len(), 28);
         assert_eq!(
             registry.raw()["registry_test_vectors"]
                 .as_array()
                 .unwrap()
                 .len(),
-            6
+            14
         );
+        assert_eq!(
+            registry.raw()["fact_templates"].as_object().unwrap().len(),
+            2
+        );
+    }
+
+    #[test]
+    fn registry_rejects_artifact_manifest_and_producer_requirement_drift() {
+        let mutate_and_reject = |requirement_id: &str, field: &str, replacement: Value| {
+            let mut raw = parse_strict_json(REGISTRY_BYTES).expect("reviewed registry JSON");
+            let requirement = raw["requirements"]
+                .as_array_mut()
+                .expect("requirements array")
+                .iter_mut()
+                .find(|requirement| {
+                    requirement.get("id").and_then(Value::as_str) == Some(requirement_id)
+                })
+                .expect("reviewed requirement");
+            requirement[field] = replacement;
+            let bytes = serde_json::to_vec(&raw).expect("candidate registry");
+            let error = MachineClassRegistry::load_candidate(&bytes, embedded_source)
+                .expect_err("binding requirement drift must reject");
+            assert_eq!(
+                error.reason,
+                MachineClassReason::SourceIdentityInvalid,
+                "{requirement_id}.{field} drift rejected for wrong reason: {error}"
+            );
+        };
+
+        for requirement_id in ["MC-MUST-021", "MC-MUST-022"] {
+            mutate_and_reject(
+                requirement_id,
+                "id",
+                Value::String(format!("{requirement_id}-renamed")),
+            );
+            mutate_and_reject(
+                requirement_id,
+                "text",
+                Value::String("weakened binding requirement".to_owned()),
+            );
+
+            let mut raw = parse_strict_json(REGISTRY_BYTES).expect("reviewed registry JSON");
+            raw["requirements"]
+                .as_array_mut()
+                .expect("requirements array")
+                .retain(|requirement| {
+                    requirement.get("id").and_then(Value::as_str) != Some(requirement_id)
+                });
+            let bytes = serde_json::to_vec(&raw).expect("candidate registry");
+            let error = MachineClassRegistry::load_candidate(&bytes, embedded_source)
+                .expect_err("missing binding requirement must reject");
+            assert_eq!(
+                error.reason,
+                MachineClassReason::SourceIdentityInvalid,
+                "missing {requirement_id} rejected for wrong reason: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn frozen_execution_profiles_separate_hardware_capacity_and_release_disposition() {
+        let registry = MachineClassRegistry::frozen().expect("frozen registry");
+
+        let diagnostic_key = MachineProfileKey::new(
+            HardwareClassId::X86VpsOvh,
+            ExecutionProfileId::X86Diagnostic,
+        )
+        .expect("canonical x86 diagnostic key");
+        let diagnostic = registry
+            .execution_profile(diagnostic_key)
+            .expect("x86 diagnostic profile");
+        assert_eq!(
+            diagnostic.capacity_semantics(),
+            ExecutionCapacitySemantics::DiagnosticWorkerBudget
+        );
+        assert_eq!(diagnostic.execution_capacity(), None);
+        assert_eq!(
+            diagnostic
+                .gate_policy("QG-1")
+                .expect("diagnostic QG-1 policy")
+                .default_flip_disposition(),
+            DefaultFlipDisposition::DiagnosticOnly
+        );
+        assert_eq!(
+            diagnostic
+                .gate_policy("QG-1")
+                .expect("diagnostic QG-1 policy")
+                .max_exercised_cell_width(),
+            None
+        );
+
+        let physical_key = MachineProfileKey::new(
+            HardwareClassId::TrjZen35995wx,
+            ExecutionProfileId::Physical64,
+        )
+        .expect("canonical Threadripper physical key");
+        let physical = registry
+            .execution_profile(physical_key)
+            .expect("Threadripper physical profile");
+        assert_eq!(
+            physical.capacity_semantics(),
+            ExecutionCapacitySemantics::PhysicalCores
+        );
+        assert_eq!(physical.execution_capacity(), Some(64));
+        assert_eq!(
+            physical
+                .gate_policy("QG-1")
+                .expect("physical QG-1 policy")
+                .max_exercised_cell_width(),
+            Some(64)
+        );
+        assert_eq!(
+            physical_key
+                .latest_basename("QG-1")
+                .expect("physical destination"),
+            "QG-1.trj-zen3-5995wx.physical-64.latest.json"
+        );
+
+        let smt_key =
+            MachineProfileKey::new(HardwareClassId::TrjZen35995wx, ExecutionProfileId::Smt2_128)
+                .expect("canonical Threadripper SMT key");
+        let smt = registry
+            .execution_profile(smt_key)
+            .expect("Threadripper SMT profile");
+        assert_eq!(
+            smt.capacity_semantics(),
+            ExecutionCapacitySemantics::LogicalThreads
+        );
+        assert_eq!(smt.execution_capacity(), Some(128));
+        assert_eq!(
+            smt.gate_policy("QG-1")
+                .expect("SMT QG-1 policy")
+                .max_exercised_cell_width(),
+            Some(128)
+        );
+
+        let m4_key =
+            MachineProfileKey::new(HardwareClassId::M4Macos, ExecutionProfileId::Scheduler10)
+                .expect("canonical M4 scheduler key");
+        let m4 = registry
+            .execution_profile(m4_key)
+            .expect("M4 scheduler profile");
+        assert_eq!(
+            m4.capacity_semantics(),
+            ExecutionCapacitySemantics::SchedulerWorkers
+        );
+        assert_eq!(m4.execution_capacity(), Some(10));
+        assert_eq!(
+            m4.gate_policy("QG-1")
+                .expect("M4 QG-1 policy")
+                .max_exercised_cell_width(),
+            Some(8)
+        );
+        assert!(
+            m4.forbidden_claims()
+                .iter()
+                .any(|claim| claim == "p-core-residency")
+        );
+        assert_eq!(
+            m4_key.latest_basename("QG-1").expect("M4 destination"),
+            "QG-1.m4-macos.scheduler-10.latest.json"
+        );
+
+        let m5_key =
+            MachineProfileKey::new(HardwareClassId::M5Macos, ExecutionProfileId::Scheduler14)
+                .expect("canonical M5 scheduler key");
+        let m5 = registry
+            .execution_profile(m5_key)
+            .expect("typed unavailable M5 profile");
+        assert_eq!(m5.availability(), MachineProfileAvailability::Unavailable);
+        assert_eq!(m5.execution_capacity(), None);
+        assert_eq!(
+            m5.gate_policy("QG-1")
+                .expect("M5 QG-1 policy")
+                .default_flip_disposition(),
+            DefaultFlipDisposition::RequiredForDefaultFlip
+        );
+        assert_eq!(
+            m5.gate_policy("QG-1")
+                .expect("M5 QG-1 policy")
+                .max_exercised_cell_width(),
+            None
+        );
+        assert_eq!(
+            m5_key
+                .latest_basename("QG-1")
+                .expect("typed M5 destination"),
+            "QG-1.m5-macos.scheduler-14.latest.json"
+        );
+
+        let profile_hashes = registry
+            .execution_profiles
+            .iter()
+            .map(|profile| profile.contract_sha256())
+            .collect::<BTreeSet<_>>();
+        assert_eq!(profile_hashes.len(), registry.execution_profiles.len());
+    }
+
+    #[test]
+    fn execution_profile_resolution_rejects_unknown_and_cross_class_substitution() {
+        assert_eq!(
+            MachineProfileKey::new(HardwareClassId::M5Macos, ExecutionProfileId::Scheduler10)
+                .expect_err("M4 profile cannot relabel M5")
+                .reason,
+            MachineClassReason::ExecutionProfileClassMismatch
+        );
+        assert_eq!(
+            MachineProfileKey::new(HardwareClassId::M4Macos, ExecutionProfileId::Scheduler14)
+                .expect_err("M5 profile cannot relabel M4")
+                .reason,
+            MachineClassReason::ExecutionProfileClassMismatch
+        );
+        let unknown = br#"{
+            "hardware_class_id":"m4-macos",
+            "execution_profile_id":"scheduler-128"
+        }"#;
+        assert!(
+            serde_json::from_slice::<MachineProfileKey>(unknown).is_err(),
+            "unknown profile spelling must fail typed deserialization"
+        );
+    }
+
+    #[test]
+    fn registry_rejects_profile_capacity_shrink_fabrication_and_all_unavailable_relabeling() {
+        let mutate_and_reject = |path: &str, replacement: Value| {
+            let mut raw = MachineClassRegistry::frozen()
+                .expect("frozen registry")
+                .raw()
+                .clone();
+            set_path(&mut raw, path, replacement);
+            let bytes = serde_json::to_vec(&raw).expect("candidate registry");
+            let error = MachineClassRegistry::load_candidate(&bytes, embedded_source)
+                .expect_err("profile mutation must reject");
+            assert_eq!(
+                error.reason,
+                MachineClassReason::ExecutionProfileContractInvalid,
+                "mutation at {path} rejected for wrong reason: {error}"
+            );
+        };
+
+        mutate_and_reject("execution_profiles.3.execution_capacity", Value::from(128));
+        mutate_and_reject("execution_profiles.1.execution_capacity", Value::from(32));
+        mutate_and_reject("execution_profiles.4.execution_capacity", Value::from(14));
+        mutate_and_reject(
+            "execution_profiles.4.gate_policies.QG-1.max_exercised_cell_width",
+            Value::from(8),
+        );
+        for gate in 1..=10 {
+            mutate_and_reject(
+                &format!("execution_profiles.3.gate_policies.QG-{gate}.default_flip_disposition"),
+                Value::String("diagnostic_only".to_owned()),
+            );
+        }
+    }
+
+    #[test]
+    fn registry_requires_explicit_nullable_capacity_fields() {
+        for path in [
+            "execution_profiles.0.execution_capacity",
+            "execution_profiles.4.execution_capacity",
+            "execution_profiles.0.gate_policies.QG-1.max_exercised_cell_width",
+            "execution_profiles.4.gate_policies.QG-1.max_exercised_cell_width",
+        ] {
+            let mut raw = MachineClassRegistry::frozen()
+                .expect("frozen registry")
+                .raw()
+                .clone();
+            remove_path(&mut raw, path);
+            let bytes = serde_json::to_vec(&raw).expect("candidate registry");
+            let error = MachineClassRegistry::load_candidate(&bytes, embedded_source)
+                .expect_err("omitted nullable capacity field must reject");
+            assert_eq!(
+                error.reason,
+                MachineClassReason::MissingField,
+                "omission at {path} rejected for wrong reason: {error}"
+            );
+        }
     }
 
     #[test]
@@ -3314,9 +4488,9 @@ mod tests {
             .expect("lookup vectors")
         {
             let lookup = registry.lookup(
-                vector["requested_class_id"]
+                vector["requested_hardware_class_id"]
                     .as_str()
-                    .expect("requested class"),
+                    .expect("requested hardware class"),
             );
             assert_eq!(
                 serde_json::to_value(lookup.decision).unwrap(),
@@ -3325,9 +4499,9 @@ mod tests {
                 vector["id"]
             );
             assert_eq!(
-                serde_json::to_value(lookup.class_id).unwrap(),
-                vector["expected"]["class_id"],
-                "{} class",
+                serde_json::to_value(lookup.hardware_class_id).unwrap(),
+                vector["expected"]["hardware_class_id"],
+                "{} hardware class",
                 vector["id"]
             );
             assert_eq!(
@@ -3358,19 +4532,13 @@ mod tests {
                         panic!("{} unexpectedly rejected: {error}", vector["id"])
                     });
                     assert_eq!(write_count.get(), 1, "{} write count", vector["id"]);
+                    let expected_profile =
+                        serde_json::from_value::<MachineProfileKey>(expected["profile"].clone())
+                            .expect("expected admitted profile");
                     assert_eq!(
-                        Some(identity.class_id()),
-                        expected["class_id"].as_str(),
-                        "{} class",
-                        vector["id"]
-                    );
-                    let golden: MachineClassDerivedHashes =
-                        serde_json::from_value(expected["derived_sha256"].clone())
-                            .expect("golden hashes");
-                    assert_eq!(
-                        identity.derived_sha256(),
-                        &golden,
-                        "{} golden hashes",
+                        identity.profile(),
+                        expected_profile,
+                        "{} profile",
                         vector["id"]
                     );
                     identity.verify().expect("stored identity re-verifies");
@@ -3389,8 +4557,8 @@ mod tests {
                 other => panic!("unexpected receipt decision {other}"),
             }
         }
-        assert_eq!(allow_count, 2);
-        assert_eq!(reject_count, 69);
+        assert_eq!(allow_count, 1);
+        assert_eq!(reject_count, 27);
     }
 
     #[test]
@@ -3400,14 +4568,14 @@ mod tests {
             .as_array()
             .expect("receipt vectors")
             .iter()
-            .find(|vector| vector["id"].as_str() == Some("MCV-001-trj-registered"))
+            .find(|vector| vector["id"].as_str() == Some("MCV-001-trj-physical-64-admitted"))
             .expect("registered TRJ vector");
         let (bytes, context) = materialize_receipt_vector(registry.raw(), vector);
         let receipt =
             serde_json::from_slice::<RunnerReceipt>(&bytes).expect("materialized runner receipt");
         let preflight = registry
             .preflight(
-                &receipt.requested_class_id,
+                receipt.requested_profile,
                 receipt.hardware.clone(),
                 receipt.execution.request.clone(),
                 receipt.execution.start.clone(),
@@ -3426,7 +4594,7 @@ mod tests {
         wrong_hardware.cpu_vendor = "GenuineIntel".to_owned();
         let error = registry
             .preflight(
-                &receipt.requested_class_id,
+                receipt.requested_profile,
                 wrong_hardware,
                 receipt.execution.request,
                 receipt.execution.start,
@@ -3440,7 +4608,10 @@ mod tests {
     #[test]
     fn registered_classes_reject_forged_family_lease_identities() {
         let registry = MachineClassRegistry::frozen().expect("frozen registry");
-        for vector_id in ["MCV-001-trj-registered", "MCV-002-m4-registered"] {
+        for vector_id in [
+            "MCV-001-trj-physical-64-admitted",
+            "MCV-002-m4-scheduler-10-runtime-unavailable",
+        ] {
             let vector = registry.raw()["test_vectors"]
                 .as_array()
                 .expect("receipt vectors")
@@ -3490,7 +4661,7 @@ mod tests {
             .as_array()
             .expect("receipt vectors")
             .iter()
-            .find(|vector| vector["id"].as_str() == Some("MCV-001-trj-registered"))
+            .find(|vector| vector["id"].as_str() == Some("MCV-001-trj-physical-64-admitted"))
             .expect("registered vector");
         let cases = [
             (
@@ -3555,12 +4726,6 @@ mod tests {
             let bytes = vector.get("raw_json").and_then(Value::as_str).map_or_else(
                 || {
                     let mut candidate = registry.raw().clone();
-                    if let Some(class) = vector.get("add_class").filter(|value| !value.is_null()) {
-                        candidate["classes"]
-                            .as_array_mut()
-                            .expect("classes")
-                            .push(class.clone());
-                    }
                     for (path, replacement) in vector["set"].as_object().expect("set map") {
                         set_path(&mut candidate, path, replacement.clone());
                     }
@@ -3600,8 +4765,14 @@ mod tests {
 
     #[test]
     fn artifact_manifest_requires_exact_compact_typed_bytes() {
+        let profile = MachineProfileKey::new(
+            HardwareClassId::TrjZen35995wx,
+            ExecutionProfileId::Physical64,
+        )
+        .expect("canonical test profile");
         let manifest = RunnerArtifactManifest::from_artifacts(
             "QG-2",
+            profile,
             "candidate-a",
             "window-a",
             b"exact run log",

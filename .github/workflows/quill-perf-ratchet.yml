@@ -124,38 +124,32 @@ jobs:
         shell: bash
         run: bash -n scripts/perf-runner.sh
 
-      - name: Measure candidate and same-revision rehearsal
+      - name: Verify typed profile, plan, and bootstrap contracts
         shell: bash
-        env:
-          QUILL_PERF_GATE: ${{ matrix.gate }}
-          QUILL_PERF_BUILD_PROFILE: release-perf
-          QUILL_PERF_GIT_REV: ${{ github.sha }}
-          QUILL_PERF_RUNS: "10"
-          QUILL_PERF_SCALE: ${{ github.event_name == 'pull_request' && 'smoke' || 'full' }}
-          QUILL_PERF_RUN_WINDOW: ${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.gate }}
         run: |
           set -euo pipefail
-          for pass in candidate rerun; do
-            export QUILL_PERF_RUN_ID="${pass}"
-            export QUILL_PERF_OUTPUT_DIR="${GITHUB_WORKSPACE}/ci_artifacts/quill-perf/${pass}"
-            cargo bench \
-              --profile release-perf \
-              -p frankensearch-quill-gauntlet \
-              --bench perf_matrix \
-              --features perf-harness \
-              -- \
-              --noplot
-          done
+          cargo test \
+            --profile release-perf \
+            -p frankensearch-quill-gauntlet \
+            --lib \
+            perf::tests::profile_plans_cover_the_complete_matrix_and_reject_plan_or_matrix_drift \
+            -- --exact
+          cargo test \
+            --profile release-perf \
+            -p frankensearch-quill-gauntlet \
+            --lib \
+            perf_ratchet::tests::every_committed_unmeasured_placeholder_is_the_exact_current_manifest_sentinel \
+            -- --exact
 
-      - name: Evaluate structural reproduction diagnostic
+      - name: Prove hosted rehearsal remains fail-closed
         id: ratchet
         shell: bash
         env:
           QG_GATE: ${{ matrix.gate }}
-          # Hosted runners are structural diagnostics only. Exact ephemeral host
-          # identity and the unmeasured sentinel deliberately yield Quarantine.
-          # Promotion is possible only on an eligible registered class through
-          # the typed producer's complete lifecycle.
+          # Hosted runners have no immutable registered hardware/profile
+          # identity and therefore execute no performance cells. Replaying the
+          # exact unmeasured sentinel as both baseline and candidate must remain
+          # Block or Quarantine. Allow would be a fail-open defect.
           QG_MODE: regression-alarm
         run: |
           set -euo pipefail
@@ -164,10 +158,7 @@ jobs:
           args=(
             --manifest docs/contracts/quill-perf-gates.toml
             --baseline "${history}"
-            --candidate "ci_artifacts/quill-perf/candidate/${QG_GATE}.json"
-            --candidate-evidence "ci_artifacts/quill-perf/candidate/${QG_GATE}.evidence.json"
-            --rerun "ci_artifacts/quill-perf/rerun/${QG_GATE}.json"
-            --rerun-evidence "ci_artifacts/quill-perf/rerun/${QG_GATE}.evidence.json"
+            --candidate "${history}"
             --output "ci_artifacts/quill-perf/${QG_GATE}.ratchet.json"
             --mode "${QG_MODE}"
           )
@@ -184,15 +175,16 @@ jobs:
 
           case "${status}" in
             0)
-              echo "decision=allow" >> "${GITHUB_OUTPUT}"
+              echo "hosted structural rehearsal unexpectedly allowed an unmeasured sentinel" >&2
+              exit 1
               ;;
             1)
               echo "decision=block" >> "${GITHUB_OUTPUT}"
-              exit 1
+              echo "::notice::${QG_GATE} unmeasured sentinel correctly blocked"
               ;;
             2)
               echo "decision=quarantine" >> "${GITHUB_OUTPUT}"
-              echo "::warning::${QG_GATE} evidence quarantined; inspect the ratchet artifact"
+              echo "::notice::${QG_GATE} unmeasured sentinel correctly quarantined"
               ;;
             *)
               echo "ratchet invocation failed with status ${status}" >&2
@@ -200,7 +192,7 @@ jobs:
               ;;
           esac
 
-      - name: Upload QG rehearsal measurements and decision
+      - name: Upload QG fail-closed rehearsal artifacts and decision
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
@@ -209,4 +201,4 @@ jobs:
           retention-days: 30
           path: |
             ci_artifacts/quill-perf/
-            .bench-history/${{ matrix.gate }}.*.json
+            .bench-history/${{ matrix.gate }}.unmeasured.latest.json

@@ -7,7 +7,7 @@ use std::process::Command;
 
 use sha2::{Digest, Sha256};
 
-const PRODUCER_CONTRACT_VERSION: &str = "frankensearch.quill-local-perf-producer.v3";
+const PRODUCER_CONTRACT_VERSION: &str = "frankensearch.quill-local-perf-producer.v4";
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");

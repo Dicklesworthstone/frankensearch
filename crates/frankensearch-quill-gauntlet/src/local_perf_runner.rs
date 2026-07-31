@@ -25,20 +25,22 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::machine_class_registry::{
+    ExecutionCapacitySemantics, ExecutionProfileId, HardwareClassId,
     LOCAL_PERF_PRODUCER_CONTRACT_VERSION, MACHINE_CLASS_REGISTRY_SHA256,
     MachineClassAdmissionContext, MachineClassError, MachineClassRegistry,
-    RUNNER_RECEIPT_SCHEMA_VERSION, RunnerArtifactManifest, RunnerBuild, RunnerCompletion,
-    RunnerDurability, RunnerExecution, RunnerExecutionRequest, RunnerExecutionSnapshot,
-    RunnerHardware, RunnerProducer, RunnerReceipt, seal_runner_receipt, sha256_hex,
+    MachineProfileAvailability, MachineProfileKey, RUNNER_RECEIPT_SCHEMA_VERSION,
+    RunnerArtifactManifest, RunnerBuild, RunnerCompletion, RunnerDurability, RunnerExecution,
+    RunnerExecutionRequest, RunnerExecutionSnapshot, RunnerHardware, RunnerProducer, RunnerReceipt,
+    seal_runner_receipt, sha256_hex,
 };
 use crate::{
-    EvidenceArtifactError, PerfEvidenceArtifact, PerfGate, PerfGateArtifact, PerfMatrixSpec,
-    command_sha256_from_argv,
+    EvidenceArtifactError, PerfApplicabilityPlan, PerfApplicabilityPlanBinding,
+    PerfEvidenceArtifact, PerfGate, PerfGateArtifact, PerfMatrixSpec, command_sha256_from_argv,
 };
 
 const PRODUCER_CONTRACT_SCHEMA_VERSION: &str =
     "frankensearch.quill-local-perf-producer-contract.v1";
-const ATTEMPT_RECEIPT_SCHEMA_VERSION: &str = "frankensearch.perf-runner-attempt.v1";
+const ATTEMPT_RECEIPT_SCHEMA_VERSION: &str = "frankensearch.perf-runner-attempt.v2";
 const MAX_IDENTITY_COMPONENT_BYTES: usize = 96;
 const MAX_OUTPUT_COMPONENT_BYTES: usize = 128;
 const MIN_MEASUREMENT_RUNS: usize = 10;
@@ -55,18 +57,14 @@ const EMBEDDED_PRODUCER_CARGO_LOCK_SHA256: &str = env!("QUILL_PERF_PRODUCER_CARG
 pub struct LocalPerfRunConfig {
     /// Gate selected for this invocation.
     pub gate: PerfGate,
-    /// Canonical registered machine class.
-    pub class_id: String,
+    /// Canonical registered hardware/profile identity.
+    pub profile: MachineProfileKey,
     /// Unique pass identity.
     pub run_id: String,
     /// Window shared by a candidate and its immediate rerun.
     pub run_window: String,
-    /// Exact maximum thread width in the selected gate's frozen full matrix.
-    pub thread_budget: u64,
     /// Predeclared measured block count; never inherited from ambient state.
     pub measurement_runs: usize,
-    /// `not-applicable` or the currently admissible `p-plus-e`.
-    pub apple_execution_mode: String,
     /// Unique not-yet-created output directory. Existing paths are rejected.
     pub output_dir: PathBuf,
 }
@@ -193,12 +191,23 @@ struct PlatformCapture {
     snapshot: RunnerExecutionSnapshot,
 }
 
+#[derive(Debug, Clone)]
+struct RunProfileContract {
+    capacity_semantics: ExecutionCapacitySemantics,
+    execution_capacity: u64,
+    max_exercised_cell_width: u64,
+    applicability_plan: PerfApplicabilityPlan,
+}
+
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PrecommitInventory {
     schema_version: String,
     gate: String,
-    class_id: String,
+    profile: MachineProfileKey,
+    execution_capacity: u64,
+    max_exercised_cell_width: u64,
+    applicability_plan: PerfApplicabilityPlanBinding,
     run_id: String,
     run_window: String,
     run_log_sha256: String,
@@ -225,7 +234,7 @@ struct RunnerAttemptReceipt {
     schema_version: String,
     mode: String,
     gate: String,
-    class_id: String,
+    profile: MachineProfileKey,
     run_id: String,
     run_window: String,
     registry_sha256: String,
@@ -286,7 +295,9 @@ pub fn run_local_perf_command(
 ) -> Result<LocalPerfRunOutput, LocalPerfRunError> {
     validate_bounded_inputs(config)?;
     validate_platform_gate_policy(config)?;
-    let lease_path = stable_lease_path(&config.class_id)?;
+    let registry = MachineClassRegistry::frozen()?;
+    let run_profile = resolve_run_profile(config, &registry)?;
+    let lease_path = stable_lease_path(config.profile.hardware_class_id())?;
     validate_canonical_lease_parent(&lease_path)?;
     let (lease_file, lease_identity) = acquire_family_lease(&lease_path)?;
 
@@ -319,12 +330,12 @@ pub fn run_local_perf_command(
     let started_at_utc = utc_now()?;
     let context = MachineClassAdmissionContext {
         gate: config.gate.label().to_owned(),
-        destination_basename: format!("{}.{}.latest.json", config.gate.label(), config.class_id),
+        expected_profile: config.profile,
+        destination_basename: config.profile.latest_basename(config.gate.label())?,
     };
     let durability = durability_for_run(config)?;
-    let registry = MachineClassRegistry::frozen()?;
     let pre_spawn = registry.preflight(
-        &config.class_id,
+        config.profile,
         start.hardware.clone(),
         start.request.clone(),
         start.snapshot.clone(),
@@ -402,10 +413,18 @@ pub fn run_local_perf_command(
     let evidence_bytes = read_file_at(&run_directories.artifacts.handle, &evidence_name)?;
     let threshold = read_canonical_threshold(&threshold_bytes)?;
     let evidence = read_canonical_evidence(&evidence_bytes)?;
-    validate_child_artifacts(config, &captured_build, &start, &threshold, &evidence)?;
+    validate_child_artifacts(
+        config,
+        &run_profile,
+        &captured_build,
+        &start,
+        &threshold,
+        &evidence,
+    )?;
 
     let artifact_manifest = RunnerArtifactManifest::from_artifacts(
         config.gate.label(),
+        config.profile,
         &config.run_id,
         &config.run_window,
         &run_log_bytes,
@@ -418,8 +437,8 @@ pub fn run_local_perf_command(
         sha256_hex(&serde_json::to_vec(&captured_build.receipt.producer)?);
     let receipt = RunnerReceipt {
         schema_version: RUNNER_RECEIPT_SCHEMA_VERSION.to_owned(),
-        requested_class_id: config.class_id.clone(),
-        derived_class_id: config.class_id.clone(),
+        requested_profile: config.profile,
+        derived_profile: config.profile,
         registry_sha256: MACHINE_CLASS_REGISTRY_SHA256.to_owned(),
         hardware: start.hardware,
         execution: RunnerExecution {
@@ -465,9 +484,12 @@ pub fn run_local_perf_command(
         .join(format!("{}.runner.json", config.gate.label()));
     let inventory_path = config.output_dir.join("PRECOMMIT.json");
     let inventory = PrecommitInventory {
-        schema_version: "frankensearch.perf-run-precommit.v3".to_owned(),
+        schema_version: "frankensearch.perf-run-precommit.v4".to_owned(),
         gate: config.gate.label().to_owned(),
-        class_id: config.class_id.clone(),
+        profile: config.profile,
+        execution_capacity: run_profile.execution_capacity,
+        max_exercised_cell_width: run_profile.max_exercised_cell_width,
+        applicability_plan: run_profile.applicability_plan.binding().clone(),
         run_id: config.run_id.clone(),
         run_window: config.run_window.clone(),
         run_log_sha256: sha256_hex(&run_log_bytes),
@@ -532,7 +554,14 @@ fn validate_config(config: &LocalPerfRunConfig) -> Result<ExternalRunPaths, Loca
 
 fn validate_bounded_inputs(config: &LocalPerfRunConfig) -> Result<(), LocalPerfRunError> {
     for (name, value) in [
-        ("class ID", config.class_id.as_str()),
+        (
+            "hardware class ID",
+            config.profile.hardware_class_id().as_str(),
+        ),
+        (
+            "execution profile ID",
+            config.profile.execution_profile_id().as_str(),
+        ),
         ("run ID", config.run_id.as_str()),
         ("run window", config.run_window.as_str()),
     ] {
@@ -540,20 +569,20 @@ fn validate_bounded_inputs(config: &LocalPerfRunConfig) -> Result<(), LocalPerfR
             return Err(LocalPerfRunError::Invalid(format!("{name} is empty")));
         }
     }
-    let normative_thread_budget = normative_thread_budget(config.gate)?;
-    if config.thread_budget != normative_thread_budget {
-        return Err(LocalPerfRunError::Invalid(format!(
-            "{} requires exact normative thread budget {normative_thread_budget}, received {}",
-            config.gate, config.thread_budget
-        )));
-    }
     if !(MIN_MEASUREMENT_RUNS..=MAX_MEASUREMENT_RUNS).contains(&config.measurement_runs) {
         return Err(LocalPerfRunError::Invalid(format!(
             "measurement runs must remain within {MIN_MEASUREMENT_RUNS}..={MAX_MEASUREMENT_RUNS}"
         )));
     }
     for (field, value) in [
-        ("class ID", config.class_id.as_str()),
+        (
+            "hardware class ID",
+            config.profile.hardware_class_id().as_str(),
+        ),
+        (
+            "execution profile ID",
+            config.profile.execution_profile_id().as_str(),
+        ),
         ("run ID", config.run_id.as_str()),
         ("run window", config.run_window.as_str()),
     ] {
@@ -562,13 +591,54 @@ fn validate_bounded_inputs(config: &LocalPerfRunConfig) -> Result<(), LocalPerfR
     Ok(())
 }
 
-fn normative_thread_budget(gate: PerfGate) -> Result<u64, LocalPerfRunError> {
-    PerfMatrixSpec::complete()
-        .max_thread_width(gate)
-        .and_then(|threads| u64::try_from(threads).ok())
+fn resolve_run_profile(
+    config: &LocalPerfRunConfig,
+    registry: &MachineClassRegistry,
+) -> Result<RunProfileContract, LocalPerfRunError> {
+    let profile = registry.execution_profile(config.profile)?;
+    if profile.availability() != MachineProfileAvailability::Registered {
+        return Err(LocalPerfRunError::Invalid(format!(
+            "execution profile {}.{} is unavailable",
+            config.profile.hardware_class_id().as_str(),
+            config.profile.execution_profile_id().as_str()
+        )));
+    }
+    let execution_capacity = profile.execution_capacity().ok_or_else(|| {
+        LocalPerfRunError::Invalid(
+            "typed promotion runner requires a frozen non-diagnostic execution capacity".to_owned(),
+        )
+    })?;
+    let max_exercised_cell_width = profile
+        .gate_policy(config.gate.label())
+        .and_then(|policy| policy.max_exercised_cell_width())
         .ok_or_else(|| {
-            LocalPerfRunError::Invalid(format!("{} has no positive normative thread width", gate))
-        })
+            LocalPerfRunError::Invalid(format!(
+                "execution profile has no runnable width for {}",
+                config.gate
+            ))
+        })?;
+    let applicability_plan = PerfMatrixSpec::complete()
+        .applicability_plan(registry, config.profile, config.gate)
+        .map_err(|error| {
+            LocalPerfRunError::Invalid(format!(
+                "cannot construct the frozen profile applicability plan: {error}"
+            ))
+        })?;
+    if applicability_plan.execution_capacity != Some(execution_capacity)
+        || applicability_plan.max_exercised_cell_width != Some(max_exercised_cell_width)
+        || applicability_plan.capacity_semantics != profile.capacity_semantics()
+    {
+        return Err(LocalPerfRunError::Invalid(
+            "registry profile and canonical applicability plan disagree on the execution envelope"
+                .to_owned(),
+        ));
+    }
+    Ok(RunProfileContract {
+        capacity_semantics: profile.capacity_semantics(),
+        execution_capacity,
+        max_exercised_cell_width,
+        applicability_plan,
+    })
 }
 
 fn validate_component(value: &str, field: &str) -> Result<(), LocalPerfRunError> {
@@ -593,14 +663,10 @@ fn validate_platform_gate_policy(config: &LocalPerfRunConfig) -> Result<(), Loca
             config.gate
         )));
     }
-    if config.class_id == "m4-macos" {
+    if config.profile.hardware_class_id() == HardwareClassId::M4Macos {
         return Err(LocalPerfRunError::Invalid(
             "m4-macos promotion is unavailable until the producer can attest the actual executing image through a supported O_EXEC or loaded-image mechanism; every current M4 run is diagnostic-only"
                 .to_owned(),
-        ));
-    } else if config.apple_execution_mode != "not-applicable" {
-        return Err(LocalPerfRunError::Invalid(
-            "non-M4 producer requires apple mode not-applicable".to_owned(),
         ));
     }
     Ok(())
@@ -944,6 +1010,8 @@ fn controlled_environments(
     target: &PinnedDirectory,
     artifact_dir: &Path,
 ) -> Result<ControlledEnvironments, LocalPerfRunError> {
+    let registry = MachineClassRegistry::frozen()?;
+    let run_profile = resolve_run_profile(config, &registry)?;
     let home = canonical_environment_directory("HOME", None)?;
     let cargo_home = canonical_environment_directory("CARGO_HOME", Some(&home.join(".cargo")))?;
     let rustup_home = canonical_environment_directory("RUSTUP_HOME", Some(&home.join(".rustup")))?;
@@ -1048,8 +1116,78 @@ fn controlled_environments(
     );
     insert_environment(
         &mut measurement,
+        "QUILL_PERF_HARDWARE_CLASS",
+        OsStr::new(config.profile.hardware_class_id().as_str()),
+    );
+    insert_environment(
+        &mut measurement,
+        "QUILL_PERF_EXECUTION_PROFILE",
+        OsStr::new(config.profile.execution_profile_id().as_str()),
+    );
+    insert_environment(
+        &mut measurement,
+        "QUILL_PERF_EXECUTION_CAPACITY",
+        OsStr::new(&run_profile.execution_capacity.to_string()),
+    );
+    insert_environment(
+        &mut measurement,
+        "QUILL_PERF_MAX_EXERCISED_CELL_WIDTH",
+        OsStr::new(&run_profile.max_exercised_cell_width.to_string()),
+    );
+    insert_environment(
+        &mut measurement,
+        "QUILL_PERF_APPLICABILITY_PLAN_SCHEMA_VERSION",
+        OsStr::new(&run_profile.applicability_plan.binding().schema_version),
+    );
+    insert_environment(
+        &mut measurement,
+        "QUILL_PERF_APPLICABILITY_PLAN_SHA256",
+        OsStr::new(
+            &run_profile
+                .applicability_plan
+                .binding()
+                .applicability_plan_sha256,
+        ),
+    );
+    insert_environment(
+        &mut measurement,
+        "QUILL_PERF_GATE_MATRIX_CONTRACT_SHA256",
+        OsStr::new(
+            &run_profile
+                .applicability_plan
+                .binding()
+                .gate_matrix_contract_sha256,
+        ),
+    );
+    insert_environment(
+        &mut measurement,
+        "QUILL_PERF_PROFILE_CONTRACT_SHA256",
+        OsStr::new(
+            &run_profile
+                .applicability_plan
+                .binding()
+                .profile_contract_sha256,
+        ),
+    );
+    insert_environment(
+        &mut measurement,
+        "QUILL_PERF_REGISTRY_SCHEMA_VERSION",
+        OsStr::new(
+            &run_profile
+                .applicability_plan
+                .binding()
+                .registry_schema_version,
+        ),
+    );
+    insert_environment(
+        &mut measurement,
+        "QUILL_PERF_REGISTRY_SHA256",
+        OsStr::new(&run_profile.applicability_plan.binding().registry_sha256),
+    );
+    insert_environment(
+        &mut measurement,
         "RAYON_NUM_THREADS",
-        OsStr::new(&config.thread_budget.to_string()),
+        OsStr::new(&run_profile.execution_capacity.to_string()),
     );
     insert_environment(&mut measurement, "RCH_DISABLE", OsStr::new("1"));
     insert_environment(
@@ -1078,7 +1216,46 @@ fn controlled_environments(
         };
         policy.insert(format!("measurement.{name}"), normalized);
     }
-    policy.insert("policy.class_id".to_owned(), config.class_id.clone());
+    policy.insert(
+        "policy.hardware_class_id".to_owned(),
+        config.profile.hardware_class_id().as_str().to_owned(),
+    );
+    policy.insert(
+        "policy.execution_profile_id".to_owned(),
+        config.profile.execution_profile_id().as_str().to_owned(),
+    );
+    policy.insert(
+        "policy.execution_capacity".to_owned(),
+        run_profile.execution_capacity.to_string(),
+    );
+    policy.insert(
+        "policy.max_exercised_cell_width".to_owned(),
+        run_profile.max_exercised_cell_width.to_string(),
+    );
+    policy.insert(
+        "policy.applicability_plan_sha256".to_owned(),
+        run_profile
+            .applicability_plan
+            .binding()
+            .applicability_plan_sha256
+            .clone(),
+    );
+    policy.insert(
+        "policy.gate_matrix_contract_sha256".to_owned(),
+        run_profile
+            .applicability_plan
+            .binding()
+            .gate_matrix_contract_sha256
+            .clone(),
+    );
+    policy.insert(
+        "policy.profile_contract_sha256".to_owned(),
+        run_profile
+            .applicability_plan
+            .binding()
+            .profile_contract_sha256
+            .clone(),
+    );
     policy.insert(
         "policy.fixture_selection".to_owned(),
         "<all-gate-cells>".to_owned(),
@@ -1768,20 +1945,19 @@ fn durability_for_run(config: &LocalPerfRunConfig) -> Result<RunnerDurability, L
     })
 }
 
-fn stable_lease_id(class_id: &str) -> Result<&'static str, LocalPerfRunError> {
-    if class_id == "m4-macos" {
-        Ok("m4-macos-exclusive")
-    } else if parse_trj_class(class_id).is_ok() {
-        Ok("trj-zen3-exclusive")
-    } else {
-        Err(LocalPerfRunError::Invalid(format!(
-            "no stable exclusive-lease family exists for class {class_id:?}"
-        )))
+fn stable_lease_id(hardware_class_id: HardwareClassId) -> Result<&'static str, LocalPerfRunError> {
+    match hardware_class_id {
+        HardwareClassId::TrjZen35995wx => Ok("trj-zen3-exclusive"),
+        HardwareClassId::M4Macos => Ok("m4-macos-exclusive"),
+        HardwareClassId::X86VpsOvh => Ok("x86-vps-ovh-exclusive"),
+        HardwareClassId::M5Macos => Err(LocalPerfRunError::Invalid(
+            "M5 has no registered host-global lease".to_owned(),
+        )),
     }
 }
 
-fn stable_lease_path(class_id: &str) -> Result<PathBuf, LocalPerfRunError> {
-    stable_lease_id(class_id)?;
+fn stable_lease_path(hardware_class_id: HardwareClassId) -> Result<PathBuf, LocalPerfRunError> {
+    stable_lease_id(hardware_class_id)?;
     Ok(PathBuf::from(
         "/tmp/frankensearch-perf-host-global-exclusive.lock",
     ))
@@ -1871,12 +2047,22 @@ fn verify_family_lease_path(
 }
 
 fn capture_linux(config: &LocalPerfRunConfig) -> Result<PlatformCapture, LocalPerfRunError> {
-    if config.apple_execution_mode != "not-applicable" {
+    if config.profile.hardware_class_id() != HardwareClassId::TrjZen35995wx {
         return Err(LocalPerfRunError::Invalid(
-            "Linux producer requires apple mode not-applicable".to_owned(),
+            "promotion-grade Linux producer requires trj-zen3-5995wx".to_owned(),
         ));
     }
-    let class = parse_trj_class(&config.class_id)?;
+    let run_profile = resolve_run_profile(config, &MachineClassRegistry::frozen()?)?;
+    let threads_per_core = match config.profile.execution_profile_id() {
+        ExecutionProfileId::Physical64 => 1,
+        ExecutionProfileId::Smt2_128 => 2,
+        other => {
+            return Err(LocalPerfRunError::Invalid(format!(
+                "unsupported Threadripper execution profile {:?}",
+                other.as_str()
+            )));
+        }
+    };
     let cpuinfo = fs::read_to_string("/proc/cpuinfo")?;
     let records = parse_cpuinfo(&cpuinfo);
     let first = records.first().ok_or_else(|| {
@@ -1949,24 +2135,27 @@ fn capture_linux(config: &LocalPerfRunConfig) -> Result<PlatformCapture, LocalPe
         ));
     }
     let request = RunnerExecutionRequest {
+        capacity_semantics: run_profile.capacity_semantics,
+        execution_capacity: run_profile.execution_capacity,
+        max_exercised_cell_width: run_profile.max_exercised_cell_width,
         requested_logical_cpu_ids: observed_logical_cpu_ids.clone(),
-        requested_physical_core_width: class.0,
-        thread_budget: config.thread_budget,
-        apple_execution_mode: config.apple_execution_mode.clone(),
+        requested_physical_core_width: Some(64),
+        requested_worker_pool_width: run_profile.execution_capacity,
+        requested_qos: "not-applicable".to_owned(),
     };
     let snapshot = RunnerExecutionSnapshot {
         observed_logical_cpu_ids,
         effective_physical_core_ids,
         cpu_assignment_observability: "affinity-enforced".to_owned(),
         effective_cpuset_sha256: String::new(),
-        threads_per_core: class.1,
-        smt_state: if class.1 == 2 { "on" } else { "off" }.to_owned(),
+        threads_per_core,
+        smt_state: if threads_per_core == 2 { "on" } else { "off" }.to_owned(),
         numa_node_ids: vec![0],
         numa_policy: "bind:0".to_owned(),
         governor,
         thermal_pressure,
         exclusive_lease: true,
-        exclusive_lease_id: stable_lease_id(&config.class_id)?.to_owned(),
+        exclusive_lease_id: stable_lease_id(config.profile.hardware_class_id())?.to_owned(),
         local_execution: true,
         observed_hardware_fingerprint_sha256: String::new(),
         snapshot_sha256: String::new(),
@@ -1979,18 +2168,14 @@ fn capture_linux(config: &LocalPerfRunConfig) -> Result<PlatformCapture, LocalPe
 }
 
 fn capture_macos(config: &LocalPerfRunConfig) -> Result<PlatformCapture, LocalPerfRunError> {
-    if config.class_id != "m4-macos" {
+    if config.profile.hardware_class_id() != HardwareClassId::M4Macos
+        || config.profile.execution_profile_id() != ExecutionProfileId::Scheduler10
+    {
         return Err(LocalPerfRunError::Invalid(
-            "macOS producer currently admits only m4-macos".to_owned(),
+            "macOS producer currently recognizes only m4-macos.scheduler-10".to_owned(),
         ));
     }
-    if config.apple_execution_mode != "p-plus-e" {
-        return Err(LocalPerfRunError::Invalid(
-            "M4 diagnostic capture recognizes only p-plus-e execution; promotion remains unavailable"
-                .to_owned(),
-        ));
-    }
-    let width = 14;
+    let run_profile = resolve_run_profile(config, &MachineClassRegistry::frozen()?)?;
     let sysctl = |name: &str| command_output("sysctl", &["-n", name]);
     let hardware = RunnerHardware {
         os: "macos".to_owned(),
@@ -2025,10 +2210,13 @@ fn capture_macos(config: &LocalPerfRunConfig) -> Result<PlatformCapture, LocalPe
         )));
     }
     let request = RunnerExecutionRequest {
+        capacity_semantics: run_profile.capacity_semantics,
+        execution_capacity: run_profile.execution_capacity,
+        max_exercised_cell_width: run_profile.max_exercised_cell_width,
         requested_logical_cpu_ids: Vec::new(),
-        requested_physical_core_width: width,
-        thread_budget: config.thread_budget,
-        apple_execution_mode: config.apple_execution_mode.clone(),
+        requested_physical_core_width: None,
+        requested_worker_pool_width: run_profile.execution_capacity,
+        requested_qos: "inherit-process-default".to_owned(),
     };
     let snapshot = RunnerExecutionSnapshot {
         observed_logical_cpu_ids: Vec::new(),
@@ -2042,7 +2230,7 @@ fn capture_macos(config: &LocalPerfRunConfig) -> Result<PlatformCapture, LocalPe
         governor: "not-applicable".to_owned(),
         thermal_pressure: false,
         exclusive_lease: true,
-        exclusive_lease_id: stable_lease_id(&config.class_id)?.to_owned(),
+        exclusive_lease_id: stable_lease_id(config.profile.hardware_class_id())?.to_owned(),
         local_execution: true,
         observed_hardware_fingerprint_sha256: String::new(),
         snapshot_sha256: String::new(),
@@ -2076,6 +2264,7 @@ fn read_canonical_evidence(bytes: &[u8]) -> Result<PerfEvidenceArtifact, LocalPe
 
 fn validate_child_artifacts(
     config: &LocalPerfRunConfig,
+    run_profile: &RunProfileContract,
     build: &CapturedBuild,
     platform: &PlatformCapture,
     threshold: &PerfGateArtifact,
@@ -2096,6 +2285,8 @@ fn validate_child_artifacts(
             != Some(build.receipt.environment_sha256.as_str())
         || evidence.provenance.build.cargo_lock_sha256.as_deref()
             != Some(build.receipt.cargo_lock_sha256.as_str())
+        || threshold.applicability_plan.as_ref() != Some(run_profile.applicability_plan.binding())
+        || evidence.applicability_plan != *run_profile.applicability_plan.binding()
         || threshold.execution.as_ref() != Some(&evidence.provenance.machine.execution)
         || evidence.provenance.machine.os != platform.hardware.os
         || evidence.provenance.machine.arch != platform.hardware.arch
@@ -2111,28 +2302,6 @@ fn validate_child_artifacts(
         ));
     }
     Ok(())
-}
-
-fn parse_trj_class(class_id: &str) -> Result<(u64, u64), LocalPerfRunError> {
-    let suffix = class_id.strip_prefix("trj-zen3-").ok_or_else(|| {
-        LocalPerfRunError::Invalid(format!("Linux class {class_id:?} is not a TRJ class"))
-    })?;
-    let (width, threads_per_core) = suffix
-        .strip_suffix("c-smt2")
-        .map_or_else(
-            || suffix.strip_suffix('c').map(|width| (width, 1)),
-            |width| Some((width, 2)),
-        )
-        .ok_or_else(|| LocalPerfRunError::Invalid(format!("invalid TRJ class {class_id:?}")))?;
-    let width = width
-        .parse::<u64>()
-        .map_err(|error| LocalPerfRunError::Invalid(format!("invalid TRJ class width: {error}")))?;
-    if !(1..=64).contains(&width) {
-        return Err(LocalPerfRunError::Invalid(format!(
-            "TRJ class width {width} is outside 1..=64"
-        )));
-    }
-    Ok((width, threads_per_core))
 }
 
 fn parse_cpuinfo(contents: &str) -> Vec<BTreeMap<String, String>> {
@@ -2513,7 +2682,7 @@ fn write_failed_attempt_receipt(
         schema_version: ATTEMPT_RECEIPT_SCHEMA_VERSION.to_owned(),
         mode: "measurement".to_owned(),
         gate: config.gate.label().to_owned(),
-        class_id: config.class_id.clone(),
+        profile: config.profile,
         run_id: config.run_id.clone(),
         run_window: config.run_window.clone(),
         registry_sha256: MACHINE_CLASS_REGISTRY_SHA256.to_owned(),
@@ -2586,31 +2755,35 @@ mod tests {
 
     use super::*;
 
-    fn policy_config(gate: PerfGate, mode: &str) -> LocalPerfRunConfig {
+    fn profile(
+        hardware_class_id: HardwareClassId,
+        execution_profile_id: ExecutionProfileId,
+    ) -> MachineProfileKey {
+        MachineProfileKey::new(hardware_class_id, execution_profile_id)
+            .expect("registered test profile")
+    }
+
+    fn policy_config(gate: PerfGate) -> LocalPerfRunConfig {
         LocalPerfRunConfig {
             gate,
-            class_id: "m4-macos".to_owned(),
+            profile: profile(HardwareClassId::M4Macos, ExecutionProfileId::Scheduler10),
             run_id: "candidate-1".to_owned(),
             run_window: "window-1".to_owned(),
-            thread_budget: 14,
             measurement_runs: MIN_MEASUREMENT_RUNS,
-            apple_execution_mode: mode.to_owned(),
             output_dir: PathBuf::from("/tmp/frankensearch-perf-run"),
         }
     }
 
     #[test]
-    fn m4_policy_fails_closed_for_every_gate_and_execution_mode() {
+    fn m4_policy_fails_closed_for_every_gate() {
         for gate in PerfGate::ALL {
-            for mode in ["p-only", "p-plus-e", "not-applicable"] {
-                let error = validate_platform_gate_policy(&policy_config(gate, mode))
-                    .expect_err("every current M4 promotion path must reject");
-                if matches!(gate, PerfGate::Qg3 | PerfGate::Qg4 | PerfGate::Qg5) {
-                    assert!(error.to_string().contains("any host"));
-                } else {
-                    assert!(error.to_string().contains("actual executing image"));
-                    assert!(error.to_string().contains("diagnostic-only"));
-                }
+            let error = validate_platform_gate_policy(&policy_config(gate))
+                .expect_err("every current M4 promotion path must reject");
+            if matches!(gate, PerfGate::Qg3 | PerfGate::Qg4 | PerfGate::Qg5) {
+                assert!(error.to_string().contains("any host"));
+            } else {
+                assert!(error.to_string().contains("actual executing image"));
+                assert!(error.to_string().contains("diagnostic-only"));
             }
         }
     }
@@ -2635,20 +2808,75 @@ mod tests {
     }
 
     #[test]
-    fn full_gate_thread_budget_is_derived_from_the_frozen_matrix() {
-        for (gate, expected) in [
-            (PerfGate::Qg1, 128),
-            (PerfGate::Qg2, 1),
-            (PerfGate::Qg3, 1),
-            (PerfGate::Qg4, 1),
-            (PerfGate::Qg5, 1),
-            (PerfGate::Qg6, 1),
-            (PerfGate::Qg7, 8),
-            (PerfGate::Qg8, 32),
-            (PerfGate::Qg9, 1),
-            (PerfGate::Qg10, 1),
+    fn run_profile_is_derived_from_the_frozen_profile_and_applicability_plan() {
+        let registry = MachineClassRegistry::frozen().expect("frozen registry");
+        for (profile, gate, semantics, capacity, max_width) in [
+            (
+                profile(
+                    HardwareClassId::TrjZen35995wx,
+                    ExecutionProfileId::Physical64,
+                ),
+                PerfGate::Qg1,
+                ExecutionCapacitySemantics::PhysicalCores,
+                64,
+                64,
+            ),
+            (
+                profile(HardwareClassId::TrjZen35995wx, ExecutionProfileId::Smt2_128),
+                PerfGate::Qg1,
+                ExecutionCapacitySemantics::LogicalThreads,
+                128,
+                128,
+            ),
+            (
+                profile(
+                    HardwareClassId::TrjZen35995wx,
+                    ExecutionProfileId::Physical64,
+                ),
+                PerfGate::Qg7,
+                ExecutionCapacitySemantics::PhysicalCores,
+                64,
+                8,
+            ),
+            (
+                profile(
+                    HardwareClassId::TrjZen35995wx,
+                    ExecutionProfileId::Physical64,
+                ),
+                PerfGate::Qg8,
+                ExecutionCapacitySemantics::PhysicalCores,
+                64,
+                32,
+            ),
+            (
+                profile(HardwareClassId::M4Macos, ExecutionProfileId::Scheduler10),
+                PerfGate::Qg1,
+                ExecutionCapacitySemantics::SchedulerWorkers,
+                10,
+                8,
+            ),
         ] {
-            assert_eq!(normative_thread_budget(gate).unwrap(), expected);
+            let config = LocalPerfRunConfig {
+                gate,
+                profile,
+                run_id: "candidate-1".to_owned(),
+                run_window: "window-1".to_owned(),
+                measurement_runs: MIN_MEASUREMENT_RUNS,
+                output_dir: PathBuf::from("/tmp/frankensearch-perf-run"),
+            };
+            let resolved =
+                resolve_run_profile(&config, &registry).expect("resolve registered profile");
+            assert_eq!(resolved.capacity_semantics, semantics);
+            assert_eq!(resolved.execution_capacity, capacity);
+            assert_eq!(resolved.max_exercised_cell_width, max_width);
+            assert_eq!(
+                resolved.applicability_plan.execution_capacity,
+                Some(capacity)
+            );
+            assert_eq!(
+                resolved.applicability_plan.max_exercised_cell_width,
+                Some(max_width)
+            );
         }
     }
 
@@ -2752,24 +2980,24 @@ mod tests {
     #[test]
     fn lease_path_is_host_global_while_receipt_identity_tracks_family() {
         assert_eq!(
-            stable_lease_id("trj-zen3-1c").unwrap(),
-            stable_lease_id("trj-zen3-64c-smt2").unwrap()
+            stable_lease_id(HardwareClassId::TrjZen35995wx).unwrap(),
+            "trj-zen3-exclusive"
         );
-        assert_eq!(stable_lease_id("m4-macos").unwrap(), "m4-macos-exclusive");
         assert_eq!(
-            stable_lease_path("trj-zen3-1c").unwrap(),
+            stable_lease_id(HardwareClassId::M4Macos).unwrap(),
+            "m4-macos-exclusive"
+        );
+        assert_eq!(
+            stable_lease_path(HardwareClassId::TrjZen35995wx).unwrap(),
             PathBuf::from("/tmp/frankensearch-perf-host-global-exclusive.lock")
         );
         assert_eq!(
-            stable_lease_path("trj-zen3-64c-smt2").unwrap(),
-            PathBuf::from("/tmp/frankensearch-perf-host-global-exclusive.lock")
-        );
-        assert_eq!(
-            stable_lease_path("m4-macos").unwrap(),
+            stable_lease_path(HardwareClassId::M4Macos).unwrap(),
             PathBuf::from("/tmp/frankensearch-perf-host-global-exclusive.lock")
         );
         validate_canonical_lease_parent(
-            &stable_lease_path("trj-zen3-1c").expect("canonical TRJ lease"),
+            &stable_lease_path(HardwareClassId::TrjZen35995wx)
+                .expect("canonical Threadripper lease"),
         )
         .expect("root-owned sticky /tmp lease parent");
     }
@@ -2958,18 +3186,27 @@ mod tests {
     }
 
     #[test]
-    fn trj_class_parser_preserves_physical_width_and_smt_identity() {
-        assert_eq!(parse_trj_class("trj-zen3-1c").unwrap(), (1, 1));
-        assert_eq!(parse_trj_class("trj-zen3-64c").unwrap(), (64, 1));
-        assert_eq!(parse_trj_class("trj-zen3-64c-smt2").unwrap(), (64, 2));
-        for rejected in [
-            "trj-zen-128c",
-            "trj-zen3-0c",
-            "trj-zen3-65c",
-            "trj-zen3-16c-smt4",
-            "x86-vps-ovh",
-        ] {
-            assert!(parse_trj_class(rejected).is_err(), "{rejected} admitted");
+    fn typed_profiles_preserve_capacity_semantics_without_width_aliases() {
+        let physical = profile(
+            HardwareClassId::TrjZen35995wx,
+            ExecutionProfileId::Physical64,
+        );
+        let smt = profile(HardwareClassId::TrjZen35995wx, ExecutionProfileId::Smt2_128);
+        assert_ne!(physical, smt);
+        assert_eq!(physical.hardware_class_id(), HardwareClassId::TrjZen35995wx);
+        assert_eq!(smt.hardware_class_id(), HardwareClassId::TrjZen35995wx);
+        assert!(
+            MachineProfileKey::new(HardwareClassId::M4Macos, ExecutionProfileId::Physical64)
+                .is_err()
+        );
+        for obsolete_hardware_id in ["trj-zen3-1c", "trj-zen3-64c", "trj-zen3-64c-smt2"] {
+            let json = format!(
+                r#"{{"hardware_class_id":"{obsolete_hardware_id}","execution_profile_id":"physical-64"}}"#
+            );
+            assert!(
+                serde_json::from_str::<MachineProfileKey>(&json).is_err(),
+                "{obsolete_hardware_id} admitted"
+            );
         }
     }
 
@@ -3205,7 +3442,10 @@ mod tests {
             schema_version: ATTEMPT_RECEIPT_SCHEMA_VERSION.to_owned(),
             mode: "measurement".to_owned(),
             gate: "QG-2".to_owned(),
-            class_id: "trj-zen3-1c".to_owned(),
+            profile: profile(
+                HardwareClassId::TrjZen35995wx,
+                ExecutionProfileId::Physical64,
+            ),
             run_id: "failed-1".to_owned(),
             run_window: "window-1".to_owned(),
             registry_sha256: MACHINE_CLASS_REGISTRY_SHA256.to_owned(),
@@ -3229,10 +3469,13 @@ mod tests {
                 fingerprint_sha256: "b".repeat(64),
             },
             execution_request: RunnerExecutionRequest {
+                capacity_semantics: ExecutionCapacitySemantics::PhysicalCores,
+                execution_capacity: 64,
+                max_exercised_cell_width: 1,
                 requested_logical_cpu_ids: vec![0],
-                requested_physical_core_width: 1,
-                thread_budget: 1,
-                apple_execution_mode: "not-applicable".to_owned(),
+                requested_physical_core_width: Some(64),
+                requested_worker_pool_width: 64,
+                requested_qos: "not-applicable".to_owned(),
             },
             execution_start: RunnerExecutionSnapshot {
                 observed_logical_cpu_ids: vec![0],
@@ -3281,9 +3524,16 @@ mod tests {
         verify_attempt_receipt(&bytes).expect("verify sealed attempt receipt");
 
         let registry = MachineClassRegistry::frozen().expect("frozen registry");
+        let expected_profile = profile(
+            HardwareClassId::TrjZen35995wx,
+            ExecutionProfileId::Physical64,
+        );
         let context = MachineClassAdmissionContext {
             gate: "QG-2".to_owned(),
-            destination_basename: "QG-2.trj-zen3-1c.latest.json".to_owned(),
+            expected_profile,
+            destination_basename: expected_profile
+                .latest_basename("QG-2")
+                .expect("typed latest destination"),
         };
         let write_count = std::cell::Cell::new(0_u64);
         assert!(

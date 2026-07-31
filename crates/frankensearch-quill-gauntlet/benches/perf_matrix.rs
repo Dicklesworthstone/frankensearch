@@ -37,18 +37,19 @@ use frankensearch_quill_gauntlet::{
     BuildIdentity, ColdCacheEvidence, ComparatorConfig, ComparisonStatus, CorpusIdentity,
     CorpusManifest, CountState, DistributionSummary, EngineConcurrencyObservation,
     EngineObservation, EvidenceCell, EvidenceCellSpec, EvidencePolicy, EvidenceProvenance,
-    EvidenceRole, MachineIdentity, NativeTieKey, PERF_ARTIFACT_SCHEMA_VERSION, PERF_MIN_RUNS,
-    PairedEstimatorConfig, PeakRssEvidence, PerfCellResult, PerfCellSpec, PerfConcurrencyEngine,
-    PerfConcurrencyObserver, PerfConcurrencyWitness, PerfCorpus, PerfEvidenceArtifact, PerfGate,
-    PerfGateArtifact, PerfInputIdentity, PerfMatrixSpec, PerfMetricSemantics, PerfOperationScope,
-    PerfQueryClass, PerfRawSample, PerfSampleArm, PerfSampleOrder, PerfSamplePhase,
-    PerfSampleProvenance, PerfTopology, PositionMode, QG6_QUERY_GROUP_IDS, QG6_QUERY_GROUPS,
-    Qg6ArmRole, Qg6Comparison, Qg6Phase, Qg6PreparedExperiment, Qg6QuerySpec, Qg6SampleBinding,
-    Qg6SampleOrder, Qg6SearchHit, Qg6SearchResult, Qg6SelectionScope, Qg6SemanticContract,
-    RankClass, RankedHit, ScoreEpsilonReason, SyntheticCorpus, SyntheticCorpusSpec, ZipfExponent,
-    command_sha256_from_argv, compare_observations, estimate_paired_experiment,
-    machine_fingerprint, oracle_version_contract, peak_rss_bytes, perf_manifest_contract_sha256,
-    seeded_balanced_pair_order, validate_matrix,
+    EvidenceRole, ExecutionProfileId, HardwareClassId, MachineClassRegistry, MachineIdentity,
+    MachineProfileKey, NativeTieKey, PERF_ARTIFACT_SCHEMA_VERSION, PERF_MIN_RUNS,
+    PairedEstimatorConfig, PeakRssEvidence, PerfApplicabilityPlan, PerfCellApplicability,
+    PerfCellResult, PerfCellSpec, PerfConcurrencyEngine, PerfConcurrencyObserver,
+    PerfConcurrencyWitness, PerfCorpus, PerfEvidenceArtifact, PerfGate, PerfGateArtifact,
+    PerfInputIdentity, PerfMatrixSpec, PerfMetricSemantics, PerfOperationScope, PerfQueryClass,
+    PerfRawSample, PerfSampleArm, PerfSampleOrder, PerfSamplePhase, PerfSampleProvenance,
+    PerfTopology, PositionMode, QG6_QUERY_GROUP_IDS, QG6_QUERY_GROUPS, Qg6ArmRole, Qg6Comparison,
+    Qg6Phase, Qg6PreparedExperiment, Qg6QuerySpec, Qg6SampleBinding, Qg6SampleOrder, Qg6SearchHit,
+    Qg6SearchResult, Qg6SemanticContract, RankClass, RankedHit, ScoreEpsilonReason,
+    SyntheticCorpus, SyntheticCorpusSpec, ZipfExponent, command_sha256_from_argv,
+    compare_observations, estimate_paired_experiment, machine_fingerprint, oracle_version_contract,
+    peak_rss_bytes, perf_manifest_contract_sha256, seeded_balanced_pair_order, validate_matrix,
 };
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -272,6 +273,221 @@ impl MatrixScale {
             Self::Smoke => SMOKE_SEGMENTS,
             Self::Full => FULL_SEGMENTS,
         }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RunnerPlanClaims {
+    gate: PerfGate,
+    hardware_class: HardwareClassId,
+    execution_profile: ExecutionProfileId,
+    execution_capacity: u64,
+    max_exercised_cell_width: u64,
+    rayon_num_threads: u64,
+    applicability_plan_schema_version: String,
+    applicability_plan_sha256: String,
+    gate_matrix_contract_sha256: String,
+    profile_contract_sha256: String,
+    registry_schema_version: String,
+    registry_sha256: String,
+}
+
+impl RunnerPlanClaims {
+    fn from_env() -> Result<Self, String> {
+        let gate_text = required_env("QUILL_PERF_GATE")?;
+        let gate = gate_text
+            .parse::<PerfGate>()
+            .map_err(|error| format!("QUILL_PERF_GATE is invalid: {error}"))?;
+        if gate_text != gate.label() {
+            return Err(format!(
+                "QUILL_PERF_GATE must use canonical spelling {:?}, got {gate_text:?}",
+                gate.label()
+            ));
+        }
+        Ok(Self {
+            gate,
+            hardware_class: parse_hardware_class_id(&required_env("QUILL_PERF_HARDWARE_CLASS")?)?,
+            execution_profile: parse_execution_profile_id(&required_env(
+                "QUILL_PERF_EXECUTION_PROFILE",
+            )?)?,
+            execution_capacity: canonical_positive_u64_env("QUILL_PERF_EXECUTION_CAPACITY")?,
+            max_exercised_cell_width: canonical_positive_u64_env(
+                "QUILL_PERF_MAX_EXERCISED_CELL_WIDTH",
+            )?,
+            rayon_num_threads: canonical_positive_u64_env("RAYON_NUM_THREADS")?,
+            applicability_plan_schema_version: required_env(
+                "QUILL_PERF_APPLICABILITY_PLAN_SCHEMA_VERSION",
+            )?,
+            applicability_plan_sha256: required_env("QUILL_PERF_APPLICABILITY_PLAN_SHA256")?,
+            gate_matrix_contract_sha256: required_env("QUILL_PERF_GATE_MATRIX_CONTRACT_SHA256")?,
+            profile_contract_sha256: required_env("QUILL_PERF_PROFILE_CONTRACT_SHA256")?,
+            registry_schema_version: required_env("QUILL_PERF_REGISTRY_SCHEMA_VERSION")?,
+            registry_sha256: required_env("QUILL_PERF_REGISTRY_SHA256")?,
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+struct RunnerApplicabilityContext {
+    profile: MachineProfileKey,
+    plan: PerfApplicabilityPlan,
+    execution_capacity: u64,
+    max_exercised_cell_width: u64,
+}
+
+impl RunnerApplicabilityContext {
+    fn reconstruct(matrix: &PerfMatrixSpec, claims: &RunnerPlanClaims) -> Result<Self, String> {
+        let profile = MachineProfileKey::new(claims.hardware_class, claims.execution_profile)
+            .map_err(|error| format!("runner profile key is invalid: {error}"))?;
+        let registry = MachineClassRegistry::frozen()
+            .map_err(|error| format!("frozen machine registry is invalid: {error}"))?;
+        let registered_profile = registry
+            .execution_profile(profile)
+            .map_err(|error| format!("runner profile is not registered: {error}"))?;
+        let plan = matrix
+            .applicability_plan(&registry, profile, claims.gate)
+            .map_err(|error| format!("cannot reconstruct runner applicability plan: {error}"))?;
+        plan.verify_against(matrix, &registry)
+            .map_err(|error| format!("runner applicability plan does not recompute: {error}"))?;
+        if plan.capacity_semantics != registered_profile.capacity_semantics() {
+            return Err(
+                "registry profile and applicability plan disagree on capacity semantics".to_owned(),
+            );
+        }
+
+        verify_runner_claim(
+            "QUILL_PERF_APPLICABILITY_PLAN_SCHEMA_VERSION",
+            &claims.applicability_plan_schema_version,
+            &plan.binding().schema_version,
+        )?;
+        verify_runner_claim(
+            "QUILL_PERF_APPLICABILITY_PLAN_SHA256",
+            &claims.applicability_plan_sha256,
+            &plan.binding().applicability_plan_sha256,
+        )?;
+        verify_runner_claim(
+            "QUILL_PERF_GATE_MATRIX_CONTRACT_SHA256",
+            &claims.gate_matrix_contract_sha256,
+            &plan.binding().gate_matrix_contract_sha256,
+        )?;
+        verify_runner_claim(
+            "QUILL_PERF_PROFILE_CONTRACT_SHA256",
+            &claims.profile_contract_sha256,
+            &plan.binding().profile_contract_sha256,
+        )?;
+        verify_runner_claim(
+            "QUILL_PERF_REGISTRY_SCHEMA_VERSION",
+            &claims.registry_schema_version,
+            &plan.binding().registry_schema_version,
+        )?;
+        verify_runner_claim(
+            "QUILL_PERF_REGISTRY_SHA256",
+            &claims.registry_sha256,
+            &plan.binding().registry_sha256,
+        )?;
+
+        let execution_capacity = plan.execution_capacity.ok_or_else(|| {
+            "typed benchmark runner requires a frozen execution capacity".to_owned()
+        })?;
+        if claims.execution_capacity != execution_capacity {
+            return Err(format!(
+                "QUILL_PERF_EXECUTION_CAPACITY={} differs from frozen profile capacity \
+                 {execution_capacity}",
+                claims.execution_capacity
+            ));
+        }
+        if claims.rayon_num_threads != execution_capacity {
+            return Err(format!(
+                "RAYON_NUM_THREADS={} differs from frozen profile capacity {execution_capacity}",
+                claims.rayon_num_threads
+            ));
+        }
+        let max_exercised_cell_width = plan.max_exercised_cell_width.ok_or_else(|| {
+            "typed benchmark runner requires a frozen maximum exercised cell width".to_owned()
+        })?;
+        if claims.max_exercised_cell_width != max_exercised_cell_width {
+            return Err(format!(
+                "QUILL_PERF_MAX_EXERCISED_CELL_WIDTH={} differs from frozen gate maximum \
+                 {max_exercised_cell_width}",
+                claims.max_exercised_cell_width
+            ));
+        }
+        let planned_max = plan
+            .max_runnable_cell_width()
+            .and_then(|width| u64::try_from(width).ok())
+            .ok_or_else(|| "applicability plan has no representable runnable width".to_owned())?;
+        if planned_max > max_exercised_cell_width {
+            return Err(format!(
+                "applicability plan's maximum runnable literal {planned_max} exceeds frozen gate \
+                 maximum {max_exercised_cell_width}"
+            ));
+        }
+        if max_exercised_cell_width > execution_capacity {
+            return Err(format!(
+                "frozen gate maximum {max_exercised_cell_width} exceeds execution capacity \
+                 {execution_capacity}"
+            ));
+        }
+        Ok(Self {
+            profile,
+            plan,
+            execution_capacity,
+            max_exercised_cell_width,
+        })
+    }
+}
+
+fn required_env(name: &str) -> Result<String, String> {
+    let value = std::env::var(name).map_err(|error| format!("{name} is required: {error}"))?;
+    if value.is_empty() || value.trim() != value {
+        return Err(format!("{name} must be nonempty canonical text"));
+    }
+    Ok(value)
+}
+
+fn canonical_positive_u64_env(name: &str) -> Result<u64, String> {
+    let text = required_env(name)?;
+    let value = text
+        .parse::<u64>()
+        .map_err(|error| format!("{name} must be a positive canonical integer: {error}"))?;
+    if value == 0 || value.to_string() != text {
+        return Err(format!("{name} must be a positive canonical integer"));
+    }
+    Ok(value)
+}
+
+fn parse_hardware_class_id(value: &str) -> Result<HardwareClassId, String> {
+    match value {
+        "x86-vps-ovh" => Ok(HardwareClassId::X86VpsOvh),
+        "trj-zen3-5995wx" => Ok(HardwareClassId::TrjZen35995wx),
+        "m4-macos" => Ok(HardwareClassId::M4Macos),
+        "m5-macos" => Ok(HardwareClassId::M5Macos),
+        _ => Err(format!(
+            "QUILL_PERF_HARDWARE_CLASS names unknown closed hardware class {value:?}"
+        )),
+    }
+}
+
+fn parse_execution_profile_id(value: &str) -> Result<ExecutionProfileId, String> {
+    match value {
+        "x86-diagnostic" => Ok(ExecutionProfileId::X86Diagnostic),
+        "physical-64" => Ok(ExecutionProfileId::Physical64),
+        "smt2-128" => Ok(ExecutionProfileId::Smt2_128),
+        "scheduler-10" => Ok(ExecutionProfileId::Scheduler10),
+        "scheduler-14" => Ok(ExecutionProfileId::Scheduler14),
+        _ => Err(format!(
+            "QUILL_PERF_EXECUTION_PROFILE names unknown closed execution profile {value:?}"
+        )),
+    }
+}
+
+fn verify_runner_claim(name: &str, supplied: &str, expected: &str) -> Result<(), String> {
+    if supplied == expected {
+        Ok(())
+    } else {
+        Err(format!(
+            "{name}={supplied:?} differs from frozen applicability-plan value {expected:?}"
+        ))
     }
 }
 
@@ -2636,6 +2852,7 @@ struct CellCollection {
 fn collect_cell(
     context: &BenchContext,
     spec: &PerfCellSpec,
+    role: EvidenceRole,
     runs: usize,
     evidence: &EvidenceContext,
 ) -> CellCollection {
@@ -2656,7 +2873,7 @@ fn collect_cell(
                 fixture: spec.fixture.clone(),
                 metric: spec.metric.clone(),
                 unit: unit(spec).to_owned(),
-                role: EvidenceRole::Diagnostic,
+                role,
                 input_identity: None,
                 qg6_semantic_contract: None,
                 cold_cache: None,
@@ -2827,11 +3044,7 @@ fn collect_cell(
             fixture: spec.fixture.clone(),
             metric: spec.metric.clone(),
             unit: unit(spec).to_owned(),
-            role: if is_tokenizer_null {
-                EvidenceRole::Diagnostic
-            } else {
-                EvidenceRole::Required
-            },
+            role,
             input_identity,
             qg6_semantic_contract,
             cold_cache,
@@ -2900,43 +3113,151 @@ fn collect_cell(
     }
 }
 
-fn selected_cells(matrix: &PerfMatrixSpec, scale: MatrixScale) -> Vec<PerfCellSpec> {
-    let gate_filter = std::env::var("QUILL_PERF_GATE").unwrap_or_else(|_| "QG-1".to_owned());
-    let fixture_filter = std::env::var("QUILL_PERF_FIXTURE").ok();
-    let mut selected = if gate_filter.eq_ignore_ascii_case("all") {
-        matrix.cells.clone()
-    } else {
-        let gate = gate_filter.parse::<PerfGate>().expect("QUILL_PERF_GATE");
-        matrix
-            .for_gate(gate)
-            .into_iter()
-            .cloned()
-            .collect::<Vec<_>>()
-    };
-    if let Some(needle) = fixture_filter {
-        selected.retain(|cell| cell.fixture.contains(&needle));
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PlannedPerfCell {
+    ordinal: usize,
+    spec: PerfCellSpec,
+    role: EvidenceRole,
+}
+
+fn selected_cells(
+    matrix: &PerfMatrixSpec,
+    runner: &RunnerApplicabilityContext,
+    scale: MatrixScale,
+    fixture_filter: Option<&str>,
+) -> Result<Vec<PlannedPerfCell>, String> {
+    let gate = runner.plan.binding().gate;
+    let canonical = matrix.for_gate(gate);
+    if canonical.len() != runner.plan.cells.len() {
+        return Err(format!(
+            "canonical {gate} matrix has {} cells but applicability plan classifies {}",
+            canonical.len(),
+            runner.plan.cells.len()
+        ));
+    }
+
+    let mut filter_matched = false;
+    let mut selected = Vec::new();
+    for (ordinal, (spec, classification)) in canonical
+        .into_iter()
+        .zip(runner.plan.cells.iter())
+        .enumerate()
+    {
+        if classification.ordinal != ordinal {
+            return Err(format!(
+                "applicability plan ordinal {} occupies canonical {gate} position {ordinal}",
+                classification.ordinal
+            ));
+        }
+        let cell_sha256 = spec
+            .contract_sha256()
+            .map_err(|error| format!("cannot hash canonical {gate} cell {ordinal}: {error}"))?;
+        if classification.cell_contract_sha256 != cell_sha256 {
+            return Err(format!(
+                "applicability plan hash for canonical {gate} cell {ordinal} does not match"
+            ));
+        }
+        if spec.threads != Some(classification.configured_threads) {
+            return Err(format!(
+                "applicability plan width for canonical {gate} cell {ordinal} does not match"
+            ));
+        }
+
+        let matches_filter = fixture_filter.is_none_or(|needle| spec.fixture.contains(needle));
+        if fixture_filter.is_some() && matches_filter {
+            filter_matched = true;
+        }
+        let role = match classification.applicability {
+            PerfCellApplicability::Required => EvidenceRole::Required,
+            PerfCellApplicability::Diagnostic => EvidenceRole::Diagnostic,
+            PerfCellApplicability::NotApplicable => {
+                if fixture_filter.is_some() && matches_filter {
+                    return Err(format!(
+                        "QUILL_PERF_FIXTURE selected non-applicable {gate} cell {:?} for profile \
+                         {}.{}",
+                        spec.fixture,
+                        runner.profile.hardware_class_id().as_str(),
+                        runner.profile.execution_profile_id().as_str()
+                    ));
+                }
+                continue;
+            }
+        };
+        if matches_filter {
+            selected.push(PlannedPerfCell {
+                ordinal,
+                spec: spec.clone(),
+                role,
+            });
+        }
+    }
+
+    if fixture_filter.is_some() && !filter_matched {
+        return Err("QUILL_PERF_FIXTURE matched no canonical gate cell".to_owned());
     }
     if !scale.is_full() {
         selected.truncate(1);
     }
-    assert!(!selected.is_empty(), "QG matrix slice selected no cells");
+    if selected.is_empty() {
+        return Err("QG applicability-plan selection contains no runnable cells".to_owned());
+    }
+    let configured_max = selected
+        .iter()
+        .filter_map(|cell| cell.spec.threads)
+        .max()
+        .ok_or_else(|| "selected runnable cells have no configured width".to_owned())?;
+    let configured_max = u64::try_from(configured_max)
+        .map_err(|_| "selected configured width is not representable".to_owned())?;
+    if configured_max > runner.max_exercised_cell_width
+        || configured_max > runner.execution_capacity
+    {
+        return Err(format!(
+            "selected configured width {configured_max} exceeds profile maximum {} or capacity {}",
+            runner.max_exercised_cell_width, runner.execution_capacity
+        ));
+    }
+    Ok(selected)
+}
+
+fn fixture_filter_from_env() -> Result<Option<String>, String> {
+    match std::env::var("QUILL_PERF_FIXTURE") {
+        Ok(value) if !value.is_empty() && value.trim() == value => Ok(Some(value)),
+        Ok(_) => Err("QUILL_PERF_FIXTURE must be nonempty canonical text".to_owned()),
+        Err(std::env::VarError::NotPresent) => Ok(None),
+        Err(error) => Err(format!("QUILL_PERF_FIXTURE is invalid: {error}")),
+    }
+}
+
+fn configured_engine_widths(selected: &[PlannedPerfCell]) -> Vec<usize> {
     selected
+        .iter()
+        .filter_map(|cell| cell.spec.threads)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
 }
 
 fn gate_selection_complete(
-    matrix: &PerfMatrixSpec,
-    selected: &[PerfCellSpec],
-    gate: PerfGate,
+    runner: &RunnerApplicabilityContext,
+    selected: &[PlannedPerfCell],
+    scale: MatrixScale,
+    fixture_filter: Option<&str>,
 ) -> bool {
-    let normative = matrix.for_gate(gate).len();
-    let selected = selected.iter().filter(|cell| cell.gate == gate).count();
-    if gate == PerfGate::Qg6 {
-        return matches!(
-            Qg6SelectionScope::from_cell_counts(selected, normative),
-            Ok(Qg6SelectionScope::CompleteGate)
-        );
+    if !scale.is_full() || fixture_filter.is_some() {
+        return false;
     }
-    normative != 0 && selected == normative
+    let expected = runner
+        .plan
+        .cells
+        .iter()
+        .filter(|cell| cell.applicability.is_runnable())
+        .map(|cell| cell.ordinal)
+        .collect::<BTreeSet<_>>();
+    let actual = selected
+        .iter()
+        .map(|cell| cell.ordinal)
+        .collect::<BTreeSet<_>>();
+    !expected.is_empty() && actual == expected && actual.len() == selected.len()
 }
 
 fn git_revision(scale: MatrixScale) -> String {
@@ -3246,14 +3567,27 @@ fn bench_matrix(c: &mut Criterion, bench_elf_sha256: &str) {
     let build_profile = build_profile_label(scale);
     let matrix = PerfMatrixSpec::complete();
     validate_matrix(&matrix).expect("normative QG matrix");
-    let selected = selected_cells(&matrix, scale);
-    let context = BenchContext::for_selected(scale, &selected);
-    preflight_indexing_fixtures(&context, &matrix, &selected);
+    let claims = RunnerPlanClaims::from_env()
+        .unwrap_or_else(|error| panic!("typed runner applicability claims rejected: {error}"));
+    let runner = RunnerApplicabilityContext::reconstruct(&matrix, &claims)
+        .unwrap_or_else(|error| panic!("typed runner applicability plan rejected: {error}"));
+    let fixture_filter = fixture_filter_from_env()
+        .unwrap_or_else(|error| panic!("typed runner fixture filter rejected: {error}"));
+    let selected = selected_cells(&matrix, &runner, scale, fixture_filter.as_deref())
+        .unwrap_or_else(|error| panic!("typed runner cell selection rejected: {error}"));
+    let selection_complete =
+        gate_selection_complete(&runner, &selected, scale, fixture_filter.as_deref());
+    let selected_specs = selected
+        .iter()
+        .map(|cell| cell.spec.clone())
+        .collect::<Vec<_>>();
+    let context = BenchContext::for_selected(scale, &selected_specs);
+    preflight_indexing_fixtures(&context, &matrix, &selected_specs);
     let configured_runs = std::env::var("QUILL_PERF_RUNS")
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or_else(|| {
-            if scale.is_full() && selected.iter().any(|cell| cell.gate == PerfGate::Qg4) {
+            if scale.is_full() && selected.iter().any(|cell| cell.spec.gate == PerfGate::Qg4) {
                 100
             } else {
                 PERF_MIN_RUNS
@@ -3271,7 +3605,7 @@ fn bench_matrix(c: &mut Criterion, bench_elf_sha256: &str) {
     let run_id = std::env::var("QUILL_PERF_RUN_ID")
         .unwrap_or_else(|_| format!("manual-pass-{}", std::process::id()));
     let manifest_hash = manifest_sha256();
-    let corpus_hash = corpus_manifest_hash(&context, &selected)
+    let corpus_hash = corpus_manifest_hash(&context, &selected_specs)
         .expect("verify exact prepared QG-1 corpus identity");
     let bootstrap_seed = std::env::var("QUILL_PERF_BOOTSTRAP_SEED")
         .ok()
@@ -3294,7 +3628,8 @@ fn bench_matrix(c: &mut Criterion, bench_elf_sha256: &str) {
             build_profile: build_profile.clone(),
         },
     };
-    let mut machine = MachineIdentity::capture(selected.iter().filter_map(|spec| spec.threads));
+    let configured_widths = configured_engine_widths(&selected);
+    let mut machine = MachineIdentity::capture(configured_widths.iter().copied());
     eprintln!(
         "[quill-perf-execution-provenance] {}",
         serde_json::to_string(&machine.execution).expect("serialize execution provenance")
@@ -3302,8 +3637,15 @@ fn bench_matrix(c: &mut Criterion, bench_elf_sha256: &str) {
 
     let mut by_gate: BTreeMap<PerfGate, Vec<PerfCellResult>> = BTreeMap::new();
     let mut evidence_by_gate: BTreeMap<PerfGate, Vec<EvidenceCell>> = BTreeMap::new();
-    for spec in &selected {
-        let collection = collect_cell(&context, spec, configured_runs, &evidence_context);
+    for planned in &selected {
+        let spec = &planned.spec;
+        let collection = collect_cell(
+            &context,
+            spec,
+            planned.role,
+            configured_runs,
+            &evidence_context,
+        );
         by_gate
             .entry(spec.gate)
             .or_default()
@@ -3323,17 +3665,19 @@ fn bench_matrix(c: &mut Criterion, bench_elf_sha256: &str) {
         build: build_identity(bench_elf_sha256, &revision, &build_profile),
         machine: machine.clone(),
         peak_rss: PeakRssEvidence::capture(),
-        corpus: corpus_identity(&context, &selected, &corpus_hash),
+        corpus: corpus_identity(&context, &selected_specs, &corpus_hash),
     };
+    let applicability_binding = runner.plan.binding().clone();
     for (gate, cells) in evidence_by_gate {
         let mut artifact = PerfEvidenceArtifact::assemble(
             gate,
+            applicability_binding.clone(),
             evidence_context.policy.clone(),
             provenance.clone(),
             cells,
         )
         .expect("assemble QG evidence artifact");
-        if !gate_selection_complete(&matrix, &selected, gate) {
+        if !selection_complete {
             artifact.force_no_claim(
                 "evidence.incomplete_gate_selection",
                 "the invocation selected only part of the normative gate; durable pre-admission \
@@ -3355,6 +3699,7 @@ fn bench_matrix(c: &mut Criterion, bench_elf_sha256: &str) {
         let artifact = PerfGateArtifact {
             schema_version: PERF_ARTIFACT_SCHEMA_VERSION.to_owned(),
             gate,
+            applicability_plan: Some(applicability_binding.clone()),
             bench_elf_sha256: bench_elf_sha256.to_owned(),
             machine_fingerprint: machine_fingerprint(),
             execution: Some(machine.execution.clone()),
@@ -3364,7 +3709,7 @@ fn bench_matrix(c: &mut Criterion, bench_elf_sha256: &str) {
             corpus_manifest_hash: corpus_hash.clone(),
             manifest_sha256: manifest_hash.clone(),
             cells,
-            laws_attested: scale.is_full() && gate_selection_complete(&matrix, &selected, gate),
+            laws_attested: selection_complete,
         };
         let (json, table) = artifact.write_to(&output_dir).expect("write QG artifacts");
         eprintln!("{}", artifact.human_table());
@@ -3561,6 +3906,341 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn runner_profile_parsers_accept_only_closed_canonical_ids() {
+        use frankensearch_quill_gauntlet::{ExecutionProfileId, HardwareClassId};
+
+        assert_eq!(
+            super::parse_hardware_class_id("trj-zen3-5995wx"),
+            Ok(HardwareClassId::TrjZen35995wx)
+        );
+        assert_eq!(
+            super::parse_hardware_class_id("m4-macos"),
+            Ok(HardwareClassId::M4Macos)
+        );
+        assert!(super::parse_hardware_class_id("trj-zen3-64c").is_err());
+        assert!(super::parse_hardware_class_id(" M4-macos").is_err());
+        assert_eq!(
+            super::parse_execution_profile_id("physical-64"),
+            Ok(ExecutionProfileId::Physical64)
+        );
+        assert_eq!(
+            super::parse_execution_profile_id("smt2-128"),
+            Ok(ExecutionProfileId::Smt2_128)
+        );
+        assert_eq!(
+            super::parse_execution_profile_id("scheduler-10"),
+            Ok(ExecutionProfileId::Scheduler10)
+        );
+        assert!(super::parse_execution_profile_id("64").is_err());
+        assert!(super::parse_execution_profile_id("p-plus-e").is_err());
+    }
+
+    #[test]
+    fn runner_plan_claims_reject_mutation_and_cross_profile_substitution() {
+        use frankensearch_quill_gauntlet::{
+            ExecutionProfileId, HardwareClassId, MachineClassRegistry, MachineProfileKey, PerfGate,
+            PerfMatrixSpec,
+        };
+
+        fn claims_for(
+            matrix: &PerfMatrixSpec,
+            hardware_class: HardwareClassId,
+            execution_profile: ExecutionProfileId,
+            gate: PerfGate,
+        ) -> super::RunnerPlanClaims {
+            let registry = MachineClassRegistry::frozen().expect("frozen machine registry");
+            let profile = MachineProfileKey::new(hardware_class, execution_profile)
+                .expect("canonical typed profile key");
+            let plan = matrix
+                .applicability_plan(&registry, profile, gate)
+                .expect("canonical applicability plan");
+            let execution_capacity = plan
+                .execution_capacity
+                .expect("typed promotion profile capacity");
+            let max_exercised_cell_width = plan
+                .max_exercised_cell_width
+                .expect("typed promotion gate maximum");
+            super::RunnerPlanClaims {
+                gate,
+                hardware_class,
+                execution_profile,
+                execution_capacity,
+                max_exercised_cell_width,
+                rayon_num_threads: execution_capacity,
+                applicability_plan_schema_version: plan.binding().schema_version.clone(),
+                applicability_plan_sha256: plan.binding().applicability_plan_sha256.clone(),
+                gate_matrix_contract_sha256: plan.binding().gate_matrix_contract_sha256.clone(),
+                profile_contract_sha256: plan.binding().profile_contract_sha256.clone(),
+                registry_schema_version: plan.binding().registry_schema_version.clone(),
+                registry_sha256: plan.binding().registry_sha256.clone(),
+            }
+        }
+
+        let matrix = PerfMatrixSpec::complete();
+        let claims = claims_for(
+            &matrix,
+            HardwareClassId::TrjZen35995wx,
+            ExecutionProfileId::Physical64,
+            PerfGate::Qg1,
+        );
+        let context = super::RunnerApplicabilityContext::reconstruct(&matrix, &claims)
+            .expect("exact physical-64 claims");
+        assert_eq!(
+            context.profile,
+            MachineProfileKey::new(
+                HardwareClassId::TrjZen35995wx,
+                ExecutionProfileId::Physical64,
+            )
+            .expect("canonical typed profile key")
+        );
+        assert_eq!(context.execution_capacity, 64);
+        assert_eq!(context.max_exercised_cell_width, 64);
+
+        let mut plan_hash_mutation = claims.clone();
+        plan_hash_mutation.applicability_plan_sha256 = "0".repeat(64);
+        assert!(
+            super::RunnerApplicabilityContext::reconstruct(&matrix, &plan_hash_mutation)
+                .expect_err("mutated plan hash")
+                .contains("QUILL_PERF_APPLICABILITY_PLAN_SHA256")
+        );
+
+        let mut matrix_hash_mutation = claims.clone();
+        matrix_hash_mutation.gate_matrix_contract_sha256 = "0".repeat(64);
+        assert!(
+            super::RunnerApplicabilityContext::reconstruct(&matrix, &matrix_hash_mutation)
+                .expect_err("mutated gate matrix hash")
+                .contains("QUILL_PERF_GATE_MATRIX_CONTRACT_SHA256")
+        );
+
+        let mut capacity_mutation = claims.clone();
+        capacity_mutation.execution_capacity = 63;
+        assert!(
+            super::RunnerApplicabilityContext::reconstruct(&matrix, &capacity_mutation)
+                .expect_err("mutated execution capacity")
+                .contains("QUILL_PERF_EXECUTION_CAPACITY")
+        );
+
+        let mut max_width_mutation = claims.clone();
+        max_width_mutation.max_exercised_cell_width = 32;
+        assert!(
+            super::RunnerApplicabilityContext::reconstruct(&matrix, &max_width_mutation)
+                .expect_err("mutated gate maximum")
+                .contains("QUILL_PERF_MAX_EXERCISED_CELL_WIDTH")
+        );
+
+        let mut rayon_mutation = claims.clone();
+        rayon_mutation.rayon_num_threads = 63;
+        assert!(
+            super::RunnerApplicabilityContext::reconstruct(&matrix, &rayon_mutation)
+                .expect_err("mutated Rayon capacity")
+                .contains("RAYON_NUM_THREADS")
+        );
+
+        let mut cross_profile = claims.clone();
+        cross_profile.execution_profile = ExecutionProfileId::Smt2_128;
+        assert!(
+            super::RunnerApplicabilityContext::reconstruct(&matrix, &cross_profile)
+                .expect_err("cross-profile substitution")
+                .contains("QUILL_PERF_APPLICABILITY_PLAN_SHA256")
+        );
+
+        let mut cross_hardware = claims;
+        cross_hardware.hardware_class = HardwareClassId::M4Macos;
+        assert!(
+            super::RunnerApplicabilityContext::reconstruct(&matrix, &cross_hardware)
+                .expect_err("cross-hardware profile substitution")
+                .contains("profile key is invalid")
+        );
+    }
+
+    #[test]
+    fn m4_selection_executes_exact_runnable_plan_and_rejects_na_filters() {
+        use frankensearch_quill_gauntlet::{
+            EvidenceRole, ExecutionProfileId, HardwareClassId, MachineClassRegistry,
+            MachineProfileKey, PerfGate, PerfMatrixSpec,
+        };
+
+        fn claims_for(
+            matrix: &PerfMatrixSpec,
+            hardware_class: HardwareClassId,
+            execution_profile: ExecutionProfileId,
+            gate: PerfGate,
+        ) -> super::RunnerPlanClaims {
+            let registry = MachineClassRegistry::frozen().expect("frozen machine registry");
+            let profile = MachineProfileKey::new(hardware_class, execution_profile)
+                .expect("canonical typed profile key");
+            let plan = matrix
+                .applicability_plan(&registry, profile, gate)
+                .expect("canonical applicability plan");
+            let execution_capacity = plan
+                .execution_capacity
+                .expect("typed promotion profile capacity");
+            let max_exercised_cell_width = plan
+                .max_exercised_cell_width
+                .expect("typed promotion gate maximum");
+            super::RunnerPlanClaims {
+                gate,
+                hardware_class,
+                execution_profile,
+                execution_capacity,
+                max_exercised_cell_width,
+                rayon_num_threads: execution_capacity,
+                applicability_plan_schema_version: plan.binding().schema_version.clone(),
+                applicability_plan_sha256: plan.binding().applicability_plan_sha256.clone(),
+                gate_matrix_contract_sha256: plan.binding().gate_matrix_contract_sha256.clone(),
+                profile_contract_sha256: plan.binding().profile_contract_sha256.clone(),
+                registry_schema_version: plan.binding().registry_schema_version.clone(),
+                registry_sha256: plan.binding().registry_sha256.clone(),
+            }
+        }
+
+        let matrix = PerfMatrixSpec::complete();
+        let claims = claims_for(
+            &matrix,
+            HardwareClassId::M4Macos,
+            ExecutionProfileId::Scheduler10,
+            PerfGate::Qg1,
+        );
+        let context = super::RunnerApplicabilityContext::reconstruct(&matrix, &claims)
+            .expect("exact scheduler-10 claims");
+        let full = super::selected_cells(&matrix, &context, super::MatrixScale::Full, None)
+            .expect("complete M4 runnable selection");
+        assert_eq!(full.len(), 34);
+        assert_eq!(
+            full.iter()
+                .filter(|cell| cell.role == EvidenceRole::Required)
+                .count(),
+            32
+        );
+        assert_eq!(
+            full.iter()
+                .filter(|cell| cell.role == EvidenceRole::Diagnostic)
+                .count(),
+            2
+        );
+        assert_eq!(super::configured_engine_widths(&full), vec![1, 2, 4, 8]);
+        assert!(full.iter().all(|cell| cell.spec.threads != Some(10)));
+        assert!(super::gate_selection_complete(
+            &context,
+            &full,
+            super::MatrixScale::Full,
+            None
+        ));
+
+        let smoke = super::selected_cells(&matrix, &context, super::MatrixScale::Smoke, None)
+            .expect("smoke selection");
+        assert_eq!(smoke.len(), 1);
+        assert!(!super::gate_selection_complete(
+            &context,
+            &smoke,
+            super::MatrixScale::Smoke,
+            None
+        ));
+
+        let filtered = super::selected_cells(
+            &matrix,
+            &context,
+            super::MatrixScale::Full,
+            Some("bulk/tiny/1/"),
+        )
+        .expect("runnable partial selection");
+        assert_eq!(filtered.len(), 2);
+        assert!(!super::gate_selection_complete(
+            &context,
+            &filtered,
+            super::MatrixScale::Full,
+            Some("bulk/tiny/1/")
+        ));
+
+        assert!(
+            super::selected_cells(
+                &matrix,
+                &context,
+                super::MatrixScale::Full,
+                Some("bulk/tiny/16/"),
+            )
+            .expect_err("explicit NA fixture filter must fail")
+            .contains("non-applicable")
+        );
+        assert!(
+            super::selected_cells(
+                &matrix,
+                &context,
+                super::MatrixScale::Full,
+                Some("not-a-canonical-fixture"),
+            )
+            .expect_err("unknown fixture filter must fail")
+            .contains("matched no canonical")
+        );
+    }
+
+    #[test]
+    fn runner_selection_rejects_matrix_or_plan_cell_mutation() {
+        use frankensearch_quill_gauntlet::{
+            ExecutionProfileId, HardwareClassId, MachineClassRegistry, MachineProfileKey, PerfGate,
+            PerfMatrixSpec,
+        };
+
+        fn claims_for(
+            matrix: &PerfMatrixSpec,
+            hardware_class: HardwareClassId,
+            execution_profile: ExecutionProfileId,
+            gate: PerfGate,
+        ) -> super::RunnerPlanClaims {
+            let registry = MachineClassRegistry::frozen().expect("frozen machine registry");
+            let profile = MachineProfileKey::new(hardware_class, execution_profile)
+                .expect("canonical typed profile key");
+            let plan = matrix
+                .applicability_plan(&registry, profile, gate)
+                .expect("canonical applicability plan");
+            let execution_capacity = plan
+                .execution_capacity
+                .expect("typed promotion profile capacity");
+            let max_exercised_cell_width = plan
+                .max_exercised_cell_width
+                .expect("typed promotion gate maximum");
+            super::RunnerPlanClaims {
+                gate,
+                hardware_class,
+                execution_profile,
+                execution_capacity,
+                max_exercised_cell_width,
+                rayon_num_threads: execution_capacity,
+                applicability_plan_schema_version: plan.binding().schema_version.clone(),
+                applicability_plan_sha256: plan.binding().applicability_plan_sha256.clone(),
+                gate_matrix_contract_sha256: plan.binding().gate_matrix_contract_sha256.clone(),
+                profile_contract_sha256: plan.binding().profile_contract_sha256.clone(),
+                registry_schema_version: plan.binding().registry_schema_version.clone(),
+                registry_sha256: plan.binding().registry_sha256.clone(),
+            }
+        }
+
+        let matrix = PerfMatrixSpec::complete();
+        let claims = claims_for(
+            &matrix,
+            HardwareClassId::TrjZen35995wx,
+            ExecutionProfileId::Physical64,
+            PerfGate::Qg1,
+        );
+        let mut context = super::RunnerApplicabilityContext::reconstruct(&matrix, &claims)
+            .expect("exact physical plan");
+        context.plan.cells[0].cell_contract_sha256 = "0".repeat(64);
+        assert!(
+            super::selected_cells(&matrix, &context, super::MatrixScale::Full, None)
+                .expect_err("mutated plan cell")
+                .contains("does not match")
+        );
+
+        let mut mutated_matrix = matrix;
+        mutated_matrix.cells[0].fixture.push_str("/mutated");
+        assert!(
+            super::RunnerApplicabilityContext::reconstruct(&mutated_matrix, &claims)
+                .expect_err("mutated canonical matrix")
+                .contains("cannot reconstruct runner applicability plan")
+        );
+    }
+
     #[test]
     fn qg1_prepared_corpus_prefixes_replay_exact_manifests_and_share_one_materialization() {
         let prepared = super::PreparedQg1Corpus::from_effective_counts([12, 40, 12])

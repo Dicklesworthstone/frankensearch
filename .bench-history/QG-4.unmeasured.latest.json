@@ -1,5 +1,5 @@
 {
-  "schema_version": "quill-perf-artifact-v5",
+  "schema_version": "quill-perf-artifact-v6",
   "gate": "Qg4",
   "bench_elf_sha256": "unmeasured",
   "machine_fingerprint": "unmeasured",
@@ -7,7 +7,7 @@
   "run_window": "unmeasured",
   "run_id": "unmeasured",
   "corpus_manifest_hash": "0000000000000000000000000000000000000000000000000000000000000000",
-  "manifest_sha256": "bc7b97c1b5cbf07e46fdbd662f490290f60e3fa94f4c0cddc93020ed36cc0592",
+  "manifest_sha256": "62c81b25dec1d1243220695a869c83acf9166544d2148e84518a8fdfae84cfa9",
   "cells": [],
   "laws_attested": false
 }

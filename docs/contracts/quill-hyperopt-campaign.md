@@ -7,8 +7,8 @@ this file overrides them).
 **Owning bead:** `bd-quill-e8-hyperopt-*` epic (see § Bead map).
 **Scope:** closing the measured Quill-vs-Tantivy performance deficit across
 the existing x86 VPS fleet, one 64-core/128-thread AMD Threadripper PRO 5995WX
-(`trj`), and independently keyed Apple Silicon M4/M5 classes under the
-repository's existing honesty machinery.
+(`trj`), and independently keyed Apple Silicon M4/M5 hardware/execution
+profiles under the repository's existing honesty machinery.
 
 ---
 
@@ -43,8 +43,8 @@ time." A miss honestly measured and ledgered is useful evidence, but it does
 not lower a target and it never authorizes the Quill flip. The user has fixed
 the terminal policy: Quill replaces Tantivy only after Quill wins the written
 QG targets across the board. A win that cannot survive a hostile reading of
-its own artifacts is a campaign failure. An unavailable machine class limits
-claim scope; it never suppresses useful measurements on ready hardware.
+its own artifacts is a campaign failure. An unavailable hardware/profile key
+limits claim scope; it never suppresses useful measurements on ready hardware.
 
 ## 1. Standing laws
 
@@ -52,71 +52,80 @@ Laws 1–5 are inherited verbatim from `quill-perf-gates.md` (no benchmark-only
 semantics; distributions not averages; never hide maintenance; memory is
 first-class; one lever per change). This campaign adds:
 
-6. **Machine-class scoping.** Every claim is `(gate, fixture, machine-class)`
-   scoped. Ratios are NEVER compared, averaged, or quoted across machine
-   classes. Every machine class carries its own A/A null tolerances, derived
-   from measured dispersion on that machine, not copied from another class. A
-   lever may KEEP on one class and NoClaim on another; the ledger row must say
-   so explicitly.
+6. **Hardware/profile scoping.** Every claim is
+   `(gate, fixture, hardware-class, execution-profile)` scoped. Ratios are
+   NEVER compared, averaged, or quoted across canonical profile keys. Every
+   profile carries its own A/A null tolerances, derived from measured
+   dispersion on that profile, not copied from another profile. A lever may
+   KEEP on one profile and NoClaim on another; the ledger row must say so
+   explicitly.
 7. **Platform-symmetric durability.** On macOS, any commit/durability-adjacent
    number is admissible only with `F_FULLFSYNC` treatment attested symmetric
    for both engines (macOS `fsync(2)` does not guarantee media durability
    without it). This is Law 1 applied to Apple Silicon; the attestation lives
    in the run's provenance JSON.
 
-## 2. Machine-class matrix
+## 2. Hardware/profile matrix
 
-`.bench-history/QG-<n>.<machine-class>.latest.json` keys baselines by machine
-class through one atomic pointer to immutable run-ID-qualified threshold and
-evidence objects. The sole normative class grammar, predicates, receipt fields,
-reason codes, and shared conformance fixtures are in
+`.bench-history/QG-<n>.<hardware-class>.<execution-profile>.latest.json` keys
+baselines by one closed `MachineProfileKey` through an atomic pointer to
+immutable run-ID-qualified threshold and evidence objects. Requested widths,
+CPU counts, affinity, SMT, or scheduler settings never create or relabel a
+key. The sole normative grammar, predicates, applicability plan, receipt
+fields, reason codes, and shared conformance fixtures are in
 [`quill-machine-classes.json`](quill-machine-classes.json); prose in this
 document cannot weaken or override that contract.
 
-| Class ID | Hardware | Campaign role | Mandatory provenance (beyond the evidence-v3 contract) |
+| Canonical hardware/profile key | Hardware and capacity semantics | Campaign role | Mandatory provenance (beyond evidence-v4) |
 |---|---|---|---|
-| `x86-vps-ovh` | Existing rch workers; homogeneity not yet proven | Diagnostic continuity only until `bd-9f03f` either proves one class or splits the fleet | Exact worker facts and receipt are retained, but the class is `diagnostic_only` and cannot promote history |
-| `trj-zen3-<N>c` / `trj-zen3-<N>c-smt2` | AMD Threadripper PRO 5995WX, Zen 3, 64 physical cores/128 SMT threads, one NUMA node, no AVX-512 | Scale-out truth: QG-1 high-thread cells, QG-8 scaling, allocator/NUMA attribution | `N` is effective physical-core slice width (1–64), not logical threads. No suffix means one hardware thread/core; SMT-on requires `-smt2`, preventing latest-artifact and null-band collisions. Requested and observed CPU sets, thread budget, NUMA binding, performance governor, exclusive lease, and pre/post fingerprints remain separately bound. `trj-zen-128c` is obsolete provenance only and is rejected for new evidence |
-| `m4-macos` | Apple M4 Pro, 10P+4E, 14 logical CPUs, 64 GiB, 16 KiB pages | Registered ARM64 optimization and diagnostic target; every gate is currently promotion-unavailable until the producer can attest the actual executing image through a supported `O_EXEC` or loaded-image mechanism | All current M4 numbers are diagnostic-only. A future promotion contract must additionally witness scheduler assignment, reject thermal pressure, bind page size/local execution/sealed completion, add class-specific scaling endpoints, and prove applicable durability treatment |
-| `m5-macos` | No reachable, fingerprinted M5 host yet | Independent future M5 lane; descriptive M4/M5 delta only | `unavailable` and diagnostic-only until a real named host and immutable fingerprint are registered. No M5 fact or number is inferred from M4, and M5 never blocks non-M5 work |
+| `x86-vps-ovh/x86-diagnostic` | Existing heterogeneous RCH workers; runtime-derived diagnostic capacity only | Diagnostic continuity; never supplies default-flip authority | Exact worker facts and receipt are retained. Every gate is `Diagnostic`, has no frozen maximum width, and cannot promote history |
+| `trj-zen3-5995wx/physical-64` | AMD Threadripper PRO 5995WX; 64 physical cores, one admitted worker per core | Required default-flip profile; physical-core QG-1 scale-out plus QG-8/allocator/NUMA truth | Exact 64-core capacity; one-thread-per-core cpuset/sibling map, SMT state, NUMA policy, governor, observable worker activity, local execution, exclusive lease, and pre/post fingerprints. QG-1 max width 64; QG-8 max width 32 |
+| `trj-zen3-5995wx/smt2-128` | Same host; 128 admitted logical threads with two siblings per physical core | Required default-flip profile; independent SMT scale-out/null-band truth | Exact 128-thread capacity and two-threads-per-core evidence. Lower literal widths remain profile-specific and never reuse `physical-64` baselines, null bands, or destinations. QG-1 max width 128; QG-8 max width 32 |
+| `m4-macos/scheduler-10` | Apple M4 Pro, 10P+4E, 14 logical CPUs, 64 GiB, 16 KiB pages; scheduler-managed capacity 10 | Required default-flip profile, but currently promotion-unavailable until executing-image attestation lands; QG-8 additionally awaits a reviewed profile-aware 8-vs-4 target/evaluator | Requested pool/QoS, observable worker activity, thermal state, page size, local execution, exclusive lease, loaded-image attestation, symmetric durability where applicable, and sealed completion. The widest canonical QG-1/QG-8 cell is 8; no width-10 cell or P/E residency claim is invented |
+| `m5-macos/scheduler-14` | No reachable, fingerprinted M5 host; capacity intentionally absent | Required future default-flip profile; no runnable cells while unavailable | `Unavailable` remains an explicit release blocker, not `NotApplicable`. No M5 fact, capacity, number, or applicability decision is inferred from M4 |
 
 The registry is a specification plus executable conformance corpus:
 
 | Surface | Normative coverage | Implementation bead |
 |---|---|---|
-| Identity and resolution | Exact/pattern grammar, obsolete/unknown/ambiguous IDs, non-overlap, immutable fingerprint provenance | `bd-guum3` |
-| Receipt admission | Hardware identity plus explicit request/start/end execution snapshots, requested/observed CPU assignment, SMT/NUMA/P-E mode, one cross-language canonical hash contract, durability, sealed completion | `bd-guum3` |
-| Shared tests | 20 MUST and 2 SHOULD requirements; class-lookup, full receipt/admission, artifact-manifest, and registry-loader vectors, including collision, duplicate-key, legacy-alias, unknown-field, cpuset, SMT-suffix, ISA, pre/post drift, derived-hash, destination-key, log binding, and tamper cases | `bd-guum3` |
-| Rust evidence and ratchet | Strict loader, receipt-derived class binding, destination-stem enforcement, and no history writes on rejection | `bd-39bqp` |
-| Shell runner | The same registry and vectors, fail-closed preflight/finalization, no CLI relabeling | `bd-e8h-p0-runner-verify-jr6w` |
+| Identity and resolution | Closed hardware IDs plus closed execution-profile IDs, obsolete/unknown/cross-profile rejection, immutable fingerprint provenance | `bd-e8h-p0-machine-classes-26os` |
+| Applicability plan | Exact registry-v2 plus matrix-v2 plus gate hash reconstruction; every canonical cell is `Required`, `Diagnostic`, or `NotApplicable` for one profile | `bd-e8h-p0-machine-classes-26os` |
+| Receipt admission | Hardware identity plus explicit request/start/end execution snapshots, registry-derived capacity/max width, observed CPU assignment, SMT/NUMA/scheduler facts, canonical hashes, durability, and sealed completion-v6 | `bd-e8h-p0-machine-classes-26os` |
+| Rust evidence and ratchet | Evidence-v4 reconstructs the plan; threshold-v6, finalizer, ratchet, and history pointer enforce exact profile/plan/destination identity and zero history writes on rejection | `bd-e8h-p0-machine-classes-26os` |
+| Shell runner | Accepts only `--hardware-class` plus `--execution-profile`; callers cannot supply widths, Apple modes, lease paths, or legacy class aliases | `bd-e8h-p0-machine-classes-26os` |
 
 Rules:
 
 - Candidate and rerun on the same machine, same run window (existing
   promotion contract).
-- Admission is per `(gate, fixture, machine-class, source SHA, executable
-  SHA, execution identity)`. Onboarding or calibration for one class never
-  blocks diagnostic or activation-eligible work on another class.
+- Admission is per `(gate, fixture, hardware-class, execution-profile, source
+  SHA, executable SHA, execution identity, applicability-plan hash)`.
+  Onboarding or calibration for one profile never blocks diagnostic or
+  activation-eligible work on another profile.
 - `trj` and the Macs are NOT rch workers. Promotion-capable TRJ runs use
   `scripts/perf-runner.sh` (this campaign's one piece of new infrastructure).
   Its typed producer builds and resolves the exact benchmark ELF from the clean
   source snapshot and owns one continuous lease/probe/child/log/manifest/receipt
   lifecycle. Detached and foreground modes emit the same finalized layout;
-  neither path writes history. The script recognizes M4 only to fail closed;
-  Apple profiling remains diagnostic until a supported executing-image
+  neither path writes history. M4 is a registered hardware/profile key, but
+  Apple promotion remains fail-closed until a supported executing-image
   attestation design lands.
 - Every M4 gate is deliberately promotion-unavailable today because a
   read-only `/dev/fd` alias cannot attest or execute the loaded image under the
-  strict contract. A future class-scoped contract must solve that boundary,
-  add scheduler-managed 10- and 14-worker scaling endpoints plus a real
-  scheduler-state witness, and retain the durability laws; trimming the x86
-  matrix ad hoc can never activate an Apple claim.
+  strict contract. A future profile-scoped contract must solve that boundary,
+  retain the frozen `scheduler-10` applicability plan and a real
+  scheduler-state witness, and retain the durability laws. QG-8 also needs a
+  reviewed profile-aware 8-vs-4 target/evaluator because its current ratchet
+  threshold is the x86-only 16-vs-4 requirement. The widest current canonical
+  M4 scale cell is 8; neither a width-10 cell nor any M5 `scheduler-14`
+  capacity may be invented. Trimming the x86 matrix ad hoc can never activate
+  an Apple claim.
 
 ## 3. Phase plan
 
 ```
 Phase 0  LANE-LOCAL INSTRUMENT INTEGRITY + ONBOARDING
-Phase 1  PROFILE TRUTH                                     (per gate x class; local, never rch — rch cannot symbolize, bd-e41k)
+Phase 1  PROFILE TRUTH                                     (per gate x profile; local, never rch — rch cannot symbolize, bd-e41k)
 Phase 2  HYPOTHESIS LEDGER SEEDING + PRIOR MINING          (mandatory before a production lever)
 Phase 3  INDEPENDENT OPTIMIZATION LOOPS                    (workstreams W1–W5)
 Phase 4  MATH-FAMILY ARTIFACTS                             (bounded to 3 families)
@@ -136,17 +145,21 @@ Phase 5  DISCOVERY REVIEW + ACTIVATION + TERMINAL GATE
 3. QG-1 retry predicate executed as written: `QUILL_PERF_FIXTURE` narrowed,
    `xlarge` + `tokenize_only` captured, complete `QG-1.json` emitted. The
    global rch timeout is not raised.
-4. Machine-class onboarding: harden the shared runner, then validate it
-   independently on x86 (`bd-9f03f`), trj (`bd-7ihq9`), M4 (`bd-0v8uz`), and
-   M5 when reachable (`bd-swfyn`). Derive A/A-only bands independently for
-   x86 (`bd-jjs6q`), trj (`bd-cpqjb`), M4 (`bd-w7zxm`), and M5
-   (`bd-6wnws`). Threadripper calibration is keyed by 1/16/32/64 physical-core
-   slices plus any explicitly used SMT-on lane; current Apple calibration is
-   keyed by the registered P+E class, a scheduler-managed 10- or 14-worker
-   pool, and observable scheduler state. Report inferred P/E residency only as
-   a diagnostic: a worker-count request is not evidence that macOS assigned
-   those workers to performance cores. P-only calibration remains outside the
-   registered producer until a real scheduler-assignment witness exists.
+4. Hardware/profile onboarding: harden the shared runner, then validate it
+   independently on `x86-vps-ovh/x86-diagnostic` (`bd-9f03f`),
+   `trj-zen3-5995wx/{physical-64,smt2-128}` (`bd-7ihq9`),
+   `m4-macos/scheduler-10` (`bd-0v8uz`), and
+   `m5-macos/scheduler-14` only when a real host becomes reachable
+   (`bd-swfyn`). Derive A/A-only bands independently for x86 (`bd-jjs6q`),
+   each trj profile (`bd-cpqjb`), M4 (`bd-w7zxm`), and M5 (`bd-6wnws`).
+   Threadripper calibration uses the exact frozen runnable cell set for each
+   physical/SMT profile; lower literal widths never cross profiles. Current
+   Apple calibration is keyed by scheduler-managed capacity 10 but exercises
+   only the registry's canonical runnable widths (maximum 8). Report inferred
+   P/E residency only as a diagnostic: a worker-count request is not evidence
+   that macOS assigned those workers to performance cores. P-only calibration
+   remains outside the registered producer until a real scheduler-assignment
+   witness exists.
    At least two independent live calibrations are required for a band.
    Diagnostic A/B runs may execute earlier only when labeled non-claim.
    Manifest (`quill-perf-gates.toml`) additions for the new classes are
@@ -155,16 +168,18 @@ Phase 5  DISCOVERY REVIEW + ACTIVATION + TERMINAL GATE
 
 **Lane exit:** the exact lane has a valid instrument/schema, matched workload,
 required A/A calibration, complete immutable provenance, and a ratchet that
-consumes that class's artifact. QG-1, QG-2, and QG-6 on `x86-vps-ovh` may
-advance while trj or Apple onboarding remains incomplete. Conversely, Apple or
-trj lanes advance when their own prerequisites pass. There is no fleet-wide
-barrier.
+consumes that profile's artifact. QG-1, QG-2, and QG-6 diagnostics on
+`x86-vps-ovh/x86-diagnostic` may advance while trj or Apple onboarding remains
+incomplete. Conversely, Apple or trj lanes advance when their own
+prerequisites pass. There is no fleet-wide measurement barrier, but every
+`required_for_default_flip` profile remains a release requirement even when
+its hardware is unavailable.
 
 ### Phase 1 — Profile truth
 
 Local lanes (flamegraph + samply + dhat allocation census + `strace -c` /
 `fs_usage` syscall+fsync census) under `release-perf` with frame pointers.
-Deliverable per (gate x class): a committed profile card with the top-10
+Deliverable per (gate x profile): a committed profile card with the top-10
 self-time frames ≥0.1%, triangulated (a lever is actionable only when two
 profilers agree on the frame). QG-1 cards additionally record the
 **tokenize-only honesty denominator** — the measured ceiling that converts
@@ -178,7 +193,7 @@ for QG-1, `x4e4.5.4` for QG-6); the campaign adds trj/M4/M5 cards only.
 
 Every candidate lever gets a hypothesis row BEFORE implementation:
 `hypothesis / minimal repro / expected signal (as % of ceiling gap) /
-falsifiability / one-line invocation / machine-class scope / results-inline /
+falsifiability / one-line invocation / hardware/profile scope / results-inline /
 retry-condition predicate on reject`. Rows live in the campaign evidence
 directory, NOT in `docs/NEGATIVE_EVIDENCE.md` (terminal rejects still go
 there, via its null-control commit gate, once an experiment concludes).
@@ -200,13 +215,13 @@ recorded retry predicate):
 
 One lever per commit. Every lever ships: a recommendation-contract card (see
 § Keep-gates), same-window old-Quill/new-Quill causal evidence, a genuine
-Tantivy incumbent arm, a same-invocation A/A control per claimed class, and a
+Tantivy incumbent arm, a same-invocation A/A control per claimed profile, and a
 **green differential parity campaign at the same SHA** — the gauntlet is this
 campaign's isomorphism oracle. Rank-exactness (the vendored BM25 fieldnorm table
 and f32 op order in `contract.rs`) is the invariant most levers can silently
 break; "Floating-point: identical" is a load-bearing line of every proof.
 
-Each `(gate, fixture, class)` lane advances independently through hypothesis,
+Each `(gate, fixture, hardware-class, execution-profile)` lane advances independently through hypothesis,
 implementation, verdict, and re-profile. Chronological batches may still be
 called rounds in status reports, but no round is a synchronization barrier and
 no round count is an acceptance criterion. After three rejects in one
@@ -254,11 +269,11 @@ Each gets a hypothesis-ledger row with the predicate that would revive it.
   has become true.
 - The performance campaign has one terminal convergence condition: every
   complete written target frozen in `quill-perf-gates.toml` is a validated WIN
-  on every required machine class and cell. Infeasibility evidence, exhausted
+  on every required profile and its `Required` cells. Infeasibility evidence, exhausted
   hypotheses, unavailable hardware, missing execution attestation, or a
   bounded non-inferiority result cannot close a gate, satisfy a dependency,
   authorize a waiver, or retarget the target.
-- Gates activate per gate per class exactly per the existing activation
+- Gates activate per gate per profile exactly per the existing activation
   contract. A complete eligible lane need not wait for unrelated gates or
   hardware. Diagnostic runs remain visible but cannot activate a claim.
 - **Round-6 evidence-review checkpoint (non-optional when triggered):** open
@@ -305,18 +320,19 @@ predicate passes.
 | Seal-time section checksum cost | if sealing hashes every byte with a heavy hash, it is a prime constant-factor suspect | Algorithm change = FSLX format-registry bump; EV-scored; registry owners coordinate. |
 | Commit-path fsync count | batch directory syncs; two-slot manifest bounds the floor | `strace -c` / `fs_usage` census first; Law 7 on macOS. |
 
-### W3 — Parallel scale-out (QG-1 high-thread, QG-8; truth machine: trj-zen3-*)
+### W3 — Parallel scale-out (QG-1 high-thread, QG-8; truth profiles: `trj-zen3-5995wx/{physical-64,smt2-128}`)
 
 Shard-per-worker indexing into independent segments, then
 `KeeperWriter::concat_merge` (already exists) — N independent single-thread
 problems plus one cheap concat. NUMA/CCD-aware sharding; per-thread arenas;
 sharded interners merged at seal (no global interner Mutex). Deliverables
 include the allocator-contention axis; "a bandwidth ceiling is honest, a lock
-plateau is a bug." On M4, the next promotion contract must first attest the
-actual executing image, then freeze class-scoped scheduler-managed 10- and
-14-worker endpoints plus a real scheduler-state witness before QG-1 or QG-8
-can admit evidence. P/E residency remains diagnostic unless the witness proves
-it; pool width alone must never be relabeled as `10P` or `14P+E`. Until then
+plateau is a bug." On M4, promotion must first attest the actual executing
+image and scheduler state for `m4-macos/scheduler-10`; QG-1 and QG-8 exercise
+the frozen canonical maximum width 8, not an invented width 10. P/E residency
+remains diagnostic unless a witness proves it; scheduler capacity alone must
+never be relabeled as `10P`. `m5-macos/scheduler-14` remains unavailable with
+no inferred capacity or runnable cells. Until these boundaries are satisfied
 there is no promotion-grade Apple scaling curve.
 
 ### W4 — SIMD/µarch kernels (all classes; safe-code constraint binding)
@@ -330,8 +346,8 @@ kernel is written. AVX-512 on trj is **C-tier/blocked** until the packaging
 predicate changes; recorded as a ledger row so nobody burns a week on it.
 Targets: FOR unpack/pack (re-derive dispatch bands on NEON), BM25 scoring
 loops, block-max screening. Every kernel measured across the full width
-domain on every claimed class; a kernel that wins on trj and regresses on M4
-ships behind per-class dispatch or not at all.
+domain on every claimed profile; a kernel that wins on trj and regresses on M4
+ships behind per-profile dispatch or not at all.
 
 ### W5 — Memory + I/O behavior (QG-7, QG-9)
 
@@ -351,7 +367,7 @@ A lever is KEEP only if ALL hold:
 2. The claimed causal speedup compares old Quill and new Quill in one
    source-state-controlled window. The same evidence window also runs the
    genuine Tantivy incumbent and a same-invocation A/A null whose CI contains
-   1.0, per claimed machine class. A cross-commit Quill/Tantivy ratio or a
+   1.0, per claimed profile. A cross-commit Quill/Tantivy ratio or a
    Quill self-speedup alone is not an incumbent KEEP.
 3. `release-perf` profile; never a bare `--release` with different codegen.
 4. Focused and broad gates moved in the same run window (same git state, same
@@ -360,8 +376,8 @@ A lever is KEEP only if ALL hold:
    flags the cell for rerun).
 6. Differential parity campaign green at the same SHA (isomorphism oracle);
    rank-exactness explicitly attested.
-7. Ratchet `Allow` on every claimed class; per-class KEEP/NoClaim split stated
-   in the ledger row.
+7. Ratchet `Allow` on every claimed profile; per-profile KEEP/NoClaim split
+   stated in the ledger row.
 8. Both-engine absolute metrics, p50/p95/p99 or throughput distributions,
    RSS/bytes, disk bytes, and durability/maintenance work are reported beside
    ratios. An unavailable metric is explicit and limits scope.
@@ -373,10 +389,10 @@ Every lever bead body carries the recommendation contract:
 
 ```
 Change:
-Hotspot evidence (frame, % self-time, class):
+Hotspot evidence (frame, % self-time, profile):
 EV score (Impact x Confidence x Reuse / Effort x Friction, >=2.0):
 Expected recoverable fraction of measured gap:
-Machine-class scope:
+Hardware/profile scope:
 Adoption wedge:
 Budgeted mode (caps + on-exhaust behavior):
 Isomorphism proof plan (parity campaign + rank-exactness):
@@ -392,11 +408,11 @@ Reject retry predicate:
 
 ## 6. Campaign anti-patterns
 
-- Quoting any cross-machine-class ratio, ever.
+- Quoting any cross-profile ratio, ever.
 - Running trj timed windows while the agent swarm builds on the same box —
   isolated target dir + exclusive build slot, or the A/A null vetoes the run.
 - Treating M4 results as M5 results.
-- Waiting for every machine class, every gate, or a fleet-wide phase before
+- Waiting for every profile, every gate, or a fleet-wide phase before
   recording or acting on a locally valid diagnostic.
 - Requiring an arbitrary number of rounds, or requiring all workstreams to
   produce a lever in lockstep.
@@ -415,7 +431,7 @@ Reject retry predicate:
 ## 7. Bead map + lanes
 
 Epic `bd-quill-e8-hyperopt-*` under the E8 doctrine (not a parallel taxonomy).
-Children: `p0-*` (onboarding/calibration), `p1-*` (per-class profile cards),
+Children: `p0-*` (onboarding/calibration), `p1-*` (per-profile cards),
 `p2-*` (hypothesis ledger), `w1-*`/`w2-*` (specified levers), `w3-*`/`w4-*`/
 `w5-*`/`math-*` (stubs behind their lane-local profile prerequisites),
 `convergence`, `renegotiation`. The historically named `renegotiation` bead is
