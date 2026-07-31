@@ -922,15 +922,13 @@ impl TwoTierIndex {
 
     /// Test-only mutable access to a PATH-OPENED fast tier (WAL injection).
     ///
-    /// Panics on an admitted v2 tier: sealed owners are never mutably
+    /// `None` for an admitted v2 tier: sealed owners are never mutably
     /// exposed, in tests or otherwise.
     #[cfg(test)]
-    fn fast_tier_mut_for_test(&mut self) -> &mut VectorIndex {
+    fn fast_tier_mut_for_test(&mut self) -> Option<&mut VectorIndex> {
         match &mut self.fast_source {
-            TierSource::PathOpened(index) => index,
-            TierSource::AdmittedV2(_) => {
-                panic!("admitted v2 tiers are sealed; no mutable access even in tests")
-            }
+            TierSource::PathOpened(index) => Some(index),
+            TierSource::AdmittedV2(_) => None,
         }
     }
 
@@ -4556,18 +4554,26 @@ mod tests {
 
         // Inject a WAL entry with NaN in the embedding. dot_product with NaN
         // produces NaN, which should be filtered out by the is_finite() guard.
-        index.fast_tier_mut_for_test().wal_entries.push(WalEntry {
-            doc_id: "doc-nan".into(),
-            doc_id_hash: crate::fnv1a_hash(b"doc-nan"),
-            embedding: vec![f32::NAN, 0.0, 0.0, 0.0],
-        });
+        index
+            .fast_tier_mut_for_test()
+            .expect("path-opened tier")
+            .wal_entries
+            .push(WalEntry {
+                doc_id: "doc-nan".into(),
+                doc_id_hash: crate::fnv1a_hash(b"doc-nan"),
+                embedding: vec![f32::NAN, 0.0, 0.0, 0.0],
+            });
 
         // Also inject a valid WAL entry to confirm it's still returned.
-        index.fast_tier_mut_for_test().wal_entries.push(WalEntry {
-            doc_id: "doc-wal-ok".into(),
-            doc_id_hash: crate::fnv1a_hash(b"doc-wal-ok"),
-            embedding: vec![0.0, 1.0, 0.0, 0.0],
-        });
+        index
+            .fast_tier_mut_for_test()
+            .expect("path-opened tier")
+            .wal_entries
+            .push(WalEntry {
+                doc_id: "doc-wal-ok".into(),
+                doc_id_hash: crate::fnv1a_hash(b"doc-wal-ok"),
+                embedding: vec![0.0, 1.0, 0.0, 0.0],
+            });
 
         let hits = index
             .search_fast(&[1.0, 0.0, 0.0, 0.0], 10)
@@ -5568,8 +5574,13 @@ mod tests {
             .finish()
             .expect("finish seed");
         let seed_snapshot = tier_snapshot(&seed_path);
-        let FsviTierObservation::V1(seed) = observe_tier(&seed_path).expect("observe seed") else {
-            panic!("v1 seed must observe as V1");
+        let seed_observation = observe_tier(&seed_path).expect("observe seed");
+        assert!(
+            matches!(seed_observation, FsviTierObservation::V1(_)),
+            "v1 seed must observe as V1, got {seed_observation:?}"
+        );
+        let FsviTierObservation::V1(seed) = seed_observation else {
+            return;
         };
         assert_eq!(seed.record_count, 0);
         assert_eq!(seed.active_wal_records, 0);
@@ -5587,8 +5598,13 @@ mod tests {
         }
         let live_snapshot = tier_snapshot(&live_path);
         assert!(live_snapshot.1.is_some(), "fixture must have a WAL sidecar");
-        let FsviTierObservation::V1(live) = observe_tier(&live_path).expect("observe live") else {
-            panic!("live v1 must observe as V1");
+        let live_observation = observe_tier(&live_path).expect("observe live");
+        assert!(
+            matches!(live_observation, FsviTierObservation::V1(_)),
+            "live v1 must observe as V1, got {live_observation:?}"
+        );
+        let FsviTierObservation::V1(live) = live_observation else {
+            return;
         };
         assert_eq!(live.record_count, 1);
         assert_eq!(live.active_wal_records, 1);
@@ -5605,10 +5621,13 @@ mod tests {
         let (binding, _) = fsvi_v2_binding("observe-v2-model", 4, 2);
         write_v2_tier(&v2_path, &binding, &[("doc-a", &[1.0, 0.0, 0.0, 0.0])]);
         let v2_snapshot = tier_snapshot(&v2_path);
-        let FsviTierObservation::V2IdentityComplete(metadata) =
-            observe_tier(&v2_path).expect("observe v2")
-        else {
-            panic!("v2 tier must observe as V2IdentityComplete");
+        let v2_observation = observe_tier(&v2_path).expect("observe v2");
+        assert!(
+            matches!(v2_observation, FsviTierObservation::V2IdentityComplete(_)),
+            "v2 tier must observe as V2IdentityComplete, got {v2_observation:?}"
+        );
+        let FsviTierObservation::V2IdentityComplete(metadata) = v2_observation else {
+            return;
         };
         assert_eq!(metadata.record_count, 1);
         assert!(metadata.identity_v2.is_some());
@@ -5663,10 +5682,13 @@ mod tests {
         );
 
         let snapshot = tier_snapshot(&target_path);
-        let FsviTierObservation::V1(observation) =
-            observe_tier(&target_path).expect("observe target")
-        else {
-            panic!("target must observe as V1");
+        let target_observation = observe_tier(&target_path).expect("observe target");
+        assert!(
+            matches!(target_observation, FsviTierObservation::V1(_)),
+            "target must observe as V1, got {target_observation:?}"
+        );
+        let FsviTierObservation::V1(observation) = target_observation else {
+            return;
         };
         assert_eq!(
             observation.active_wal_records, 0,
@@ -5721,8 +5743,13 @@ mod tests {
         assert_eq!(corrupted_len, clean_len + 32);
 
         let snapshot = tier_snapshot(&path);
-        let FsviTierObservation::V1(observation) = observe_tier(&path).expect("observe") else {
-            panic!("must observe as V1");
+        let trailer_observation = observe_tier(&path).expect("observe");
+        assert!(
+            matches!(trailer_observation, FsviTierObservation::V1(_)),
+            "must observe as V1, got {trailer_observation:?}"
+        );
+        let FsviTierObservation::V1(observation) = trailer_observation else {
+            return;
         };
         assert_eq!(
             observation.active_wal_records, 1,
