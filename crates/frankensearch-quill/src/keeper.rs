@@ -9321,15 +9321,82 @@ fn segment_unreachability_floor_at(
     directory_file: &File,
     directory: &Path,
     snapshot: &KeeperSnapshot,
-    now: SystemTime,
+    _observation_time: SystemTime,
 ) -> Result<Option<SystemTime>, KeeperError> {
-    use rustix::fs::{AtFlags, FileType, statat};
+    use rustix::fs::{AtFlags, FileType, fstat, statat};
 
     if snapshot.loaded_manifest().source != ManifestSource::Current {
-        // A missing/corrupt current slot is a publication recovery window, so
-        // the time at which the union became unreachable is not durable yet.
-        // Start a fresh grace window rather than infer an unsafe older time.
-        return Ok(Some(now));
+        // The namespace mutation that removed or replaced MANIFEST is the
+        // durable recovery-window witness. Unlike the caller's observation
+        // time, it remains stable across repeated GC attempts. Include the
+        // selected previous inode and any extant corrupt current inode so an
+        // in-place rewrite cannot make the inferred floor earlier. Unrelated
+        // directory mutations may postpone reclamation, but cannot accelerate
+        // it.
+        let directory_stat = fstat(directory_file)
+            .map_err(io::Error::from)
+            .map_err(|source| KeeperError::Io {
+                operation: "inspect recovery GC directory witness",
+                path: directory.to_path_buf(),
+                source,
+            })?;
+        if FileType::from_raw_mode(directory_stat.st_mode) != FileType::Directory {
+            return Err(KeeperError::GarbageDirectoryChanged {
+                directory: directory.to_path_buf(),
+            });
+        }
+        let mut changed = required_gc_witness_time(
+            &directory_stat,
+            directory,
+            "decode recovery GC directory timestamp",
+        )?;
+
+        let previous_path = directory.join("MANIFEST.prev");
+        let previous_stat = statat(directory_file, "MANIFEST.prev", AtFlags::SYMLINK_NOFOLLOW)
+            .map_err(io::Error::from)
+            .map_err(|source| KeeperError::Io {
+                operation: "inspect recovery MANIFEST.prev witness",
+                path: previous_path.clone(),
+                source,
+            })?;
+        if FileType::from_raw_mode(previous_stat.st_mode) != FileType::RegularFile {
+            return Err(KeeperError::GarbageDirectoryChanged {
+                directory: directory.to_path_buf(),
+            });
+        }
+        changed = std::cmp::max(
+            changed,
+            required_gc_witness_time(
+                &previous_stat,
+                &previous_path,
+                "decode recovery MANIFEST.prev timestamp",
+            )?,
+        );
+
+        if snapshot.loaded_manifest().source == ManifestSource::PreviousAfterCorruptCurrent {
+            let current_path = directory.join("MANIFEST");
+            let current_stat = statat(directory_file, "MANIFEST", AtFlags::SYMLINK_NOFOLLOW)
+                .map_err(io::Error::from)
+                .map_err(|source| KeeperError::Io {
+                    operation: "inspect corrupt MANIFEST GC witness",
+                    path: current_path.clone(),
+                    source,
+                })?;
+            if FileType::from_raw_mode(current_stat.st_mode) != FileType::RegularFile {
+                return Err(KeeperError::GarbageDirectoryChanged {
+                    directory: directory.to_path_buf(),
+                });
+            }
+            changed = std::cmp::max(
+                changed,
+                required_gc_witness_time(
+                    &current_stat,
+                    &current_path,
+                    "decode corrupt MANIFEST timestamp",
+                )?,
+            );
+        }
+        return Ok(Some(changed));
     }
     let path = directory.join("MANIFEST");
     let stat = statat(directory_file, "MANIFEST", AtFlags::SYMLINK_NOFOLLOW)
@@ -9349,11 +9416,51 @@ fn segment_unreachability_floor_at(
     // even when publication reuses an older temp whose mtime and embedded
     // informational timestamp predate the rename. The embedded witness may be
     // later (for example after a wall-clock step), so use the later boundary.
-    let changed = stat_change_time(&stat).unwrap_or(now);
-    let published = manifest_publish_time(&snapshot.loaded_manifest().manifest);
+    let changed = required_gc_witness_time(&stat, &path, "decode MANIFEST GC timestamp")?;
+    let manifest = &snapshot.loaded_manifest().manifest;
+    let published = if manifest.last_publish_unix_s > 0 {
+        Some(
+            manifest_publish_time(manifest).ok_or_else(|| KeeperError::Io {
+                operation: "decode MANIFEST publish timestamp",
+                path,
+                source: io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "MANIFEST publish timestamp is outside the SystemTime domain",
+                ),
+            })?,
+        )
+    } else {
+        None
+    };
     Ok(Some(published.map_or(changed, |published| {
         std::cmp::max(changed, published)
     })))
+}
+
+#[cfg(unix)]
+#[allow(dead_code, reason = "wired by the dependent writer-lock milestone")]
+fn required_gc_witness_time(
+    stat: &rustix::fs::Stat,
+    path: &Path,
+    operation: &'static str,
+) -> Result<SystemTime, KeeperError> {
+    let changed = stat_change_time(stat).ok_or_else(|| KeeperError::Io {
+        operation,
+        path: path.to_path_buf(),
+        source: io::Error::new(
+            io::ErrorKind::InvalidData,
+            "filesystem change timestamp is outside the SystemTime domain",
+        ),
+    })?;
+    let modified = stat_modified_time(stat).ok_or_else(|| KeeperError::Io {
+        operation,
+        path: path.to_path_buf(),
+        source: io::Error::new(
+            io::ErrorKind::InvalidData,
+            "filesystem modification timestamp is outside the SystemTime domain",
+        ),
+    })?;
+    Ok(std::cmp::max(changed, modified))
 }
 
 #[cfg(unix)]
@@ -16717,6 +16824,87 @@ mod tests {
             ))]
         );
         assert!(!unreachable_path.exists());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovery_gc_floor_is_stable_across_repeated_attempts() -> TestResult {
+        let directory = tempdir()?;
+        let unreachable = write_test_segment(directory.path(), 0xbeef, 1, 0, 2)?;
+        let segment_name = canonical_segment_name(unreachable.segment_id);
+        let segment_path = directory.path().join(&segment_name);
+        File::options()
+            .write(true)
+            .open(&segment_path)?
+            .set_times(std::fs::FileTimes::new().set_modified(SystemTime::UNIX_EPOCH))?;
+
+        write_manifest(
+            &directory.path().join("MANIFEST.prev"),
+            &durable_test_manifest(1, Vec::new()),
+        )?;
+        write_manifest(
+            &directory.path().join(".tmp-manifest-2"),
+            &durable_test_manifest(2, vec![unreachable]),
+        )?;
+
+        let snapshot = KeeperSnapshot::open(directory.path(), DEFAULT_SCHEMA)?;
+        assert_eq!(
+            snapshot.loaded_manifest().source,
+            ManifestSource::PreviousAfterMissingCurrent
+        );
+        let directory_file = open_gc_directory(directory.path())?;
+        let first_observation = SystemTime::now();
+        let first_floor = segment_unreachability_floor_at(
+            &directory_file,
+            directory.path(),
+            &snapshot,
+            first_observation,
+        )?
+        .ok_or_else(|| io::Error::other("recovery must supply a GC floor"))?;
+        let later_observation = first_observation
+            .checked_add(Duration::from_secs(3_600))
+            .ok_or_else(|| io::Error::other("test clock remains representable"))?;
+        let second_floor = segment_unreachability_floor_at(
+            &directory_file,
+            directory.path(),
+            &snapshot,
+            later_observation,
+        )?
+        .ok_or_else(|| io::Error::other("recovery must supply a stable GC floor"))?;
+        assert_eq!(
+            second_floor, first_floor,
+            "a later observation must not restart the recovery grace window"
+        );
+
+        let options = GarbageCollectionOptions {
+            grace_period: Duration::from_secs(60),
+        };
+        let before_grace = first_floor
+            .checked_add(Duration::from_secs(59))
+            .ok_or_else(|| io::Error::other("test clock remains representable"))?;
+        assert!(
+            collect_writer_garbage_at(directory.path(), DEFAULT_SCHEMA, options, before_grace)?
+                .is_empty(),
+            "the first recovery attempt must preserve the segment for the full grace"
+        );
+        assert!(segment_path.exists());
+
+        let after_grace = first_floor
+            .checked_add(options.grace_period)
+            .ok_or_else(|| io::Error::other("test clock remains representable"))?;
+        let mut expected_removed = vec![
+            PathBuf::from(".tmp-manifest-2"),
+            PathBuf::from(segment_name),
+        ];
+        expected_removed.sort_unstable();
+        assert_eq!(
+            collect_writer_garbage_at(directory.path(), DEFAULT_SCHEMA, options, after_grace)?
+                .removed,
+            expected_removed,
+            "the second recovery attempt must not reset the grace to its call time"
+        );
+        assert!(!segment_path.exists());
         Ok(())
     }
 
