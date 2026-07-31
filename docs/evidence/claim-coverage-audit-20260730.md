@@ -168,6 +168,35 @@ The `README.md → 0` half is confirmed and stands. The `CHANGELOG.md → 0` hal
 was a misread of a non-empty result. `CHANGELOG.md` is rendered on the GitHub
 repository front page; it is as public as the README.
 
+**Which tree these claims live in — checked, because it changes the severity.**
+This checkout's `main` is 266 commits behind `origin/main`, and the working tree
+additionally carries an unrelated peer's uncommitted 170-line v1.4.0
+release-notes draft. All three states were counted separately:
+
+| tree | perf-claim lines in `CHANGELOG.md` | superlative present |
+|---|---:|---|
+| local `HEAD` (266 behind) | 0 | no |
+| working tree (peer's uncommitted draft) | 5 | yes |
+| **`origin/main` — the published surface** | **5** | **yes, at `:82`** |
+
+```bash
+git show origin/main:CHANGELOG.md | grep -cE "[0-9]+(\.[0-9]+)?\s*[x×]|faster|speedup|beats"   # 5
+git show origin/main:README.md    | grep -cE "[0-9]+(\.[0-9]+)?\s*[x×]|faster|speedup|beats"   # 0
+git show HEAD:CHANGELOG.md        | grep -cE "[0-9]+(\.[0-9]+)?\s*[x×]|faster|speedup|beats"   # 0
+```
+
+So the claims are **genuinely published**, not a local draft. Line numbers below
+are this working tree's (`:65-68`); the same content sits at
+`origin/main:81-84`, with the superlative at `origin/main:82`. Local `HEAD`
+showing zero is an artifact of being 266 commits stale, not evidence of safety —
+and it is the reason a naive re-audit of this checkout would wrongly conclude the
+exposure had gone away.
+
+The superlative also travels in the git history itself: commit `f04074a4`'s
+subject line is *"FSVI 4-bit two-pass — fastest lossless vector-search primitive
+(2.56x flat, 1.07x int8)"*, stating the superlative and its two self-vs-self
+numbers in the same breath.
+
 ## The 10 public claims (CHANGELOG.md:65-68)
 
 | # | claim | line | comparator actually used | incumbent-live ratio? |
