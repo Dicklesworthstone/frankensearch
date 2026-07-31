@@ -1,0 +1,201 @@
+# Parent-red pass C — compile-red proof for the index-crate owner retention
+#
+# Same git-archive tree, refresh.rs restored pristine, then the r2 test block
+# from crates/frankensearch-index/src/two_tier.rs (commit afcae1db) appended
+# to the parent's two_tier.rs test module. Command:
+#   cargo test -p frankensearch-index --lib -- --exact \
+#     two_tier::tests::admitted_v2_open_retains_sealed_owners_in_full
+#
+# EXPECTED on the parent: E0599 fast_admitted_owner/quality_admitted_owner
+# (owner peeled, NO-GO item 3) and E0425/E0433/E0422 observe_tier /
+# FsviTierObservation / FsviUpgradeRequired-not-in-scope (the read-only
+# observation API does not exist there, NO-GO item 2 seam).
+
+   Compiling criterion v0.8.2
+   Compiling frankensearch-core v0.2.1 (/data/tmp/claude-1000/-data-projects-frankensearch/6ba18fed-10c5-4855-b287-a7067faf4133/scratchpad/parent-868c0801/crates/frankensearch-core)
+   Compiling frankensearch-index v0.2.1 (/data/tmp/claude-1000/-data-projects-frankensearch/6ba18fed-10c5-4855-b287-a7067faf4133/scratchpad/parent-868c0801/crates/frankensearch-index)
+error[E0422]: cannot find struct, variant or union type `FsviUpgradeRequired` in this scope
+    --> crates/frankensearch-index/src/two_tier.rs:5448:54
+     |
+5448 |                 FsviTierObservation::UpgradeRequired(FsviUpgradeRequired {
+     |                                                      ^^^^^^^^^^^^^^^^^^^ not found in this scope
+     |
+help: consider importing this struct
+     |
+2173 +     use crate::FsviUpgradeRequired;
+     |
+
+warning: use of deprecated method `wide::i16x8::mul_widen`: renamed to `widening_mul`
+    --> crates/frankensearch-index/src/simd.rs:1268:28
+     |
+1268 |         acc0 += w8::<0>(s).mul_widen(w8::<0>(q));
+     |                            ^^^^^^^^^
+     |
+     = note: `#[warn(deprecated)]` on by default
+
+warning: use of deprecated method `wide::i16x8::mul_widen`: renamed to `widening_mul`
+    --> crates/frankensearch-index/src/simd.rs:1269:28
+     |
+1269 |         acc1 += w8::<8>(s).mul_widen(w8::<8>(q));
+     |                            ^^^^^^^^^
+
+warning: use of deprecated method `wide::i16x8::mul_widen`: renamed to `widening_mul`
+    --> crates/frankensearch-index/src/simd.rs:1270:29
+     |
+1270 |         acc2 += w8::<16>(s).mul_widen(w8::<16>(q));
+     |                             ^^^^^^^^^
+
+warning: use of deprecated method `wide::i16x8::mul_widen`: renamed to `widening_mul`
+    --> crates/frankensearch-index/src/simd.rs:1271:29
+     |
+1271 |         acc3 += w8::<24>(s).mul_widen(w8::<24>(q));
+     |                             ^^^^^^^^^
+
+warning: use of deprecated method `wide::i16x8::mul_widen`: renamed to `widening_mul`
+    --> crates/frankensearch-index/src/simd.rs:1279:46
+     |
+1279 |         sum += i16x8::from(s.map(i16::from)).mul_widen(i16x8::from(q.map(i16::from)));
+     |                                              ^^^^^^^^^
+
+error[E0599]: no method named `fast_admitted_owner` found for struct `two_tier::TwoTierIndex` in the current scope
+    --> crates/frankensearch-index/src/two_tier.rs:5140:14
+     |
+ 409 |   pub struct TwoTierIndex {
+     |   ----------------------- method `fast_admitted_owner` not found for this struct
+...
+5139 |           let fast_owner = index
+     |  __________________________-
+5140 | |             .fast_admitted_owner()
+     | |             -^^^^^^^^^^^^^^^^^^^ method not found in `two_tier::TwoTierIndex`
+     | |_____________|
+     |
+
+error[E0599]: no method named `quality_admitted_owner` found for struct `two_tier::TwoTierIndex` in the current scope
+    --> crates/frankensearch-index/src/two_tier.rs:5143:14
+     |
+ 409 |   pub struct TwoTierIndex {
+     |   ----------------------- method `quality_admitted_owner` not found for this struct
+...
+5142 |           let quality_owner = index
+     |  _____________________________-
+5143 | |             .quality_admitted_owner()
+     | |             -^^^^^^^^^^^^^^^^^^^^^^ method not found in `two_tier::TwoTierIndex`
+     | |_____________|
+     |
+
+error[E0599]: no method named `fast_admitted_owner` found for struct `two_tier::TwoTierIndex` in the current scope
+    --> crates/frankensearch-index/src/two_tier.rs:5194:14
+     |
+ 409 |   pub struct TwoTierIndex {
+     |   ----------------------- method `fast_admitted_owner` not found for this struct
+...
+5193 |           let witness_before = index
+     |  ______________________________-
+5194 | |             .fast_admitted_owner()
+     | |             -^^^^^^^^^^^^^^^^^^^ method not found in `two_tier::TwoTierIndex`
+     | |_____________|
+     |
+
+error[E0599]: no method named `fast_admitted_owner` found for struct `two_tier::TwoTierIndex` in the current scope
+    --> crates/frankensearch-index/src/two_tier.rs:5208:27
+     |
+ 409 | pub struct TwoTierIndex {
+     | ----------------------- method `fast_admitted_owner` not found for this struct
+...
+5208 |         let owner = index.fast_admitted_owner().expect("retained owner");
+     |                           ^^^^^^^^^^^^^^^^^^^ method not found in `two_tier::TwoTierIndex`
+
+error[E0599]: no method named `fast_admitted_owner` found for struct `two_tier::TwoTierIndex` in the current scope
+    --> crates/frankensearch-index/src/two_tier.rs:5235:23
+     |
+ 409 | pub struct TwoTierIndex {
+     | ----------------------- method `fast_admitted_owner` not found for this struct
+...
+5235 |         assert!(index.fast_admitted_owner().is_none());
+     |                       ^^^^^^^^^^^^^^^^^^^ method not found in `two_tier::TwoTierIndex`
+
+error[E0599]: no method named `quality_admitted_owner` found for struct `two_tier::TwoTierIndex` in the current scope
+    --> crates/frankensearch-index/src/two_tier.rs:5236:23
+     |
+ 409 | pub struct TwoTierIndex {
+     | ----------------------- method `quality_admitted_owner` not found for this struct
+...
+5236 |         assert!(index.quality_admitted_owner().is_none());
+     |                       ^^^^^^^^^^^^^^^^^^^^^^ method not found in `two_tier::TwoTierIndex`
+
+error[E0425]: cannot find function `observe_tier` in this scope
+    --> crates/frankensearch-index/src/two_tier.rs:5263:45
+     |
+5263 |         let FsviTierObservation::V1(seed) = observe_tier(&seed_path).expect("observe seed") else {
+     |                                             ^^^^^^^^^^^^ not found in this scope
+
+error[E0425]: cannot find function `observe_tier` in this scope
+    --> crates/frankensearch-index/src/two_tier.rs:5282:45
+     |
+5282 |         let FsviTierObservation::V1(live) = observe_tier(&live_path).expect("observe live") else {
+     |                                             ^^^^^^^^^^^^ not found in this scope
+
+error[E0425]: cannot find function `observe_tier` in this scope
+    --> crates/frankensearch-index/src/two_tier.rs:5301:13
+     |
+5301 |             observe_tier(&v2_path).expect("observe v2")
+     |             ^^^^^^^^^^^^ not found in this scope
+
+error[E0425]: cannot find function `observe_tier` in this scope
+    --> crates/frankensearch-index/src/two_tier.rs:5359:13
+     |
+5359 |             observe_tier(&target_path).expect("observe target")
+     |             ^^^^^^^^^^^^ not found in this scope
+
+error[E0425]: cannot find function `observe_tier` in this scope
+    --> crates/frankensearch-index/src/two_tier.rs:5416:52
+     |
+5416 |         let FsviTierObservation::V1(observation) = observe_tier(&path).expect("observe") else {
+     |                                                    ^^^^^^^^^^^^ not found in this scope
+
+error[E0425]: cannot find function `observe_tier` in this scope
+    --> crates/frankensearch-index/src/two_tier.rs:5444:27
+     |
+5444 |         let observation = observe_tier(&path).expect("observe future schema");
+     |                           ^^^^^^^^^^^^ not found in this scope
+
+error[E0433]: cannot find type `FsviTierObservation` in this scope
+    --> crates/frankensearch-index/src/two_tier.rs:5263:13
+     |
+5263 |         let FsviTierObservation::V1(seed) = observe_tier(&seed_path).expect("observe seed") else {
+     |             ^^^^^^^^^^^^^^^^^^^ use of undeclared type `FsviTierObservation`
+
+error[E0433]: cannot find type `FsviTierObservation` in this scope
+    --> crates/frankensearch-index/src/two_tier.rs:5282:13
+     |
+5282 |         let FsviTierObservation::V1(live) = observe_tier(&live_path).expect("observe live") else {
+     |             ^^^^^^^^^^^^^^^^^^^ use of undeclared type `FsviTierObservation`
+
+error[E0433]: cannot find type `FsviTierObservation` in this scope
+    --> crates/frankensearch-index/src/two_tier.rs:5300:13
+     |
+5300 |         let FsviTierObservation::V2IdentityComplete(metadata) =
+     |             ^^^^^^^^^^^^^^^^^^^ use of undeclared type `FsviTierObservation`
+
+error[E0433]: cannot find type `FsviTierObservation` in this scope
+    --> crates/frankensearch-index/src/two_tier.rs:5358:13
+     |
+5358 |         let FsviTierObservation::V1(observation) =
+     |             ^^^^^^^^^^^^^^^^^^^ use of undeclared type `FsviTierObservation`
+
+error[E0433]: cannot find type `FsviTierObservation` in this scope
+    --> crates/frankensearch-index/src/two_tier.rs:5416:13
+     |
+5416 |         let FsviTierObservation::V1(observation) = observe_tier(&path).expect("observe") else {
+     |             ^^^^^^^^^^^^^^^^^^^ use of undeclared type `FsviTierObservation`
+
+error[E0433]: cannot find type `FsviTierObservation` in this scope
+    --> crates/frankensearch-index/src/two_tier.rs:5448:17
+     |
+5448 |                 FsviTierObservation::UpgradeRequired(FsviUpgradeRequired {
+     |                 ^^^^^^^^^^^^^^^^^^^ use of undeclared type `FsviTierObservation`
+
+Some errors have detailed explanations: E0422, E0425, E0433, E0599.
+For more information about an error, try `rustc --explain E0422`.
+warning: `frankensearch-index` (lib test) generated 5 warnings
+error: could not compile `frankensearch-index` (lib test) due to 19 previous errors; 5 warnings emitted
