@@ -16,7 +16,7 @@ grep -nE "[Rr]etry (condition|predicate|only|performance|the|when|if)|Retry:|Do 
 
 | class | count | action |
 |---|---:|---|
-| A. Predicate satisfied, **re-run dispatched this session** | 1 | `bd-3srq` |
+| A. Predicate satisfied, **re-run executed -> now DECIDED** | 1 | `bd-3srq` (was BLOCKED/UNTIMED) |
 | B. Predicate satisfied **and already re-decided** in-ledger | 5 | none — verified current |
 | C. **Decision basis VOID** (rule withdrawn) — relabelled UNDECIDABLE, no re-run needed | 6 | relabelled below |
 | D. Predicate **NOT satisfied — fleet/isolation** | 3 | stays blocked, evidence recorded |
@@ -105,7 +105,7 @@ records.
 
 ---
 
-## Class A — predicate satisfied, re-run dispatched
+## Class A — predicate satisfied, re-run executed, row now DECIDED
 
 **`bd-3srq` — revalidate top-k same-invocation A/A under the median-CI gate.**
 
@@ -132,13 +132,49 @@ missing step was running it.
 Dispatched this session via
 `rch exec --base 3debdf25 --clean-overlay --no-overlay -- cargo run --profile
 release-perf -p frankensearch-index --features bench-internals --bin
-int8_vs_f16_fast_ab`. **Result recorded in the RESULT section at the foot of
-this card.** Until that section carries numbers, `bd-3srq` remains
-`BLOCKED/UNTIMED` and nothing here converts it.
+int8_vs_f16_fast_ab`. **Result in the RESULT section below.**
 
-## RESULT — `bd-3srq`
+## RESULT — `bd-3srq` — **DECIDED** (was `BLOCKED/UNTIMED` since 2026-07-22)
 
-<!-- ITEM3-RESULT -->
+Strict-remote `rch exec` on worker `vmi1227854`, `release-perf`, exit 0.
+Self-reported from inside the process:
+
+```
+bench_elf_sha256=d66a2799cdadd02cccd5cce8bda18974b31f484334c5b3fdddcc3da220007cd5
+  (5156976 bytes)
+  .../.rch-target-vmi1227854-pool-ca3e8fde774fd1d0f596c8740f7c6b9e/release-perf/int8_vs_f16_fast_ab
+
+[recall] int8_two_pass vs f16-exact: set-recall@10=1.0000 exact-order-match=32/32
+[null]   fast_scan: median 1.0351 median_ci95 [0.9529, 1.0738] p5 0.7741 p95 1.3405 admissible=true
+[lever]  fast_scan int8/f16 median 0.6033 median_ci95 [0.5536, 0.6803] p5 0.3058 p95 1.3342
+         -> DECIDABLE WIN (int8 two-pass faster, candidate-lossless)
+```
+
+**Every clause of the retry predicate is satisfied:** same executing ELF
+(self-reported), same-invocation A/A and A/B, exact 32/32 order with
+recall@10 = 1.0000, and a median-CI/null-floor decision. Raw CV was not used.
+
+**Verdict: DECIDABLE — the shipped int8 two-pass is 0.6033 of the exact f16 scan
+(~1.66×).** The lever median 0.6033 sits below the null's p5 of 0.7741, so it
+clears the null floor rather than sitting inside it. This **revalidates an
+already-shipped path**; it is not a new KEEP and no source changed.
+
+**Comparison class: SELF-SPEEDUP** — our int8 two-pass against our own exact f16
+scan. There is no incumbent arm in this harness, so this result says nothing
+about how either compares to faiss/usearch/Lucene.
+
+### Two caveats that must travel with the number
+
+1. **The null median is 1.0351, which fails a strict 1.000 ± 0.030 median
+   clause.** The harness's own `is_admissible_null()` passes it because the null
+   CI95 `[0.9529, 1.0738]` contains 1.0, and that is the contract this repo
+   wrote. But the A/A control showed a 3.5% asymmetry, so the *point estimate*
+   0.6033 should be read as "decidably below the floor", not as a precise ratio.
+2. **The null band is wide — `[0.7741, 1.3405]`.** The fleet was at 15
+   concurrent builds during the run. The lever clears the floor by a large
+   margin, so the direction is robust to that noise; a tighter number would need
+   a quiet worker. This is the same environmental limit that keeps Class D
+   blocked.
 
 ---
 

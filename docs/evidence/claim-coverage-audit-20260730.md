@@ -223,6 +223,31 @@ Form (b)'s **44** is mechanically reproducible; the **54** is 44 plus 10
 hand-identified older-format headings, so the defensible total is a range,
 **137–147, with 137 as the mechanically reproducible floor**.
 
+## Surface sweep extended (2026-07-31): CHANGELOG is the *only* exposed surface
+
+The 2026-07-30 audit checked `README.md`, `CHANGELOG.md`, crate `description`
+fields and `lib.rs` rustdoc — it did **not** check the 16 other tracked
+`README.md` files, which ship to crates.io alongside their crates. Swept:
+
+```bash
+for f in $(git ls-files '*README*.md'); do
+  echo "$(grep -cE '[0-9]+(\.[0-9]+)?\s*[x×]|faster|speedup|beats|fastest' "$f")  $f"
+done
+```
+
+Four files match; **all four are false positives** and none is a perf claim:
+
+| file | match | what it actually is |
+|---|---|---|
+| `crates/frankensearch-embed/README.md:52` | "fastest available embedder" | describes `stack.fast()` selecting within *our own* embedder set |
+| `crates/frankensearch-lexical/README.md:7` | "2x BM25 boost" | a title **scoring** factor, not a speed ratio |
+| `crates/frankensearch-rerank/README.md:9` | "faster retrieval methods" | architectural prose about the shortlist stage |
+| `.bench-history/README.md:19` | "2x null-floor margin" | a **gate parameter**, not a result |
+
+So the public exposure is bounded exactly: **`CHANGELOG.md:65-68` is the only
+shipped surface in this repository carrying a perf claim.** That makes the
+correction above the complete Tier-0 inventory, not a sample.
+
 ## Method note
 
 The audit ran the right command and misreported its output. A grep whose result

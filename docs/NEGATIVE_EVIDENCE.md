@@ -16724,3 +16724,55 @@ implements. It is not blocked on a lever; it is blocked on a quiet worker.
 
 Full sweep of all 84 retry predicates:
 `docs/evidence/retry-predicate-sweep-20260731.md`.
+
+
+### 2026-07-31 — RESOLVED: `bd-3srq` top-k revalidation finally reached its timed path — the shipped int8 two-pass is 0.6033 of the exact f16 scan, decidable (BlackThrush)
+
+`bd-3srq` had been `BLOCKED/UNTIMED` since 2026-07-22 across three attempts. The
+2026-07-27 model-integrity correction restated its predicate as *same executing
+ELF, same-invocation A/A and A/B, exact 32/32 order and recall@10 = 1.0000, and a
+median-CI/null-floor decision; raw CV is diagnostic only.* FoggySquirrel repaired
+build/link admission on 2026-07-26 (`hz2`, 9m10s, exit 0) but **did not execute
+the binary**, so the row stayed blocked for a reason that had already been fixed.
+
+Every predicate clause was already implemented in the retained harness
+`crates/frankensearch-index/benches/int8_vs_f16_fast_ab.rs`
+(`print_bench_elf_sha256()`, `paired_median_ratio` A/A at `:152` and A/B at
+`:153`, `is_admissible_null()` at `:162`, `decidable_against()` at `:172`). The
+only missing step was running it. Executed this session, strict-remote
+`rch exec --base 3debdf25 --clean-overlay --no-overlay` on worker `vmi1227854`,
+`release-perf`, exit 0. Self-reported from inside the process:
+
+```
+bench_elf_sha256=d66a2799cdadd02cccd5cce8bda18974b31f484334c5b3fdddcc3da220007cd5
+  (5156976 bytes) .../release-perf/int8_vs_f16_fast_ab
+
+[recall] int8_two_pass vs f16-exact: set-recall@10=1.0000 exact-order-match=32/32
+[null]   fast_scan: median 1.0351 median_ci95 [0.9529, 1.0738] p5 0.7741 p95 1.3405 admissible=true
+[lever]  fast_scan int8/f16 median 0.6033 median_ci95 [0.5536, 0.6803] p5 0.3058 p95 1.3342
+         -> DECIDABLE WIN (int8 two-pass faster, candidate-lossless)
+```
+
+**Outcome: DECIDABLE.** The lever median 0.6033 sits below the same-invocation
+A/A null's p5 of 0.7741, so it clears the null floor instead of sitting inside
+it. Losslessness held exactly: set-recall@10 = 1.0000 with 32/32 exact order
+match.
+
+**Comparison class: SELF-SPEEDUP** — the shipped int8 two-pass against our own
+exact f16 scan. No incumbent arm exists in this harness, so this says nothing
+about faiss/usearch/Lucene-class engines. This **revalidates an already-shipped
+path**; it is not a new lever, and no source changed.
+
+**Two caveats travel with the number.**
+
+1. The **A/A null median is 1.0351**, which fails a strict `1.000 +/- 0.030`
+   median clause. The harness admits it because the null CI95 `[0.9529, 1.0738]`
+   contains 1.0, which is the contract this repository wrote — but the control
+   showed a 3.5% asymmetry, so 0.6033 should be read as *decidably below the
+   floor*, not as a precise ratio.
+2. The **null band is wide, `[0.7741, 1.3405]`**, because the fleet was at 15
+   concurrent builds. The margin is large enough that the direction survives, but
+   a quotable point estimate needs a quiet worker — the same limit that keeps the
+   fleet-isolation predicates blocked.
+
+Full sweep context: `docs/evidence/retry-predicate-sweep-20260731.md`.
