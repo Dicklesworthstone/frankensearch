@@ -1,4 +1,4 @@
-# Claim conversion #1 — "the fastest lossless vector-search primitive" vs a live third-party incumbent (2026-07-31, BlackThrush)
+# Claim conversion #1 — "the fastest lossless vector-search primitive" is REFUTED against a live third-party incumbent (2026-07-31, BlackThrush)
 
 **Claim under test:** `origin/main:CHANGELOG.md:82` (this working tree: `:66`) —
 *"Lossless quantized search: FSVI 4-bit two-pass, the fastest lossless
@@ -67,11 +67,15 @@ CPU/wall and observed thread count are published per arm.
   (64 centroids, noise 0.30) written once to an FSVI index; the identical f32
   vectors, in the identical order, form the incumbent's `Array2`. Positional id
   `i` therefore corresponds to `doc-{i:06}` in both arms.
-- **Interleaved rounds with order reversal.** Arm order is reversed on odd
-  rounds (AB/BA) so linear drift cancels.
-- **A/A null from two replicates of the incumbent arm** (`inc_a`, `inc_b`) run
-  at opposite ends of each round. Null ratio distribution = `inc_b/inc_a` per
-  round.
+- **Bracketed control (final design, run 3).** Every subject is measured
+  *between* two incumbent runs and scored `X / mean(I_before, I_after)`, and the
+  A/A null is an incumbent run scored by the **same rule** — so null and
+  candidate ratios share one structure and one drift cancellation. Subject order
+  rotates each round. This is the control `PERF_LEDGER.md:822-824` already
+  validated on this fleet (B/A 0.9999).
+  *Runs 1 and 2 used a whole-round A/A (replicates at opposite ends of the
+  round) and its null was dirty both times; see "How the decidable answer was
+  reached".*
 - **Corrected null gate with the median clause.** The null is admissible only
   if its *median* lies within 1.000 ± 0.030; a candidate ratio is decidable only
   if it falls **outside** the null's [p5, p95]. A point estimate inside the band
@@ -93,7 +97,7 @@ bench and its `Cargo.toml` overlaid. Bench source:
 |---|---|---|---|
 | 1 (15 rounds) | `dff84b78…30a271` | as committed in `f23adfd0` **except** `unwrap_or(15)` instead of `unwrap_or(61)` | **no** — that literal was edited before the first commit |
 | 2 (61 rounds) | `905fa959…bb7924` | exactly `f23adfd0` | yes |
-| 3 (bracketed) | see below | the bracketed rewrite | yes |
+| 3 (bracketed) | `3a99d494…cdcc6e` | the bracketed rewrite, as committed | yes |
 
 **Run 1's exact source is not in git**, and that is a real defect in this card,
 not a rounding of one. It differs from the committed file by a single integer
@@ -247,18 +251,72 @@ environmental, not sampling error** — this is a shared, contended VPS, and mor
 samples of a drifting process do not converge. That is the method lesson: when a
 null is dirty because the host is noisy, `n` is the wrong lever.
 
+## Results — run 3 (61 rounds, BRACKETED): **null CLEAN, claim DECIDABLY REFUTED at equal threads**
+
+The whole-round A/A was replaced with a bracketing control (see the bench
+header). Same worker `vmi1152480`, same fixture, `rounds=61`,
+`elf_sha256 = 3a99d4940d987778e83cd80637995f24ec92a01bf2a710931e1091a1f7cdcc6e`,
+exit 0. Losslessness reconfirmed a third time on a third independent ELF:
+32/32 on all three definitions.
+
+```
+--- PER-ARM (median wall; 61 rounds x 5 slots, each = 32 queries) ---
+arm                             median_us/q   cpu/wall        n
+incumbent_batch32_bracket           1961.66       0.98      366
+cand_4bit_mult5_threads1            3131.09       0.99       61
+cand_4bit_mult5_default             2661.39       2.51       61
+ours_exact_flat_default             2676.27       2.81       61
+incumbent_null_AA                   1872.06       0.99       61
+incumbent_gemv_nq1                  8382.91       1.00       61
+
+--- A/A NULL (incumbent bracketed by incumbents, same rule as every ratio) ---
+null_median = 0.9814   null_p5 = 0.7656   null_p95 = 1.4825
+null_gate(median within 1.000 +/- 0.030) = CLEAN
+
+--- BRACKETED RATIOS vs incumbent_batch32 (1961.66 us/query) ---
+cand_4bit_mult5_threads1 = 1.5790 (0.63x) [p5 1.3040, p95 3.0279]  SLOWER (outside null)
+cand_4bit_mult5_default  = 1.1575 (0.86x) [p5 0.6521, p95 2.1822]  WASH (inside null)
+ours_exact_flat_default  = 1.3369 (0.75x) [p5 0.7371, p95 3.4275]  WASH (inside null)
+incumbent_gemv_nq1       = 4.3293 (0.23x) [p5 3.6938, p95 6.6701]  SLOWER (outside null)
+
+self_vs_self: cand_default / ours_exact_flat = 0.8658 (1.15x)
+```
+
+**The bracketing fixed the null**: median 1.0598 (whole-round, 61 rounds) →
+**0.9814** (bracketed, same rounds, same worker). The dispersion really was
+drift across the replicate gap, and closing that gap closed the null.
+
+### The decision
+
+> **At equal threads the FSVI 4-bit two-pass is DECIDABLY SLOWER than a
+> third-party BLAS-class exact scan: ratio 1.5790, i.e. the incumbent is
+> ~1.58× faster.** The candidate median 1.5790 lies above the null's p95 of
+> 1.4825, so it clears the floor by the pre-declared rule.
+
+**Margin honesty:** it clears p95 by 6.5%. That is a pass, not a rout. The
+verdict is "decidably slower", and the *magnitude* (1.58×) is a point estimate
+whose own p5–p95 is wide (`[1.3040, 3.0279]`).
+
+**As shipped, the candidate reaches only parity.** Given ~2.5 effective threads
+against the incumbent's 1 (`cpu/wall` 2.51 vs 0.98), the ratio is 1.1575 —
+**inside the null, a WASH.** So the shipped configuration does not beat a
+single-threaded third-party exact scan even with a 2.5× thread advantage.
+
+**The incumbent was reported at its best, and that is now proven rather than
+asserted:** the unbatched GEMV shape is decidably 4.33× slower than the batched
+GEMM, so using batched as the incumbent number was the generous choice.
+
 ## Verdict
 
 | half of the claim | outcome |
 |---|---|
 | **"lossless"** | **SUPPORTED.** 32/32 on all three definitions, twice, on two independent ELFs. This is a deterministic set comparison, so it needs no null and the fleet noise cannot touch it. It is also *stronger* than the ledger ever showed: the ledger only tested against our own f16 scan; it is now verified against an f32 exhaustive scan. |
-| **"the fastest … primitive"** | **NOT SUPPORTED, and not refutable on this infrastructure either.** Both runs are UNDECIDABLE by the pre-declared gate. |
+| **"the fastest … primitive"** | **REFUTED.** Run 3's bracketed A/A null is CLEAN (0.9814) and the equal-threads ratio 1.5790 clears its p95 (1.4825). The primitive is **decidably slower** than a third-party BLAS-class exact scan at equal threads, and only a **WASH** even when given ~2.5× the threads. |
 
-**All six ratio observations across two runs and two binaries put the candidate
-slower than the incumbent** (1.62, 1.18 / 1.54, 1.62 vs the incumbent; and our
-own exact scan slower still). But — the same discipline the ledger gate enforced
-on me elsewhere this session — **consistent direction across runs is a prior, not
-a decision.** No ratio from this card may be quoted.
+Runs 1 and 2 were undecidable (dirty null) and pointed the same way; run 3 made
+it decidable. Nine ratio observations across three runs and three independent
+binaries all put the candidate slower than or equal to the incumbent, and the one
+run with a clean null decides it.
 
 ### The retraction does not depend on the measurement
 
@@ -278,12 +336,18 @@ corrected from this checkout** — local `main` is 270 commits behind and its HE
 does not contain the line, while the working-tree `CHANGELOG.md` carries an
 unrelated peer's uncommitted 170-line draft that a commit here would sweep in.
 
-### What a decidable answer needs
+### How the decidable answer was reached
 
-A quiet or CPU-pinned host, both arms in one invocation as here. The harness is
-done and reusable; only the environment is missing. This is the same blocker that
-keeps the Class-D retry predicates in
-`retry-predicate-sweep-20260731.md` unsatisfied.
+Not by a quieter host — by a better control. Runs 1 and 2 blamed the fleet; the
+real fault was the measurement design placing the two A/A replicates ~600 ms
+apart, so the null absorbed drift the candidate ratio never saw. Bracketing each
+subject between two incumbent runs, and scoring the null by that same rule,
+brought the null from 1.0598 to 0.9814 on the same worker with the same round
+count.
+
+**Method lesson: when a null is dirty, check the control's geometry before
+blaming the host or reaching for more samples.** Raising n from 15 to 61 made
+this null worse; restructuring the control fixed it in one run.
 
 ## Disclosed asymmetries
 

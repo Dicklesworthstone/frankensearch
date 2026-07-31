@@ -16776,3 +16776,82 @@ path**; it is not a new lever, and no source changed.
    fleet-isolation predicates blocked.
 
 Full sweep context: `docs/evidence/retry-predicate-sweep-20260731.md`.
+
+
+### 2026-07-31 — REFUTED: "the fastest lossless vector-search primitive" — the FSVI 4-bit two-pass is decidably SLOWER than a live third-party exact scan at equal threads (BlackThrush)
+
+**Claim under test:** `origin/main:CHANGELOG.md:82` — *"Lossless quantized
+search: FSVI 4-bit two-pass, the fastest lossless vector-search primitive"* —
+the only unbounded superlative on any public surface of this repository. It also
+travels as the subject line of commit `f04074a4`. Its entire evidentiary base is
+`docs/PERF_LEDGER.md:825` and `:827`, and both compare against **our own** int8
+two-pass and **our own** flat f16 scan. No third-party arm existed anywhere in
+its provenance.
+
+**Actual legacy incumbent: `ndarray` 0.17.2 over `matrixmultiply` 0.3.10** —
+the `faiss::IndexFlatIP` structure for exact search (dense
+`queries[nq x d] . corpus^T[d x N]` GEMM, then bounded top-k per row). Verified
+third-party and BLAS-free: `ndarray`'s lockfile deps list `matrixmultiply`, and
+`grep -cE '^name = "(blas-src|cblas-sys|openblas-src|netlib-src)"' Cargo.lock`
+returns 0, so `Array2::dot` lowers to `matrixmultiply`'s runtime-dispatched
+AVX2/FMA sgemm. **Both arms ran side by side in one binary, one invocation, over
+one fixture.**
+
+Strict-remote `rch exec --base 3debdf25 --clean-overlay` on worker
+`vmi1152480`, host `frankenlibc-test`, AMD EPYC (with IBPB), nproc 10, exit 0.
+Executing ELF SHA-256, self-reported from inside the process:
+`3a99d4940d987778e83cd80637995f24ec92a01bf2a710931e1091a1f7cdcc6e`.
+N=100000, dim=384, k=10, 32 queries, mult=5, 61 rounds.
+
+**Same-invocation A/A null: median 0.9814, p5 0.7656, p95 1.4825 — CLEAN.**
+The null is an incumbent run bracketed by incumbent runs and scored by the same
+rule as every candidate ratio, so it measures exactly the noise the candidate
+ratio is exposed to. It clears the 1.000 +/- 0.030 median clause.
+
+| subject | numeric incumbent ratio | [p5, p95] | verdict |
+|---|---:|---|---|
+| 4-bit two-pass, **1 thread both arms** | **1.5790** | [1.3040, 3.0279] | **SLOWER, outside null** |
+| 4-bit two-pass, as shipped (~2.5 eff threads vs incumbent's 1) | 1.1575 | [0.6521, 2.1822] | WASH, inside null |
+| our exact flat scan | 1.3369 | [0.7371, 3.4275] | WASH, inside null |
+| incumbent unbatched GEMV | 4.3293 | [3.6938, 6.6701] | slower than batched — batched is the incumbent's best shape |
+
+`cpu/wall` per arm confirms the thread discipline: incumbent 0.98, pinned
+candidate 0.99, default candidate 2.51. (`/proc/self/task` is process-wide and
+cannot distinguish arms; cpu/wall is the per-arm concurrency evidence.)
+
+**Losslessness is SUPPORTED and is strengthened, not weakened.** Top-10 doc-id
+set equality over 32 queries, on three independent ELFs:
+`candidate == ours_exact_f16` 32/32, `candidate == incumbent_f32` 32/32,
+`ours_exact_f16 == incumbent_f32` 32/32. The ledger had only ever tested the
+first of those; the primitive is now verified lossless against a full-precision
+f32 exhaustive scan.
+
+**Decision: the speed superlative is REFUTED; the losslessness claim stands.**
+At equal threads the primitive is decidably slower than a third-party exact
+scan, and as shipped it reaches only parity despite a ~2.5x thread advantage.
+Margin honesty: 1.5790 clears the null p95 of 1.4825 by 6.5% — a pass, not a
+rout — and the magnitude's own p5-p95 is wide, so "decidably slower" is the
+finding and 1.58x is a point estimate.
+
+**Comparison class: INCUMBENT.**
+
+**Method note — the null was fixed by geometry, not by a quieter host or more
+samples.** Two earlier runs used a whole-round A/A with the replicates at
+opposite ends of each round; both nulls were dirty (median 1.0321 at 15 rounds,
+1.0598 at 61), and raising n made it *worse* because the dispersion was host
+drift across the ~600 ms replicate gap, not sampling error. Bracketing each
+subject between two incumbent runs — the control `PERF_LEDGER.md:822-824`
+already validated on this fleet at B/A 0.9999 — brought the null to 0.9814 on
+the same worker at the same round count. When a null is dirty, check the
+control's geometry before blaming the fleet.
+
+**Scope.** One incumbent does not settle "fastest" in either direction; faiss,
+usearch and hnswlib remain unmeasured and none is in-tree. The incumbent holds
+f32 (146.5 MiB) against the candidate's 4-bit pass-1 slab (18.3 MiB), so the
+comparison is generous to the candidate on working set and does not cover
+faiss's own quantized indexes. Fixture is clustered (64 centroids, noise 0.30).
+
+Full card: `docs/evidence/fsvi-4bit-vs-incumbent-20260731.md`.
+Retraction filed as `bd-retract-fastest-lossless-superlative-3ush8` — it cannot
+be landed from this checkout, which is 270 commits behind `origin/main` and
+whose HEAD does not contain the line.
