@@ -424,7 +424,7 @@ impl InMemoryVectorIndex {
     /// Results are **bit-identical** to [`Self::search_top_k`] whenever pass-1
     /// retains the true top-k (recall = 1). Measured ~1.4–1.5× faster than the
     /// parallel exact path across 10k–100k at `candidate_multiplier = 5` (int8 is
-    /// half the bytes + an integer `widening_mul` MAC — see `docs/PERF_LEDGER.md`), at
+    /// half the bytes + an integer `mul_widen` MAC — see `docs/PERF_LEDGER.md`), at
     /// the cost of *approximate* recall.
     ///
     /// **Tuning `candidate_multiplier`:** recall@10 = 1.0 held down to `mult = 2`

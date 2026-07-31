@@ -739,7 +739,7 @@ pub fn dot_product_f32_bytes_f32_generic(stored_bytes: &[u8], query: &[f32]) -> 
 ///
 /// This is the candidate **pass-1 kernel** for an int8 ADC two-pass scan (`bd-b5wl`):
 /// quantized vectors are 1 byte/elem (half the bandwidth of f16) and the multiply
-/// accumulates in integer lanes. `i16x8::widening_mul` keeps every product in full i32
+/// accumulates in integer lanes. `i16::mul_widen` keeps every product in full i32
 /// precision, so the only overflow bound is the i32 accumulator (a 512-dim dot of
 /// ±127 values peaks at ~8.3M, far below `i32::MAX`) — exact for any realistic dim.
 ///
@@ -1265,10 +1265,10 @@ pub fn dot_i8_i8_generic(stored: &[i8], query: &[i8]) -> i32 {
     let (s32, s_rem32) = stored.as_chunks::<32>();
     let (q32, q_rem32) = query.as_chunks::<32>();
     for (s, q) in s32.iter().zip(q32) {
-        acc0 += w8::<0>(s).widening_mul(w8::<0>(q));
-        acc1 += w8::<8>(s).widening_mul(w8::<8>(q));
-        acc2 += w8::<16>(s).widening_mul(w8::<16>(q));
-        acc3 += w8::<24>(s).widening_mul(w8::<24>(q));
+        acc0 += w8::<0>(s).mul_widen(w8::<0>(q));
+        acc1 += w8::<8>(s).mul_widen(w8::<8>(q));
+        acc2 += w8::<16>(s).mul_widen(w8::<16>(q));
+        acc3 += w8::<24>(s).mul_widen(w8::<24>(q));
     }
     let mut sum = (acc0 + acc1) + (acc2 + acc3);
 
@@ -1276,7 +1276,7 @@ pub fn dot_i8_i8_generic(stored: &[i8], query: &[i8]) -> i32 {
     let (s8, s_rem) = s_rem32.as_chunks::<8>();
     let (q8, q_rem) = q_rem32.as_chunks::<8>();
     for (s, q) in s8.iter().zip(q8) {
-        sum += i16x8::from(s.map(i16::from)).widening_mul(i16x8::from(q.map(i16::from)));
+        sum += i16x8::from(s.map(i16::from)).mul_widen(i16x8::from(q.map(i16::from)));
     }
     let mut result = sum.reduce_add();
     for (s, q) in s_rem.iter().zip(q_rem) {
