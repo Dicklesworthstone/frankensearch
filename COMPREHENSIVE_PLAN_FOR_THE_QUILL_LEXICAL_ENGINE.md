@@ -488,7 +488,7 @@ Reference machines: (a) Apple Silicon ≥ M2 Pro-class (P/E asymmetric, 10–12 
 | Gate | Target (provisional) |
 |---|---|
 | **QG-1 Bulk indexing, multi-core** (medium profile, positions on, 8 threads, commit included) | ≥ **3.0×** tantivy docs/s; and ≥ 60% of single-pass tokenization bandwidth ceiling (measured tokenize-only throughput) as the honesty denominator |
-| **QG-2 Bulk indexing, single-thread** | ≥ **1.5×** tantivy |
+| **QG-2 Bulk indexing, single-thread** | ≥ **1.5×** tantivy. BINDING Q2C COMPARATOR CONTRACT 2026-07-31: QG-2 compares both arms symmetrically in memory with no durable storage. Continuous timing begins at the first document feed and ends only after terminal searchable visibility plus complete worker, merge, and queue quiescence. Commit is the searchable-visibility boundary, not durable publication. QG-2 excludes fsync, F_FULLFSYNC, crash recovery, durable publication, and on-disk-byte measurements. Durable gates and production-source durability nonregression remain mandatory outside QG-2. |
 | **QG-3 Watch-mode incremental** (5k-update batches, upsert-heavy) | ≥ existing contract floor (5k updates/s, 25ms p95) with ≥ **4×** headroom on update→searchable latency vs tantivy commit+reload path |
 | **QG-4 Commit latency** (100k-doc index, warm) | p99 ≤ 50ms sealed-commit; visibility lead (searchable-before-commit) demonstrated in the harness |
 | **QG-5 Full compaction** (1M docs, 20% tombstones) | ≥ **5×** tantivy force-merge wall-clock |
@@ -498,7 +498,7 @@ Reference machines: (a) Apple Silicon ≥ M2 Pro-class (P/E asymmetric, 10–12 
 | **QG-9 Cold open** | `open()` of a 1M-doc index ≤ 50ms (manifest + lazy sections) vs tantivy reader open |
 | **QG-10 Dependency surface** | Default `lexical` feature: tantivy + its transitive tree removed; `cargo tree` delta recorded in the plan's evidence bundle |
 
-Method: the five standing laws — (1) no benchmark-only semantics (durability settings identical to shipped defaults, commits included in indexing numbers); (2) distributions, not averages (p50/p95/p99 + cv_pct always); (3) never hide maintenance (merge/compaction time inside the bulk-index window); (4) memory is first-class (bytes/doc includes tombstones, block-max, idmap); (5) one lever per change with MT8-style ≥0.1% frame attribution, ledgered per `NEGATIVE_EVIDENCE.md` ratio conventions (revert in [0.97,1.03]). `.bench-history` JSON per gate, pass-over-pass ratchet, committed baselines. RCH offload for the matrix; local runs only for flamegraph attribution.
+Method: the five standing laws — (1) no benchmark-only semantics (each gate uses its explicit comparator scope; both arms perform matched work and consume results symmetrically; durable gates match shipped durability, while QG-2 uses the symmetric in-memory terminal-visibility contract above; marker-only commit latency and unlabeled positions-off substitutions remain forbidden); (2) distributions, not averages (p50/p95/p99 + cv_pct always); (3) never hide maintenance (merge/compaction time inside the bulk-index window); (4) memory is first-class (bytes/doc includes tombstones, block-max, idmap); (5) one lever per change with MT8-style ≥0.1% frame attribution, ledgered per `NEGATIVE_EVIDENCE.md` ratio conventions (revert in [0.97,1.03]). `.bench-history` JSON per gate, pass-over-pass ratchet, committed baselines. RCH offload for the matrix; local runs only for flamegraph attribution.
 
 ---
 

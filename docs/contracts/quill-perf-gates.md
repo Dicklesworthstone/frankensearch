@@ -14,7 +14,7 @@ other manifest byte still invalidates prior evidence.
 
 ## The five standing laws (bind every published number)
 
-1. **No benchmark-only semantics.** Durability settings, commits, and result consumption match shipped defaults; no marker-only "commit latency"; no positions-off numbers marketed against positions-on defaults without saying so.
+1. **No benchmark-only semantics; comparator scope is explicit.** BINDING Q2C COMPARATOR CONTRACT 2026-07-31: QG-2 compares both arms symmetrically in memory with no durable storage. Continuous timing begins at the first document feed and ends only after terminal searchable visibility plus complete worker, merge, and queue quiescence. Commit is the searchable-visibility boundary, not durable publication. QG-2 excludes fsync, F_FULLFSYNC, crash recovery, durable publication, and on-disk-byte measurements. Durable gates and production-source durability nonregression remain mandatory outside QG-2. Across every gate, both arms still perform matched work and consume results symmetrically; non-QG-2 comparator settings match the gate's shipped scope; no marker-only "commit latency" is admissible; and no positions-off number may be marketed against a positions-on default without saying so.
 2. **Distributions, not averages.** p50/p95/p99, a deterministic bootstrap
    95% confidence interval on the median, MAD, and cv_pct provenance always;
    extreme quantiles only with sufficient observations. `cv_pct` is never an

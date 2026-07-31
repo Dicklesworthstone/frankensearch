@@ -59,11 +59,12 @@ first-class; one lever per change). This campaign adds:
    dispersion on that profile, not copied from another profile. A lever may
    KEEP on one profile and NoClaim on another; the ledger row must say so
    explicitly.
-7. **Platform-symmetric durability.** On macOS, any commit/durability-adjacent
-   number is admissible only with `F_FULLFSYNC` treatment attested symmetric
-   for both engines (macOS `fsync(2)` does not guarantee media durability
-   without it). This is Law 1 applied to Apple Silicon; the attestation lives
-   in the run's provenance JSON.
+7. **QG-2 comparator scope and platform durability.** BINDING Q2C COMPARATOR CONTRACT 2026-07-31: QG-2 compares both arms symmetrically in memory with no durable storage. Continuous timing begins at the first document feed and ends only after terminal searchable visibility plus complete worker, merge, and queue quiescence. Commit is the searchable-visibility boundary, not durable publication. QG-2 excludes fsync, F_FULLFSYNC, crash recovery, durable publication, and on-disk-byte measurements. Durable gates and production-source durability nonregression remain mandatory outside QG-2.
+   On macOS, durable-gate evidence remains admissible only with
+   `F_FULLFSYNC` treatment attested symmetrically for both engines (macOS
+   `fsync(2)` does not guarantee media durability without it). The
+   attestation lives in the durable run's provenance JSON and is not a QG-2
+   timed operation.
 
 ## 2. Hardware/profile matrix
 
@@ -318,7 +319,7 @@ predicate passes.
 | Term-interner hashing + arena | interner re-hash per field + SipHash-class cost | aHash/FxHash family is a proven repo-wide win; measure, don't assume. |
 | Postings accumulation growth | per-term Vec realloc churn vs arena-backed exponential chunks (the incumbent's `expull` trick) | dhat census first. |
 | Seal-time section checksum cost | if sealing hashes every byte with a heavy hash, it is a prime constant-factor suspect | Algorithm change = FSLX format-registry bump; EV-scored; registry owners coordinate. |
-| Commit-path fsync count | batch directory syncs; two-slot manifest bounds the floor | `strace -c` / `fs_usage` census first; Law 7 on macOS. |
+| Commit-path fsync count (durable gates only) | batch directory syncs; two-slot manifest bounds the floor | `strace -c` / `fs_usage` census first; Law 7 on macOS; excluded from QG-2 timing and evidence. |
 
 ### W3 — Parallel scale-out (QG-1 high-thread, QG-8; truth profiles: `trj-zen3-5995wx/{physical-64,smt2-128}`)
 

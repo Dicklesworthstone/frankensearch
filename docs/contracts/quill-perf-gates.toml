@@ -60,9 +60,19 @@ activated = false
 
 [gate.QG-2]
 name = "bulk indexing, single-thread"
-fixture = "medium; positions ON; threads = 1; commit included"
+fixture = "medium; positions ON; threads = 1; continuous first-feed through terminal searchable visibility and complete worker/merge/queue quiescence"
 target = "docs_per_sec >= 1.5x oracle"
 activated = false
+
+[gate.QG-2.qg2_contract]
+contract = "BINDING Q2C COMPARATOR CONTRACT 2026-07-31: QG-2 compares both arms symmetrically in memory with no durable storage. Continuous timing begins at the first document feed and ends only after terminal searchable visibility plus complete worker, merge, and queue quiescence. Commit is the searchable-visibility boundary, not durable publication. QG-2 excludes fsync, F_FULLFSYNC, crash recovery, durable publication, and on-disk-byte measurements. Durable gates and production-source durability nonregression remain mandatory outside QG-2."
+storage_topology = "symmetric_in_memory"
+durability_scope = "non_durable"
+timing_start = "first_document_feed"
+timing_end = "terminal_searchable_visibility_and_complete_worker_merge_queue_quiescence"
+commit_boundary = "searchable_visibility_not_durable_publication"
+excluded_operations = ["fsync", "F_FULLFSYNC", "crash_recovery", "durable_publication", "on_disk_bytes"]
+source_nonregression = "durable_gates_and_production_source_durability_remain_mandatory"
 
 [gate.QG-3]
 name = "watch-mode incremental"
