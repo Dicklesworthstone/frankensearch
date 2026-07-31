@@ -223,6 +223,36 @@ Form (b)'s **44** is mechanically reproducible; the **54** is 44 plus 10
 hand-identified older-format headings, so the defensible total is a range,
 **137–147, with 137 as the mechanically reproducible floor**.
 
+## A third coverage dimension the original audit did not measure: *reproducibility*
+
+Incumbent-ratio coverage is one axis. The repo's own contract also requires a
+claim to identify the **host** it ran on and the **executing ELF SHA-256**.
+Measured on the 83 dated claim rows (form (a)):
+
+| dimension | rows carrying it | share |
+|---|---:|---:|
+| names a host or RCH worker | **24 / 83** | 29% |
+| carries an ELF/binary SHA-256 **in the row** | **0 / 83** | 0% |
+
+```bash
+grep -cE "^\| 20[0-9]{2}-[0-9]{2}-[0-9]{2} \|" docs/PERF_LEDGER.md                      # 83
+grep -E  "^\| 20[0-9]{2}-[0-9]{2}-[0-9]{2} \|" docs/PERF_LEDGER.md \
+  | grep -cEi "worker|ovh-a|ovh-b|hz1|hz2|vmi[0-9]+|thinkstation|EPYC|Threadripper|Ryzen"  # 24
+grep -coE "\b[0-9a-f]{64}\b" docs/PERF_LEDGER.md                                        # 14 (whole file)
+```
+
+Fourteen 64-hex hashes appear in the file's narrative prose, so roughly **14 of
+147 claims can point at the binary that produced them**. The other ~133 cannot
+be re-executed as measured.
+
+**This is not academic.** The first conversion (`fsvi-4bit-vs-incumbent-20260731.md`)
+measured `PERF_LEDGER.md:825/827`'s "2.56×–3.22× vs our own flat scan" at
+**1.05×** on a 10-core EPYC host. Because those rows record no host, there is no
+way to tell whether that is a contradiction or a different machine. A ratio that
+moves by 3× across hosts, published without the host, is a host-conditional
+result presented as an unconditional one. Filed as
+`bd-fourbit-self-ratio-not-portable-1eqce`.
+
 ## Surface sweep extended (2026-07-31): CHANGELOG is the *only* exposed surface
 
 The 2026-07-30 audit checked `README.md`, `CHANGELOG.md`, crate `description`
