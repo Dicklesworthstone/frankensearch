@@ -16,6 +16,7 @@ mod generator;
 mod local_perf_runner;
 mod machine_class_registry;
 mod perf;
+mod perf_assembly;
 mod perf_evidence;
 mod perf_ratchet;
 mod qg6_prepared;
@@ -77,8 +78,11 @@ pub use generator::{
     SyntheticCorpusSpec, UnicodeLane, XLARGE_DOCUMENT_COUNT, ZipfExponent,
 };
 pub use local_perf_runner::{
-    LocalPerfRunConfig, LocalPerfRunError, LocalPerfRunOutput, local_perf_producer_contract_json,
-    run_local_perf_command,
+    LOCAL_PERF_ATTEMPT_RECEIPT_SCHEMA_VERSION, LocalPerfAttemptOutcome, LocalPerfAttemptReceipt,
+    LocalPerfInternalLifecycleGaps, LocalPerfInternalLifecycleUnavailable,
+    LocalPerfProcessLifecycle, LocalPerfRetryPredicate, LocalPerfRunConfig, LocalPerfRunError,
+    LocalPerfRunOutput, LocalPerfRunSelection, LocalPerfUnsupportedControl,
+    local_perf_producer_contract_json, run_local_perf_command, run_selected_local_perf_command,
 };
 pub use machine_class_registry::{
     DefaultFlipDisposition, ExecutionCapacitySemantics, ExecutionProfileId, HardwareClassId,
@@ -107,6 +111,20 @@ pub use perf::{
     estimate_paired_experiment, machine_fingerprint, parse_macos_time_max_rss_bytes,
     peak_rss_bytes, perf_manifest_contract_sha256, perf_writer_heap_bytes,
     seeded_balanced_pair_order, validate_matrix,
+};
+pub use perf_assembly::{
+    PERF_ASSEMBLY_ENGINE_LIFECYCLE_NO_CLAIM_CODE, PERF_ASSEMBLY_MAX_ARTIFACT_BYTES,
+    PERF_ASSEMBLY_MAX_RECEIPT_BYTES, PERF_ASSEMBLY_MAX_RETRY_PREDICATE_BYTES,
+    PERF_ASSEMBLY_MAX_SHARDS, PERF_ASSEMBLY_PARTIAL_SHARD_NO_CLAIM_CODE,
+    PERF_ASSEMBLY_PARTIAL_SHARD_NO_CLAIM_DETAIL, PERF_ASSEMBLY_PROCESS_TREE_NO_CLAIM_CODE,
+    PERF_EVIDENCE_ASSEMBLY_MATRIX_SCHEMA_VERSION, PERF_EVIDENCE_ASSEMBLY_SCHEMA_VERSION,
+    PERF_EVIDENCE_SEMANTIC_CELL_SET_SCHEMA_VERSION, PerfAssemblyMachineIdentity,
+    PerfAssemblyProcessReceipt, PerfEvidenceAssemblyArtifact, PerfEvidenceAssemblyCompatibility,
+    PerfEvidenceAssemblyCompleteness, PerfEvidenceAssemblyCounts, PerfEvidenceAssemblyError,
+    PerfEvidenceAssemblyFailedAttempt, PerfEvidenceAssemblyMatrixCell,
+    PerfEvidenceAssemblyMatrixManifest, PerfEvidenceAssemblyNoClaimCell,
+    PerfEvidenceAssemblyNoClaimSource, PerfEvidenceAssemblyReadiness, PerfEvidenceAssemblySource,
+    PerfEvidenceCellSource, PerfEvidenceSemanticCellSetSeal, VerifiedLocalPerfAttemptBundle,
 };
 pub use perf_evidence::{
     AbsoluteRelativeReconciliation, BuildIdentity, ColdCacheEvidence, CorpusIdentity,
