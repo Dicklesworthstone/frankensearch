@@ -78,6 +78,12 @@ brief. **The first finding is that this ranking's top tier is empty.**
 
 ### Tier 0 — public/user-facing unsupported claims: **0**
 
+> ⚠️ **THIS SECTION IS WRONG — see the CORRECTION below.** Tier 0 is **not**
+> empty: `origin/main:CHANGELOG.md` carries **10 public perf claims**, 0 of them
+> with an incumbent ratio, including an unbounded superlative at `:82`. The
+> table immediately below reports `CHANGELOG.md | 0`, which contradicts this
+> section's own reproduce command. Left in place so the error stays visible.
+
 Verified by grep across every published surface:
 
 | surface | perf claims found |
