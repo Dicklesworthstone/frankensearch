@@ -100,6 +100,19 @@ pub struct InMemoryVectorIndex {
     /// header's empty revision is preserved as `Some("")`, distinct from the
     /// `None` of a source with no header at all.
     embedder_revision: Option<String>,
+    /// Whether [`Self::space_fingerprint_hex`] was derived from a validated
+    /// FSVI v2 identity HEADER — i.e. read out of the artifact's own bytes
+    /// through exact admission — rather than declared by a caller
+    /// (bd-9xuj T2-C4-write, admission guards 2+8).
+    ///
+    /// `true` only on the [`Self::from_admitted_v2`] load path (the sole way
+    /// a v2 header reaches this type: [`VectorIndex::open`] is strictly v1).
+    /// A caller-supplied space on [`Self::from_vectors_with_identity`] is a
+    /// DECLARED identity: retained for joins and diagnostics, but it is a
+    /// claim by the constructing process, not an attestation persisted in an
+    /// artifact header, so it stays `false`. Attested-only seams (the refresh
+    /// identity-bound merge) admit against attested identity exclusively.
+    space_identity_attested: bool,
     /// Vector dimensionality.
     dimension: usize,
 }
@@ -221,6 +234,7 @@ impl InMemoryVectorIndex {
             space_fingerprint_hex: None,
             embedder_id: None,
             embedder_revision: None,
+            space_identity_attested: false,
             dimension,
         })
     }
@@ -266,6 +280,10 @@ impl InMemoryVectorIndex {
         // above stays the only compatibility authority.
         index.embedder_id = Some(space.logical_model_id.clone());
         index.embedder_revision = Some(space.immutable_revision.clone());
+        // A caller-supplied space is a DECLARED identity, not one attested by
+        // an artifact header (bd-9xuj T2-C4-write): the discriminator stays
+        // false, and attested-only seams must not admit against it.
+        index.space_identity_attested = false;
         Ok(index)
     }
 
@@ -338,6 +356,12 @@ impl InMemoryVectorIndex {
         let space_fingerprint_hex = index
             .identity_v2()
             .map(|identity| crate::fingerprint_hex(&identity.space_fingerprint));
+        // The attested bit derives from WHERE the identity came from
+        // (bd-9xuj T2-C4-write): `identity_v2()` is populated exclusively by
+        // the v2 header parse inside exact admission (`VectorIndex::open` is
+        // strictly v1), so its presence here means the fingerprint above was
+        // read out of the artifact's own validated header bytes.
+        let space_identity_attested = index.identity_v2().is_some();
         // Every FSVI header (v1 and v2) carries the embedder id/revision
         // strings; retain them verbatim instead of discarding them at load
         // (bd-9xuj T2-C2). A v1 header's empty revision stays `Some("")` —
@@ -356,6 +380,7 @@ impl InMemoryVectorIndex {
             space_fingerprint_hex,
             embedder_id,
             embedder_revision,
+            space_identity_attested,
             dimension,
         })
     }
@@ -386,6 +411,22 @@ impl InMemoryVectorIndex {
     #[must_use]
     pub fn space_fingerprint_hex(&self) -> Option<&str> {
         self.space_fingerprint_hex.as_deref()
+    }
+
+    /// Whether this index's space identity is FSVI-v2-HEADER-attested rather
+    /// than builder/caller-declared (bd-9xuj T2-C4-write, guards 2+8).
+    ///
+    /// `true` exactly when the index was loaded through
+    /// [`Self::from_admitted_v2`] from an artifact whose validated v2 header
+    /// carried the identity — i.e. the fingerprint in
+    /// [`Self::space_fingerprint_hex`] was read out of the artifact's own
+    /// bytes. A `Some` fingerprint with `false` here is a DECLARED identity
+    /// ([`Self::from_vectors_with_identity`]): usable for diagnostics and
+    /// query-side joins, but never sufficient for an attested-only admission
+    /// seam such as the refresh identity-bound merge.
+    #[must_use]
+    pub const fn space_identity_is_attested(&self) -> bool {
+        self.space_identity_attested
     }
 
     /// Embedder id recorded by this index's source, when the source carried
@@ -1381,6 +1422,28 @@ impl InMemoryTwoTierIndex {
             .and_then(InMemoryVectorIndex::space_fingerprint_hex)
     }
 
+    /// Whether the fast tier's space identity is FSVI-v2-HEADER-attested
+    /// rather than declared
+    /// (see [`InMemoryVectorIndex::space_identity_is_attested`];
+    /// bd-9xuj T2-C4-write, guards 2+8).
+    #[must_use]
+    pub const fn fast_identity_is_attested(&self) -> bool {
+        self.fast_index.space_identity_is_attested()
+    }
+
+    /// Whether the quality tier's space identity is FSVI-v2-HEADER-attested.
+    ///
+    /// `false` both when no quality index is loaded and when the loaded one's
+    /// identity was declared rather than read from a validated v2 header
+    /// (see [`InMemoryVectorIndex::space_identity_is_attested`];
+    /// bd-9xuj T2-C4-write, guards 2+8).
+    #[must_use]
+    pub fn quality_identity_is_attested(&self) -> bool {
+        self.quality_index
+            .as_ref()
+            .is_some_and(InMemoryVectorIndex::space_identity_is_attested)
+    }
+
     /// Embedder id retained by the fast tier, when its source carried one
     /// (see [`InMemoryVectorIndex::embedder_id`]; bd-9xuj T2-C2).
     #[must_use]
@@ -1716,6 +1779,10 @@ mod tests {
             "the index must expose exactly the space fingerprint it was built with"
         );
         assert_eq!(index.record_count(), 3);
+        assert!(
+            !index.space_identity_is_attested(),
+            "a caller-declared space is DECLARED, never header-attested (C4-write guards 2+8)"
+        );
 
         // The identity-less constructor stays typed-absent: no fabrication.
         let (doc_ids, vectors) = identity_rows(dim, 3);
@@ -1725,6 +1792,7 @@ mod tests {
             None,
             "an identity-less build must never fabricate a space fingerprint"
         );
+        assert!(!legacy.space_identity_is_attested());
     }
 
     #[test]
@@ -1780,6 +1848,17 @@ mod tests {
             Some(expected.as_str()),
             "the in-memory index must preserve the admitted space identity"
         );
+        assert!(
+            index.space_identity_is_attested(),
+            "an identity read out of a validated v2 header through exact admission is ATTESTED \
+             (C4-write guards 2+8)"
+        );
+        let two_tier = InMemoryTwoTierIndex::new(index, None);
+        assert!(two_tier.fast_identity_is_attested());
+        assert!(
+            !two_tier.quality_identity_is_attested(),
+            "no quality tier means no attested quality identity"
+        );
 
         // Sanity pin: the legacy pathname loader cannot read v2 at all, so
         // the admitted path above is not optional for identified artifacts.
@@ -1809,6 +1888,10 @@ mod tests {
             index.space_fingerprint_hex(),
             None,
             "legacy v1 absence must stay typed, never fabricated"
+        );
+        assert!(
+            !index.space_identity_is_attested(),
+            "a v1 header attests nothing (C4-write guards 2+8)"
         );
         cleanup(&path);
     }

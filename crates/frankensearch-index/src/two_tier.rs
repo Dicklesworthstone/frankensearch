@@ -23,7 +23,10 @@ use tracing::{debug, info, warn};
 use crate::hnsw::HNSW_META_FORMAT_CURRENT;
 #[cfg(feature = "ann")]
 use crate::hnsw::HnswLoadDisposition;
-use crate::{ClassifiedHits, Quantization, SearchParams, VectorIndex, dot_product_f32_f32};
+use crate::{
+    ClassifiedHits, FsviAdmissionError, FsviV2IdentityBinding, Quantization, SearchParams,
+    VectorIndex, dot_product_f32_f32,
+};
 #[cfg(feature = "ann")]
 use crate::{HNSW_DEFAULT_MAX_LAYER, HnswConfig, HnswIndex};
 
@@ -506,16 +509,88 @@ impl TwoTierIndex {
     /// roles alias, and propagates parse/corruption errors from
     /// `VectorIndex::open`. Relative paths are frozen against the current
     /// directory before validation and opening.
-    #[allow(clippy::too_many_lines)]
     pub fn open_with_paths(paths: &TwoTierIndexPaths, config: TwoTierConfig) -> SearchResult<Self> {
         let paths = paths.clone().into_absolute()?;
         validate_index_paths(&paths)?;
         let fast_index = VectorIndex::open(paths.fast_index())?;
+        let quality_index = match paths.quality_index() {
+            Some(quality_path) => Some(VectorIndex::open(quality_path)?),
+            None => None,
+        };
+        Self::assemble_opened(fast_index, quality_index, &paths, config)
+    }
+
+    /// Open a two-tier generation whose tiers are identity-complete FSVI v2
+    /// artifacts, through exact admission (bd-9xuj T2-C4-write).
+    ///
+    /// [`VectorIndex::open`] is strictly v1 — it rejects v2 bytes with
+    /// `IndexVersionMismatch` — so v2 tiers can never be plain-opened. Each
+    /// supplied tier is admitted via [`VectorIndex::open_admitted_v2`]
+    /// against its caller-held [`FsviV2IdentityBinding`], and the retained
+    /// owner's validated index becomes the tier. The resulting index reports
+    /// header-ATTESTED identity: [`Self::fast_identity_is_attested`] (and the
+    /// quality counterpart when a quality tier is supplied) return `true`,
+    /// and the per-tier space fingerprints come from each artifact's own
+    /// validated header bytes.
+    ///
+    /// A quality path and its binding must be supplied together: a v2 tier
+    /// without a binding has no legitimate open path.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError::InvalidConfig`] when a quality path/binding is
+    /// supplied without its counterpart, typed admission failures (mapped
+    /// from [`FsviAdmissionError`], naming the tier), and the same path
+    /// validation errors as [`Self::open_with_paths`].
+    pub fn open_admitted_v2_with_paths(
+        paths: &TwoTierIndexPaths,
+        config: TwoTierConfig,
+        fast_binding: &FsviV2IdentityBinding,
+        quality_binding: Option<&FsviV2IdentityBinding>,
+    ) -> SearchResult<Self> {
+        let paths = paths.clone().into_absolute()?;
+        validate_index_paths(&paths)?;
+        let fast_index = admit_v2_tier(paths.fast_index(), fast_binding, "fast")?;
+        let quality_index = match (paths.quality_index(), quality_binding) {
+            (Some(path), Some(binding)) => Some(admit_v2_tier(path, binding, "quality")?),
+            (None, None) => None,
+            (Some(path), None) => {
+                return Err(SearchError::InvalidConfig {
+                    field: "two_tier.quality_v2_admission".to_owned(),
+                    value: path.display().to_string(),
+                    reason: "a quality index path was supplied without its identity binding; \
+                             v2 tiers are only opened through exact admission"
+                        .to_owned(),
+                });
+            }
+            (None, Some(_)) => {
+                return Err(SearchError::InvalidConfig {
+                    field: "two_tier.quality_v2_admission".to_owned(),
+                    value: "<no-quality-path>".to_owned(),
+                    reason: "a quality identity binding was supplied without a quality index path"
+                        .to_owned(),
+                });
+            }
+        };
+        Self::assemble_opened(fast_index, quality_index, &paths, config)
+    }
+
+    /// Shared assembly over tiers that were already opened — by the plain v1
+    /// [`VectorIndex::open`] path or by exact FSVI v2 admission
+    /// (bd-9xuj T2-C4-write refactor). Computes quality alignment, plans ANN
+    /// sidecars, and retains per-tier header identity. Behavior for the v1
+    /// path is unchanged; the identity retention comment below applies to
+    /// both sources.
+    #[allow(clippy::too_many_lines)]
+    fn assemble_opened(
+        fast_index: VectorIndex,
+        quality_index: Option<VectorIndex>,
+        paths: &TwoTierIndexPaths,
+        config: TwoTierConfig,
+    ) -> SearchResult<Self> {
         let mut quality_alignment = QualityAlignment::None;
 
-        let quality_index = if let Some(quality_path) = paths.quality_index() {
-            let quality = VectorIndex::open(quality_path)?;
-
+        let quality_index = if let Some(quality) = quality_index {
             if quality.record_count() != fast_index.record_count() {
                 warn!(
                     fast_records = fast_index.record_count(),
@@ -667,7 +742,7 @@ impl TwoTierIndex {
                 .is_some_and(AnnOpenPlan::needs_persistence);
             let persistence_prepared = if fast_needs_persistence || quality_needs_persistence {
                 match validate_ann_persistence_paths(
-                    &paths,
+                    paths,
                     fast_needs_persistence,
                     quality_needs_persistence,
                 ) {
@@ -693,7 +768,7 @@ impl TwoTierIndex {
                         plan,
                         path,
                         "fast",
-                        &paths,
+                        paths,
                         fast_needs_persistence,
                         quality_needs_persistence,
                     );
@@ -703,7 +778,7 @@ impl TwoTierIndex {
                         plan,
                         path,
                         "quality",
-                        &paths,
+                        paths,
                         fast_needs_persistence,
                         quality_needs_persistence,
                     );
@@ -1274,6 +1349,40 @@ impl TwoTierIndex {
         self.quality_declared_identity.as_ref()
     }
 
+    /// Whether the fast tier's identity is FSVI-v2-HEADER-attested rather
+    /// than builder-time declared (bd-9xuj T2-C4-write, admission guards
+    /// 2+8).
+    ///
+    /// The attested bit derives from WHERE the identity came from, not from
+    /// stored state that could drift: a tier's `VectorIndex` carries
+    /// `identity_v2()` metadata exactly when its bytes were parsed as a
+    /// validated FSVI v2 header inside exact admission
+    /// ([`Self::open_admitted_v2_with_paths`] →
+    /// [`VectorIndex::open_admitted_v2`]; plain [`VectorIndex::open`] is
+    /// strictly v1 and can never produce it). A builder-declared identity
+    /// ([`TwoTierIndexBuilder::set_fast_identity`]) populates
+    /// [`Self::fast_declared_identity`] and the space fingerprint, but never
+    /// this bit: a declaration is a claim by the constructing process, an
+    /// attestation is read out of the artifact's own bytes. Attested-only
+    /// admission seams (the refresh identity-bound merge) must join against
+    /// attested identity exclusively and route declared-only or v1 tiers to
+    /// the typed legacy refusal.
+    #[must_use]
+    pub fn fast_identity_is_attested(&self) -> bool {
+        self.fast_index.identity_v2().is_some()
+    }
+
+    /// Quality-tier counterpart of [`Self::fast_identity_is_attested`].
+    ///
+    /// `false` both when no quality index is loaded and when the loaded one
+    /// carries no validated v2 identity header.
+    #[must_use]
+    pub fn quality_identity_is_attested(&self) -> bool {
+        self.quality_index
+            .as_ref()
+            .is_some_and(|index| index.identity_v2().is_some())
+    }
+
     /// Space fingerprint of the tier a semantic vector was served from, when
     /// known (bd-9xuj T2-C2). The typed join between
     /// [`Self::semantic_vector_with_tier_for_doc_id`]'s provenance and the
@@ -1834,6 +1943,45 @@ fn ensure_identity_describes_tier(
              this tier's vectors"
         ),
     })
+}
+
+/// Admit one identity-complete FSVI v2 tier through the only legitimate v2
+/// open path and hand back its validated index (bd-9xuj T2-C4-write).
+///
+/// [`VectorIndex::open_admitted_v2`] copies the artifact once into a sealed
+/// byte owner, verifies the complete identity/content bindings against
+/// `binding`, and rejects any WAL directory entry. Moving the owner's
+/// validated index out preserves the parsed v2 identity metadata
+/// (`identity_v2()` stays `Some`), which is exactly what marks the tier
+/// ATTESTED on the assembled [`TwoTierIndex`].
+fn admit_v2_tier(
+    path: &Path,
+    binding: &FsviV2IdentityBinding,
+    tier: &str,
+) -> SearchResult<VectorIndex> {
+    let validated = VectorIndex::open_admitted_v2(path, binding)
+        .map_err(|error| admission_error_to_search_error(error, tier, path))?;
+    Ok(validated.index)
+}
+
+/// Map a typed [`FsviAdmissionError`] into the [`SearchError`] surface,
+/// naming the tier so refusals stay attributable. I/O and corruption pass
+/// through unchanged; reindex/upgrade/snapshot outcomes become typed
+/// `InvalidConfig` refusals rather than being flattened into strings at the
+/// caller.
+fn admission_error_to_search_error(
+    error: FsviAdmissionError,
+    tier: &str,
+    path: &Path,
+) -> SearchError {
+    match error {
+        FsviAdmissionError::Index(error) => error,
+        other => SearchError::InvalidConfig {
+            field: format!("two_tier.{tier}_v2_admission"),
+            value: path.display().to_string(),
+            reason: other.to_string(),
+        },
+    }
 }
 
 fn resolve_fast_path(dir: &Path) -> SearchResult<PathBuf> {
@@ -4756,4 +4904,205 @@ mod tests {
     }
 
     // ─── bd-3szp tests end ───
+
+    // ─── Attested vs declared identity discriminator (bd-9xuj T2-C4-write) ──
+
+    use frankensearch_core::generation::{ArtifactGenerationIdentityV1, QuantizationFormat};
+
+    /// Identity binding for `model_id` with canonical FSVI v2 storage, plus
+    /// the in-memory-storage sibling bundle a producing embedder would hold.
+    fn fsvi_v2_binding(
+        model_id: &str,
+        dimension: u32,
+        sequence: u64,
+    ) -> (FsviV2IdentityBinding, EmbeddingIdentityBundleV1) {
+        let mut identity = EmbeddingIdentityBundleV1::explicit_test_model(model_id, dimension);
+        "fsvi-v2".clone_into(&mut identity.storage.format);
+        identity.storage.quantization = QuantizationFormat::F16;
+        "little-endian".clone_into(&mut identity.storage.endianness);
+        let generation =
+            ArtifactGenerationIdentityV1::new(sequence, [0x4d; 16]).expect("valid test generation");
+        let binding = FsviV2IdentityBinding::new(
+            generation,
+            identity.freeze().expect("freeze artifact identity"),
+        )
+        .expect("valid FSVI v2 identity binding");
+        (binding, identity)
+    }
+
+    fn write_v2_tier(path: &Path, binding: &FsviV2IdentityBinding, rows: &[(&str, &[f32])]) {
+        let mut writer =
+            VectorIndex::create_v2(path, binding.clone()).expect("create_v2 writer for fixture");
+        for (doc_id, vector) in rows {
+            writer.write_record(doc_id, vector).expect("write v2 row");
+        }
+        writer.finish().expect("finish v2 fixture");
+    }
+
+    #[test]
+    fn admitted_v2_open_reports_header_attested_identity() {
+        // Isolated dir: exact admission snapshots the containing directory
+        // and fails closed when sibling files churn it, so the shared test
+        // temp dir is not a legal admission site (see 58726e26).
+        let dir = temp_index_dir("admitted-v2-attested");
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let fast_path = dir.join(VECTOR_INDEX_FAST_FILENAME);
+        let quality_path = dir.join(VECTOR_INDEX_QUALITY_FILENAME);
+        let (fast_binding, fast_identity) = fsvi_v2_binding("attested-fast-model", 4, 3);
+        let (quality_binding, quality_identity) = fsvi_v2_binding("attested-quality-model", 4, 3);
+        let rows: [(&str, &[f32]); 2] = [
+            ("doc-a", &[1.0, 0.0, 0.0, 0.0]),
+            ("doc-b", &[0.0, 1.0, 0.0, 0.0]),
+        ];
+        write_v2_tier(&fast_path, &fast_binding, &rows);
+        write_v2_tier(&quality_path, &quality_binding, &rows);
+
+        // Plain discovery/open can never reach a v2 tier: VectorIndex::open
+        // is strictly v1, so the attested state is unreachable except through
+        // exact admission.
+        let plain = TwoTierIndex::open(&dir, TwoTierConfig::default());
+        assert!(
+            matches!(plain, Err(SearchError::IndexVersionMismatch { .. })),
+            "plain open must reject v2 bytes, got {plain:?}"
+        );
+
+        let paths = TwoTierIndexPaths::new(&fast_path).with_quality_index(&quality_path);
+        let index = TwoTierIndex::open_admitted_v2_with_paths(
+            &paths,
+            TwoTierConfig::default(),
+            &fast_binding,
+            Some(&quality_binding),
+        )
+        .expect("admit both v2 tiers");
+
+        assert!(
+            index.fast_identity_is_attested(),
+            "identity parsed from the artifact's validated v2 header is ATTESTED"
+        );
+        assert!(index.quality_identity_is_attested());
+        assert_eq!(
+            index.fast_space_fingerprint_hex(),
+            Some(fast_identity.space.fingerprint().as_str()),
+            "the join key must be the header's space fingerprint, bit-for-bit"
+        );
+        assert_eq!(
+            index.quality_space_fingerprint_hex(),
+            Some(quality_identity.space.fingerprint().as_str())
+        );
+        assert!(
+            index.fast_declared_identity().is_none(),
+            "attested identity is not a builder declaration"
+        );
+        assert!(index.quality_declared_identity().is_none());
+        assert_eq!(index.doc_count(), 2);
+        let hits = index
+            .search_fast(&[0.0, 1.0, 0.0, 0.0], 1)
+            .expect("search admitted v2 fast tier");
+        assert_eq!(hits[0].doc_id, "doc-b");
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn builder_declared_identity_is_never_attested() {
+        // The C4-write discriminator half of red proof (c): a builder-time
+        // declaration retains the identity (C2) but must NOT read as
+        // attested — the persisted artifacts are v1 and their headers attest
+        // nothing.
+        let dir = temp_index_dir("declared-not-attested");
+        let fast_bundle = EmbeddingIdentityBundleV1::explicit_test_model("declared-fast", 4);
+        let quality_bundle = EmbeddingIdentityBundleV1::explicit_test_model("declared-quality", 4);
+        let mut builder = TwoTierIndex::create(&dir, TwoTierConfig::default()).expect("builder");
+        builder
+            .set_fast_identity(&fast_bundle)
+            .expect("declare fast identity");
+        builder
+            .set_quality_identity(&quality_bundle)
+            .expect("declare quality identity");
+        builder
+            .add_record("doc-a", &[1.0, 0.0, 0.0, 0.0], Some(&[0.0, 1.0, 0.0, 0.0]))
+            .expect("add record");
+        let index = builder.finish().expect("finish");
+
+        assert!(
+            index.fast_space_fingerprint_hex().is_some()
+                && index.fast_declared_identity().is_some(),
+            "the declaration is retained (C2)…"
+        );
+        assert!(
+            !index.fast_identity_is_attested(),
+            "…but a declaration is a process-local claim, never a header attestation"
+        );
+        assert!(!index.quality_identity_is_attested());
+
+        drop(index);
+        let reopened = TwoTierIndex::open(&dir, TwoTierConfig::default()).expect("reopen");
+        assert!(!reopened.fast_identity_is_attested());
+        assert!(!reopened.quality_identity_is_attested());
+        assert_eq!(reopened.fast_space_fingerprint_hex(), None);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn admitted_v2_open_requires_binding_for_quality_path() {
+        let dir = temp_index_dir("admitted-v2-missing-binding");
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let fast_path = dir.join(VECTOR_INDEX_FAST_FILENAME);
+        let quality_path = dir.join(VECTOR_INDEX_QUALITY_FILENAME);
+        let (fast_binding, _) = fsvi_v2_binding("binding-gap-fast", 4, 1);
+        let (quality_binding, _) = fsvi_v2_binding("binding-gap-quality", 4, 1);
+        let rows: [(&str, &[f32]); 1] = [("doc-a", &[1.0, 0.0, 0.0, 0.0])];
+        write_v2_tier(&fast_path, &fast_binding, &rows);
+        write_v2_tier(&quality_path, &quality_binding, &rows);
+
+        let paths = TwoTierIndexPaths::new(&fast_path).with_quality_index(&quality_path);
+        let error = TwoTierIndex::open_admitted_v2_with_paths(
+            &paths,
+            TwoTierConfig::default(),
+            &fast_binding,
+            None,
+        )
+        .expect_err("a quality path without its binding must be refused");
+        assert!(
+            matches!(
+                error,
+                SearchError::InvalidConfig { ref field, .. }
+                    if field == "two_tier.quality_v2_admission"
+            ),
+            "got {error:?}"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn admitted_v2_open_rejects_foreign_binding() {
+        let dir = temp_index_dir("admitted-v2-foreign-binding");
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let fast_path = dir.join(VECTOR_INDEX_FAST_FILENAME);
+        let (fast_binding, _) = fsvi_v2_binding("real-artifact-model", 4, 1);
+        let rows: [(&str, &[f32]); 1] = [("doc-a", &[1.0, 0.0, 0.0, 0.0])];
+        write_v2_tier(&fast_path, &fast_binding, &rows);
+
+        let (foreign_binding, _) = fsvi_v2_binding("foreign-expectation-model", 4, 1);
+        let paths = TwoTierIndexPaths::new(&fast_path);
+        let error = TwoTierIndex::open_admitted_v2_with_paths(
+            &paths,
+            TwoTierConfig::default(),
+            &foreign_binding,
+            None,
+        )
+        .expect_err("admission against a foreign identity binding must be refused");
+        assert!(
+            matches!(
+                error,
+                SearchError::InvalidConfig { ref field, .. }
+                    if field == "two_tier.fast_v2_admission"
+            ),
+            "got {error:?}"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
 }
