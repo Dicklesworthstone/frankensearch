@@ -18265,7 +18265,9 @@ All nine requested widths ran on `threadripperje`, boot
 `b107a2c6-9fac-40df-a637-c3a772b0ad57`, a 64-core/128-thread AMD Ryzen
 Threadripper PRO 5995WX. Each row completed 66/66 work receipts with zero
 H1/H2 wall mismatches, zero terminal failures, matching evidence identity,
-and `laws_attested=false`.
+and `laws_attested=false`. A later receipt-integrity audit invalidated every
+CPU-derived activity field while leaving host, census membership, wall,
+throughput, and executable identity intact.
 
 The corrected null gate requires an effect median-CI excluding 1, effect
 distance from 1 greater than twice the widest A/A null half-width, and both
@@ -18276,26 +18278,33 @@ null medians within 2% of 1. It passes widths 1, 8, 64, and 96. Widths 2, 4,
 Quill/Quill median `1.001974 [0.980393, 1.029851]`, same invocation at
 width 1.**
 
-| requested | host | Quill docs/s | Tantivy docs/s | Q/T median [95% CI] | productive active eq med Q/T | positive dedicated workers med Q/T |
+| requested | host | Quill docs/s | Tantivy docs/s | Q/T median [95% CI] | observed Quill workers med | observed Tantivy index / all workers med |
 |---:|---|---:|---:|---:|---:|---:|
-| 1 | `threadripperje` | 35,551.521 | 71,930.065 | `0.499882 [0.487438, 0.511549]` | 0.999 / 1.704 | 0 / 5 |
-| 2 | `threadripperje` | 36,505.685 | 116,424.790 | `0.312842 [0.306422, 0.321050]` | 0.999 / 2.690 | 0 / 6 |
-| 4 | `threadripperje` | 37,270.193 | 132,936.059 | `0.277612 [0.273338, 0.284961]` | 0.999 / 4.639 | 0 / 9 |
-| 8 | `threadripperje` | 35,409.346 | 126,257.903 | `0.281265 [0.269878, 0.286662]` | 0.999 / 6.169 | 0 / 13 |
-| 16 | `threadripperje` | 33,473.596 | 117,564.256 | `0.285757 [0.270176, 0.300316]` | 1.001 / 6.235 | 0 / 21 |
-| 32 | `threadripperje` | 25,712.146 | 109,380.264 | `0.230809 [0.210160, 0.254111]` | 1.001 / 6.950 | 0 / 37 |
-| 64 | `threadripperje` | 22,417.172 | 89,304.888 | `0.248270 [0.233913, 0.269171]` | 1.009 / 7.160 | 0 / 69 |
-| 96 | `threadripperje` | 24,465.701 | 64,092.430 | `0.382646 [0.344567, 0.413863]` | 1.050 / 7.147 | 36 / 101 |
-| 128 | `threadripperje` | 22,408.810 | 79,804.620 | `0.275095 [0.267489, 0.311525]` | 1.052 / 9.132 | 38 / 130 |
+| 1 | `threadripperje` | 35,551.521 | 71,930.065 | `0.499882 [0.487438, 0.511549]` | 1 | 2 / 8 |
+| 2 | `threadripperje` | 36,505.685 | 116,424.790 | `0.312842 [0.306422, 0.321050]` | 2 | 4 / 12 |
+| 4 | `threadripperje` | 37,270.193 | 132,936.059 | `0.277612 [0.273338, 0.284961]` | 4 | 8 / 19 |
+| 8 | `threadripperje` | 35,409.346 | 126,257.903 | `0.281265 [0.269878, 0.286662]` | 8 | 16 / 31 |
+| 16 | `threadripperje` | 33,473.596 | 117,564.256 | `0.285757 [0.270176, 0.300316]` | 16 | 32 / 54 |
+| 32 | `threadripperje` | 25,712.146 | 109,380.264 | `0.230809 [0.210160, 0.254111]` | 32 | 64 / 102 |
+| 64 | `threadripperje` | 22,417.172 | 89,304.888 | `0.248270 [0.233913, 0.269171]` | 64 | 128 / 198 |
+| 96 | `threadripperje` | 24,465.701 | 64,092.430 | `0.382646 [0.344567, 0.413863]` | 96 | 192 / 295 |
+| 128 | `threadripperje` | 22,408.810 | 79,804.620 | `0.275095 [0.267489, 0.311525]` | 128 | 256 / 392 |
 
-The actual-activity columns are receipt-window process CPU integrals and
-positive 10 ms CPU-tick counts, not configured worker counts. Tantivy's raw
-throughput peaks at requested width 4 (`1.848x` width 1), then falls to
-`0.950x/0.884x/0.823x/0.672x/0.482x/0.600x` of the peak at widths
-8/16/32/64/96/128. Even at width 128, its median productive CPU is only
-9.132 active equivalents despite 130 dedicated workers registering a
-positive tick. The structural route is to beat this low productive-
-concurrency ceiling rather than reproduce Tantivy's worker explosion.
+**Invalidation / retraction:** the measured collector replaced observed
+process CPU with `max(process_cpu, role_cpu_sum)` under non-atomic tick skew
+and retained no pre-floor value. All 594 process-CPU, active-equivalent,
+role/unattributed-CPU, and positive-tick rows are **CONTAMINATED / VOID FOR
+INFERENCE**. The previously stated `4.639 -> 9.132` active-equivalent
+increase and "low productive-concurrency ceiling" conclusion are retracted.
+The raw bytes remain preserved.
+
+The surviving worker columns are actual thread-membership census medians,
+not activity. The full per-row host/boot and min/median/max census is in the
+card. Tantivy's raw throughput peaks at requested width 4 (`1.848x` width
+1), then falls to `0.950x/0.884x/0.823x/0.672x/0.482x/0.600x` of the peak at
+widths 8/16/32/64/96/128 while its observed worker topology continues to
+expand. That locates a widening-overhead regime, but the void CPU evidence
+cannot distinguish contention, coordination, memory, or another cost.
 
 **Decision: STRUCTURAL / NO-CLAIM / NO QG-1 VERDICT.** The incomplete
 normative selection and `laws_attested=false` prohibit activation or
@@ -18307,9 +18316,10 @@ authoritative. Raw evidence:
 full card:
 `docs/evidence/e8h/qg1-trj-thread-sweep-20260731.md`.
 
-**Retry predicate:** require the complete normative 74-cell bundle and an
-immediate same-ELF reproduction. Interleave null and effect blocks or bind
-effect order/drift explicitly; ratchet-bind continuous timing and work-
-receipt modes; preserve exact host, executable, wall, and actual-activity
-receipts. Do not promote a partial slice, weaken the null-center law, or gate
-on CV.
+**Retry predicate:** use the repaired collector that never rewrites process
+CPU and never clips measured-call totals; require the complete normative
+74-cell bundle and an immediate same-ELF reproduction. Interleave null and
+effect blocks or bind effect order/drift explicitly; ratchet-bind continuous
+timing and work-receipt modes; preserve exact host, executable, wall, and
+worker-census receipts. Do not promote a partial slice, weaken the
+null-center law, or gate on CV.

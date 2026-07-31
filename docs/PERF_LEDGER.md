@@ -8481,42 +8481,49 @@ on CV.
   `bulk/xlarge`, positions on, one excluded warmup, ten paired blocks,
   continuous timing, work receipts on. Every width exited 0 with 66/66
   receipts, zero H1/H2 wall mismatches, zero terminal failures, matching
-  evidence identity, and equal final H1/H2 walls.
+  evidence identity, and equal final H1/H2 walls. A later integrity audit
+  invalidated the CPU-derived receipt fields as described below.
 - **Corrected null law:** effect median-CI excludes 1;
   `abs(effect_median - 1) > 2 * max(T/T null half-width, Q/Q null
   half-width)`; and both A/A null medians are within 2% of 1. CV is
   provenance only.
 
-| requested | Quill docs/s | Tantivy docs/s | Q/T median [95% CI] | corrected null | Quill active eq med | Tantivy active eq med | positive dedicated workers med Q/T |
-|---:|---:|---:|---:|---|---:|---:|---:|
-| 1 | 35,551.521 | 71,930.065 | `0.499882 [0.487438, 0.511549]` | PASS | 0.999 | 1.704 | 0 / 5 |
-| 2 | 36,505.685 | 116,424.790 | `0.312842 [0.306422, 0.321050]` | FAIL: T/T center | 0.999 | 2.690 | 0 / 6 |
-| 4 | 37,270.193 | 132,936.059 | `0.277612 [0.273338, 0.284961]` | FAIL: T/T center | 0.999 | 4.639 | 0 / 9 |
-| 8 | 35,409.346 | 126,257.903 | `0.281265 [0.269878, 0.286662]` | PASS | 0.999 | 6.169 | 0 / 13 |
-| 16 | 33,473.596 | 117,564.256 | `0.285757 [0.270176, 0.300316]` | FAIL: T/T center | 1.001 | 6.235 | 0 / 21 |
-| 32 | 25,712.146 | 109,380.264 | `0.230809 [0.210160, 0.254111]` | FAIL: T/T center | 1.001 | 6.950 | 0 / 37 |
-| 64 | 22,417.172 | 89,304.888 | `0.248270 [0.233913, 0.269171]` | PASS | 1.009 | 7.160 | 0 / 69 |
-| 96 | 24,465.701 | 64,092.430 | `0.382646 [0.344567, 0.413863]` | PASS | 1.050 | 7.147 | 36 / 101 |
-| 128 | 22,408.810 | 79,804.620 | `0.275095 [0.267489, 0.311525]` | FAIL: T/T center | 1.052 | 9.132 | 38 / 130 |
+| requested | Quill docs/s | Tantivy docs/s | Q/T median [95% CI] | corrected null | observed Quill workers med | observed Tantivy index / all workers med |
+|---:|---:|---:|---:|---|---:|---:|
+| 1 | 35,551.521 | 71,930.065 | `0.499882 [0.487438, 0.511549]` | PASS | 1 | 2 / 8 |
+| 2 | 36,505.685 | 116,424.790 | `0.312842 [0.306422, 0.321050]` | FAIL: T/T center | 2 | 4 / 12 |
+| 4 | 37,270.193 | 132,936.059 | `0.277612 [0.273338, 0.284961]` | FAIL: T/T center | 4 | 8 / 19 |
+| 8 | 35,409.346 | 126,257.903 | `0.281265 [0.269878, 0.286662]` | PASS | 8 | 16 / 31 |
+| 16 | 33,473.596 | 117,564.256 | `0.285757 [0.270176, 0.300316]` | FAIL: T/T center | 16 | 32 / 54 |
+| 32 | 25,712.146 | 109,380.264 | `0.230809 [0.210160, 0.254111]` | FAIL: T/T center | 32 | 64 / 102 |
+| 64 | 22,417.172 | 89,304.888 | `0.248270 [0.233913, 0.269171]` | PASS | 64 | 128 / 198 |
+| 96 | 24,465.701 | 64,092.430 | `0.382646 [0.344567, 0.413863]` | PASS | 96 | 192 / 295 |
+| 128 | 22,408.810 | 79,804.620 | `0.275095 [0.267489, 0.311525]` | FAIL: T/T center | 128 | 256 / 392 |
 
-Active equivalents are receipt-window process CPU integrals, not configured
-workers. Positive dedicated workers count any live worker with a positive
-10 ms `/proc` CPU tick; exited threads may be unattributed. The separate
-live census sees `requested - 1` Quill Rayon workers and `2 * requested`
-Tantivy index workers plus support threads, but that is liveness rather than
-productive concurrency. At requested 128, Tantivy has a median 130 positive
-dedicated workers yet only 9.132 active equivalents.
+- **Receipt invalidation:** the measured collector floored observed process
+  CPU to the sampled role sum when non-atomic `/proc` reads disagreed, and
+  did not retain the original process value. All 594 process-CPU,
+  active-equivalent, role/unattributed-CPU, and positive-tick rows are
+  **CONTAMINATED / VOID FOR INFERENCE**. The previously published
+  `4.639 -> 9.132` active-equivalent claim and "productive-concurrency
+  ceiling" interpretation are retracted. Raw bytes remain unchanged.
+- **Actual observed workers:** the surviving census columns are membership,
+  not activity. Quill instantiated exactly the requested total
+  caller-plus-Rayon topology; Tantivy instantiated exactly two index workers
+  per requested thread plus support workers. The full min/median/max census
+  and host/boot identity for every row are in the evidence card.
 
 **Status: STRUCTURAL / NO-CLAIM.** Tantivy reaches `1.619x` width-1
 throughput at width 2 and a `1.848x` raw apex at width 4. Relative to that
 apex, widths 8/16/32/64/96/128 deliver
 `0.950x/0.884x/0.823x/0.672x/0.482x/0.600x`. Its observed throughput scaling
-stops at requested width 4; the structural opportunity is to beat this low
-productive-concurrency ceiling rather than mirror its worker explosion.
-This is not a QG verdict: every row has `laws_attested=false`, the normative
-selection is incomplete, and the sequential null blocks are disjoint from
-the effect block without an effect order/drift gate. QG-1 remains inactive
-and the unmeasured placeholder remains authoritative.
+stops at requested width 4 while the observed worker census continues to
+expand. That locates the widening-overhead regime but cannot distinguish
+contention, coordination, memory, or another per-worker cost. This is not a
+QG verdict: every row has `laws_attested=false`, the normative selection is
+incomplete, and the sequential null blocks are disjoint from the effect
+block without an effect order/drift gate. QG-1 remains inactive and the
+unmeasured placeholder remains authoritative.
 
 Raw bundle:
 `.bench-history/attempts/qg1-trj-h1h2-ccc37c8e-clean-r10-20260731T0349Z/`;
@@ -8525,13 +8532,13 @@ aggregate SHA-256
 Full card:
 `docs/evidence/e8h/qg1-trj-thread-sweep-20260731.md`.
 
-**Retry predicate:** run the complete normative 74-cell bundle and its
-immediate same-ELF reproduction. Interleave null and effect blocks or
-explicitly gate effect order/drift, ratchet-bind continuous timing and
-work-receipt modes, and retain exact host, executable, wall, and actual-
-activity receipts. Do not activate QG-1, label a PASS/MISS, or gate on CV
-from this tranche.
-## 2026-07-30 — KEEP (BANKED; push gated on the user ruling `bd-s1rc1-ubs-user-ruling-gate-82rpt`): Quill `EncodedSegment` per-commit deep-clone elimination via `Arc<Vec<u8>>` byte backing (`bd-s1rc1`, REBASE pass at tip `504fa185`)
+**Retry predicate:** use the repaired collector that never rewrites process
+CPU and never clips measured-call totals; run the complete normative 74-cell
+bundle and its immediate same-ELF reproduction. Interleave null and effect
+blocks or explicitly gate effect order/drift, ratchet-bind continuous timing
+and work-receipt modes, and retain exact host, executable, wall, and worker-
+census receipts. Do not activate QG-1, label a PASS/MISS, or gate on CV from
+this tranche.
 
 - **Comparison class: SELF-SPEEDUP (maintenance).** Both arms are
   frankensearch (Quill); no incumbent arm anywhere in this evidence.

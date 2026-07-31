@@ -7,13 +7,13 @@ successfully, but every row has `laws_attested=false`, so this tranche does
 not activate QG-1 and does not support a QG PASS, MISS, KEEP, or REJECT.
 The raw throughput curve does answer the routing question: pinned Tantivy
 0.26.1 reaches its observed apex at requested width 4 and declines at every
-wider setting. Its median productive CPU rises only from 4.639 active
-worker-equivalents at width 4 to 9.132 at width 128 even though the live
-worker census expands to 256 index workers plus merge, compression, and
-updater threads.
+wider setting. The observed worker census expands from 8 median Tantivy
+workers at width 1 to 392 at width 128, including exactly 256 index workers.
 
-The next structural target is therefore the incumbent's low productive-
-concurrency ceiling, not its configured thread count.
+The usable structural target is therefore the incumbent's widening
+worker-overhead regime after width 4. A post-run receipt audit invalidated
+the CPU-derived activity fields, so this sweep does not identify a
+productive-concurrency or contention ceiling.
 
 ## Provenance
 
@@ -66,6 +66,22 @@ checksum manifest verifies every other raw file:
 - `artifact-sha256.txt`:
   `5a29364d552f848b09322854de6d537d756f6f3ea5eedde9a6390335257c2c2d`
 
+## Post-run CPU receipt invalidation
+
+The `ccc37c8e` collector replaced the independently observed process CPU
+delta with `max(process_cpu, role_cpu_sum)` when non-atomic `/proc` reads
+disagreed. The original process value is not retained. Process CPU,
+active-concurrency integrals/means, role/unattributed CPU decomposition, and
+positive-tick worker counts in all 594 receipts are therefore
+**CONTAMINATED / VOID FOR INFERENCE**. The prior `4.639 -> 9.132` active
+equivalents and "low productive-concurrency ceiling" conclusion are
+retracted.
+
+No raw file was rewritten. Thread-membership census rows remain valid
+liveness observations because thread names and roles were sampled
+independently of the process-CPU floor. H1 wall and throughput remain
+source-bound diagnostics.
+
 ## Corrected null gate and throughput
 
 The corrected per-row null gate requires all three conditions:
@@ -95,33 +111,28 @@ The corrected gate passes widths 1, 8, 64, and 96. It fails widths 2, 4,
 1. These labels are diagnostic: incomplete selection and
 `laws_attested=false` prohibit a normative QG verdict.
 
-## Actual observed worker activity
+## Actual observed worker census
 
-`active eq min/median/max` is the process CPU integral over each receipt
-window expressed as simultaneously active hardware-thread equivalents.
-`positive dedicated min/median/max` counts live dedicated workers with any
-positive CPU tick in that window. The latter has 10 ms `/proc` tick
-granularity, and CPU from a thread that exits before the final census can be
-unattributed.
+These are thread-membership observations, not CPU activity. `Quill all`
+counts the benchmark caller plus dedicated Rayon workers. `Tantivy support`
+counts segment-updater, merge, and docstore-compressor threads. Each
+min/median/max covers 33 receipts for that engine.
 
-| requested | host / boot ID | Quill active eq min/med/max | Tantivy active eq min/med/max | Quill positive dedicated min/med/max | Tantivy positive dedicated min/med/max |
-|---:|---|---:|---:|---:|---:|
-| 1 | `threadripperje` / `b107a2c6-9fac-40df-a637-c3a772b0ad57` | `0.999/0.999/1.001` | `1.654/1.704/1.757` | `0/0/0` | `2/5/5` |
-| 2 | `threadripperje` / `b107a2c6-9fac-40df-a637-c3a772b0ad57` | `0.999/0.999/1.001` | `2.526/2.690/2.955` | `0/0/0` | `2/6/7` |
-| 4 | `threadripperje` / `b107a2c6-9fac-40df-a637-c3a772b0ad57` | `0.999/0.999/1.000` | `4.405/4.639/4.915` | `0/0/0` | `8/9/10` |
-| 8 | `threadripperje` / `b107a2c6-9fac-40df-a637-c3a772b0ad57` | `0.999/0.999/1.001` | `5.576/6.169/6.547` | `0/0/0` | `6/13/14` |
-| 16 | `threadripperje` / `b107a2c6-9fac-40df-a637-c3a772b0ad57` | `1.000/1.001/1.002` | `5.684/6.235/7.599` | `0/0/0` | `5/21/22` |
-| 32 | `threadripperje` / `b107a2c6-9fac-40df-a637-c3a772b0ad57` | `1.001/1.001/1.002` | `5.459/6.950/8.336` | `0/0/0` | `19/37/37` |
-| 64 | `threadripperje` / `b107a2c6-9fac-40df-a637-c3a772b0ad57` | `1.007/1.009/1.160` | `6.659/7.160/8.066` | `0/0/62` | `5/69/70` |
-| 96 | `threadripperje` / `b107a2c6-9fac-40df-a637-c3a772b0ad57` | `1.012/1.050/1.354` | `5.525/7.147/7.778` | `0/36/86` | `5/101/102` |
-| 128 | `threadripperje` / `b107a2c6-9fac-40df-a637-c3a772b0ad57` | `1.012/1.052/1.238` | `7.148/9.132/10.051` | `0/38/74` | `5/130/136` |
+| requested | host / boot ID | Quill all min/med/max | Quill Rayon min/med/max | Tantivy index min/med/max | Tantivy support min/med/max | Tantivy all min/med/max |
+|---:|---|---:|---:|---:|---:|---:|
+| 1 | `threadripperje` / `b107a2c6-9fac-40df-a637-c3a772b0ad57` | `1/1/1` | `0/0/0` | `2/2/2` | `5/6/6` | `7/8/8` |
+| 2 | `threadripperje` / `b107a2c6-9fac-40df-a637-c3a772b0ad57` | `2/2/2` | `1/1/1` | `4/4/4` | `6/8/9` | `10/12/13` |
+| 4 | `threadripperje` / `b107a2c6-9fac-40df-a637-c3a772b0ad57` | `4/4/4` | `3/3/3` | `8/8/8` | `6/11/13` | `14/19/21` |
+| 8 | `threadripperje` / `b107a2c6-9fac-40df-a637-c3a772b0ad57` | `8/8/8` | `7/7/7` | `16/16/16` | `7/15/16` | `23/31/32` |
+| 16 | `threadripperje` / `b107a2c6-9fac-40df-a637-c3a772b0ad57` | `16/16/16` | `15/15/15` | `32/32/32` | `5/22/25` | `37/54/57` |
+| 32 | `threadripperje` / `b107a2c6-9fac-40df-a637-c3a772b0ad57` | `32/32/32` | `31/31/31` | `64/64/64` | `31/38/41` | `95/102/105` |
+| 64 | `threadripperje` / `b107a2c6-9fac-40df-a637-c3a772b0ad57` | `64/64/64` | `63/63/63` | `128/128/128` | `5/70/74` | `133/198/202` |
+| 96 | `threadripperje` / `b107a2c6-9fac-40df-a637-c3a772b0ad57` | `96/96/96` | `95/95/95` | `192/192/192` | `7/103/107` | `199/295/299` |
+| 128 | `threadripperje` / `b107a2c6-9fac-40df-a637-c3a772b0ad57` | `128/128/128` | `127/127/127` | `256/256/256` | `5/136/140` | `261/392/396` |
 
-The separate live census sees `requested - 1` Quill Rayon workers and
-`2 * requested` Tantivy index workers, plus Tantivy compression, merge, and
-updater workers. That census is configuration/liveness evidence, not actual
-activity. At width 128, for example, a median 130 dedicated Tantivy workers
-register at least one CPU tick while their aggregate work is only 9.132
-active equivalents.
+The census proves the requested Quill topology and Tantivy's
+two-index-workers-per-requested-thread topology were instantiated. It does
+not prove simultaneous productive work.
 
 ## Structural interpretation and limitation
 
@@ -131,9 +142,11 @@ to `0.950x`, `0.884x`, `0.823x`, `0.672x`, `0.482x`, and `0.600x` at
 widths 8, 16, 32, 64, 96, and 128. Its observed throughput scaling therefore
 stops at requested width 4 on this host and fixture.
 
-H1/H2 fixes the earlier missing-wall and missing-work-receipt defects, but
-the null blocks remain sequential and disjoint from the effect block. The
-harness does not bind effect-block order or drift to those nulls. Together
-with incomplete normative selection and `laws_attested=false`, that prevents
-promotion of the raw curve to a certified QG decision. QG-1 remains inactive;
-the checked-in unmeasured placeholder remains authoritative.
+The expanding census plus declining throughput is structural routing
+evidence, but the void CPU fields cannot distinguish contention,
+coordination, memory, or other per-worker costs. The null blocks also remain
+sequential and disjoint from the effect block, and the harness does not bind
+effect-block order or drift to those nulls. Together with incomplete
+normative selection and `laws_attested=false`, that prevents promotion of
+the raw curve to a certified QG decision. QG-1 remains inactive; the
+checked-in unmeasured placeholder remains authoritative.
