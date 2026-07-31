@@ -99,6 +99,11 @@ harness = false
 required-features = ["bench-internals"]
 
 [[bench]]
+name = "parallel_shard_ingest_ab"
+harness = false
+required-features = ["bench-internals"]
+
+[[bench]]
 name = "segment_fanout_ab"
 harness = false
 required-features = ["bench-internals"]

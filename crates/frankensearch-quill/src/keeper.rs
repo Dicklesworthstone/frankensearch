@@ -8271,7 +8271,10 @@ fn remove_stale_generation_claim(
             path: path.to_path_buf(),
             source,
         })?;
-    if stat.st_dev != metadata.dev() || stat.st_ino != metadata.ino() || stat.st_size != 0 {
+    if stat_dev_as_u64(&stat) != metadata.dev()
+        || stat.st_ino != metadata.ino()
+        || stat.st_size != 0
+    {
         return Err(KeeperError::InvalidClaimArtifact {
             path: path.to_path_buf(),
             detail: "claim pathname changed during stale recovery".to_owned(),
@@ -9418,6 +9421,16 @@ fn parse_claim_name(name: &OsStr) -> Option<u64> {
     digits.parse().ok()
 }
 
+/// `rustix::fs::Stat::st_dev` carries the platform's native device type
+/// (`i32` on macOS, `u64` on Linux) while `std::os::unix::fs::MetadataExt::
+/// dev()` always yields the raw value widened to `u64` with a sign-extending
+/// cast. Device-identity checks must apply the identical conversion or they
+/// compare different bits on macOS.
+#[allow(clippy::unnecessary_cast, clippy::cast_sign_loss)]
+fn stat_dev_as_u64(stat: &rustix::fs::Stat) -> u64 {
+    stat.st_dev as u64
+}
+
 struct GenerationClaimGuard {
     admission: Arc<WriterAdmissionInner>,
     name: OsString,
@@ -9558,7 +9571,7 @@ fn release_generation_claim(claim: &GenerationClaimGuard) {
     ) else {
         return;
     };
-    if stat.st_dev != claim.device || stat.st_ino != claim.inode || stat.st_size != 0 {
+    if stat_dev_as_u64(&stat) != claim.device || stat.st_ino != claim.inode || stat.st_size != 0 {
         return;
     }
     if unlinkat(
@@ -12161,8 +12174,15 @@ fn read_current_file(current_path: &Path) -> Result<Option<Vec<u8>>, CurrentPoin
     Ok(Some(bytes))
 }
 
-/// Scan `lexical_root` for engine directories and apply the adoption rule.
-fn adopt_or_report_empty(lexical_root: &Path) -> Result<ResolvedCurrent, CurrentPointerError> {
+/// Scan `lexical_root` for adoptable engine directories (name-sorted).
+///
+/// Shared, strictly read-only policy used by both the mutating adoption rule
+/// ([`adopt_or_report_empty`]) and the non-mutating inspector
+/// ([`inspect_lexical_layout`]), so the two can never disagree about what
+/// counts as an engine directory.
+fn scan_adoption_candidates(
+    lexical_root: &Path,
+) -> Result<Vec<(String, BlueGreenEngine)>, CurrentPointerError> {
     let entries = std::fs::read_dir(lexical_root).map_err(|source| CurrentPointerError::Io {
         operation: "scan lexical root for engine directories",
         path: lexical_root.to_path_buf(),
@@ -12209,6 +12229,12 @@ fn adopt_or_report_empty(lexical_root: &Path) -> Result<ResolvedCurrent, Current
         }
     }
     candidates.sort_by(|left, right| left.0.cmp(&right.0));
+    Ok(candidates)
+}
+
+/// Scan `lexical_root` for engine directories and apply the adoption rule.
+fn adopt_or_report_empty(lexical_root: &Path) -> Result<ResolvedCurrent, CurrentPointerError> {
+    let mut candidates = scan_adoption_candidates(lexical_root)?;
     match candidates.len() {
         0 => Ok(ResolvedCurrent::Empty),
         1 => {
@@ -12220,6 +12246,185 @@ fn adopt_or_report_empty(lexical_root: &Path) -> Result<ResolvedCurrent, Current
         _ => Err(CurrentPointerError::AmbiguousEngineDirs {
             root: lexical_root.to_path_buf(),
             candidates: candidates.into_iter().map(|(name, _)| name).collect(),
+        }),
+    }
+}
+
+/// Non-mutating classification of a lexical root's on-disk layout
+/// (bd-8nqz.2).
+///
+/// Unlike [`resolve_current`], inspection NEVER adopts a child, writes
+/// CURRENT, acquires a writer lease, or overwrites bytes — and it never
+/// infers "empty" from MANIFEST absence alone: foreign and damaged layouts
+/// are reported as themselves so no caller can mistake a tantivy index or a
+/// half-destroyed blue-green root for free space.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LexicalLayout {
+    /// No lexical content: the root is missing, or holds no engine markers,
+    /// no CURRENT, and no adoptable children.
+    Empty,
+    /// A Quill index lives directly at the root (MANIFEST, no CURRENT).
+    DirectQuill,
+    /// A tantivy index lives directly at the root (meta.json, no CURRENT).
+    DirectTantivy,
+    /// Blue-green root with exactly one coherent active candidate.
+    ///
+    /// `pointer_on_disk == true` means a published CURRENT names a coherent
+    /// engine directory. `false` means no CURRENT exists but exactly one
+    /// adoptable child does; the pointer is the computed adoption candidate,
+    /// which inspection reports but never publishes (the mutating
+    /// [`resolve_current`] is the only adoption path).
+    BlueGreen {
+        /// Active (or computed adoption-candidate) pointer.
+        pointer: CurrentPointer,
+        /// Whether CURRENT actually exists on disk.
+        pointer_on_disk: bool,
+    },
+    /// Quill markers present but the layout is damaged.
+    CorruptQuill {
+        /// Human-readable description of the damage.
+        detail: String,
+    },
+    /// Tantivy markers present but the layout is damaged.
+    CorruptTantivy {
+        /// Human-readable description of the damage.
+        detail: String,
+    },
+    /// Conflicting engine markers that no reader may silently pick from.
+    Mixed {
+        /// Human-readable description of the conflict.
+        detail: String,
+    },
+    /// Layout cannot be attributed to one engine safely.
+    Ambiguous {
+        /// Human-readable description of why attribution failed.
+        detail: String,
+    },
+}
+
+impl LexicalLayout {
+    /// Whether an index-builder-style writer may initialize a fresh Quill
+    /// index at this root without destroying or shadowing existing content.
+    #[must_use]
+    pub const fn is_safe_for_quill_init(&self) -> bool {
+        matches!(self, Self::Empty)
+    }
+
+    /// Short stable label for errors and telemetry.
+    #[must_use]
+    pub const fn label(&self) -> &'static str {
+        match self {
+            Self::Empty => "empty",
+            Self::DirectQuill => "direct-quill",
+            Self::DirectTantivy => "direct-tantivy",
+            Self::BlueGreen { .. } => "blue-green",
+            Self::CorruptQuill { .. } => "corrupt-quill",
+            Self::CorruptTantivy { .. } => "corrupt-tantivy",
+            Self::Mixed { .. } => "mixed",
+            Self::Ambiguous { .. } => "ambiguous",
+        }
+    }
+}
+
+/// Classify the layout at `lexical_root` without mutating anything.
+///
+/// # Errors
+///
+/// Returns [`CurrentPointerError`] only for I/O failures (permissions, a
+/// symlinked CURRENT rejected by the no-follow open, unreadable directory
+/// entries). Every attributable on-disk shape — including an undecodable
+/// CURRENT or conflicting markers — is a successful classification, not an
+/// error, so callers can act on the shape instead of guessing from error
+/// strings.
+pub fn inspect_lexical_layout(lexical_root: &Path) -> Result<LexicalLayout, CurrentPointerError> {
+    if !lexical_root.is_dir() {
+        return Ok(LexicalLayout::Empty);
+    }
+    let root_quill = lexical_root
+        .join(BlueGreenEngine::Quill.adoption_marker())
+        .is_file();
+    let root_tantivy = lexical_root
+        .join(BlueGreenEngine::Tantivy.adoption_marker())
+        .is_file();
+    let current_path = lexical_root.join(CURRENT_FILE_NAME);
+
+    if let Some(bytes) = read_current_file(&current_path)? {
+        if root_quill || root_tantivy {
+            return Ok(LexicalLayout::Mixed {
+                detail: format!(
+                    "CURRENT coexists with direct engine markers at the root \
+                     (MANIFEST: {root_quill}, meta.json: {root_tantivy})"
+                ),
+            });
+        }
+        let pointer = match CurrentPointer::decode(&bytes) {
+            Ok(pointer) => pointer,
+            Err(error) => {
+                return Ok(LexicalLayout::Ambiguous {
+                    detail: format!("CURRENT does not decode: {error}"),
+                });
+            }
+        };
+        let engine_dir = pointer.engine_dir(lexical_root);
+        let marker = pointer.engine().adoption_marker();
+        let corrupt = |detail: String| match pointer.engine() {
+            BlueGreenEngine::Quill => LexicalLayout::CorruptQuill { detail },
+            BlueGreenEngine::Tantivy => LexicalLayout::CorruptTantivy { detail },
+        };
+        if !engine_dir.is_dir() {
+            return Ok(corrupt(format!(
+                "CURRENT names missing engine dir {:?}",
+                pointer.dir_name()
+            )));
+        }
+        if !engine_dir.join(marker).is_file() {
+            return Ok(corrupt(format!(
+                "engine dir {:?} lacks its {marker} marker",
+                pointer.dir_name()
+            )));
+        }
+        return Ok(LexicalLayout::BlueGreen {
+            pointer,
+            pointer_on_disk: true,
+        });
+    }
+
+    match (root_quill, root_tantivy) {
+        (true, true) => {
+            return Ok(LexicalLayout::Mixed {
+                detail: "MANIFEST and meta.json coexist at the root".to_owned(),
+            });
+        }
+        (true, false) => return Ok(LexicalLayout::DirectQuill),
+        (false, true) => return Ok(LexicalLayout::DirectTantivy),
+        (false, false) => {}
+    }
+
+    // No CURRENT and no direct markers: consult the shared adoption scan,
+    // but never publish anything.
+    let mut candidates = scan_adoption_candidates(lexical_root)?;
+    match candidates.len() {
+        0 => Ok(LexicalLayout::Empty),
+        1 => {
+            let (dir_name, engine) = candidates.remove(0);
+            match CurrentPointer::new(engine, dir_name, engine.adopted_format_version()) {
+                Ok(pointer) => Ok(LexicalLayout::BlueGreen {
+                    pointer,
+                    pointer_on_disk: false,
+                }),
+                Err(error) => Ok(LexicalLayout::Ambiguous {
+                    detail: format!("sole engine dir cannot be pointed at: {error}"),
+                }),
+            }
+        }
+        _ => Ok(LexicalLayout::Ambiguous {
+            detail: format!(
+                "multiple adoptable engine dirs: {:?}",
+                candidates
+                    .iter()
+                    .map(|(name, _)| name.as_str())
+                    .collect::<Vec<_>>()
+            ),
         }),
     }
 }
@@ -18008,6 +18213,191 @@ mod tests {
                 "hostile name {hostile:?} must fail"
             );
         }
+    }
+
+    /// bd-8nqz.2: every layout state classifies without a single write. The
+    /// decisive case is the single-adoptable-child root: `resolve_current`
+    /// ADOPTS it (publishes CURRENT); `inspect_lexical_layout` must report it
+    /// and leave the disk byte-identical.
+    #[test]
+    fn inspect_lexical_layout_classifies_every_state_without_mutating() -> TestResult {
+        // Missing root → Empty, and inspection must not create it.
+        let missing = tempdir()?;
+        let missing_root = missing.path().join("absent");
+        assert_eq!(inspect_lexical_layout(&missing_root)?, LexicalLayout::Empty);
+        assert!(
+            !missing_root.exists(),
+            "inspection must not create the root"
+        );
+
+        // Bare dir → Empty, no CURRENT appears.
+        let bare = tempdir()?;
+        assert_eq!(inspect_lexical_layout(bare.path())?, LexicalLayout::Empty);
+        assert!(!bare.path().join(CURRENT_FILE_NAME).exists());
+
+        // Direct Quill: MANIFEST at the root, no CURRENT.
+        let direct_quill = tempdir()?;
+        std::fs::write(direct_quill.path().join("MANIFEST"), b"m")?;
+        assert_eq!(
+            inspect_lexical_layout(direct_quill.path())?,
+            LexicalLayout::DirectQuill
+        );
+
+        // Direct tantivy: meta.json at the root, no CURRENT.
+        let direct_tantivy = tempdir()?;
+        std::fs::write(direct_tantivy.path().join("meta.json"), b"{}")?;
+        assert_eq!(
+            inspect_lexical_layout(direct_tantivy.path())?,
+            LexicalLayout::DirectTantivy
+        );
+
+        // Mixed: both markers at the root — never silently pick one.
+        let mixed = tempdir()?;
+        std::fs::write(mixed.path().join("MANIFEST"), b"m")?;
+        std::fs::write(mixed.path().join("meta.json"), b"{}")?;
+        assert!(matches!(
+            inspect_lexical_layout(mixed.path())?,
+            LexicalLayout::Mixed { .. }
+        ));
+
+        // Valid blue-green: published CURRENT naming a coherent engine dir.
+        let published = tempdir()?;
+        let quill_dir = published.path().join("quill-v1");
+        std::fs::create_dir(&quill_dir)?;
+        std::fs::write(quill_dir.join("MANIFEST"), b"m")?;
+        publish_current(published.path(), &quill_v1_pointer())?;
+        assert_eq!(
+            inspect_lexical_layout(published.path())?,
+            LexicalLayout::BlueGreen {
+                pointer: quill_v1_pointer(),
+                pointer_on_disk: true,
+            }
+        );
+
+        // Mixed: CURRENT coexists with a direct root marker.
+        let current_plus_direct = tempdir()?;
+        let cpd_dir = current_plus_direct.path().join("quill-v1");
+        std::fs::create_dir(&cpd_dir)?;
+        std::fs::write(cpd_dir.join("MANIFEST"), b"m")?;
+        publish_current(current_plus_direct.path(), &quill_v1_pointer())?;
+        std::fs::write(current_plus_direct.path().join("MANIFEST"), b"squatter")?;
+        assert!(matches!(
+            inspect_lexical_layout(current_plus_direct.path())?,
+            LexicalLayout::Mixed { .. }
+        ));
+
+        // THE decisive non-mutation case: single adoptable child, no CURRENT.
+        let adoptable = tempdir()?;
+        let child = adoptable.path().join("quill-v1");
+        std::fs::create_dir(&child)?;
+        std::fs::write(child.join("MANIFEST"), b"m")?;
+        assert_eq!(
+            inspect_lexical_layout(adoptable.path())?,
+            LexicalLayout::BlueGreen {
+                pointer: quill_v1_pointer(),
+                pointer_on_disk: false,
+            }
+        );
+        assert!(
+            !adoptable.path().join(CURRENT_FILE_NAME).exists(),
+            "inspection must never publish CURRENT; adoption belongs to resolve_current alone"
+        );
+        // And the same root still adopts through the mutating path afterwards.
+        assert_eq!(
+            resolve_current(adoptable.path())?,
+            ResolvedCurrent::Adopted(quill_v1_pointer())
+        );
+
+        // Corrupt Quill: CURRENT names a dir that does not exist.
+        let corrupt_missing = tempdir()?;
+        let ghost = CurrentPointer::new(
+            BlueGreenEngine::Quill,
+            "quill-v2",
+            crate::segment::FSLX_FORMAT_VERSION,
+        )?;
+        std::fs::write(
+            corrupt_missing.path().join(CURRENT_FILE_NAME),
+            ghost.encode(),
+        )?;
+        assert!(matches!(
+            inspect_lexical_layout(corrupt_missing.path())?,
+            LexicalLayout::CorruptQuill { .. }
+        ));
+
+        // Corrupt Quill: engine dir exists but lacks its MANIFEST marker.
+        let corrupt_marker = tempdir()?;
+        let bald = corrupt_marker.path().join("quill-v1");
+        std::fs::create_dir(&bald)?;
+        std::fs::write(
+            corrupt_marker.path().join(CURRENT_FILE_NAME),
+            quill_v1_pointer().encode(),
+        )?;
+        assert!(matches!(
+            inspect_lexical_layout(corrupt_marker.path())?,
+            LexicalLayout::CorruptQuill { .. }
+        ));
+
+        // Corrupt tantivy: CURRENT names a tantivy dir lacking meta.json.
+        let corrupt_tantivy = tempdir()?;
+        let tantivy_dir = corrupt_tantivy.path().join("tantivy");
+        std::fs::create_dir(&tantivy_dir)?;
+        let tantivy_pointer = CurrentPointer::new(
+            BlueGreenEngine::Tantivy,
+            "tantivy",
+            TANTIVY_INDEX_FORMAT_VERSION,
+        )?;
+        std::fs::write(
+            corrupt_tantivy.path().join(CURRENT_FILE_NAME),
+            tantivy_pointer.encode(),
+        )?;
+        assert!(matches!(
+            inspect_lexical_layout(corrupt_tantivy.path())?,
+            LexicalLayout::CorruptTantivy { .. }
+        ));
+
+        // Ambiguous: CURRENT bytes do not decode.
+        let undecodable = tempdir()?;
+        std::fs::write(undecodable.path().join(CURRENT_FILE_NAME), b"garbage")?;
+        assert!(matches!(
+            inspect_lexical_layout(undecodable.path())?,
+            LexicalLayout::Ambiguous { .. }
+        ));
+
+        // Ambiguous: multiple adoptable children, no CURRENT.
+        let multiple = tempdir()?;
+        for (name, marker) in [("quill-v1", "MANIFEST"), ("tantivy", "meta.json")] {
+            let dir = multiple.path().join(name);
+            std::fs::create_dir(&dir)?;
+            std::fs::write(dir.join(marker), b"m")?;
+        }
+        assert!(matches!(
+            inspect_lexical_layout(multiple.path())?,
+            LexicalLayout::Ambiguous { .. }
+        ));
+        assert!(
+            !multiple.path().join(CURRENT_FILE_NAME).exists(),
+            "ambiguity must not trigger any tie-breaking write"
+        );
+
+        Ok(())
+    }
+
+    /// Symlink boundary: a symlinked CURRENT is rejected by the no-follow
+    /// open instead of being silently followed out of the root.
+    #[cfg(unix)]
+    #[test]
+    fn inspect_lexical_layout_rejects_symlinked_current() -> TestResult {
+        let root = tempdir()?;
+        std::fs::write(root.path().join("target"), b"elsewhere")?;
+        std::os::unix::fs::symlink(
+            root.path().join("target"),
+            root.path().join(CURRENT_FILE_NAME),
+        )?;
+        assert!(
+            inspect_lexical_layout(root.path()).is_err(),
+            "no-follow open must refuse a symlinked CURRENT"
+        );
+        Ok(())
     }
 
     #[test]

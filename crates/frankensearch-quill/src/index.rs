@@ -9,6 +9,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ops::{Bound, Deref};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+#[cfg(feature = "conformance-internals")]
+use std::sync::atomic::{AtomicBool, AtomicU8};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -17,11 +19,14 @@ use asupersync::Cx;
 use asupersync::runtime::spawn_blocking;
 use asupersync::sync::{LockError, Mutex, OwnedMutexGuard, TryLockError};
 use frankensearch_core::{
-    DocId, IndexableDocument, LexicalSearch, ScoreSource, ScoredResult, SearchError, SearchFuture,
+    DocId, IndexableDocument, LexicalCandidateBatch, LexicalHydrationContext, LexicalRead,
+    LexicalSearch, LexicalWrite, ScoreSource, ScoredResult, SearchError, SearchFuture,
 };
 #[cfg(feature = "durability")]
 use frankensearch_durability::FileProtector;
 use rayon::prelude::*;
+#[cfg(feature = "conformance-internals")]
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 use tracing::Instrument;
 use xxhash_rust::xxh3::{Xxh3, xxh3_64};
@@ -31,7 +36,7 @@ use crate::argus::{
     DeltaPostingCursor, DocSetCollector, FieldNormReader, MAX_SCORE_MAX_CLAUSES, PhraseScorer,
     PhraseTerm, PositionsHandle, PositionsReader, PostingCursor, PruningTelemetry,
     QueryWorkCheckpoint, QueryWorkKind, ReferenceScorer, ScorerClause, SealedPostingCursor,
-    TermScorer, TopDocsCollector,
+    TermRecordOption, TermScorer, TopDocsCollector,
 };
 use crate::config::QuillConfig;
 use crate::delta::DeltaSnapshot;
@@ -1137,15 +1142,256 @@ struct QueryFuelState {
     position_docs: AtomicU64,
 }
 
+/// Deterministic request-cancellation checkpoints exposed only to the
+/// conformance harness.
+///
+/// Synchronous Quill collection cannot be preempted from an external test
+/// task at a reproducible work unit. The conformance controller therefore
+/// requests cancellation on the real [`Cx`] from an exact engine checkpoint;
+/// the public method must still observe that request through its normal
+/// cancellation poll and return its own typed outcome.
+#[cfg(feature = "conformance-internals")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum ConformanceCancellationStage {
+    /// One admitted collection work unit.
+    QueryCollection = 1,
+    /// One deferred-metadata candidate before materialization.
+    FusionHydration = 2,
+    /// The retained commit transaction immediately before publication.
+    CommitPublication = 3,
+}
+
+/// Fixed-size conformance receipt for the complete retained scalar writer
+/// transaction.
+///
+/// The digest binds canonical pending segment bytes and identities, staged
+/// flush state, retained MANIFEST proposals, dirty shard document witnesses,
+/// allocator leases, and all publication-relevant flags. Summary counters stay
+/// explicit so a receipt cannot hide a missing state class behind an opaque
+/// digest. This type and the hashing work do not exist in shipping builds.
+#[cfg(feature = "conformance-internals")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConformancePendingWriterState {
+    digest_sha256: [u8; 32],
+    shard_count: u64,
+    dirty_shard_count: u64,
+    pending_identity_count: u64,
+    uncommitted_id_count: u64,
+    pending_segment_count: u64,
+    pending_owned_segment_count: u64,
+    flags: u8,
+}
+
+#[cfg(feature = "conformance-internals")]
+impl ConformancePendingWriterState {
+    const STAGED_FLUSH_PRESENT: u8 = 1 << 0;
+    const PENDING_MANIFEST_PRESENT: u8 = 1 << 1;
+    const PENDING_REPLACEMENT_MANIFEST_PRESENT: u8 = 1 << 2;
+    const PENDING_DELTA_SEAL_PRESENT: u8 = 1 << 3;
+    const UNPUBLISHED_SINCE_PRESENT: u8 = 1 << 4;
+    const INGEST_RETRY_REQUIRED: u8 = 1 << 5;
+
+    const fn has_flag(self, flag: u8) -> bool {
+        self.flags & flag != 0
+    }
+
+    /// SHA-256 over the canonical complete pending writer transaction.
+    #[must_use]
+    pub const fn digest_sha256(self) -> [u8; 32] {
+        self.digest_sha256
+    }
+
+    /// Number of configured scalar writer shards represented by the digest.
+    #[must_use]
+    pub const fn shard_count(self) -> u64 {
+        self.shard_count
+    }
+
+    /// Number of shards retaining documents, identities, or an active lease.
+    #[must_use]
+    pub const fn dirty_shard_count(self) -> u64 {
+        self.dirty_shard_count
+    }
+
+    /// Canonical document identity rows still resident in dirty shards.
+    #[must_use]
+    pub const fn pending_identity_count(self) -> u64 {
+        self.pending_identity_count
+    }
+
+    /// Stable document IDs reserved by all unpublished scalar state.
+    #[must_use]
+    pub const fn uncommitted_id_count(self) -> u64 {
+        self.uncommitted_id_count
+    }
+
+    /// Installed but unpublished MANIFEST segment rows.
+    #[must_use]
+    pub const fn pending_segment_count(self) -> u64 {
+        self.pending_segment_count
+    }
+
+    /// Canonical in-memory FSLX buffers retained for pending segments.
+    #[must_use]
+    pub const fn pending_owned_segment_count(self) -> u64 {
+        self.pending_owned_segment_count
+    }
+
+    /// Whether a flush transaction has been encoded but not fully installed.
+    #[must_use]
+    pub const fn staged_flush_present(self) -> bool {
+        self.has_flag(Self::STAGED_FLUSH_PRESENT)
+    }
+
+    /// Whether the exact next ordinary MANIFEST proposal is retained.
+    #[must_use]
+    pub const fn pending_manifest_present(self) -> bool {
+        self.has_flag(Self::PENDING_MANIFEST_PRESENT)
+    }
+
+    /// Whether a complete replacement MANIFEST proposal is retained.
+    #[must_use]
+    pub const fn pending_replacement_manifest_present(self) -> bool {
+        self.has_flag(Self::PENDING_REPLACEMENT_MANIFEST_PRESENT)
+    }
+
+    /// Whether a Delta-seal publication transaction is retained.
+    #[must_use]
+    pub const fn pending_delta_seal_present(self) -> bool {
+        self.has_flag(Self::PENDING_DELTA_SEAL_PRESENT)
+    }
+
+    /// Whether the writer is tracking an unpublished visibility interval.
+    #[must_use]
+    pub const fn unpublished_since_present(self) -> bool {
+        self.has_flag(Self::UNPUBLISHED_SINCE_PRESENT)
+    }
+
+    /// Whether scalar ingest requires reconciliation before more mutation.
+    #[must_use]
+    pub const fn ingest_retry_required(self) -> bool {
+        self.has_flag(Self::INGEST_RETRY_REQUIRED)
+    }
+}
+
+#[cfg(feature = "conformance-internals")]
+impl ConformanceCancellationStage {
+    const fn code(self) -> u8 {
+        match self {
+            Self::QueryCollection => 1,
+            Self::FusionHydration => 2,
+            Self::CommitPublication => 3,
+        }
+    }
+}
+
+/// Per-index deterministic cancellation requester for live conformance tests.
+///
+/// This type, its atomics, and every call site are absent unless the dedicated
+/// `conformance-internals` feature is enabled. It cannot fabricate a return
+/// value: firing only marks the real request [`Cx`] as cancelled.
+#[cfg(feature = "conformance-internals")]
+#[derive(Debug, Default)]
+pub struct ConformanceCancellationController {
+    stage: AtomicU8,
+    trigger_ordinal: AtomicU64,
+    observed_checkpoints: AtomicU64,
+    fired: AtomicBool,
+}
+
+#[cfg(feature = "conformance-internals")]
+impl ConformanceCancellationController {
+    const DISARMED: u8 = 0;
+    const ARMING: u8 = u8::MAX;
+
+    /// Arm one exact nonzero checkpoint ordinal.
+    ///
+    /// # Errors
+    ///
+    /// Returns an invalid-state error for ordinal zero or when a prior stage
+    /// remains armed.
+    pub fn arm(
+        &self,
+        stage: ConformanceCancellationStage,
+        trigger_ordinal: u64,
+    ) -> Result<(), QuillIndexError> {
+        if trigger_ordinal == 0 {
+            return Err(invalid_state(
+                "conformance cancellation trigger ordinal must be nonzero",
+            ));
+        }
+        self.stage
+            .compare_exchange(
+                Self::DISARMED,
+                Self::ARMING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .map_err(|_| invalid_state("conformance cancellation controller is already armed"))?;
+        self.trigger_ordinal
+            .store(trigger_ordinal, Ordering::Relaxed);
+        self.observed_checkpoints.store(0, Ordering::Relaxed);
+        self.fired.store(false, Ordering::Relaxed);
+        self.stage.store(stage.code(), Ordering::Release);
+        Ok(())
+    }
+
+    /// Stop injecting checkpoints without changing request cancellation.
+    ///
+    /// The caller must clear the real [`Cx`] explicitly. Keeping those actions
+    /// separate proves the request context remains the cancellation authority.
+    pub fn disarm(&self) {
+        self.stage.store(Self::DISARMED, Ordering::Release);
+    }
+
+    /// Number of matching stage checkpoints observed by the current arm.
+    #[must_use]
+    pub fn observed_checkpoints(&self) -> u64 {
+        self.observed_checkpoints.load(Ordering::Acquire)
+    }
+
+    /// Whether the current arm requested cancellation on its real [`Cx`].
+    #[must_use]
+    pub fn fired(&self) -> bool {
+        self.fired.load(Ordering::Acquire)
+    }
+
+    fn checkpoint(&self, stage: ConformanceCancellationStage, cx: &Cx) {
+        if self.stage.load(Ordering::Acquire) != stage.code() {
+            return;
+        }
+        let ordinal = self
+            .observed_checkpoints
+            .fetch_add(1, Ordering::AcqRel)
+            .saturating_add(1);
+        if ordinal != self.trigger_ordinal.load(Ordering::Acquire) {
+            return;
+        }
+        self.fired.store(true, Ordering::Release);
+        tracing::info!(
+            target: crate::tracing_conventions::TARGET,
+            event = "quill.conformance.cancellation_checkpoint",
+            ?stage,
+            ordinal,
+            "deterministic conformance checkpoint requested cancellation on the real Cx"
+        );
+        cx.set_cancel_requested(true);
+    }
+}
+
 struct QueryCheckpoint<'a> {
     cx: &'a Cx,
     phase: &'static str,
     budget: u64,
     metering: bool,
     state: QueryFuelState,
+    #[cfg(feature = "conformance-internals")]
+    conformance_controller: Arc<ConformanceCancellationController>,
 }
 
 impl<'a> QueryCheckpoint<'a> {
+    #[cfg(any(not(feature = "conformance-internals"), test))]
     fn new(cx: &'a Cx, phase: &'static str, budget: u64, upper_bound: u64) -> Arc<Self> {
         Arc::new(Self {
             cx,
@@ -1153,6 +1399,26 @@ impl<'a> QueryCheckpoint<'a> {
             budget,
             metering: upper_bound > budget,
             state: QueryFuelState::default(),
+            #[cfg(feature = "conformance-internals")]
+            conformance_controller: Arc::default(),
+        })
+    }
+
+    #[cfg(feature = "conformance-internals")]
+    fn new_with_controller(
+        cx: &'a Cx,
+        phase: &'static str,
+        budget: u64,
+        upper_bound: u64,
+        conformance_controller: Arc<ConformanceCancellationController>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            cx,
+            phase,
+            budget,
+            metering: upper_bound > budget,
+            state: QueryFuelState::default(),
+            conformance_controller,
         })
     }
 
@@ -1190,6 +1456,9 @@ impl<'a> QueryCheckpoint<'a> {
 
 impl QueryWorkCheckpoint for QueryCheckpoint<'_> {
     fn admit(&self, kind: QueryWorkKind, units: u64) -> Result<(), ArgusError> {
+        #[cfg(feature = "conformance-internals")]
+        self.conformance_controller
+            .checkpoint(ConformanceCancellationStage::QueryCollection, self.cx);
         if self.cx.is_cancel_requested() {
             return Err(ArgusError::QueryCancelled { phase: self.phase });
         }
@@ -1326,6 +1595,8 @@ struct QuillReader {
     schema: SchemaDescriptor,
     parser: Option<DefaultQueryParser>,
     published_snapshot: Arc<SnapshotPublisher>,
+    #[cfg(feature = "conformance-internals")]
+    conformance_controller: Arc<ConformanceCancellationController>,
 }
 
 /// Shared Quill index handle with lock-free readers and one cancel-aware writer.
@@ -1724,6 +1995,8 @@ impl QuillWriterState {
                 schema,
                 parser,
                 published_snapshot,
+                #[cfg(feature = "conformance-internals")]
+                conformance_controller: Arc::default(),
             },
             backend,
             shards,
@@ -2003,6 +2276,200 @@ impl QuillWriterState {
             || self.pending_manifest.is_some()
             || self.pending_replacement_manifest.is_some()
             || self.pending_delta_seal.is_some()
+    }
+
+    #[cfg(feature = "conformance-internals")]
+    fn conformance_pending_writer_state(
+        &self,
+    ) -> Result<ConformancePendingWriterState, QuillIndexError> {
+        let shard_count = conformance_usize_to_u64(self.shards.len(), "writer shard count")?;
+        let dirty_shard_count = conformance_usize_to_u64(
+            self.shards
+                .iter()
+                .filter(|shard| {
+                    shard.accumulator.document_count() != 0
+                        || !shard.identities.is_empty()
+                        || shard.current_lease_base.is_some()
+                })
+                .count(),
+            "dirty writer shard count",
+        )?;
+        let pending_identity_count = self.shards.iter().try_fold(0_u64, |total, shard| {
+            total
+                .checked_add(conformance_usize_to_u64(
+                    shard.identities.len(),
+                    "pending identity count",
+                )?)
+                .ok_or_else(|| invalid_state("pending identity count overflow"))
+        })?;
+        let uncommitted_id_count =
+            conformance_usize_to_u64(self.uncommitted_ids.len(), "uncommitted id count")?;
+        let pending_segment_count =
+            conformance_usize_to_u64(self.pending_segments.len(), "pending segment count")?;
+        let pending_owned_segment_count = conformance_usize_to_u64(
+            self.pending_owned_segments.len(),
+            "pending owned segment count",
+        )?;
+        let staged_flush_present = self.staged_flush.is_some();
+        let pending_manifest_present = self.pending_manifest.is_some();
+        let pending_replacement_manifest_present = self.pending_replacement_manifest.is_some();
+        let pending_delta_seal_present = self.pending_delta_seal.is_some();
+        let unpublished_since_present = self.unpublished_since.is_some();
+        let mut flags = 0_u8;
+        if staged_flush_present {
+            flags |= ConformancePendingWriterState::STAGED_FLUSH_PRESENT;
+        }
+        if pending_manifest_present {
+            flags |= ConformancePendingWriterState::PENDING_MANIFEST_PRESENT;
+        }
+        if pending_replacement_manifest_present {
+            flags |= ConformancePendingWriterState::PENDING_REPLACEMENT_MANIFEST_PRESENT;
+        }
+        if pending_delta_seal_present {
+            flags |= ConformancePendingWriterState::PENDING_DELTA_SEAL_PRESENT;
+        }
+        if unpublished_since_present {
+            flags |= ConformancePendingWriterState::UNPUBLISHED_SINCE_PRESENT;
+        }
+        if self.ingest_retry_required {
+            flags |= ConformancePendingWriterState::INGEST_RETRY_REQUIRED;
+        }
+
+        let published = self.published_snapshot.load();
+        let mut hasher = Sha256::new();
+        hasher.update(b"frankensearch/quill/pending-writer-state/v2\0");
+        conformance_hash_bytes(&mut hasher, &self.schema.canonical_encoding()?);
+        conformance_hash_bytes(
+            &mut hasher,
+            &conformance_manifest_bytes(
+                &published.keeper_snapshot().loaded_manifest().manifest,
+                "published composite MANIFEST",
+            )?,
+        );
+        hasher.update(published.snapshot_epoch().to_be_bytes());
+        hasher.update(published.keeper_generation().to_be_bytes());
+        hasher.update(published.bm25_doc_count().to_be_bytes());
+        hasher.update(published.live_doc_count().to_be_bytes());
+        hasher.update(
+            conformance_usize_to_u64(published.delta_count(), "published Delta count")?
+                .to_be_bytes(),
+        );
+        for delta in published.delta_snapshots() {
+            conformance_hash_bytes(&mut hasher, &delta.conformance_content_sha256()?);
+        }
+        conformance_hash_bytes(
+            &mut hasher,
+            &conformance_manifest_bytes(
+                &self.backend.snapshot().loaded_manifest().manifest,
+                "writer backend MANIFEST",
+            )?,
+        );
+        hasher.update([u8::from(matches!(&self.backend, IndexBackend::Durable(_)))]);
+        hasher.update(self.next_lease_base.to_be_bytes());
+        hasher.update(self.next_seal_seq.to_be_bytes());
+        hasher.update(self.docid_allocator.watermark().to_be_bytes());
+        hasher.update(shard_count.to_be_bytes());
+        hasher.update(dirty_shard_count.to_be_bytes());
+        hasher.update(pending_identity_count.to_be_bytes());
+        hasher.update(uncommitted_id_count.to_be_bytes());
+        hasher.update(pending_segment_count.to_be_bytes());
+        hasher.update(pending_owned_segment_count.to_be_bytes());
+        hasher.update([flags]);
+
+        for (shard_index, shard) in self.shards.iter().enumerate() {
+            hasher
+                .update(conformance_usize_to_u64(shard_index, "writer shard index")?.to_be_bytes());
+            hasher.update(
+                conformance_usize_to_u64(
+                    shard.accumulator.document_count(),
+                    "shard document count",
+                )?
+                .to_be_bytes(),
+            );
+            hasher.update(
+                conformance_usize_to_u64(shard.accumulator.token_count(), "shard token count")?
+                    .to_be_bytes(),
+            );
+            hasher.update(
+                conformance_usize_to_u64(shard.accumulator.bytes_used(), "shard bytes used")?
+                    .to_be_bytes(),
+            );
+            conformance_hash_optional_u64(&mut hasher, shard.current_lease_base);
+            conformance_hash_optional_lease(
+                &mut hasher,
+                self.docid_allocator.live_lease(shard_index),
+            );
+            hasher.update(
+                conformance_usize_to_u64(
+                    shard.accumulator.document_ords().len(),
+                    "shard document ordinal count",
+                )?
+                .to_be_bytes(),
+            );
+            for document_ord in shard.accumulator.document_ords() {
+                hasher.update(document_ord.to_be_bytes());
+            }
+            hasher.update(
+                conformance_usize_to_u64(shard.identities.len(), "shard identity count")?
+                    .to_be_bytes(),
+            );
+            for identity in &shard.identities {
+                hasher.update(identity.doc_ord.to_be_bytes());
+                conformance_hash_bytes(&mut hasher, identity.document_id.as_bytes());
+                conformance_hash_bytes(&mut hasher, &identity.canonical_content);
+            }
+        }
+
+        hasher.update(uncommitted_id_count.to_be_bytes());
+        for document_id in &self.uncommitted_ids {
+            conformance_hash_bytes(&mut hasher, document_id.as_bytes());
+        }
+
+        match &self.staged_flush {
+            None => hasher.update([0]),
+            Some(staged) => {
+                hasher.update([1]);
+                hasher.update(
+                    conformance_usize_to_u64(staged.shard, "staged flush shard")?.to_be_bytes(),
+                );
+                conformance_hash_bytes(&mut hasher, staged.encoded.as_bytes());
+                conformance_hash_manifest_segment(&mut hasher, &staged.manifest_segment);
+                conformance_hash_field_stats(&mut hasher, &staged.pending_field_stats)?;
+                hasher.update(staged.next_seal_seq.to_be_bytes());
+            }
+        }
+
+        hasher.update(pending_segment_count.to_be_bytes());
+        for segment in &self.pending_segments {
+            conformance_hash_manifest_segment(&mut hasher, segment);
+        }
+        hasher.update(pending_owned_segment_count.to_be_bytes());
+        for segment in &self.pending_owned_segments {
+            conformance_hash_bytes(&mut hasher, segment.as_bytes());
+        }
+        conformance_hash_field_stats(&mut hasher, &self.pending_field_stats)?;
+        conformance_hash_optional_manifest(
+            &mut hasher,
+            self.pending_manifest.as_ref(),
+            "pending MANIFEST",
+        )?;
+        conformance_hash_optional_manifest(
+            &mut hasher,
+            self.pending_replacement_manifest.as_ref(),
+            "pending replacement MANIFEST",
+        )?;
+        conformance_hash_optional_delta_seal(&mut hasher, self.pending_delta_seal.as_ref())?;
+
+        Ok(ConformancePendingWriterState {
+            digest_sha256: hasher.finalize().into(),
+            shard_count,
+            dirty_shard_count,
+            pending_identity_count,
+            uncommitted_id_count,
+            pending_segment_count,
+            pending_owned_segment_count,
+            flags,
+        })
     }
 
     fn has_active_deltas(&self) -> bool {
@@ -2295,6 +2762,10 @@ impl QuillWriterState {
         let _commit_timer = crate::tracing_conventions::StageTimer::new(&commit_span);
         let instrumented = commit_span.clone();
         async {
+            #[cfg(feature = "conformance-internals")]
+            self.reader
+                .conformance_controller
+                .checkpoint(ConformanceCancellationStage::CommitPublication, cx);
             check_cancel(cx, "commit publish")?;
             let open_span = tracing::info_span!(
                 target: crate::tracing_conventions::TARGET,
@@ -3078,6 +3549,36 @@ impl QuillWriterState {
 }
 
 impl QuillReader {
+    #[cfg(not(feature = "conformance-internals"))]
+    #[inline]
+    fn query_checkpoint<'a>(
+        &self,
+        cx: &'a Cx,
+        phase: &'static str,
+        budget: u64,
+        upper_bound: u64,
+    ) -> Arc<QueryCheckpoint<'a>> {
+        QueryCheckpoint::new(cx, phase, budget, upper_bound)
+    }
+
+    #[cfg(feature = "conformance-internals")]
+    #[inline]
+    fn query_checkpoint<'a>(
+        &self,
+        cx: &'a Cx,
+        phase: &'static str,
+        budget: u64,
+        upper_bound: u64,
+    ) -> Arc<QueryCheckpoint<'a>> {
+        QueryCheckpoint::new_with_controller(
+            cx,
+            phase,
+            budget,
+            upper_bound,
+            Arc::clone(&self.conformance_controller),
+        )
+    }
+
     fn default_parser(&self) -> Result<&DefaultQueryParser, QuillIndexError> {
         self.parser.as_ref().ok_or_else(|| {
             invalid_state("string query APIs are unavailable for this preparsed-only index")
@@ -3200,6 +3701,20 @@ impl QuillReader {
         limit: usize,
         hydrate_metadata: bool,
     ) -> Result<Vec<ScoredResult>, QuillIndexError> {
+        self.scored_results_pinned(cx, query, limit, hydrate_metadata)
+            .map(|(results, _snapshot)| results)
+    }
+
+    /// Score on the currently published snapshot and return that exact
+    /// snapshot `Arc` alongside the results, so callers can pin hydration to
+    /// the generation that produced the scores (bd-8nqz.1).
+    fn scored_results_pinned(
+        &self,
+        cx: &Cx,
+        query: &str,
+        limit: usize,
+        hydrate_metadata: bool,
+    ) -> Result<(Vec<ScoredResult>, Arc<QuillSearchSnapshot>), QuillIndexError> {
         let published = self.published_snapshot.load();
         let search = self.search_paginated_on(cx, query, limit, 0, false, published.as_ref())?;
         let mut results = Vec::new();
@@ -3224,7 +3739,7 @@ impl QuillReader {
                 metadata,
             });
         }
-        Ok(results)
+        Ok((results, published))
     }
 
     /// Collect the complete deterministic set of matching global document IDs.
@@ -3385,12 +3900,13 @@ impl QuillReader {
         validate_query_lowering(&parsed.query, 1.0, self.schema)?;
         let published = self.published_snapshot.load();
         let snapshot = published.as_ref();
-        let rank_pruning = limit != 0
+        let topdocs_root = limit != 0;
+        let rank_pruning = topdocs_root
             && rank_pruning.unwrap_or_else(|| query_has_prunable_root_union(&parsed.query, 1.0));
         let mut collector = TopDocsCollector::new(limit, 0)?;
         let work_upper_bound =
             query_work_upper_bound(&parsed.query, snapshot, self.config.glob_expansion_limit)?;
-        let concrete_checkpoint = QueryCheckpoint::new(
+        let concrete_checkpoint = self.query_checkpoint(
             cx,
             "search",
             self.config.query_fuel_budget,
@@ -3405,6 +3921,7 @@ impl QuillReader {
             &parsed.query,
             snapshot,
             rank_pruning,
+            topdocs_root,
             fan_out && !metering,
         )?;
         let collected = collector.finish()?;
@@ -3428,7 +3945,7 @@ impl QuillReader {
         validate_query_lowering(query, 1.0, self.schema)?;
         let work_upper_bound =
             query_work_upper_bound(query, snapshot, self.config.glob_expansion_limit)?;
-        let concrete_checkpoint = QueryCheckpoint::new(
+        let concrete_checkpoint = self.query_checkpoint(
             cx,
             "search",
             self.config.query_fuel_budget,
@@ -3446,7 +3963,8 @@ impl QuillReader {
         } else {
             TopDocsCollector::new(limit, offset)?
         };
-        let rank_pruning = !exact_count && limit != 0 && query_has_prunable_root_union(query, 1.0);
+        let topdocs_root = !exact_count && limit != 0;
+        let rank_pruning = topdocs_root && query_has_prunable_root_union(query, 1.0);
         let sealed_docs: u64 = keeper
             .segments()
             .iter()
@@ -3460,6 +3978,7 @@ impl QuillReader {
             query,
             snapshot,
             rank_pruning,
+            topdocs_root,
             fan_out,
         )?;
         for delta in snapshot.delta_snapshots() {
@@ -3490,6 +4009,7 @@ impl QuillReader {
                 self.schema,
                 self.config.glob_expansion_limit,
                 rank_pruning,
+                topdocs_root,
             )?;
             collector.collect(&mut scorer, delta.as_ref())?;
             record_pruning_telemetry(&score_span, scorer.pruning_telemetry());
@@ -3558,6 +4078,7 @@ impl QuillReader {
         query: &Query,
         snapshot: &QuillSearchSnapshot,
         rank_pruning: bool,
+        topdocs_root: bool,
         fan_out: bool,
     ) -> Result<(), QuillIndexError> {
         let keeper = snapshot.keeper_snapshot();
@@ -3597,6 +4118,7 @@ impl QuillReader {
                         schema,
                         glob_expansion_limit,
                         rank_pruning,
+                        topdocs_root,
                     )?;
                     local.collect(&mut scorer, segment)?;
                     record_pruning_telemetry(&score_span, scorer.pruning_telemetry());
@@ -3635,6 +4157,7 @@ impl QuillReader {
                     self.schema,
                     self.config.glob_expansion_limit,
                     rank_pruning,
+                    topdocs_root,
                 )?;
                 collector.collect(&mut scorer, segment)?;
                 record_pruning_telemetry(&score_span, scorer.pruning_telemetry());
@@ -3761,7 +4284,7 @@ impl QuillReader {
         let mut collector = DocSetCollector::new();
         let work_upper_bound =
             query_work_upper_bound(&parsed.query, snapshot, self.config.glob_expansion_limit)?;
-        let concrete_checkpoint = QueryCheckpoint::new(
+        let concrete_checkpoint = self.query_checkpoint(
             cx,
             "collect_docids",
             self.config.query_fuel_budget,
@@ -3789,7 +4312,7 @@ impl QuillReader {
         validate_query_lowering(query, 1.0, self.schema)?;
         let work_upper_bound =
             query_work_upper_bound(query, snapshot, self.config.glob_expansion_limit)?;
-        let concrete_checkpoint = QueryCheckpoint::new(
+        let concrete_checkpoint = self.query_checkpoint(
             cx,
             "collect_docids",
             self.config.query_fuel_budget,
@@ -3962,6 +4485,8 @@ impl PreparsedQuillIndex {
                 schema,
                 parser: None,
                 published_snapshot,
+                #[cfg(feature = "conformance-internals")]
+                conformance_controller: Arc::default(),
             },
         })
     }
@@ -4019,6 +4544,8 @@ impl QuillSearchIndex {
                 config,
                 schema: DEFAULT_SCHEMA,
                 published_snapshot,
+                #[cfg(feature = "conformance-internals")]
+                conformance_controller: Arc::default(),
             },
             directory,
         })
@@ -4224,11 +4751,12 @@ impl QuillIndex {
         query: &Query,
         snapshot: &QuillSearchSnapshot,
         rank_pruning: bool,
+        topdocs_root: bool,
         fan_out: bool,
     ) -> Result<(), QuillIndexError> {
         let work_upper_bound =
             query_work_upper_bound(query, snapshot, self.reader.config.glob_expansion_limit)?;
-        let concrete_checkpoint = QueryCheckpoint::new(
+        let concrete_checkpoint = self.reader.query_checkpoint(
             cx,
             "search",
             self.reader.config.query_fuel_budget,
@@ -4243,6 +4771,7 @@ impl QuillIndex {
             query,
             snapshot,
             rank_pruning,
+            topdocs_root,
             fan_out && !metering,
         )
     }
@@ -4362,6 +4891,34 @@ impl QuillIndex {
     #[must_use]
     pub fn search_snapshot(&self) -> Arc<QuillSearchSnapshot> {
         self.reader.published_snapshot.load()
+    }
+
+    /// Clone the deterministic real-`Cx` cancellation requester used by the
+    /// method-bound conformance harness.
+    ///
+    /// This API and its per-index state do not exist in normal builds.
+    #[cfg(feature = "conformance-internals")]
+    #[must_use]
+    pub fn conformance_cancellation_controller(&self) -> Arc<ConformanceCancellationController> {
+        Arc::clone(&self.reader.conformance_controller)
+    }
+
+    /// Capture a fixed-size digest receipt for the complete retained scalar
+    /// writer transaction.
+    ///
+    /// This conformance-only surface hashes actual canonical pending FSLX
+    /// bytes and identity rows rather than reporting only a dirty boolean.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed error if the writer is busy or any retained MANIFEST
+    /// proposal cannot be canonically encoded.
+    #[cfg(feature = "conformance-internals")]
+    pub fn conformance_pending_writer_state(
+        &self,
+    ) -> Result<ConformancePendingWriterState, QuillIndexError> {
+        let writer = self.writer.try_lock().map_err(map_try_lock_error)?;
+        writer.conformance_pending_writer_state()
     }
 
     /// Resolve one published document through IDHASH and return its IDMAP hash.
@@ -4567,6 +5124,26 @@ impl QuillIndex {
     ) -> Result<bool, QuillIndexError> {
         let mut writer = self.lock_writer(cx, "delete document writer lock").await?;
         writer.delete_document(cx, document_id).await
+    }
+
+    /// Delete a bounded batch of live document IDs and publish one successor
+    /// snapshot.
+    ///
+    /// IDs that are already absent are ignored. Publishing once for the batch
+    /// keeps bulk tombstone setup from paying one durable MANIFEST transition
+    /// per ID while preserving the same atomic visibility boundary.
+    ///
+    /// # Errors
+    ///
+    /// Returns typed writer-lock, cancellation, identity-resolution, or
+    /// successor-publication failures.
+    pub async fn delete_documents(
+        &self,
+        cx: &Cx,
+        document_ids: &[&str],
+    ) -> Result<usize, QuillIndexError> {
+        let mut writer = self.lock_writer(cx, "delete documents writer lock").await?;
+        writer.delete_documents(cx, document_ids).await
     }
 
     /// Delete every live document and publish an empty successor snapshot.
@@ -4854,6 +5431,221 @@ impl LexicalSearch for QuillIndex {
     }
 }
 
+/// Backend tag carried by Quill hydration contexts (bd-8nqz.1).
+pub const QUILL_LEXICAL_BACKEND: &str = "quill";
+
+/// Feature-only snapshot pin that carries the deterministic hydration
+/// checkpoint alongside the immutable scoring generation.
+#[cfg(feature = "conformance-internals")]
+struct ConformanceHydrationPin {
+    snapshot: Arc<QuillSearchSnapshot>,
+    controller: Arc<ConformanceCancellationController>,
+}
+
+/// Shared generation-pinned candidate search for Quill readers (bd-8nqz.1).
+fn quill_search_candidates<'a>(
+    reader: &'a QuillReader,
+    cx: &'a Cx,
+    query: &'a str,
+    limit: usize,
+) -> SearchFuture<'a, LexicalCandidateBatch> {
+    Box::pin(async move {
+        let (results, snapshot) = reader
+            .scored_results_pinned(cx, query, limit, false)
+            .map_err(SearchError::from)?;
+        #[cfg(not(feature = "conformance-internals"))]
+        let context = LexicalHydrationContext::new(QUILL_LEXICAL_BACKEND, Box::new(snapshot));
+        #[cfg(feature = "conformance-internals")]
+        let context = LexicalHydrationContext::new(
+            QUILL_LEXICAL_BACKEND,
+            Box::new(ConformanceHydrationPin {
+                snapshot,
+                controller: Arc::clone(&reader.conformance_controller),
+            }),
+        );
+        Ok(LexicalCandidateBatch::deferred(results, context))
+    })
+}
+
+/// Shared pinned hydration for Quill readers (bd-8nqz.1): metadata is
+/// materialized from the exact snapshot that scored the batch, never from a
+/// newer published generation.
+fn quill_hydrate_candidates<'a>(
+    cx: &'a Cx,
+    context: Option<&'a LexicalHydrationContext>,
+    results: &'a mut [ScoredResult],
+) -> SearchFuture<'a, ()> {
+    Box::pin(async move {
+        check_cancel(cx, "fusion metadata hydration").map_err(SearchError::from)?;
+        let Some(context) = context else {
+            return Err(SearchError::SubsystemError {
+                subsystem: "quill.hydration",
+                source: "deferred Quill candidates require their batch context; \
+                         none was provided"
+                    .into(),
+            });
+        };
+        #[cfg(not(feature = "conformance-internals"))]
+        let Some(snapshot) = context.downcast_ref::<Arc<QuillSearchSnapshot>>() else {
+            return Err(SearchError::SubsystemError {
+                subsystem: "quill.hydration",
+                source: format!(
+                    "hydration context from backend {:?} is not a Quill snapshot pin; \
+                     refusing cross-engine hydration",
+                    context.backend()
+                )
+                .into(),
+            });
+        };
+        #[cfg(feature = "conformance-internals")]
+        let Some(conformance_pin) = context.downcast_ref::<ConformanceHydrationPin>() else {
+            return Err(SearchError::SubsystemError {
+                subsystem: "quill.hydration",
+                source: format!(
+                    "hydration context from backend {:?} is not a Quill snapshot pin; \
+                     refusing cross-engine hydration",
+                    context.backend()
+                )
+                .into(),
+            });
+        };
+        #[cfg(feature = "conformance-internals")]
+        let snapshot = &conformance_pin.snapshot;
+        for result in results
+            .iter_mut()
+            .filter(|result| result.lexical_score.is_some())
+        {
+            #[cfg(feature = "conformance-internals")]
+            conformance_pin
+                .controller
+                .checkpoint(ConformanceCancellationStage::FusionHydration, cx);
+            check_cancel(cx, "fusion metadata hydration").map_err(SearchError::from)?;
+            let Some(global_docid) = snapshot
+                .resolve_document_id(result.doc_id.as_str())
+                .map_err(SearchError::from)?
+            else {
+                result.metadata = None;
+                continue;
+            };
+            result.metadata = snapshot
+                .materialize_metadata(global_docid)
+                .map_err(SearchError::from)?;
+        }
+        Ok(())
+    })
+}
+
+impl LexicalRead for QuillIndex {
+    fn search<'a>(
+        &'a self,
+        cx: &'a Cx,
+        query: &'a str,
+        limit: usize,
+    ) -> SearchFuture<'a, Vec<ScoredResult>> {
+        Box::pin(async move {
+            self.reader
+                .scored_results(cx, query, limit, true)
+                .map_err(SearchError::from)
+        })
+    }
+
+    fn search_candidates<'a>(
+        &'a self,
+        cx: &'a Cx,
+        query: &'a str,
+        limit: usize,
+    ) -> SearchFuture<'a, LexicalCandidateBatch> {
+        quill_search_candidates(&self.reader, cx, query, limit)
+    }
+
+    fn hydrate_candidates<'a>(
+        &'a self,
+        cx: &'a Cx,
+        context: Option<&'a LexicalHydrationContext>,
+        results: &'a mut [ScoredResult],
+    ) -> SearchFuture<'a, ()> {
+        quill_hydrate_candidates(cx, context, results)
+    }
+
+    fn doc_count(&self) -> usize {
+        usize::try_from(Self::doc_count(self)).unwrap_or(usize::MAX)
+    }
+}
+
+impl LexicalWrite for QuillIndex {
+    fn index_document<'a>(
+        &'a self,
+        cx: &'a Cx,
+        doc: &'a IndexableDocument,
+    ) -> SearchFuture<'a, ()> {
+        Box::pin(async move {
+            self.upsert_documents(cx, std::slice::from_ref(doc))
+                .await
+                .map_err(SearchError::from)
+        })
+    }
+
+    fn index_documents<'a>(
+        &'a self,
+        cx: &'a Cx,
+        docs: &'a [IndexableDocument],
+    ) -> SearchFuture<'a, ()> {
+        Box::pin(async move {
+            self.upsert_documents(cx, docs)
+                .await
+                .map_err(SearchError::from)
+        })
+    }
+
+    fn commit<'a>(&'a self, cx: &'a Cx) -> SearchFuture<'a, ()> {
+        Box::pin(async move {
+            Self::commit(self, cx)
+                .await
+                .map(drop)
+                .map_err(SearchError::from)
+        })
+    }
+}
+
+/// The read-only reader implements ONLY [`LexicalRead`] — no writer lease is
+/// ever acquired on a read-only open (bd-8nqz.1).
+impl LexicalRead for QuillSearchIndex {
+    fn search<'a>(
+        &'a self,
+        cx: &'a Cx,
+        query: &'a str,
+        limit: usize,
+    ) -> SearchFuture<'a, Vec<ScoredResult>> {
+        Box::pin(async move {
+            self.reader
+                .scored_results(cx, query, limit, true)
+                .map_err(SearchError::from)
+        })
+    }
+
+    fn search_candidates<'a>(
+        &'a self,
+        cx: &'a Cx,
+        query: &'a str,
+        limit: usize,
+    ) -> SearchFuture<'a, LexicalCandidateBatch> {
+        quill_search_candidates(&self.reader, cx, query, limit)
+    }
+
+    fn hydrate_candidates<'a>(
+        &'a self,
+        cx: &'a Cx,
+        context: Option<&'a LexicalHydrationContext>,
+        results: &'a mut [ScoredResult],
+    ) -> SearchFuture<'a, ()> {
+        quill_hydrate_candidates(cx, context, results)
+    }
+
+    fn doc_count(&self) -> usize {
+        usize::try_from(Self::doc_count(self)).unwrap_or(usize::MAX)
+    }
+}
+
 impl From<QuillIndexError> for SearchError {
     fn from(error: QuillIndexError) -> Self {
         match error {
@@ -5089,6 +5881,156 @@ pub fn indexable_document_content_hash(
 ) -> Result<u64, QuillIndexError> {
     let metadata = canonical_metadata(&document.metadata)?;
     Ok(xxh3_64(&canonical_document_preimage(document, &metadata)?))
+}
+
+#[cfg(feature = "conformance-internals")]
+fn conformance_usize_to_u64(value: usize, label: &'static str) -> Result<u64, QuillIndexError> {
+    u64::try_from(value).map_err(|_| invalid_state(format!("{label} does not fit u64")))
+}
+
+#[cfg(feature = "conformance-internals")]
+fn conformance_hash_bytes(hasher: &mut Sha256, bytes: &[u8]) {
+    hasher.update(u64::try_from(bytes.len()).unwrap_or(u64::MAX).to_be_bytes());
+    hasher.update(bytes);
+}
+
+#[cfg(feature = "conformance-internals")]
+fn conformance_hash_optional_u64(hasher: &mut Sha256, value: Option<u64>) {
+    match value {
+        None => hasher.update([0]),
+        Some(value) => {
+            hasher.update([1]);
+            hasher.update(value.to_be_bytes());
+        }
+    }
+}
+
+#[cfg(feature = "conformance-internals")]
+fn conformance_hash_optional_lease(hasher: &mut Sha256, lease: Option<(u64, u32)>) {
+    match lease {
+        None => hasher.update([0]),
+        Some((base, used)) => {
+            hasher.update([1]);
+            hasher.update(base.to_be_bytes());
+            hasher.update(used.to_be_bytes());
+        }
+    }
+}
+
+#[cfg(feature = "conformance-internals")]
+fn conformance_manifest_bytes(
+    manifest: &Manifest,
+    label: &'static str,
+) -> Result<Vec<u8>, QuillIndexError> {
+    manifest
+        .to_bytes()
+        .map_err(|error| invalid_state(format!("could not encode {label} receipt: {error}")))
+}
+
+#[cfg(feature = "conformance-internals")]
+fn conformance_hash_manifest_segment(hasher: &mut Sha256, segment: &ManifestSegment) {
+    hasher.update(segment.segment_id.to_be_bytes());
+    hasher.update(segment.seal_seq.to_be_bytes());
+    hasher.update(segment.file_len.to_be_bytes());
+    hasher.update(segment.file_xxh3.to_be_bytes());
+    hasher.update(segment.docid_lo.to_be_bytes());
+    hasher.update(segment.docid_hi.to_be_bytes());
+    hasher.update(segment.doc_count.to_be_bytes());
+    conformance_hash_bytes(hasher, segment.tombstones.as_bytes());
+}
+
+#[cfg(feature = "conformance-internals")]
+fn conformance_hash_field_stats(
+    hasher: &mut Sha256,
+    field_stats: &BTreeMap<u16, (u64, u32)>,
+) -> Result<(), QuillIndexError> {
+    hasher.update(
+        conformance_usize_to_u64(field_stats.len(), "pending field-stat count")?.to_be_bytes(),
+    );
+    for (&field_ord, &(total_tokens, document_count)) in field_stats {
+        hasher.update(field_ord.to_be_bytes());
+        hasher.update(total_tokens.to_be_bytes());
+        hasher.update(document_count.to_be_bytes());
+    }
+    Ok(())
+}
+
+#[cfg(feature = "conformance-internals")]
+fn conformance_hash_optional_manifest(
+    hasher: &mut Sha256,
+    manifest: Option<&Manifest>,
+    label: &'static str,
+) -> Result<(), QuillIndexError> {
+    match manifest {
+        None => hasher.update([0]),
+        Some(manifest) => {
+            hasher.update([1]);
+            conformance_hash_bytes(hasher, &conformance_manifest_bytes(manifest, label)?);
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "conformance-internals")]
+fn conformance_hash_optional_delta_seal(
+    hasher: &mut Sha256,
+    pending: Option<&PendingDeltaSeal>,
+) -> Result<(), QuillIndexError> {
+    let Some(pending) = pending else {
+        hasher.update([0]);
+        return Ok(());
+    };
+    hasher.update([1]);
+    match &pending.encoded {
+        None => hasher.update([0]),
+        Some(encoded) => {
+            hasher.update([1]);
+            conformance_hash_bytes(hasher, encoded.as_bytes());
+        }
+    }
+    hasher.update([u8::from(pending.segment_installed)]);
+    conformance_hash_bytes(
+        hasher,
+        &conformance_manifest_bytes(&pending.manifest, "pending Delta MANIFEST")?,
+    );
+    hasher.update(pending.next_seal_seq.to_be_bytes());
+    hasher.update(pending.successor_watermark.to_be_bytes());
+
+    let prepared = &pending.prepared;
+    hasher.update(prepared.snapshot_epoch.to_be_bytes());
+    hasher.update(prepared.expected_keeper_generation.to_be_bytes());
+    hasher.update(prepared.expected_schema_id.to_be_bytes());
+    hasher.update(prepared.expected_docid_high_watermark.to_be_bytes());
+    conformance_hash_bytes(hasher, &prepared.schema.canonical_encoding()?);
+    hasher.update(
+        conformance_usize_to_u64(prepared.field_stats.len(), "prepared field-stat count")?
+            .to_be_bytes(),
+    );
+    for field_stats in &prepared.field_stats {
+        hasher.update(field_stats.field_ord.to_be_bytes());
+        hasher.update(field_stats.total_tokens.to_be_bytes());
+        hasher.update(field_stats.doc_count.to_be_bytes());
+    }
+    hasher.update(prepared.bm25_doc_count.to_be_bytes());
+    hasher.update(prepared.live_doc_count.to_be_bytes());
+    hasher.update(prepared.delta_live_doc_count.to_be_bytes());
+    hasher.update(
+        conformance_usize_to_u64(prepared.deltas.len(), "prepared Delta count")?.to_be_bytes(),
+    );
+    for delta in &prepared.deltas {
+        hasher.update(delta.keeper_generation().to_be_bytes());
+        let (lineage_id, generation, lease_base, lease_end) = delta.publication_lineage();
+        hasher.update(lineage_id.to_be_bytes());
+        hasher.update(generation.to_be_bytes());
+        hasher.update(lease_base.to_be_bytes());
+        hasher.update(lease_end.to_be_bytes());
+        hasher.update(
+            conformance_usize_to_u64(delta.live_document_count(), "prepared Delta live rows")?
+                .to_be_bytes(),
+        );
+        conformance_hash_bytes(hasher, &delta.conformance_content_sha256()?);
+    }
+    Ok(())
 }
 
 fn manifest_segment(encoded: &EncodedSegment, seal_seq: u64) -> ManifestSegment {
@@ -5451,6 +6393,7 @@ fn lower_query<'a>(
     schema: SchemaDescriptor,
     glob_expansion_limit: usize,
     rank_pruning: bool,
+    topdocs_root: bool,
 ) -> Result<ReferenceScorer<'a>, QuillIndexError> {
     lower_query_with_mode(
         cx,
@@ -5463,6 +6406,7 @@ fn lower_query<'a>(
         glob_expansion_limit,
         QueryLoweringMode::Scored,
         rank_pruning,
+        topdocs_root,
     )
 }
 
@@ -5486,6 +6430,7 @@ fn lower_query_unscored<'a>(
         schema,
         glob_expansion_limit,
         QueryLoweringMode::Unscored,
+        false,
         false,
     )
 }
@@ -5808,8 +6753,10 @@ enum QueryLoweringMode {
 fn lower_boolean(
     clauses: Vec<ScorerClause<'_>>,
     mode: QueryLoweringMode,
+    topdocs_root: bool,
 ) -> Result<ReferenceScorer<'_>, QuillIndexError> {
     match mode {
+        QueryLoweringMode::Scored if topdocs_root => ReferenceScorer::boolean_topdocs(clauses),
         QueryLoweringMode::Scored => ReferenceScorer::boolean(clauses),
         QueryLoweringMode::Unscored => ReferenceScorer::boolean_unscored(clauses),
     }
@@ -5827,6 +6774,7 @@ fn lower_query_with_mode<'a>(
     glob_expansion_limit: usize,
     mode: QueryLoweringMode,
     rank_pruning: bool,
+    topdocs_root: bool,
 ) -> Result<ReferenceScorer<'a>, QuillIndexError> {
     match query {
         Query::Empty => Ok(ReferenceScorer::empty()),
@@ -5856,7 +6804,7 @@ fn lower_query_with_mode<'a>(
                     checkpoint,
                 )?));
             }
-            lower_boolean(clauses, mode)
+            lower_boolean(clauses, mode, topdocs_root)
         }
         Query::Phrase {
             fields,
@@ -5884,7 +6832,7 @@ fn lower_query_with_mode<'a>(
                         checkpoint,
                     )?));
                 }
-                return lower_boolean(clauses, mode);
+                return lower_boolean(clauses, mode, topdocs_root);
             }
             let mut clauses = Vec::new();
             for field in fields {
@@ -5952,7 +6900,7 @@ fn lower_query_with_mode<'a>(
                 };
                 clauses.push(ScorerClause::should(ReferenceScorer::phrase(scorer)));
             }
-            lower_boolean(clauses, mode)
+            lower_boolean(clauses, mode, topdocs_root)
         }
         Query::Boolean { clauses, .. } => {
             let mut lowered = Vec::new();
@@ -5973,10 +6921,11 @@ fn lower_query_with_mode<'a>(
                         glob_expansion_limit,
                         mode,
                         rank_pruning,
+                        false,
                     )?,
                 ));
             }
-            lower_boolean(lowered, mode)
+            lower_boolean(lowered, mode, topdocs_root)
         }
         Query::Boost { query, factor } => {
             let boost = inherited_boost * *factor;
@@ -5996,6 +6945,7 @@ fn lower_query_with_mode<'a>(
                 glob_expansion_limit,
                 mode,
                 rank_pruning,
+                topdocs_root,
             )
         }
         Query::Range {
@@ -6238,6 +7188,26 @@ fn query_field_kind(
     field_ord: u16,
 ) -> Result<FieldKind, QuillIndexError> {
     query_field_descriptor(schema, field_ord).map(|field| field.kind)
+}
+
+fn term_record_option(
+    schema: SchemaDescriptor,
+    field_ord: u16,
+) -> Result<TermRecordOption, QuillIndexError> {
+    match query_field_kind(schema, field_ord)? {
+        FieldKind::Keyword
+        | FieldKind::Text {
+            positions: false, ..
+        } => Ok(TermRecordOption::Basic),
+        FieldKind::Text {
+            positions: true, ..
+        } => Ok(TermRecordOption::WithFreqsAndPositions),
+        FieldKind::StoredOnly | FieldKind::I64 { .. } | FieldKind::U64 { .. } => {
+            Err(QuillIndexError::UnsupportedQuery {
+                detail: format!("term scorer names non-string field {field_ord}"),
+            })
+        }
+    }
 }
 
 fn query_field_descriptor(
@@ -6573,7 +7543,7 @@ fn lower_numeric_field_set<'a>(
             document_count,
         )?));
     }
-    let matching = lower_boolean(clauses, QueryLoweringMode::Unscored)?;
+    let matching = lower_boolean(clauses, QueryLoweringMode::Unscored, false)?;
     match mode {
         QueryLoweringMode::Scored => {
             ReferenceScorer::constant_score(matching, boost).map_err(QuillIndexError::from)
@@ -6601,7 +7571,7 @@ fn lower_leaf_string_predicate<'a>(
             leaf, snapshot, schema, field_ord, &term, 1.0, false, checkpoint,
         )?));
     }
-    let matching = lower_boolean(clauses, QueryLoweringMode::Unscored)?;
+    let matching = lower_boolean(clauses, QueryLoweringMode::Unscored, false)?;
     match mode {
         QueryLoweringMode::Scored => {
             ReferenceScorer::constant_score(matching, boost).map_err(QuillIndexError::from)
@@ -6639,7 +7609,7 @@ fn lower_leaf_glob<'a>(
         )?;
         fields.push(ScorerClause::should(field_scorer));
     }
-    lower_boolean(fields, mode)
+    lower_boolean(fields, mode, false)
 }
 
 fn snapshot_glob_terms(
@@ -6838,13 +7808,14 @@ fn lower_leaf_term<'a>(
 ) -> Result<ReferenceScorer<'a>, QuillIndexError> {
     let stats = composite_snapshot_field(snapshot, field_ord)?;
     let doc_freq = checkpointed_snapshot_doc_freq(checkpoint, snapshot, field_ord, term)?;
+    let record_option = term_record_option(schema, field_ord)?;
     match leaf {
         QueryLeaf::Sealed(segment) => {
             checkpoint.admit(QueryWorkKind::DictionaryBlock, 1)?;
             let (cursor, fieldnorms) =
                 open_sealed_term_cursor(segment, schema, field_ord, term, rank_pruning)?;
             let cursor = CheckpointPostingCursor::new(cursor, Arc::clone(checkpoint))?;
-            build_term_scorer(cursor, fieldnorms, stats, doc_freq, boost)
+            build_term_scorer(cursor, fieldnorms, stats, doc_freq, record_option, boost)
         }
         QueryLeaf::Delta(delta) => {
             let cursor = DeltaPostingCursor::new(delta, field_ord, term)?;
@@ -6854,6 +7825,7 @@ fn lower_leaf_term<'a>(
                 DeltaFieldNorms::new(delta, field_ord),
                 stats,
                 doc_freq,
+                record_option,
                 boost,
             )
         }
@@ -6988,7 +7960,14 @@ fn lower_term(
     let doc_freq = snapshot_doc_freq(snapshot, schema, field_ord, term)?;
     let cursor = open_owned_cursor(segment, schema, field_ord, term, false, None)?;
     let norms = owned_fieldnorms(segment, schema, field_ord)?;
-    build_term_scorer(cursor, norms, stats, doc_freq, boost)
+    build_term_scorer(
+        cursor,
+        norms,
+        stats,
+        doc_freq,
+        term_record_option(schema, field_ord)?,
+        boost,
+    )
 }
 
 fn build_term_scorer<'a, C, F>(
@@ -6996,6 +7975,7 @@ fn build_term_scorer<'a, C, F>(
     fieldnorms: F,
     stats: SnapshotFieldStats,
     snapshot_doc_freq: u64,
+    record_option: TermRecordOption,
     boost: f32,
 ) -> Result<ReferenceScorer<'a>, QuillIndexError>
 where
@@ -7007,6 +7987,7 @@ where
         fieldnorms,
         Bm25FieldSnapshot::new(stats)?,
         snapshot_doc_freq,
+        record_option,
         boost,
     )?))
 }
@@ -7026,7 +8007,14 @@ fn lower_composite_sealed_term(
     let doc_freq = snapshot.bm25_doc_freq(field_ord, term)?;
     let cursor = open_owned_cursor(segment, schema, field_ord, term, false, None)?;
     let norms = owned_fieldnorms(segment, schema, field_ord)?;
-    build_term_scorer(cursor, norms, stats, doc_freq, boost)
+    build_term_scorer(
+        cursor,
+        norms,
+        stats,
+        doc_freq,
+        term_record_option(schema, field_ord)?,
+        boost,
+    )
 }
 
 #[cfg(test)]
@@ -7046,6 +8034,7 @@ fn lower_delta_term<'a>(
         DeltaFieldNorms::new(delta, field_ord),
         stats,
         doc_freq,
+        term_record_option(delta.schema(), field_ord)?,
         boost,
     )
 }
@@ -7793,6 +8782,20 @@ mod tests {
         document_id: &str,
         content: &str,
     ) {
+        let content_has_positions = delta
+            .schema()
+            .fields
+            .iter()
+            .find(|field| field.id == CONTENT_FIELD)
+            .is_some_and(|field| {
+                matches!(
+                    field.kind,
+                    FieldKind::Text {
+                        positions: true,
+                        ..
+                    }
+                )
+            });
         let mut term_positions = BTreeMap::<&str, Vec<u32>>::new();
         for (position, term) in content.split_ascii_whitespace().enumerate() {
             term_positions.entry(term).or_default().push(
@@ -7837,7 +8840,7 @@ mod tests {
                 field_ord: CONTENT_FIELD,
                 term: term.as_bytes(),
                 frequency: u32::try_from(positions.len()).expect("fixture frequency fits u32"),
-                positions: Some(positions),
+                positions: content_has_positions.then_some(positions.as_slice()),
             });
         }
         let ordinal = u64::from(global_docid).to_le_bytes();
@@ -8458,6 +9461,7 @@ mod tests {
         let snapshot = index.search_snapshot();
         let rank_pruning =
             !exact_count && limit != 0 && query_has_prunable_root_union(&parsed.query, 1.0);
+        let topdocs_root = !exact_count && limit != 0;
         let mut collector = if exact_count {
             TopDocsCollector::with_exact_count(limit, offset)
         } else {
@@ -8471,6 +9475,7 @@ mod tests {
                 &parsed.query,
                 &snapshot,
                 rank_pruning,
+                topdocs_root,
                 fan_out,
             )
             .expect("sealed collection");
@@ -8820,6 +9825,7 @@ mod tests {
                 &[
                     IndexableDocument::new("first", "alpha"),
                     IndexableDocument::new("second", "beta"),
+                    IndexableDocument::new("third", "gamma"),
                 ],
             )
             .await
@@ -8827,6 +9833,21 @@ mod tests {
             LexicalSearch::commit(&index, &cx)
                 .await
                 .expect("commit repopulated backend");
+            assert_eq!(
+                index
+                    .delete_documents(&cx, &["first", "missing", "second"])
+                    .await
+                    .expect("delete bounded document batch"),
+                2
+            );
+            assert_eq!(index.doc_count(), 1);
+            assert_eq!(
+                LexicalSearch::search(&index, &cx, "gamma", 10)
+                    .await
+                    .expect("search batch-delete survivor")
+                    .len(),
+                1
+            );
             index.delete_all(&cx).await.expect("delete all documents");
             assert_eq!(index.doc_count(), 0);
 
@@ -11920,6 +12941,65 @@ mod tests {
         });
     }
 
+    #[cfg(feature = "bench-internals")]
+    #[test]
+    fn basic_record_option_scores_and_bounds_repeated_delta_occurrences_as_presence() {
+        let keeper = Arc::new(
+            KeeperSnapshot::in_memory(POSITIONLESS_QG_SCHEMA)
+                .expect("genesis positionless Keeper snapshot"),
+        );
+        let generation = keeper.loaded_manifest().manifest.generation;
+        let mut delta =
+            DeltaSegment::new(POSITIONLESS_QG_SCHEMA, 0, usize::MAX).expect("Basic Delta shard");
+        apply_tokenized_delta_document(&mut delta, 0, "repeat", "token token neutral");
+        apply_tokenized_delta_document(&mut delta, 1, "single", "token single neutral");
+        let frozen = Arc::new(delta.freeze(generation));
+        let composite = QuillSearchSnapshot::compose(0, keeper, vec![Arc::clone(&frozen)])
+            .expect("positionless Delta composite snapshot");
+        let stats = composite
+            .bm25_field_stats(CONTENT_FIELD)
+            .expect("positionless Delta content statistics");
+        assert_eq!((stats.total_tokens, stats.doc_count), (6, 2));
+        assert_eq!(
+            composite
+                .bm25_doc_freq(CONTENT_FIELD, b"token")
+                .expect("positionless Delta token document frequency"),
+            2
+        );
+
+        let mut cursor = DeltaPostingCursor::new(&frozen, CONTENT_FIELD, b"token")
+            .expect("positionless Delta token cursor");
+        assert_eq!((cursor.doc(), cursor.freq()), (Some(0), Some(1)));
+        assert!(cursor.positions_handle().is_none());
+        assert_eq!(cursor.next().expect("advance Basic Delta cursor"), Some(1));
+        assert_eq!(cursor.freq(), Some(1));
+        assert!(cursor.positions_handle().is_none());
+
+        let average = stats
+            .average_field_length()
+            .expect("non-empty positionless Delta average");
+        let weight = crate::contract::idf(2, 2) * (1.0 + crate::contract::BM25_K1);
+        let bound = cursor
+            .term_score_upper_bound(average, weight, TermRecordOption::Basic)
+            .expect("positionless Delta term bound");
+        let mut scorer = lower_delta_term(&frozen, &composite, CONTENT_FIELD, b"token", 1.0)
+            .expect("positionless Delta term scorer");
+        let repeated_score = scorer.score().expect("score repeated Delta occurrence");
+        assert_eq!(
+            repeated_score.to_bits(),
+            bound.to_bits(),
+            "Delta Basic term bound must use the scorer's effective tf=1"
+        );
+        assert_eq!(scorer.next().expect("advance Basic Delta scorer"), Some(1));
+        let single_score = scorer.score().expect("score single Delta occurrence");
+        assert_eq!(
+            repeated_score.to_bits(),
+            single_score.to_bits(),
+            "Delta Basic postings score document presence, not retained raw frequency"
+        );
+        assert_eq!(scorer.next().expect("exhaust Basic Delta scorer"), None);
+    }
+
     #[test]
     fn delta_and_sealed_term_cursors_have_rank_exact_corpus_parity() {
         run_with_cx(|cx| async move {
@@ -12304,6 +13384,7 @@ mod tests {
                 &live_snapshot,
                 DEFAULT_SCHEMA,
                 1_024,
+                true,
                 true,
             )
             .expect("lower direct disjunction with pruning metadata");
@@ -13085,6 +14166,169 @@ mod tests {
             assert!(
                 phrase.hits.iter().any(|hit| hit.document_id == "rust-1"),
                 "the positioned control must exercise a real phrase hit"
+            );
+        });
+    }
+
+    #[cfg(feature = "bench-internals")]
+    #[test]
+    fn positionless_basic_scoring_uses_presence_for_repeated_edge_ngrams() {
+        run_with_cx(|cx| async move {
+            let positioned =
+                QuillIndex::in_memory_with_schema(POSITIONED_QG_SCHEMA, deterministic_config())
+                    .expect("construct the positioned control");
+            let positionless =
+                QuillIndex::in_memory_with_schema(POSITIONLESS_QG_SCHEMA, deterministic_config())
+                    .expect("construct the Basic fixture");
+            assert!(
+                positionless
+                    .search_paginated(&cx, "token", 10, 0, true)
+                    .expect("search empty Basic fixture")
+                    .hits
+                    .is_empty(),
+                "an empty Basic field must have no term hits"
+            );
+            let repeated = crate::scribe::cass_generate_edge_ngrams("tokens tokens");
+            let single = crate::scribe::cass_generate_edge_ngrams("tokens abcdef");
+            assert_eq!(
+                repeated.split_whitespace().count(),
+                single.split_whitespace().count(),
+                "control documents must retain equal field lengths"
+            );
+            let documents = vec![
+                IndexableDocument::new("repeat", repeated).with_title("neutral"),
+                IndexableDocument::new("single", single).with_title("neutral"),
+            ];
+            positioned
+                .index_documents(&cx, &documents)
+                .await
+                .expect("index positioned control documents");
+            positionless
+                .index_documents(&cx, &documents)
+                .await
+                .expect("index Basic fixture documents");
+            let assert_record_semantics = |positioned: &QuillSearchResult,
+                                           positionless: &QuillSearchResult,
+                                           phase: &str| {
+                let score = |result: &QuillSearchResult, document_id: &str| {
+                    result
+                        .hits
+                        .iter()
+                        .find(|hit| hit.document_id == document_id)
+                        .unwrap_or_else(|| panic!("{phase}: missing {document_id} hit"))
+                        .score
+                };
+                let basic_repeat = score(positionless, "repeat");
+                let basic_single = score(positionless, "single");
+                let positioned_repeat = score(positioned, "repeat");
+                let positioned_single = score(positioned, "single");
+
+                assert_eq!(
+                    basic_repeat.to_bits(),
+                    basic_single.to_bits(),
+                    "{phase}: Basic postings score document presence, not retained raw frequency"
+                );
+                assert_eq!(
+                    basic_single.to_bits(),
+                    positioned_single.to_bits(),
+                    "{phase}: a unit frequency is unchanged across record options"
+                );
+                assert!(
+                    positioned_repeat > positioned_single,
+                    "{phase}: frequency-bearing postings retain the repeated edge n-gram boost"
+                );
+            };
+
+            positioned
+                .commit(&cx)
+                .await
+                .expect("publish positioned control");
+            positionless
+                .commit(&cx)
+                .await
+                .expect("publish Basic fixture");
+
+            let positioned = positioned
+                .search_paginated(&cx, "token", 10, 0, true)
+                .expect("search positioned control");
+            let positionless = positionless
+                .search_paginated(&cx, "token", 10, 0, true)
+                .expect("search Basic fixture");
+            assert_record_semantics(&positioned, &positionless, "sealed");
+        });
+    }
+
+    #[cfg(feature = "bench-internals")]
+    #[test]
+    fn positionless_basic_scoring_survives_multiple_segments_and_reopen() {
+        run_with_blocking_cx(|cx| async move {
+            let directory = tempfile::tempdir().expect("temporary Basic scoring directory");
+            let writer = QuillWriterState::create_with_schema(
+                &cx,
+                directory.path(),
+                POSITIONLESS_QG_SCHEMA,
+                deterministic_config(),
+            )
+            .await
+            .expect("create durable Basic writer");
+            let index = QuillIndex::from_writer(writer);
+            let repeated = crate::scribe::cass_generate_edge_ngrams("tokens tokens");
+            let single = crate::scribe::cass_generate_edge_ngrams("tokens abcdef");
+
+            index
+                .index_document(
+                    &cx,
+                    &IndexableDocument::new("repeat", repeated).with_title("neutral"),
+                )
+                .await
+                .expect("index repeated edge n-gram segment");
+            index
+                .commit(&cx)
+                .await
+                .expect("publish first Basic segment");
+            index
+                .index_document(
+                    &cx,
+                    &IndexableDocument::new("single", single).with_title("neutral"),
+                )
+                .await
+                .expect("index single edge n-gram segment");
+            index
+                .commit(&cx)
+                .await
+                .expect("publish second Basic segment");
+            assert_eq!(
+                index.snapshot().segments().len(),
+                2,
+                "fixture must exercise composite scoring across two sealed segments"
+            );
+
+            let before_reopen = index
+                .search_paginated(&cx, "token", 10, 0, true)
+                .expect("search two-segment Basic fixture");
+            assert_eq!(before_reopen.hits.len(), 2);
+            assert_eq!(
+                before_reopen.hits[0].score.to_bits(),
+                before_reopen.hits[1].score.to_bits(),
+                "Basic tf=1 must remain exact across sealed segments"
+            );
+
+            drop(index);
+            let writer = KeeperWriter::open(&cx, directory.path(), POSITIONLESS_QG_SCHEMA)
+                .await
+                .expect("reopen custom-schema Keeper");
+            let reopened = QuillIndex::from_backend(
+                IndexBackend::Durable(writer),
+                POSITIONLESS_QG_SCHEMA,
+                deterministic_config(),
+            )
+            .expect("bind reopened Basic index");
+            let after_reopen = reopened
+                .search_paginated(&cx, "token", 10, 0, true)
+                .expect("search reopened Basic fixture");
+            assert_eq!(
+                after_reopen, before_reopen,
+                "reopen must preserve Basic ids, order, score bits, and exact count"
             );
         });
     }
@@ -14549,6 +15793,104 @@ mod tests {
                 .expect("search reopened durable index");
             assert_eq!(result.total_count, Some(2));
             assert_eq!(result.doc_count, 3);
+        });
+    }
+
+    /// bd-8nqz.1 flagship: a retained candidate batch hydrates from the
+    /// EXACT snapshot that scored it, even after a newer generation commits —
+    /// while the legacy combined-trait path demonstrably reads the newer
+    /// generation (the race the split exists to fix). Also pins the typed
+    /// rejection of missing and foreign hydration contexts.
+    #[test]
+    fn lexical_read_hydration_is_pinned_to_the_scoring_generation() {
+        run_with_cx(|cx| async move {
+            let index = QuillIndex::in_memory(QuillConfig::default()).expect("in-memory index");
+            let doc_v1 =
+                IndexableDocument::new("doc-a", "alpha pinned content").with_metadata("rev", "v1");
+            index
+                .index_documents(&cx, std::slice::from_ref(&doc_v1))
+                .await
+                .expect("index generation N");
+            index.commit(&cx).await.expect("publish generation N");
+
+            // Score on generation N; candidates defer metadata.
+            let batch = LexicalRead::search_candidates(&index, &cx, "pinned", 10)
+                .await
+                .expect("candidates on generation N");
+            assert!(batch.is_deferred(), "Quill candidates must carry a pin");
+            assert_eq!(batch.results().len(), 1);
+            assert!(
+                batch.results()[0].metadata.is_none(),
+                "candidate metadata is deferred until hydration"
+            );
+            let mut legacy_path = batch.results().to_vec();
+
+            // Publish generation N+1 with different metadata for the same doc.
+            let doc_v2 =
+                IndexableDocument::new("doc-a", "alpha pinned content").with_metadata("rev", "v2");
+            LexicalWrite::index_document(&index, &cx, &doc_v2)
+                .await
+                .expect("upsert generation N+1");
+            LexicalWrite::commit(&index, &cx)
+                .await
+                .expect("publish generation N+1");
+
+            let rev_of = |result: &ScoredResult| -> Option<String> {
+                result.metadata.as_ref().and_then(|metadata| {
+                    metadata
+                        .get("rev")
+                        .and_then(|value| value.as_str())
+                        .map(str::to_owned)
+                })
+            };
+
+            // A fresh search observes N+1.
+            let fresh = LexicalRead::search(&index, &cx, "pinned", 10)
+                .await
+                .expect("fresh search on N+1");
+            assert_eq!(rev_of(&fresh[0]).as_deref(), Some("v2"));
+
+            // The retained batch hydrates from its PINNED generation N.
+            let (mut winners, context) = batch.into_parts();
+            LexicalRead::hydrate_candidates(&index, &cx, context.as_ref(), &mut winners)
+                .await
+                .expect("pinned hydration");
+            assert_eq!(
+                rev_of(&winners[0]).as_deref(),
+                Some("v1"),
+                "hydration must read the scoring snapshot, not the newest one"
+            );
+
+            // Differential control: the legacy combined-trait hydration reads
+            // the CURRENT snapshot and returns v2 for the same retained
+            // candidates — the exact generation race.
+            LexicalSearch::hydrate_fusion_metadata(&index, &cx, &mut legacy_path)
+                .await
+                .expect("legacy hydration");
+            assert_eq!(
+                rev_of(&legacy_path[0]).as_deref(),
+                Some("v2"),
+                "legacy path demonstrates the race the split fixes"
+            );
+
+            // Missing context: typed rejection, never a silent no-op.
+            let missing = LexicalRead::hydrate_candidates(&index, &cx, None, &mut winners)
+                .await
+                .expect_err("deferred hydration without a context must fail");
+            assert!(
+                matches!(missing, SearchError::SubsystemError { subsystem, .. }
+                    if subsystem == "quill.hydration"),
+            );
+
+            // Foreign context: typed rejection of cross-engine mixing.
+            let foreign = LexicalHydrationContext::new("not-quill", Box::new(7_u32));
+            let mixed = LexicalRead::hydrate_candidates(&index, &cx, Some(&foreign), &mut winners)
+                .await
+                .expect_err("foreign hydration context must fail");
+            assert!(
+                matches!(mixed, SearchError::SubsystemError { subsystem, .. }
+                    if subsystem == "quill.hydration"),
+            );
         });
     }
 }
