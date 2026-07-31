@@ -3,16 +3,14 @@
 //! FSLX TERMDICT sections use field-namespaced, prefix-compressed blocks. The
 //! durable bytes contain a block-first-key index and full restart keys every
 //! [`TERM_RESTART_INTERVAL`] entries. Opening a dictionary validates the whole
-//! section and builds a bounded in-memory restart directory plus a cache-local
-//! negative filter. Exact misses usually stop at one filter word; possible hits
-//! decode at most one restart group while ordered scans reuse one key buffer.
+//! section and builds a bounded in-memory restart directory; exact lookup then
+//! decodes at most one restart group while ordered scans reuse one key buffer.
 
 use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::ops::{Bound, Range};
 
 use thiserror::Error;
-use xxhash_rust::xxh3::xxh3_64;
 
 use crate::schema::{FieldKind, SchemaDescriptor};
 
@@ -37,8 +35,6 @@ const BLOCK_COUNT_BYTES: usize = 4;
 const BLOCK_ENTRY_COUNT_BYTES: usize = 2;
 const MIN_WIRE_BYTES_PER_BLOCK: usize = 14;
 const MIN_WIRE_BYTES_PER_ENTRY: usize = 7;
-const NEGATIVE_FILTER_KEYS_PER_WORD: usize = 8;
-const NEGATIVE_FILTER_FIELD_SALT: u64 = 0x9e37_79b9_7f4a_7c15;
 
 /// One byte range inside another FSLX section.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -808,8 +804,7 @@ impl EncodedTermDictionary {
             max_terms: terms.len(),
             max_restarts: restart_count,
         };
-        let parsed =
-            TermDictionary::parse_with_limits_mode(&bytes, schema, sections, owned_limits, false)?;
+        let parsed = TermDictionary::parse_with_limits(&bytes, schema, sections, owned_limits)?;
         debug_assert_eq!(parsed.restart_count(), restart_count);
         debug_assert_eq!(parsed.term_count(), term_count);
         Ok(Self {
@@ -904,117 +899,6 @@ struct IndexRecord {
     relative_offset: u64,
 }
 
-/// Cache-local negative membership filter for exact term lookups.
-///
-/// False positives fall through to the canonical restart decoder. Every
-/// inserted key sets three bits in one word, so a definite miss costs one hash
-/// and one cache-line load without weakening exact lookup correctness.
-#[derive(Clone, Debug)]
-struct NegativeTermFilter {
-    words: Vec<u64>,
-    word_mask: usize,
-}
-
-impl NegativeTermFilter {
-    const fn empty() -> Self {
-        Self {
-            words: Vec::new(),
-            word_mask: 0,
-        }
-    }
-
-    fn build(hashes: Vec<u64>) -> Result<Self, TermDictionaryError> {
-        if hashes.is_empty() {
-            return Ok(Self::empty());
-        }
-        let minimum_words = hashes.len().div_ceil(NEGATIVE_FILTER_KEYS_PER_WORD);
-        let word_count =
-            minimum_words
-                .checked_next_power_of_two()
-                .ok_or(TermDictionaryError::SizeOverflow {
-                    field: "negative-filter word count",
-                })?;
-        let mut words = Vec::new();
-        words
-            .try_reserve_exact(word_count)
-            .map_err(|_| TermDictionaryError::Allocation {
-                context: "negative-filter words",
-                count: word_count,
-            })?;
-        words.resize(word_count, 0);
-        let word_mask = word_count - 1;
-        for hash in hashes {
-            words[reduce_negative_filter_hash(hash, word_mask)] |= negative_filter_bit_mask(hash);
-        }
-        Ok(Self { words, word_mask })
-    }
-
-    fn may_contain(&self, field_ord: u16, term: &[u8]) -> bool {
-        if self.words.is_empty() {
-            return false;
-        }
-        let hash = exact_term_hash(field_ord, term);
-        let required = negative_filter_bit_mask(hash);
-        self.words[reduce_negative_filter_hash(hash, self.word_mask)] & required == required
-    }
-}
-
-#[derive(Debug, Default)]
-struct NegativeTermFilterBuilder {
-    hashes: Vec<u64>,
-}
-
-impl NegativeTermFilterBuilder {
-    fn reserve(&mut self, additional: usize) -> Result<(), TermDictionaryError> {
-        self.hashes
-            .try_reserve(additional)
-            .map_err(|_| TermDictionaryError::Allocation {
-                context: "negative-filter hashes",
-                count: self.hashes.len().saturating_add(additional),
-            })
-    }
-
-    fn push_composite(&mut self, composite_key: &[u8]) {
-        debug_assert!(composite_key.len() >= 2);
-        let field_ord = u16::from_be_bytes([composite_key[0], composite_key[1]]);
-        self.hashes
-            .push(exact_term_hash(field_ord, &composite_key[2..]));
-    }
-
-    fn finish(self) -> Result<NegativeTermFilter, TermDictionaryError> {
-        NegativeTermFilter::build(self.hashes)
-    }
-}
-
-fn exact_term_hash(field_ord: u16, term: &[u8]) -> u64 {
-    mix_negative_filter_hash(
-        xxh3_64(term)
-            ^ u64::from(field_ord).wrapping_mul(NEGATIVE_FILTER_FIELD_SALT)
-            ^ u64::try_from(term.len())
-                .unwrap_or(u64::MAX)
-                .rotate_left(17),
-    )
-}
-
-const fn mix_negative_filter_hash(mut value: u64) -> u64 {
-    value ^= value >> 30;
-    value = value.wrapping_mul(0xbf58_476d_1ce4_e5b9);
-    value ^= value >> 27;
-    value = value.wrapping_mul(0x94d0_49bb_1331_11eb);
-    value ^ (value >> 31)
-}
-
-fn reduce_negative_filter_hash(hash: u64, word_mask: usize) -> usize {
-    let mask = u64::try_from(word_mask).unwrap_or(u64::MAX);
-    usize::try_from(hash & mask).unwrap_or(word_mask)
-}
-
-const fn negative_filter_bit_mask(hash: u64) -> u64 {
-    (1_u64 << ((hash >> 21) & 63))
-        | (1_u64 << ((hash >> 42) & 63))
-        | (1_u64 << ((hash.rotate_left(17) >> 37) & 63))
-}
-
 /// Owned, allocation-bounded metadata produced by one complete TERMDICT
 /// validation.
 ///
@@ -1030,7 +914,6 @@ pub(crate) struct ValidatedTermDictionaryMetadata {
     sections: TermSectionLengths,
     blocks: Vec<BlockMeta>,
     restarts: Vec<RestartMeta>,
-    negative_filter: NegativeTermFilter,
     term_count: u32,
 }
 
@@ -1048,7 +931,6 @@ pub struct TermDictionary<'a> {
     sections: TermSectionLengths,
     blocks: Cow<'a, [BlockMeta]>,
     restarts: Cow<'a, [RestartMeta]>,
-    negative_filter: Option<Cow<'a, NegativeTermFilter>>,
     term_count: u32,
 }
 
@@ -1078,16 +960,6 @@ impl<'a> TermDictionary<'a> {
         schema: SchemaDescriptor,
         sections: TermSectionLengths,
         limits: TermDictionaryLimits,
-    ) -> Result<Self, TermDictionaryError> {
-        Self::parse_with_limits_mode(bytes, schema, sections, limits, true)
-    }
-
-    fn parse_with_limits_mode(
-        bytes: &'a [u8],
-        schema: SchemaDescriptor,
-        sections: TermSectionLengths,
-        limits: TermDictionaryLimits,
-        build_negative_filter: bool,
     ) -> Result<Self, TermDictionaryError> {
         validate_schema(schema)?;
         validate_positions_section(schema, sections)?;
@@ -1137,8 +1009,6 @@ impl<'a> TermDictionary<'a> {
                 sections,
                 blocks: Cow::Owned(Vec::new()),
                 restarts: Cow::Owned(Vec::new()),
-                negative_filter: build_negative_filter
-                    .then(|| Cow::Owned(NegativeTermFilter::empty())),
                 term_count: 0,
             });
         }
@@ -1235,7 +1105,6 @@ impl<'a> TermDictionary<'a> {
         let mut references = ReferenceValidator::new(schema, sections)?;
         let mut previous_key = Vec::new();
         let mut decode_key = Vec::new();
-        let mut negative_filter = build_negative_filter.then(NegativeTermFilterBuilder::default);
         let mut previous_tail = None;
         let mut term_count = 0_usize;
 
@@ -1265,7 +1134,6 @@ impl<'a> TermDictionary<'a> {
                 &mut references,
                 &mut decode_key,
                 &mut previous_key,
-                negative_filter.as_mut(),
                 previous_tail.as_ref(),
             )?;
             blocks
@@ -1278,10 +1146,6 @@ impl<'a> TermDictionary<'a> {
             previous_tail = Some(tail);
         }
         references.finish()?;
-        let negative_filter = match negative_filter {
-            Some(builder) => Some(Cow::Owned(builder.finish()?)),
-            None => None,
-        };
         let term_count_u32 =
             u32::try_from(term_count).map_err(|_| TermDictionaryError::ValueOutOfRange {
                 field: "term_count",
@@ -1294,7 +1158,6 @@ impl<'a> TermDictionary<'a> {
             sections,
             blocks: Cow::Owned(blocks),
             restarts: Cow::Owned(restarts),
-            negative_filter,
             term_count: term_count_u32,
         })
     }
@@ -1315,14 +1178,8 @@ impl<'a> TermDictionary<'a> {
             sections,
             blocks,
             restarts,
-            negative_filter,
             term_count,
         } = parsed;
-        let negative_filter = negative_filter
-            .ok_or_else(|| TermDictionaryError::InvalidSchema {
-                detail: "validated TERMDICT metadata omitted its negative filter".to_owned(),
-            })?
-            .into_owned();
         Ok(ValidatedTermDictionaryMetadata {
             source_start: bytes.as_ptr() as usize,
             source_len: bytes.len(),
@@ -1330,7 +1187,6 @@ impl<'a> TermDictionary<'a> {
             sections,
             blocks: blocks.into_owned(),
             restarts: restarts.into_owned(),
-            negative_filter,
             term_count,
         })
     }
@@ -1353,7 +1209,6 @@ impl<'a> TermDictionary<'a> {
             sections: metadata.sections,
             blocks: Cow::Borrowed(&metadata.blocks),
             restarts: Cow::Borrowed(&metadata.restarts),
-            negative_filter: Some(Cow::Borrowed(&metadata.negative_filter)),
             term_count: metadata.term_count,
         })
     }
@@ -1398,9 +1253,8 @@ impl<'a> TermDictionary<'a> {
 
     /// Exact lookup reusing caller-owned key buffers.
     ///
-    /// A cache-local negative filter first rejects definite misses. Hits and
-    /// filter false positives use the canonical block/restart search and decode
-    /// no more than 16 entries.
+    /// The block and restart indexes are binary-searched, then no more than 16
+    /// entries are decoded.
     ///
     /// # Errors
     ///
@@ -1413,13 +1267,6 @@ impl<'a> TermDictionary<'a> {
         scratch: &mut TermScratch,
     ) -> Result<Option<TermMatch>, TermDictionaryError> {
         validate_query_term(self.schema, field_ord, term)?;
-        if self
-            .negative_filter
-            .as_deref()
-            .is_some_and(|filter| !filter.may_contain(field_ord, term))
-        {
-            return Ok(None);
-        }
         build_composite_in(&mut scratch.target, field_ord, term, "lookup target")?;
         let target = scratch.target.as_slice();
         let Some(block_index) = self.block_for_key(target) else {
@@ -2082,7 +1929,6 @@ fn validate_block(
     references: &mut ReferenceValidator,
     block_key: &mut Vec<u8>,
     previous_key: &mut Vec<u8>,
-    mut negative_filter: Option<&mut NegativeTermFilterBuilder>,
     previous_tail: Option<&BlockTail>,
 ) -> Result<(BlockMeta, BlockTail), TermDictionaryError> {
     let block_len = byte_range.end.saturating_sub(byte_range.start);
@@ -2141,9 +1987,6 @@ fn validate_block(
             context: "restart metadata",
             count: next_restart_count,
         })?;
-    if let Some(filter) = negative_filter.as_mut() {
-        filter.reserve(entry_count)?;
-    }
 
     let restart_start = restarts.len();
     block_key.clear();
@@ -2187,9 +2030,6 @@ fn validate_block(
         }
         if !previous_key.is_empty() && block_key.as_slice() <= previous_key.as_slice() {
             return Err(TermDictionaryError::NonAscendingKey { term_ordinal });
-        }
-        if let Some(filter) = negative_filter.as_mut() {
-            filter.push_composite(block_key);
         }
         if let Some(marker) = decoded.full_key_range {
             restarts.push(RestartMeta {
@@ -3342,7 +3182,6 @@ mod tests {
         let second = TermDictionary::from_validated_metadata(encoded.as_bytes(), &metadata)?;
         assert!(matches!(&first.blocks, Cow::Borrowed(_)));
         assert!(matches!(&first.restarts, Cow::Borrowed(_)));
-        assert!(matches!(&first.negative_filter, Some(Cow::Borrowed(_))));
         assert_eq!(first.term_count(), 33);
         assert_eq!(first.block_count(), second.block_count());
         assert_eq!(first.restart_count(), second.restart_count());
@@ -3367,36 +3206,6 @@ mod tests {
             Err(TermDictionaryError::InvalidSchema { detail })
                 if detail.contains("different byte source")
         ));
-        Ok(())
-    }
-
-    #[test]
-    fn negative_filter_rejects_absent_terms_without_false_negatives() -> TestResult {
-        let keys = sorted_numbered_keys(4_097);
-        let (encoded, _, sections) = encode_fixture(KEYWORD_SCHEMA, &keys)?;
-        let dictionary = encoded.dictionary(KEYWORD_SCHEMA, sections)?;
-        let filter = dictionary
-            .negative_filter
-            .as_deref()
-            .expect("ordinary dictionary builds a negative filter");
-
-        for (_, term) in &keys {
-            assert!(filter.may_contain(0, term), "false negative for {term:?}");
-        }
-
-        let rejected = (0..4_096)
-            .filter(|ordinal| {
-                let term = format!("absent-{ordinal:05}");
-                !filter.may_contain(0, term.as_bytes())
-            })
-            .count();
-        assert!(
-            rejected >= 4_000,
-            "blocked filter rejected only {rejected} of 4096 absent terms"
-        );
-        for term in [b"absent-alpha".as_slice(), b"absent-omega".as_slice()] {
-            assert_eq!(dictionary.lookup(0, term)?, None);
-        }
         Ok(())
     }
 
