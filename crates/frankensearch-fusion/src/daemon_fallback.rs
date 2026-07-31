@@ -7,8 +7,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use frankensearch_core::{
-    DaemonClient, DaemonError, DaemonRetryConfig, ModelCategory, RerankDocument, RerankScore,
-    SearchError, SearchResult, SyncEmbed, SyncRerank, next_request_id,
+    DaemonClient, DaemonError, DaemonRetryConfig, EmbeddingIdentityBundleV1,
+    FrozenEmbeddingIdentityBundleV1, ModelCategory, RerankDocument, RerankScore, SearchError,
+    SearchResult, SyncEmbed, SyncRerank, next_request_id,
 };
 use tracing::{debug, warn};
 
@@ -112,23 +113,105 @@ fn lock_state(state: &Mutex<DaemonState>) -> std::sync::MutexGuard<'_, DaemonSta
 pub struct DaemonFallbackEmbedder {
     daemon: Arc<dyn DaemonClient>,
     fallback: Arc<dyn SyncEmbed>,
+    identity: EmbeddingIdentityBundleV1,
+    daemon_identity: Option<EmbeddingIdentityBundleV1>,
     config: DaemonRetryConfig,
     state: Mutex<DaemonState>,
 }
 
 impl DaemonFallbackEmbedder {
-    #[must_use]
+    /// # Errors
+    ///
+    /// Returns `InvalidConfig` when the local fallback does not expose a
+    /// complete immutable identity.
     pub fn new(
         daemon: Arc<dyn DaemonClient>,
         fallback: Arc<dyn SyncEmbed>,
         config: DaemonRetryConfig,
-    ) -> Self {
-        Self {
+    ) -> SearchResult<Self> {
+        let identity = Self::validated_fallback_identity(fallback.as_ref())?;
+        Ok(Self {
             daemon,
             fallback,
+            identity,
+            daemon_identity: None,
             config,
             state: Mutex::new(DaemonState::new()),
+        })
+    }
+
+    /// Construct a wrapper that may accept daemon vectors only when the daemon
+    /// is pinned to the exact complete identity exposed by the fallback.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError::UnverifiableRemoteSpace`] when the epoch is
+    /// invalid or differs in space, producer, input, or storage identity. A
+    /// dynamic wrapper cannot truthfully expose two producer identities through
+    /// one `SyncEmbed` object.
+    pub fn with_immutable_daemon_epoch(
+        daemon: Arc<dyn DaemonClient>,
+        fallback: Arc<dyn SyncEmbed>,
+        config: DaemonRetryConfig,
+        daemon_epoch: FrozenEmbeddingIdentityBundleV1,
+    ) -> SearchResult<Self> {
+        daemon_epoch.validate().map_err(|_error| {
+            unverifiable_daemon_space(
+                daemon.id(),
+                "explicit daemon epoch failed canonical validation",
+            )
+        })?;
+        let daemon_identity = daemon_epoch.identity;
+        let identity = Self::validated_fallback_identity(fallback.as_ref())?;
+        if daemon_identity.fingerprint() != identity.fingerprint() {
+            return Err(unverifiable_daemon_space(
+                daemon.id(),
+                "daemon epoch must exactly equal the wrapper's exposed fallback identity",
+            ));
         }
+        Ok(Self {
+            daemon,
+            fallback,
+            daemon_identity: Some(identity.clone()),
+            identity,
+            config,
+            state: Mutex::new(DaemonState::new()),
+        })
+    }
+
+    fn validated_fallback_identity(
+        fallback: &dyn SyncEmbed,
+    ) -> SearchResult<EmbeddingIdentityBundleV1> {
+        let identity = fallback.identity()?.clone();
+        identity.validate()?;
+        let identity_dimension =
+            usize::try_from(identity.space.dimension).map_err(|_| SearchError::InvalidConfig {
+                field: "daemon_fallback.identity.dimension".to_owned(),
+                value: identity.space.dimension.to_string(),
+                reason: "identity dimension does not fit usize".to_owned(),
+            })?;
+        if fallback.dimension() != identity_dimension {
+            return Err(SearchError::InvalidConfig {
+                field: "daemon_fallback.dimension".to_owned(),
+                value: fallback.dimension().to_string(),
+                reason: format!(
+                    "fallback dimension disagrees with immutable identity dimension {identity_dimension}"
+                ),
+            });
+        }
+        let identity_is_semantic = matches!(
+            identity.space.kind,
+            frankensearch_core::EmbeddingSpaceKindV1::Semantic
+        );
+        if fallback.is_semantic() != identity_is_semantic {
+            return Err(SearchError::InvalidConfig {
+                field: "daemon_fallback.is_semantic".to_owned(),
+                value: fallback.is_semantic().to_string(),
+                reason: "fallback semantic classification disagrees with immutable identity"
+                    .to_owned(),
+            });
+        }
+        Ok(identity)
     }
 
     const fn should_retry(err: &DaemonError) -> bool {
@@ -153,7 +236,6 @@ impl DaemonFallbackEmbedder {
 
     fn log_fallback(&self, request_id: &str, retries: u32, reason: &str) {
         warn!(
-            daemon_id = self.daemon.id(),
             request_id = request_id,
             retry_count = retries,
             fallback_reason = reason,
@@ -184,7 +266,6 @@ impl DaemonFallbackEmbedder {
         while attempts < self.config.max_attempts {
             attempts += 1;
             debug!(
-                daemon_id = self.daemon.id(),
                 request_id,
                 attempt = attempts,
                 max_attempts = self.config.max_attempts,
@@ -192,6 +273,26 @@ impl DaemonFallbackEmbedder {
             );
             match self.daemon.embed(text, request_id) {
                 Ok(vector) => {
+                    if self.daemon_identity.as_ref() != Some(&self.identity) {
+                        return Err(DaemonFailure {
+                            error: DaemonError::Failed(
+                                "daemon response has no matching immutable embedding epoch"
+                                    .to_owned(),
+                            ),
+                            attempts,
+                            backoff: false,
+                        });
+                    }
+                    if vector.len() != self.fallback.dimension() {
+                        return Err(DaemonFailure {
+                            error: DaemonError::Failed(
+                                "daemon response dimension disagrees with immutable embedding epoch"
+                                    .to_owned(),
+                            ),
+                            attempts,
+                            backoff: false,
+                        });
+                    }
                     lock_state(&self.state).record_success();
                     return Ok(vector);
                 }
@@ -206,12 +307,11 @@ impl DaemonFallbackEmbedder {
                     };
 
                     debug!(
-                        daemon_id = self.daemon.id(),
                         request_id,
                         attempt = attempts,
                         max_attempts = self.config.max_attempts,
                         will_retry = should_retry && attempts < self.config.max_attempts,
-                        error = %err,
+                        error_kind = Self::fallback_reason(&err, false),
                         "Daemon embed failed"
                     );
 
@@ -265,7 +365,6 @@ impl DaemonFallbackEmbedder {
         while attempts < self.config.max_attempts {
             attempts += 1;
             debug!(
-                daemon_id = self.daemon.id(),
                 request_id,
                 attempt = attempts,
                 max_attempts = self.config.max_attempts,
@@ -273,6 +372,30 @@ impl DaemonFallbackEmbedder {
             );
             match self.daemon.embed_batch(texts, request_id) {
                 Ok(vectors) => {
+                    if self.daemon_identity.as_ref() != Some(&self.identity) {
+                        return Err(DaemonFailure {
+                            error: DaemonError::Failed(
+                                "daemon response has no matching immutable embedding epoch"
+                                    .to_owned(),
+                            ),
+                            attempts,
+                            backoff: false,
+                        });
+                    }
+                    if vectors.len() != texts.len()
+                        || vectors
+                            .iter()
+                            .any(|vector| vector.len() != self.fallback.dimension())
+                    {
+                        return Err(DaemonFailure {
+                            error: DaemonError::Failed(
+                                "daemon batch shape disagrees with immutable embedding epoch"
+                                    .to_owned(),
+                            ),
+                            attempts,
+                            backoff: false,
+                        });
+                    }
                     lock_state(&self.state).record_success();
                     return Ok(vectors);
                 }
@@ -287,12 +410,11 @@ impl DaemonFallbackEmbedder {
                     };
 
                     debug!(
-                        daemon_id = self.daemon.id(),
                         request_id,
                         attempt = attempts,
                         max_attempts = self.config.max_attempts,
                         will_retry = should_retry && attempts < self.config.max_attempts,
-                        error = %err,
+                        error_kind = Self::fallback_reason(&err, false),
                         "Daemon embed batch failed"
                     );
 
@@ -318,6 +440,25 @@ impl DaemonFallbackEmbedder {
             backoff: false,
         })
     }
+}
+
+fn unverifiable_daemon_space(producer: &str, reason: &str) -> SearchError {
+    let producer = if producer.len() <= 128
+        && !producer.is_empty()
+        && producer
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    {
+        producer.to_owned()
+    } else {
+        "<redacted-daemon-producer>".to_owned()
+    };
+    let reason = if reason.len() <= 512 && !reason.chars().any(char::is_control) {
+        reason.to_owned()
+    } else {
+        "daemon identity validation failed".to_owned()
+    };
+    SearchError::UnverifiableRemoteSpace { producer, reason }
 }
 
 impl SyncEmbed for DaemonFallbackEmbedder {
@@ -349,6 +490,10 @@ impl SyncEmbed for DaemonFallbackEmbedder {
 
     fn dimension(&self) -> usize {
         self.fallback.dimension()
+    }
+
+    fn identity(&self) -> SearchResult<&EmbeddingIdentityBundleV1> {
+        Ok(&self.identity)
     }
 
     fn id(&self) -> &str {
@@ -393,7 +538,6 @@ impl DaemonFallbackReranker {
 
     fn log_fallback(&self, request_id: &str, retries: u32, reason: &str) {
         warn!(
-            daemon_id = self.daemon.id(),
             request_id,
             retry_count = retries,
             fallback_reason = reason,
@@ -429,7 +573,6 @@ impl DaemonFallbackReranker {
         while attempts < self.config.max_attempts {
             attempts += 1;
             debug!(
-                daemon_id = self.daemon.id(),
                 request_id,
                 attempt = attempts,
                 max_attempts = self.config.max_attempts,
@@ -451,12 +594,11 @@ impl DaemonFallbackReranker {
                     };
 
                     debug!(
-                        daemon_id = self.daemon.id(),
                         request_id,
                         attempt = attempts,
                         max_attempts = self.config.max_attempts,
                         will_retry = should_retry && attempts < self.config.max_attempts,
-                        error = %err,
+                        error_kind = DaemonFallbackEmbedder::fallback_reason(&err, false),
                         "Daemon rerank failed"
                     );
 
@@ -569,6 +711,7 @@ mod tests {
         value: f32,
         semantic: bool,
         category: ModelCategory,
+        identity: EmbeddingIdentityBundleV1,
     }
 
     impl SyncEmbed for ConstEmbedder {
@@ -578,6 +721,10 @@ mod tests {
 
         fn dimension(&self) -> usize {
             self.dim
+        }
+
+        fn identity(&self) -> SearchResult<&EmbeddingIdentityBundleV1> {
+            Ok(&self.identity)
         }
 
         fn id(&self) -> &str {
@@ -728,6 +875,7 @@ mod tests {
             value,
             semantic: false,
             category: ModelCategory::HashEmbedder,
+            identity: EmbeddingIdentityBundleV1::explicit_test_model("fallback-embed", 4),
         })
     }
 
@@ -736,7 +884,8 @@ mod tests {
         let daemon = Arc::new(FixtureDaemon::new(1, FailureMode::Unavailable, false, 2.0));
         let fallback = fallback_embedder(1.0);
         let embedder =
-            DaemonFallbackEmbedder::new(daemon.clone(), fallback, DaemonRetryConfig::default());
+            DaemonFallbackEmbedder::new(daemon.clone(), fallback, DaemonRetryConfig::default())
+                .unwrap();
 
         let result = embedder.embed_sync("hello").unwrap();
         assert_eq!(result, vec![1.0; 4]);
@@ -744,20 +893,130 @@ mod tests {
     }
 
     #[test]
+    fn embedder_rejects_invalid_fallback_identity() {
+        let daemon = Arc::new(FixtureDaemon::new(0, FailureMode::Failed, false, 2.0));
+        let mut identity = EmbeddingIdentityBundleV1::explicit_test_model("invalid-fallback", 4);
+        identity.storage.dimension = 3;
+        let fallback: Arc<dyn SyncEmbed> = Arc::new(ConstEmbedder {
+            id: "invalid-fallback",
+            model_name: "invalid-fallback",
+            dim: 4,
+            value: 1.0,
+            semantic: false,
+            category: ModelCategory::HashEmbedder,
+            identity,
+        });
+        assert!(matches!(
+            DaemonFallbackEmbedder::new(daemon, fallback, DaemonRetryConfig::default()),
+            Err(SearchError::InvalidConfig { .. })
+        ));
+    }
+
+    #[test]
+    fn embedder_rejects_fallback_metadata_that_disagrees_with_identity() {
+        let daemon = Arc::new(FixtureDaemon::new(0, FailureMode::Failed, false, 2.0));
+        let fallback: Arc<dyn SyncEmbed> = Arc::new(ConstEmbedder {
+            id: "wrong-dimension",
+            model_name: "wrong-dimension",
+            dim: 3,
+            value: 1.0,
+            semantic: false,
+            category: ModelCategory::HashEmbedder,
+            identity: EmbeddingIdentityBundleV1::explicit_test_model("wrong-dimension", 4),
+        });
+        let result = DaemonFallbackEmbedder::new(daemon, fallback, DaemonRetryConfig::default());
+        assert!(result.is_err(), "dimension mismatch must fail closed");
+        let error = result.err().expect("asserted error result");
+        assert!(error.to_string().contains("fallback dimension disagrees"));
+
+        let daemon = Arc::new(FixtureDaemon::new(0, FailureMode::Failed, false, 2.0));
+        let fallback: Arc<dyn SyncEmbed> = Arc::new(ConstEmbedder {
+            id: "wrong-semantic-kind",
+            model_name: "wrong-semantic-kind",
+            dim: 4,
+            value: 1.0,
+            semantic: true,
+            category: ModelCategory::StaticEmbedder,
+            identity: EmbeddingIdentityBundleV1::explicit_test_model("wrong-semantic-kind", 4),
+        });
+        let result = DaemonFallbackEmbedder::new(daemon, fallback, DaemonRetryConfig::default());
+        assert!(
+            result.is_err(),
+            "semantic classification mismatch must fail closed"
+        );
+        let error = result.err().expect("asserted error result");
+        assert!(
+            error
+                .to_string()
+                .contains("semantic classification disagrees")
+        );
+    }
+
+    #[test]
     fn embedder_retries_then_uses_daemon() {
         let daemon = Arc::new(FixtureDaemon::new(1, FailureMode::Failed, true, 2.0));
         let fallback = fallback_embedder(1.0);
+        let daemon_identity = fallback.identity().unwrap().freeze().unwrap();
         let config = DaemonRetryConfig {
             max_attempts: 2,
             base_delay: Duration::from_millis(1),
             max_delay: Duration::from_millis(5),
             jitter_pct: 0.0,
         };
-        let embedder = DaemonFallbackEmbedder::new(daemon.clone(), fallback, config);
+        let embedder = DaemonFallbackEmbedder::with_immutable_daemon_epoch(
+            daemon.clone(),
+            fallback,
+            config,
+            daemon_identity,
+        )
+        .unwrap();
 
         let result = embedder.embed_sync("hello").unwrap();
         assert_eq!(result, vec![2.0; 4]);
         assert_eq!(daemon.calls.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn embedder_rejects_drifted_daemon_epoch_with_typed_error() {
+        let daemon = Arc::new(FixtureDaemon::new(0, FailureMode::Failed, true, 2.0));
+        let fallback = fallback_embedder(1.0);
+        let drifted = EmbeddingIdentityBundleV1::explicit_test_model("different-embedder", 4)
+            .freeze()
+            .unwrap();
+        let result = DaemonFallbackEmbedder::with_immutable_daemon_epoch(
+            daemon,
+            fallback,
+            DaemonRetryConfig::default(),
+            drifted,
+        );
+        assert!(matches!(
+            result,
+            Err(SearchError::UnverifiableRemoteSpace { .. })
+        ));
+    }
+
+    #[test]
+    fn unverifiable_daemon_space_redacts_untrusted_labels() {
+        let error =
+            unverifiable_daemon_space("daemon\nforged-log-line", "reason\nforged-reason-line");
+        let rendered = error.to_string();
+        assert!(rendered.contains("<redacted-daemon-producer>"));
+        assert!(rendered.contains("daemon identity validation failed"));
+        assert!(!rendered.contains("forged-log-line"));
+        assert!(!rendered.contains("forged-reason-line"));
+    }
+
+    #[test]
+    fn embedder_rejects_unattested_daemon_success_and_falls_back() {
+        let daemon = Arc::new(FixtureDaemon::new(0, FailureMode::Failed, true, 2.0));
+        let fallback = fallback_embedder(1.0);
+        let embedder =
+            DaemonFallbackEmbedder::new(daemon.clone(), fallback, DaemonRetryConfig::default())
+                .unwrap();
+
+        let result = embedder.embed_sync("hello").unwrap();
+        assert_eq!(result, vec![1.0; 4]);
+        assert_eq!(daemon.calls.load(Ordering::Relaxed), 1);
     }
 
     #[test]
@@ -768,7 +1027,7 @@ mod tests {
             max_attempts: 3,
             ..DaemonRetryConfig::default()
         };
-        let embedder = DaemonFallbackEmbedder::new(daemon.clone(), fallback, config);
+        let embedder = DaemonFallbackEmbedder::new(daemon.clone(), fallback, config).unwrap();
 
         let result = embedder.embed_sync("hello").unwrap();
         assert_eq!(result, vec![1.0; 4]);
@@ -824,7 +1083,7 @@ mod tests {
             max_delay: Duration::from_millis(50),
             jitter_pct: 0.0,
         };
-        let embedder = DaemonFallbackEmbedder::new(daemon.clone(), fallback, config);
+        let embedder = DaemonFallbackEmbedder::new(daemon.clone(), fallback, config).unwrap();
 
         let _ = embedder.embed_sync("first").unwrap();
         let calls_after_first = daemon.calls.load(Ordering::Relaxed);

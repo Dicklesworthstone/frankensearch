@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 use frankensearch_core::filter::SearchFilter;
 use frankensearch_core::{
     FusedHit, PhaseMetrics, RankChanges, ScoreSource, ScoredResult, SearchError, SearchPhase,
-    SearchResult, TwoTierConfig, TwoTierMetrics, VectorHit,
+    SearchResult, TwoTierConfig, TwoTierMetrics, VectorHit, ZeroSignalReason,
 };
 use frankensearch_index::{InMemoryTwoTierIndex, SearchParams};
 
@@ -465,6 +465,13 @@ impl SyncTwoTierSearcher {
         let fast_hits = self.search_fast_hits(query_vec, fetch, filter)?;
         metrics.phase1_vectors_searched = fast_hits.len();
         metrics.semantic_candidates = fast_hits.len();
+        // Typed zero-signal classification (bd-tqhc): an empty semantic lane
+        // must carry why. Lazy — the non-empty path pays nothing.
+        metrics.zero_signal = if fast_hits.is_empty() {
+            self.classify_fast_empty(query_vec, fetch, filter)
+        } else {
+            None
+        };
 
         let lexical_started = Instant::now();
         let lexical_hits = self
@@ -666,6 +673,48 @@ impl SyncTwoTierSearcher {
             },
             // Explicit params: honour the exact scan + parallelism configuration.
             |params| fast_index.search_top_k_with_params(query_vec, fetch, filter, params),
+        )
+    }
+
+    /// Classify an empty fast-tier result with its typed
+    /// [`ZeroSignalReason`] (bd-tqhc).
+    ///
+    /// Request-scoped defects are classified from the request itself, in the
+    /// documented precedence order; state-scoped reasons come from the
+    /// index's own classified lane so in-memory and persistent paths agree.
+    /// The classified re-scan runs only on the (already cheap) empty path,
+    /// and its hits are never used for result production. Classification is
+    /// diagnostic and must never fail the search: errors degrade to an
+    /// unclassified lane at debug level rather than a fabricated reason.
+    fn classify_fast_empty(
+        &self,
+        query_vec: &[f32],
+        fetch: usize,
+        filter: Option<&dyn SearchFilter>,
+    ) -> Option<ZeroSignalReason> {
+        // Request-scoped conditions take precedence over index state, in the
+        // order documented on `ZeroSignalReason`.
+        if fetch == 0 {
+            return Some(ZeroSignalReason::CallerRequestedZeroK);
+        }
+        if query_vec.iter().any(|value| !value.is_finite()) {
+            return Some(ZeroSignalReason::NonFiniteQuery);
+        }
+        if query_vec.iter().all(|&value| value == 0.0) {
+            return Some(ZeroSignalReason::ZeroNormQuery);
+        }
+        // State-scoped reasons come from the index census rather than from a
+        // second search. Re-scanning would cost a full extra pass on a path
+        // that has already answered, and — because the production fast lane
+        // is the int8 two-pass while the classified lane is the exact scan —
+        // the two can disagree, which would leave an empty result carrying
+        // no reason at all. The census cannot disagree with itself, and
+        // always yields a reason.
+        Some(
+            self.index
+                .fast_index()
+                .zero_signal_state()
+                .empty_result_reason(filter.is_some()),
         )
     }
 }
@@ -1057,6 +1106,56 @@ mod tests {
         assert_eq!(results[0].source, ScoreSource::SemanticQuality);
         assert!(metrics.phase1_total_ms >= 0.0);
         assert!(metrics.phase2_total_ms >= 0.0);
+        // The semantic lane produced hits, so it must not be classified.
+        assert_eq!(metrics.zero_signal, None);
+    }
+
+    #[test]
+    fn empty_index_search_carries_typed_zero_signal() {
+        let fast = InMemoryVectorIndex::from_vectors(Vec::new(), Vec::new(), 2).unwrap();
+        let index = Arc::new(InMemoryTwoTierIndex::new(fast, None));
+        let searcher = SyncTwoTierSearcher::new(index, TwoTierConfig::default());
+        let (results, metrics) = searcher.search_collect(&[1.0, 0.0], 3).unwrap();
+        assert!(results.is_empty());
+        assert_eq!(
+            metrics.zero_signal,
+            Some(ZeroSignalReason::NewlyCreatedEmpty),
+            "an empty semantic lane must say why, not just return nothing"
+        );
+    }
+
+    #[test]
+    fn filter_eliminating_every_candidate_classifies_as_filter() {
+        struct ExcludeAll;
+        impl SearchFilter for ExcludeAll {
+            fn matches(&self, _doc_id: &str, _metadata: Option<&serde_json::Value>) -> bool {
+                false
+            }
+            fn name(&self) -> &'static str {
+                "exclude-all"
+            }
+        }
+        let searcher = SyncTwoTierSearcher::new(make_index(), TwoTierConfig::default());
+        let (results, metrics) = searcher
+            .search_collect_with_filter(&[1.0, 0.0], 3, Some(&ExcludeAll))
+            .unwrap();
+        assert!(results.is_empty());
+        assert_eq!(
+            metrics.zero_signal,
+            Some(ZeroSignalReason::FilterEliminatedAll)
+        );
+    }
+
+    #[test]
+    fn zero_norm_query_over_empty_index_prefers_request_scoped_reason() {
+        // Request-scoped pre-scan classification outranks index state:
+        // a zero-norm query is the caller's defect even on an empty index.
+        let fast = InMemoryVectorIndex::from_vectors(Vec::new(), Vec::new(), 2).unwrap();
+        let index = Arc::new(InMemoryTwoTierIndex::new(fast, None));
+        let searcher = SyncTwoTierSearcher::new(index, TwoTierConfig::default());
+        let (results, metrics) = searcher.search_collect(&[0.0, 0.0], 3).unwrap();
+        assert!(results.is_empty());
+        assert_eq!(metrics.zero_signal, Some(ZeroSignalReason::ZeroNormQuery));
     }
 
     #[test]
