@@ -2032,6 +2032,18 @@ impl VectorIndex {
         Ok(ids)
     }
 
+    /// Iterate the WAL-resident rows as `(doc_id, embedding)` pairs.
+    ///
+    /// These are acknowledged appends that have not been compacted into the
+    /// main slab yet; any full rebuild that merges "the previous index"
+    /// must include them or it silently drops durable writes. The resident
+    /// set is already deduplicated (last write wins per doc ID).
+    pub fn wal_records(&self) -> impl Iterator<Item = (&str, &[f32])> {
+        self.wal_entries
+            .iter()
+            .map(|entry| (entry.doc_id.as_str(), entry.embedding.as_slice()))
+    }
+
     /// Whether the WAL is large enough that compaction is recommended.
     ///
     /// Returns `true` when the WAL exceeds either the absolute threshold
@@ -2314,10 +2326,15 @@ impl VectorIndex {
     /// `SearchError::InvalidConfig` for invalid values, and
     /// `SearchError::Io` for filesystem failures.
     pub fn append_batch(&mut self, entries: &[(String, Vec<f32>)]) -> SearchResult<()> {
-        self.append_batch_impl::<false>(entries)
+        self.append_batch_impl(entries)
     }
 
-    /// Bench-only candidate that skips already-completed resident-WAL deduplication.
+    /// Bench-only alias retained for the wal_append_dedup_ab harness.
+    ///
+    /// The "skip redundant dedup" candidate arm no longer exists: since the
+    /// log-then-supersede reordering, the resident-WAL dedup is load-bearing
+    /// (it feeds the sidecar compaction) and can never be skipped, so both
+    /// arms measure the same code path.
     ///
     /// # Errors
     ///
@@ -2328,13 +2345,10 @@ impl VectorIndex {
         &mut self,
         entries: &[(String, Vec<f32>)],
     ) -> SearchResult<()> {
-        self.append_batch_impl::<true>(entries)
+        self.append_batch_impl(entries)
     }
 
-    fn append_batch_impl<const SKIP_REDUNDANT_DEDUP: bool>(
-        &mut self,
-        entries: &[(String, Vec<f32>)],
-    ) -> SearchResult<()> {
+    fn append_batch_impl(&mut self, entries: &[(String, Vec<f32>)]) -> SearchResult<()> {
         self.ensure_legacy_mutation_format("append_batch")?;
         if entries.is_empty() {
             return Ok(());
@@ -2369,11 +2383,6 @@ impl VectorIndex {
             })?;
         }
 
-        // Soft-delete any existing entries (main or WAL) for these documents
-        // so that the newly appended WAL entries replace them entirely.
-        let doc_ids: Vec<&str> = entries.iter().map(|(id, _)| id.as_str()).collect();
-        self.soft_delete_batch(&doc_ids)?;
-
         let mut wal_entries: Vec<wal::WalEntry> = Vec::with_capacity(entries.len());
         let mut seen = std::collections::HashSet::new();
         for (doc_id, embedding) in entries.iter().rev() {
@@ -2387,7 +2396,16 @@ impl VectorIndex {
         }
         wal_entries.reverse();
 
-        // Write to WAL file.
+        // DURABILITY ORDER IS LOAD-BEARING (fleet-review critical): the
+        // replacement entries must be durably logged BEFORE anything
+        // destroys the old copies. The previous ordering ran
+        // `soft_delete_batch` first, which durably tombstoned the main-index
+        // rows and durably rewrote the WAL sidecar without the doc — so an
+        // append_wal_batch failure (ENOSPC is the canonical one) or a crash
+        // in between destroyed the old vector with the new one never
+        // written: an update executed as delete-then-log. Log-then-supersede
+        // is safe at every cut point because `open` deduplicates duplicate
+        // WAL doc IDs with last-wins semantics.
         let wal_path = wal::wal_path_for(&self.path);
         wal::append_wal_batch(
             &wal_path,
@@ -2398,16 +2416,35 @@ impl VectorIndex {
             self.wal_config.fsync_on_write,
         )?;
 
-        // `soft_delete_batch` already removed every incoming doc ID from the resident
-        // WAL. Keep the redundant legacy loop available only for the same-binary gate.
-        if !SKIP_REDUNDANT_DEDUP {
-            for new_entry in &wal_entries {
-                self.wal_entries
-                    .retain(|existing| existing.doc_id != new_entry.doc_id);
+        // Supersede older resident copies in memory, then admit the new
+        // entries (immediately searchable). This dedup is load-bearing: it
+        // produces the exact resident set the sidecar compaction below
+        // persists.
+        let resident_before = self.wal_entries.len();
+        for new_entry in &wal_entries {
+            self.wal_entries
+                .retain(|existing| existing.doc_id != new_entry.doc_id);
+        }
+        let superseded_resident = self.wal_entries.len() < resident_before;
+        self.wal_entries.extend(wal_entries.clone());
+
+        // BEST-EFFORT: compact superseded duplicates out of the durable
+        // sidecar (keeps repeated updates from growing it — the goal the
+        // old delete-first ordering pursued unsafely). The atomic
+        // tmp+rename rewrite includes the entries appended above, and a
+        // failure or crash here merely leaves old+new pairs on disk for
+        // `open`'s last-wins dedup — so it must never fail the append.
+        if superseded_resident {
+            if let Err(err) = self.rewrite_wal_sidecar() {
+                tracing::warn!(
+                    target: "frankensearch.index",
+                    path = %self.path.display(),
+                    error = %err,
+                    "post-append WAL sidecar compaction failed; superseded \
+                     duplicates remain until the next rewrite"
+                );
             }
         }
-        // Add to in-memory entries (immediately searchable).
-        self.wal_entries.extend(wal_entries.clone());
 
         // BEST-EFFORT: Tombstone the old main index entries so they don't pollute the top-K heap.
         // If this crashes before completing, it's fine; they will be resolved out later (though they might steal a top-K slot temporarily).
@@ -3184,6 +3221,10 @@ impl VectorIndex {
         let wal_path = wal::wal_path_for(&self.path);
         if self.wal_entries.is_empty() {
             wal::remove_wal(&wal_path)?;
+            // Durable removal needs the dirent update persisted: without the
+            // parent sync a crash can resurrect the removed sidecar, whose
+            // stale entries would replay over the post-delete state.
+            sync_parent_directory(&wal_path)?;
             return Ok(());
         }
 
@@ -3205,11 +3246,11 @@ impl VectorIndex {
         }
 
         match fs::rename(&tmp_path, &wal_path) {
-            Ok(()) => Ok(()),
+            Ok(()) => sync_parent_directory(&wal_path),
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
                 wal::remove_wal(&wal_path)?;
                 fs::rename(&tmp_path, &wal_path)?;
-                Ok(())
+                sync_parent_directory(&wal_path)
             }
             Err(error) => {
                 let _ = wal::remove_wal(&tmp_path);
@@ -5698,7 +5739,7 @@ fn temporary_output_path(path: &Path) -> PathBuf {
     PathBuf::from(os)
 }
 
-fn sync_parent_directory(path: &Path) -> SearchResult<()> {
+pub(crate) fn sync_parent_directory(path: &Path) -> SearchResult<()> {
     #[cfg(unix)]
     {
         if let Some(parent) = path.parent() {
@@ -8222,6 +8263,61 @@ mod tests {
     }
 
     // ─── WAL integration tests ─────────────────────────────────────────
+
+    /// Fleet-review critical regression pin: an update whose WAL append
+    /// FAILS must leave the old vector fully alive. The pre-fix ordering
+    /// ran the durably-destructive soft-delete before logging the
+    /// replacement, so a failed/interrupted WAL write destroyed the old
+    /// vector with the new one never written anywhere.
+    #[cfg(unix)]
+    #[test]
+    fn failed_wal_append_leaves_the_old_vector_alive() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = temp_index_path("wal-append-atomic-update");
+        let dim = 4;
+        let mut writer = VectorIndex::create(&path, "test", dim).expect("writer");
+        writer
+            .write_record("doc-x", &[1.0, 0.0, 0.0, 0.0])
+            .expect("write");
+        writer.finish().expect("finish");
+
+        let mut index = VectorIndex::open(&path).expect("open");
+
+        // Make WAL-sidecar creation impossible: the parent directory is
+        // read-only, so append_wal_batch's create fails with EACCES.
+        let dir = path.parent().expect("fixture dir").to_path_buf();
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o555)).expect("seal fixture dir");
+        let result = index.append("doc-x", &[0.0, 1.0, 0.0, 0.0]);
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).expect("restore fixture dir");
+        if result.is_ok() {
+            // Root ignores directory permission bits; the scenario cannot
+            // be forced, so the ordering property is unobservable here.
+            eprintln!("skipping: running as a principal that bypasses directory permissions");
+            return;
+        }
+
+        // The failed update must not have destroyed the old vector — in
+        // the live handle NOR in the durable state a fresh open sees.
+        for (label, snapshot) in [
+            ("live handle", &mut index),
+            ("fresh open", &mut VectorIndex::open(&path).expect("reopen")),
+        ] {
+            let hits = snapshot
+                .search_top_k(&[1.0, 0.0, 0.0, 0.0], 10, None)
+                .expect("search");
+            assert_eq!(
+                hits.len(),
+                1,
+                "{label}: old vector must survive a failed update"
+            );
+            assert_eq!(hits[0].doc_id, "doc-x", "{label}");
+            assert!(
+                !snapshot.is_deleted(0),
+                "{label}: the main-slab record must not be tombstoned by a failed update"
+            );
+        }
+    }
 
     #[test]
     fn append_single_vector_is_searchable() {

@@ -1084,8 +1084,10 @@ pub(crate) fn append_wal_batch(
         .create_new(true)
         .open(wal_path);
 
+    let mut created_fresh = false;
     let mut file = match created {
         Ok(mut file) => {
+            created_fresh = true;
             write_wal_header(&mut file, dimension, quantization, compaction_gen)?;
             file
         }
@@ -1148,6 +1150,13 @@ pub(crate) fn append_wal_batch(
 
     if fsync {
         file.sync_all()?;
+        if created_fresh {
+            // A durable first append also needs the CREATE dirent persisted:
+            // file fsync alone does not guarantee the new sidecar survives a
+            // crash on every filesystem, and a vanished sidecar silently
+            // loses every acknowledged append.
+            crate::sync_parent_directory(wal_path)?;
+        }
     }
 
     debug!(

@@ -595,8 +595,23 @@ impl RefreshWorker {
                 }
             }
 
+            // WAL-resident rows supersede main-slab rows for the same doc
+            // and MUST be carried into the rebuild: they are acknowledged,
+            // durable appends that record_count() does not cover (fleet
+            // review: dropping them silently lost writes on every rebuild).
+            let wal_rows: HashMap<&str, &[f32]> = fast_index.wal_records().collect();
+
             for fast_idx in 0..fast_index.record_count() {
+                // Fleet review: tombstoned rows were merged back as live
+                // records, resurrecting every soft-deleted document on the
+                // next rebuild cycle.
+                if fast_index.is_deleted(fast_idx) {
+                    continue;
+                }
                 let doc_id = fast_index.doc_id_at(fast_idx)?;
+                if wal_rows.contains_key(doc_id) {
+                    continue;
+                }
                 if let Some(&record_idx) = latest_by_doc_id.get(doc_id) {
                     let record = &records[record_idx];
                     builder.add_record(
@@ -622,6 +637,33 @@ impl RefreshWorker {
                 builder.add_record(
                     doc_id.to_owned(),
                     &fast_embedding,
+                    quality_embedding.as_deref(),
+                )?;
+            }
+
+            for (doc_id, fast_embedding) in wal_rows {
+                if let Some(&record_idx) = latest_by_doc_id.get(doc_id) {
+                    let record = &records[record_idx];
+                    builder.add_record(
+                        record.doc_id.clone(),
+                        &record.fast_embedding,
+                        record.quality_embedding.as_deref(),
+                    )?;
+                    consumed[record_idx] = true;
+                    continue;
+                }
+                let quality_embedding = if let Some(ref quality_index) = existing_quality {
+                    if let Some(&quality_idx) = quality_index_by_doc_id.get(doc_id) {
+                        Some(quality_index.vector_at_f32(quality_idx)?)
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                builder.add_record(
+                    doc_id.to_owned(),
+                    fast_embedding,
                     quality_embedding.as_deref(),
                 )?;
             }
@@ -1326,6 +1368,59 @@ mod tests {
             let doc_ids: Vec<String> = current.iter_doc_ids().filter_map(Result::ok).collect();
             assert_eq!(doc_ids.len(), 1);
             assert_eq!(doc_ids[0], "doc-1");
+        });
+    }
+
+    /// Fleet-review regression pins: a rebuild cycle must (a) NOT
+    /// resurrect soft-deleted documents (the merge loop used to re-add
+    /// tombstoned main-slab rows as live records) and (b) NOT drop
+    /// WAL-resident appends (acknowledged durable writes that
+    /// record_count() does not cover).
+    #[test]
+    fn rebuild_honors_tombstones_and_wal_residents() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let dir = temp_index_dir("tombstone-wal-rebuild");
+            let queue = make_queue(100);
+            let cache = make_cache(&dir, 256);
+            let config =
+                RefreshWorkerConfig::new(&dir).with_poll_interval(Duration::from_millis(10));
+            let fast = Arc::new(StubEmbedder::new("stub-fast", 256));
+            let worker = RefreshWorker::new(config, queue.clone(), fast.clone(), cache.clone());
+
+            submit(&queue, "doc-keep", "kept document");
+            submit(&queue, "doc-delete", "doomed document");
+            worker.run_cycle(&cx).await.unwrap();
+            assert_eq!(cache.current().doc_count(), 2);
+
+            // Out-of-band mutations through the public index API, exactly
+            // as an application deleting/appending between cycles does.
+            let fast_path = dir.join(VECTOR_INDEX_FAST_FILENAME);
+            {
+                let mut index =
+                    frankensearch_index::VectorIndex::open(&fast_path).expect("open fast tier");
+                assert!(index.soft_delete("doc-delete").expect("soft delete"));
+                let dim = index.dimension();
+                index
+                    .append("doc-wal", &vec![0.25_f32; dim])
+                    .expect("wal append");
+            }
+
+            submit(&queue, "doc-new", "new document");
+            worker.run_cycle(&cx).await.unwrap();
+
+            let rebuilt =
+                frankensearch_index::VectorIndex::open(&fast_path).expect("reopen fast tier");
+            let live = rebuilt.live_doc_ids().expect("live ids");
+            assert!(
+                !live.contains("doc-delete"),
+                "soft-deleted document must not be resurrected by the rebuild: {live:?}"
+            );
+            assert!(
+                live.contains("doc-wal"),
+                "WAL-resident append must survive the rebuild: {live:?}"
+            );
+            assert!(live.contains("doc-keep"), "{live:?}");
+            assert!(live.contains("doc-new"), "{live:?}");
         });
     }
 
