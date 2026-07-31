@@ -482,6 +482,60 @@ jobs:
             echo "- Perf gate artifacts: \`perf_regression_gate_policy.json\`, \`perf_regression_gate_result.json\`."
           } >> "${GITHUB_STEP_SUMMARY}"
 
+  ann-path-identity:
+    name: ANN path identity (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - macos-latest
+          - windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install nightly toolchain
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
+        with:
+          toolchain: nightly-2026-07-20
+
+      - name: Prepare path dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          deps_dir="$(cd "$GITHUB_WORKSPACE/.." && pwd)"
+          asupersync_ref="15e6b6920fa0ad3e6d843ea55186eed754389ad2"
+          frankensqlite_ref="5c99eeb93d789c1309d5c46a540289369ff39535"
+          fast_cmaes_ref="17f633e2c24bdd0c358310949066e5922b9e17b5"
+
+          clone_at_ref() {
+            local repo_url="$1"
+            local dest_path="$2"
+            local ref="$3"
+            git clone --filter=blob:none --no-checkout "${repo_url}" "${dest_path}"
+            git -C "${dest_path}" fetch --depth 1 origin "${ref}"
+            git -C "${dest_path}" checkout --detach FETCH_HEAD
+          }
+
+          clone_at_ref "https://github.com/Dicklesworthstone/asupersync.git" "${deps_dir}/asupersync" "${asupersync_ref}"
+          clone_at_ref "https://github.com/Dicklesworthstone/frankensqlite.git" "${deps_dir}/frankensqlite" "${frankensqlite_ref}"
+          clone_at_ref "https://github.com/Dicklesworthstone/fast_cmaes.git" "${deps_dir}/fast_cmaes" "${fast_cmaes_ref}"
+
+          find "$GITHUB_WORKSPACE" -name Cargo.toml -exec \
+            sed -i.bak -e "s|/data/projects/|${deps_dir}/|g" {} +
+          find "$GITHUB_WORKSPACE" -name '*.bak' -delete
+
+      - name: Cache cargo registry + target
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: ann-path-identity-${{ matrix.os }}-nightly
+          cache-targets: true
+
+      - name: Exercise mounted-filesystem ANN alias semantics
+        run: cargo test -p frankensearch-index --features ann two_tier::tests::missing_ann_role_aliases_follow_the_mounted_filesystem_not_the_os_name -- --exact --nocapture
+
   quill-oracle-nightly-rch:
     name: Quill oracle nightly (strict RCH)
     if: github.event_name == 'schedule'
