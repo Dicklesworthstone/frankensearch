@@ -141,6 +141,37 @@ jobs:
       - name: cargo check (fsfs explicit model-free lane)
         run: cargo check -p frankensearch-fsfs --no-default-features
 
+      - name: Downstream path-dep consumer smoke (fresh resolution, bd-efe5y)
+        if: matrix.os == 'ubuntu-latest'
+        shell: bash
+        run: |
+          set -euo pipefail
+          # A green in-repo build can ride a warm Cargo.lock; a downstream path-dep
+          # consumer (e.g. hfdt) always re-resolves from the DECLARED ranges. bd-efe5y:
+          # the wide floor said 1.1.1 while the code needed 1.6.0's `widening_mul` —
+          # invisible in-repo, fatal for every consumer. This synthesizes the smallest
+          # such consumer and checks it against a lockfile built from scratch, so a
+          # declared-range/API drift fails HERE instead of in the consumer's tree.
+          consumer_dir="${RUNNER_TEMP}/frankensearch-consumer-smoke"
+          rm -rf "${consumer_dir}"
+          mkdir -p "${consumer_dir}/src"
+          cat > "${consumer_dir}/Cargo.toml" <<EOF
+          [package]
+          name = "frankensearch-consumer-smoke"
+          version = "0.0.0"
+          edition = "2021"
+          publish = false
+
+          [dependencies]
+          frankensearch = { path = "${GITHUB_WORKSPACE}/frankensearch" }
+          frankensearch-index = { path = "${GITHUB_WORKSPACE}/crates/frankensearch-index" }
+          frankensearch-quill = { path = "${GITHUB_WORKSPACE}/crates/frankensearch-quill" }
+          EOF
+          printf 'fn main() {}\n' > "${consumer_dir}/src/main.rs"
+          cd "${consumer_dir}"
+          cargo generate-lockfile
+          cargo check --locked
+
       - name: Cache verified bundled model inputs
         uses: actions/cache@v4
         with:

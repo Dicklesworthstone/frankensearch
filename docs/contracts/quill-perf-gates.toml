@@ -15,7 +15,7 @@ decision_precedence = "Fatal > Block > Quarantine > NoDecision/Provisional > All
 ratchet = ".bench-history/<gate>.<hardware-class>.<execution-profile>.latest.json is one frankensearch.perf-history-pointer.v2 atomic pointer to immutable profile-qualified <date>.<run-id> threshold/evidence objects; pass-over-pass comparisons, null bands, reruns, and destinations never cross the immutable hardware/profile key"
 machines = ["trj-zen3-5995wx/physical-64 (registered, required; capacity 64 physical cores)", "trj-zen3-5995wx/smt2-128 (registered, required; capacity 128 logical threads)", "m4-macos/scheduler-10 (registered, required, promotion held pending supported actual-loaded-image attestation; capacity 10 scheduler workers)", "m5-macos/scheduler-14 (unavailable but required; capacity and maximum widths absent until a real fingerprint and scheduler receipt land)", "x86-vps-ovh/x86-diagnostic (registered diagnostic-only; never supplies default-flip authority)"]
 machine_gate_availability = "M4 promotion is held on supported O_EXEC or loaded-image attestation; M5 is unavailable-required and must not be rewritten as all N/A; x86-vps-ovh/x86-diagnostic is diagnostic-only; QG-3/4/5 are promotion-unavailable on every profile until both arms emit a non-declarative witness of identical durability treatment"
-profile_applicability = "the unchanged complete canonical gate matrix is projected through the frozen registry: cells above the profile maximum are NotApplicable, runnable diagnostic-profile or canonical-diagnostic cells are Diagnostic, and all other runnable cells are Required; evidence must cover exactly Required plus Diagnostic with matching roles and must exclude NotApplicable"
+profile_applicability = "the unchanged complete canonical gate matrix is projected through the frozen registry under frankensearch.quill-perf-applicability-plan.v2; the plan hash binds this independently normalized manifest SHA-256 and any gate.primary_target_cell_width; cells above the profile maximum are NotApplicable with typed hardware/profile/capacity/required-width/maximum facts, runnable diagnostic-profile or canonical-diagnostic cells are Diagnostic, and all other runnable cells are Required; a required profile must retain the primary target as Required; evidence must cover exactly Required plus Diagnostic with matching roles and must exclude NotApplicable"
 normative_execution_envelope = "capacity semantics, execution capacity, and per-gate maximum exercised width come only from the frozen registry and reconstructed applicability plan, never from a caller; RAYON_NUM_THREADS equals profile execution capacity while measured cells stop at the plan maximum"
 registered_host_command = "scripts/perf-runner.sh --gate <QG-N> --hardware-class <hardware-class> --execution-profile <execution-profile> --run-id <unique-pass-id> --run-window <shared-window> [platform-required bounded options]"
 cli_identity = "--hardware-class and --execution-profile are an inseparable immutable key; producer/launcher legacy --class, --thread-budget, and --apple-mode flags are rejected, and the ratchet rejects the former class-only --machine-class flag"
@@ -25,7 +25,7 @@ rss_probe = "linux: /proc/self/status VmHWM; macos: mach task_info / time -l (pe
 threshold_artifact = "quill-perf-artifact-v6"
 evidence_artifact = "quill-perf-evidence-v4"
 machine_registry = "frankensearch.quill-machine-class-registry.v2"
-applicability_plan = "frankensearch.quill-perf-applicability-plan.v1"
+applicability_plan = "frankensearch.quill-perf-applicability-plan.v2"
 runner_completion_receipt = "frankensearch.perf-runner-completion.v6"
 runner_artifact_manifest = "frankensearch.perf-runner-artifact-manifest.v2"
 local_producer_contract = "frankensearch.quill-local-perf-producer.v4"
@@ -56,6 +56,7 @@ status = "LANDED deterministic content-addressed 1M-doc generator (quill-e6.1)"
 name = "bulk indexing, multi-core"
 fixture = "tiny + small + medium + xlarge; positions ON/OFF; threads = 1,2,4,8,16,32,64,96,128; commit included in timed window"
 target = "docs_per_sec >= 3.0x oracle AND >= 0.60x measured tokenize-only bandwidth ceiling (honesty denominator lane: same corpus through the tokenizer alone)"
+primary_target_cell_width = 8
 activated = false
 
 [gate.QG-2]

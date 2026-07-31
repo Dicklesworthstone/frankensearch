@@ -21,9 +21,13 @@
 //!   envelopes where silent acceptance would hide producer bugs.
 //! * `-00:00` (RFC 3339's "offset unknown") parses as UTC, matching its
 //!   numeric value.
-//! * Formatting always emits UTC (`Z`), with subsecond digits only when
-//!   nonzero, trimmed of trailing zeros — byte-identical to the `time`
-//!   crate's output for the values frankensearch produces.
+//! * Formatting always emits UTC with a `Z` designator, and subsecond
+//!   digits only when nonzero, trimmed of trailing zeros. This is a valid
+//!   RFC 3339 rendering that this module's own parser round-trips exactly;
+//!   it is NOT guaranteed byte-identical to the `time` crate (which may
+//!   render a numeric `+00:00` offset). frankensearch only ever re-parses
+//!   these strings or checks them for validity — never byte-compares them
+//!   against a `time`-produced golden — so the rendering choice is free.
 
 use thiserror::Error;
 

@@ -454,7 +454,10 @@ fn parse_rfc3339_timestamp_ms_reference(timestamp: &str) -> SearchResult<i64> {
                 reason: format!("must be RFC3339 ({err})"),
             }
         })?;
-    let millis = nanos.div_euclid(1_000_000);
+    // Truncating division toward zero, matching the prior `time`-based
+    // reference (`unix_timestamp_nanos() / 1_000_000`) exactly; `div_euclid`
+    // would floor and diverge by 1 ms for sub-millisecond pre-1970 inputs.
+    let millis = nanos / 1_000_000;
     i64::try_from(millis).map_err(|_| SearchError::InvalidConfig {
         field: "telemetry_envelope.ts".to_owned(),
         value: timestamp.to_owned(),

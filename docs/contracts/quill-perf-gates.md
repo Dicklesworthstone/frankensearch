@@ -12,6 +12,16 @@ assignments to `false`. This makes the evidence used for a false→true review
 stable across the flip itself; changing a fixture, target, estimator, or any
 other manifest byte still invalidates prior evidence.
 
+Applicability plan schema
+`frankensearch.quill-perf-applicability-plan.v2` binds that independently
+normalized manifest SHA-256 into every plan hash. QG-1 additionally declares
+`primary_target_cell_width = 8`; every registered profile required for the
+default flip must retain ordinary width-8 cells as `Required`. A wider canonical
+cell classified `NotApplicable` carries the exact typed hardware/profile,
+capacity semantics, execution capacity, required cell width, and admitted
+maximum that justify the classification. Missing or mutated facts fail
+reconstruction rather than falling back to explanatory text.
+
 ## The five standing laws (bind every published number)
 
 1. **No benchmark-only semantics.** Durability settings, commits, and result consumption match shipped defaults; no marker-only "commit latency"; no positions-off numbers marketed against positions-on defaults without saying so.
@@ -98,13 +108,22 @@ settings never create or relabel a key. Registry schema
 | `x86-vps-ovh` | `x86-diagnostic` | registered; diagnostic-only for every gate | No default-flip capacity or maximum; bounded execution facts come from one exact local diagnostic receipt and never acquire release authority |
 
 The typed producer and evidence loader reconstruct the complete canonical gate
-matrix and its profile-specific applicability plan; callers supply neither
-capacity nor a maximum width. In unchanged matrix order, a cell above the
-profile maximum is `NotApplicable`, a runnable cell on a diagnostic profile or
-a canonically diagnostic cell is `Diagnostic`, and every other runnable cell is
-`Required`. Evidence v4 must contain exactly the union of `Required` and
-`Diagnostic` cells with matching roles. Missing runnable cells, extra cells,
-role changes, and any measured `NotApplicable` cell fail closed.
+matrix and its profile-specific applicability plan; callers supply neither an
+ad hoc capacity nor an ad hoc maximum width. A registry-only diagnostic profile
+with either bound absent produces a typed no-claim planning error: `None` never
+means unlimited. A future runtime-bound diagnostic plan must first bind a
+verified capacity and maximum into its admitted identity. In unchanged matrix
+order, a cell above that bound is `NotApplicable` with typed
+hardware/profile/capacity and width facts, a runnable cell on a diagnostic
+profile or a canonically diagnostic cell is `Diagnostic`, and every other
+runnable cell is `Required`. A diagnostic-only plan therefore has no `Required`
+cells; the evidence fold must emit
+`evidence.gate_without_required_cells`/`NoDecision` and can never produce an
+`Allow` claim. The v2 plan hash also binds the normalized manifest SHA-256 and
+the gate's declared primary target width. Evidence v4 must contain exactly the
+union of `Required` and `Diagnostic` cells with matching roles. Missing runnable
+cells, extra cells, role changes, and any measured `NotApplicable` cell fail
+closed.
 
 Runtime availability is independent of release requirement. M4 remains held
 until the producer can attest the actual loaded image; M5 remains unavailable

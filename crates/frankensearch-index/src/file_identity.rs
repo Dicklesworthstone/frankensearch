@@ -11,23 +11,30 @@
 //!   (mode-`000`) artifacts still compare correctly where an open-based
 //!   probe would fail with `EACCES`, and no descriptor is spent per
 //!   comparison.
-//! * **Windows** — `(volume_serial_number, file_index)` from
-//!   [`std::os::windows::fs::MetadataExt`] via an opened handle (the
-//!   by-handle fields are only populated for handle-derived metadata).
-//!   This uses the nightly `windows_by_handle` std feature — the
-//!   workspace already mandates nightly — instead of hand-rolled
-//!   `GetFileInformationByHandle` FFI.
+//! * **Windows** — canonicalized-path equality via [`std::fs::canonicalize`],
+//!   which resolves symlinks and case/`.`/`..` differences on a
+//!   stable-std API. This deliberately does NOT use the by-handle
+//!   `(volume_serial_number, file_index)` identity: those `MetadataExt`
+//!   accessors are still gated behind the unstable `windows_by_handle`
+//!   feature, and this crate must compile without depending on that gate's
+//!   status. The only completeness cost is hardlink aliasing (two hardlinks
+//!   to one file canonicalize to distinct names), which the sole
+//!   consumer — rejecting a config that points two index roles at the same
+//!   artifact — does not need: role aliasing in practice is symlinks and
+//!   case, both of which canonicalization catches.
 //!
-//! Both paths follow symlinks, matching `same_file` semantics at every
-//! existing call site.
+//! The Unix path additionally detects hardlinks; both paths follow
+//! symlinks, matching `same_file` semantics at every existing call site.
 
 use std::io;
 use std::path::Path;
 
-/// Do `left` and `right` refer to the same physical filesystem object?
+/// Do `left` and `right` refer to the same filesystem object?
 ///
-/// Follows symlinks. Two hardlinks to one inode compare equal; two
-/// distinct files with identical contents do not.
+/// Follows symlinks. On Unix two hardlinks to one inode also compare equal
+/// (identity is `(dev, ino)`); on Windows the comparison is
+/// canonicalized-path equality, which catches symlink/case aliasing but not
+/// hardlinks.
 ///
 /// # Errors
 ///
@@ -36,30 +43,22 @@ use std::path::Path;
 /// path means "not the same file" or is fatal, exactly as they did with
 /// `same-file`).
 pub fn is_same_file(left: &Path, right: &Path) -> io::Result<bool> {
-    Ok(identity_of(left)? == identity_of(right)?)
+    identity_eq(left, right)
 }
 
 #[cfg(unix)]
-fn identity_of(path: &Path) -> io::Result<(u64, u64)> {
+fn identity_eq(left: &Path, right: &Path) -> io::Result<bool> {
     use std::os::unix::fs::MetadataExt;
-    let metadata = std::fs::metadata(path)?;
-    Ok((metadata.dev(), metadata.ino()))
+    let identity = |path: &Path| -> io::Result<(u64, u64)> {
+        let metadata = std::fs::metadata(path)?;
+        Ok((metadata.dev(), metadata.ino()))
+    };
+    Ok(identity(left)? == identity(right)?)
 }
 
-#[cfg(windows)]
-fn identity_of(path: &Path) -> io::Result<(u32, u64)> {
-    use std::os::windows::fs::MetadataExt;
-    // By-handle identity fields are only populated on metadata obtained
-    // from an open handle, so open for metadata access and stat that.
-    let handle = std::fs::File::open(path)?;
-    let metadata = handle.metadata()?;
-    match (metadata.volume_serial_number(), metadata.file_index()) {
-        (Some(volume), Some(index)) => Ok((volume, index)),
-        _ => Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "platform did not report a by-handle file identity",
-        )),
-    }
+#[cfg(not(unix))]
+fn identity_eq(left: &Path, right: &Path) -> io::Result<bool> {
+    Ok(std::fs::canonicalize(left)? == std::fs::canonicalize(right)?)
 }
 
 #[cfg(test)]
