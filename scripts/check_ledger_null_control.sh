@@ -109,6 +109,10 @@ while [[ $# -gt 0 ]]; do
       MODE="leakcheck"
       shift
       ;;
+    --gatecheck)
+      MODE="gatecheck"
+      shift
+      ;;
     --ledger)
       need_value "$@"
       LEDGER_OVERRIDE="$2"
@@ -262,7 +266,16 @@ blob_stream() {
         fi
       fi
       ;;
-    since|all)
+    since)
+      # Read the ledger AS OF HEAD, not the working tree. The --since diff
+      # numbers rows relative to HEAD, so a dirty working tree would desync
+      # the added[] line map against the blob content (bd-z4lqq --since
+      # line-map desync). A ledger absent at HEAD is an error, not empty.
+      if ! git -C "${ROOT_DIR}" show "HEAD:${rel}" 2>/dev/null; then
+        return 64
+      fi
+      ;;
+    all)
       command cat "${abs}"
       ;;
     selfcheck)
@@ -275,6 +288,28 @@ lint_one() {
   local requested="$1"
   resolve_ledger "${requested}"
 
+  # Materialize both inputs to temp files with explicit exit-code checks.
+  # Process substitutions <(...) hide their commands' exit status from
+  # `set -euo pipefail`, so a failing `git diff`/`git show` inside
+  # diff_stream/blob_stream would otherwise deliver an empty stream and the
+  # gate would report "checked_new_rows=0" and exit 0 — a vacuous pass on a
+  # real error (bd-z4lqq process-substitution bypass; e.g. a --since ref with
+  # no merge base). blob_stream's `return 64` was likewise unobservable.
+  local diff_tmp blob_tmp
+  diff_tmp="$(mktemp)" || return 64
+  blob_tmp="$(mktemp)" || { rm -f "${diff_tmp}"; return 64; }
+  if ! diff_stream "${LEDGER_REL}" >"${diff_tmp}"; then
+    rm -f "${diff_tmp}" "${blob_tmp}"
+    echo "ERROR: could not compute the ledger diff for ${LEDGER_REL}" >&2
+    return 64
+  fi
+  if ! blob_stream "${LEDGER_REL}" "${LEDGER_ABS}" >"${blob_tmp}"; then
+    rm -f "${diff_tmp}" "${blob_tmp}"
+    echo "ERROR: could not read the ledger blob for ${LEDGER_REL}" >&2
+    return 64
+  fi
+
+  local awk_status=0
   awk -v mode="${MODE}" \
       -v ledger="${LEDGER_REL}" \
       -v selfcheck_added_heading="${SELF_CHECK_ADDED_HEADING_LINE}" '
@@ -365,14 +400,20 @@ coefficient of variation[_ -]*gate/ ||
       counted_mechanism = 0; binary_sha = 0; cv_verdict = 0
       side_by_side = 0; self_speedup_class = 0; incumbent_class = 0
       actual_incumbent = 0; incumbent_ratio = 0; competitive_claim = 0
+      body_touched = 0
     }
     function flush(    upper, explicit_reject, explicit_keep, exempt,
                        is_reject, is_keep, new_entry, has_null,
                        incumbent_complete) {
       if (header == "") return
+      # An entry is subject to gating when its heading was added OR any of
+      # its body lines was added/modified. Keying only on the heading line
+      # (the old behavior) let a body-only edit rewrite the verdict of an
+      # existing entry — e.g. flip a historical REJECT to KEEP — without any
+      # check firing (bd-z4lqq body-only-mutation bypass).
       new_entry = (mode == "all" ||
                    (mode == "selfcheck" && selfcheck_added_heading == "") ||
-                   added[start_line])
+                   added[start_line] || body_touched)
       if (!new_entry) {
         reset_entry_state()
         return
@@ -397,6 +438,24 @@ AUDIT|INVENTORY|METHODOLOGY|BLOCKED|UNTIMED|INVALID|HOLD/)
       has_null = numeric_null && same_invocation
       incumbent_complete = actual_incumbent && incumbent_ratio &&
                             has_null && side_by_side
+
+      # Deny by default: a new dated entry must classify as exactly one of
+      # KEEP / REJECT / exempt. Previously an entry whose verdict matched
+      # neither the KEEP nor the REJECT vocabulary (e.g. "Verdict: ADOPTED")
+      # fell through every admission rule and was admitted with zero
+      # evidence — a fail-open classification hole (bd-z4lqq). NEGATIVE_EVIDENCE
+      # rows already default to REJECT above, so this only catches the
+      # genuinely unclassifiable case (chiefly on PERF_LEDGER).
+      if (!is_keep && !is_reject && !exempt) {
+        violations++
+        if (mode != "all" || violations <= 20) {
+          print "BLOCKED UNCLASSIFIED " ledger ":" start_line
+          print "  " header
+          print "  verdict matched neither KEEP nor REJECT nor an explicit exempt"
+          print "  note (SURVEY/CORRECTION/METHODOLOGY/AUDIT/...); classify it"
+          print "  explicitly — unclassified entries are denied by default"
+        }
+      }
 
       if (is_reject && !has_null && !counted_mechanism) {
         violations++
@@ -482,9 +541,16 @@ AUDIT|INVENTORY|METHODOLOGY|BLOCKED|UNTIMED|INVALID|HOLD/)
         next
       }
       if (header != "") {
+        if (added[FNR]) body_touched = 1
         note_line($0)
         low = tolower($0)
-        if (low ~ /(verdict|decision|outcome|status)[[:space:]:-]/) {
+        # Verdict-bearing body prefixes. "scope" is included because the
+        # established ledger convention expresses the verdict as a
+        # "**Scope:** KEEP ..." bullet; without it those legitimate rows read
+        # as UNCLASSIFIED under the deny-by-default rule below. Broadening
+        # classification never weakens evidence: a "Scope: KEEP" with no ELF
+        # SHA still fails the KEEP rules.
+        if (low ~ /(verdict|decision|outcome|status|scope)[[:space:]:-]/) {
           decision_lines = decision_lines "\n" $0
         }
       }
@@ -500,7 +566,9 @@ AUDIT|INVENTORY|METHODOLOGY|BLOCKED|UNTIMED|INVALID|HOLD/)
       print "[ledger-gate] OK " ledger ": checked_new_rows=" (checked + 0)
       exit 0
     }
-  ' <(diff_stream "${LEDGER_REL}") <(blob_stream "${LEDGER_REL}" "${LEDGER_ABS}")
+  ' "${diff_tmp}" "${blob_tmp}" || awk_status=$?
+  rm -f "${diff_tmp}" "${blob_tmp}"
+  return "${awk_status}"
 }
 
 lint_ledgers() {
@@ -514,6 +582,15 @@ lint_ledgers() {
   if [[ "${MODE}" == "since" ]] &&
      ! git -C "${ROOT_DIR}" rev-parse --verify --quiet "${SINCE_REF}^{commit}" >/dev/null; then
     echo "ERROR: --since ref is not a commit: ${SINCE_REF}" >&2
+    return 64
+  fi
+  # A --since ref with no common history yields a `git diff A...B` fatal; the
+  # materialized-stream check turns that into exit 64, but fail explicitly and
+  # early with an actionable message rather than an opaque diff error
+  # (bd-z4lqq: this exact case used to pass vacuously).
+  if [[ "${MODE}" == "since" ]] &&
+     ! git -C "${ROOT_DIR}" merge-base "${SINCE_REF}" HEAD >/dev/null 2>&1; then
+    echo "ERROR: --since ref has no common history with HEAD: ${SINCE_REF}" >&2
     return 64
   fi
   if [[ -n "${LEDGER_OVERRIDE}" ]]; then
@@ -632,6 +709,17 @@ Decision: KEEP." || SELF_CHECK_FAILED=1
 Comparison class: SELF-SPEEDUP
 ELF sha256: ${sha}
 Decision: KEEP." || SELF_CHECK_FAILED=1
+  # bd-z4lqq: a new dated entry whose verdict matches neither the KEEP nor the
+  # REJECT vocabulary must be denied by default, not admitted with zero
+  # evidence. Blocked on both ledgers (PERF: UNCLASSIFIED; NEGATIVE_EVIDENCE:
+  # defaults to REJECT then fails the missing-null rule).
+  run_selfcheck_case "unclassified verdict is denied by default" 2 "${ledger}" $'### 2099-01-14 — adopted, promote to the default path\nNo A/A null. No comparison class. No ELF sha.\nVerdict: ADOPTED.' || SELF_CHECK_FAILED=1
+  # bd-z4lqq: a body-only edit to an existing entry (heading NOT re-added, one
+  # body line added) must be gated. The selected added line 2 is the flipped
+  # verdict of entry one; a correct linter judges entry one as touched and
+  # blocks the class-less KEEP, while the pre-fix linter keyed only on the
+  # heading line and admitted it.
+  run_selfcheck_case "body-only edit to an existing entry is gated" 2 "${ledger}" $'### 2099-01-15 — historical lever, body silently flipped\nDecision: KEEP — reclassified in place.\n### 2099-01-16 — untouched conformant reject\nA/A null: 1.000 [0.980, 1.020], same invocation\nDecision: no-ship inside the null floor.' 2 || SELF_CHECK_FAILED=1
 }
 
 run_selfcheck() {
@@ -780,6 +868,129 @@ run_leakcheck() {
   echo "[ledger-leakcheck] OK: 2/2 leak-regression cases"
 }
 
+# --- gatecheck: real-repo regression coverage for the bd-z4lqq bypasses ---
+# The awk fixture selfcheck cannot reach the bash-level stream materialization,
+# so these run the real staged/--since Git path. A gate that is fail-closed
+# blocks each fraudulent input (exit 2) or errors on a broken invocation (exit
+# 64); the conformant control (exit 0) proves the harness exercises the linter
+# so it can never pass vacuously.
+run_gatecheck_once() {
+  # $1 = script under test (abs); $2 = variant. Prints nothing; returns the
+  # linter exit code, or 64 on a harness/setup failure.
+  local target="$1" variant="$2" repo rc=0
+  repo="$(mktemp -d "${TMPDIR:-/tmp}/ledger-gatecheck.XXXXXX")" || return 64
+  GATECHECK_LAST_DIR="${repo}"
+  leakcheck_env git -C "${repo}" init -q -b main || return 64
+  mkdir -p "${repo}/docs" "${repo}/scripts"
+  cp "${target}" "${repo}/scripts/check_ledger_null_control.sh"
+  chmod +x "${repo}/scripts/check_ledger_null_control.sh"
+  printf '# PERF_LEDGER (gatecheck)\n' > "${repo}/docs/PERF_LEDGER.md"
+  printf '# NEGATIVE_EVIDENCE (gatecheck)\n' > "${repo}/docs/NEGATIVE_EVIDENCE.md"
+  local gc="leakcheck_env git -C ${repo} -c user.name=gc -c user.email=gc@local"
+  ${gc} add -A || return 64
+  ${gc} commit -q -m base || return 64
+
+  case "${variant}" in
+    unclassified)
+      cat >> "${repo}/docs/PERF_LEDGER.md" <<'ROW'
+
+## 2099-03-01 — adopted, promote to default path
+Verdict: ADOPTED — promote everywhere.
+ROW
+      ${gc} add -A || return 64
+      leakcheck_env "${repo}/scripts/check_ledger_null_control.sh" --staged >/dev/null 2>&1 || rc=$?
+      ;;
+    bodyonly)
+      cat >> "${repo}/docs/NEGATIVE_EVIDENCE.md" <<'ROW'
+
+## 2099-03-02 — historical reject
+A/A null: 1.000 [0.98,1.02], same invocation
+Decision: REJECT — reverted.
+ROW
+      ${gc} add -A || return 64
+      ${gc} commit -q -m "historical reject" || return 64
+      # Edit the BODY only; the heading line is untouched.
+      leakcheck_env sed -i 's/Decision: REJECT — reverted./Decision: KEEP — reclassified in place./' \
+        "${repo}/docs/NEGATIVE_EVIDENCE.md" || return 64
+      ${gc} add -A || return 64
+      leakcheck_env "${repo}/scripts/check_ledger_null_control.sh" --staged >/dev/null 2>&1 || rc=$?
+      ;;
+    nomergebase)
+      # An orphan commit shares no history with HEAD, so `git diff O...HEAD`
+      # is fatal; a fail-closed gate must error (64), never pass vacuously.
+      cat >> "${repo}/docs/PERF_LEDGER.md" <<'ROW'
+
+## 2099-03-03 — bogus reject with no evidence
+Verdict: REJECT.
+ROW
+      ${gc} add -A || return 64
+      ${gc} commit -q -m "bogus reject" || return 64
+      leakcheck_env git -C "${repo}" checkout -q --orphan orphanb || return 64
+      leakcheck_env git -C "${repo}" reset -q --hard || true
+      printf 'x\n' > "${repo}/unrelated.txt"
+      ${gc} add unrelated.txt || return 64
+      ${gc} commit -q -m orphan || return 64
+      local orphan
+      orphan="$(leakcheck_env git -C "${repo}" rev-parse HEAD)" || return 64
+      leakcheck_env git -C "${repo}" checkout -q main || return 64
+      leakcheck_env "${repo}/scripts/check_ledger_null_control.sh" --since "${orphan}" >/dev/null 2>&1 || rc=$?
+      ;;
+    control)
+      cat >> "${repo}/docs/PERF_LEDGER.md" <<'ROW'
+
+## 2099-03-04 — conformant maintenance keep
+Comparison class: SELF-SPEEDUP
+ELF sha256: 3333333333333333333333333333333333333333333333333333333333333333
+Verdict: KEEP.
+ROW
+      ${gc} add -A || return 64
+      leakcheck_env "${repo}/scripts/check_ledger_null_control.sh" --staged >/dev/null 2>&1 || rc=$?
+      ;;
+    *) return 64 ;;
+  esac
+  return "${rc}"
+}
+
+run_gatecheck() {
+  local target="${LEDGER_LEAKCHECK_TARGET:-${BASH_SOURCE[0]}}"
+  if [[ "${target}" != /* ]]; then
+    target="$(cd "$(dirname "${target}")" && pwd)/$(basename "${target}")"
+  fi
+  local failed=0 rc dir
+  # variant : expected-exit : description
+  local cases=(
+    "unclassified:2:unclassified PERF verdict is blocked (fail-open verdict allowlist)"
+    "bodyonly:2:body-only flip of a historical entry is gated"
+    "nomergebase:64:no-merge-base --since errors instead of passing vacuously"
+    "control:0:conformant KEEP is admitted (harness exercises the linter)"
+  )
+  local entry variant want desc
+  for entry in "${cases[@]}"; do
+    variant="${entry%%:*}"; entry="${entry#*:}"
+    want="${entry%%:*}"; desc="${entry#*:}"
+    GATECHECK_LAST_DIR=""
+    rc=0
+    run_gatecheck_once "${target}" "${variant}" || rc=$?
+    dir="${GATECHECK_LAST_DIR}"
+    if [[ ${rc} -eq ${want} ]]; then
+      echo "[ledger-gatecheck] PASS ${desc}: exit ${rc}"
+    else
+      echo "[ledger-gatecheck] BLOCKED ${desc}: expected exit ${want}, got ${rc}" >&2
+      failed=1
+    fi
+    if [[ -n "${dir}" && -d "${dir}" && "${dir}" == *ledger-gatecheck* && ${rc} -ne ${want} ]]; then
+      echo "[ledger-gatecheck] retained temp repo: ${dir}" >&2
+    else
+      rm -rf "${dir}" 2>/dev/null || true
+    fi
+  done
+  if [[ ${failed} -ne 0 ]]; then
+    echo "[ledger-gatecheck] BLOCKED: bypass regression detected" >&2
+    return 2
+  fi
+  echo "[ledger-gatecheck] OK: ${#cases[@]}/${#cases[@]} bypass-regression cases"
+}
+
 case "${MODE}" in
   candidate)
     candidate_preflight
@@ -791,10 +1002,14 @@ case "${MODE}" in
     LEDGER_GATE_STATUS=0
     if ! run_selfcheck; then LEDGER_GATE_STATUS=2; fi
     if ! run_leakcheck; then LEDGER_GATE_STATUS=2; fi
+    if ! run_gatecheck; then LEDGER_GATE_STATUS=2; fi
     exit "${LEDGER_GATE_STATUS}"
     ;;
   leakcheck)
     run_leakcheck
+    ;;
+  gatecheck)
+    run_gatecheck
     ;;
   staged|since|all)
     lint_ledgers
