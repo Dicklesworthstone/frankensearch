@@ -2830,6 +2830,7 @@ fn next_telemetry_identifier(prefix: &str) -> String {
     id
 }
 
+#[cfg(test)]
 const TELEMETRY_TIMESTAMP_FALLBACK_RFC3339: &str = "1970-01-01T00:00:00Z";
 
 fn telemetry_timestamp_ms() -> u64 {
@@ -4929,7 +4930,7 @@ mod tests {
     fn rank(docs: &[String], id: &str) -> usize {
         docs.iter()
             .position(|doc| doc.as_str() == id)
-            .unwrap_or_else(|| panic!("{id} missing from {docs:?}"))
+            .expect("rank helper requires the requested document")
     }
 
     /// PARITY GATE. Both corrections off (the default) ⇒ `correct_phase1_pool` returns the pool
