@@ -15,6 +15,7 @@ use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicU8, Ordering as AtomicOrdering};
 
 use frankensearch_core::config::ZeroSignalReason;
+use frankensearch_core::generation::EmbeddingIdentityBundleV1;
 use frankensearch_core::{SearchError, SearchResult, TwoTierConfig, VectorHit};
 use tracing::{debug, info, warn};
 
@@ -22,7 +23,7 @@ use tracing::{debug, info, warn};
 use crate::hnsw::HNSW_META_FORMAT_CURRENT;
 #[cfg(feature = "ann")]
 use crate::hnsw::HnswLoadDisposition;
-use crate::{ClassifiedHits, SearchParams, VectorIndex, dot_product_f32_f32};
+use crate::{ClassifiedHits, Quantization, SearchParams, VectorIndex, dot_product_f32_f32};
 #[cfg(feature = "ann")]
 use crate::{HNSW_DEFAULT_MAX_LAYER, HnswConfig, HnswIndex};
 
@@ -418,6 +419,27 @@ pub struct TwoTierIndex {
     last_zero_signal: AtomicU8,
     quality_alignment: QualityAlignment,
     config: TwoTierConfig,
+    /// Lowercase hex SHA-256 fingerprint of the fast tier's embedding space,
+    /// when known (bd-9xuj T2-C2). Filled from the artifact's validated FSVI
+    /// v2 identity header at open, or from the builder-declared producing
+    /// identity when [`TwoTierIndexBuilder::finish`] wrote this tier in the
+    /// current process. `None` is the typed legacy-unidentified state (v1
+    /// artifacts) — never fabricated from the header's id/revision strings.
+    fast_space_fingerprint_hex: Option<String>,
+    /// Quality-tier counterpart of [`Self::fast_space_fingerprint_hex`].
+    quality_space_fingerprint_hex: Option<String>,
+    /// Complete identity bundle of the embedder that produced the fast
+    /// tier's vectors, when the builder that wrote this tier declared it
+    /// (bd-9xuj T2-C2). Retained so bundle-holding seams can apply the full
+    /// admission law
+    /// ([`frankensearch_core::BoundQueryEmbedding::verify_producer_conformance`])
+    /// rather than the fingerprint-only join. Its storage component
+    /// describes the PRODUCER's output contract, not this index's persisted
+    /// encoding. Process-local for v1 artifacts: a reopen from disk has no
+    /// bundle to retain and stays `None`.
+    fast_declared_identity: Option<EmbeddingIdentityBundleV1>,
+    /// Quality-tier counterpart of [`Self::fast_declared_identity`].
+    quality_declared_identity: Option<EmbeddingIdentityBundleV1>,
 }
 
 /// Sentinel for "the last fast-tier search produced hits".
@@ -715,6 +737,19 @@ impl TwoTierIndex {
             "opened two-tier index"
         );
 
+        // Retain each tier's embedding-space identity from its artifact
+        // header when the artifact carries one (bd-9xuj T2-C2). Legacy v1
+        // artifacts have no identity header — `identity_v2()` is
+        // structurally `None` there — and that absence is kept as the typed
+        // legacy-unidentified state, never synthesized from id strings.
+        let fast_space_fingerprint_hex = fast_index
+            .identity_v2()
+            .map(|identity| crate::fingerprint_hex(&identity.space_fingerprint));
+        let quality_space_fingerprint_hex = quality_index
+            .as_ref()
+            .and_then(VectorIndex::identity_v2)
+            .map(|identity| crate::fingerprint_hex(&identity.space_fingerprint));
+
         Ok(Self {
             fast_index,
             quality_index,
@@ -727,6 +762,10 @@ impl TwoTierIndex {
             last_zero_signal: AtomicU8::new(ZERO_SIGNAL_NONE),
             quality_alignment,
             config,
+            fast_space_fingerprint_hex,
+            quality_space_fingerprint_hex,
+            fast_declared_identity: None,
+            quality_declared_identity: None,
         })
     }
 
@@ -1181,6 +1220,72 @@ impl TwoTierIndex {
             .map(VectorIndex::embedder_revision)
     }
 
+    /// Lowercase hex SHA-256 fingerprint of the fast tier's embedding space,
+    /// when known (bd-9xuj T2-C2).
+    ///
+    /// This is the index-side join key for
+    /// [`frankensearch_core::BoundQueryEmbedding::verify_space_identity`]:
+    /// a bound query embedding is admissible against the fast tier exactly
+    /// when its space fingerprint equals this value (necessary, never
+    /// sufficient for a foreign producer — bundle-holding seams must apply
+    /// [`frankensearch_core::BoundQueryEmbedding::verify_producer_conformance`]).
+    ///
+    /// `Some` when the tier's artifact carries a validated FSVI v2 identity
+    /// header, or when this instance was returned by a
+    /// [`TwoTierIndexBuilder`] whose caller declared the producing identity
+    /// ([`TwoTierIndexBuilder::set_fast_identity`]). `None` is the typed
+    /// legacy-unidentified state: v1 artifacts persist no space identity, so
+    /// a reopen from disk of a v1-built index returns `None` and must be
+    /// routed as `LegacyUnidentified` reindex — never admitted on the
+    /// id/revision strings or dimension equality.
+    #[must_use]
+    pub fn fast_space_fingerprint_hex(&self) -> Option<&str> {
+        self.fast_space_fingerprint_hex.as_deref()
+    }
+
+    /// Quality-tier counterpart of [`Self::fast_space_fingerprint_hex`].
+    ///
+    /// `None` both when no quality index is loaded and when the loaded one
+    /// carries no identity; either way there is no quality-tier space to
+    /// verify a query embedding against.
+    #[must_use]
+    pub fn quality_space_fingerprint_hex(&self) -> Option<&str> {
+        self.quality_space_fingerprint_hex.as_deref()
+    }
+
+    /// Complete identity bundle of the embedder that produced the fast
+    /// tier's vectors, when this instance was returned by a builder that
+    /// declared it (bd-9xuj T2-C2; see
+    /// [`TwoTierIndexBuilder::set_fast_identity`]).
+    ///
+    /// This is the `expected` side for
+    /// [`frankensearch_core::BoundQueryEmbedding::verify_producer_conformance`].
+    /// Its storage component describes the producing embedder's output
+    /// contract, not this index's persisted encoding. Process-local for v1
+    /// artifacts: a reopen from disk has no bundle and returns `None`.
+    #[must_use]
+    pub const fn fast_declared_identity(&self) -> Option<&EmbeddingIdentityBundleV1> {
+        self.fast_declared_identity.as_ref()
+    }
+
+    /// Quality-tier counterpart of [`Self::fast_declared_identity`].
+    #[must_use]
+    pub const fn quality_declared_identity(&self) -> Option<&EmbeddingIdentityBundleV1> {
+        self.quality_declared_identity.as_ref()
+    }
+
+    /// Space fingerprint of the tier a semantic vector was served from, when
+    /// known (bd-9xuj T2-C2). The typed join between
+    /// [`Self::semantic_vector_with_tier_for_doc_id`]'s provenance and the
+    /// per-tier space accessors.
+    #[must_use]
+    pub fn space_fingerprint_hex_for_tier(&self, tier: SemanticVectorTier) -> Option<&str> {
+        match tier {
+            SemanticVectorTier::Fast => self.fast_space_fingerprint_hex(),
+            SemanticVectorTier::Quality => self.quality_space_fingerprint_hex(),
+        }
+    }
+
     /// Filesystem path of the loaded fast-tier index artifact.
     #[must_use]
     pub fn fast_index_path(&self) -> &Path {
@@ -1273,14 +1378,47 @@ impl TwoTierIndex {
     /// Falls back to the fast-tier vector when the quality tier is unavailable
     /// or missing for this document.
     ///
+    /// The fallback is SILENT here: the returned vector may live in the fast
+    /// tier's embedding space rather than the quality tier's, and this
+    /// signature cannot say which. Callers that must know — any caller that
+    /// compares the vector against other vectors — should use
+    /// [`Self::semantic_vector_with_tier_for_doc_id`], which returns the
+    /// serving tier alongside the vector (bd-9xuj T2-C2).
+    ///
     /// # Errors
     ///
     /// Returns `SearchError` if index access fails.
     pub fn semantic_vector_for_doc_id(&self, doc_id: &str) -> SearchResult<Option<Vec<f32>>> {
+        Ok(self
+            .semantic_vector_with_tier_for_doc_id(doc_id)?
+            .map(|(_, vector)| vector))
+    }
+
+    /// Semantic vector for the given document id with typed tier provenance
+    /// (bd-9xuj T2-C2).
+    ///
+    /// Identical lookup order and results as
+    /// [`Self::semantic_vector_for_doc_id`] — quality tier first, silent
+    /// fast-tier fallback — but the returned [`SemanticVectorTier`] names the
+    /// tier that served the vector, so a caller can resolve which embedding
+    /// space it lives in via [`Self::space_fingerprint_hex_for_tier`] instead
+    /// of comparing vectors across spaces unknowingly. Changing the fallback
+    /// itself is out of scope here (C4); this accessor only makes it
+    /// observable.
+    ///
+    /// # Errors
+    ///
+    /// Returns `SearchError` if index access fails.
+    pub fn semantic_vector_with_tier_for_doc_id(
+        &self,
+        doc_id: &str,
+    ) -> SearchResult<Option<(SemanticVectorTier, Vec<f32>)>> {
         if let Some(quality) = self.quality_vector_for_doc_id(doc_id)? {
-            return Ok(Some(quality));
+            return Ok(Some((SemanticVectorTier::Quality, quality)));
         }
-        self.fast_vector_for_doc_id(doc_id)
+        Ok(self
+            .fast_vector_for_doc_id(doc_id)?
+            .map(|vector| (SemanticVectorTier::Fast, vector)))
     }
 
     /// Whether the fast-tier document at `index` has a quality-tier vector.
@@ -1342,6 +1480,23 @@ impl TwoTierIndex {
     }
 }
 
+/// Tier that served a semantic vector
+/// ([`TwoTierIndex::semantic_vector_with_tier_for_doc_id`]; bd-9xuj T2-C2).
+///
+/// The tier is the typed handle to the embedding space the vector lives in:
+/// resolve it via [`TwoTierIndex::space_fingerprint_hex_for_tier`]. Vectors
+/// from different tiers are NOT comparable — the silent quality→fast fallback
+/// is exactly the seam this type makes observable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SemanticVectorTier {
+    /// Served from the quality tier (its embedding space is the quality
+    /// tier's).
+    Quality,
+    /// Served from the fast tier: either no quality index is loaded or the
+    /// quality tier has no vector for this document.
+    Fast,
+}
+
 /// Builder for writing fast and optional quality FSVI indices.
 #[derive(Debug)]
 pub struct TwoTierIndexBuilder {
@@ -1349,6 +1504,10 @@ pub struct TwoTierIndexBuilder {
     config: TwoTierConfig,
     fast_embedder_id: String,
     quality_embedder_id: String,
+    fast_embedder_revision: String,
+    quality_embedder_revision: String,
+    fast_identity: Option<EmbeddingIdentityBundleV1>,
+    quality_identity: Option<EmbeddingIdentityBundleV1>,
     fast_dimension: Option<usize>,
     quality_dimension: Option<usize>,
     fast_records: Vec<(String, Vec<f32>)>,
@@ -1364,6 +1523,10 @@ impl TwoTierIndexBuilder {
             config,
             fast_embedder_id: "fast-tier".to_owned(),
             quality_embedder_id: "quality-tier".to_owned(),
+            fast_embedder_revision: String::new(),
+            quality_embedder_revision: String::new(),
+            fast_identity: None,
+            quality_identity: None,
             fast_dimension: None,
             quality_dimension: None,
             fast_records: Vec::new(),
@@ -1383,6 +1546,59 @@ impl TwoTierIndexBuilder {
     pub fn set_quality_embedder_id(&mut self, embedder_id: impl Into<String>) -> &mut Self {
         self.quality_embedder_id = embedder_id.into();
         self
+    }
+
+    /// Declare the complete identity of the embedder producing the fast
+    /// tier's vectors (bd-9xuj T2-C2).
+    ///
+    /// The bundle is validated before it is accepted — a bound identity is a
+    /// claim every downstream verifier trusts — and [`Self::finish`]
+    /// additionally rejects it when its space dimension does not describe the
+    /// vectors actually written. On success:
+    ///
+    /// - the fast-tier header's revision string is set to the space's
+    ///   `immutable_revision` (the same rule `VectorIndex::create_v2` uses),
+    ///   so the persisted v1 header finally carries a real revision;
+    /// - the finished [`TwoTierIndex`] retains the bundle
+    ///   ([`TwoTierIndex::fast_declared_identity`]) and exposes the space
+    ///   join key ([`TwoTierIndex::fast_space_fingerprint_hex`]).
+    ///
+    /// The operational id string ([`Self::set_fast_embedder_id`]) is left
+    /// untouched: id strings are diagnostics, and this typed bundle — never
+    /// a string — is the compatibility authority. Retention is process-local
+    /// for the v1 artifacts this builder writes: a later reopen from disk is
+    /// legacy-unidentified until an identity-persisting writer exists.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError::InvalidConfig`] when the bundle fails its own
+    /// validation.
+    pub fn set_fast_identity(
+        &mut self,
+        identity: &EmbeddingIdentityBundleV1,
+    ) -> SearchResult<&mut Self> {
+        identity.validate()?;
+        self.fast_embedder_revision
+            .clone_from(&identity.space.immutable_revision);
+        self.fast_identity = Some(identity.clone());
+        Ok(self)
+    }
+
+    /// Quality-tier counterpart of [`Self::set_fast_identity`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError::InvalidConfig`] when the bundle fails its own
+    /// validation.
+    pub fn set_quality_identity(
+        &mut self,
+        identity: &EmbeddingIdentityBundleV1,
+    ) -> SearchResult<&mut Self> {
+        identity.validate()?;
+        self.quality_embedder_revision
+            .clone_from(&identity.space.immutable_revision);
+        self.quality_identity = Some(identity.clone());
+        Ok(self)
     }
 
     /// Add a fast-tier vector record.
@@ -1504,9 +1720,21 @@ impl TwoTierIndexBuilder {
 
     /// Write all buffered records and open the resulting `TwoTierIndex`.
     ///
+    /// When a producing identity was declared
+    /// ([`Self::set_fast_identity`] / [`Self::set_quality_identity`]), it is
+    /// checked against the vectors actually written (its space dimension
+    /// must equal the tier dimension — an index must never carry an identity
+    /// that does not describe its vectors), written into the tier header's
+    /// id/revision strings as far as the v1 format can carry it, and
+    /// retained on the returned [`TwoTierIndex`] so consumers can verify
+    /// per-tier space identity (bd-9xuj T2-C2). A declared quality identity
+    /// is attached only when this build wrote a quality tier: it must never
+    /// describe a stale quality artifact discovered on disk.
+    ///
     /// # Errors
     ///
-    /// Returns `SearchError::InvalidConfig` if no fast-tier records were added,
+    /// Returns `SearchError::InvalidConfig` if no fast-tier records were
+    /// added or a declared identity does not describe the written vectors,
     /// and propagates writer/open errors from `VectorIndex`.
     pub fn finish(self) -> SearchResult<TwoTierIndex> {
         let fast_dimension = self
@@ -1516,10 +1744,26 @@ impl TwoTierIndexBuilder {
                 value: "0".to_owned(),
                 reason: "at least one fast-tier record is required".to_owned(),
             })?;
+        if let Some(identity) = &self.fast_identity {
+            ensure_identity_describes_tier(identity, fast_dimension, "fast_identity")?;
+        }
+        if let (Some(identity), Some(quality_dimension)) =
+            (&self.quality_identity, self.quality_dimension)
+        {
+            ensure_identity_describes_tier(identity, quality_dimension, "quality_identity")?;
+        }
 
         let fast_path = self.dir.join(VECTOR_INDEX_FAST_FILENAME);
-        let mut fast_writer =
-            VectorIndex::create(&fast_path, &self.fast_embedder_id, fast_dimension)?;
+        // `create(path, id, dim)` is `create_with_revision(path, id, "", dim,
+        // F16)`, so this is byte-identical to the former `create` call for
+        // builders that declared no identity (empty default revision).
+        let mut fast_writer = VectorIndex::create_with_revision(
+            &fast_path,
+            &self.fast_embedder_id,
+            &self.fast_embedder_revision,
+            fast_dimension,
+            Quantization::F16,
+        )?;
         for (doc_id, embedding) in &self.fast_records {
             fast_writer.write_record(doc_id, embedding)?;
         }
@@ -1527,16 +1771,69 @@ impl TwoTierIndexBuilder {
 
         if let Some(quality_dimension) = self.quality_dimension {
             let quality_path = self.dir.join(VECTOR_INDEX_QUALITY_FILENAME);
-            let mut quality_writer =
-                VectorIndex::create(&quality_path, &self.quality_embedder_id, quality_dimension)?;
+            let mut quality_writer = VectorIndex::create_with_revision(
+                &quality_path,
+                &self.quality_embedder_id,
+                &self.quality_embedder_revision,
+                quality_dimension,
+                Quantization::F16,
+            )?;
             for (doc_id, embedding) in &self.quality_records {
                 quality_writer.write_record(doc_id, embedding)?;
             }
             quality_writer.finish()?;
         }
 
-        TwoTierIndex::open(&self.dir, self.config)
+        let mut index = TwoTierIndex::open(&self.dir, self.config)?;
+
+        // Retain the declared producing identities on the opened index
+        // (bd-9xuj T2-C2). This is retention of a validated declaration by
+        // the process that produced every vector it wrote — the same class
+        // as `InMemoryVectorIndex::from_vectors_with_identity` — not
+        // fabrication: an artifact-header identity, were one ever present,
+        // wins, and a reopen from disk of these v1 artifacts stays typed
+        // legacy-unidentified. The quality identity is dropped unless THIS
+        // build wrote the quality tier, so it can never describe a stale
+        // quality artifact `open` discovered on disk.
+        if let Some(identity) = self.fast_identity {
+            if index.fast_space_fingerprint_hex.is_none() {
+                index.fast_space_fingerprint_hex = Some(identity.space.fingerprint());
+            }
+            index.fast_declared_identity = Some(identity);
+        }
+        if let Some(identity) = self.quality_identity
+            && self.quality_dimension.is_some()
+            && index.quality_index.is_some()
+        {
+            if index.quality_space_fingerprint_hex.is_none() {
+                index.quality_space_fingerprint_hex = Some(identity.space.fingerprint());
+            }
+            index.quality_declared_identity = Some(identity);
+        }
+        Ok(index)
     }
+}
+
+/// Reject a declared producing identity whose space dimension does not
+/// describe the tier's written vectors (bd-9xuj T2-C2): the identity claim is
+/// checked before it is retained, never trusted on assertion alone.
+fn ensure_identity_describes_tier(
+    identity: &EmbeddingIdentityBundleV1,
+    tier_dimension: usize,
+    tier_field: &str,
+) -> SearchResult<()> {
+    if usize::try_from(identity.space.dimension).ok() == Some(tier_dimension) {
+        return Ok(());
+    }
+    Err(SearchError::InvalidConfig {
+        field: format!("{tier_field}.space.dimension"),
+        value: identity.space.dimension.to_string(),
+        reason: format!(
+            "declared embedding-space dimension must equal the written tier dimension \
+             ({tier_dimension}); refusing to retain an identity that does not describe \
+             this tier's vectors"
+        ),
+    })
 }
 
 fn resolve_fast_path(dir: &Path) -> SearchResult<PathBuf> {
@@ -4025,6 +4322,257 @@ mod tests {
             .expect("add record");
         let index = builder.finish().expect("finish");
         assert_eq!(index.doc_count(), 1);
+    }
+
+    // ─── Embedding-space identity retention (bd-9xuj T2-C2) ─────────────────
+
+    #[test]
+    fn builder_finish_retains_declared_typed_identity() {
+        let dir = temp_index_dir("typed-identity-retention");
+        let fast_bundle = EmbeddingIdentityBundleV1::explicit_test_model("builder-fast-model", 4);
+        let quality_bundle =
+            EmbeddingIdentityBundleV1::explicit_test_model("builder-quality-model", 4);
+
+        let mut builder = TwoTierIndex::create(&dir, TwoTierConfig::default()).expect("builder");
+        builder.set_fast_embedder_id("op-fast-id");
+        builder.set_quality_embedder_id("op-quality-id");
+        builder
+            .set_fast_identity(&fast_bundle)
+            .expect("declare fast identity");
+        builder
+            .set_quality_identity(&quality_bundle)
+            .expect("declare quality identity");
+        builder
+            .add_record("doc-a", &[1.0, 0.0, 0.0, 0.0], Some(&[0.0, 1.0, 0.0, 0.0]))
+            .expect("add record");
+        let index = builder.finish().expect("finish");
+
+        // The finished index carries the REAL typed identity, per tier.
+        assert_eq!(
+            index.fast_space_fingerprint_hex(),
+            Some(fast_bundle.space.fingerprint().as_str())
+        );
+        assert_eq!(
+            index.quality_space_fingerprint_hex(),
+            Some(quality_bundle.space.fingerprint().as_str())
+        );
+        assert_ne!(
+            index.fast_space_fingerprint_hex(),
+            index.quality_space_fingerprint_hex(),
+            "distinct producing models must stay distinct per tier"
+        );
+        assert_eq!(
+            index
+                .fast_declared_identity()
+                .map(EmbeddingIdentityBundleV1::fingerprint),
+            Some(fast_bundle.fingerprint()),
+            "the full producing bundle survives finish for the admission law"
+        );
+        assert_eq!(
+            index
+                .quality_declared_identity()
+                .map(EmbeddingIdentityBundleV1::fingerprint),
+            Some(quality_bundle.fingerprint())
+        );
+
+        // The operational id string is untouched by the typed declaration;
+        // the header revision now carries the space's immutable revision.
+        assert_eq!(index.fast_embedder_id(), "op-fast-id");
+        assert_eq!(index.quality_embedder_id(), Some("op-quality-id"));
+        assert_eq!(
+            index.fast_embedder_revision(),
+            fast_bundle.space.immutable_revision.as_str()
+        );
+        assert_eq!(
+            index.quality_embedder_revision(),
+            Some(quality_bundle.space.immutable_revision.as_str())
+        );
+        drop(index);
+
+        // Reopen from disk: the v1 artifacts persist id/revision strings but
+        // NO space identity — absence stays typed (LegacyUnidentified), and
+        // is never re-fabricated from the surviving strings.
+        let reopened = TwoTierIndex::open(&dir, TwoTierConfig::default()).expect("reopen");
+        assert_eq!(reopened.fast_embedder_id(), "op-fast-id");
+        assert_eq!(
+            reopened.fast_embedder_revision(),
+            fast_bundle.space.immutable_revision.as_str(),
+            "the declared revision must survive persistence in the v1 header"
+        );
+        assert_eq!(reopened.fast_space_fingerprint_hex(), None);
+        assert_eq!(reopened.quality_space_fingerprint_hex(), None);
+        assert!(reopened.fast_declared_identity().is_none());
+        assert!(reopened.quality_declared_identity().is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn builder_finish_rejects_identity_not_describing_vectors() -> Result<(), String> {
+        // A 16-dim space cannot describe 4-dim written vectors: the claim is
+        // checked against what was actually written, never trusted alone.
+        let dir = temp_index_dir("typed-identity-dim-mismatch");
+        let wrong_bundle = EmbeddingIdentityBundleV1::explicit_test_model("wrong-dim-model", 16);
+
+        let mut builder = TwoTierIndex::create(&dir, TwoTierConfig::default()).expect("builder");
+        builder
+            .set_fast_identity(&wrong_bundle)
+            .expect("bundle itself is coherent; the mismatch is against the records");
+        builder
+            .add_record("doc-a", &[1.0, 0.0, 0.0, 0.0], None)
+            .expect("add record");
+        let error = builder
+            .finish()
+            .expect_err("a non-describing identity must be rejected at finish");
+        let rendered = format!("{error:?}");
+        let SearchError::InvalidConfig { field, value, .. } = error else {
+            return Err(format!("expected InvalidConfig, got {rendered}"));
+        };
+        assert_eq!(field, "fast_identity.space.dimension");
+        assert_eq!(value, "16");
+
+        // Quality arm: same law, its own field name.
+        let mut builder = TwoTierIndex::create(&dir, TwoTierConfig::default()).expect("builder");
+        builder
+            .set_quality_identity(&wrong_bundle)
+            .expect("bundle itself is coherent");
+        builder
+            .add_record("doc-a", &[1.0, 0.0, 0.0, 0.0], Some(&[0.0, 1.0, 0.0, 0.0]))
+            .expect("add record");
+        let error = builder
+            .finish()
+            .expect_err("a non-describing quality identity must be rejected at finish");
+        let rendered = format!("{error:?}");
+        let SearchError::InvalidConfig { field, value, .. } = error else {
+            return Err(format!("expected InvalidConfig, got {rendered}"));
+        };
+        assert_eq!(field, "quality_identity.space.dimension");
+        assert_eq!(value, "16");
+
+        let _ = std::fs::remove_dir_all(&dir);
+        Ok(())
+    }
+
+    #[test]
+    fn builder_quality_identity_without_quality_tier_is_dropped() {
+        // A declared quality identity with no quality records written must
+        // NOT be attached: this build produced no quality tier, and the
+        // declaration must never end up describing a stale or absent one.
+        let dir = temp_index_dir("typed-identity-no-quality");
+        let quality_bundle = EmbeddingIdentityBundleV1::explicit_test_model("unused-quality", 4);
+
+        let mut builder = TwoTierIndex::create(&dir, TwoTierConfig::default()).expect("builder");
+        builder
+            .set_quality_identity(&quality_bundle)
+            .expect("declare quality identity");
+        builder
+            .add_record("doc-a", &[1.0, 0.0, 0.0, 0.0], None)
+            .expect("add fast-only record");
+        let index = builder.finish().expect("finish fast-only build");
+        assert!(!index.has_quality_index());
+        assert_eq!(index.quality_space_fingerprint_hex(), None);
+        assert!(index.quality_declared_identity().is_none());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn builder_without_identity_stays_legacy_unidentified() {
+        // The pre-C2 builder path, byte-compatible: no declaration, empty
+        // header revision, and the typed-absent identity state throughout.
+        let dir = temp_index_dir("typed-identity-legacy");
+        let mut builder = TwoTierIndex::create(&dir, TwoTierConfig::default()).expect("builder");
+        builder
+            .add_record("doc-a", &[1.0, 0.0], Some(&[0.0, 1.0]))
+            .expect("add record");
+        let index = builder.finish().expect("finish");
+        assert_eq!(index.fast_space_fingerprint_hex(), None);
+        assert_eq!(index.quality_space_fingerprint_hex(), None);
+        assert!(index.fast_declared_identity().is_none());
+        assert!(index.quality_declared_identity().is_none());
+        assert_eq!(index.fast_embedder_revision(), "");
+        assert_eq!(index.quality_embedder_revision(), Some(""));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn semantic_vector_with_tier_reports_serving_tier() {
+        // doc-a exists in both tiers; doc-b is fast-only. The provenance twin
+        // must (1) return exactly what semantic_vector_for_doc_id returns,
+        // (2) name the tier that served it, and (3) join to that tier's
+        // space through space_fingerprint_hex_for_tier.
+        let dir = temp_index_dir("semantic-vector-tier");
+        let fast_bundle = EmbeddingIdentityBundleV1::explicit_test_model("svt-fast-model", 4);
+        let quality_bundle = EmbeddingIdentityBundleV1::explicit_test_model("svt-quality-model", 4);
+
+        let mut builder = TwoTierIndex::create(&dir, TwoTierConfig::default()).expect("builder");
+        builder
+            .set_fast_identity(&fast_bundle)
+            .expect("declare fast identity");
+        builder
+            .set_quality_identity(&quality_bundle)
+            .expect("declare quality identity");
+        builder
+            .add_record("doc-a", &[1.0, 0.0, 0.0, 0.0], Some(&[0.0, 1.0, 0.0, 0.0]))
+            .expect("add doc-a");
+        builder
+            .add_record("doc-b", &[0.0, 0.0, 1.0, 0.0], None)
+            .expect("add doc-b");
+        let index = builder.finish().expect("finish");
+
+        // Quality-covered doc: served from the quality tier.
+        let (tier, vector) = index
+            .semantic_vector_with_tier_for_doc_id("doc-a")
+            .expect("lookup doc-a")
+            .expect("doc-a exists");
+        assert_eq!(tier, SemanticVectorTier::Quality);
+        assert_eq!(
+            Some(vector.clone()),
+            index
+                .semantic_vector_for_doc_id("doc-a")
+                .expect("legacy lookup doc-a"),
+            "the provenance twin must return exactly the legacy accessor's vector"
+        );
+        assert_eq!(
+            index.space_fingerprint_hex_for_tier(tier),
+            Some(quality_bundle.space.fingerprint().as_str()),
+            "Quality provenance joins to the quality tier's space"
+        );
+
+        // Quality-missing doc: the silent fast fallback, now observable.
+        let (tier, vector) = index
+            .semantic_vector_with_tier_for_doc_id("doc-b")
+            .expect("lookup doc-b")
+            .expect("doc-b exists");
+        assert_eq!(tier, SemanticVectorTier::Fast);
+        assert_eq!(
+            Some(vector),
+            index
+                .semantic_vector_for_doc_id("doc-b")
+                .expect("legacy lookup doc-b")
+        );
+        assert_eq!(
+            index.space_fingerprint_hex_for_tier(tier),
+            Some(fast_bundle.space.fingerprint().as_str()),
+            "Fast provenance joins to the fast tier's space"
+        );
+
+        // Missing doc: both accessors agree on absence.
+        assert!(
+            index
+                .semantic_vector_with_tier_for_doc_id("doc-missing")
+                .expect("lookup missing")
+                .is_none()
+        );
+        assert!(
+            index
+                .semantic_vector_for_doc_id("doc-missing")
+                .expect("legacy lookup missing")
+                .is_none()
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
