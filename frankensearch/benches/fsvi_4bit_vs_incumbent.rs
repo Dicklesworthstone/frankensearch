@@ -280,8 +280,9 @@ impl Arm {
     }
 }
 
-/// Time one arm for one round: `f` runs the full 32-query workload.
-fn time_round<F: FnOnce() -> Vec<Vec<u32>>>(arm: &mut Arm, f: F) -> Vec<Vec<u32>> {
+/// Time one arm for one slot: `f` runs the full 32-query workload. Returns the
+/// wall time in ns so the caller can form bracketed ratios.
+fn time_one<F: FnOnce() -> Vec<Vec<u32>>>(arm: &mut Arm, f: F) -> f64 {
     let cpu0 = cpu_time_ns();
     let t0 = Instant::now();
     let out = black_box(f());
@@ -289,7 +290,8 @@ fn time_round<F: FnOnce() -> Vec<Vec<u32>>>(arm: &mut Arm, f: F) -> Vec<Vec<u32>
     arm.cpu_ns_total += cpu_time_ns().saturating_sub(cpu0);
     arm.wall_ns.push(wall);
     arm.threads_seen = arm.threads_seen.max(observed_threads());
-    out
+    drop(out);
+    wall
 }
 
 // ──────────────────────────────────────────────────────────────────── main ──
@@ -403,20 +405,38 @@ fn main() {
     println!("candidate == incumbent_f32      : {agree_cand_vs_incumbent}/{QUERIES}   <- the world's definition");
     println!("ours_exact_f16 == incumbent_f32 : {agree_ours_exact_vs_incumbent}/{QUERIES}   <- our f16 storage vs f32 truth");
 
-    // ── Timed, interleaved rounds. ──────────────────────────────────────────
-    // inc_a / inc_b are the SAME arm run twice: their per-round ratio is the
-    // A/A null. Order is reversed on odd rounds so drift cancels (AB/BA).
+    // ── Timed rounds, BRACKETED. ────────────────────────────────────────────
+    // Runs 1 and 2 used a whole-round A/A (inc_a first, inc_b last) and the null
+    // came back dirty both times — 1.0321 at 15 rounds, 1.0598 at 61. Raising n
+    // made it WORSE, because the dispersion is host drift over the ~600 ms that
+    // separated the two replicates, not sampling error.
+    //
+    // So: bracket instead. Every subject X is measured BETWEEN two incumbent
+    // runs and scored as X / mean(I_before, I_after), which cancels linear drift
+    // across the subject's own measurement window. The A/A null is an incumbent
+    // run scored the SAME way, so null and candidate ratios share one structure
+    // and one drift-cancellation — the null now measures exactly the noise the
+    // candidate ratio is exposed to. This is the bracketing control this ledger
+    // already validated at PERF_LEDGER.md:822-824, where it produced B/A 0.9999
+    // on this same fleet.
     let pool1 = rayon::ThreadPoolBuilder::new()
         .num_threads(1)
         .build()
         .expect("1-thread pool");
 
-    let mut inc_a = Arm::new("incumbent_batch32_A");
-    let mut inc_b = Arm::new("incumbent_batch32_B");
-    let mut inc_gemv = Arm::new("incumbent_gemv_nq1");
-    let mut cand_t1 = Arm::new("cand_4bit_mult5_threads1");
-    let mut cand_def = Arm::new("cand_4bit_mult5_default");
-    let mut ours_flat = Arm::new("ours_exact_flat_default");
+    const S_CAND_T1: usize = 0;
+    const S_CAND_DEF: usize = 1;
+    const S_OURS_FLAT: usize = 2;
+    const S_INC_NULL: usize = 3;
+    const S_INC_GEMV: usize = 4;
+    const SUBJECTS: usize = 5;
+    let subject_names: [&'static str; SUBJECTS] = [
+        "cand_4bit_mult5_threads1",
+        "cand_4bit_mult5_default",
+        "ours_exact_flat_default",
+        "incumbent_null_AA",
+        "incumbent_gemv_nq1",
+    ];
 
     let run_cand = |pool: Option<&rayon::ThreadPool>| -> Vec<Vec<u32>> {
         let work = || {
@@ -456,115 +476,114 @@ fn main() {
     let _ = run_cand(None);
     let _ = run_ours_flat();
 
+    let mut arms: Vec<Arm> = subject_names.iter().map(|n| Arm::new(n)).collect();
+    let mut inc_arm = Arm::new("incumbent_batch32_bracket");
+    let mut ratios: Vec<Vec<f64>> = vec![Vec::new(); SUBJECTS];
+
     for round in 0..rounds {
-        if round % 2 == 0 {
-            time_round(&mut inc_a, || incumbent_batch(&corpus, &queries, K));
-            time_round(&mut cand_t1, || run_cand(Some(&pool1)));
-            time_round(&mut cand_def, || run_cand(None));
-            time_round(&mut inc_gemv, || incumbent_single(&corpus, &queries, K));
-            time_round(&mut ours_flat, run_ours_flat);
-            time_round(&mut inc_b, || incumbent_batch(&corpus, &queries, K));
-        } else {
-            time_round(&mut inc_b, || incumbent_batch(&corpus, &queries, K));
-            time_round(&mut ours_flat, run_ours_flat);
-            time_round(&mut inc_gemv, || incumbent_single(&corpus, &queries, K));
-            time_round(&mut cand_def, || run_cand(None));
-            time_round(&mut cand_t1, || run_cand(Some(&pool1)));
-            time_round(&mut inc_a, || incumbent_batch(&corpus, &queries, K));
+        let mut prev = time_one(&mut inc_arm, || incumbent_batch(&corpus, &queries, K));
+        for slot in 0..SUBJECTS {
+            // Rotate so every subject visits every position within the round;
+            // no subject is permanently adjacent to the warm-up edge.
+            let s = (slot + round) % SUBJECTS;
+            let t = match s {
+                S_CAND_T1 => time_one(&mut arms[s], || run_cand(Some(&pool1))),
+                S_CAND_DEF => time_one(&mut arms[s], || run_cand(None)),
+                S_OURS_FLAT => time_one(&mut arms[s], || run_ours_flat()),
+                S_INC_NULL => time_one(&mut arms[s], || incumbent_batch(&corpus, &queries, K)),
+                _ => time_one(&mut arms[s], || incumbent_single(&corpus, &queries, K)),
+            };
+            let next = time_one(&mut inc_arm, || incumbent_batch(&corpus, &queries, K));
+            ratios[s].push(t / ((prev + next) / 2.0));
+            prev = next;
         }
     }
 
-    // ── A/A null from the two incumbent replicates. ─────────────────────────
-    let mut null_ratios: Vec<f64> = inc_a
-        .wall_ns
-        .iter()
-        .zip(&inc_b.wall_ns)
-        .map(|(a, b)| b / a)
-        .collect();
+    // ── A/A null: an incumbent run scored by the SAME bracketing rule. ──────
+    let mut null_ratios = ratios[S_INC_NULL].clone();
     let null_median = median(&mut null_ratios);
     let null_sorted = null_ratios.clone();
     let null_p5 = percentile(&null_sorted, 0.05);
     let null_p95 = percentile(&null_sorted, 0.95);
-
-    // Pooled incumbent = both replicates of the same arm.
-    let mut pooled: Vec<f64> = inc_a
-        .wall_ns
-        .iter()
-        .chain(&inc_b.wall_ns)
-        .copied()
-        .collect();
-    let inc_batch_med = median(&mut pooled);
-    let inc_gemv_med = inc_gemv.median_wall();
-    // Report the incumbent at its BEST of the two shapes.
-    let (inc_best_name, inc_best) = if inc_gemv_med < inc_batch_med {
-        ("incumbent_gemv_nq1", inc_gemv_med)
-    } else {
-        ("incumbent_batch32", inc_batch_med)
-    };
+    let null_clean = (null_median - 1.0).abs() <= 0.03;
 
     let per_q = |ns: f64| ns / QUERIES as f64 / 1000.0; // us/query
 
-    println!("\n--- PER-ARM (median wall over {rounds} rounds; each round = {QUERIES} queries) ---");
     println!(
-        "{:<28} {:>12} {:>14} {:>10} {:>9}",
-        "arm", "median_us/q", "cpu/wall", "max_thr", "n"
+        "\n--- PER-ARM (median wall; {rounds} rounds x {SUBJECTS} slots, each = {QUERIES} queries) ---"
     );
-    for a in [
-        &inc_a, &inc_b, &inc_gemv, &cand_t1, &cand_def, &ours_flat,
-    ] {
+    println!(
+        "{:<30} {:>12} {:>10} {:>8}",
+        "arm", "median_us/q", "cpu/wall", "n"
+    );
+    println!(
+        "{:<30} {:>12.2} {:>10.2} {:>8}",
+        inc_arm.name,
+        per_q(inc_arm.median_wall()),
+        inc_arm.cpu_over_wall(),
+        inc_arm.wall_ns.len()
+    );
+    for a in &arms {
         println!(
-            "{:<28} {:>12.2} {:>14.2} {:>10} {:>9}",
+            "{:<30} {:>12.2} {:>10.2} {:>8}",
             a.name,
             per_q(a.median_wall()),
             a.cpu_over_wall(),
-            a.threads_seen,
             a.wall_ns.len()
         );
     }
-
-    println!("\n--- A/A NULL (incumbent measured twice, interleaved) ---");
-    println!("null_median = {null_median:.4}   null_p5 = {null_p5:.4}   null_p95 = {null_p95:.4}");
-    let null_clean = (null_median - 1.0).abs() <= 0.03;
     println!(
-        "null_gate(median within 1.000+/-0.030) = {}",
-        if null_clean { "CLEAN" } else { "DIRTY -- ratios below are NOT decidable" }
+        "(cpu/wall is the per-arm concurrency evidence; /proc/self/task is \
+process-wide and cannot distinguish arms)"
     );
 
-    println!("\n--- RATIOS vs INCUMBENT ({inc_best_name} @ {:.2} us/query) ---", per_q(inc_best));
-    let ratio_t1 = cand_t1.median_wall() / inc_best;
-    let ratio_def = cand_def.median_wall() / inc_best;
-    let ratio_flat = ours_flat.median_wall() / inc_best;
+    println!("\n--- A/A NULL (incumbent bracketed by incumbents, same rule as every ratio) ---");
+    println!("null_median = {null_median:.4}   null_p5 = {null_p5:.4}   null_p95 = {null_p95:.4}");
+    println!(
+        "null_gate(median within 1.000+/-0.030) = {}",
+        if null_clean {
+            "CLEAN"
+        } else {
+            "DIRTY -- ratios below are NOT decidable"
+        }
+    );
+
+    println!(
+        "\n--- BRACKETED RATIOS vs incumbent_batch32 ({:.2} us/query) ---",
+        per_q(inc_arm.median_wall())
+    );
     let decide = |r: f64| -> &'static str {
         if !null_clean {
             "UNDECIDABLE (dirty null)"
         } else if r < null_p5 {
-            "CANDIDATE FASTER (outside null)"
+            "SUBJECT FASTER than incumbent (outside null)"
         } else if r > null_p95 {
-            "CANDIDATE SLOWER (outside null)"
+            "SUBJECT SLOWER than incumbent (outside null)"
         } else {
             "WASH (inside null)"
         }
     };
+    for s in [S_CAND_T1, S_CAND_DEF, S_OURS_FLAT, S_INC_GEMV] {
+        let mut r = ratios[s].clone();
+        let m = median(&mut r);
+        let sorted = r.clone();
+        println!(
+            "{:<26} = {m:.4}  ({:.2}x)  [p5 {:.4}, p95 {:.4}]  {}",
+            subject_names[s],
+            1.0 / m,
+            percentile(&sorted, 0.05),
+            percentile(&sorted, 0.95),
+            decide(m)
+        );
+    }
+    let mut cdf = ratios[S_CAND_DEF].clone();
+    let mut ofl = ratios[S_OURS_FLAT].clone();
+    let (ratio_def, ratio_flat) = (median(&mut cdf), median(&mut ofl));
     println!(
-        "ratio_like_for_like(1 thread both) = {ratio_t1:.4}  ({:.2}x)  {}",
-        1.0 / ratio_t1,
-        decide(ratio_t1)
-    );
-    println!(
-        "ratio_as_shipped(cand {} thr vs inc 1 thr) = {ratio_def:.4}  ({:.2}x)  {}",
-        cand_def.threads_seen,
-        1.0 / ratio_def,
-        decide(ratio_def)
-    );
-    println!(
-        "ratio_ours_exact_flat              = {ratio_flat:.4}  ({:.2}x)  {}",
-        1.0 / ratio_flat,
-        decide(ratio_flat)
-    );
-    println!(
-        "\nself_vs_self_context: cand_default / ours_exact_flat = {:.4} ({:.2}x) <- the number the published claim was built on",
-        cand_def.median_wall() / ours_flat.median_wall(),
-        ours_flat.median_wall() / cand_def.median_wall()
+        "\nself_vs_self_context: cand_default / ours_exact_flat = {:.4} ({:.2}x) \
+<- the number the published claim was built on",
+        ratio_def / ratio_flat,
+        ratio_flat / ratio_def
     );
     println!("threads_at_end        = {}", observed_threads());
     println!("elf_sha256            = {}", elf_sha256());

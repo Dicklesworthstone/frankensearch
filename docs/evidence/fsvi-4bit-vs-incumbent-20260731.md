@@ -87,6 +87,20 @@ Build: strict-remote `rch exec --base 3debdf25 --clean-overlay` with only the
 bench and its `Cargo.toml` overlaid. Bench source:
 `frankensearch/benches/fsvi_4bit_vs_incumbent.rs`.
 
+### Source-to-ELF provenance (stated because one entry is imperfect)
+
+| run | ELF SHA-256 | source state | in git? |
+|---|---|---|---|
+| 1 (15 rounds) | `dff84b78…30a271` | as committed in `f23adfd0` **except** `unwrap_or(15)` instead of `unwrap_or(61)` | **no** — that literal was edited before the first commit |
+| 2 (61 rounds) | `905fa959…bb7924` | exactly `f23adfd0` | yes |
+| 3 (bracketed) | see below | the bracketed rewrite | yes |
+
+**Run 1's exact source is not in git**, and that is a real defect in this card,
+not a rounding of one. It differs from the committed file by a single integer
+literal — the round count, which is also printed in run 1's own output
+(`rounds=15`) — so it is reconstructible, but it should have been committed
+before being measured. Recorded rather than quietly dropped.
+
 > **Note on a known wart.** `cpu_time_ns()` routes through a pointless
 > `american_paren()` helper where `rsplit_once(')')` would do. It is deliberately
 > left in place: the committed source must keep producing the two ELF SHA-256s
