@@ -2290,6 +2290,12 @@ pub struct PerfGateArtifact {
     pub manifest_sha256: String,
     pub cells: Vec<PerfCellResult>,
     pub laws_attested: bool,
+    /// QG-1 H2 actual-work/queue/worker-role/lifecycle receipts. Additive:
+    /// absent (and never serialized) unless the invocation opted in via
+    /// `QUILL_PERF_WORK_RECEIPTS=on`, so the legacy artifact byte shape is
+    /// unchanged by default. Receipts are provenance, never claims.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub work_receipts: Option<crate::work_receipt::WorkReceiptEvidence>,
 }
 
 impl PerfGateArtifact {
@@ -3448,6 +3454,7 @@ mod tests {
                 distribution,
             }],
             laws_attested: true,
+            work_receipts: None,
         };
         let json = artifact.to_json_pretty().expect("artifact JSON");
         let value: serde_json::Value = serde_json::from_str(&json).expect("decode artifact");

@@ -2903,6 +2903,7 @@ mod tests {
             manifest_sha256: "b".repeat(64),
             cells: Vec::new(),
             laws_attested: false,
+            work_receipts: None,
         }
     }
 
@@ -2950,6 +2951,7 @@ mod tests {
                 },
             ],
             laws_attested: true,
+            work_receipts: None,
         }
     }
 
@@ -3090,6 +3092,7 @@ mod tests {
                 },
             ],
             laws_attested: true,
+            work_receipts: None,
         };
         let mut evidence = PerfEvidenceArtifact::assemble(
             PerfGate::Qg2,
@@ -3321,6 +3324,7 @@ mod tests {
                 },
             ],
             laws_attested: true,
+            work_receipts: None,
         };
         let mut evidence = PerfEvidenceArtifact::assemble(
             PerfGate::Qg6,

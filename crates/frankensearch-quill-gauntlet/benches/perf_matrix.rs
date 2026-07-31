@@ -34,10 +34,11 @@ use frankensearch_quill::{
     QuillIndex, SchemaDescriptor, SegmentStatsProvider,
 };
 use frankensearch_quill_gauntlet::{
-    BuildIdentity, ColdCacheEvidence, ComparatorConfig, ComparisonStatus, CorpusIdentity,
-    CorpusManifest, CountState, DistributionSummary, EngineConcurrencyObservation,
-    EngineObservation, EvidenceCell, EvidenceCellSpec, EvidencePolicy, EvidenceProvenance,
-    EvidenceRole, MachineIdentity, NativeTieKey, PERF_ARTIFACT_SCHEMA_VERSION, PERF_MIN_RUNS,
+    BuildIdentity, ColdCacheEvidence, CollectorBinding, ComparatorConfig, ComparisonStatus,
+    CorpusIdentity, CorpusManifest, CountState, DistributionSummary, EngineByteObservation,
+    EngineConcurrencyObservation, EngineObservation, EvidenceCell, EvidenceCellSpec,
+    EvidencePolicy, EvidenceProvenance, EvidenceRole, LifecycleObserver, LifecyclePhase,
+    MachineIdentity, NativeTieKey, PERF_ARTIFACT_SCHEMA_VERSION, PERF_MIN_RUNS,
     PairedEstimatorConfig, PeakRssEvidence, PerfCellResult, PerfCellSpec, PerfConcurrencyEngine,
     PerfConcurrencyObserver, PerfConcurrencyWitness, PerfCorpus, PerfEvidenceArtifact, PerfGate,
     PerfGateArtifact, PerfInputIdentity, PerfMatrixSpec, PerfMetricSemantics, PerfOperationScope,
@@ -45,10 +46,12 @@ use frankensearch_quill_gauntlet::{
     PerfSampleProvenance, PerfTopology, PositionMode, QG6_QUERY_GROUP_IDS, QG6_QUERY_GROUPS,
     Qg6ArmRole, Qg6Comparison, Qg6Phase, Qg6PreparedExperiment, Qg6QuerySpec, Qg6SampleBinding,
     Qg6SampleOrder, Qg6SearchHit, Qg6SearchResult, Qg6SelectionScope, Qg6SemanticContract,
-    RankClass, RankedHit, ScoreEpsilonReason, SyntheticCorpus, SyntheticCorpusSpec, ZipfExponent,
-    command_sha256_from_argv, compare_observations, estimate_paired_experiment,
-    machine_fingerprint, oracle_version_contract, peak_rss_bytes, perf_manifest_contract_sha256,
-    seeded_balanced_pair_order, validate_matrix,
+    QueueObservation, RankClass, RankedHit, ScoreEpsilonReason, SyntheticCorpus,
+    SyntheticCorpusSpec, TerminalJoin, WORK_RECEIPT_SCHEMA_VERSION, WidthObservation, WorkReceipt,
+    WorkReceiptCellEvidence, WorkReceiptCollector, WorkReceiptEvidence, WorkReceiptExpectation,
+    WorkReceiptMode, ZipfExponent, command_sha256_from_argv, compare_observations, document_bytes,
+    estimate_paired_experiment, machine_fingerprint, oracle_version_contract, peak_rss_bytes,
+    perf_manifest_contract_sha256, seeded_balanced_pair_order, validate_matrix,
 };
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -101,6 +104,17 @@ fn validate_qg6_queries_per_class(manifest: &str) -> Result<(), String> {
 static SCRATCH_COUNTER: AtomicU64 = AtomicU64::new(0);
 static LIFECYCLE_RECEIPT_COUNTER: AtomicU64 = AtomicU64::new(0);
 static LIFECYCLE_RECEIPTS: OnceLock<Mutex<Vec<serde_json::Value>>> = OnceLock::new();
+/// Invocation-wide work-receipt mode (QG-1 H2). Read once; off by default.
+static WORK_RECEIPT_MODE: OnceLock<WorkReceiptMode> = OnceLock::new();
+/// Monotonic anchor all receipt windows are expressed against.
+static WORK_RECEIPT_ORIGIN: OnceLock<Instant> = OnceLock::new();
+/// Run identity sealed by `bench_matrix` before any receipted collection.
+static WORK_RECEIPT_IDENTITY: OnceLock<WorkReceiptRunIdentity> = OnceLock::new();
+/// Per-fixture work-receipt accumulator (bounded: counts + last per arm).
+static WORK_RECEIPT_STATE: OnceLock<Mutex<BTreeMap<String, WorkReceiptCellState>>> =
+    OnceLock::new();
+/// Every sealed receipt of the invocation, flushed as JSONL post-collection.
+static WORK_RECEIPT_LOG: OnceLock<Mutex<Vec<serde_json::Value>>> = OnceLock::new();
 static CONCURRENCY_OBSERVATIONS: OnceLock<
     Mutex<BTreeMap<(String, String), ConcurrencyAccumulator>>,
 > = OnceLock::new();
@@ -716,7 +730,11 @@ fn fence_tantivy_lifecycle(
     (index, Duration::from_nanos(receipt.join_elapsed_ns))
 }
 
-fn finish_tantivy_lifecycle(index: TantivyIndex, spec: &PerfCellSpec, phase: &str) -> Duration {
+fn finish_tantivy_lifecycle(
+    index: TantivyIndex,
+    spec: &PerfCellSpec,
+    phase: &str,
+) -> (Duration, BenchmarkWriterJoinReceipt) {
     let receipt = index
         .benchmark_join_workers()
         .expect("join Tantivy benchmark workers without rearming");
@@ -725,7 +743,275 @@ fn finish_tantivy_lifecycle(index: TantivyIndex, spec: &PerfCellSpec, phase: &st
         "terminal Tantivy lifecycle fence unexpectedly rearmed a writer"
     );
     emit_tantivy_lifecycle_receipt(spec, phase, &receipt);
-    Duration::from_nanos(receipt.join_elapsed_ns)
+    (Duration::from_nanos(receipt.join_elapsed_ns), receipt)
+}
+
+// ─── QG-1 H2: actual-work, queue, worker-role, and lifecycle receipts ────────
+//
+// Opt-in via `QUILL_PERF_WORK_RECEIPTS=on`, scoped to QG-1 docs_per_second
+// cells (the only cells with a prepared immutable corpus to bind against).
+// The collector observes at the harness↔engine boundary and through the
+// engines' real accessors; anything no seam exposes stays a typed gap. The
+// same collector implements the H1 `LifecycleObserver` seam, so when the
+// continuous-timing window lands it plugs into `bulk_metric_continuous`'s
+// observer slot with `timing_mode: "continuous"` and no interface change.
+
+/// Run identity every receipt binds (sealed once per invocation).
+struct WorkReceiptRunIdentity {
+    run_id: String,
+    machine_fingerprint: String,
+    build_profile: String,
+    executable_sha256: String,
+    git_rev: String,
+}
+
+/// Bounded per-fixture accumulator entry.
+struct WorkReceiptCellState {
+    gate: PerfGate,
+    rounds_quill: u64,
+    rounds_tantivy: u64,
+    last_quill: Option<WorkReceipt>,
+    last_tantivy: Option<WorkReceipt>,
+    all_validated: bool,
+}
+
+fn work_receipt_mode() -> WorkReceiptMode {
+    *WORK_RECEIPT_MODE
+        .get_or_init(|| WorkReceiptMode::from_env().expect("QUILL_PERF_WORK_RECEIPTS"))
+}
+
+/// Whether this cell collects H2 work receipts.
+fn work_receipt_cell(spec: &PerfCellSpec) -> bool {
+    work_receipt_mode().is_enabled()
+        && spec.gate == PerfGate::Qg1
+        && spec.metric == "docs_per_second"
+}
+
+fn work_receipt_origin_elapsed_ns() -> u64 {
+    u64::try_from(
+        WORK_RECEIPT_ORIGIN
+            .get_or_init(Instant::now)
+            .elapsed()
+            .as_nanos(),
+    )
+    .expect("monotonic ns")
+}
+
+/// First alphanumeric token of the prepared corpus, lowercased with the same
+/// folding the analyzers apply: a term guaranteed searchable after the
+/// terminal commit.
+fn work_receipt_probe_term(documents: &[IndexableDocument]) -> String {
+    documents
+        .iter()
+        .find_map(|document| {
+            document
+                .content
+                .split(|c: char| !c.is_alphanumeric())
+                .find(|token| !token.is_empty())
+        })
+        .expect("prepared corpus contains at least one searchable token")
+        .to_ascii_lowercase()
+}
+
+/// Build the receipt collector for one window of one arm.
+fn work_receipt_collector(
+    spec: &PerfCellSpec,
+    arm: EngineArm,
+    prefix: &PreparedQg1Prefix,
+) -> WorkReceiptCollector {
+    let identity = WORK_RECEIPT_IDENTITY
+        .get()
+        .expect("work-receipt identity sealed before any receipted collection");
+    WorkReceiptCollector::new(
+        CollectorBinding {
+            run_id: identity.run_id.clone(),
+            machine_fingerprint: identity.machine_fingerprint.clone(),
+            build_profile: identity.build_profile.clone(),
+            executable_sha256: identity.executable_sha256.clone(),
+            git_rev: identity.git_rev.clone(),
+            gate: spec.gate.to_string(),
+            fixture: spec.fixture.clone(),
+            metric: spec.metric.clone(),
+            engine: arm.label().to_owned(),
+            timing_mode: "per-call".to_owned(),
+            corpus_identity: format!(
+                "qg1-native/prepared-prefix-v1/{}",
+                prefix.indexed_content_sha256
+            ),
+            corpus_manifest_sha256: prefix.manifest_sha256.clone(),
+        },
+        u64::try_from(spec.threads.expect("QG-1 bulk cell thread width")).expect("width fits u64"),
+    )
+}
+
+/// Quill's honest engine-reported footprint: exact FSLX byte lengths from
+/// the published manifest (backend-independent — `managed_disk_bytes` is
+/// hard-zero on the in-memory backend and must not be used here).
+fn quill_index_footprint(index: &QuillIndex) -> (EngineByteObservation, EngineByteObservation) {
+    let snapshot = index.snapshot();
+    let manifest = &snapshot.loaded_manifest().manifest;
+    let bytes: u64 = manifest
+        .segments
+        .iter()
+        .map(|segment| segment.file_len)
+        .sum();
+    (
+        EngineByteObservation::Observed {
+            bytes,
+            seam: "quill KeeperSnapshot::loaded_manifest().manifest.segments[].file_len \
+                   (exact FSLX lengths, backend-independent)"
+                .to_owned(),
+        },
+        EngineByteObservation::Observed {
+            bytes: manifest.segments.len() as u64,
+            seam: "quill KeeperSnapshot::loaded_manifest().manifest.segments.len()".to_owned(),
+        },
+    )
+}
+
+/// Tantivy's honest engine-reported footprint via the bench layout seam.
+fn tantivy_index_footprint(index: &TantivyIndex) -> (EngineByteObservation, EngineByteObservation) {
+    match index.benchmark_index_layout() {
+        Ok((segments, bytes)) => (
+            EngineByteObservation::Observed {
+                bytes,
+                seam: "TantivyIndex::benchmark_index_layout (managed segment files via \
+                       Directory::open_read)"
+                    .to_owned(),
+            },
+            EngineByteObservation::Observed {
+                bytes: segments as u64,
+                seam: "TantivyIndex::benchmark_index_layout searchable segment count".to_owned(),
+            },
+        ),
+        Err(error) => {
+            let seam = format!("TantivyIndex::benchmark_index_layout failed: {error}");
+            (
+                EngineByteObservation::StructurallyUnobservable { seam: seam.clone() },
+                EngineByteObservation::StructurallyUnobservable { seam },
+            )
+        }
+    }
+}
+
+/// Finish, validate fail-closed, log, and record one receipt.
+fn finalize_work_receipt(
+    collector: WorkReceiptCollector,
+    spec: &PerfCellSpec,
+    arm: EngineArm,
+    expected_docs: u64,
+    expected_bytes: u64,
+    window_started_rel_ns: u64,
+) {
+    let receipt = collector
+        .finish(window_started_rel_ns)
+        .expect("assemble QG-1 work receipt");
+    let expectation = WorkReceiptExpectation {
+        engine: arm.label().to_owned(),
+        doc_count: expected_docs,
+        total_bytes: expected_bytes,
+        configured_threads: u64::try_from(spec.threads.expect("QG-1 bulk cell thread width"))
+            .expect("width fits u64"),
+    };
+    let validated = receipt.validate(&expectation);
+    eprintln!("{}", receipt.bounded_log_line());
+    let mut state = WORK_RECEIPT_STATE
+        .get_or_init(|| Mutex::new(BTreeMap::new()))
+        .lock()
+        .expect("lock work-receipt state");
+    let cell = state
+        .entry(spec.fixture.clone())
+        .or_insert_with(|| WorkReceiptCellState {
+            gate: spec.gate,
+            rounds_quill: 0,
+            rounds_tantivy: 0,
+            last_quill: None,
+            last_tantivy: None,
+            all_validated: true,
+        });
+    cell.all_validated &= validated.is_ok();
+    match arm {
+        EngineArm::Quill => {
+            cell.rounds_quill += 1;
+            cell.last_quill = Some(receipt.clone());
+        }
+        EngineArm::Tantivy => {
+            cell.rounds_tantivy += 1;
+            cell.last_tantivy = Some(receipt.clone());
+        }
+    }
+    drop(state);
+    WORK_RECEIPT_LOG
+        .get_or_init(|| Mutex::new(Vec::new()))
+        .lock()
+        .expect("lock work-receipt log")
+        .push(serde_json::to_value(&receipt).expect("serialize work receipt"));
+    validated.expect("work receipt violated the H2 contract");
+}
+
+/// Drain the accumulator into per-gate additive artifact evidence.
+fn take_work_receipt_evidence() -> BTreeMap<PerfGate, WorkReceiptEvidence> {
+    let Some(state) = WORK_RECEIPT_STATE.get() else {
+        return BTreeMap::new();
+    };
+    let drained = {
+        let mut state = state.lock().expect("lock work-receipt state for drain");
+        std::mem::take(&mut *state)
+    };
+    let mut by_gate: BTreeMap<PerfGate, WorkReceiptEvidence> = BTreeMap::new();
+    for (fixture, cell) in drained {
+        by_gate
+            .entry(cell.gate)
+            .or_insert_with(|| WorkReceiptEvidence {
+                schema_version: WORK_RECEIPT_SCHEMA_VERSION.to_owned(),
+                mode: work_receipt_mode().label().to_owned(),
+                cells: Vec::new(),
+            })
+            .cells
+            .push(WorkReceiptCellEvidence {
+                schema_version: WORK_RECEIPT_SCHEMA_VERSION.to_owned(),
+                fixture,
+                rounds_quill: cell.rounds_quill,
+                rounds_tantivy: cell.rounds_tantivy,
+                last_quill_receipt: cell.last_quill,
+                last_tantivy_receipt: cell.last_tantivy,
+                all_receipts_validated: cell.all_validated,
+            });
+    }
+    by_gate
+}
+
+/// Flush every sealed receipt as JSONL alongside the lifecycle receipts.
+fn flush_work_receipts(output_dir: &Path) {
+    let Some(log) = WORK_RECEIPT_LOG.get() else {
+        return;
+    };
+    let (payload, receipt_count) = {
+        let log = log.lock().expect("lock work-receipt log for flush");
+        if log.is_empty() {
+            return;
+        }
+        let mut payload = Vec::new();
+        for row in log.iter() {
+            serde_json::to_writer(&mut payload, row).expect("serialize work receipt row");
+            payload.push(b'\n');
+        }
+        (payload, log.len())
+    };
+    std::fs::create_dir_all(output_dir).expect("create work-receipt directory");
+    let path = output_dir.join("work-receipts.jsonl");
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)
+        .expect("open work-receipt JSONL");
+    file.write_all(&payload).expect("write work receipts");
+    eprintln!(
+        "[qg1-work-receipts] receipts={} sha256={} path={}",
+        receipt_count,
+        lower_hex(&Sha256::digest(&payload)),
+        display_path(&path),
+    );
 }
 
 fn preflight_index<E: LexicalRead + LexicalWrite>(
@@ -894,6 +1180,7 @@ fn index_prepared_qg1_batches<E: LexicalWrite>(
     context: &BenchContext,
     index: &E,
     documents: &[IndexableDocument],
+    observe_batch: &mut dyn FnMut(&[IndexableDocument]),
 ) -> Duration {
     let mut measured = Duration::ZERO;
     for batch in documents.chunks(context.scale.batch_documents()) {
@@ -905,6 +1192,8 @@ fn index_prepared_qg1_batches<E: LexicalWrite>(
                 .expect("QG-1 prepared index batch");
         });
         measured += timer.elapsed();
+        // Observed at the hand-off boundary, after the call returned.
+        observe_batch(batch);
     }
     measured
 }
@@ -914,6 +1203,7 @@ fn index_prepared_qg1_batches_with_visibility_commits<E: LexicalWrite>(
     index: &E,
     documents: &[IndexableDocument],
     commit_cadence: Duration,
+    observe_batch: &mut dyn FnMut(&[IndexableDocument]),
 ) -> (Duration, usize) {
     let mut measured = Duration::ZERO;
     let mut unpublished_since = None;
@@ -928,6 +1218,7 @@ fn index_prepared_qg1_batches_with_visibility_commits<E: LexicalWrite>(
                 .expect("QG-1 prepared index batch");
         });
         measured += timer.elapsed();
+        observe_batch(batch);
         if unpublished_started.elapsed() >= commit_cadence {
             measured += commit(context, index);
             periodic_commits = periodic_commits.saturating_add(1);
@@ -945,15 +1236,42 @@ fn commit<E: LexicalWrite>(context: &BenchContext, index: &E) -> Duration {
     timer.elapsed()
 }
 
+#[allow(clippy::too_many_lines)]
 fn bulk_metric_unpooled(context: &BenchContext, spec: &PerfCellSpec, arm: EngineArm) -> f64 {
     let requested = spec.document_count.expect("bulk document count");
     let count = context.scale.document_count(requested);
-    let prepared_qg1_documents = (spec.gate == PerfGate::Qg1).then(|| context.qg1_prefix(count).1);
+    let prepared_qg1 = (spec.gate == PerfGate::Qg1).then(|| context.qg1_prefix(count));
+    let prepared_qg1_documents = prepared_qg1.map(|(_, documents)| documents);
     let generated_corpus = (spec.gate != PerfGate::Qg1).then(|| corpus_for(count));
+    // QG-1 H2 receipts (opt-in): the collector observes at the hand-off
+    // boundary and through engine accessors, strictly between the timed
+    // regions, identically for both arms.
+    let mut collector = work_receipt_cell(spec).then(|| {
+        let (prefix, _) = prepared_qg1.expect("QG-1 receipted cell has a prepared corpus");
+        work_receipt_collector(spec, arm, prefix)
+    });
+    let expected_bytes: u64 = collector.as_ref().map_or(0, |_| {
+        prepared_qg1_documents
+            .expect("QG-1 receipted cell has prepared documents")
+            .iter()
+            .map(document_bytes)
+            .sum()
+    });
+    let mut window_started_rel_ns = 0_u64;
+    let win_ns =
+        |origin: Instant| u64::try_from(origin.elapsed().as_nanos()).expect("monotonic ns");
     let elapsed = match arm {
         EngineArm::Quill => {
             let index = quill_in_memory(spec);
             let generation_before = index.snapshot().loaded_manifest().manifest.generation;
+            if let Some(c) = collector.as_mut() {
+                window_started_rel_ns = work_receipt_origin_elapsed_ns();
+                c.begin_window();
+            }
+            let window_origin = Instant::now();
+            if let Some(c) = collector.as_mut() {
+                c.on_phase(LifecyclePhase::FirstFeed, 0);
+            }
             let mut elapsed = prepared_qg1_documents.map_or_else(
                 || {
                     index_batches(
@@ -966,29 +1284,98 @@ fn bulk_metric_unpooled(context: &BenchContext, spec: &PerfCellSpec, arm: Engine
                         None,
                     )
                 },
-                |documents| index_prepared_qg1_batches(context, &index, documents),
+                |documents| {
+                    index_prepared_qg1_batches(context, &index, documents, &mut |batch| {
+                        if let Some(c) = collector.as_mut() {
+                            c.record_feed_batch(
+                                batch.len() as u64,
+                                batch.iter().map(document_bytes).sum(),
+                            );
+                        }
+                    })
+                },
             );
             let generation_after = index.snapshot().loaded_manifest().manifest.generation;
+            if let Some(c) = collector.as_mut() {
+                c.on_phase(LifecyclePhase::FeedComplete, win_ns(window_origin));
+            }
             elapsed += commit(context, &index);
+            if let Some(c) = collector.as_mut() {
+                c.on_phase(LifecyclePhase::CommitComplete, win_ns(window_origin));
+            }
+            let periodic_commits = generation_after.saturating_sub(generation_before);
             if spec.gate == PerfGate::Qg1 {
                 eprintln!(
                     "[qg-commit-parity] gate={} fixture={} arm=quill cadence_ms={} \
-                     periodic_commits={} terminal_commit_calls=1 durability=in_memory",
+                     periodic_commits={periodic_commits} terminal_commit_calls=1 \
+                     durability=in_memory",
                     spec.gate,
                     spec.fixture,
                     quill_config(spec).max_visibility_lag_ms,
-                    generation_after.saturating_sub(generation_before),
                 );
+            }
+            if let Some(mut c) = collector.take() {
+                let committed =
+                    u64::try_from(LexicalRead::doc_count(&index)).expect("doc count fits u64");
+                let (index_bytes, segment_count) = quill_index_footprint(&index);
+                c.record_committed(committed, index_bytes, segment_count);
+                let documents =
+                    prepared_qg1_documents.expect("QG-1 receipted cell has prepared documents");
+                let probe = work_receipt_probe_term(documents);
+                let probe_hits = context.runtime.block_on(async {
+                    index
+                        .search(&context.cx, &probe, 1)
+                        .await
+                        .expect("QG-1 receipt terminal searchable probe")
+                        .len()
+                });
+                assert!(probe_hits > 0, "terminal searchable probe returned no hits");
+                let searchable =
+                    u64::try_from(LexicalRead::doc_count(&index)).expect("doc count fits u64");
+                c.record_searchable(searchable);
+                c.on_phase(LifecyclePhase::SearchableVerified, win_ns(window_origin));
+                for _ in 0..periodic_commits {
+                    c.record_periodic_commit();
+                }
+                c.record_queue(QueueObservation::SynchronousNoQueue {
+                    seam: "QuillIndex::index_documents/commit are synchronous; the ingest \
+                           hand-off has no queue"
+                        .to_owned(),
+                });
+                c.record_width(WidthObservation::Observed {
+                    threads: u64::try_from(rayon::current_num_threads()).expect("width fits u64"),
+                    seam: "rayon::current_num_threads inside the bench-pinned Quill pool"
+                        .to_owned(),
+                });
+                // Quill quiescence: the terminal commit is synchronous; when
+                // it returned there was no background worker left to join.
+                c.record_terminal(TerminalJoin::QuillSynchronousCommit, "completed", false);
+                c.on_phase(LifecyclePhase::QuiescenceJoined, win_ns(window_origin));
+                c.record_measured_sum_ns(
+                    u64::try_from(elapsed.as_nanos()).expect("measured ns fits u64"),
+                );
+                finalize_work_receipt(c, spec, arm, count, expected_bytes, window_started_rel_ns);
             }
             elapsed
         }
         EngineArm::Tantivy => {
             let index = tantivy_in_memory(spec);
-            if matches!(spec.gate, PerfGate::Qg1 | PerfGate::Qg8) {
-                let observed_threads = index
+            let observed_threads = if matches!(spec.gate, PerfGate::Qg1 | PerfGate::Qg8) {
+                let threads = index
                     .benchmark_materialized_writer_threads()
                     .expect("scaling Tantivy arm uses the benchmark writer constructor");
-                record_concurrency(spec, arm, observed_threads);
+                record_concurrency(spec, arm, threads);
+                Some(threads)
+            } else {
+                None
+            };
+            if let Some(c) = collector.as_mut() {
+                window_started_rel_ns = work_receipt_origin_elapsed_ns();
+                c.begin_window();
+            }
+            let window_origin = Instant::now();
+            if let Some(c) = collector.as_mut() {
+                c.on_phase(LifecyclePhase::FirstFeed, 0);
             }
             let (mut elapsed, periodic_commits) = if spec.gate == PerfGate::Qg1 {
                 index_prepared_qg1_batches_with_visibility_commits(
@@ -996,6 +1383,14 @@ fn bulk_metric_unpooled(context: &BenchContext, spec: &PerfCellSpec, arm: Engine
                     &index,
                     prepared_qg1_documents.expect("QG-1 bulk cell has a prepared immutable corpus"),
                     Duration::from_millis(quill_config(spec).max_visibility_lag_ms),
+                    &mut |batch| {
+                        if let Some(c) = collector.as_mut() {
+                            c.record_feed_batch(
+                                batch.len() as u64,
+                                batch.iter().map(document_bytes).sum(),
+                            );
+                        }
+                    },
                 )
             } else {
                 (
@@ -1011,7 +1406,13 @@ fn bulk_metric_unpooled(context: &BenchContext, spec: &PerfCellSpec, arm: Engine
                     0,
                 )
             };
+            if let Some(c) = collector.as_mut() {
+                c.on_phase(LifecyclePhase::FeedComplete, win_ns(window_origin));
+            }
             elapsed += commit(context, &index);
+            if let Some(c) = collector.as_mut() {
+                c.on_phase(LifecyclePhase::CommitComplete, win_ns(window_origin));
+            }
             if spec.gate == PerfGate::Qg1 {
                 eprintln!(
                     "[qg-commit-parity] gate={} fixture={} arm=tantivy cadence_ms={} \
@@ -1022,7 +1423,64 @@ fn bulk_metric_unpooled(context: &BenchContext, spec: &PerfCellSpec, arm: Engine
                     quill_config(spec).max_visibility_lag_ms,
                 );
             }
-            elapsed += finish_tantivy_lifecycle(index, spec, "measured_work");
+            if let Some(c) = collector.as_mut() {
+                // Pre-join observations: the post-commit worker generation,
+                // segment updater, and merge threads are still alive here.
+                let committed =
+                    u64::try_from(LexicalRead::doc_count(&index)).expect("doc count fits u64");
+                let (index_bytes, segment_count) = tantivy_index_footprint(&index);
+                c.record_committed(committed, index_bytes, segment_count);
+                let documents =
+                    prepared_qg1_documents.expect("QG-1 receipted cell has prepared documents");
+                let probe = work_receipt_probe_term(documents);
+                let probe_hits = context.runtime.block_on(async {
+                    index
+                        .search(&context.cx, &probe, 1)
+                        .await
+                        .expect("QG-1 receipt terminal searchable probe")
+                        .len()
+                });
+                assert!(probe_hits > 0, "terminal searchable probe returned no hits");
+                let searchable =
+                    u64::try_from(LexicalRead::doc_count(&index)).expect("doc count fits u64");
+                c.record_searchable(searchable);
+                c.on_phase(LifecyclePhase::SearchableVerified, win_ns(window_origin));
+                for _ in 0..periodic_commits {
+                    c.record_periodic_commit();
+                }
+                c.record_queue(QueueObservation::StructurallyUnobservable {
+                    seam: "tantivy 0.26.1 IndexWriter AddOperation channel \
+                           (crossbeam bounded(10_000)) exposes no depth accessor; observing \
+                           occupancy requires patching tantivy"
+                        .to_owned(),
+                });
+                c.record_width(WidthObservation::Observed {
+                    threads: u64::try_from(
+                        observed_threads.expect("QG-1 Tantivy arm recorded its writer width"),
+                    )
+                    .expect("width fits u64"),
+                    seam: "TantivyIndex::benchmark_materialized_writer_threads".to_owned(),
+                });
+            }
+            let (join, join_receipt) = finish_tantivy_lifecycle(index, spec, "measured_work");
+            elapsed += join;
+            if let Some(mut c) = collector.take() {
+                c.record_terminal(
+                    TerminalJoin::TantivyWorkersJoined {
+                        join_elapsed_ns: join_receipt.join_elapsed_ns,
+                        searchable_segments_before: join_receipt.searchable_segments_before as u64,
+                        searchable_segments_after: join_receipt.searchable_segments_after as u64,
+                        writer_rearmed: join_receipt.writer_rearmed,
+                    },
+                    "completed",
+                    false,
+                );
+                c.on_phase(LifecyclePhase::QuiescenceJoined, win_ns(window_origin));
+                c.record_measured_sum_ns(
+                    u64::try_from(elapsed.as_nanos()).expect("measured ns fits u64"),
+                );
+                finalize_work_receipt(c, spec, arm, count, expected_bytes, window_started_rel_ns);
+            }
             elapsed
         }
     };
@@ -1037,6 +1495,14 @@ fn bulk_metric(context: &BenchContext, spec: &PerfCellSpec, arm: EngineArm) -> f
     let threads = spec.threads.expect("QG-1/QG-8 thread count");
     rayon::ThreadPoolBuilder::new()
         .num_threads(threads)
+        // Named so the H2 worker-role census can attribute pool threads
+        // honestly; rayon threads are otherwise anonymous in /proc comm.
+        .thread_name(|index| {
+            format!(
+                "{}{index}",
+                frankensearch_quill_gauntlet::BENCH_RAYON_THREAD_PREFIX
+            )
+        })
         .build()
         .expect("build QG-1/QG-8 Quill thread pool")
         .install(|| {
@@ -3197,8 +3663,13 @@ fn register_criterion_cell(c: &mut Criterion, context: &BenchContext, spec: &Per
     // the workload after the decision artifact is sealed, without retaining
     // those samples or their A/A control. Keep Criterion's presentation lane
     // for smoke runs only.
+    //
+    // Receipted H2 cells skip the presentation lane entirely: each Criterion
+    // iteration would run another full receipted window and overwrite the
+    // recorded final-round receipt after the evidence was described.
     if context.scale.is_full()
         || matches!(spec.gate, PerfGate::Qg6 | PerfGate::Qg7 | PerfGate::Qg10)
+        || work_receipt_cell(spec)
     {
         return;
     }
@@ -3282,6 +3753,17 @@ fn bench_matrix(c: &mut Criterion, bench_elf_sha256: &str) {
         "[quill-perf-policy] warmup_rounds={}",
         evidence_policy.warmup_rounds
     );
+    // QG-1 H2: opt-in actual-work/queue/worker-role/lifecycle receipts.
+    // Off by default: the artifact byte shape and the measured lanes are
+    // untouched until a run opts in.
+    eprintln!("[quill-work-receipts] mode={}", work_receipt_mode().label());
+    let _ = WORK_RECEIPT_IDENTITY.set(WorkReceiptRunIdentity {
+        run_id: run_id.clone(),
+        machine_fingerprint: machine_fingerprint(),
+        build_profile: build_profile.clone(),
+        executable_sha256: bench_elf_sha256.to_owned(),
+        git_rev: revision.clone(),
+    });
     let evidence_context = EvidenceContext {
         config: PairedEstimatorConfig::predeclared(bootstrap_seed),
         policy: evidence_policy,
@@ -3315,6 +3797,15 @@ fn bench_matrix(c: &mut Criterion, bench_elf_sha256: &str) {
     }
     machine.finish();
     flush_tantivy_lifecycle_receipts(&output_dir);
+    flush_work_receipts(&output_dir);
+    let mut work_receipts_by_gate = take_work_receipt_evidence();
+    for (gate, evidence) in &work_receipts_by_gate {
+        eprintln!(
+            "[qg1-work-receipt-summary] gate={gate} mode={} cells={}",
+            evidence.mode,
+            evidence.cells.len(),
+        );
+    }
 
     let provenance = EvidenceProvenance {
         run_id: run_id.clone(),
@@ -3338,6 +3829,18 @@ fn bench_matrix(c: &mut Criterion, bench_elf_sha256: &str) {
                 "evidence.incomplete_gate_selection",
                 "the invocation selected only part of the normative gate; durable pre-admission \
                  evidence cannot support a publication or ratchet claim",
+            );
+        }
+        // Unconditional guard, not convention: receipts are provenance, and
+        // enabling them adds observation probes between the measured regions
+        // (symmetric across arms, but unratcheted), so a receipted run can
+        // never support a claim until the ratchet binds the receipts mode.
+        if work_receipt_mode().is_enabled() {
+            artifact.force_no_claim(
+                "evidence.work_receipts_mode_unratcheted",
+                "QUILL_PERF_WORK_RECEIPTS=on adds symmetric observation probes between \
+                 measured regions; the ratchet does not bind the receipts mode, so receipt \
+                 runs are provenance only",
             );
         }
         let paths = artifact
@@ -3365,6 +3868,7 @@ fn bench_matrix(c: &mut Criterion, bench_elf_sha256: &str) {
             manifest_sha256: manifest_hash.clone(),
             cells,
             laws_attested: scale.is_full() && gate_selection_complete(&matrix, &selected, gate),
+            work_receipts: work_receipts_by_gate.remove(&gate),
         };
         let (json, table) = artifact.write_to(&output_dir).expect("write QG artifacts");
         eprintln!("{}", artifact.human_table());
