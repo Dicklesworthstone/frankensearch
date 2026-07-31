@@ -1116,7 +1116,7 @@ fn clone_delta_arcs(
 struct PendingIdentity {
     doc_ord: u32,
     document_id: String,
-    canonical_content: Vec<u8>,
+    content_hash: u64,
 }
 
 struct StagedFlush {
@@ -2416,7 +2416,7 @@ impl QuillWriterState {
             for identity in &shard.identities {
                 hasher.update(identity.doc_ord.to_be_bytes());
                 conformance_hash_bytes(&mut hasher, identity.document_id.as_bytes());
-                conformance_hash_bytes(&mut hasher, &identity.canonical_content);
+                hasher.update(identity.content_hash.to_be_bytes());
             }
         }
 
@@ -2620,11 +2620,11 @@ impl QuillWriterState {
                         arena_bytes_used_high_water.max(accumulated.bytes_used);
                     arena_bytes_reserved_high_water =
                         arena_bytes_reserved_high_water.max(accumulated.bytes_reserved);
-                    let canonical_content = canonical_document_preimage(document, &metadata)?;
+                    let content_hash = canonical_document_content_hash(document, &metadata)?;
                     self.shards[shard_id].identities.push(PendingIdentity {
                         doc_ord,
                         document_id: document.id.clone(),
-                        canonical_content,
+                        content_hash,
                     });
                     self.uncommitted_ids.insert(document.id.clone());
                     self.unpublished_since.get_or_insert_with(Instant::now);
@@ -3352,10 +3352,10 @@ impl QuillWriterState {
             .identities
             .iter()
             .map(|identity| {
-                FlushDocumentInput::from_canonical_content(
+                FlushDocumentInput::new(
                     identity.doc_ord,
                     &identity.document_id,
-                    &identity.canonical_content,
+                    identity.content_hash,
                 )
             })
             .collect::<Vec<_>>();
@@ -3460,11 +3460,7 @@ impl QuillWriterState {
         let schema_id = self.schema.schema_id()?;
         let mut batch_hasher = Xxh3::new();
         for identity in &self.shards[shard].identities {
-            let len = u64::try_from(identity.canonical_content.len()).map_err(|_| {
-                invalid_state("canonical document preimage length does not fit u64")
-            })?;
-            batch_hasher.update(&len.to_le_bytes());
-            batch_hasher.update(&identity.canonical_content);
+            batch_hasher.update(&identity.content_hash.to_le_bytes());
         }
         let batch_digest = batch_hasher.digest();
         for salt in 0_u64..=u64::from(u16::MAX) {
@@ -5863,6 +5859,37 @@ fn canonical_metadata(
     serde_json::to_vec(&ordered)
 }
 
+struct ContentHashWriter<'a>(&'a mut Xxh3);
+
+impl std::io::Write for ContentHashWriter<'_> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.update(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+fn canonical_document_content_hash(
+    document: &IndexableDocument,
+    metadata: &[u8],
+) -> Result<u64, serde_json::Error> {
+    let mut hasher = Xxh3::new();
+    serde_json::to_writer(
+        ContentHashWriter(&mut hasher),
+        &(
+            document.id.as_str(),
+            document.content.as_str(),
+            document.title.as_deref().unwrap_or(""),
+            metadata,
+        ),
+    )?;
+    Ok(hasher.digest())
+}
+
+#[cfg(test)]
 fn canonical_document_preimage(
     document: &IndexableDocument,
     metadata: &[u8],
@@ -5884,7 +5911,7 @@ pub fn indexable_document_content_hash(
     document: &IndexableDocument,
 ) -> Result<u64, QuillIndexError> {
     let metadata = canonical_metadata(&document.metadata)?;
-    Ok(xxh3_64(&canonical_document_preimage(document, &metadata)?))
+    Ok(canonical_document_content_hash(document, &metadata)?)
 }
 
 #[cfg(feature = "conformance-internals")]
@@ -14938,6 +14965,21 @@ mod tests {
             assert_eq!(page.total_count, Some(2));
             assert_eq!(page.hits.len(), 1);
         });
+    }
+
+    #[test]
+    fn streaming_content_hash_matches_the_canonical_json_witness() {
+        let document = IndexableDocument::new("hash-fixture", "content with \"quotes\" and λ")
+            .with_title("Streaming hash")
+            .with_metadata("z-last", "three")
+            .with_metadata("a-first", "one");
+        let metadata = canonical_metadata(&document.metadata).expect("canonical metadata");
+        let canonical =
+            canonical_document_preimage(&document, &metadata).expect("canonical document preimage");
+        assert_eq!(
+            indexable_document_content_hash(&document).expect("streaming content hash"),
+            xxh3_64(&canonical),
+        );
     }
 
     #[test]
