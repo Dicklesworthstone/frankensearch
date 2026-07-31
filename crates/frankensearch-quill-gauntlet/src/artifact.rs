@@ -5,20 +5,34 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use xxhash_rust::xxh3::Xxh3;
 
 use crate::GauntletError;
-use crate::comparator::{ComparatorConfig, compare_observations};
+use crate::comparator::{
+    ComparatorConfig, LexicalBoundary, LexicalComparisonStatus, LexicalContractComparison,
+    LexicalEngineRole, LexicalExposureContract, LexicalObservationContext, compare_observations,
+};
 use crate::engine::{EnginePairIdentity, HarnessRun};
 use crate::generator::{
     GENERATOR_ID, GeneratedQueryCase, QuerySuiteSource, validate_generated_case_metadata,
 };
-use crate::runner::{CampaignReport, DivergenceRegisterEntry, SemanticContract};
+use crate::runner::{
+    CampaignContractMode, CampaignReport, DivergenceRegisterEntry, SemanticContract,
+    lexical_backend_identity, lexical_query_contract_sha256,
+};
 use crate::version_contract::{OracleVersionContract, oracle_version_contract};
 
-pub const OBJECT_SCHEMA_VERSION: u32 = 1;
+pub const OBJECT_SCHEMA_VERSION: u32 = 3;
 pub const CANONICALIZATION_VERSION: u32 = 1;
-const HASH_DOMAIN: &[u8] = b"frankensearch-quill-gauntlet:artifact-object:v1\0";
+/// Current mutable run-manifest schema.
+///
+/// Version 2 pins the referenced current object address to domain-separated
+/// SHA-256. Version 1 carried legacy XXH3-64 addresses and is decode-only.
+pub const RUN_MANIFEST_SCHEMA_VERSION: u32 = 2;
+const HASH_DOMAIN_V1: &[u8] = b"frankensearch-quill-gauntlet:artifact-object:v1\0";
+const HASH_DOMAIN_V2: &[u8] = b"frankensearch-quill-gauntlet:artifact-object:v2\0";
+const HASH_DOMAIN_V3: &[u8] = b"frankensearch-quill-gauntlet:artifact-object:v3\0";
 const MAX_CAMPAIGN_RESERVATION_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_CAMPAIGN_REPORT_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const MAX_CAMPAIGN_RUN_MANIFEST_BYTES: u64 = 2 * 1024 * 1024;
@@ -32,19 +46,38 @@ const MAX_CAMPAIGN_OBJECT_BYTES: u64 = 512 * 1024 * 1024;
 /// profile, pagination, and reviewed-divergence evidence that cannot be
 /// represented by the raw-query-only [`crate::DifferentialCase`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CampaignArtifactContext {
     pub corpus_manifest_hash: String,
     pub query_manifest_hash: String,
     pub query_suite_source: QuerySuiteSource,
     pub query_source_identity_sha256: String,
     pub semantic_contract: SemanticContract,
+    pub contract_mode: CampaignContractMode,
+    pub query_seed: u64,
     pub query: GeneratedQueryCase,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub registered_divergence: Option<DivergenceRegisterEntry>,
 }
 
+/// Explicit total-contract scope carried by every v3 artifact.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "scope", rename_all = "snake_case", deny_unknown_fields)]
+pub enum ArtifactLexicalContractEvidence {
+    /// Decode-only marker for pre-v3 objects, which are no longer admissible.
+    #[default]
+    LegacyPreV3Missing,
+    /// The object intentionally proves only the legacy rich result envelope.
+    RankEnvelopeOnly,
+    /// Complete replayable ordinary `LexicalSearch` comparison.
+    CoreLexicalV3 {
+        comparison: Box<LexicalContractComparison>,
+    },
+}
+
 /// Immutable comparison object. Run-local provenance is deliberately absent.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ArtifactObject {
     pub object_schema_version: u32,
     pub canonicalization_version: u32,
@@ -53,6 +86,8 @@ pub struct ArtifactObject {
     pub case: crate::DifferentialCase,
     pub comparator_config: ComparatorConfig,
     pub comparison: crate::ComparisonReport,
+    #[serde(default)]
+    pub lexical_contract: ArtifactLexicalContractEvidence,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub campaign: Option<CampaignArtifactContext>,
 }
@@ -72,6 +107,7 @@ impl ArtifactObject {
             case: run.case,
             comparator_config: run.comparator_config,
             comparison: run.comparison,
+            lexical_contract: ArtifactLexicalContractEvidence::RankEnvelopeOnly,
             campaign: None,
         })
     }
@@ -84,8 +120,10 @@ impl ArtifactObject {
     pub(crate) fn from_campaign_run(
         run: HarnessRun,
         campaign: CampaignArtifactContext,
+        lexical_contract: ArtifactLexicalContractEvidence,
     ) -> Result<Self, GauntletError> {
         let mut object = Self::from_run(run)?;
+        object.lexical_contract = lexical_contract;
         object.campaign = Some(campaign);
         Ok(object)
     }
@@ -102,17 +140,37 @@ impl ArtifactObject {
         Ok(serde_json::to_vec(self)?)
     }
 
-    /// Compute the domain-separated xxh3-64 object address.
+    /// Compute the versioned, domain-separated object address.
+    ///
+    /// Legacy v1/v2 objects retain their historical XXH3-64 address so they can
+    /// be decoded and diagnosed. Current v3 evidence uses SHA-256; a 64-bit
+    /// non-cryptographic digest is not an admissible durable evidence seal.
+    ///
+    /// For a legacy object decoded from historical bytes, this method hashes
+    /// the DTO's current canonical reserialization, including fields added
+    /// with serde defaults. It is therefore not an original-byte verifier.
+    /// Durable legacy-address verification would have to hash the stored bytes
+    /// before decoding. The current verified-campaign loader instead rejects
+    /// legacy schemas before address admission because they cannot satisfy the
+    /// total lexical contract.
     ///
     /// # Errors
     ///
     /// Returns an error when canonical serialization fails.
     pub fn object_hash(&self) -> Result<String, GauntletError> {
         let bytes = self.canonical_bytes()?;
-        Ok(hash_object_bytes(&bytes))
+        hash_object_bytes(&bytes, self.object_schema_version)
     }
 
     pub(crate) fn validate(&self) -> Result<(), GauntletError> {
+        if matches!(self.object_schema_version, 1 | 2) {
+            return Err(GauntletError::InvalidContract {
+                reason: format!(
+                    "legacy artifact v{} lacks the current total lexical contract and is non-admissible; rerun the campaign",
+                    self.object_schema_version
+                ),
+            });
+        }
         if self.object_schema_version != OBJECT_SCHEMA_VERSION
             || self.canonicalization_version != CANONICALIZATION_VERSION
             || self.oracle_version != oracle_version_contract()?
@@ -142,7 +200,17 @@ impl ArtifactObject {
             });
         }
         if let Some(campaign) = &self.campaign {
-            campaign.validate_against(&self.engines, &self.case, &self.comparison)?;
+            campaign.validate_against(
+                &self.engines,
+                &self.case,
+                &self.comparison,
+                &self.lexical_contract,
+            )?;
+        } else if self.lexical_contract != ArtifactLexicalContractEvidence::RankEnvelopeOnly {
+            return Err(GauntletError::InvalidContract {
+                reason: "standalone artifact has an invalid total lexical evidence scope"
+                    .to_owned(),
+            });
         }
         self.case.validate_observations(
             &self.engines,
@@ -169,6 +237,7 @@ impl CampaignArtifactContext {
         engines: &EnginePairIdentity,
         case: &crate::DifferentialCase,
         comparison: &crate::ComparisonReport,
+        lexical_contract: &ArtifactLexicalContractEvidence,
     ) -> Result<(), GauntletError> {
         let hashes_are_canonical = [
             self.corpus_manifest_hash.as_str(),
@@ -189,7 +258,7 @@ impl CampaignArtifactContext {
         let generated_metadata_matches = match self.query_suite_source {
             QuerySuiteSource::Generated => {
                 case.metadata.generator_id.as_deref() == Some(GENERATOR_ID)
-                    && case.metadata.generator_seed.is_some()
+                    && case.metadata.generator_seed == Some(self.query_seed)
             }
             QuerySuiteSource::ExplicitCases => {
                 case.metadata.generator_id.is_none() && case.metadata.generator_seed.is_none()
@@ -205,8 +274,92 @@ impl CampaignArtifactContext {
         {
             return Err(GauntletError::InvalidContract {
                 reason:
-                    "campaign artifact context does not match its manifests or differential case"
+                    "campaign artifact context or lexical evidence does not match its manifests, engines, or differential case".to_owned(),
+            });
+        }
+        match (self.contract_mode, lexical_contract) {
+            (
+                CampaignContractMode::RankEnvelopeOnly,
+                ArtifactLexicalContractEvidence::RankEnvelopeOnly,
+            ) => Ok(()),
+            (
+                CampaignContractMode::CoreLexicalV3,
+                ArtifactLexicalContractEvidence::CoreLexicalV3 {
+                    comparison: lexical,
+                },
+            ) => self.validate_core_lexical_contract(engines, lexical),
+            (
+                CampaignContractMode::RankEnvelopeOnly | CampaignContractMode::CoreLexicalV3,
+                ArtifactLexicalContractEvidence::LegacyPreV3Missing
+                | ArtifactLexicalContractEvidence::RankEnvelopeOnly
+                | ArtifactLexicalContractEvidence::CoreLexicalV3 { .. },
+            ) => Err(GauntletError::InvalidContract {
+                reason: "campaign contract mode does not match its lexical evidence schema"
+                    .to_owned(),
+            }),
+        }
+    }
+
+    fn validate_core_lexical_contract(
+        &self,
+        engines: &EnginePairIdentity,
+        comparison: &LexicalContractComparison,
+    ) -> Result<(), GauntletError> {
+        if self.query.syntax != crate::QuerySyntax::Default {
+            return Err(GauntletError::InvalidContract {
+                reason: "core lexical evidence cannot be attached to a non-default query"
+                    .to_owned(),
+            });
+        }
+        comparison.validate_replay()?;
+        let query_contract_sha256 = lexical_query_contract_sha256(&self.semantic_contract)?;
+        let limit =
+            usize::try_from(self.query.limit).map_err(|_| GauntletError::InvalidContract {
+                reason: "artifact lexical query limit does not fit usize".to_owned(),
+            })?;
+        let subject_backend =
+            lexical_backend_identity(&engines.subject, &self.corpus_manifest_hash)?;
+        let oracle_backend = lexical_backend_identity(&engines.oracle, &self.corpus_manifest_hash)?;
+        let expected_subject_context = LexicalObservationContext::new(
+            LexicalBoundary::FullSearch,
+            subject_backend,
+            self.corpus_manifest_hash.clone(),
+            query_contract_sha256.clone(),
+            &self.query.query,
+            self.query_seed,
+            limit,
+            LexicalExposureContract::CORE_LEXICAL_SEARCH,
+        )?;
+        let expected_oracle_context = LexicalObservationContext::new(
+            LexicalBoundary::FullSearch,
+            oracle_backend,
+            self.corpus_manifest_hash.clone(),
+            query_contract_sha256,
+            &self.query.query,
+            self.query_seed,
+            limit,
+            LexicalExposureContract::CORE_LEXICAL_SEARCH,
+        )?;
+        let subject = &comparison.subject;
+        let oracle = &comparison.oracle;
+        if subject.engine_role() != LexicalEngineRole::Subject
+            || oracle.engine_role() != LexicalEngineRole::Oracle
+            || subject.snapshot_sha256() != self.corpus_manifest_hash
+            || oracle.snapshot_sha256() != self.corpus_manifest_hash
+            || subject.full_search().context != expected_subject_context
+            || oracle.full_search().context != expected_oracle_context
+        {
+            return Err(GauntletError::InvalidContract {
+                reason:
+                    "core lexical evidence is not bound to the artifact query, snapshot, roles, or backend descriptors"
                         .to_owned(),
+            });
+        }
+        if comparison.status == LexicalComparisonStatus::Equivalent
+            && comparison.first_mismatch.is_some()
+        {
+            return Err(GauntletError::InvalidContract {
+                reason: "equivalent core lexical comparison retains a first mismatch".to_owned(),
             });
         }
         Ok(())
@@ -408,9 +561,9 @@ impl ArtifactStore {
             MAX_CAMPAIGN_OBJECT_BYTES,
             "artifact object exceeds its durable file-size budget",
         )?;
-        let object_hash = hash_object_bytes(&object_bytes);
+        let object_hash = hash_object_bytes(&object_bytes, object.object_schema_version)?;
         let run_manifest = RunManifest {
-            schema_version: 1,
+            schema_version: RUN_MANIFEST_SCHEMA_VERSION,
             run_id: run_id.to_owned(),
             object_hash: object_hash.clone(),
             provenance,
@@ -510,6 +663,11 @@ impl ArtifactStore {
         let report_bytes =
             campaign.read_regular_bounded(OsStr::new("report.json"), MAX_CAMPAIGN_REPORT_BYTES)?;
         let report: CampaignReport = serde_json::from_slice(&report_bytes)?;
+        if matches!(report.schema_version, 3 | 4) {
+            return Err(GauntletError::InvalidPreparedArtifact {
+                reason: "legacy campaign report schema lacks the current total lexical contract and is non-admissible; rerun the campaign".to_owned(),
+            });
+        }
         if report.run_id != run_id {
             return Err(GauntletError::InvalidPreparedArtifact {
                 reason: "completed campaign report has the wrong run ID".to_owned(),
@@ -622,7 +780,7 @@ impl ArtifactStore {
                 ("query_source".to_owned(), query.source.clone()),
             ]);
             if !canonical_json_matches(&run_manifest, &run_bytes)?
-                || run_manifest.schema_version != 1
+                || run_manifest.schema_version != RUN_MANIFEST_SCHEMA_VERSION
                 || run_manifest.run_id != expected_run_id
                 || result.artifact_hash.as_deref() != Some(run_manifest.object_hash.as_str())
                 || run_manifest.provenance != expected_provenance
@@ -641,7 +799,12 @@ impl ArtifactStore {
                 })?
                 .read_regular_bounded(&object_name, MAX_CAMPAIGN_OBJECT_BYTES)?;
             let object: ArtifactObject = serde_json::from_slice(&object_bytes)?;
-            let object_hash = hash_object_bytes(&object_bytes);
+            if matches!(object.object_schema_version, 1 | 2) {
+                return Err(GauntletError::InvalidPreparedArtifact {
+                    reason: "legacy artifact schema lacks the current total lexical contract and is non-admissible; rerun the campaign".to_owned(),
+                });
+            }
+            let object_hash = hash_object_bytes(&object_bytes, object.object_schema_version)?;
             if !canonical_json_matches(&object, &object_bytes)?
                 || object_hash != run_manifest.object_hash
             {
@@ -675,7 +838,8 @@ impl ArtifactStore {
         let object: ArtifactObject = serde_json::from_slice(&prepared.object_bytes)?;
         object.validate()?;
         if !canonical_json_matches(&object, &prepared.object_bytes)?
-            || hash_object_bytes(&prepared.object_bytes) != prepared.object_hash
+            || hash_object_bytes(&prepared.object_bytes, object.object_schema_version)?
+                != prepared.object_hash
             || prepared.object_path
                 != self
                     .root
@@ -710,7 +874,7 @@ impl ArtifactStore {
                     .join(format!("q{ordinal:06}.json"))
             }
         };
-        if prepared.run_manifest.schema_version != 1
+        if prepared.run_manifest.schema_version != RUN_MANIFEST_SCHEMA_VERSION
             || prepared.run_manifest.object_hash != prepared.object_hash
             || !canonical_json_matches(&prepared.run_manifest, &prepared.run_manifest_bytes)?
             || prepared.run_path != expected_run_path
@@ -730,11 +894,41 @@ enum ExistingFileKind {
     Run,
 }
 
-fn hash_object_bytes(bytes: &[u8]) -> String {
-    let mut hasher = Xxh3::new();
-    hasher.update(HASH_DOMAIN);
-    hasher.update(bytes);
-    format!("{:016x}", hasher.digest())
+fn hash_object_bytes(bytes: &[u8], schema_version: u32) -> Result<String, GauntletError> {
+    match schema_version {
+        1 | 2 => {
+            let domain = if schema_version == 1 {
+                HASH_DOMAIN_V1
+            } else {
+                HASH_DOMAIN_V2
+            };
+            let mut hasher = Xxh3::new();
+            hasher.update(domain);
+            hasher.update(bytes);
+            Ok(format!("{:016x}", hasher.digest()))
+        }
+        OBJECT_SCHEMA_VERSION => {
+            let mut hasher = Sha256::new();
+            hasher.update(HASH_DOMAIN_V3);
+            hasher.update(bytes);
+            Ok(lower_hex(&hasher.finalize()))
+        }
+        _ => Err(GauntletError::InvalidContract {
+            reason: format!(
+                "artifact object schema version {schema_version} has no registered hash domain"
+            ),
+        }),
+    }
+}
+
+fn lower_hex(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+
+    let mut output = String::with_capacity(bytes.len().saturating_mul(2));
+    for byte in bytes {
+        write!(output, "{byte:02x}").expect("writing to String is infallible");
+    }
+    output
 }
 
 struct BoundedJsonWriter {
@@ -1416,6 +1610,7 @@ mod tests {
             case,
             comparator_config,
             comparison,
+            lexical_contract: ArtifactLexicalContractEvidence::RankEnvelopeOnly,
             campaign: None,
         }
     }
@@ -1439,6 +1634,8 @@ mod tests {
             query_suite_source: QuerySuiteSource::ExplicitCases,
             query_source_identity_sha256: "c".repeat(64),
             semantic_contract,
+            contract_mode: CampaignContractMode::RankEnvelopeOnly,
+            query_seed: 42,
             query: GeneratedQueryCase {
                 id: object.case.fixture_id.clone(),
                 syntax: crate::QuerySyntax::Default,
@@ -1531,6 +1728,80 @@ mod tests {
     }
 
     #[test]
+    fn committed_v1_object_decodes_but_is_nonadmissible_and_uses_raw_byte_addressing() {
+        const LEGACY_V1_BYTES: &[u8] = include_bytes!("../fixtures/artifact-object-v1.json");
+        let object: ArtifactObject =
+            serde_json::from_slice(LEGACY_V1_BYTES).expect("decode committed v1 object");
+        assert_eq!(object.object_schema_version, 1);
+
+        let original_byte_hash =
+            hash_object_bytes(LEGACY_V1_BYTES, 1).expect("hash original v1 bytes");
+        assert_eq!(original_byte_hash.len(), 16);
+        assert_ne!(
+            original_byte_hash,
+            object
+                .object_hash()
+                .expect("decoded DTO remains diagnosable"),
+            "a decoded legacy DTO must not masquerade as an original-byte verifier"
+        );
+
+        let error = object
+            .validate()
+            .expect_err("committed v1 object must require a campaign rerun");
+        assert!(matches!(
+            error,
+            GauntletError::InvalidContract { ref reason }
+                if reason.contains("legacy artifact")
+                    && reason.contains("non-admissible")
+                    && reason.contains("rerun")
+        ));
+    }
+
+    #[test]
+    fn synthetic_v2_object_is_decode_only_and_never_admissible() {
+        let mut object = sample_object();
+        object.object_schema_version = 2;
+        assert_eq!(
+            object
+                .object_hash()
+                .expect("registered v2 address remains diagnosable")
+                .len(),
+            16
+        );
+        let error = object
+            .validate()
+            .expect_err("pre-v3 object must require a campaign rerun");
+        assert!(matches!(
+            error,
+            GauntletError::InvalidContract { ref reason }
+                if reason.contains("legacy artifact")
+                    && reason.contains("non-admissible")
+                    && reason.contains("rerun")
+        ));
+    }
+
+    #[test]
+    fn legacy_run_manifest_cannot_reference_a_current_sha256_object() {
+        let store = ArtifactStore::default();
+        let mut prepared = store
+            .prepare("legacy-run-manifest", &sample_object(), BTreeMap::new())
+            .expect("prepare current artifact");
+        assert_eq!(
+            prepared.run_manifest.schema_version,
+            RUN_MANIFEST_SCHEMA_VERSION
+        );
+        assert_eq!(prepared.object_hash.len(), 64);
+
+        prepared.run_manifest.schema_version = 1;
+        prepared.run_manifest_bytes =
+            serde_json::to_vec(&prepared.run_manifest).expect("encode legacy-shaped manifest");
+        assert!(
+            store.validate_prepared(&prepared).is_err(),
+            "legacy manifest semantics must not ambiguously carry a current SHA-256 address"
+        );
+    }
+
+    #[test]
     fn current_generator_metadata_requires_campaign_context() {
         let mut object = sample_object();
         object.case.metadata.generator_id = Some(GENERATOR_ID.to_owned());
@@ -1564,11 +1835,14 @@ mod tests {
     fn canonical_object_golden_bytes_and_hash_are_pinned() {
         let object = sample_object();
         let canonical = object.canonical_bytes().unwrap();
-        let golden_with_newline = include_bytes!("../fixtures/artifact-object-v1.json");
+        let golden_with_newline = include_bytes!("../fixtures/artifact-object-v3.json");
         let golden = golden_with_newline
             .strip_suffix(b"\n")
             .expect("golden fixture must end in exactly one LF");
-        assert_eq!(object.object_hash().unwrap(), "46cf5c8d37641b7e");
+        assert_eq!(
+            object.object_hash().unwrap(),
+            "f6267a769cdc6ecf067619d2502e014be77183e94cb7c93bfd0b80a0d98aac83"
+        );
         assert_eq!(canonical, golden);
     }
 
@@ -1578,7 +1852,7 @@ mod tests {
         assert_eq!(object.engines.subject.family, EngineFamily::Quill);
         assert_eq!(object.engines.oracle.family, EngineFamily::Tantivy);
         assert_eq!(object.oracle_version, oracle_version_contract().unwrap());
-        assert_eq!(object.object_hash().unwrap().len(), 16);
+        assert_eq!(object.object_hash().unwrap().len(), 64);
         let encoded = serde_json::to_value(&object).expect("serialize object");
         let pointer = object
             .comparison
