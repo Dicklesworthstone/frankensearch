@@ -56,6 +56,9 @@ pub const QG6_QUERY_GROUPS: usize = 16;
 pub const QG6_QUERY_GROUP_IDS: [u64; QG6_QUERY_GROUPS] =
     [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
 
+/// Exact normative performance manifest compiled into every applicability plan.
+const NORMATIVE_PERF_MANIFEST: &str = include_str!("../../../docs/contracts/quill-perf-gates.toml");
+
 /// Hash the normative performance contract without binding administrative
 /// activation state into measurement identity.
 ///
@@ -330,7 +333,7 @@ impl PerfCellSpec {
 
 /// Wire schema for a profile-qualified projection of one canonical gate matrix.
 pub const PERF_APPLICABILITY_PLAN_SCHEMA_VERSION: &str =
-    "frankensearch.quill-perf-applicability-plan.v1";
+    "frankensearch.quill-perf-applicability-plan.v2";
 
 /// Whether one canonical cell is required, diagnostic, or impossible for one
 /// immutable execution profile.
@@ -363,7 +366,7 @@ impl PerfCellApplicability {
 
 /// Stable reason for one profile-specific cell classification.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
 pub enum PerfCellApplicabilityReason {
     /// The profile and gate require this ordinary measurement cell.
     RequiredForDefaultFlip,
@@ -372,7 +375,18 @@ pub enum PerfCellApplicabilityReason {
     /// The canonical matrix defines this cell as diagnostic for every profile.
     DiagnosticCell,
     /// The cell's configured width exceeds the profile's frozen gate maximum.
-    ExceedsProfileMaximum,
+    ExceedsProfileMaximum {
+        /// Immutable hardware and execution profile that makes the cell N/A.
+        profile: MachineProfileKey,
+        /// Meaning of the admitted execution-capacity value.
+        capacity_semantics: ExecutionCapacitySemantics,
+        /// Frozen capacity admitted for this exact profile.
+        execution_capacity: u64,
+        /// Canonical cell width that the profile cannot exercise.
+        required_cell_width: u64,
+        /// Widest canonical cell the profile may exercise for this gate.
+        max_exercised_cell_width: u64,
+    },
 }
 
 impl PerfCellApplicabilityReason {
@@ -381,7 +395,29 @@ impl PerfCellApplicabilityReason {
             Self::RequiredForDefaultFlip => "required_for_default_flip",
             Self::DiagnosticProfile => "diagnostic_profile",
             Self::DiagnosticCell => "diagnostic_cell",
-            Self::ExceedsProfileMaximum => "exceeds_profile_maximum",
+            Self::ExceedsProfileMaximum { .. } => "exceeds_profile_maximum",
+        }
+    }
+
+    fn update_contract_hash(self, hasher: &mut Sha256) {
+        update_length_framed(hasher, self.contract_label().as_bytes());
+        if let Self::ExceedsProfileMaximum {
+            profile,
+            capacity_semantics,
+            execution_capacity,
+            required_cell_width,
+            max_exercised_cell_width,
+        } = self
+        {
+            update_length_framed(hasher, profile.hardware_class_id().as_str().as_bytes());
+            update_length_framed(hasher, profile.execution_profile_id().as_str().as_bytes());
+            update_length_framed(
+                hasher,
+                capacity_semantics_contract_label(capacity_semantics).as_bytes(),
+            );
+            update_length_framed(hasher, execution_capacity.to_string().as_bytes());
+            update_length_framed(hasher, required_cell_width.to_string().as_bytes());
+            update_length_framed(hasher, max_exercised_cell_width.to_string().as_bytes());
         }
     }
 }
@@ -418,6 +454,10 @@ pub struct PerfApplicabilityPlanBinding {
     pub profile_contract_sha256: String,
     /// Gate whose complete canonical slice is classified.
     pub gate: PerfGate,
+    /// SHA-256 of the independently normalized normative performance manifest.
+    pub normalized_perf_manifest_sha256: String,
+    /// Mandatory ordinary-cell width declared by this gate, when one is frozen.
+    pub primary_target_cell_width: Option<u64>,
     /// Schema of the canonical gate-matrix hash contract.
     pub matrix_contract_schema_version: String,
     /// Ordered hash of every canonical cell in this gate.
@@ -494,7 +534,7 @@ impl PerfApplicabilityPlan {
 
     fn contract_sha256(&self) -> String {
         let mut hasher = Sha256::new();
-        hasher.update(b"frankensearch.quill.perf-applicability-plan.v1\0");
+        hasher.update(b"frankensearch.quill.perf-applicability-plan.v2\0");
         update_length_framed(&mut hasher, self.binding.schema_version.as_bytes());
         update_length_framed(
             &mut hasher,
@@ -512,6 +552,11 @@ impl PerfApplicabilityPlan {
         update_length_framed(&mut hasher, self.binding.registry_sha256.as_bytes());
         update_length_framed(&mut hasher, self.binding.profile_contract_sha256.as_bytes());
         update_length_framed(&mut hasher, self.binding.gate.label().as_bytes());
+        update_length_framed(
+            &mut hasher,
+            self.binding.normalized_perf_manifest_sha256.as_bytes(),
+        );
+        update_optional_u64(&mut hasher, self.binding.primary_target_cell_width);
         update_length_framed(
             &mut hasher,
             self.binding.matrix_contract_schema_version.as_bytes(),
@@ -536,7 +581,7 @@ impl PerfApplicabilityPlan {
             update_length_framed(&mut hasher, cell.cell_contract_sha256.as_bytes());
             update_length_framed(&mut hasher, cell.configured_threads.to_string().as_bytes());
             update_length_framed(&mut hasher, cell.applicability.contract_label().as_bytes());
-            update_length_framed(&mut hasher, cell.reason.contract_label().as_bytes());
+            cell.reason.update_contract_hash(&mut hasher);
         }
         finish_sha256_hex(hasher)
     }
@@ -582,6 +627,32 @@ pub enum PerfApplicabilityPlanError {
         profile: MachineProfileKey,
         /// Gate whose maximum is invalid.
         gate: PerfGate,
+    },
+    /// A required profile cannot exercise the gate's primary target width.
+    #[error(
+        "required execution profile {profile:?} cannot exercise {gate} primary target width \
+         {primary_target_cell_width} with capacity {execution_capacity:?} and maximum \
+         {max_exercised_cell_width:?}"
+    )]
+    RequiredProfileBelowPrimaryTarget {
+        /// Profile whose execution envelope is too narrow.
+        profile: MachineProfileKey,
+        /// Gate whose primary target would be omitted.
+        gate: PerfGate,
+        /// Manifest-declared mandatory target width.
+        primary_target_cell_width: u64,
+        /// Frozen execution capacity.
+        execution_capacity: Option<u64>,
+        /// Frozen maximum runnable canonical width.
+        max_exercised_cell_width: Option<u64>,
+    },
+    /// The normative manifest cannot provide a bounded gate identity.
+    #[error("invalid normative performance manifest contract for {gate}: {detail}")]
+    ManifestContract {
+        /// Gate whose manifest identity is invalid.
+        gate: PerfGate,
+        /// Bounded parse or shape failure.
+        detail: String,
     },
     /// A canonical cell lacks a representable positive configured width.
     #[error("canonical {gate} cell ordinal {ordinal} has no representable positive width")]
@@ -631,6 +702,81 @@ fn update_optional_u64(hasher: &mut Sha256, value: Option<u64>) {
         }
         None => update_length_framed(hasher, b"none"),
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PerfGateManifestIdentity {
+    normalized_perf_manifest_sha256: String,
+    primary_target_cell_width: Option<u64>,
+}
+
+fn perf_gate_manifest_identity(
+    manifest: &str,
+    gate: PerfGate,
+) -> Result<PerfGateManifestIdentity, PerfApplicabilityPlanError> {
+    let parsed = toml::from_str::<toml::Value>(manifest).map_err(|error| {
+        PerfApplicabilityPlanError::ManifestContract {
+            gate,
+            detail: format!("manifest is not valid TOML: {error}"),
+        }
+    })?;
+    let schema = parsed
+        .get("schemas")
+        .and_then(toml::Value::as_table)
+        .and_then(|schemas| schemas.get("applicability_plan"))
+        .and_then(toml::Value::as_str)
+        .ok_or_else(|| PerfApplicabilityPlanError::ManifestContract {
+            gate,
+            detail: "schemas.applicability_plan is missing or not a string".to_owned(),
+        })?;
+    if schema != PERF_APPLICABILITY_PLAN_SCHEMA_VERSION {
+        return Err(PerfApplicabilityPlanError::ManifestContract {
+            gate,
+            detail: format!(
+                "schemas.applicability_plan is {schema:?}, expected \
+                 {PERF_APPLICABILITY_PLAN_SCHEMA_VERSION:?}"
+            ),
+        });
+    }
+    let gate_contract = parsed
+        .get("gate")
+        .and_then(toml::Value::as_table)
+        .and_then(|gates| gates.get(gate.label()))
+        .and_then(toml::Value::as_table)
+        .ok_or_else(|| PerfApplicabilityPlanError::ManifestContract {
+            gate,
+            detail: "gate table is missing or not a table".to_owned(),
+        })?;
+    let primary_target_cell_width = gate_contract
+        .get("primary_target_cell_width")
+        .map(|value| {
+            let width =
+                value
+                    .as_integer()
+                    .ok_or_else(|| PerfApplicabilityPlanError::ManifestContract {
+                        gate,
+                        detail: "primary_target_cell_width is not an integer".to_owned(),
+                    })?;
+            u64::try_from(width)
+                .ok()
+                .filter(|width| *width > 0)
+                .ok_or_else(|| PerfApplicabilityPlanError::ManifestContract {
+                    gate,
+                    detail: "primary_target_cell_width is not a positive u64".to_owned(),
+                })
+        })
+        .transpose()?;
+    if gate == PerfGate::Qg1 && primary_target_cell_width.is_none() {
+        return Err(PerfApplicabilityPlanError::ManifestContract {
+            gate,
+            detail: "QG-1 requires primary_target_cell_width".to_owned(),
+        });
+    }
+
+    Ok(PerfGateManifestIdentity {
+        normalized_perf_manifest_sha256: perf_manifest_contract_sha256(manifest),
+        primary_target_cell_width,
+    })
 }
 
 /// Complete, deterministic QG-1..QG-10 execution matrix.
@@ -912,7 +1058,8 @@ impl PerfMatrixSpec {
             detail: error.to_string(),
         })?;
         let profile = registry.execution_profile(profile_key)?;
-        self.applicability_plan_for_profile(profile, gate)
+        let manifest_identity = perf_gate_manifest_identity(NORMATIVE_PERF_MANIFEST, gate)?;
+        self.applicability_plan_for_profile(profile, gate, &manifest_identity)
     }
 
     /// Build one exhaustive plan for every normative gate.
@@ -938,6 +1085,7 @@ impl PerfMatrixSpec {
         &self,
         profile: &MachineExecutionProfile,
         gate: PerfGate,
+        manifest_identity: &PerfGateManifestIdentity,
     ) -> Result<PerfApplicabilityPlan, PerfApplicabilityPlanError> {
         let profile_key = profile.key();
         if profile.availability() == MachineProfileAvailability::Unavailable {
@@ -964,6 +1112,7 @@ impl PerfMatrixSpec {
         }
         if profile.execution_capacity() == Some(0)
             || max_exercised_cell_width == Some(0)
+            || (profile.execution_capacity().is_none() && max_exercised_cell_width.is_some())
             || profile.execution_capacity().is_some_and(|capacity| {
                 max_exercised_cell_width.is_some_and(|maximum| maximum > capacity)
             })
@@ -972,6 +1121,39 @@ impl PerfMatrixSpec {
                 profile: profile_key,
                 gate,
             });
+        }
+        if let Some(primary_target_cell_width) = manifest_identity.primary_target_cell_width {
+            let target_exists = self.for_gate(gate).into_iter().any(|cell| {
+                cell.threads.and_then(|width| u64::try_from(width).ok())
+                    == Some(primary_target_cell_width)
+                    && !canonical_cell_is_diagnostic(cell)
+            });
+            if !target_exists {
+                return Err(PerfApplicabilityPlanError::ManifestContract {
+                    gate,
+                    detail: format!(
+                        "primary target width {primary_target_cell_width} has no ordinary \
+                         canonical cell"
+                    ),
+                });
+            }
+            if disposition == DefaultFlipDisposition::RequiredForDefaultFlip
+                && (profile
+                    .execution_capacity()
+                    .is_none_or(|capacity| capacity < primary_target_cell_width)
+                    || max_exercised_cell_width
+                        .is_none_or(|maximum| maximum < primary_target_cell_width))
+            {
+                return Err(
+                    PerfApplicabilityPlanError::RequiredProfileBelowPrimaryTarget {
+                        profile: profile_key,
+                        gate,
+                        primary_target_cell_width,
+                        execution_capacity: profile.execution_capacity(),
+                        max_exercised_cell_width,
+                    },
+                );
+            }
         }
 
         let mut entries = Vec::new();
@@ -982,28 +1164,41 @@ impl PerfMatrixSpec {
                 .ok_or(PerfApplicabilityPlanError::InvalidCellWidth { gate, ordinal })?;
             let configured_width = u64::try_from(configured_threads)
                 .map_err(|_| PerfApplicabilityPlanError::InvalidCellWidth { gate, ordinal })?;
-            let (applicability, reason) =
-                if max_exercised_cell_width.is_some_and(|maximum| configured_width > maximum) {
-                    (
-                        PerfCellApplicability::NotApplicable,
-                        PerfCellApplicabilityReason::ExceedsProfileMaximum,
-                    )
-                } else if disposition == DefaultFlipDisposition::DiagnosticOnly {
-                    (
-                        PerfCellApplicability::Diagnostic,
-                        PerfCellApplicabilityReason::DiagnosticProfile,
-                    )
-                } else if canonical_cell_is_diagnostic(cell) {
-                    (
-                        PerfCellApplicability::Diagnostic,
-                        PerfCellApplicabilityReason::DiagnosticCell,
-                    )
-                } else {
-                    (
-                        PerfCellApplicability::Required,
-                        PerfCellApplicabilityReason::RequiredForDefaultFlip,
-                    )
-                };
+            let exceeded_maximum =
+                max_exercised_cell_width.filter(|maximum| configured_width > *maximum);
+            let (applicability, reason) = if let Some(maximum) = exceeded_maximum {
+                let execution_capacity = profile.execution_capacity().ok_or(
+                    PerfApplicabilityPlanError::InvalidCapacityEnvelope {
+                        profile: profile_key,
+                        gate,
+                    },
+                )?;
+                (
+                    PerfCellApplicability::NotApplicable,
+                    PerfCellApplicabilityReason::ExceedsProfileMaximum {
+                        profile: profile_key,
+                        capacity_semantics: profile.capacity_semantics(),
+                        execution_capacity,
+                        required_cell_width: configured_width,
+                        max_exercised_cell_width: maximum,
+                    },
+                )
+            } else if disposition == DefaultFlipDisposition::DiagnosticOnly {
+                (
+                    PerfCellApplicability::Diagnostic,
+                    PerfCellApplicabilityReason::DiagnosticProfile,
+                )
+            } else if canonical_cell_is_diagnostic(cell) {
+                (
+                    PerfCellApplicability::Diagnostic,
+                    PerfCellApplicabilityReason::DiagnosticCell,
+                )
+            } else {
+                (
+                    PerfCellApplicability::Required,
+                    PerfCellApplicabilityReason::RequiredForDefaultFlip,
+                )
+            };
             entries.push(PerfCellApplicabilityEntry {
                 ordinal,
                 cell_contract_sha256: cell.contract_sha256().map_err(|error| {
@@ -1021,6 +1216,24 @@ impl PerfMatrixSpec {
                 detail: format!("{gate} has no canonical cells"),
             });
         }
+        if disposition == DefaultFlipDisposition::RequiredForDefaultFlip {
+            if let Some(primary_target_cell_width) = manifest_identity.primary_target_cell_width {
+                if !entries.iter().any(|entry| {
+                    u64::try_from(entry.configured_threads) == Ok(primary_target_cell_width)
+                        && entry.applicability == PerfCellApplicability::Required
+                }) {
+                    return Err(
+                        PerfApplicabilityPlanError::RequiredProfileBelowPrimaryTarget {
+                            profile: profile_key,
+                            gate,
+                            primary_target_cell_width,
+                            execution_capacity: profile.execution_capacity(),
+                            max_exercised_cell_width,
+                        },
+                    );
+                }
+            }
+        }
 
         let gate_matrix_contract_sha256 = self.gate_contract_sha256(gate).map_err(|error| {
             PerfApplicabilityPlanError::ContractIdentity {
@@ -1035,6 +1248,10 @@ impl PerfMatrixSpec {
                 registry_sha256: MACHINE_CLASS_REGISTRY_SHA256.to_owned(),
                 profile_contract_sha256: profile.contract_sha256().to_owned(),
                 gate,
+                normalized_perf_manifest_sha256: manifest_identity
+                    .normalized_perf_manifest_sha256
+                    .clone(),
+                primary_target_cell_width: manifest_identity.primary_target_cell_width,
                 matrix_contract_schema_version: Self::CONTRACT_SCHEMA_VERSION.to_owned(),
                 gate_matrix_contract_sha256,
                 applicability_plan_sha256: String::new(),
@@ -3745,8 +3962,17 @@ mod tests {
                 16,
                 Some(64),
                 Some(64),
+                "2157d4c9c1e2a604f6f1468ad278798126fae81b5aed107dc411e520cc009fcd",
             ),
-            (ExecutionProfileId::Smt2_128, 72, 2, 0, Some(128), Some(128)),
+            (
+                ExecutionProfileId::Smt2_128,
+                72,
+                2,
+                0,
+                Some(128),
+                Some(128),
+                "ddc419dfe3fd66444f3a14be2ca04c0affb6ee7e4074b4bfcfa1236069759638",
+            ),
             (
                 ExecutionProfileId::Scheduler10,
                 32,
@@ -3754,6 +3980,7 @@ mod tests {
                 40,
                 Some(10),
                 Some(8),
+                "3ef9f339e897ff6c0ac108853b2d470aeb5f23d93398885506f7faa593076a70",
             ),
         ];
         let mut plan_hashes = BTreeSet::new();
@@ -3764,6 +3991,7 @@ mod tests {
             not_applicable,
             execution_capacity,
             max_exercised_cell_width,
+            expected_plan_sha256,
         ) in cases
         {
             let plan = qg1_plan(&registry, profile);
@@ -3784,18 +4012,33 @@ mod tests {
                 PerfMatrixSpec::QG1_CANONICAL_SHA256
             );
             assert_eq!(
+                plan.binding.normalized_perf_manifest_sha256,
+                perf_manifest_contract_sha256(PERF_MANIFEST)
+            );
+            assert_eq!(plan.binding.primary_target_cell_width, Some(8));
+            assert_eq!(
                 plan.binding.registry_schema_version,
                 MACHINE_CLASS_REGISTRY_SCHEMA_VERSION
             );
             assert_eq!(plan.binding.registry_sha256, MACHINE_CLASS_REGISTRY_SHA256);
             assert!(is_lower_hex_digest(&plan.binding.profile_contract_sha256));
-            assert!(is_lower_hex_digest(&plan.binding.applicability_plan_sha256));
+            assert_eq!(
+                plan.binding.applicability_plan_sha256, expected_plan_sha256,
+                "{profile:?} plan hash must remain frozen"
+            );
             assert!(
                 plan.cells
                     .iter()
                     .enumerate()
                     .all(|(ordinal, cell)| cell.ordinal == ordinal
                         && is_lower_hex_digest(&cell.cell_contract_sha256))
+            );
+            assert!(
+                plan.cells.iter().any(|cell| {
+                    cell.configured_threads == 8
+                        && cell.applicability == PerfCellApplicability::Required
+                }),
+                "{profile:?} must retain the QG-1 primary target width as Required"
             );
             plan.verify_against(&PerfMatrixSpec::complete(), &registry)
                 .expect("recompute canonical plan");
@@ -3804,6 +4047,298 @@ mod tests {
                 "each execution profile requires a distinct plan hash"
             );
         }
+    }
+
+    #[test]
+    fn qg1_plan_identity_binds_manifest_and_primary_target_independently() {
+        let registry = MachineClassRegistry::frozen().expect("frozen machine registry");
+        let matrix = PerfMatrixSpec::complete();
+        let trj_key = profile_key(
+            HardwareClassId::TrjZen35995wx,
+            ExecutionProfileId::Physical64,
+        );
+        let trj = registry
+            .execution_profile(trj_key)
+            .expect("physical Threadripper profile");
+        let normative_identity = perf_gate_manifest_identity(PERF_MANIFEST, PerfGate::Qg1)
+            .expect("normative QG-1 manifest identity");
+        let normative = matrix
+            .applicability_plan_for_profile(trj, PerfGate::Qg1, &normative_identity)
+            .expect("normative physical QG-1 plan");
+
+        let manifest_only_change = PERF_MANIFEST.replacen(
+            "Quill performance gate manifests",
+            "Quill performance gate contract manifests",
+            1,
+        );
+        let manifest_only_identity =
+            perf_gate_manifest_identity(&manifest_only_change, PerfGate::Qg1)
+                .expect("manifest-only QG-1 identity");
+        assert_eq!(
+            manifest_only_identity.primary_target_cell_width,
+            normative_identity.primary_target_cell_width
+        );
+        assert_ne!(
+            manifest_only_identity.normalized_perf_manifest_sha256,
+            normative_identity.normalized_perf_manifest_sha256
+        );
+        let manifest_only_plan = matrix
+            .applicability_plan_for_profile(trj, PerfGate::Qg1, &manifest_only_identity)
+            .expect("manifest-only physical QG-1 plan");
+        assert_eq!(manifest_only_plan.cells, normative.cells);
+        assert_ne!(
+            manifest_only_plan.binding.applicability_plan_sha256,
+            normative.binding.applicability_plan_sha256
+        );
+
+        let activation_only_change =
+            PERF_MANIFEST.replacen("activated = false", "activated = true", 1);
+        let activation_only_identity =
+            perf_gate_manifest_identity(&activation_only_change, PerfGate::Qg1)
+                .expect("activation-only QG-1 identity");
+        let activation_only_plan = matrix
+            .applicability_plan_for_profile(trj, PerfGate::Qg1, &activation_only_identity)
+            .expect("activation-only physical QG-1 plan");
+        assert_eq!(activation_only_identity, normative_identity);
+        assert_eq!(
+            activation_only_plan.binding.applicability_plan_sha256,
+            normative.binding.applicability_plan_sha256
+        );
+
+        let mut primary_only_identity = normative_identity.clone();
+        primary_only_identity.primary_target_cell_width = Some(16);
+        let primary_only_plan = matrix
+            .applicability_plan_for_profile(trj, PerfGate::Qg1, &primary_only_identity)
+            .expect("physical Threadripper supports the mutated target");
+        assert_eq!(
+            primary_only_plan.binding.normalized_perf_manifest_sha256,
+            normative.binding.normalized_perf_manifest_sha256
+        );
+        assert_ne!(
+            primary_only_plan.binding.applicability_plan_sha256,
+            normative.binding.applicability_plan_sha256
+        );
+
+        let m4_key = profile_key(HardwareClassId::M4Macos, ExecutionProfileId::Scheduler10);
+        let m4 = registry
+            .execution_profile(m4_key)
+            .expect("M4 scheduler profile");
+        assert!(matches!(
+            matrix.applicability_plan_for_profile(
+                m4,
+                PerfGate::Qg1,
+                &primary_only_identity
+            ),
+            Err(PerfApplicabilityPlanError::RequiredProfileBelowPrimaryTarget {
+                profile,
+                gate: PerfGate::Qg1,
+                primary_target_cell_width: 16,
+                execution_capacity: Some(10),
+                max_exercised_cell_width: Some(8),
+            }) if profile == m4_key
+        ));
+
+        let mut stored_manifest_mutation = normative.clone();
+        stored_manifest_mutation
+            .binding
+            .normalized_perf_manifest_sha256 = "0".repeat(64);
+        stored_manifest_mutation.binding.applicability_plan_sha256 =
+            stored_manifest_mutation.contract_sha256();
+        assert!(matches!(
+            stored_manifest_mutation.verify_against(&matrix, &registry),
+            Err(PerfApplicabilityPlanError::PlanMismatch { .. })
+        ));
+
+        let mut stored_primary_mutation = normative;
+        stored_primary_mutation.binding.primary_target_cell_width = Some(16);
+        stored_primary_mutation.binding.applicability_plan_sha256 =
+            stored_primary_mutation.contract_sha256();
+        assert!(matches!(
+            stored_primary_mutation.verify_against(&matrix, &registry),
+            Err(PerfApplicabilityPlanError::PlanMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn qg1_manifest_contract_rejects_missing_or_unbounded_primary_target() {
+        let missing = PERF_MANIFEST.replacen("primary_target_cell_width = 8\n", "", 1);
+        assert!(matches!(
+            perf_gate_manifest_identity(&missing, PerfGate::Qg1),
+            Err(PerfApplicabilityPlanError::ManifestContract {
+                gate: PerfGate::Qg1,
+                ..
+            })
+        ));
+
+        for invalid in ["0", "-1", "\"eight\""] {
+            let mutated = PERF_MANIFEST.replacen(
+                "primary_target_cell_width = 8",
+                &format!("primary_target_cell_width = {invalid}"),
+                1,
+            );
+            assert!(
+                matches!(
+                    perf_gate_manifest_identity(&mutated, PerfGate::Qg1),
+                    Err(PerfApplicabilityPlanError::ManifestContract {
+                        gate: PerfGate::Qg1,
+                        ..
+                    })
+                ),
+                "invalid primary target {invalid} must fail closed"
+            );
+        }
+
+        let stale_schema = PERF_MANIFEST.replacen(
+            "applicability_plan = \"frankensearch.quill-perf-applicability-plan.v2\"",
+            "applicability_plan = \"frankensearch.quill-perf-applicability-plan.v1\"",
+            1,
+        );
+        assert!(matches!(
+            perf_gate_manifest_identity(&stale_schema, PerfGate::Qg1),
+            Err(PerfApplicabilityPlanError::ManifestContract {
+                gate: PerfGate::Qg1,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn qg1_required_profiles_retain_all_primary_width_cells() {
+        let registry = MachineClassRegistry::frozen().expect("frozen machine registry");
+        for profile in [
+            ExecutionProfileId::Physical64,
+            ExecutionProfileId::Smt2_128,
+            ExecutionProfileId::Scheduler10,
+        ] {
+            let plan = qg1_plan(&registry, profile);
+            let required_primary_cells = plan
+                .cells
+                .iter()
+                .filter(|cell| {
+                    cell.configured_threads == 8
+                        && cell.applicability == PerfCellApplicability::Required
+                })
+                .count();
+            assert_eq!(
+                required_primary_cells, 8,
+                "{profile:?} must retain all eight ordinary QG-1 width-8 cells"
+            );
+        }
+    }
+
+    #[test]
+    fn qg1_not_applicable_reason_facts_are_hash_bound_and_reconstructed() {
+        let registry = MachineClassRegistry::frozen().expect("frozen machine registry");
+        let matrix = PerfMatrixSpec::complete();
+        let plan = qg1_plan(&registry, ExecutionProfileId::Scheduler10);
+        let entry_index = plan
+            .cells
+            .iter()
+            .position(|cell| cell.applicability == PerfCellApplicability::NotApplicable)
+            .expect("M4 QG-1 has N/A cells");
+        let reason = plan.cells[entry_index].reason;
+        let profile = plan.binding.profile;
+        let capacity_semantics = ExecutionCapacitySemantics::SchedulerWorkers;
+        let execution_capacity = 10;
+        let required_cell_width = 16;
+        let max_exercised_cell_width = 8;
+        assert_eq!(
+            reason,
+            PerfCellApplicabilityReason::ExceedsProfileMaximum {
+                profile,
+                capacity_semantics,
+                execution_capacity,
+                required_cell_width,
+                max_exercised_cell_width,
+            },
+            "M4 N/A cell must carry the exact typed execution-envelope facts"
+        );
+        assert_eq!(profile, plan.binding.profile);
+        assert_eq!(
+            capacity_semantics,
+            ExecutionCapacitySemantics::SchedulerWorkers
+        );
+        assert_eq!(execution_capacity, 10);
+        assert_eq!(required_cell_width, 16);
+        assert_eq!(max_exercised_cell_width, 8);
+
+        let baseline_hash = plan.binding.applicability_plan_sha256.clone();
+        let assert_mutation_rejected = |mutated_reason: PerfCellApplicabilityReason,
+                                        field: &str| {
+            let mut mutated = plan.clone();
+            mutated.cells[entry_index].reason = mutated_reason;
+            mutated.binding.applicability_plan_sha256 = mutated.contract_sha256();
+            assert_ne!(
+                mutated.binding.applicability_plan_sha256, baseline_hash,
+                "{field} must participate in the plan hash"
+            );
+            assert!(
+                matches!(
+                    mutated.verify_against(&matrix, &registry),
+                    Err(PerfApplicabilityPlanError::PlanMismatch { .. })
+                ),
+                "{field} mutation must fail reconstruction"
+            );
+        };
+        let physical_key = profile_key(
+            HardwareClassId::TrjZen35995wx,
+            ExecutionProfileId::Physical64,
+        );
+        assert_mutation_rejected(
+            PerfCellApplicabilityReason::ExceedsProfileMaximum {
+                profile: physical_key,
+                capacity_semantics,
+                execution_capacity,
+                required_cell_width,
+                max_exercised_cell_width,
+            },
+            "profile",
+        );
+        assert_mutation_rejected(
+            PerfCellApplicabilityReason::ExceedsProfileMaximum {
+                profile,
+                capacity_semantics: ExecutionCapacitySemantics::PhysicalCores,
+                execution_capacity,
+                required_cell_width,
+                max_exercised_cell_width,
+            },
+            "capacity_semantics",
+        );
+        assert_mutation_rejected(
+            PerfCellApplicabilityReason::ExceedsProfileMaximum {
+                profile,
+                capacity_semantics,
+                execution_capacity: execution_capacity + 1,
+                required_cell_width,
+                max_exercised_cell_width,
+            },
+            "execution_capacity",
+        );
+        assert_mutation_rejected(
+            PerfCellApplicabilityReason::ExceedsProfileMaximum {
+                profile,
+                capacity_semantics,
+                execution_capacity,
+                required_cell_width: required_cell_width + 1,
+                max_exercised_cell_width,
+            },
+            "required_cell_width",
+        );
+        assert_mutation_rejected(
+            PerfCellApplicabilityReason::ExceedsProfileMaximum {
+                profile,
+                capacity_semantics,
+                execution_capacity,
+                required_cell_width,
+                max_exercised_cell_width: max_exercised_cell_width + 1,
+            },
+            "max_exercised_cell_width",
+        );
+
+        let encoded = serde_json::to_vec(&reason).expect("serialize typed N/A reason");
+        let decoded: PerfCellApplicabilityReason =
+            serde_json::from_slice(&encoded).expect("deserialize typed N/A reason");
+        assert_eq!(decoded, reason);
     }
 
     #[test]
@@ -3820,7 +4355,20 @@ mod tests {
                 .filter(|cell| cell.configured_threads > 8)
                 .all(|cell| {
                     cell.applicability == PerfCellApplicability::NotApplicable
-                        && cell.reason == PerfCellApplicabilityReason::ExceedsProfileMaximum
+                        && matches!(
+                            cell.reason,
+                            PerfCellApplicabilityReason::ExceedsProfileMaximum {
+                                profile,
+                                capacity_semantics:
+                                    ExecutionCapacitySemantics::SchedulerWorkers,
+                                execution_capacity: 10,
+                                required_cell_width,
+                                max_exercised_cell_width: 8,
+                            } if profile == plan.binding.profile
+                                && required_cell_width
+                                    == u64::try_from(cell.configured_threads)
+                                        .expect("canonical width fits u64")
+                        )
                 })
         );
     }
@@ -3999,8 +4547,13 @@ mod tests {
         assert_eq!(manifest.matches("activated = false").count(), 10);
         assert_eq!(
             perf_manifest_contract_sha256(manifest),
+            "82e978f1aafe9c8b0164c5151f84e43445cf24951c12f0963ff077cd2733e387",
+            "the normalized all-inactive manifest digest must remain frozen"
+        );
+        assert_eq!(
+            perf_manifest_contract_sha256(manifest),
             lower_sha256_hex(manifest.as_bytes()),
-            "the all-inactive manifest retains its historical raw-file digest"
+            "the all-inactive manifest's normalized digest equals its raw-file digest"
         );
 
         let activated = manifest.replacen("activated = false", "activated = true", 1);
