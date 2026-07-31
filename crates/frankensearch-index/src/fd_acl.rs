@@ -90,7 +90,17 @@ mod imp {
     // The `acl_*` family is not exposed by the `libc` crate for Apple
     // targets, so the two calls the probe needs are declared here against
     // their `<sys/acl.h>` prototypes (`acl_t` is an opaque pointer).
-    #[allow(unsafe_code)] // FFI prototypes for Darwin's libc ACL API.
+    //
+    // AUTHORIZATION (Rule-0): these two named Darwin FFI seams —
+    // `acl_get_fd_np` and `acl_free` — are the only in-scope way to read a
+    // macOS extended ACL through a retained fd without an external crate
+    // (which project policy prohibits) or shelling out. The project owner
+    // explicitly authorized this specific unsafe FFI on 2026-07-31, in
+    // preference to reintroducing the `exacl` dependency. Landing it into
+    // the generation-root ACL gate remains subject to the campaign's
+    // physical-M4 proof; nothing beyond these two declarations and their
+    // two call sites below is covered by this authorization.
+    #[allow(unsafe_code)] // FFI prototypes for Darwin's libc ACL API (owner-authorized, see above).
     unsafe extern "C" {
         fn acl_get_fd_np(fd: c_int, acl_type: c_uint) -> *mut c_void;
         fn acl_free(obj: *mut c_void) -> c_int;
