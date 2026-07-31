@@ -311,6 +311,51 @@ fn swar_load(bytes: &[u8], at: usize) -> u64 {
     u64::from_le_bytes(lanes)
 }
 
+/// Append `source` (all-ASCII by the caller's `all_ascii` guarantee) to `dst`
+/// lowercased in one fused pass, replacing the two-pass
+/// `push_str` + `make_ascii_lowercase` emit whose per-token libc `memcpy` call
+/// and second lowercase sweep dominated the analyze leaf in the Round-2
+/// instruction-level profile.
+///
+/// Eight bytes per step: [`swar_range_mark`] marks each `A-Z` lane with `0x80`,
+/// and shifting that marker right by two turns it into the lane's `0x20` ASCII
+/// case bit — `word | (upper_mark >> 2)` is therefore exactly
+/// [`u8::to_ascii_lowercase`] per lane (all non-`A-Z` bytes pass through
+/// unchanged, the marker never crosses a lane boundary because only bit 7 of a
+/// lane can be set). The `swar_range_mark` non-ASCII caveat does not apply:
+/// every byte is `< 0x80` here. The tail (< 8 bytes) lowers per byte with the
+/// same `| 0x20` identity.
+///
+/// The lowered word is emitted through a fixed `[u8; 8]` buffer with a
+/// byte-wise `push` loop rather than
+/// `push_str(str::from_utf8(&lowered.to_le_bytes()))`: disassembly of the
+/// `release-perf` artifact showed the const-8 `push_str` lowering to a runtime
+/// UTF-8 validation call plus a libc `memcpy` call per word (the slice length
+/// degrades to a runtime value through the `Result` payload), while the
+/// byte-wise loop inlines to single-byte stores with no libc call.
+#[inline]
+fn push_ascii_lowercase(dst: &mut String, source: &str) {
+    debug_assert!(source.is_ascii());
+    let bytes = source.as_bytes();
+    let len = bytes.len();
+    let mut at = 0;
+    while at + SWAR_LANES <= len {
+        let word = swar_load(bytes, at);
+        let upper_mark = swar_range_mark(word, u64::from(b'A'), u64::from(b'Z'));
+        let lowered = (word | (upper_mark >> 2)).to_le_bytes();
+        for byte in lowered {
+            dst.push(char::from(byte));
+        }
+        at += SWAR_LANES;
+    }
+    while at < len {
+        let byte = bytes[at];
+        let lowered = byte | (u8::from(byte.wrapping_sub(b'A') < 26) << 5);
+        dst.push(char::from(lowered));
+        at += 1;
+    }
+}
+
 /// Advance past separators and return the byte offset of the first byte that
 /// begins an alphanumeric token, or `text.len()` when the remainder holds none.
 ///
@@ -545,8 +590,7 @@ impl TokenAnalyzer for FrankensearchTokenizer {
             self.token.text.clear();
             let source = &text[offset_from..offset_to];
             if all_ascii {
-                self.token.text.push_str(source);
-                self.token.text.make_ascii_lowercase();
+                push_ascii_lowercase(&mut self.token.text, source);
             } else {
                 for source_char in source.chars() {
                     self.token.text.extend(source_char.to_lowercase());
@@ -5532,6 +5576,46 @@ mod tests {
                 scalar_reference_tokens(&input),
                 "boundary-mask analyzer diverged from the scalar char-walk reference for {input:?}"
             );
+        }
+    }
+
+    #[test]
+    fn fused_ascii_lowercase_emit_word_boundary_sweep_matches_reference() {
+        // Fused single-pass lowercase emit regression: uppercase-heavy tokens
+        // whose spans start at every alignment 0..=8 and whose lengths 1..=25
+        // cross the 8-byte SWAR word boundary at every offset (0..3 full words
+        // x every tail width). A distinguishing marker byte slides across every
+        // position: '0' pins digit passthrough, 'z' pins already-lowercase
+        // passthrough, and 'B' pins the A-Z case flip, in every lane of both
+        // the full-word path and the scalar tail. Token text must be
+        // byte-identical to the `str::to_ascii_lowercase` reference and the
+        // whole stream byte-identical to the scalar char-walk oracle.
+        for pad in 0..=8_usize {
+            for len in 1..=25_usize {
+                for marker_at in 0..len {
+                    for marker in ['0', 'z', 'B'] {
+                        let mut input = " ".repeat(pad);
+                        let token_start = input.len();
+                        for at in 0..len {
+                            input.push(if at == marker_at { marker } else { 'A' });
+                        }
+                        let tokens = analyzed_tokens(&input);
+                        assert_eq!(tokens.len(), 1, "for {input:?}");
+                        assert_eq!(
+                            tokens[0].text,
+                            input[token_start..].to_ascii_lowercase(),
+                            "for {input:?}"
+                        );
+                        assert_eq!(tokens[0].offset_from, token_start, "for {input:?}");
+                        assert_eq!(tokens[0].offset_to, input.len(), "for {input:?}");
+                        assert_eq!(
+                            tokens,
+                            scalar_reference_tokens(&input),
+                            "fused emit diverged from the scalar reference for {input:?}"
+                        );
+                    }
+                }
+            }
         }
     }
 
