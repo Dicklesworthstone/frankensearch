@@ -922,14 +922,16 @@ impl ValidatedTermDictionaryMetadata {
         self.schema
     }
 
-    /// Exact heap bytes retained by this validated metadata object.
+    /// Estimated payload bytes retained by this validated metadata object.
     ///
-    /// Counts the boxed struct itself plus the full capacity of the block and
-    /// restart directories. [`BlockMeta`] and [`RestartMeta`] are flat offset
-    /// records without nested heap allocations, so capacity-based accounting
-    /// is exact. This is the persistent per-segment cost of validating
-    /// TERMDICT metadata once per immutable backing instead of per query.
-    pub(crate) fn heap_bytes(&self) -> usize {
+    /// Counts the struct itself plus the full capacity of the block and
+    /// restart directories ([`BlockMeta`] and [`RestartMeta`] are flat offset
+    /// records without nested heap allocations). This is a payload estimate,
+    /// not an exact memory claim: it excludes `Arc` control-block overhead,
+    /// allocation alignment, and allocator slack. It reports the persistent
+    /// per-segment cost of validating TERMDICT metadata once per immutable
+    /// backing instead of per query.
+    pub(crate) fn payload_bytes(&self) -> usize {
         core::mem::size_of::<Self>()
             .saturating_add(
                 self.blocks

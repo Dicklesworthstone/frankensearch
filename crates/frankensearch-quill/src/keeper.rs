@@ -1949,6 +1949,17 @@ impl RecoveredSegmentBacking {
         }
     }
 
+    /// Whether this backing is a memory-mapped durable file.
+    ///
+    /// Mapped bytes are mutable out from under the process by external file
+    /// writes, and a warm reader's section-checksum gates do not re-verify on
+    /// later access, so no in-place rebind path may treat a mapped backing's
+    /// re-validation as fresh. Mapped successor generations must go through a
+    /// durable reopen.
+    const fn is_mapped(&self) -> bool {
+        matches!(self, Self::Mapped(_))
+    }
+
     fn validate_witnesses(
         &self,
         path: &Path,
@@ -2319,15 +2330,20 @@ impl RecoveredSegment {
     /// Bind one manifest generation over a shared immutable backing.
     ///
     /// `reuse_from` names the predecessor binding of the exact same backing
-    /// when the caller is performing a tombstone-only manifest rebind. Its
-    /// already-validated TERMDICT metadata is reused only after every
-    /// content-identity witness holds: the backing must be the same `Arc`
-    /// allocation, the trailer-verified whole-file xxh3 recorded at
-    /// validation time must equal this reader's, the schema must match, and
-    /// the live TERMDICT slice must still be the exact address/length the
-    /// metadata was minted for. Any witness mismatch falls back to one
-    /// complete fresh validation, so reuse can never weaken admission; it can
-    /// only skip re-validating bytes that were already proven valid.
+    /// when the caller is performing a tombstone-only manifest rebind. This
+    /// path is OWNED-ONLY: a mapped predecessor is rejected up front with a
+    /// typed reopen-required transition error, because mapped bytes can
+    /// change on disk behind warm checksum gates and neither reuse nor an
+    /// in-place "fresh" validation would be honest there. For owned
+    /// backings, the already-validated TERMDICT metadata is reused only
+    /// after every content-identity witness holds: the backing must be the
+    /// same `Arc` allocation, the trailer-verified whole-file xxh3 recorded
+    /// at validation time must equal this reader's, the schema must match,
+    /// and the live TERMDICT slice must still be the exact address/length
+    /// the metadata was minted for. Any witness mismatch falls back to one
+    /// complete fresh validation of the immutable owned bytes, so reuse can
+    /// never weaken admission; it can only skip re-validating bytes that
+    /// were already proven valid.
     fn bind_shared(
         path: PathBuf,
         manifest: ManifestSegment,
@@ -2336,6 +2352,22 @@ impl RecoveredSegment {
         schema: SchemaDescriptor,
         reuse_from: Option<&Self>,
     ) -> Result<Self, KeeperError> {
+        // TRUST BOUNDARY: in-place rebind (any binding that names a
+        // predecessor) is owned-only. A mapped backing's bytes can change on
+        // disk after open while the reader's stored trailer hash and warm
+        // section-checksum gates keep vouching for the ORIGINAL bytes, so
+        // neither the reuse path nor its fresh-validation fallback would be
+        // honest for a mapped rebind. Mapped successor generations require a
+        // durable reopen, which re-verifies everything from actual bytes.
+        if reuse_from.is_some() && reader.is_mapped() {
+            return Err(KeeperError::InvalidTransition {
+                detail: format!(
+                    "mapped segment {} cannot rebind in place; a durable reopen \
+                     is required (validated TERMDICT metadata reuse is owned-only)",
+                    path.display()
+                ),
+            });
+        }
         let id_map_bytes = required_identity_section(&path, &reader, SectionKind::IDMAP)?;
         let id_map = IdMapSection::parse(id_map_bytes, manifest.docid_lo, manifest.docid_hi)
             .map_err(|source| KeeperError::IdMapCorrupted {
@@ -2442,7 +2474,9 @@ impl RecoveredSegment {
     /// tombstone-only rebind re-checks the manifest witnesses against the
     /// backing and then reuses the already-validated TERMDICT metadata via
     /// [`Self::bind_shared`]'s identity-gated reuse path instead of
-    /// re-validating unchanged bytes.
+    /// re-validating unchanged bytes. Rebind is owned-only: a mapped backing
+    /// is rejected there with a typed reopen-required transition error and
+    /// must go through a durable reopen instead.
     fn rebind(&self, manifest: ManifestSegment) -> Result<Self, KeeperError> {
         self.reader.validate_witnesses(&self.path, &manifest)?;
         let schema = self.term_dictionary_metadata.schema();
@@ -2509,14 +2543,18 @@ impl RecoveredSegment {
             .load(AtomicOrdering::Relaxed)
     }
 
-    /// Exact heap bytes retained by this binding's validated TERMDICT
+    /// Estimated payload bytes retained by this binding's validated TERMDICT
     /// metadata.
     ///
+    /// Payload estimate only: excludes `Arc` control-block overhead,
+    /// allocation alignment, and allocator slack — not an exact RSS claim.
     /// Rebound generations of the same immutable backing share one metadata
-    /// allocation; each binding reports the full size of the shared object.
+    /// allocation, and each binding reports the FULL payload of that shared
+    /// object: summing this value across concurrently held snapshot
+    /// generations double-counts the shared allocation.
     #[must_use]
-    pub fn term_dictionary_metadata_bytes(&self) -> usize {
-        self.term_dictionary_metadata.heap_bytes()
+    pub fn term_dictionary_metadata_payload_bytes(&self) -> usize {
+        self.term_dictionary_metadata.payload_bytes()
     }
 
     pub(crate) fn cached_rank_pruning_metadata(
@@ -3132,19 +3170,22 @@ impl KeeperSnapshot {
         &self.segments
     }
 
-    /// Total heap bytes retained by validated TERMDICT metadata across every
-    /// segment bound in this snapshot.
+    /// Total estimated payload bytes of validated TERMDICT metadata across
+    /// every segment bound in this snapshot.
     ///
-    /// This is the persistent memory cost of validating TERMDICT metadata
-    /// once per unique immutable backing instead of per query or per rebind.
-    /// A snapshot holds each segment exactly once, so the sum never
-    /// double-counts inside one snapshot; successive snapshot generations that
-    /// share a backing also share one metadata allocation.
+    /// Payload estimate only (see
+    /// [`RecoveredSegment::term_dictionary_metadata_payload_bytes`]): it
+    /// excludes `Arc` control-block overhead, alignment, and allocator slack,
+    /// so it is not an exact memory claim. A snapshot holds each segment
+    /// exactly once, so this sum never double-counts inside ONE snapshot.
+    /// Successive snapshot generations that share a backing also share one
+    /// metadata allocation, and each generation reports that shared payload
+    /// in full: summing across concurrently held snapshots double-counts it.
     #[must_use]
-    pub fn term_dictionary_metadata_bytes(&self) -> u64 {
+    pub fn term_dictionary_metadata_payload_bytes(&self) -> u64 {
         self.segments.iter().fold(0_u64, |total, segment| {
             total.saturating_add(
-                u64::try_from(segment.term_dictionary_metadata_bytes()).unwrap_or(u64::MAX),
+                u64::try_from(segment.term_dictionary_metadata_payload_bytes()).unwrap_or(u64::MAX),
             )
         })
     }
@@ -15698,6 +15739,50 @@ mod tests {
     }
 
     #[test]
+    fn mapped_segment_rebind_is_rejected_with_reopen_required_transition_error() -> TestResult {
+        let directory = tempdir()?;
+        let encoded = encoded_identity_test_segment(0xe02, 0, &[Some("map-a"), Some("map-b")])?;
+        std::fs::write(
+            directory.path().join(canonical_segment_name(0xe02)),
+            encoded.as_bytes(),
+        )?;
+        let manifest = durable_test_manifest(1, vec![manifest_segment(&encoded, 1)]);
+        write_manifest(&directory.path().join("MANIFEST"), &manifest)?;
+
+        let snapshot = KeeperSnapshot::open(directory.path(), DEFAULT_SCHEMA)?;
+        let segment = &snapshot.segments()[0];
+        assert_eq!(segment.term_dictionary_cache_counts(), (1, 0));
+
+        // A mapped backing must never rebind in place: neither metadata reuse
+        // nor the fresh-validation fallback is honest over bytes that can
+        // change on disk behind warm checksum gates. The typed transition
+        // error tells the caller a durable reopen is required.
+        let mut successor = snapshot.next_manifest()?;
+        assert!(successor.segments[0].insert_tombstone(1)?);
+        let Err(error) = segment.rebind(successor.segments[0].clone()) else {
+            panic!("mapped rebind must be rejected with a reopen-required error");
+        };
+        assert!(
+            matches!(
+                &error,
+                KeeperError::InvalidTransition { detail }
+                    if detail.contains("cannot rebind in place")
+                        && detail.contains("durable reopen")
+                        && detail.contains("owned-only")
+            ),
+            "mapped rebind must fail with the typed reopen-required transition \
+             error: {error:?}"
+        );
+        assert_eq!(
+            segment.term_dictionary_cache_counts(),
+            (1, 0),
+            "the rejected rebind must not validate or reuse anything"
+        );
+        assert_eq!(segment.term_dictionary_metadata_reuse_count(), 0);
+        Ok(())
+    }
+
+    #[test]
     fn validated_termdict_metadata_bytes_are_accounted_and_shared_across_rebinds() -> TestResult {
         let original = KeeperSnapshot::in_memory(DEFAULT_SCHEMA)?;
         let first = encoded_identity_test_segment(0xf01, 0, &[Some("acct-a")])?;
@@ -15710,7 +15795,7 @@ mod tests {
         let per_segment = published
             .segments()
             .iter()
-            .map(RecoveredSegment::term_dictionary_metadata_bytes)
+            .map(RecoveredSegment::term_dictionary_metadata_payload_bytes)
             .collect::<Vec<_>>();
         assert!(
             per_segment.iter().all(|&bytes| bytes > 0),
@@ -15719,18 +15804,21 @@ mod tests {
         let expected_total = per_segment.iter().fold(0_u64, |total, &bytes| {
             total.saturating_add(u64::try_from(bytes).unwrap_or(u64::MAX))
         });
-        assert_eq!(published.term_dictionary_metadata_bytes(), expected_total);
+        assert_eq!(
+            published.term_dictionary_metadata_payload_bytes(),
+            expected_total
+        );
 
         let mut tombstoned = published.next_manifest()?;
         assert!(tombstoned.segments[0].insert_tombstone(0)?);
         let rebound = published.publish_owned_segments(&tombstoned, Vec::new())?;
         assert_eq!(
-            rebound.segments()[0].term_dictionary_metadata_bytes(),
+            rebound.segments()[0].term_dictionary_metadata_payload_bytes(),
             per_segment[0],
             "a rebound binding reports the shared allocation, not a new one"
         );
         assert_eq!(
-            rebound.term_dictionary_metadata_bytes(),
+            rebound.term_dictionary_metadata_payload_bytes(),
             expected_total,
             "tombstone-only rebinds must not grow persistent metadata bytes"
         );
