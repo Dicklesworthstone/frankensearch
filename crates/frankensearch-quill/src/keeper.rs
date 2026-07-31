@@ -9325,14 +9325,34 @@ fn segment_unreachability_floor_at(
 ) -> Result<Option<SystemTime>, KeeperError> {
     use rustix::fs::{AtFlags, FileType, fstat, statat};
 
-    if snapshot.loaded_manifest().source != ManifestSource::Current {
+    let source = snapshot.loaded_manifest().source;
+    match source {
+        ManifestSource::PreviousAfterCorruptCurrent => {
+            // An invalid current inode does not reveal when latent or silent
+            // content corruption was first observed. Its ctime/mtime may be
+            // arbitrarily older than the moment its segments became
+            // unreachable to recovery, so no timestamp-derived grace floor is
+            // admissible. Fail before the sweep until writer recovery
+            // durably republishes a valid current slot.
+            return Err(KeeperError::RecoveryRequired {
+                path: directory.join("MANIFEST"),
+            });
+        }
+        ManifestSource::InMemory => {
+            return Err(KeeperError::GarbageDirectoryChanged {
+                directory: directory.to_path_buf(),
+            });
+        }
+        ManifestSource::PreviousAfterMissingCurrent | ManifestSource::Current => {}
+    }
+
+    if source != ManifestSource::Current {
         // The namespace mutation that removed or replaced MANIFEST is the
         // durable recovery-window witness. Unlike the caller's observation
         // time, it remains stable across repeated GC attempts. Include the
-        // selected previous inode and any extant corrupt current inode so an
-        // in-place rewrite cannot make the inferred floor earlier. Unrelated
-        // directory mutations may postpone reclamation, but cannot accelerate
-        // it.
+        // selected previous inode so the inferred floor cannot predate its
+        // publication. Unrelated directory mutations may postpone
+        // reclamation, but cannot accelerate it.
         let directory_stat = fstat(directory_file)
             .map_err(io::Error::from)
             .map_err(|source| KeeperError::Io {
@@ -9372,32 +9392,9 @@ fn segment_unreachability_floor_at(
                 "decode recovery MANIFEST.prev timestamp",
             )?,
         );
-
-        if snapshot.loaded_manifest().source == ManifestSource::PreviousAfterCorruptCurrent {
-            let current_path = directory.join("MANIFEST");
-            let current_stat = statat(directory_file, "MANIFEST", AtFlags::SYMLINK_NOFOLLOW)
-                .map_err(io::Error::from)
-                .map_err(|source| KeeperError::Io {
-                    operation: "inspect corrupt MANIFEST GC witness",
-                    path: current_path.clone(),
-                    source,
-                })?;
-            if FileType::from_raw_mode(current_stat.st_mode) != FileType::RegularFile {
-                return Err(KeeperError::GarbageDirectoryChanged {
-                    directory: directory.to_path_buf(),
-                });
-            }
-            changed = std::cmp::max(
-                changed,
-                required_gc_witness_time(
-                    &current_stat,
-                    &current_path,
-                    "decode corrupt MANIFEST timestamp",
-                )?,
-            );
-        }
         return Ok(Some(changed));
     }
+
     let path = directory.join("MANIFEST");
     let stat = statat(directory_file, "MANIFEST", AtFlags::SYMLINK_NOFOLLOW)
         .map_err(io::Error::from)
@@ -16903,6 +16900,105 @@ mod tests {
                 .removed,
             expected_removed,
             "the second recovery attempt must not reset the grace to its call time"
+        );
+        assert!(!segment_path.exists());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn corrupt_current_blocks_gc_until_valid_current_is_republished() -> TestResult {
+        use rustix::fs::{AtFlags, statat};
+
+        let directory = tempdir()?;
+        let unreachable = write_test_segment(directory.path(), 0xc0ff_ee, 1, 0, 2)?;
+        let segment_name = canonical_segment_name(unreachable.segment_id);
+        let segment_path = directory.path().join(&segment_name);
+        File::options()
+            .write(true)
+            .open(&segment_path)?
+            .set_times(std::fs::FileTimes::new().set_modified(SystemTime::UNIX_EPOCH))?;
+
+        write_manifest(
+            &directory.path().join("MANIFEST.prev"),
+            &durable_test_manifest(1, Vec::new()),
+        )?;
+        let current_path = directory.path().join("MANIFEST");
+        std::fs::write(&current_path, b"old latent corruption")?;
+        File::options()
+            .write(true)
+            .open(&current_path)?
+            .set_times(std::fs::FileTimes::new().set_modified(SystemTime::UNIX_EPOCH))?;
+
+        let snapshot = KeeperSnapshot::open(directory.path(), DEFAULT_SCHEMA)?;
+        assert_eq!(
+            snapshot.loaded_manifest().source,
+            ManifestSource::PreviousAfterCorruptCurrent
+        );
+        let directory_file = open_gc_directory(directory.path())?;
+        let current_stat = statat(&directory_file, "MANIFEST", AtFlags::SYMLINK_NOFOLLOW)?;
+        let stale_inode_time = required_gc_witness_time(
+            &current_stat,
+            &current_path,
+            "decode test corrupt-current timestamp",
+        )?;
+        let first_observation = stale_inode_time
+            .checked_add(DEFAULT_GARBAGE_GRACE + Duration::from_secs(1))
+            .ok_or_else(|| io::Error::other("test clock remains representable"))?;
+        let second_observation = first_observation
+            .checked_add(Duration::from_secs(3_600))
+            .ok_or_else(|| io::Error::other("test clock remains representable"))?;
+        let before = directory_bytes(directory.path())?;
+
+        assert!(matches!(
+            collect_writer_garbage_at(
+                directory.path(),
+                DEFAULT_SCHEMA,
+                GarbageCollectionOptions::default(),
+                first_observation,
+            ),
+            Err(KeeperError::RecoveryRequired { .. })
+        ));
+        assert_eq!(directory_bytes(directory.path())?, before);
+        assert!(segment_path.exists());
+
+        assert!(matches!(
+            collect_writer_garbage_at(
+                directory.path(),
+                DEFAULT_SCHEMA,
+                GarbageCollectionOptions::default(),
+                second_observation,
+            ),
+            Err(KeeperError::RecoveryRequired { .. })
+        ));
+        assert_eq!(directory_bytes(directory.path())?, before);
+        assert!(segment_path.exists());
+
+        write_manifest(&current_path, &durable_test_manifest(2, Vec::new()))?;
+        File::open(&current_path)?.sync_all()?;
+        sync_directory(directory.path())?;
+        let recovered = KeeperSnapshot::open(directory.path(), DEFAULT_SCHEMA)?;
+        assert_eq!(recovered.loaded_manifest().source, ManifestSource::Current);
+        let directory_file = open_gc_directory(directory.path())?;
+        let republish_floor = segment_unreachability_floor_at(
+            &directory_file,
+            directory.path(),
+            &recovered,
+            second_observation,
+        )?
+        .ok_or_else(|| io::Error::other("valid republish supplies a GC floor"))?;
+        let after_republish_grace = republish_floor
+            .checked_add(DEFAULT_GARBAGE_GRACE)
+            .ok_or_else(|| io::Error::other("test clock remains representable"))?;
+        assert_eq!(
+            collect_writer_garbage_at(
+                directory.path(),
+                DEFAULT_SCHEMA,
+                GarbageCollectionOptions::default(),
+                after_republish_grace,
+            )?
+            .removed,
+            vec![PathBuf::from(segment_name)]
         );
         assert!(!segment_path.exists());
         Ok(())
