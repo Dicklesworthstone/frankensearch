@@ -78,6 +78,17 @@ see "Deferred lib.rs hunks" below.
   fabricated. Operational id strings are unchanged (`fsfs/src/runtime.rs`
   compares them to `embedder.id()` at `:678/:11203`; the typed bundle, not
   a string, is the compatibility authority).
+- **NEW production failure mode** (named per review #8151): threading
+  identities through `build` made it able to fail where it previously
+  succeeded — an embedder whose declared identity's space dimension does
+  not describe the vectors it actually emits is rejected at
+  `TwoTierIndexBuilder::finish` with typed `InvalidConfig`
+  (`fast_identity.space.dimension` / `quality_identity.space.dimension`,
+  via `ensure_identity_describes_tier`) — never a panic, and never an
+  index written that carries an identity lying about its vectors. Pinned
+  end-to-end through the facade by
+  `build_fails_typed_when_declared_identity_dimension_mismatches_vectors`
+  (follow-up commit on `codex/sandygrove-t2c2f-20260731`).
 
 ## Identity representation decisions
 
@@ -111,6 +122,7 @@ see "Deferred lib.rs hunks" below.
 | `semantic_vector_with_tier_reports_serving_tier` | two_tier.rs | 3, 5 |
 | `build_threads_typed_identity_into_persisted_headers` | index_builder.rs | 4, 6 |
 | `build_without_identity_bundles_stays_legacy_unidentified` | index_builder.rs | — (legacy-arm pin) |
+| `build_fails_typed_when_declared_identity_dimension_mismatches_vectors` | index_builder.rs | — (new-failure-mode pin; review #8151 follow-up commit) |
 
 Red-proof transcripts (each: mutation applied at `e5693265`, targeted test
 FAILING with `EXIT_STATUS=101` under `set -o pipefail`, mutation reverted,

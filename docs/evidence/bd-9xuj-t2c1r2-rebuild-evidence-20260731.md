@@ -60,8 +60,9 @@ C3 replay deviations from frozen `548a6177` (both confined to test code in
    enum at `types.rs:371`, stable codes at `types.rs:388`); otherwise typed
    rejection at `query_embedding.<tier>.producer_conformance`. Red proof 3
    witnesses the resurrected obsolete law being caught.
-3. **Producer-conformance certification/telemetry + real create_v2
-   roundtrip.** `crates/frankensearch-index/tests/space_identity_roundtrip.rs`
+3. **Producer certificate equality (comparison of declared certificates)
+   /telemetry + real create_v2 roundtrip.**
+   `crates/frankensearch-index/tests/space_identity_roundtrip.rs`
    writes a real FSVI v2 artifact through the production
    `VectorIndex::create_v2` writer (`index/src/lib.rs:1819`), admits it via
    `VectorIndex::open_admitted_v2` (`index/src/lib.rs:1647`), pins
@@ -69,7 +70,11 @@ C3 replay deviations from frozen `548a6177` (both confined to test code in
    (`verify_space_identity`), certifies (`SameProducer` and
    `ConformanceCompatibleProducer` against the artifact's frozen bundle), and
    rejects a wrong model at equal dimension — all against the artifact's own
-   header bytes. Not synthetic.
+   header bytes. Not synthetic. What admission establishes here is EQUALITY
+   of declared golden-vector certificates (heading corrected per review
+   #8151 — no embedder is executed against the golden corpus on this path);
+   the execution-attestation leg is a C4-blocking carry-forward per that
+   review.
 4. **No new panic paths.** The `8cb3c3e7` test `panic!` is gone; all new
    error-variant pins use let-else with `Result<(), String>` tests. UBS
    confirms: CRITICAL `panic!` count on the changed files is 1 → 1

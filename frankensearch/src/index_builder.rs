@@ -1462,6 +1462,57 @@ mod tests {
         });
     }
 
+    /// bd-9xuj T2-C2 follow-up (review #8151): threading identities through
+    /// `build` introduced a NEW production failure mode — a build that
+    /// previously succeeded now fails when an embedder's declared identity
+    /// does not describe the vectors it actually emits. Pin the failure:
+    /// declared space dimension 8, emitted vectors dimension 4 →
+    /// `TwoTierIndexBuilder::finish` rejects with typed `InvalidConfig` at
+    /// `fast_identity.space.dimension` — never a panic, and never an index
+    /// carrying an identity that lies about its vectors.
+    #[test]
+    fn build_fails_typed_when_declared_identity_dimension_mismatches_vectors() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let dir = tempfile::tempdir().unwrap();
+            // Emits 4-dim vectors but declares an 8-dim space: exactly the
+            // self-inconsistent embedder the finish()-time check exists for.
+            let lying = IdentityStubEmbedder {
+                id: "identity-lying-fast",
+                dim: 4,
+                identity:
+                    frankensearch_core::generation::EmbeddingIdentityBundleV1::explicit_test_model(
+                        "identity-lying-fast",
+                        8,
+                    ),
+            };
+            let stack = EmbedderStack::from_parts(Arc::new(lying), None);
+            let error = IndexBuilder::new(dir.path())
+                .with_embedder_stack(stack)
+                .add_document("doc-1", "Hello world")
+                .build(&cx)
+                .await
+                .expect_err(
+                    "a declared identity that does not describe the emitted vectors \
+                     must fail the build with a typed error",
+                );
+            assert!(
+                matches!(
+                    &error,
+                    SearchError::InvalidConfig {
+                        field,
+                        value,
+                        reason,
+                    } if field == "fast_identity.space.dimension"
+                        && value == "8"
+                        && reason.contains("does not describe")
+                ),
+                "expected typed InvalidConfig at fast_identity.space.dimension \
+                 (value 8, refusing an identity that does not describe the \
+                 written vectors), got {error:?}"
+            );
+        });
+    }
+
     #[test]
     fn build_fast_only() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {

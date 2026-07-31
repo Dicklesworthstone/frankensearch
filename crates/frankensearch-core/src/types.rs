@@ -366,8 +366,17 @@ impl BoundQueryEmbedding {
 /// can log and route the admission basis instead of collapsing it into a bare
 /// `Ok`: a foreign producer admitted through its golden-vector certificate is
 /// telemetry-visible by construction.
+///
+/// `#[non_exhaustive]` (review #8151): the different-corpus-digest case
+/// today rejects only vacuously through the single reject arm — nothing
+/// distinguishes "certificates pinned to different corpora, so conformance
+/// is unattestable" from "same corpus, conformance failed". A future typed
+/// `Unattestable` classification is expected as a third arm; marking the
+/// enum non-exhaustive now means adding it will not be a semver break on
+/// downstream matches.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "admission")]
+#[non_exhaustive]
 pub enum SpaceIdentityAdmission {
     /// Same space and the same attested producer.
     SameProducer,
@@ -1047,6 +1056,66 @@ mod tests {
         assert_eq!(field, "query_embedding.fast.producer_conformance");
         assert_eq!(value, base.producer.fingerprint());
         assert!(reason.contains("golden-vector certificate"));
+        Ok(())
+    }
+
+    /// Pins the KNOWN GAP the review (#8151) named, so it is documented
+    /// rather than hidden: two producers whose golden-vector certificates
+    /// differ ONLY in the corpus digest were certified against different
+    /// golden corpora, so their conformance is not comparable at all —
+    /// yet today the admission law rejects them through the same single
+    /// reject arm as a same-corpus conformance failure. The rejection is
+    /// correct but VACUOUS: no typed `Unattestable` classification exists
+    /// yet to distinguish "cannot be attested" from "attested and failed".
+    /// When that third [`SpaceIdentityAdmission`] arm lands (the enum is
+    /// `#[non_exhaustive]` for exactly that addition), this test pins the
+    /// behavior it replaces.
+    #[test]
+    fn different_corpus_digest_certificates_reject_vacuously_today() -> Result<(), String> {
+        let base = identity("corpus-digest-model", 8);
+        let bound = BoundQueryEmbedding::new(vec![0.5; 8], base.clone()).expect("bind");
+
+        // Expected side differs from the query side ONLY in the golden
+        // corpus digest: a certificate genuinely pinned to a different
+        // (equally valid) golden corpus.
+        let mut foreign_corpus = base.clone();
+        foreign_corpus.producer.golden_vectors.corpus_sha256 =
+            crate::generation::GoldenVectorCertificateV1::corpus_fingerprint(&[
+                "a different golden corpus",
+            ])
+            .expect("corpus fingerprint");
+        foreign_corpus
+            .validate()
+            .expect("a certificate pinned to another corpus is still a coherent bundle");
+        assert_ne!(
+            foreign_corpus.producer.golden_vectors.corpus_sha256,
+            base.producer.golden_vectors.corpus_sha256,
+            "the corpus digests must differ"
+        );
+        assert_eq!(
+            foreign_corpus.producer.golden_vectors.vectors_sha256,
+            base.producer.golden_vectors.vectors_sha256,
+            "everything but the corpus digest must be identical"
+        );
+        assert_eq!(
+            foreign_corpus.producer.golden_vectors.vector_count,
+            base.producer.golden_vectors.vector_count
+        );
+        assert_eq!(
+            foreign_corpus.producer.golden_vectors.dimension,
+            base.producer.golden_vectors.dimension
+        );
+
+        // Today: rejected through the single producer-conformance reject
+        // arm — indistinguishable from a same-corpus conformance failure.
+        let error = bound
+            .verify_producer_conformance(&foreign_corpus, "fast")
+            .expect_err("a different-corpus certificate must not be admitted");
+        let rendered = format!("{error:?}");
+        let SearchError::InvalidConfig { field, .. } = error else {
+            return Err(format!("expected InvalidConfig, got {rendered}"));
+        };
+        assert_eq!(field, "query_embedding.fast.producer_conformance");
         Ok(())
     }
 
