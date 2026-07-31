@@ -4375,7 +4375,13 @@ mod tests {
     #[test]
     fn every_profile_and_gate_has_a_unique_latest_destination() {
         let registry = MachineClassRegistry::frozen().expect("frozen registry");
+        assert_eq!(
+            registry.execution_profiles.len(),
+            5,
+            "the frozen registry proof must cover exactly five execution profiles"
+        );
         let mut destinations = BTreeSet::new();
+        let mut normalized_destinations = BTreeSet::new();
         for profile in &registry.execution_profiles {
             for gate in 1..=10 {
                 let gate = format!("QG-{gate}");
@@ -4387,12 +4393,25 @@ mod tests {
                     destinations.insert(destination.clone()),
                     "profile-qualified destination collision: {destination}"
                 );
+                assert!(
+                    destination.is_ascii(),
+                    "latest destinations must remain ASCII: {destination}"
+                );
+                assert!(
+                    normalized_destinations.insert(destination.to_ascii_lowercase()),
+                    "ASCII-normalized destination collision: {destination}"
+                );
             }
         }
         assert_eq!(
             destinations.len(),
-            registry.execution_profiles.len() * 10,
+            50,
             "five profiles times ten normative gates must produce fifty destinations"
+        );
+        assert_eq!(
+            normalized_destinations.len(),
+            50,
+            "all fifty destinations must also remain unique after ASCII normalization"
         );
     }
 
