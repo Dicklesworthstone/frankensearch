@@ -9,6 +9,7 @@ use std::collections::HashMap;
 #[cfg(feature = "ann")]
 use std::collections::HashSet;
 use std::fs;
+use std::io::{Read as _, Seek as _, SeekFrom};
 use std::path::{Path, PathBuf};
 #[cfg(feature = "ann")]
 use std::sync::atomic::AtomicU64;
@@ -24,8 +25,8 @@ use crate::hnsw::HNSW_META_FORMAT_CURRENT;
 #[cfg(feature = "ann")]
 use crate::hnsw::HnswLoadDisposition;
 use crate::{
-    ClassifiedHits, FsviAdmissionError, FsviV2IdentityBinding, Quantization, SearchParams,
-    VectorIndex, dot_product_f32_f32,
+    ClassifiedHits, FsviAdmissionError, FsviUpgradeRequired, FsviV2IdentityBinding, Quantization,
+    SearchParams, ValidatedFsviBytes, VectorIndex, VectorMetadata, dot_product_f32_f32,
 };
 #[cfg(feature = "ann")]
 use crate::{HNSW_DEFAULT_MAX_LAYER, HnswConfig, HnswIndex};
@@ -404,11 +405,56 @@ enum QualityAlignment {
     Mapping(Vec<Option<usize>>),
 }
 
+/// One opened tier: either a plain v1 path-opened index or a fully retained
+/// sealed FSVI v2 admission owner (bd-9xuj C4-write r2).
+///
+/// The `AdmittedV2` variant retains the complete [`ValidatedFsviBytes`]
+/// owner — the `Arc`'d byte image, the complete admission witness, and the
+/// publication state — honoring the owner contract on [`ValidatedFsviBytes`]:
+/// the owner is never converted into a mutable/path-opened [`VectorIndex`];
+/// the tier's index is only ever borrowed from inside the retained owner.
+// The owner is materially larger than a plain `VectorIndex` (it additionally
+// carries the witness and the byte handle), but exactly one `TierSource`
+// exists per tier per opened index, so the variant-size asymmetry buys
+// capability retention for a few hundred one-time bytes.
+#[allow(clippy::large_enum_variant)]
+#[derive(Debug)]
+enum TierSource {
+    /// Plain v1 [`VectorIndex::open`] tier (mutable mapping, WAL-bearing).
+    PathOpened(VectorIndex),
+    /// Sealed FSVI v2 admission owner, retained in full.
+    AdmittedV2(ValidatedFsviBytes),
+}
+
+impl TierSource {
+    /// Borrow the tier's index for read-only serving.
+    ///
+    /// For `AdmittedV2` this borrows the validated index INSIDE the retained
+    /// owner (crate-internal field access); the owner itself stays sealed and
+    /// is never moved out of, so its byte/witness/publication capabilities
+    /// remain intact for the lifetime of the tier.
+    const fn index(&self) -> &VectorIndex {
+        match self {
+            Self::PathOpened(index) => index,
+            Self::AdmittedV2(owner) => &owner.index,
+        }
+    }
+
+    /// The retained sealed admission owner, when this tier came from exact
+    /// FSVI v2 admission.
+    const fn admitted_owner(&self) -> Option<&ValidatedFsviBytes> {
+        match self {
+            Self::PathOpened(_) => None,
+            Self::AdmittedV2(owner) => Some(owner),
+        }
+    }
+}
+
 /// Dual-index container used by progressive search orchestration.
 #[derive(Debug)]
 pub struct TwoTierIndex {
-    fast_index: VectorIndex,
-    quality_index: Option<VectorIndex>,
+    fast_source: TierSource,
+    quality_source: Option<TierSource>,
     #[cfg(feature = "ann")]
     fast_ann: Option<HnswIndex>,
     #[cfg(feature = "ann")]
@@ -512,12 +558,12 @@ impl TwoTierIndex {
     pub fn open_with_paths(paths: &TwoTierIndexPaths, config: TwoTierConfig) -> SearchResult<Self> {
         let paths = paths.clone().into_absolute()?;
         validate_index_paths(&paths)?;
-        let fast_index = VectorIndex::open(paths.fast_index())?;
-        let quality_index = match paths.quality_index() {
-            Some(quality_path) => Some(VectorIndex::open(quality_path)?),
+        let fast_source = TierSource::PathOpened(VectorIndex::open(paths.fast_index())?);
+        let quality_source = match paths.quality_index() {
+            Some(quality_path) => Some(TierSource::PathOpened(VectorIndex::open(quality_path)?)),
             None => None,
         };
-        Self::assemble_opened(fast_index, quality_index, &paths, config)
+        Self::assemble_opened(fast_source, quality_source, &paths, config)
     }
 
     /// Open a two-tier generation whose tiers are identity-complete FSVI v2
@@ -526,12 +572,16 @@ impl TwoTierIndex {
     /// [`VectorIndex::open`] is strictly v1 — it rejects v2 bytes with
     /// `IndexVersionMismatch` — so v2 tiers can never be plain-opened. Each
     /// supplied tier is admitted via [`VectorIndex::open_admitted_v2`]
-    /// against its caller-held [`FsviV2IdentityBinding`], and the retained
-    /// owner's validated index becomes the tier. The resulting index reports
-    /// header-ATTESTED identity: [`Self::fast_identity_is_attested`] (and the
-    /// quality counterpart when a quality tier is supplied) return `true`,
-    /// and the per-tier space fingerprints come from each artifact's own
-    /// validated header bytes.
+    /// against its caller-held [`FsviV2IdentityBinding`], and the sealed
+    /// [`ValidatedFsviBytes`] owner is RETAINED IN FULL (r2 repair of the
+    /// C4-write NO-GO): the `Arc`'d byte image, complete witness, and
+    /// publication state stay reachable via
+    /// [`Self::fast_admitted_owner`] / [`Self::quality_admitted_owner`], and
+    /// the tier is served by reference from inside the owner. The resulting
+    /// index reports header-ATTESTED identity:
+    /// [`Self::fast_identity_is_attested`] (and the quality counterpart when
+    /// a quality tier is supplied) return `true`, and the per-tier space
+    /// fingerprints come from each artifact's own validated header bytes.
     ///
     /// A quality path and its binding must be supplied together: a v2 tier
     /// without a binding has no legitimate open path.
@@ -550,9 +600,12 @@ impl TwoTierIndex {
     ) -> SearchResult<Self> {
         let paths = paths.clone().into_absolute()?;
         validate_index_paths(&paths)?;
-        let fast_index = admit_v2_tier(paths.fast_index(), fast_binding, "fast")?;
-        let quality_index = match (paths.quality_index(), quality_binding) {
-            (Some(path), Some(binding)) => Some(admit_v2_tier(path, binding, "quality")?),
+        let fast_source =
+            TierSource::AdmittedV2(admit_v2_tier(paths.fast_index(), fast_binding, "fast")?);
+        let quality_source = match (paths.quality_index(), quality_binding) {
+            (Some(path), Some(binding)) => Some(TierSource::AdmittedV2(admit_v2_tier(
+                path, binding, "quality",
+            )?)),
             (None, None) => None,
             (Some(path), None) => {
                 return Err(SearchError::InvalidConfig {
@@ -572,7 +625,7 @@ impl TwoTierIndex {
                 });
             }
         };
-        Self::assemble_opened(fast_index, quality_index, &paths, config)
+        Self::assemble_opened(fast_source, quality_source, &paths, config)
     }
 
     /// Shared assembly over tiers that were already opened — by the plain v1
@@ -580,17 +633,19 @@ impl TwoTierIndex {
     /// (bd-9xuj T2-C4-write refactor). Computes quality alignment, plans ANN
     /// sidecars, and retains per-tier header identity. Behavior for the v1
     /// path is unchanged; the identity retention comment below applies to
-    /// both sources.
+    /// both sources. Admitted v2 sources arrive as sealed retained owners
+    /// ([`TierSource::AdmittedV2`]) and are only ever borrowed here.
     #[allow(clippy::too_many_lines)]
     fn assemble_opened(
-        fast_index: VectorIndex,
-        quality_index: Option<VectorIndex>,
+        fast_source: TierSource,
+        quality_source: Option<TierSource>,
         paths: &TwoTierIndexPaths,
         config: TwoTierConfig,
     ) -> SearchResult<Self> {
+        let fast_index = fast_source.index();
         let mut quality_alignment = QualityAlignment::None;
 
-        let quality_index = if let Some(quality) = quality_index {
+        let quality_index = if let Some(quality) = quality_source.as_ref().map(TierSource::index) {
             if quality.record_count() != fast_index.record_count() {
                 warn!(
                     fast_records = fast_index.record_count(),
@@ -711,7 +766,7 @@ impl TwoTierIndex {
         #[cfg(feature = "ann")]
         let fast_ann_plan = paths.fast_ann.as_deref().and_then(|fast_ann_path| {
             plan_load_or_build_ann(
-                &fast_index,
+                fast_index,
                 fast_ann_path,
                 config.hnsw_threshold,
                 &config,
@@ -720,7 +775,7 @@ impl TwoTierIndex {
         });
 
         #[cfg(feature = "ann")]
-        let quality_ann_plan = quality_index.as_ref().and_then(|quality_index| {
+        let quality_ann_plan = quality_index.and_then(|quality_index| {
             paths.quality_ann.as_deref().and_then(|quality_ann_path| {
                 plan_load_or_build_ann(
                     quality_index,
@@ -821,13 +876,12 @@ impl TwoTierIndex {
             .identity_v2()
             .map(|identity| crate::fingerprint_hex(&identity.space_fingerprint));
         let quality_space_fingerprint_hex = quality_index
-            .as_ref()
             .and_then(VectorIndex::identity_v2)
             .map(|identity| crate::fingerprint_hex(&identity.space_fingerprint));
 
         Ok(Self {
-            fast_index,
-            quality_index,
+            fast_source,
+            quality_source,
             #[cfg(feature = "ann")]
             fast_ann,
             #[cfg(feature = "ann")]
@@ -854,6 +908,55 @@ impl TwoTierIndex {
     pub fn create(dir: &Path, config: TwoTierConfig) -> SearchResult<TwoTierIndexBuilder> {
         fs::create_dir_all(dir)?;
         Ok(TwoTierIndexBuilder::new(dir.to_path_buf(), config))
+    }
+
+    /// Borrow the fast tier's index for read paths.
+    const fn fast_tier(&self) -> &VectorIndex {
+        self.fast_source.index()
+    }
+
+    /// Borrow the quality tier's index for read paths, when loaded.
+    fn quality_tier(&self) -> Option<&VectorIndex> {
+        self.quality_source.as_ref().map(TierSource::index)
+    }
+
+    /// Test-only mutable access to a PATH-OPENED fast tier (WAL injection).
+    ///
+    /// Panics on an admitted v2 tier: sealed owners are never mutably
+    /// exposed, in tests or otherwise.
+    #[cfg(test)]
+    fn fast_tier_mut_for_test(&mut self) -> &mut VectorIndex {
+        match &mut self.fast_source {
+            TierSource::PathOpened(index) => index,
+            TierSource::AdmittedV2(_) => {
+                panic!("admitted v2 tiers are sealed; no mutable access even in tests")
+            }
+        }
+    }
+
+    /// The retained sealed admission owner of the fast tier, when this index
+    /// was opened through exact FSVI v2 admission
+    /// ([`Self::open_admitted_v2_with_paths`]).
+    ///
+    /// The owner carries the `Arc`'d validated byte image, the complete
+    /// [`crate::FsviV2Witness`], and the publication state
+    /// ([`ValidatedFsviBytes::published_wal_absent`]). Replacing, renaming,
+    /// or mutating the source pathname after admission cannot alter what the
+    /// retained owner serves. `None` for plain v1 path-opened tiers.
+    #[must_use]
+    pub const fn fast_admitted_owner(&self) -> Option<&ValidatedFsviBytes> {
+        self.fast_source.admitted_owner()
+    }
+
+    /// Quality-tier counterpart of [`Self::fast_admitted_owner`].
+    ///
+    /// `None` both when no quality tier is loaded and when the loaded one is
+    /// a plain v1 path-opened tier.
+    #[must_use]
+    pub fn quality_admitted_owner(&self) -> Option<&ValidatedFsviBytes> {
+        self.quality_source
+            .as_ref()
+            .and_then(TierSource::admitted_owner)
     }
 
     /// Search the fast tier only.
@@ -890,7 +993,7 @@ impl TwoTierIndex {
             // canonical VectorIndex search; overfetching would incorrectly
             // backfill lower-ranked public IDs.
             let (hits, stats) = ann.knn_search_raw_with_stats_against(
-                &self.fast_index,
+                self.fast_tier(),
                 query_vec,
                 k,
                 self.config.hnsw_ef_search,
@@ -919,8 +1022,8 @@ impl TwoTierIndex {
             rescore_top_k: self.config.mrl_rescore_top_k,
         };
 
-        if mrl_config.search_dims > 0 && mrl_config.search_dims < self.fast_index.dimension() {
-            return self.fast_index.mrl_search(query_vec, k, &mrl_config, None);
+        if mrl_config.search_dims > 0 && mrl_config.search_dims < self.fast_tier().dimension() {
+            return self.fast_tier().mrl_search(query_vec, k, &mrl_config, None);
         }
 
         // Default (no explicit exact-scan params): the fast tier is a reranked candidate generator
@@ -935,11 +1038,11 @@ impl TwoTierIndex {
         const FAST_TIER_MULT: usize = 3;
         params.map_or_else(
             || {
-                self.fast_index
+                self.fast_tier()
                     .search_top_k_int8_two_pass(query_vec, k, FAST_TIER_MULT)
             },
             |params| {
-                self.fast_index
+                self.fast_tier()
                     .search_top_k_with_params(query_vec, k, None, params)
             },
         )
@@ -963,9 +1066,9 @@ impl TwoTierIndex {
         query_vec: &[f32],
         k: usize,
     ) -> SearchResult<ClassifiedHits> {
-        if query_vec.len() != self.fast_index.dimension() {
+        if query_vec.len() != self.fast_tier().dimension() {
             return Err(SearchError::DimensionMismatch {
-                expected: self.fast_index.dimension(),
+                expected: self.fast_tier().dimension(),
                 found: query_vec.len(),
             });
         }
@@ -999,7 +1102,7 @@ impl TwoTierIndex {
     /// live vectors, the empty result is the ANN-availability anomaly rather
     /// than a data problem.
     fn classify_fast_empty(&self) -> ZeroSignalReason {
-        let state = self.fast_index.zero_signal_state();
+        let state = self.fast_tier().zero_signal_state();
         if let Some(reason) = state.state_reason() {
             return reason;
         }
@@ -1072,16 +1175,16 @@ impl TwoTierIndex {
         // HNSW maps compact graph ids to canonical physical VectorIndex rows.
         // Keep that identity: resolving through doc_id would collapse distinct
         // physical rows before the canonical result resolver gets to rank them.
-        let base_index = self.fast_index.record_count();
+        let base_index = self.fast_tier().record_count();
         let mut hits = Vec::with_capacity(
             ann_hits
                 .len()
-                .saturating_add(self.fast_index.wal_entries.len()),
+                .saturating_add(self.fast_tier().wal_entries.len()),
         );
         for hit in ann_hits {
             if let Ok(position) = usize::try_from(hit.index)
                 && position < base_index
-                && !self.fast_index.is_deleted(position)
+                && !self.fast_tier().is_deleted(position)
             {
                 hits.push(hit);
             }
@@ -1099,7 +1202,7 @@ impl TwoTierIndex {
         // Suppression must happen after physical top-k selection. Doing it
         // earlier backfills a lower-ranked hit that canonical exact search
         // deliberately does not return.
-        for (wal_index, entry) in self.fast_index.wal_entries.iter().enumerate() {
+        for (wal_index, entry) in self.fast_tier().wal_entries.iter().enumerate() {
             let score = dot_product_f32_f32(&entry.embedding, query_vec)?;
             if !score.is_finite() {
                 continue;
@@ -1171,7 +1274,7 @@ impl TwoTierIndex {
         query_vec: &[f32],
         hits: &[VectorHit],
     ) -> SearchResult<Vec<Option<f32>>> {
-        let Some(quality_index) = &self.quality_index else {
+        let Some(quality_index) = self.quality_tier() else {
             return Ok(vec![None; hits.len()]);
         };
 
@@ -1209,8 +1312,8 @@ impl TwoTierIndex {
 
             if found_score.is_none() {
                 let fast_idx = if hit.index == u32::MAX {
-                    self.fast_index.find_index_by_doc_id(&hit.doc_id)?
-                } else if (hit.index as usize) < self.fast_index.record_count() {
+                    self.fast_tier().find_index_by_doc_id(&hit.doc_id)?
+                } else if (hit.index as usize) < self.fast_tier().record_count() {
                     Some(hit.index as usize)
                 } else {
                     None
@@ -1236,7 +1339,7 @@ impl TwoTierIndex {
     /// Returns true when a quality index was loaded.
     #[must_use]
     pub const fn has_quality_index(&self) -> bool {
-        self.quality_index.is_some()
+        self.quality_source.is_some()
     }
 
     /// Returns true when fast-tier ANN is loaded/enabled.
@@ -1266,33 +1369,31 @@ impl TwoTierIndex {
     /// Number of documents in the fast tier (canonical document count).
     #[must_use]
     pub const fn doc_count(&self) -> usize {
-        self.fast_index.record_count()
+        self.fast_tier().record_count()
     }
 
     /// Embedder identity recorded in the fast-tier index header.
     #[must_use]
     pub fn fast_embedder_id(&self) -> &str {
-        self.fast_index.embedder_id()
+        self.fast_tier().embedder_id()
     }
 
     /// Embedder revision recorded in the fast-tier index header.
     #[must_use]
     pub fn fast_embedder_revision(&self) -> &str {
-        self.fast_index.embedder_revision()
+        self.fast_tier().embedder_revision()
     }
 
     /// Embedder identity recorded in the quality-tier index header, when loaded.
     #[must_use]
     pub fn quality_embedder_id(&self) -> Option<&str> {
-        self.quality_index.as_ref().map(VectorIndex::embedder_id)
+        self.quality_tier().map(VectorIndex::embedder_id)
     }
 
     /// Embedder revision recorded in the quality-tier index header, when loaded.
     #[must_use]
     pub fn quality_embedder_revision(&self) -> Option<&str> {
-        self.quality_index
-            .as_ref()
-            .map(VectorIndex::embedder_revision)
+        self.quality_tier().map(VectorIndex::embedder_revision)
     }
 
     /// Lowercase hex SHA-256 fingerprint of the fast tier's embedding space,
@@ -1369,7 +1470,7 @@ impl TwoTierIndex {
     /// the typed legacy refusal.
     #[must_use]
     pub fn fast_identity_is_attested(&self) -> bool {
-        self.fast_index.identity_v2().is_some()
+        self.fast_tier().identity_v2().is_some()
     }
 
     /// Quality-tier counterpart of [`Self::fast_identity_is_attested`].
@@ -1378,8 +1479,7 @@ impl TwoTierIndex {
     /// carries no validated v2 identity header.
     #[must_use]
     pub fn quality_identity_is_attested(&self) -> bool {
-        self.quality_index
-            .as_ref()
+        self.quality_tier()
             .is_some_and(|index| index.identity_v2().is_some())
     }
 
@@ -1398,20 +1498,18 @@ impl TwoTierIndex {
     /// Filesystem path of the loaded fast-tier index artifact.
     #[must_use]
     pub fn fast_index_path(&self) -> &Path {
-        &self.fast_index.path
+        &self.fast_tier().path
     }
 
     /// Filesystem path of the loaded quality-tier index artifact, when loaded.
     #[must_use]
     pub fn quality_index_path(&self) -> Option<&Path> {
-        self.quality_index
-            .as_ref()
-            .map(|index| index.path.as_path())
+        self.quality_tier().map(|index| index.path.as_path())
     }
 
     /// Iterate over all document IDs in fast-tier order.
     pub fn iter_doc_ids(&self) -> impl Iterator<Item = SearchResult<String>> + '_ {
-        (0..self.doc_count()).map(|i| self.fast_index.doc_id_at(i).map(ToOwned::to_owned))
+        (0..self.doc_count()).map(|i| self.fast_tier().doc_id_at(i).map(ToOwned::to_owned))
     }
 
     /// Document ID at a given fast-tier index position.
@@ -1420,7 +1518,7 @@ impl TwoTierIndex {
     ///
     /// Returns `SearchError` if the index is out of bounds or reading fails.
     pub fn doc_id_at(&self, index: usize) -> SearchResult<&str> {
-        self.fast_index.doc_id_at(index)
+        self.fast_tier().doc_id_at(index)
     }
 
     /// Fast-tier index position for a given document id.
@@ -1429,7 +1527,7 @@ impl TwoTierIndex {
     ///
     /// Returns `SearchError` if index reading fails.
     pub fn fast_index_for_doc_id(&self, doc_id: &str) -> SearchResult<Option<usize>> {
-        self.fast_index.find_index_by_doc_id(doc_id)
+        self.fast_tier().find_index_by_doc_id(doc_id)
     }
 
     /// Fast-tier vector for the given document id.
@@ -1439,14 +1537,14 @@ impl TwoTierIndex {
     /// Returns `SearchError` if index access fails.
     pub fn fast_vector_for_doc_id(&self, doc_id: &str) -> SearchResult<Option<Vec<f32>>> {
         let hash = crate::fnv1a_hash(doc_id.as_bytes());
-        for entry in self.fast_index.wal_entries.iter().rev() {
+        for entry in self.fast_tier().wal_entries.iter().rev() {
             if entry.doc_id_hash == hash && entry.doc_id == doc_id {
                 return Ok(Some(entry.embedding.clone()));
             }
         }
 
-        if let Some(index) = self.fast_index.find_index_by_doc_id(doc_id)? {
-            return self.fast_index.vector_at_f32(index).map(Some);
+        if let Some(index) = self.fast_tier().find_index_by_doc_id(doc_id)? {
+            return self.fast_tier().vector_at_f32(index).map(Some);
         }
 
         Ok(None)
@@ -1458,7 +1556,7 @@ impl TwoTierIndex {
     ///
     /// Returns `SearchError` if index access fails.
     pub fn quality_vector_for_doc_id(&self, doc_id: &str) -> SearchResult<Option<Vec<f32>>> {
-        let Some(quality_index) = self.quality_index.as_ref() else {
+        let Some(quality_index) = self.quality_tier() else {
             return Ok(None);
         };
 
@@ -1469,7 +1567,7 @@ impl TwoTierIndex {
             }
         }
 
-        if let Some(fast_index) = self.fast_index.find_index_by_doc_id(doc_id)? {
+        if let Some(fast_index) = self.fast_tier().find_index_by_doc_id(doc_id)? {
             if let Some(quality_index_pos) = self.quality_index_for_fast_index(fast_index) {
                 return quality_index.vector_at_f32(quality_index_pos).map(Some);
             }
@@ -1877,6 +1975,15 @@ impl TwoTierIndexBuilder {
             fast_writer.write_record(doc_id, embedding)?;
         }
         fast_writer.finish()?;
+        // A WAL sidecar adjacent to a tier THIS build just rewrote describes
+        // the replaced bytes and is dead by definition. Remove it here, in
+        // the write path, so no pre-write classification step ever needs to:
+        // read-only inspection (`observe_tier`) deliberately never deletes a
+        // stale WAL, and without this write-side cleanup a leftover sidecar
+        // whose compaction generation happens to match the freshly written
+        // main slab (generation counters are mod-256 wrapping) could
+        // resurrect foreign rows into the new generation at the next open.
+        let _ = fs::remove_file(crate::wal::wal_path_for(&fast_path));
 
         if let Some(quality_dimension) = self.quality_dimension {
             let quality_path = self.dir.join(VECTOR_INDEX_QUALITY_FILENAME);
@@ -1891,6 +1998,8 @@ impl TwoTierIndexBuilder {
                 quality_writer.write_record(doc_id, embedding)?;
             }
             quality_writer.finish()?;
+            // Same write-side cleanup as the fast tier above.
+            let _ = fs::remove_file(crate::wal::wal_path_for(&quality_path));
         }
 
         let mut index = TwoTierIndex::open(&self.dir, self.config)?;
@@ -1912,7 +2021,7 @@ impl TwoTierIndexBuilder {
         }
         if let Some(identity) = self.quality_identity
             && self.quality_dimension.is_some()
-            && index.quality_index.is_some()
+            && index.quality_source.is_some()
         {
             if index.quality_space_fingerprint_hex.is_none() {
                 index.quality_space_fingerprint_hex = Some(identity.space.fingerprint());
@@ -1946,22 +2055,26 @@ fn ensure_identity_describes_tier(
 }
 
 /// Admit one identity-complete FSVI v2 tier through the only legitimate v2
-/// open path and hand back its validated index (bd-9xuj T2-C4-write).
+/// open path and hand back the SEALED OWNER, whole (bd-9xuj T2-C4-write r2).
 ///
 /// [`VectorIndex::open_admitted_v2`] copies the artifact once into a sealed
 /// byte owner, verifies the complete identity/content bindings against
-/// `binding`, and rejects any WAL directory entry. Moving the owner's
-/// validated index out preserves the parsed v2 identity metadata
-/// (`identity_v2()` stays `Some`), which is exactly what marks the tier
-/// ATTESTED on the assembled [`TwoTierIndex`].
+/// `binding`, and rejects any WAL directory entry. The r1 revision of this
+/// helper moved `validated.index` out and DROPPED the owner — discarding the
+/// `ValidatedFsviBytes` capability, the complete witness, and the
+/// publication state, contradicting the owner contract on
+/// [`ValidatedFsviBytes`] ("no conversion into a mutable/path-opened
+/// `VectorIndex`"). The r2 repair retains the owner in full; callers wrap it
+/// in [`TierSource::AdmittedV2`] and borrow the validated index from inside
+/// it, so the parsed v2 identity metadata (`identity_v2()` stays `Some`)
+/// still marks the tier ATTESTED on the assembled [`TwoTierIndex`].
 fn admit_v2_tier(
     path: &Path,
     binding: &FsviV2IdentityBinding,
     tier: &str,
-) -> SearchResult<VectorIndex> {
-    let validated = VectorIndex::open_admitted_v2(path, binding)
-        .map_err(|error| admission_error_to_search_error(error, tier, path))?;
-    Ok(validated.index)
+) -> SearchResult<ValidatedFsviBytes> {
+    VectorIndex::open_admitted_v2(path, binding)
+        .map_err(|error| admission_error_to_search_error(error, tier, path))
 }
 
 /// Map a typed [`FsviAdmissionError`] into the [`SearchError`] surface,
@@ -1997,6 +2110,200 @@ fn resolve_fast_path(dir: &Path) -> SearchResult<PathBuf> {
 
     Err(SearchError::IndexCandidatesNotFound {
         paths: vec![fast_path, fallback_path],
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Read-only tier observation (bd-9xuj C4-write r2)
+// ---------------------------------------------------------------------------
+
+/// What [`observe_tier`] proved about one on-disk FSVI tier artifact.
+///
+/// Every variant is established WITHOUT any mutable open: no WAL sidecar is
+/// ever deleted or truncated, no file is memory-mapped writable, and no byte
+/// of the artifact or its directory changes. This is the classification
+/// carrier for pre-drain refresh admission (the r2 repair of the C4-write
+/// NO-GO's mutable-`VectorIndex::open`-during-classification hazard).
+#[derive(Debug)]
+pub enum FsviTierObservation {
+    /// Recognized legacy FSVI v1 bytes, header-parsed only.
+    V1(FsviV1Observation),
+    /// Identity-complete FSVI v2 header. Content admission (digest
+    /// recomputation, sealed-owner retention) still happens through
+    /// [`VectorIndex::open_admitted_v2`]; this variant only proves the
+    /// header parses as identity-complete v2.
+    V2IdentityComplete(Box<VectorMetadata>),
+    /// A newer FSVI schema than this reader supports.
+    UpgradeRequired(FsviUpgradeRequired),
+}
+
+/// Header-level, read-only observation of a legacy FSVI v1 tier.
+///
+/// Record FLAGS are deliberately not inspected (that would require reading
+/// the record table): `record_count` counts live AND tombstoned rows, so
+/// [`Self::retains_content`] is conservative — an all-tombstoned v1 tier
+/// reads as retaining content and fails closed at admission seams. Restoring
+/// flag-level precision needs a read-only record-table inspector in the
+/// crate root (deferred to the observational-open train; see
+/// `VectorIndex::inspect`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FsviV1Observation {
+    /// Total record slots in the main slab (live + tombstoned).
+    pub record_count: usize,
+    /// Decodable WAL entries whose compaction generation matches the main
+    /// slab. `0` when the sidecar is absent, empty, STALE (generation
+    /// mismatch), or when only a corrupt trailer follows zero valid batches.
+    /// Unlike `VectorIndex::open`, observing a stale or trailer-corrupt WAL
+    /// never deletes or truncates it.
+    pub active_wal_records: usize,
+    /// Whether a WAL sidecar file exists at all (any content state).
+    pub wal_sidecar_present: bool,
+}
+
+impl FsviV1Observation {
+    /// Conservative content-retention signal for admission seams.
+    ///
+    /// True when the main slab has any record slot (live or tombstoned) or
+    /// the WAL retains generation-matched appends. Fail-closed by
+    /// construction: it can claim retention for content-free artifacts
+    /// (all-tombstoned slabs) but never the reverse.
+    #[must_use]
+    pub const fn retains_content(&self) -> bool {
+        self.record_count > 0 || self.active_wal_records > 0
+    }
+}
+
+/// Open one tier artifact strictly read-only, preserving atime when the
+/// platform allows.
+///
+/// Prefers the crate's `O_NOATIME | O_NOFOLLOW | O_CLOEXEC` opener (the same
+/// one exact v2 admission uses). Where that is denied or unsupported (non-
+/// owner files, non-Linux targets, symlinked finals) this falls back to an
+/// ordinary read-only [`fs::File::open`], whose only observable effect is a
+/// possible atime update — never weaker than `VectorIndex::inspect`'s
+/// unconditional ordinary open, and never write-capable.
+fn open_tier_readonly(path: &Path) -> SearchResult<fs::File> {
+    crate::open_readonly_noatime_nofollow(path)
+        .or_else(|_| fs::File::open(path).map_err(SearchError::Io))
+}
+
+/// Classify one on-disk FSVI tier artifact WITHOUT mutating anything.
+///
+/// Contrast with the two open paths this deliberately is not:
+/// - [`VectorIndex::open`] (v1) opens WRITE-capable, deletes a stale WAL
+///   sidecar, and truncates a corrupt WAL trailer — it must never run during
+///   classification;
+/// - [`VectorIndex::inspect`] is header-only but discards the parsed v1
+///   metadata, so callers cannot distinguish an empty v1 seed from a
+///   content-retaining one without a mutable open.
+///
+/// This function parses the SAME headers through the SAME crate parsers
+/// (`parse_header` / `parse_v2_header`), reads the v1 WAL sidecar through
+/// the same read-only `wal::read_wal`, and applies the same staleness
+/// predicate `VectorIndex::open` uses — but performs no deletion, no
+/// truncation, and no writable mapping. v2 recognition here is HEADER-ONLY:
+/// content admission still requires [`VectorIndex::open_admitted_v2`].
+///
+/// # Errors
+///
+/// Returns [`SearchError::IndexNotFound`] for a missing path, I/O errors,
+/// and [`SearchError::IndexCorrupted`] for bad magic, malformed or
+/// CRC-drifted headers, WAL header corruption, or unsupported historical
+/// versions — the same typed outcomes the corresponding open paths produce.
+pub fn observe_tier(path: &Path) -> SearchResult<FsviTierObservation> {
+    if !path.exists() {
+        return Err(SearchError::IndexNotFound {
+            path: path.to_path_buf(),
+        });
+    }
+    let mut file = open_tier_readonly(path)?;
+    let file_len = file.metadata().map_err(SearchError::Io)?.len();
+    let mut prefix = [0_u8; 6];
+    crate::read_exact_index_bytes(path, &mut file, &mut prefix, "magic and version")?;
+    if prefix[..4] != crate::FSVI_MAGIC {
+        return Err(crate::index_corrupted(
+            path,
+            format!(
+                "bad magic bytes: expected {:?}, found {:?}",
+                crate::FSVI_MAGIC,
+                &prefix[..4]
+            ),
+        ));
+    }
+    let version = u16::from_le_bytes([prefix[4], prefix[5]]);
+    match version {
+        crate::FSVI_VERSION => {
+            let bounded_len = usize::try_from(file_len)
+                .unwrap_or(usize::MAX)
+                .min(crate::FSVI_V1_MAX_HEADER_BYTES);
+            file.seek(SeekFrom::Start(0)).map_err(SearchError::Io)?;
+            let mut header = Vec::with_capacity(bounded_len);
+            file.take(u64::try_from(bounded_len).unwrap_or(u64::MAX))
+                .read_to_end(&mut header)
+                .map_err(SearchError::Io)?;
+            let (metadata, _header_len) = crate::parse_header(path, &header)?;
+            Ok(FsviTierObservation::V1(observe_v1_wal(path, &metadata)?))
+        }
+        crate::FSVI_V2_VERSION => {
+            let mut encoded_size = [0_u8; 4];
+            crate::read_exact_index_bytes(path, &mut file, &mut encoded_size, "v2 header_size")?;
+            let header_size = usize::try_from(u32::from_le_bytes(encoded_size)).map_err(|_| {
+                crate::index_corrupted(path, "v2 header_size does not fit in usize")
+            })?;
+            crate::validate_v2_header_size(path, header_size)?;
+            if u64::try_from(header_size).is_ok_and(|size| size > file_len) {
+                return Err(crate::index_corrupted(
+                    path,
+                    format!(
+                        "v2 header is truncated: declared {header_size} bytes, file has {file_len}"
+                    ),
+                ));
+            }
+            file.seek(SeekFrom::Start(0)).map_err(SearchError::Io)?;
+            let mut header = vec![0_u8; header_size];
+            crate::read_exact_index_bytes(path, &mut file, &mut header, "v2 header")?;
+            let (metadata, _header_len) = crate::parse_v2_header(path, &header)?;
+            Ok(FsviTierObservation::V2IdentityComplete(Box::new(metadata)))
+        }
+        found if found > crate::FSVI_V2_VERSION => {
+            Ok(FsviTierObservation::UpgradeRequired(FsviUpgradeRequired {
+                found_version: found,
+                supported_version: crate::FSVI_V2_VERSION,
+            }))
+        }
+        found => Err(crate::index_corrupted(
+            path,
+            format!("unsupported historical FSVI schema version {found}"),
+        )),
+    }
+}
+
+/// Read-only WAL observation for a v1 tier: same parser and same staleness
+/// predicate as `VectorIndex::open`, minus the deletion/truncation side
+/// effects.
+fn observe_v1_wal(path: &Path, metadata: &VectorMetadata) -> SearchResult<FsviV1Observation> {
+    let wal_path = crate::wal::wal_path_for(path);
+    let wal_sidecar_present = wal_path.exists();
+    let (entries, wal_compaction_gen, valid_len) =
+        crate::wal::read_wal(&wal_path, metadata.dimension, metadata.quantization)?;
+    // Staleness predicate mirrored from `VectorIndex::open` (the single
+    // other consumer of `read_wal`'s generation output). A stale sidecar's
+    // entries belong to a dead generation: they are not counted as retained
+    // content, but the FILE is left exactly as found.
+    let is_stale = if valid_len > 0 {
+        if wal_compaction_gen == 0 {
+            metadata.compaction_gen > 0
+        } else {
+            wal_compaction_gen != crate::next_generation(metadata.compaction_gen)
+        }
+    } else {
+        false
+    };
+    let active_wal_records = if is_stale { 0 } else { entries.len() };
+    Ok(FsviV1Observation {
+        record_count: metadata.record_count,
+        active_wal_records,
+        wal_sidecar_present,
     })
 }
 
@@ -4249,14 +4556,14 @@ mod tests {
 
         // Inject a WAL entry with NaN in the embedding. dot_product with NaN
         // produces NaN, which should be filtered out by the is_finite() guard.
-        index.fast_index.wal_entries.push(WalEntry {
+        index.fast_tier_mut_for_test().wal_entries.push(WalEntry {
             doc_id: "doc-nan".into(),
             doc_id_hash: crate::fnv1a_hash(b"doc-nan"),
             embedding: vec![f32::NAN, 0.0, 0.0, 0.0],
         });
 
         // Also inject a valid WAL entry to confirm it's still returned.
-        index.fast_index.wal_entries.push(WalEntry {
+        index.fast_tier_mut_for_test().wal_entries.push(WalEntry {
             doc_id: "doc-wal-ok".into(),
             doc_id_hash: crate::fnv1a_hash(b"doc-wal-ok"),
             embedding: vec![0.0, 1.0, 0.0, 0.0],
@@ -5101,6 +5408,397 @@ mod tests {
                     if field == "two_tier.fast_v2_admission"
             ),
             "got {error:?}"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    // ─── C4-write r2: retained sealed owners + read-only observation ─────
+
+    /// NO-GO item 3 repair: exact v2 admission must retain the complete
+    /// `ValidatedFsviBytes` owner per tier — byte capability, witness, and
+    /// publication state — instead of peeling `validated.index` and dropping
+    /// the rest. Red on 868c0801: `fast_admitted_owner` does not exist there
+    /// (the owner was destructured away), so this test cannot compile.
+    #[test]
+    fn admitted_v2_open_retains_sealed_owners_in_full() {
+        let dir = temp_index_dir("admitted-v2-retained-owners");
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let fast_path = dir.join(VECTOR_INDEX_FAST_FILENAME);
+        let quality_path = dir.join(VECTOR_INDEX_QUALITY_FILENAME);
+        let (fast_binding, _) = fsvi_v2_binding("retained-fast-model", 4, 5);
+        let (quality_binding, _) = fsvi_v2_binding("retained-quality-model", 4, 5);
+        let rows: [(&str, &[f32]); 2] = [
+            ("doc-a", &[1.0, 0.0, 0.0, 0.0]),
+            ("doc-b", &[0.0, 1.0, 0.0, 0.0]),
+        ];
+        write_v2_tier(&fast_path, &fast_binding, &rows);
+        write_v2_tier(&quality_path, &quality_binding, &rows);
+
+        let paths = TwoTierIndexPaths::new(&fast_path).with_quality_index(&quality_path);
+        let index = TwoTierIndex::open_admitted_v2_with_paths(
+            &paths,
+            TwoTierConfig::default(),
+            &fast_binding,
+            Some(&quality_binding),
+        )
+        .expect("admit both v2 tiers");
+
+        let fast_owner = index
+            .fast_admitted_owner()
+            .expect("fast admission owner must be retained");
+        let quality_owner = index
+            .quality_admitted_owner()
+            .expect("quality admission owner must be retained");
+        assert_eq!(fast_owner.witness().record_count, 2);
+        assert_eq!(quality_owner.witness().record_count, 2);
+        assert!(
+            fast_owner.published_wal_absent(),
+            "canonical pathname admission proves WAL absence; the publication \
+             state must survive into the retained owner"
+        );
+        assert!(quality_owner.published_wal_absent());
+        assert_eq!(
+            fast_owner.owned_byte_len(),
+            usize::try_from(fs::metadata(&fast_path).expect("stat fast").len())
+                .expect("length fits usize"),
+            "the retained owner holds the complete admitted byte image"
+        );
+        // The retained owner and the served tier are the same admission, not
+        // a re-open: identity metadata must agree bit-for-bit.
+        assert!(index.fast_identity_is_attested());
+        assert_eq!(
+            index.fast_space_fingerprint_hex(),
+            Some(crate::fingerprint_hex(&fast_owner.identity_v2().space_fingerprint).as_str())
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Required test (iv): after admission, replacing the underlying file
+    /// does not affect the retained owner's reads — the `Arc`'d bytes are
+    /// the authority (owner contract, lib.rs).
+    #[test]
+    fn admitted_owner_reads_survive_path_replacement() {
+        let dir = temp_index_dir("admitted-v2-path-replacement");
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let fast_path = dir.join(VECTOR_INDEX_FAST_FILENAME);
+        let (fast_binding, _) = fsvi_v2_binding("replacement-proof-model", 4, 9);
+        let rows: [(&str, &[f32]); 2] = [
+            ("doc-a", &[1.0, 0.0, 0.0, 0.0]),
+            ("doc-b", &[0.0, 1.0, 0.0, 0.0]),
+        ];
+        write_v2_tier(&fast_path, &fast_binding, &rows);
+
+        let paths = TwoTierIndexPaths::new(&fast_path);
+        let index = TwoTierIndex::open_admitted_v2_with_paths(
+            &paths,
+            TwoTierConfig::default(),
+            &fast_binding,
+            None,
+        )
+        .expect("admit fast v2 tier");
+        let witness_before = index
+            .fast_admitted_owner()
+            .expect("retained owner")
+            .witness()
+            .clone();
+        let hits_before = index
+            .search_fast(&[0.0, 1.0, 0.0, 0.0], 1)
+            .expect("search before replacement");
+        assert_eq!(hits_before[0].doc_id, "doc-b");
+
+        // Rename the source away, then plant garbage at the original path.
+        let renamed = dir.join("vector.fast.idx.renamed-away");
+        fs::rename(&fast_path, &renamed).expect("rename admitted source");
+        fs::write(&fast_path, b"garbage-not-an-index").expect("plant garbage");
+
+        let owner = index.fast_admitted_owner().expect("retained owner");
+        assert_eq!(
+            owner.witness(),
+            &witness_before,
+            "witness is part of the sealed owner, not re-derived from the path"
+        );
+        let hits_after = index
+            .search_fast(&[0.0, 1.0, 0.0, 0.0], 1)
+            .expect("search after replacement");
+        assert_eq!(
+            hits_after[0].doc_id, "doc-b",
+            "reads must serve the admitted Arc'd bytes, never the pathname"
+        );
+        assert_eq!(owner.row(0).expect("row 0").doc_id(), "doc-a");
+        assert_eq!(index.doc_count(), 2);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn plain_v1_open_has_no_admitted_owners() {
+        let dir = temp_index_dir("plain-v1-no-owners");
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let fast_path = dir.join(VECTOR_INDEX_FAST_FILENAME);
+        write_index_file(&fast_path, &[("doc-a", &[1.0, 0.0, 0.0, 0.0])])
+            .expect("write v1 fixture");
+        let index = TwoTierIndex::open(&dir, TwoTierConfig::default()).expect("open v1");
+        assert!(index.fast_admitted_owner().is_none());
+        assert!(index.quality_admitted_owner().is_none());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Byte-for-byte fixture snapshot of one artifact and (optionally) its
+    /// WAL sidecar, for observation-invariance assertions.
+    fn tier_snapshot(path: &Path) -> (Vec<u8>, Option<Vec<u8>>) {
+        let main = fs::read(path).expect("read main artifact");
+        let wal_path = crate::wal::wal_path_for(path);
+        let wal = wal_path
+            .exists()
+            .then(|| fs::read(&wal_path).expect("read wal"));
+        (main, wal)
+    }
+
+    #[test]
+    fn observe_tier_classifies_v1_seed_live_and_v2_without_mutation() {
+        let dir = temp_index_dir("observe-basic");
+        fs::create_dir_all(&dir).expect("create temp dir");
+
+        // Empty v1 seed: no content retained.
+        let seed_path = dir.join("seed.idx");
+        VectorIndex::create(&seed_path, "seed-model", 4)
+            .expect("create seed")
+            .finish()
+            .expect("finish seed");
+        let seed_snapshot = tier_snapshot(&seed_path);
+        let FsviTierObservation::V1(seed) = observe_tier(&seed_path).expect("observe seed") else {
+            panic!("v1 seed must observe as V1");
+        };
+        assert_eq!(seed.record_count, 0);
+        assert_eq!(seed.active_wal_records, 0);
+        assert!(!seed.wal_sidecar_present);
+        assert!(!seed.retains_content());
+        assert_eq!(tier_snapshot(&seed_path), seed_snapshot);
+
+        // Live v1 with a fresh WAL append: content retained via both signals.
+        let live_path = dir.join("live.idx");
+        write_index_file(&live_path, &[("doc-a", &[1.0, 0.0, 0.0, 0.0])]).expect("write live v1");
+        {
+            let mut live = VectorIndex::open(&live_path).expect("open live v1");
+            live.append("doc-wal", &[0.0, 1.0, 0.0, 0.0])
+                .expect("append WAL resident");
+        }
+        let live_snapshot = tier_snapshot(&live_path);
+        assert!(live_snapshot.1.is_some(), "fixture must have a WAL sidecar");
+        let FsviTierObservation::V1(live) = observe_tier(&live_path).expect("observe live") else {
+            panic!("live v1 must observe as V1");
+        };
+        assert_eq!(live.record_count, 1);
+        assert_eq!(live.active_wal_records, 1);
+        assert!(live.wal_sidecar_present);
+        assert!(live.retains_content());
+        assert_eq!(
+            tier_snapshot(&live_path),
+            live_snapshot,
+            "observation must not rewrite the artifact or its WAL"
+        );
+
+        // v2: header-only recognition.
+        let v2_path = dir.join("observed.v2.idx");
+        let (binding, _) = fsvi_v2_binding("observe-v2-model", 4, 2);
+        write_v2_tier(&v2_path, &binding, &[("doc-a", &[1.0, 0.0, 0.0, 0.0])]);
+        let v2_snapshot = tier_snapshot(&v2_path);
+        let FsviTierObservation::V2IdentityComplete(metadata) =
+            observe_tier(&v2_path).expect("observe v2")
+        else {
+            panic!("v2 tier must observe as V2IdentityComplete");
+        };
+        assert_eq!(metadata.record_count, 1);
+        assert!(metadata.identity_v2.is_some());
+        assert_eq!(tier_snapshot(&v2_path), v2_snapshot);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// NO-GO item 2 repair, stale-WAL half: `VectorIndex::open` DELETES a
+    /// stale WAL sidecar; read-only observation must classify it as inactive
+    /// while leaving the file byte-identical.
+    #[test]
+    fn observe_tier_never_deletes_a_stale_wal_sidecar() {
+        let dir = temp_index_dir("observe-stale-wal");
+        fs::create_dir_all(&dir).expect("create temp dir");
+
+        // Donor: advance the compaction generation once, then append, so the
+        // donor WAL header carries generation 2 (= next(1)).
+        let donor_path = dir.join("donor.idx");
+        write_index_file(&donor_path, &[("donor-a", &[1.0, 0.0, 0.0, 0.0])]).expect("write donor");
+        {
+            let mut donor = VectorIndex::open(&donor_path).expect("open donor");
+            donor
+                .append("donor-wal-1", &[0.0, 1.0, 0.0, 0.0])
+                .expect("append pre-compaction");
+            donor.compact().expect("compact to bump generation");
+            donor
+                .append("donor-wal-2", &[0.0, 0.0, 1.0, 0.0])
+                .expect("append post-compaction");
+        }
+        let donor_wal = crate::wal::wal_path_for(&donor_path);
+        assert!(donor_wal.exists(), "donor WAL must exist");
+
+        // Target: generation-0 main slab with a live row; the donor WAL's
+        // generation cannot match next(0), so it reads as STALE here.
+        let target_path = dir.join("target.idx");
+        write_index_file(&target_path, &[("doc-a", &[1.0, 0.0, 0.0, 0.0])]).expect("write target");
+        let target_wal = crate::wal::wal_path_for(&target_path);
+        fs::copy(&donor_wal, &target_wal).expect("transplant stale WAL");
+
+        // Precondition: the transplanted WAL really is stale for the target.
+        let (entries, wal_gen, valid_len) =
+            crate::wal::read_wal(&target_wal, 4, Quantization::F16).expect("read fixture WAL");
+        assert!(
+            !entries.is_empty() && valid_len > 0,
+            "fixture WAL has entries"
+        );
+        assert_ne!(
+            wal_gen,
+            crate::next_generation(0),
+            "fixture WAL generation must mismatch the target main slab"
+        );
+
+        let snapshot = tier_snapshot(&target_path);
+        let FsviTierObservation::V1(observation) =
+            observe_tier(&target_path).expect("observe target")
+        else {
+            panic!("target must observe as V1");
+        };
+        assert_eq!(
+            observation.active_wal_records, 0,
+            "stale WAL entries belong to a dead generation"
+        );
+        assert!(observation.wal_sidecar_present);
+        assert!(
+            observation.retains_content(),
+            "the live main row retains content regardless of WAL staleness"
+        );
+        assert!(
+            target_wal.exists(),
+            "read-only observation must NEVER delete a stale WAL (VectorIndex::open does)"
+        );
+        assert_eq!(
+            tier_snapshot(&target_path),
+            snapshot,
+            "artifact and WAL must be byte-identical after observation"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// NO-GO item 2 repair, corrupt-trailer half: `VectorIndex::open`
+    /// TRUNCATES a corrupt WAL trailer; read-only observation must count the
+    /// valid prefix and leave the trailer bytes in place.
+    #[test]
+    fn observe_tier_never_truncates_a_corrupt_wal_trailer() {
+        let dir = temp_index_dir("observe-corrupt-trailer");
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let path = dir.join("trailer.idx");
+        write_index_file(&path, &[("doc-a", &[1.0, 0.0, 0.0, 0.0])]).expect("write v1");
+        {
+            let mut index = VectorIndex::open(&path).expect("open v1");
+            index
+                .append("doc-wal", &[0.0, 1.0, 0.0, 0.0])
+                .expect("append valid WAL entry");
+        }
+        let wal_path = crate::wal::wal_path_for(&path);
+        let clean_len = fs::metadata(&wal_path).expect("stat wal").len();
+        {
+            use std::io::Write as _;
+            let mut wal_file = fs::OpenOptions::new()
+                .append(true)
+                .open(&wal_path)
+                .expect("open wal for corruption");
+            wal_file
+                .write_all(&[0xAB; 32])
+                .expect("append corrupt trailer");
+        }
+        let corrupted_len = fs::metadata(&wal_path).expect("stat wal").len();
+        assert_eq!(corrupted_len, clean_len + 32);
+
+        let snapshot = tier_snapshot(&path);
+        let FsviTierObservation::V1(observation) = observe_tier(&path).expect("observe") else {
+            panic!("must observe as V1");
+        };
+        assert_eq!(
+            observation.active_wal_records, 1,
+            "the valid prefix still counts"
+        );
+        assert_eq!(
+            fs::metadata(&wal_path).expect("re-stat wal").len(),
+            corrupted_len,
+            "read-only observation must NEVER truncate a corrupt trailer \
+             (VectorIndex::open does)"
+        );
+        assert_eq!(tier_snapshot(&path), snapshot);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn observe_tier_reports_upgrade_required_for_future_schema() {
+        let dir = temp_index_dir("observe-upgrade");
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let path = dir.join("future.idx");
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&crate::FSVI_MAGIC);
+        bytes.extend_from_slice(&3_u16.to_le_bytes());
+        bytes.extend_from_slice(&[0_u8; 16]);
+        fs::write(&path, &bytes).expect("write future-schema fixture");
+        let observation = observe_tier(&path).expect("observe future schema");
+        assert!(
+            matches!(
+                observation,
+                FsviTierObservation::UpgradeRequired(FsviUpgradeRequired {
+                    found_version: 3,
+                    supported_version: crate::FSVI_V2_VERSION,
+                })
+            ),
+            "got {observation:?}"
+        );
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Write-side WAL hygiene: a builder rewrite of a tier removes the
+    /// now-dead adjacent WAL sidecar so it can never resurrect foreign rows
+    /// into the new generation (read-only classification deliberately leaves
+    /// stale sidecars in place; the WRITE path owns their cleanup).
+    #[test]
+    fn builder_finish_removes_adjacent_wal_sidecars() {
+        let dir = temp_index_dir("builder-wal-hygiene");
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let fast_path = dir.join(VECTOR_INDEX_FAST_FILENAME);
+        write_index_file(&fast_path, &[("old-doc", &[1.0, 0.0, 0.0, 0.0])])
+            .expect("write prior generation");
+        {
+            let mut prior = VectorIndex::open(&fast_path).expect("open prior");
+            prior
+                .append("wal-resident", &[0.0, 1.0, 0.0, 0.0])
+                .expect("append WAL resident");
+        }
+        let wal_path = crate::wal::wal_path_for(&fast_path);
+        assert!(wal_path.exists(), "fixture WAL must exist before rebuild");
+
+        let mut builder = TwoTierIndex::create(&dir, TwoTierConfig::default()).expect("builder");
+        builder
+            .add_fast_record("new-doc", &[0.0, 0.0, 1.0, 0.0])
+            .expect("add rebuild row");
+        let rebuilt = builder.finish().expect("finish rebuild");
+
+        assert!(
+            !wal_path.exists(),
+            "the rewritten tier's dead WAL sidecar must be removed by the write path"
+        );
+        assert_eq!(rebuilt.doc_count(), 1);
+        let ids: Vec<String> = rebuilt.iter_doc_ids().filter_map(Result::ok).collect();
+        assert_eq!(ids, vec!["new-doc".to_owned()]);
+        assert!(
+            !ids.iter().any(|id| id == "wal-resident" || id == "old-doc"),
+            "no row from the replaced generation may leak into the rebuild: {ids:?}"
         );
 
         let _ = fs::remove_dir_all(&dir);
