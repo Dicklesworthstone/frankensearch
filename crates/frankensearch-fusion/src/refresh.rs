@@ -1375,7 +1375,7 @@ mod tests {
     /// resurrect soft-deleted documents (the merge loop used to re-add
     /// tombstoned main-slab rows as live records) and (b) NOT drop
     /// WAL-resident appends (acknowledged durable writes that
-    /// record_count() does not cover).
+    /// `record_count()` does not cover).
     #[test]
     fn rebuild_honors_tombstones_and_wal_residents() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
