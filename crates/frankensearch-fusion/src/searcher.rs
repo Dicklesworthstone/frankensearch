@@ -22,8 +22,6 @@ use asupersync::time::{timeout, wall_now};
 use tracing::instrument;
 use unicode_normalization::UnicodeNormalization;
 
-use time::{OffsetDateTime, format_description::well_known::Rfc3339};
-
 #[cfg(feature = "graph")]
 use frankensearch_core::DocumentGraph;
 use frankensearch_core::ParsedQuery;
@@ -2835,7 +2833,7 @@ fn next_telemetry_identifier(prefix: &str) -> String {
 const TELEMETRY_TIMESTAMP_FALLBACK_RFC3339: &str = "1970-01-01T00:00:00Z";
 
 fn telemetry_timestamp_ms() -> u64 {
-    let nanos = OffsetDateTime::now_utc().unix_timestamp_nanos();
+    let nanos = frankensearch_core::rfc3339::now_unix_nanos();
     if nanos <= 0 {
         return 0;
     }
@@ -2845,9 +2843,7 @@ fn telemetry_timestamp_ms() -> u64 {
 }
 
 fn telemetry_timestamp_now() -> String {
-    OffsetDateTime::now_utc()
-        .format(&Rfc3339)
-        .unwrap_or_else(|_| TELEMETRY_TIMESTAMP_FALLBACK_RFC3339.to_owned())
+    frankensearch_core::rfc3339::format_unix_nanos(frankensearch_core::rfc3339::now_unix_nanos())
 }
 
 fn telemetry_instance_for_adapter(host_adapter: &dyn HostAdapter) -> TelemetryInstance {
@@ -6739,7 +6735,7 @@ mod tests {
         let ts = telemetry_timestamp_now();
         assert!(!ts.is_empty());
         assert!(
-            OffsetDateTime::parse(&ts, &Rfc3339).is_ok(),
+            frankensearch_core::rfc3339::parse_rfc3339_to_unix_nanos(&ts).is_ok(),
             "should be RFC3339"
         );
     }
@@ -6747,7 +6743,10 @@ mod tests {
     #[test]
     fn telemetry_timestamp_fallback_constant_is_valid_rfc3339() {
         assert!(
-            OffsetDateTime::parse(TELEMETRY_TIMESTAMP_FALLBACK_RFC3339, &Rfc3339).is_ok(),
+            frankensearch_core::rfc3339::parse_rfc3339_to_unix_nanos(
+                TELEMETRY_TIMESTAMP_FALLBACK_RFC3339
+            )
+            .is_ok(),
             "fallback timestamp must remain RFC3339"
         );
     }

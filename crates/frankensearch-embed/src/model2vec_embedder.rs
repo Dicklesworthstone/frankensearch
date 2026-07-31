@@ -532,7 +532,7 @@ pub fn find_model_dir_with_hf_id(model_name: &str, hf_id: &str) -> Option<PathBu
     }
 
     // 4. HuggingFace cache
-    if let Some(cache_dir) = dirs::cache_dir() {
+    if let Some(cache_dir) = frankensearch_core::platform_dirs::cache_dir() {
         let hf_dir = cache_dir
             .join("huggingface/hub")
             .join(format!("models--{}", hf_id.replace('/', "--")));

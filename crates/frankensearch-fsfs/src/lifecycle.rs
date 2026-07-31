@@ -1923,8 +1923,8 @@ impl PidFile {
     /// Default PID file path.
     #[must_use]
     pub fn default_path() -> PathBuf {
-        let runtime_dir = dirs::runtime_dir()
-            .or_else(|| dirs::cache_dir().map(|d| d.join("run")))
+        let runtime_dir = frankensearch_core::platform_dirs::runtime_dir()
+            .or_else(|| frankensearch_core::platform_dirs::cache_dir().map(|d| d.join("run")))
             .unwrap_or_else(|| PathBuf::from("/tmp"));
         runtime_dir.join("fsfs.pid")
     }

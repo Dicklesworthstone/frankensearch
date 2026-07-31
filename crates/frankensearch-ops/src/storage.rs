@@ -18,7 +18,6 @@ use frankensearch_core::{
 use fsqlite::{Connection, Row};
 use fsqlite_types::value::SqliteValue;
 use serde::{Deserialize, Serialize};
-use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 /// Current schema version for the ops telemetry database.
 pub const OPS_SCHEMA_VERSION: i64 = 2;
@@ -440,18 +439,22 @@ fn parse_rfc3339_timestamp_ms(timestamp: &str) -> SearchResult<i64> {
     parse_rfc3339_timestamp_ms_reference(timestamp)
 }
 
-/// General-purpose RFC3339 → epoch-milliseconds parser via the `time` crate.
+/// General-purpose RFC3339 → epoch-milliseconds parser via the shared
+/// in-tree implementation ([`frankensearch_core::rfc3339`]).
 ///
 /// Retained as the canonical reference (and as the fallback for any input the
-/// [`fast_parse_rfc3339_utc_ms`] fast path declines).
+/// [`fast_parse_rfc3339_utc_ms`] fast path declines — offsets and
+/// fractional seconds land here).
 fn parse_rfc3339_timestamp_ms_reference(timestamp: &str) -> SearchResult<i64> {
-    let parsed =
-        OffsetDateTime::parse(timestamp, &Rfc3339).map_err(|err| SearchError::InvalidConfig {
-            field: "telemetry_envelope.ts".to_owned(),
-            value: timestamp.to_owned(),
-            reason: format!("must be RFC3339 ({err})"),
+    let nanos =
+        frankensearch_core::rfc3339::parse_rfc3339_to_unix_nanos(timestamp).map_err(|err| {
+            SearchError::InvalidConfig {
+                field: "telemetry_envelope.ts".to_owned(),
+                value: timestamp.to_owned(),
+                reason: format!("must be RFC3339 ({err})"),
+            }
         })?;
-    let millis = parsed.unix_timestamp_nanos() / 1_000_000;
+    let millis = nanos.div_euclid(1_000_000);
     i64::try_from(millis).map_err(|_| SearchError::InvalidConfig {
         field: "telemetry_envelope.ts".to_owned(),
         value: timestamp.to_owned(),

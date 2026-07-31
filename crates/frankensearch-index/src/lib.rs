@@ -42,8 +42,14 @@
 //! └───────────────────────────────────────────┘
 //! ```
 
+// Windows file-identity comparison (file_identity.rs) reads the
+// by-handle metadata fields, which std only exposes behind this
+// nightly feature; the workspace already mandates nightly.
+#![cfg_attr(windows, feature(windows_by_handle))]
+
 #[cfg(unix)]
 pub mod fd_acl;
+pub mod file_identity;
 #[cfg(feature = "ann")]
 pub mod hnsw;
 pub mod in_memory;

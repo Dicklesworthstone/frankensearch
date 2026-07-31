@@ -24,6 +24,14 @@
 //!   therefore an extended ACL) is absent; `ENOTSUP` means the
 //!   filesystem cannot hold POSIX ACLs at all, which is also an honest
 //!   [`ExtendedAclPresence::Absent`].
+//!
+//!   **`O_PATH` descriptors are not probeable**: `fgetxattr` on an
+//!   `O_PATH` fd fails with `EBADF`, which this module surfaces as the
+//!   error it is. Callers holding `O_PATH` capabilities (the
+//!   generation-root admission pipeline does) must probe through a
+//!   data descriptor for the same object, never the `O_PATH` handle —
+//!   there is a regression test pinning the `EBADF` behavior so this
+//!   footgun stays visible.
 //! * **Other Unix** — [`io::ErrorKind::Unsupported`]: FreeBSD and
 //!   friends have real ACLs we have not audited a probe for, and
 //!   silently answering `Absent` there would turn a hardening gate into
@@ -38,6 +46,12 @@ use std::io;
 use std::os::fd::BorrowedFd;
 
 /// Whether the filesystem object behind a descriptor has an extended ACL.
+///
+/// Security gates consuming this must match **exhaustively on `Absent`**
+/// (admit only the known-good state) rather than testing `!= Present` /
+/// `== Present`: if a future platform forces a third state, an equality
+/// test silently fails open while an exhaustive match fails the build at
+/// every admission site.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[must_use = "the observed ACL presence must be handled"]
 pub enum ExtendedAclPresence {
@@ -82,9 +96,7 @@ mod imp {
         fn acl_free(obj: *mut c_void) -> c_int;
     }
 
-    pub(super) fn extended_acl_presence(
-        fd: BorrowedFd<'_>,
-    ) -> io::Result<ExtendedAclPresence> {
+    pub(super) fn extended_acl_presence(fd: BorrowedFd<'_>) -> io::Result<ExtendedAclPresence> {
         // SAFETY: `BorrowedFd` guarantees the descriptor stays open for the
         // duration of this call, Darwin's getter does not retain the
         // descriptor, and `ACL_TYPE_EXTENDED` is the platform's valid ACL
@@ -121,18 +133,15 @@ mod imp {
 
     const ACL_XATTR_NAMES: [&CStr; 2] = [c"system.posix_acl_access", c"system.posix_acl_default"];
 
-    pub(super) fn extended_acl_presence(
-        fd: BorrowedFd<'_>,
-    ) -> io::Result<ExtendedAclPresence> {
+    pub(super) fn extended_acl_presence(fd: BorrowedFd<'_>) -> io::Result<ExtendedAclPresence> {
         for name in ACL_XATTR_NAMES {
             // SAFETY: the descriptor is kept open by `BorrowedFd` for the
             // duration of the call, `name` is a NUL-terminated C string,
             // and a null destination buffer with size 0 is the documented
             // fgetxattr size-probe form (no memory is written).
             #[allow(unsafe_code)]
-            let size = unsafe {
-                libc::fgetxattr(fd.as_raw_fd(), name.as_ptr(), std::ptr::null_mut(), 0)
-            };
+            let size =
+                unsafe { libc::fgetxattr(fd.as_raw_fd(), name.as_ptr(), std::ptr::null_mut(), 0) };
             if size >= 0 {
                 return Ok(ExtendedAclPresence::Present);
             }
@@ -154,9 +163,7 @@ mod imp {
     use std::io;
     use std::os::fd::BorrowedFd;
 
-    pub(super) fn extended_acl_presence(
-        _fd: BorrowedFd<'_>,
-    ) -> io::Result<ExtendedAclPresence> {
+    pub(super) fn extended_acl_presence(_fd: BorrowedFd<'_>) -> io::Result<ExtendedAclPresence> {
         Err(io::Error::new(
             io::ErrorKind::Unsupported,
             "extended-ACL presence probing is only audited for macOS and Linux",
@@ -286,6 +293,38 @@ mod tests {
         );
     }
 
+    /// `fgetxattr` cannot service `O_PATH` descriptors: the probe must
+    /// surface `EBADF` loudly instead of pretending an answer. The
+    /// generation-root pipeline holds `O_PATH` capabilities, so this
+    /// pin keeps anyone from wiring those directly into the probe.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_o_path_descriptor_is_rejected_not_misread() {
+        use std::os::fd::{AsFd, FromRawFd, OwnedFd};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file_path = dir.path().join("target");
+        File::create(&file_path).expect("create fixture file");
+        let path_cstr = std::ffi::CString::new(file_path.to_str().expect("utf8 fixture path"))
+            .expect("no interior NUL");
+
+        // SAFETY: open(2) with valid arguments; the raw fd is immediately
+        // wrapped in OwnedFd, which closes it on drop.
+        #[allow(unsafe_code)]
+        let raw = unsafe { libc::open(path_cstr.as_ptr(), libc::O_PATH | libc::O_CLOEXEC) };
+        assert!(raw >= 0, "O_PATH open must succeed");
+        #[allow(unsafe_code)]
+        let o_path_fd = unsafe { OwnedFd::from_raw_fd(raw) };
+
+        let error = extended_acl_presence(o_path_fd.as_fd())
+            .expect_err("an O_PATH descriptor must be rejected, not misread as Absent");
+        assert_eq!(
+            error.raw_os_error(),
+            Some(libc::EBADF),
+            "the kernel's EBADF must surface unchanged"
+        );
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn macos_chmod_acl_toggles_presence_through_a_retained_fd() {
@@ -298,8 +337,7 @@ mod tests {
         let user = std::env::var("USER").expect("USER must identify an ACL principal");
         let entry = format!("user:{user} allow read");
         assert!(
-            run_acl_tool("/bin/chmod", &["+a", &entry, path_text])
-                .expect("chmod +a must succeed"),
+            run_acl_tool("/bin/chmod", &["+a", &entry, path_text]).expect("chmod +a must succeed"),
             "/bin/chmod must exist on macOS"
         );
         assert_eq!(

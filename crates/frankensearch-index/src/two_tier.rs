@@ -211,7 +211,7 @@ fn paths_alias(left: &Path, right: &Path) -> SearchResult<bool> {
         return Ok(true);
     }
 
-    match same_file::is_same_file(left, right) {
+    match crate::file_identity::is_same_file(left, right) {
         Ok(is_same) => Ok(is_same),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
         Err(error) => Err(SearchError::Io(error)),
@@ -362,7 +362,8 @@ fn validate_ann_save_lock_identities(
     for (index, (left_role, left_path, left_identity)) in materialized.iter().enumerate() {
         for (right_role, right_path, right_identity) in &materialized[index + 1..] {
             if left_identity == right_identity
-                || same_file::is_same_file(left_path, right_path).map_err(SearchError::Io)?
+                || crate::file_identity::is_same_file(left_path, right_path)
+                    .map_err(SearchError::Io)?
             {
                 return Err(SearchError::InvalidConfig {
                     field: "index_paths".to_owned(),
@@ -2802,8 +2803,8 @@ mod tests {
             let probe = dir.join(probe_name);
             fs::write(&probe, b"filesystem collation probe").expect("write collation probe");
             let alternate_probe = dir.join(alternate_probe_name);
-            let volume_aliases =
-                same_file::is_same_file(&probe, &alternate_probe).unwrap_or_else(|error| {
+            let volume_aliases = crate::file_identity::is_same_file(&probe, &alternate_probe)
+                .unwrap_or_else(|error| {
                     assert_eq!(
                         error.kind(),
                         std::io::ErrorKind::NotFound,
@@ -2874,7 +2875,7 @@ mod tests {
             "unexpected save-lock alias error: {error:?}"
         );
         assert!(
-            same_file::is_same_file(&lock_path, &missing_quality_path)
+            crate::file_identity::is_same_file(&lock_path, &missing_quality_path)
                 .expect("compare injected save-lock alias")
         );
     }
@@ -2928,7 +2929,9 @@ mod tests {
             "save must not run after revalidation fails"
         );
         assert_eq!(ann.len(), 2);
-        assert!(same_file::is_same_file(&fast_path, &ann_path).expect("compare aliases"));
+        assert!(
+            crate::file_identity::is_same_file(&fast_path, &ann_path).expect("compare aliases")
+        );
         assert_eq!(fs::read(&fast_path).expect("read preserved FSVI"), original);
     }
 
@@ -3006,7 +3009,8 @@ mod tests {
         );
         assert_eq!(ann.len(), 2);
         assert!(
-            same_file::is_same_file(&quality_path, &quality_ann_path).expect("compare aliases")
+            crate::file_identity::is_same_file(&quality_path, &quality_ann_path)
+                .expect("compare aliases")
         );
         assert_eq!(
             fs::read(&quality_path).expect("read preserved quality FSVI"),

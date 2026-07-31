@@ -138,7 +138,8 @@ fn run(args: Vec<String>) -> SearchResult<()> {
     let verbosity = Verbosity::from_flags(cli_input.verbose, cli_input.quiet);
     init_subscriber(verbosity, cli_input.no_color);
 
-    let home_dir = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"));
+    let home_dir =
+        frankensearch_core::platform_dirs::home_dir().unwrap_or_else(|| PathBuf::from("/"));
     let mut explicit_config_path = None;
     let mut project_config_path = None;
     let mut user_config_path = None;

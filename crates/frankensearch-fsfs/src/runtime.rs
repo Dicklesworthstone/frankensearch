@@ -20,7 +20,7 @@ use asupersync::fs::{
     remove_file as async_file_remove,
 };
 use asupersync::runtime::{RuntimeBuilder, spawn_blocking};
-use dirs::home_dir;
+use frankensearch_core::platform_dirs::home_dir;
 use frankensearch_core::{
     Canonicalizer, DefaultCanonicalizer, Embedder, ExplainedSource, ExplanationPhase,
     HitExplanation, IndexableDocument, ModelCategory, ScoreComponent, SearchError, SearchResult,
@@ -3056,7 +3056,8 @@ const fn default_ttl() -> u64 {
 /// Resolve the path to the version-check cache file.
 #[must_use]
 pub fn version_cache_path() -> Option<PathBuf> {
-    dirs::cache_dir().map(|d| d.join("frankensearch").join("version_check.json"))
+    frankensearch_core::platform_dirs::cache_dir()
+        .map(|d| d.join("frankensearch").join("version_check.json"))
 }
 
 #[must_use]
@@ -3243,7 +3244,7 @@ pub fn backup_dir() -> Option<PathBuf> {
     if let Some(dir) = backup_dir_override() {
         return Some(dir);
     }
-    dirs::data_dir().map(|d| d.join("frankensearch").join("backups"))
+    frankensearch_core::platform_dirs::data_dir().map(|d| d.join("frankensearch").join("backups"))
 }
 
 /// Resolve the rollback manifest path.
@@ -4541,7 +4542,7 @@ impl FsfsRuntime {
             purge_only: true,
         });
 
-        if let Some(config_dir) = dirs::config_dir() {
+        if let Some(config_dir) = frankensearch_core::platform_dirs::config_dir() {
             let root = config_dir.join("frankensearch");
             candidates.push(UninstallTarget {
                 target: "config_dir".to_owned(),
@@ -4563,7 +4564,7 @@ impl FsfsRuntime {
             });
         }
 
-        if let Some(cache_dir) = dirs::cache_dir() {
+        if let Some(cache_dir) = frankensearch_core::platform_dirs::cache_dir() {
             candidates.push(UninstallTarget {
                 target: "cache_dir".to_owned(),
                 kind: UninstallTargetKind::Directory,
@@ -4572,7 +4573,7 @@ impl FsfsRuntime {
             });
         }
 
-        if let Some(data_dir) = dirs::data_dir() {
+        if let Some(data_dir) = frankensearch_core::platform_dirs::data_dir() {
             candidates.push(UninstallTarget {
                 target: "data_dir".to_owned(),
                 kind: UninstallTargetKind::Directory,
@@ -5830,8 +5831,8 @@ impl FsfsRuntime {
         hasher.update(index_root.display().to_string().as_bytes());
         let digest = sha256_digest_hex(hasher.finalize());
         let prefix_len = FSFS_DAEMON_SOCKET_HASH_PREFIX_LEN.min(digest.len());
-        let runtime_base = dirs::runtime_dir()
-            .or_else(|| dirs::cache_dir().map(|dir| dir.join("run")))
+        let runtime_base = frankensearch_core::platform_dirs::runtime_dir()
+            .or_else(|| frankensearch_core::platform_dirs::cache_dir().map(|dir| dir.join("run")))
             .unwrap_or_else(std::env::temp_dir);
         let socket_dir = runtime_base.join("frankensearch").join("daemon");
         Ok(socket_dir.join(format!("fsfs-query-{}.sock", &digest[..prefix_len])))

@@ -101,7 +101,6 @@ wide = "1.1.1"
 
 # Memory-mapped I/O
 memmap2 = "0.9"
-same-file = "1.0.6"
 
 # Embedder dependencies (feature-gated per crate)
 # Default features pull in native-tls and network stacks that transitively
@@ -146,7 +145,6 @@ xxhash-rust = { version = "0.8", features = ["xxh3"] }
 unicode-normalization = "0.1"
 
 # Platform-standard directories for model storage
-dirs = "6"
 
 # TOML parsing for configuration surfaces
 toml = "1.0.3"
@@ -162,7 +160,6 @@ criterion = { version = "0.8.2", features = ["html_reports"] }
 proptest = "1.6"
 
 # Date/time formatting/parsing for telemetry RFC3339 timestamps
-time = { version = "0.3.47", features = ["formatting", "parsing"] }
 
 # System information (CPU, memory, etc.)
 sysinfo = "0.38.2"
