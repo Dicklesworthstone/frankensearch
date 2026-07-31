@@ -1,0 +1,1854 @@
+{
+  "rows": [
+    {
+      "actual_activity": {
+        "quill": {
+          "census_threads_by_role": {
+            "asupersync_runtime": {
+              "max": 1,
+              "median": 1,
+              "min": 1
+            },
+            "bench_caller": {
+              "max": 1,
+              "median": 1,
+              "min": 1
+            },
+            "unattributed": {
+              "max": 1,
+              "median": 1,
+              "min": 1
+            }
+          },
+          "mean_active_millithreads": {
+            "max": 1001,
+            "median": 999,
+            "min": 999
+          },
+          "positive_cpu_threads": {
+            "max": 2,
+            "median": 1,
+            "min": 1
+          },
+          "positive_cpu_threads_by_role": {
+            "asupersync_runtime": {
+              "max": 1,
+              "median": 0,
+              "min": 0
+            },
+            "bench_caller": {
+              "max": 1,
+              "median": 1,
+              "min": 1
+            }
+          },
+          "positive_dedicated_worker_threads": {
+            "max": 0,
+            "median": 0,
+            "min": 0
+          },
+          "receipts": 33
+        },
+        "tantivy": {
+          "census_threads_by_role": {
+            "asupersync_runtime": {
+              "max": 1,
+              "median": 1,
+              "min": 1
+            },
+            "bench_caller": {
+              "max": 1,
+              "median": 1,
+              "min": 1
+            },
+            "tantivy_docstore_compressor": {
+              "max": 1,
+              "median": 1,
+              "min": 0
+            },
+            "tantivy_index_worker": {
+              "max": 2,
+              "median": 2,
+              "min": 2
+            },
+            "tantivy_merge_worker": {
+              "max": 4,
+              "median": 4,
+              "min": 4
+            },
+            "tantivy_segment_updater": {
+              "max": 1,
+              "median": 1,
+              "min": 1
+            },
+            "unattributed": {
+              "max": 2,
+              "median": 1,
+              "min": 0
+            }
+          },
+          "mean_active_millithreads": {
+            "max": 1757,
+            "median": 1704,
+            "min": 1654
+          },
+          "positive_cpu_threads": {
+            "max": 7,
+            "median": 6,
+            "min": 3
+          },
+          "positive_cpu_threads_by_role": {
+            "asupersync_runtime": {
+              "max": 1,
+              "median": 0,
+              "min": 0
+            },
+            "bench_caller": {
+              "max": 1,
+              "median": 1,
+              "min": 1
+            },
+            "tantivy_docstore_compressor": {
+              "max": 1,
+              "median": 1,
+              "min": 0
+            },
+            "tantivy_index_worker": {
+              "max": 1,
+              "median": 1,
+              "min": 0
+            },
+            "tantivy_merge_worker": {
+              "max": 2,
+              "median": 2,
+              "min": 1
+            },
+            "tantivy_segment_updater": {
+              "max": 1,
+              "median": 1,
+              "min": 1
+            }
+          },
+          "positive_dedicated_worker_threads": {
+            "max": 5,
+            "median": 5,
+            "min": 2
+          },
+          "receipts": 33
+        }
+      },
+      "corrected_null_gate": {
+        "effect_ci_excludes_one": true,
+        "effect_distance_from_one": 0.5001177096523661,
+        "effect_exceeds_twice_max_null_half_width": true,
+        "null_medians_within_two_percent": true,
+        "pass": true,
+        "quill_null": {
+          "ci95_high": 1.0298512439011007,
+          "ci95_low": 0.9803930623617145,
+          "half_width": 0.02985124390110072,
+          "median": 1.001973887708437
+        },
+        "tantivy_null": {
+          "ci95_high": 1.035060179333892,
+          "ci95_low": 0.9997148608456672,
+          "half_width": 0.03506017933389205,
+          "median": 1.0095757619495815
+        },
+        "twice_max_null_half_width": 0.0701203586677841
+      },
+      "elf_sha256": "53ab4c0975f0ad2148e37f35641dfd56e78acd8048d01cdb8b1194aa8ab9b637",
+      "git_rev": "ccc37c8e611cd313201108ffe9260376a977b4bd",
+      "host": {
+        "boot_id": "b107a2c6-9fac-40df-a637-c3a772b0ad57",
+        "captured_at": "2026-07-31T03:57:23Z",
+        "hostname": "threadripperje",
+        "uname": "Linux threadripperje 6.17.0-41-generic #41-Ubuntu SMP PREEMPT_DYNAMIC Sat Jun 20 18:01:40 UTC 2026 x86_64 GNU/Linux"
+      },
+      "machine_fingerprint": "linux-x86_64-threadripperje-128thread-AMD_Ryzen_Threadripper_PRO_5995WX_64-Cores",
+      "paired_quill_over_tantivy": {
+        "ci95_high": 0.5115490835246106,
+        "ci95_low": 0.4874383148606988,
+        "median": 0.4998822903476339
+      },
+      "receipt_caveats": [
+        "10 ms /proc clock-tick granularity",
+        "CPU from threads that exit before the final census can be unattributed"
+      ],
+      "status": {
+        "benchmark_status": "0",
+        "elapsed_ns": "1389787738624",
+        "elf_sha256": "53ab4c0975f0ad2148e37f35641dfd56e78acd8048d01cdb8b1194aa8ab9b637",
+        "ended_ns": "1785471634422507910",
+        "environment_sha256": "2d1dd64ae73859562f523d48fba90a7ad26fd81629677b8e90f6c7ff9be00931",
+        "evidence_identity_ok": "true",
+        "last_h1_h2_wall_equal": "true",
+        "laws_attested": "false",
+        "receipt_count": "66",
+        "receipt_sha256": "94e67b663a3beed283c830ea4f797e984e70ed171df6e001e1717b5059f44b96",
+        "remote_shell_pid": "2810628",
+        "self_reported_sha256": "53ab4c0975f0ad2148e37f35641dfd56e78acd8048d01cdb8b1194aa8ab9b637",
+        "source_rev": "ccc37c8e611cd313201108ffe9260376a977b4bd",
+        "started_ns": "1785470244634769286",
+        "status": "0",
+        "terminal_failures": "0",
+        "wall_mismatches": "0"
+      },
+      "threads": 1,
+      "throughput_docs_per_second": {
+        "quill": 35551.52146121288,
+        "tantivy": 71930.0649395716
+      }
+    },
+    {
+      "actual_activity": {
+        "quill": {
+          "census_threads_by_role": {
+            "asupersync_runtime": {
+              "max": 1,
+              "median": 1,
+              "min": 1
+            },
+            "bench_caller": {
+              "max": 1,
+              "median": 1,
+              "min": 1
+            },
+            "rayon_worker": {
+              "max": 1,
+              "median": 1,
+              "min": 1
+            },
+            "unattributed": {
+              "max": 1,
+              "median": 1,
+              "min": 1
+            }
+          },
+          "mean_active_millithreads": {
+            "max": 1001,
+            "median": 999,
+            "min": 999
+          },
+          "positive_cpu_threads": {
+            "max": 2,
+            "median": 1,
+            "min": 1
+          },
+          "positive_cpu_threads_by_role": {
+            "asupersync_runtime": {
+              "max": 1,
+              "median": 0,
+              "min": 0
+            },
+            "bench_caller": {
+              "max": 1,
+              "median": 1,
+              "min": 1
+            }
+          },
+          "positive_dedicated_worker_threads": {
+            "max": 0,
+            "median": 0,
+            "min": 0
+          },
+          "receipts": 33
+        },
+        "tantivy": {
+          "census_threads_by_role": {
+            "asupersync_runtime": {
+              "max": 1,
+              "median": 1,
+              "min": 1
+            },
+            "bench_caller": {
+              "max": 1,
+              "median": 1,
+              "min": 1
+            },
+            "tantivy_docstore_compressor": {
+              "max": 4,
+              "median": 3,
+              "min": 1
+            },
+            "tantivy_index_worker": {
+              "max": 4,
+              "median": 4,
+              "min": 4
+            },
+            "tantivy_merge_worker": {
+              "max": 4,
+              "median": 4,
+              "min": 4
+            },
+            "tantivy_segment_updater": {
+              "max": 1,
+              "median": 1,
+              "min": 1
+            },
+            "unattributed": {
+              "max": 2,
+              "median": 1,
+              "min": 0
+            }
+          },
+          "mean_active_millithreads": {
+            "max": 2955,
+            "median": 2690,
+            "min": 2526
+          },
+          "positive_cpu_threads": {
+            "max": 9,
+            "median": 7,
+            "min": 3
+          },
+          "positive_cpu_threads_by_role": {
+            "asupersync_runtime": {
+              "max": 1,
+              "median": 0,
+              "min": 0
+            },
+            "bench_caller": {
+              "max": 1,
+              "median": 1,
+              "min": 1
+            },
+            "tantivy_docstore_compressor": {
+              "max": 3,
+              "median": 2,
+              "min": 0
+            },
+            "tantivy_index_worker": {
+              "max": 2,
+              "median": 2,
+              "min": 0
+            },
+            "tantivy_merge_worker": {
+              "max": 2,
+              "median": 1,
+              "min": 1
+            },
+            "tantivy_segment_updater": {
+              "max": 1,
+              "median": 1,
+              "min": 1
+            }
+          },
+          "positive_dedicated_worker_threads": {
+            "max": 7,
+            "median": 6,
+            "min": 2
+          },
+          "receipts": 33
+        }
+      },
+      "corrected_null_gate": {
+        "effect_ci_excludes_one": true,
+        "effect_distance_from_one": 0.6871584406683889,
+        "effect_exceeds_twice_max_null_half_width": true,
+        "null_medians_within_two_percent": false,
+        "pass": false,
+        "quill_null": {
+          "ci95_high": 1.0370518381541676,
+          "ci95_low": 0.9869094802511154,
+          "half_width": 0.03705183815416757,
+          "median": 1.012091192433651
+        },
+        "tantivy_null": {
+          "ci95_high": 1.060963158928235,
+          "ci95_low": 0.9864957918050096,
+          "half_width": 0.060963158928234895,
+          "median": 1.0383768651974674
+        },
+        "twice_max_null_half_width": 0.12192631785646979
+      },
+      "elf_sha256": "53ab4c0975f0ad2148e37f35641dfd56e78acd8048d01cdb8b1194aa8ab9b637",
+      "git_rev": "ccc37c8e611cd313201108ffe9260376a977b4bd",
+      "host": {
+        "boot_id": "b107a2c6-9fac-40df-a637-c3a772b0ad57",
+        "captured_at": "2026-07-31T04:20:35Z",
+        "hostname": "threadripperje",
+        "uname": "Linux threadripperje 6.17.0-41-generic #41-Ubuntu SMP PREEMPT_DYNAMIC Sat Jun 20 18:01:40 UTC 2026 x86_64 GNU/Linux"
+      },
+      "machine_fingerprint": "linux-x86_64-threadripperje-128thread-AMD_Ryzen_Threadripper_PRO_5995WX_64-Cores",
+      "paired_quill_over_tantivy": {
+        "ci95_high": 0.321049862427893,
+        "ci95_low": 0.30642157166005796,
+        "median": 0.31284155933161106
+      },
+      "receipt_caveats": [
+        "10 ms /proc clock-tick granularity",
+        "CPU from threads that exit before the final census can be unattributed"
+      ],
+      "status": {
+        "benchmark_status": "0",
+        "elapsed_ns": "1261491610024",
+        "elf_sha256": "53ab4c0975f0ad2148e37f35641dfd56e78acd8048d01cdb8b1194aa8ab9b637",
+        "ended_ns": "1785472897347123481",
+        "environment_sha256": "691a46ef6c9d84d2276a9ad2cfda6c44bebe46a7a43599e902cff374fc925f60",
+        "evidence_identity_ok": "true",
+        "last_h1_h2_wall_equal": "true",
+        "laws_attested": "false",
+        "receipt_count": "66",
+        "receipt_sha256": "d20ce285d0fb53645eb661414d0610be632ca79a919a5e7999371b6a83f62ac9",
+        "remote_shell_pid": "2810628",
+        "self_reported_sha256": "53ab4c0975f0ad2148e37f35641dfd56e78acd8048d01cdb8b1194aa8ab9b637",
+        "source_rev": "ccc37c8e611cd313201108ffe9260376a977b4bd",
+        "started_ns": "1785471635855513457",
+        "status": "0",
+        "terminal_failures": "0",
+        "wall_mismatches": "0"
+      },
+      "threads": 2,
+      "throughput_docs_per_second": {
+        "quill": 36505.68471753171,
+        "tantivy": 116424.79015259397
+      }
+    },
+    {
+      "actual_activity": {
+        "quill": {
+          "census_threads_by_role": {
+            "asupersync_runtime": {
+              "max": 1,
+              "median": 1,
+              "min": 1
+            },
+            "bench_caller": {
+              "max": 1,
+              "median": 1,
+              "min": 1
+            },
+            "rayon_worker": {
+              "max": 3,
+              "median": 3,
+              "min": 3
+            },
+            "unattributed": {
+              "max": 1,
+              "median": 1,
+              "min": 1
+            }
+          },
+          "mean_active_millithreads": {
+            "max": 1000,
+            "median": 999,
+            "min": 999
+          },
+          "positive_cpu_threads": {
+            "max": 2,
+            "median": 1,
+            "min": 1
+          },
+          "positive_cpu_threads_by_role": {
+            "asupersync_runtime": {
+              "max": 1,
+              "median": 0,
+              "min": 0
+            },
+            "bench_caller": {
+              "max": 1,
+              "median": 1,
+              "min": 1
+            }
+          },
+          "positive_dedicated_worker_threads": {
+            "max": 0,
+            "median": 0,
+            "min": 0
+          },
+          "receipts": 33
+        },
+        "tantivy": {
+          "census_threads_by_role": {
+            "asupersync_runtime": {
+              "max": 1,
+              "median": 1,
+              "min": 1
+            },
+            "bench_caller": {
+              "max": 1,
+              "median": 1,
+              "min": 1
+            },
+            "tantivy_docstore_compressor": {
+              "max": 8,
+              "median": 6,
+              "min": 1
+            },
+            "tantivy_index_worker": {
+              "max": 8,
+              "median": 8,
+              "min": 8
+            },
+            "tantivy_merge_worker": {
+              "max": 4,
+              "median": 4,
+              "min": 4
+            },
+            "tantivy_segment_updater": {
+              "max": 2,
+              "median": 1,
+              "min": 1
+            },
+            "unattributed": {
+              "max": 3,
+              "median": 1,
+              "min": 1
+            }
+          },
+          "mean_active_millithreads": {
+            "max": 4915,
+            "median": 4639,
+            "min": 4405
+          },
+          "positive_cpu_threads": {
+            "max": 11,
+            "median": 10,
+            "min": 9
+          },
+          "positive_cpu_threads_by_role": {
+            "asupersync_runtime": {
+              "max": 1,
+              "median": 0,
+              "min": 0
+            },
+            "bench_caller": {
+              "max": 1,
+              "median": 1,
+              "min": 1
+            },
+            "tantivy_docstore_compressor": {
+              "max": 1,
+              "median": 0,
+              "min": 0
+            },
+            "tantivy_index_worker": {
+              "max": 4,
+              "median": 4,
+              "min": 4
+            },
+            "tantivy_merge_worker": {
+              "max": 4,
+              "median": 4,
+              "min": 3
+            },
+            "tantivy_segment_updater": {
+              "max": 1,
+              "median": 1,
+              "min": 1
+            }
+          },
+          "positive_dedicated_worker_threads": {
+            "max": 10,
+            "median": 9,
+            "min": 8
+          },
+          "receipts": 33
+        }
+      },
+      "corrected_null_gate": {
+        "effect_ci_excludes_one": true,
+        "effect_distance_from_one": 0.7223877524031598,
+        "effect_exceeds_twice_max_null_half_width": true,
+        "null_medians_within_two_percent": false,
+        "pass": false,
+        "quill_null": {
+          "ci95_high": 1.007703412635843,
+          "ci95_low": 0.9835211467889683,
+          "half_width": 0.016478853211031708,
+          "median": 0.9955427292316701
+        },
+        "tantivy_null": {
+          "ci95_high": 1.0341594637168388,
+          "ci95_low": 0.9400292577240025,
+          "half_width": 0.059970742275997524,
+          "median": 0.9730659187169513
+        },
+        "twice_max_null_half_width": 0.11994148455199505
+      },
+      "elf_sha256": "53ab4c0975f0ad2148e37f35641dfd56e78acd8048d01cdb8b1194aa8ab9b637",
+      "git_rev": "ccc37c8e611cd313201108ffe9260376a977b4bd",
+      "host": {
+        "boot_id": "b107a2c6-9fac-40df-a637-c3a772b0ad57",
+        "captured_at": "2026-07-31T04:41:38Z",
+        "hostname": "threadripperje",
+        "uname": "Linux threadripperje 6.17.0-41-generic #41-Ubuntu SMP PREEMPT_DYNAMIC Sat Jun 20 18:01:40 UTC 2026 x86_64 GNU/Linux"
+      },
+      "machine_fingerprint": "linux-x86_64-threadripperje-128thread-AMD_Ryzen_Threadripper_PRO_5995WX_64-Cores",
+      "paired_quill_over_tantivy": {
+        "ci95_high": 0.28496149557353956,
+        "ci95_low": 0.27333776403913995,
+        "median": 0.2776122475968402
+      },
+      "receipt_caveats": [
+        "10 ms /proc clock-tick granularity",
+        "CPU from threads that exit before the final census can be unattributed"
+      ],
+      "status": {
+        "benchmark_status": "0",
+        "elapsed_ns": "1170854873123",
+        "elf_sha256": "53ab4c0975f0ad2148e37f35641dfd56e78acd8048d01cdb8b1194aa8ab9b637",
+        "ended_ns": "1785474069611432996",
+        "environment_sha256": "7de10eb41b1b449d75483883a35174d5eec362001408b9b8dcee60dcc73d7f27",
+        "evidence_identity_ok": "true",
+        "last_h1_h2_wall_equal": "true",
+        "laws_attested": "false",
+        "receipt_count": "66",
+        "receipt_sha256": "8d5ec6fc6138f995cdd688e77faecd013418a225f8e20c01d99314adf2ff56dc",
+        "remote_shell_pid": "2810628",
+        "self_reported_sha256": "53ab4c0975f0ad2148e37f35641dfd56e78acd8048d01cdb8b1194aa8ab9b637",
+        "source_rev": "ccc37c8e611cd313201108ffe9260376a977b4bd",
+        "started_ns": "1785472898756559873",
+        "status": "0",
+        "terminal_failures": "0",
+        "wall_mismatches": "0"
+      },
+      "threads": 4,
+      "throughput_docs_per_second": {
+        "quill": 37270.19294343467,
+        "tantivy": 132936.0585259446
+      }
+    },
+    {
+      "actual_activity": {
+        "quill": {
+          "census_threads_by_role": {
+            "asupersync_runtime": {
+              "max": 1,
+              "median": 1,
+              "min": 1
+            },
+            "bench_caller": {
+              "max": 1,
+              "median": 1,
+              "min": 1
+            },
+            "rayon_worker": {
+              "max": 7,
+              "median": 7,
+              "min": 7
+            },
+            "unattributed": {
+              "max": 1,
+              "median": 1,
+              "min": 1
+            }
+          },
+          "mean_active_millithreads": {
+            "max": 1001,
+            "median": 999,
+            "min": 999
+          },
+          "positive_cpu_threads": {
+            "max": 2,
+            "median": 1,
+            "min": 1
+          },
+          "positive_cpu_threads_by_role": {
+            "asupersync_runtime": {
+              "max": 1,
+              "median": 0,
+              "min": 0
+            },
+            "bench_caller": {
+              "max": 1,
+              "median": 1,
+              "min": 1
+            }
+          },
+          "positive_dedicated_worker_threads": {
+            "max": 0,
+            "median": 0,
+            "min": 0
+          },
+          "receipts": 33
+        },
+        "tantivy": {
+          "census_threads_by_role": {
+            "asupersync_runtime": {
+              "max": 1,
+              "median": 1,
+              "min": 1
+            },
+            "bench_caller": {
+              "max": 1,
+              "median": 1,
+              "min": 1
+            },
+            "tantivy_docstore_compressor": {
+              "max": 11,
+              "median": 10,
+              "min": 2
+            },
+            "tantivy_index_worker": {
+              "max": 16,
+              "median": 16,
+              "min": 16
+            },
+            "tantivy_merge_worker": {
+              "max": 4,
+              "median": 4,
+              "min": 4
+            },
+            "tantivy_segment_updater": {
+              "max": 1,
+              "median": 1,
+              "min": 1
+            },
+            "unattributed": {
+              "max": 5,
+              "median": 2,
+              "min": 1
+            }
+          },
+          "mean_active_millithreads": {
+            "max": 6547,
+            "median": 6169,
+            "min": 5576
+          },
+          "positive_cpu_threads": {
+            "max": 15,
+            "median": 14,
+            "min": 7
+          },
+          "positive_cpu_threads_by_role": {
+            "asupersync_runtime": {
+              "max": 1,
+              "median": 0,
+              "min": 0
+            },
+            "bench_caller": {
+              "max": 1,
+              "median": 1,
+              "min": 1
+            },
+            "tantivy_docstore_compressor": {
+              "max": 1,
+              "median": 0,
+              "min": 0
+            },
+            "tantivy_index_worker": {
+              "max": 8,
+              "median": 8,
+              "min": 0
+            },
+            "tantivy_merge_worker": {
+              "max": 4,
+              "median": 4,
+              "min": 3
+            },
+            "tantivy_segment_updater": {
+              "max": 1,
+              "median": 1,
+              "min": 1
+            }
+          },
+          "positive_dedicated_worker_threads": {
+            "max": 14,
+            "median": 13,
+            "min": 6
+          },
+          "receipts": 33
+        }
+      },
+      "corrected_null_gate": {
+        "effect_ci_excludes_one": true,
+        "effect_distance_from_one": 0.7187345706483825,
+        "effect_exceeds_twice_max_null_half_width": true,
+        "null_medians_within_two_percent": true,
+        "pass": true,
+        "quill_null": {
+          "ci95_high": 1.0050836594560055,
+          "ci95_low": 0.9941050995635461,
+          "half_width": 0.005894900436453909,
+          "median": 0.9989074659751351
+        },
+        "tantivy_null": {
+          "ci95_high": 1.045194590088923,
+          "ci95_low": 0.9031215712386232,
+          "half_width": 0.09687842876137676,
+          "median": 0.9987725535984491
+        },
+        "twice_max_null_half_width": 0.1937568575227535
+      },
+      "elf_sha256": "53ab4c0975f0ad2148e37f35641dfd56e78acd8048d01cdb8b1194aa8ab9b637",
+      "git_rev": "ccc37c8e611cd313201108ffe9260376a977b4bd",
+      "host": {
+        "boot_id": "b107a2c6-9fac-40df-a637-c3a772b0ad57",
+        "captured_at": "2026-07-31T05:01:10Z",
+        "hostname": "threadripperje",
+        "uname": "Linux threadripperje 6.17.0-41-generic #41-Ubuntu SMP PREEMPT_DYNAMIC Sat Jun 20 18:01:40 UTC 2026 x86_64 GNU/Linux"
+      },
+      "machine_fingerprint": "linux-x86_64-threadripperje-128thread-AMD_Ryzen_Threadripper_PRO_5995WX_64-Cores",
+      "paired_quill_over_tantivy": {
+        "ci95_high": 0.2866624447755198,
+        "ci95_low": 0.26987817653575613,
+        "median": 0.28126542935161747
+      },
+      "receipt_caveats": [
+        "10 ms /proc clock-tick granularity",
+        "CPU from threads that exit before the final census can be unattributed"
+      ],
+      "status": {
+        "benchmark_status": "0",
+        "elapsed_ns": "1217921080825",
+        "elf_sha256": "53ab4c0975f0ad2148e37f35641dfd56e78acd8048d01cdb8b1194aa8ab9b637",
+        "ended_ns": "1785475288939950773",
+        "environment_sha256": "38703c761f4f2d4927a467e8460467a2bcc32de03d5a08e138dc5e270fc0b719",
+        "evidence_identity_ok": "true",
+        "last_h1_h2_wall_equal": "true",
+        "laws_attested": "false",
+        "receipt_count": "66",
+        "receipt_sha256": "4d119cfc516ccba375e1e28df6194d7f6c452313d6ff6e933303be0fc10d9e87",
+        "remote_shell_pid": "2810628",
+        "self_reported_sha256": "53ab4c0975f0ad2148e37f35641dfd56e78acd8048d01cdb8b1194aa8ab9b637",
+        "source_rev": "ccc37c8e611cd313201108ffe9260376a977b4bd",
+        "started_ns": "1785474071018869948",
+        "status": "0",
+        "terminal_failures": "0",
+        "wall_mismatches": "0"
+      },
+      "threads": 8,
+      "throughput_docs_per_second": {
+        "quill": 35409.34649988165,
+        "tantivy": 126257.90257429337
+      }
+    },
+    {
+      "actual_activity": {
+        "quill": {
+          "census_threads_by_role": {
+            "asupersync_runtime": {
+              "max": 1,
+              "median": 1,
+              "min": 1
+            },
+            "bench_caller": {
+              "max": 1,
+              "median": 1,
+              "min": 1
+            },
+            "rayon_worker": {
+              "max": 15,
+              "median": 15,
+              "min": 15
+            },
+            "unattributed": {
+              "max": 1,
+              "median": 1,
+              "min": 1
+            }
+          },
+          "mean_active_millithreads": {
+            "max": 1002,
+            "median": 1001,
+            "min": 1000
+          },
+          "positive_cpu_threads": {
+            "max": 2,
+            "median": 1,
+            "min": 1
+          },
+          "positive_cpu_threads_by_role": {
+            "asupersync_runtime": {
+              "max": 1,
+              "median": 0,
+              "min": 0
+            },
+            "bench_caller": {
+              "max": 1,
+              "median": 1,
+              "min": 1
+            }
+          },
+          "positive_dedicated_worker_threads": {
+            "max": 0,
+            "median": 0,
+            "min": 0
+          },
+          "receipts": 33
+        },
+        "tantivy": {
+          "census_threads_by_role": {
+            "asupersync_runtime": {
+              "max": 1,
+              "median": 1,
+              "min": 1
+            },
+            "bench_caller": {
+              "max": 1,
+              "median": 1,
+              "min": 1
+            },
+            "tantivy_docstore_compressor": {
+              "max": 20,
+              "median": 17,
+              "min": 0
+            },
+            "tantivy_index_worker": {
+              "max": 32,
+              "median": 32,
+              "min": 32
+            },
+            "tantivy_merge_worker": {
+              "max": 4,
+              "median": 4,
+              "min": 4
+            },
+            "tantivy_segment_updater": {
+              "max": 2,
+              "median": 1,
+              "min": 1
+            },
+            "unattributed": {
+              "max": 5,
+              "median": 2,
+              "min": 1
+            }
+          },
+          "mean_active_millithreads": {
+            "max": 7599,
+            "median": 6235,
+            "min": 5684
+          },
+          "positive_cpu_threads": {
+            "max": 23,
+            "median": 22,
+            "min": 6
+          },
+          "positive_cpu_threads_by_role": {
+            "asupersync_runtime": {
+              "max": 1,
+              "median": 0,
+              "min": 0
+            },
+            "bench_caller": {
+              "max": 1,
+              "median": 1,
+              "min": 1
+            },
+            "tantivy_docstore_compressor": {
+              "max": 1,
+              "median": 0,
+              "min": 0
+            },
+            "tantivy_index_worker": {
+              "max": 16,
+              "median": 16,
+              "min": 0
+            },
+            "tantivy_merge_worker": {
+              "max": 4,
+              "median": 4,
+              "min": 4
+            },
+            "tantivy_segment_updater": {
+              "max": 1,
+              "median": 1,
+              "min": 1
+            }
+          },
+          "positive_dedicated_worker_threads": {
+            "max": 22,
+            "median": 21,
+            "min": 5
+          },
+          "receipts": 33
+        }
+      },
+      "corrected_null_gate": {
+        "effect_ci_excludes_one": true,
+        "effect_distance_from_one": 0.7142426565246961,
+        "effect_exceeds_twice_max_null_half_width": true,
+        "null_medians_within_two_percent": false,
+        "pass": false,
+        "quill_null": {
+          "ci95_high": 1.0059723014087965,
+          "ci95_low": 0.991654974989039,
+          "half_width": 0.008345025010961016,
+          "median": 0.9967559433374447
+        },
+        "tantivy_null": {
+          "ci95_high": 1.1576981346942001,
+          "ci95_low": 0.9381380640529225,
+          "half_width": 0.15769813469420013,
+          "median": 1.0722115708146862
+        },
+        "twice_max_null_half_width": 0.31539626938840026
+      },
+      "elf_sha256": "53ab4c0975f0ad2148e37f35641dfd56e78acd8048d01cdb8b1194aa8ab9b637",
+      "git_rev": "ccc37c8e611cd313201108ffe9260376a977b4bd",
+      "host": {
+        "boot_id": "b107a2c6-9fac-40df-a637-c3a772b0ad57",
+        "captured_at": "2026-07-31T05:21:29Z",
+        "hostname": "threadripperje",
+        "uname": "Linux threadripperje 6.17.0-41-generic #41-Ubuntu SMP PREEMPT_DYNAMIC Sat Jun 20 18:01:40 UTC 2026 x86_64 GNU/Linux"
+      },
+      "machine_fingerprint": "linux-x86_64-threadripperje-128thread-AMD_Ryzen_Threadripper_PRO_5995WX_64-Cores",
+      "paired_quill_over_tantivy": {
+        "ci95_high": 0.3003161949739854,
+        "ci95_low": 0.2701756117164445,
+        "median": 0.2857573434753039
+      },
+      "receipt_caveats": [
+        "10 ms /proc clock-tick granularity",
+        "CPU from threads that exit before the final census can be unattributed"
+      ],
+      "status": {
+        "benchmark_status": "0",
+        "elapsed_ns": "1319876554590",
+        "elf_sha256": "53ab4c0975f0ad2148e37f35641dfd56e78acd8048d01cdb8b1194aa8ab9b637",
+        "ended_ns": "1785476610215562322",
+        "environment_sha256": "365636095eb539c5da0d019affb456ccba997d780a8c8b54f7d0de32cd44746b",
+        "evidence_identity_ok": "true",
+        "last_h1_h2_wall_equal": "true",
+        "laws_attested": "false",
+        "receipt_count": "66",
+        "receipt_sha256": "749f1cb666b0f444d79658fb647f9fd3f8a53e726975f81ea81b46416b26fee9",
+        "remote_shell_pid": "2810628",
+        "self_reported_sha256": "53ab4c0975f0ad2148e37f35641dfd56e78acd8048d01cdb8b1194aa8ab9b637",
+        "source_rev": "ccc37c8e611cd313201108ffe9260376a977b4bd",
+        "started_ns": "1785475290339007732",
+        "status": "0",
+        "terminal_failures": "0",
+        "wall_mismatches": "0"
+      },
+      "threads": 16,
+      "throughput_docs_per_second": {
+        "quill": 33473.59637035798,
+        "tantivy": 117564.25564867287
+      }
+    },
+    {
+      "actual_activity": {
+        "quill": {
+          "census_threads_by_role": {
+            "asupersync_runtime": {
+              "max": 1,
+              "median": 1,
+              "min": 1
+            },
+            "bench_caller": {
+              "max": 1,
+              "median": 1,
+              "min": 1
+            },
+            "rayon_worker": {
+              "max": 31,
+              "median": 31,
+              "min": 31
+            },
+            "unattributed": {
+              "max": 1,
+              "median": 1,
+              "min": 1
+            }
+          },
+          "mean_active_millithreads": {
+            "max": 1002,
+            "median": 1001,
+            "min": 1001
+          },
+          "positive_cpu_threads": {
+            "max": 2,
+            "median": 1,
+            "min": 1
+          },
+          "positive_cpu_threads_by_role": {
+            "asupersync_runtime": {
+              "max": 1,
+              "median": 0,
+              "min": 0
+            },
+            "bench_caller": {
+              "max": 1,
+              "median": 1,
+              "min": 1
+            }
+          },
+          "positive_dedicated_worker_threads": {
+            "max": 0,
+            "median": 0,
+            "min": 0
+          },
+          "receipts": 33
+        },
+        "tantivy": {
+          "census_threads_by_role": {
+            "asupersync_runtime": {
+              "max": 1,
+              "median": 1,
+              "min": 1
+            },
+            "bench_caller": {
+              "max": 1,
+              "median": 1,
+              "min": 1
+            },
+            "tantivy_docstore_compressor": {
+              "max": 36,
+              "median": 33,
+              "min": 26
+            },
+            "tantivy_index_worker": {
+              "max": 64,
+              "median": 64,
+              "min": 64
+            },
+            "tantivy_merge_worker": {
+              "max": 4,
+              "median": 4,
+              "min": 4
+            },
+            "tantivy_segment_updater": {
+              "max": 1,
+              "median": 1,
+              "min": 1
+            },
+            "unattributed": {
+              "max": 6,
+              "median": 2,
+              "min": 1
+            }
+          },
+          "mean_active_millithreads": {
+            "max": 8336,
+            "median": 6950,
+            "min": 5459
+          },
+          "positive_cpu_threads": {
+            "max": 39,
+            "median": 38,
+            "min": 20
+          },
+          "positive_cpu_threads_by_role": {
+            "asupersync_runtime": {
+              "max": 1,
+              "median": 0,
+              "min": 0
+            },
+            "bench_caller": {
+              "max": 1,
+              "median": 1,
+              "min": 1
+            },
+            "tantivy_index_worker": {
+              "max": 32,
+              "median": 32,
+              "min": 14
+            },
+            "tantivy_merge_worker": {
+              "max": 4,
+              "median": 4,
+              "min": 4
+            },
+            "tantivy_segment_updater": {
+              "max": 1,
+              "median": 1,
+              "min": 1
+            }
+          },
+          "positive_dedicated_worker_threads": {
+            "max": 37,
+            "median": 37,
+            "min": 19
+          },
+          "receipts": 33
+        }
+      },
+      "corrected_null_gate": {
+        "effect_ci_excludes_one": true,
+        "effect_distance_from_one": 0.7691912351887599,
+        "effect_exceeds_twice_max_null_half_width": true,
+        "null_medians_within_two_percent": false,
+        "pass": false,
+        "quill_null": {
+          "ci95_high": 1.0048252770417054,
+          "ci95_low": 0.9833329359601504,
+          "half_width": 0.016667064039849633,
+          "median": 0.9961321594218628
+        },
+        "tantivy_null": {
+          "ci95_high": 1.0356051015751504,
+          "ci95_low": 0.942132134458374,
+          "half_width": 0.05786786554162604,
+          "median": 0.9715483169679318
+        },
+        "twice_max_null_half_width": 0.11573573108325208
+      },
+      "elf_sha256": "53ab4c0975f0ad2148e37f35641dfd56e78acd8048d01cdb8b1194aa8ab9b637",
+      "git_rev": "ccc37c8e611cd313201108ffe9260376a977b4bd",
+      "host": {
+        "boot_id": "b107a2c6-9fac-40df-a637-c3a772b0ad57",
+        "captured_at": "2026-07-31T05:43:30Z",
+        "hostname": "threadripperje",
+        "uname": "Linux threadripperje 6.17.0-41-generic #41-Ubuntu SMP PREEMPT_DYNAMIC Sat Jun 20 18:01:40 UTC 2026 x86_64 GNU/Linux"
+      },
+      "machine_fingerprint": "linux-x86_64-threadripperje-128thread-AMD_Ryzen_Threadripper_PRO_5995WX_64-Cores",
+      "paired_quill_over_tantivy": {
+        "ci95_high": 0.2541106217288461,
+        "ci95_low": 0.210160009870259,
+        "median": 0.23080876481124013
+      },
+      "receipt_caveats": [
+        "10 ms /proc clock-tick granularity",
+        "CPU from threads that exit before the final census can be unattributed"
+      ],
+      "status": {
+        "benchmark_status": "0",
+        "elapsed_ns": "1585857596197",
+        "elf_sha256": "53ab4c0975f0ad2148e37f35641dfd56e78acd8048d01cdb8b1194aa8ab9b637",
+        "ended_ns": "1785478197474826074",
+        "environment_sha256": "3b3c94eda5bd7b3059be256882aecfbea8f02c09021712b35eb2fd781d062a9b",
+        "evidence_identity_ok": "true",
+        "last_h1_h2_wall_equal": "true",
+        "laws_attested": "false",
+        "receipt_count": "66",
+        "receipt_sha256": "d5f9637c147d557bf8925e041cea9f98d02fa21f9ed7024d09a0435c1f8e6fb7",
+        "remote_shell_pid": "2810628",
+        "self_reported_sha256": "53ab4c0975f0ad2148e37f35641dfd56e78acd8048d01cdb8b1194aa8ab9b637",
+        "source_rev": "ccc37c8e611cd313201108ffe9260376a977b4bd",
+        "started_ns": "1785476611617229877",
+        "status": "0",
+        "terminal_failures": "0",
+        "wall_mismatches": "0"
+      },
+      "threads": 32,
+      "throughput_docs_per_second": {
+        "quill": 25712.146160444336,
+        "tantivy": 109380.26394977114
+      }
+    },
+    {
+      "actual_activity": {
+        "quill": {
+          "census_threads_by_role": {
+            "asupersync_runtime": {
+              "max": 1,
+              "median": 1,
+              "min": 1
+            },
+            "bench_caller": {
+              "max": 1,
+              "median": 1,
+              "min": 1
+            },
+            "rayon_worker": {
+              "max": 63,
+              "median": 63,
+              "min": 63
+            },
+            "unattributed": {
+              "max": 1,
+              "median": 1,
+              "min": 1
+            }
+          },
+          "mean_active_millithreads": {
+            "max": 1160,
+            "median": 1009,
+            "min": 1007
+          },
+          "positive_cpu_threads": {
+            "max": 63,
+            "median": 2,
+            "min": 1
+          },
+          "positive_cpu_threads_by_role": {
+            "asupersync_runtime": {
+              "max": 1,
+              "median": 1,
+              "min": 0
+            },
+            "bench_caller": {
+              "max": 1,
+              "median": 1,
+              "min": 1
+            },
+            "rayon_worker": {
+              "max": 62,
+              "median": 0,
+              "min": 0
+            }
+          },
+          "positive_dedicated_worker_threads": {
+            "max": 62,
+            "median": 0,
+            "min": 0
+          },
+          "receipts": 33
+        },
+        "tantivy": {
+          "census_threads_by_role": {
+            "asupersync_runtime": {
+              "max": 1,
+              "median": 1,
+              "min": 1
+            },
+            "bench_caller": {
+              "max": 1,
+              "median": 1,
+              "min": 1
+            },
+            "tantivy_docstore_compressor": {
+              "max": 69,
+              "median": 65,
+              "min": 0
+            },
+            "tantivy_index_worker": {
+              "max": 128,
+              "median": 128,
+              "min": 128
+            },
+            "tantivy_merge_worker": {
+              "max": 4,
+              "median": 4,
+              "min": 4
+            },
+            "tantivy_segment_updater": {
+              "max": 1,
+              "median": 1,
+              "min": 1
+            },
+            "unattributed": {
+              "max": 6,
+              "median": 3,
+              "min": 0
+            }
+          },
+          "mean_active_millithreads": {
+            "max": 8066,
+            "median": 7160,
+            "min": 6659
+          },
+          "positive_cpu_threads": {
+            "max": 71,
+            "median": 70,
+            "min": 6
+          },
+          "positive_cpu_threads_by_role": {
+            "asupersync_runtime": {
+              "max": 1,
+              "median": 0,
+              "min": 0
+            },
+            "bench_caller": {
+              "max": 1,
+              "median": 1,
+              "min": 1
+            },
+            "tantivy_docstore_compressor": {
+              "max": 1,
+              "median": 0,
+              "min": 0
+            },
+            "tantivy_index_worker": {
+              "max": 64,
+              "median": 64,
+              "min": 0
+            },
+            "tantivy_merge_worker": {
+              "max": 4,
+              "median": 4,
+              "min": 4
+            },
+            "tantivy_segment_updater": {
+              "max": 1,
+              "median": 1,
+              "min": 1
+            }
+          },
+          "positive_dedicated_worker_threads": {
+            "max": 70,
+            "median": 69,
+            "min": 5
+          },
+          "receipts": 33
+        }
+      },
+      "corrected_null_gate": {
+        "effect_ci_excludes_one": true,
+        "effect_distance_from_one": 0.7517302306854005,
+        "effect_exceeds_twice_max_null_half_width": true,
+        "null_medians_within_two_percent": true,
+        "pass": true,
+        "quill_null": {
+          "ci95_high": 1.0410499128674104,
+          "ci95_low": 0.9971175652477954,
+          "half_width": 0.04104991286741044,
+          "median": 1.019207728085456
+        },
+        "tantivy_null": {
+          "ci95_high": 1.058811645291281,
+          "ci95_low": 0.9755274594734009,
+          "half_width": 0.05881164529128102,
+          "median": 1.0193073625325755
+        },
+        "twice_max_null_half_width": 0.11762329058256205
+      },
+      "elf_sha256": "53ab4c0975f0ad2148e37f35641dfd56e78acd8048d01cdb8b1194aa8ab9b637",
+      "git_rev": "ccc37c8e611cd313201108ffe9260376a977b4bd",
+      "host": {
+        "boot_id": "b107a2c6-9fac-40df-a637-c3a772b0ad57",
+        "captured_at": "2026-07-31T06:09:58Z",
+        "hostname": "threadripperje",
+        "uname": "Linux threadripperje 6.17.0-41-generic #41-Ubuntu SMP PREEMPT_DYNAMIC Sat Jun 20 18:01:40 UTC 2026 x86_64 GNU/Linux"
+      },
+      "machine_fingerprint": "linux-x86_64-threadripperje-128thread-AMD_Ryzen_Threadripper_PRO_5995WX_64-Cores",
+      "paired_quill_over_tantivy": {
+        "ci95_high": 0.2691714216799598,
+        "ci95_low": 0.23391303081430073,
+        "median": 0.24826976931459951
+      },
+      "receipt_caveats": [
+        "10 ms /proc clock-tick granularity",
+        "CPU from threads that exit before the final census can be unattributed"
+      ],
+      "status": {
+        "benchmark_status": "0",
+        "elapsed_ns": "1722866395181",
+        "elf_sha256": "53ab4c0975f0ad2148e37f35641dfd56e78acd8048d01cdb8b1194aa8ab9b637",
+        "ended_ns": "1785479921760503992",
+        "environment_sha256": "19cd429824378c4809e0eedbb9c4b0901da2c0a8904fb06b7536eaedecba7fcd",
+        "evidence_identity_ok": "true",
+        "last_h1_h2_wall_equal": "true",
+        "laws_attested": "false",
+        "receipt_count": "66",
+        "receipt_sha256": "ee7f125f5f734a57adbd5aca9fa273482ddade5b84bbf5355ca7df7c231a4739",
+        "remote_shell_pid": "2810628",
+        "self_reported_sha256": "53ab4c0975f0ad2148e37f35641dfd56e78acd8048d01cdb8b1194aa8ab9b637",
+        "source_rev": "ccc37c8e611cd313201108ffe9260376a977b4bd",
+        "started_ns": "1785478198894108811",
+        "status": "0",
+        "terminal_failures": "0",
+        "wall_mismatches": "0"
+      },
+      "threads": 64,
+      "throughput_docs_per_second": {
+        "quill": 22417.171918514177,
+        "tantivy": 89304.88765109029
+      }
+    },
+    {
+      "actual_activity": {
+        "quill": {
+          "census_threads_by_role": {
+            "asupersync_runtime": {
+              "max": 1,
+              "median": 1,
+              "min": 1
+            },
+            "bench_caller": {
+              "max": 1,
+              "median": 1,
+              "min": 1
+            },
+            "rayon_worker": {
+              "max": 95,
+              "median": 95,
+              "min": 95
+            },
+            "unattributed": {
+              "max": 1,
+              "median": 1,
+              "min": 1
+            }
+          },
+          "mean_active_millithreads": {
+            "max": 1354,
+            "median": 1050,
+            "min": 1012
+          },
+          "positive_cpu_threads": {
+            "max": 88,
+            "median": 37,
+            "min": 1
+          },
+          "positive_cpu_threads_by_role": {
+            "asupersync_runtime": {
+              "max": 1,
+              "median": 0,
+              "min": 0
+            },
+            "bench_caller": {
+              "max": 1,
+              "median": 1,
+              "min": 1
+            },
+            "rayon_worker": {
+              "max": 86,
+              "median": 36,
+              "min": 0
+            }
+          },
+          "positive_dedicated_worker_threads": {
+            "max": 86,
+            "median": 36,
+            "min": 0
+          },
+          "receipts": 33
+        },
+        "tantivy": {
+          "census_threads_by_role": {
+            "asupersync_runtime": {
+              "max": 1,
+              "median": 1,
+              "min": 1
+            },
+            "bench_caller": {
+              "max": 1,
+              "median": 1,
+              "min": 1
+            },
+            "tantivy_docstore_compressor": {
+              "max": 101,
+              "median": 98,
+              "min": 2
+            },
+            "tantivy_index_worker": {
+              "max": 192,
+              "median": 192,
+              "min": 192
+            },
+            "tantivy_merge_worker": {
+              "max": 5,
+              "median": 4,
+              "min": 4
+            },
+            "tantivy_segment_updater": {
+              "max": 1,
+              "median": 1,
+              "min": 1
+            },
+            "unattributed": {
+              "max": 7,
+              "median": 2,
+              "min": 1
+            }
+          },
+          "mean_active_millithreads": {
+            "max": 7778,
+            "median": 7147,
+            "min": 5525
+          },
+          "positive_cpu_threads": {
+            "max": 103,
+            "median": 102,
+            "min": 7
+          },
+          "positive_cpu_threads_by_role": {
+            "asupersync_runtime": {
+              "max": 1,
+              "median": 0,
+              "min": 0
+            },
+            "bench_caller": {
+              "max": 1,
+              "median": 1,
+              "min": 1
+            },
+            "tantivy_docstore_compressor": {
+              "max": 1,
+              "median": 0,
+              "min": 0
+            },
+            "tantivy_index_worker": {
+              "max": 96,
+              "median": 96,
+              "min": 0
+            },
+            "tantivy_merge_worker": {
+              "max": 4,
+              "median": 4,
+              "min": 4
+            },
+            "tantivy_segment_updater": {
+              "max": 1,
+              "median": 1,
+              "min": 1
+            }
+          },
+          "positive_dedicated_worker_threads": {
+            "max": 102,
+            "median": 101,
+            "min": 5
+          },
+          "receipts": 33
+        }
+      },
+      "corrected_null_gate": {
+        "effect_ci_excludes_one": true,
+        "effect_distance_from_one": 0.617353863749578,
+        "effect_exceeds_twice_max_null_half_width": true,
+        "null_medians_within_two_percent": true,
+        "pass": true,
+        "quill_null": {
+          "ci95_high": 1.0404805857033204,
+          "ci95_low": 0.9386840912678618,
+          "half_width": 0.06131590873213821,
+          "median": 1.004594023178155
+        },
+        "tantivy_null": {
+          "ci95_high": 1.021700005257525,
+          "ci95_low": 0.9855681920658683,
+          "half_width": 0.021700005257524912,
+          "median": 0.9994706318808786
+        },
+        "twice_max_null_half_width": 0.12263181746427643
+      },
+      "elf_sha256": "53ab4c0975f0ad2148e37f35641dfd56e78acd8048d01cdb8b1194aa8ab9b637",
+      "git_rev": "ccc37c8e611cd313201108ffe9260376a977b4bd",
+      "host": {
+        "boot_id": "b107a2c6-9fac-40df-a637-c3a772b0ad57",
+        "captured_at": "2026-07-31T06:38:42Z",
+        "hostname": "threadripperje",
+        "uname": "Linux threadripperje 6.17.0-41-generic #41-Ubuntu SMP PREEMPT_DYNAMIC Sat Jun 20 18:01:40 UTC 2026 x86_64 GNU/Linux"
+      },
+      "machine_fingerprint": "linux-x86_64-threadripperje-128thread-AMD_Ryzen_Threadripper_PRO_5995WX_64-Cores",
+      "paired_quill_over_tantivy": {
+        "ci95_high": 0.413862728984998,
+        "ci95_low": 0.34456698484809856,
+        "median": 0.382646136250422
+      },
+      "receipt_caveats": [
+        "10 ms /proc clock-tick granularity",
+        "CPU from threads that exit before the final census can be unattributed"
+      ],
+      "status": {
+        "benchmark_status": "0",
+        "elapsed_ns": "1748405401377",
+        "elf_sha256": "53ab4c0975f0ad2148e37f35641dfd56e78acd8048d01cdb8b1194aa8ab9b637",
+        "ended_ns": "1785481671565405287",
+        "environment_sha256": "a8bf627dc04e3b836982a1cb4cab1f519283301a6b7d5690c704d75e65db99e5",
+        "evidence_identity_ok": "true",
+        "last_h1_h2_wall_equal": "true",
+        "laws_attested": "false",
+        "receipt_count": "66",
+        "receipt_sha256": "d1b69f817717c78a5e44d993070d5ec3ef88d2b4565e7a6dd8a6bed9ef030fca",
+        "remote_shell_pid": "2810628",
+        "self_reported_sha256": "53ab4c0975f0ad2148e37f35641dfd56e78acd8048d01cdb8b1194aa8ab9b637",
+        "source_rev": "ccc37c8e611cd313201108ffe9260376a977b4bd",
+        "started_ns": "1785479923160003910",
+        "status": "0",
+        "terminal_failures": "0",
+        "wall_mismatches": "0"
+      },
+      "threads": 96,
+      "throughput_docs_per_second": {
+        "quill": 24465.701215084257,
+        "tantivy": 64092.429865660626
+      }
+    },
+    {
+      "actual_activity": {
+        "quill": {
+          "census_threads_by_role": {
+            "asupersync_runtime": {
+              "max": 1,
+              "median": 1,
+              "min": 1
+            },
+            "bench_caller": {
+              "max": 1,
+              "median": 1,
+              "min": 1
+            },
+            "rayon_worker": {
+              "max": 127,
+              "median": 127,
+              "min": 127
+            },
+            "unattributed": {
+              "max": 1,
+              "median": 1,
+              "min": 1
+            }
+          },
+          "mean_active_millithreads": {
+            "max": 1238,
+            "median": 1052,
+            "min": 1012
+          },
+          "positive_cpu_threads": {
+            "max": 76,
+            "median": 39,
+            "min": 1
+          },
+          "positive_cpu_threads_by_role": {
+            "asupersync_runtime": {
+              "max": 1,
+              "median": 0,
+              "min": 0
+            },
+            "bench_caller": {
+              "max": 1,
+              "median": 1,
+              "min": 1
+            },
+            "rayon_worker": {
+              "max": 74,
+              "median": 38,
+              "min": 0
+            }
+          },
+          "positive_dedicated_worker_threads": {
+            "max": 74,
+            "median": 38,
+            "min": 0
+          },
+          "receipts": 33
+        },
+        "tantivy": {
+          "census_threads_by_role": {
+            "asupersync_runtime": {
+              "max": 1,
+              "median": 1,
+              "min": 1
+            },
+            "bench_caller": {
+              "max": 1,
+              "median": 1,
+              "min": 1
+            },
+            "tantivy_docstore_compressor": {
+              "max": 135,
+              "median": 131,
+              "min": 0
+            },
+            "tantivy_index_worker": {
+              "max": 256,
+              "median": 256,
+              "min": 256
+            },
+            "tantivy_merge_worker": {
+              "max": 5,
+              "median": 4,
+              "min": 4
+            },
+            "tantivy_segment_updater": {
+              "max": 1,
+              "median": 1,
+              "min": 1
+            },
+            "unattributed": {
+              "max": 11,
+              "median": 4,
+              "min": 1
+            }
+          },
+          "mean_active_millithreads": {
+            "max": 10051,
+            "median": 9132,
+            "min": 7148
+          },
+          "positive_cpu_threads": {
+            "max": 138,
+            "median": 131,
+            "min": 6
+          },
+          "positive_cpu_threads_by_role": {
+            "asupersync_runtime": {
+              "max": 1,
+              "median": 0,
+              "min": 0
+            },
+            "bench_caller": {
+              "max": 1,
+              "median": 1,
+              "min": 1
+            },
+            "tantivy_docstore_compressor": {
+              "max": 3,
+              "median": 0,
+              "min": 0
+            },
+            "tantivy_index_worker": {
+              "max": 128,
+              "median": 125,
+              "min": 0
+            },
+            "tantivy_merge_worker": {
+              "max": 4,
+              "median": 4,
+              "min": 4
+            },
+            "tantivy_segment_updater": {
+              "max": 1,
+              "median": 1,
+              "min": 1
+            }
+          },
+          "positive_dedicated_worker_threads": {
+            "max": 136,
+            "median": 130,
+            "min": 5
+          },
+          "receipts": 33
+        }
+      },
+      "corrected_null_gate": {
+        "effect_ci_excludes_one": true,
+        "effect_distance_from_one": 0.7249054518906581,
+        "effect_exceeds_twice_max_null_half_width": true,
+        "null_medians_within_two_percent": false,
+        "pass": false,
+        "quill_null": {
+          "ci95_high": 1.1365026748796359,
+          "ci95_low": 0.9122441129489356,
+          "half_width": 0.13650267487963585,
+          "median": 1.0016768965180254
+        },
+        "tantivy_null": {
+          "ci95_high": 1.0185704280184322,
+          "ci95_low": 0.9525479887869337,
+          "half_width": 0.0474520112130663,
+          "median": 0.9751366643292114
+        },
+        "twice_max_null_half_width": 0.2730053497592717
+      },
+      "elf_sha256": "53ab4c0975f0ad2148e37f35641dfd56e78acd8048d01cdb8b1194aa8ab9b637",
+      "git_rev": "ccc37c8e611cd313201108ffe9260376a977b4bd",
+      "host": {
+        "boot_id": "b107a2c6-9fac-40df-a637-c3a772b0ad57",
+        "captured_at": "2026-07-31T07:07:52Z",
+        "hostname": "threadripperje",
+        "uname": "Linux threadripperje 6.17.0-41-generic #41-Ubuntu SMP PREEMPT_DYNAMIC Sat Jun 20 18:01:40 UTC 2026 x86_64 GNU/Linux"
+      },
+      "machine_fingerprint": "linux-x86_64-threadripperje-128thread-AMD_Ryzen_Threadripper_PRO_5995WX_64-Cores",
+      "paired_quill_over_tantivy": {
+        "ci95_high": 0.31152501204167493,
+        "ci95_low": 0.2674893067051049,
+        "median": 0.27509454810934186
+      },
+      "receipt_caveats": [
+        "10 ms /proc clock-tick granularity",
+        "CPU from threads that exit before the final census can be unattributed"
+      ],
+      "status": {
+        "benchmark_status": "0",
+        "elapsed_ns": "1793916538183",
+        "elf_sha256": "53ab4c0975f0ad2148e37f35641dfd56e78acd8048d01cdb8b1194aa8ab9b637",
+        "ended_ns": "1785483466910920571",
+        "environment_sha256": "eb27d19dffaf9a9b62dc1c30d34f989f98afe1ee270ed565de199a9ac3fbfe6b",
+        "evidence_identity_ok": "true",
+        "last_h1_h2_wall_equal": "true",
+        "laws_attested": "false",
+        "receipt_count": "66",
+        "receipt_sha256": "ee77fa9b602744f8c47d8217e59fce310be7f2454afdbb5a487a9fdff335baf5",
+        "remote_shell_pid": "2810628",
+        "self_reported_sha256": "53ab4c0975f0ad2148e37f35641dfd56e78acd8048d01cdb8b1194aa8ab9b637",
+        "source_rev": "ccc37c8e611cd313201108ffe9260376a977b4bd",
+        "started_ns": "1785481672994382388",
+        "status": "0",
+        "terminal_failures": "0",
+        "wall_mismatches": "0"
+      },
+      "threads": 128,
+      "throughput_docs_per_second": {
+        "quill": 22408.80988192781,
+        "tantivy": 79804.61963017652
+      }
+    }
+  ]
+}

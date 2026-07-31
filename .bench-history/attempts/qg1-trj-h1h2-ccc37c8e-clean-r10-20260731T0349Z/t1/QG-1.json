@@ -1,0 +1,599 @@
+{
+  "schema_version": "quill-perf-artifact-v5",
+  "gate": "Qg1",
+  "bench_elf_sha256": "53ab4c0975f0ad2148e37f35641dfd56e78acd8048d01cdb8b1194aa8ab9b637",
+  "machine_fingerprint": "linux-x86_64-threadripperje-128thread-AMD_Ryzen_Threadripper_PRO_5995WX_64-Cores",
+  "execution": {
+    "host_identity": "threadripperje",
+    "producer_os": "linux",
+    "physical_cores": 64,
+    "logical_threads": 128,
+    "process_available_threads": 128,
+    "configured_engine_thread_widths": [
+      1
+    ],
+    "runtime_detected_isa": [
+      "aes",
+      "avx2",
+      "bmi2",
+      "fma",
+      "vaes"
+    ],
+    "cpu_affinity_allowed_list": "0-127",
+    "affinity_or_cpuset_cap": null
+  },
+  "git_rev": "ccc37c8e611cd313201108ffe9260376a977b4bd",
+  "run_window": "qg1-trj-h1h2-ccc37c8e-clean-r10-20260731",
+  "run_id": "qg1-trj-h1h2-ccc37c8e-clean-r10-20260731T0349Z-t1",
+  "corpus_manifest_hash": "d7d0eaac5780fa7ec6aadbb474c567b44261b9d35ca89c1b6ed43d8f23d44991",
+  "manifest_sha256": "bc7b97c1b5cbf07e46fdbd662f490290f60e3fa94f4c0cddc93020ed36cc0592",
+  "cells": [
+    {
+      "fixture": "bulk/xlarge/1/positions_on",
+      "metric": "docs_per_second",
+      "engine": "quill",
+      "unit": "docs/s",
+      "value": 35551.52146121288,
+      "p50": 35551.52146121288,
+      "median_ci95_low": 35248.60191726274,
+      "median_ci95_high": 37181.465879857475,
+      "p95": 37202.277603955525,
+      "p99": 37202.277603955525,
+      "mad": 500.05769199827773,
+      "cv_pct": 2.544388751249467,
+      "runs": 10
+    },
+    {
+      "fixture": "bulk/xlarge/1/positions_on",
+      "metric": "docs_per_second",
+      "engine": "tantivy",
+      "unit": "docs/s",
+      "value": 71930.0649395716,
+      "p50": 71930.0649395716,
+      "median_ci95_low": 71127.78364146923,
+      "median_ci95_high": 72407.7795717016,
+      "p95": 73791.9646383616,
+      "p99": 73791.9646383616,
+      "mad": 423.80776017952303,
+      "cv_pct": 1.360829000197843,
+      "runs": 10
+    },
+    {
+      "fixture": "bulk/xlarge/1/positions_on",
+      "metric": "docs_per_second_quill_over_tantivy",
+      "engine": "paired_ab",
+      "unit": "ratio",
+      "value": 0.4998822903476339,
+      "p50": 0.4998822903476339,
+      "median_ci95_low": 0.4874383148606988,
+      "median_ci95_high": 0.5115490835246106,
+      "p95": 0.52935363941238,
+      "p99": 0.52935363941238,
+      "mad": 0.0105562375282586,
+      "cv_pct": 3.178005265651597,
+      "runs": 10
+    },
+    {
+      "fixture": "bulk/xlarge/1/positions_on",
+      "metric": "docs_per_second_tantivy_over_tantivy",
+      "engine": "paired_null",
+      "unit": "ratio",
+      "value": 1.0095757619495815,
+      "p50": 1.0095757619495815,
+      "median_ci95_low": 0.9997148608456672,
+      "median_ci95_high": 1.035060179333892,
+      "p95": 1.0471577895260804,
+      "p99": 1.0471577895260804,
+      "mad": 0.01839663584894896,
+      "cv_pct": 2.0157973594735115,
+      "runs": 10
+    },
+    {
+      "fixture": "bulk/xlarge/1/positions_on",
+      "metric": "docs_per_second_quill_over_quill",
+      "engine": "paired_null_quill",
+      "unit": "ratio",
+      "value": 1.001973887708437,
+      "p50": 1.001973887708437,
+      "median_ci95_low": 0.9803930623617145,
+      "median_ci95_high": 1.0298512439011007,
+      "p95": 1.0325976743265253,
+      "p99": 1.0325976743265253,
+      "mad": 0.02114372817933252,
+      "cv_pct": 2.7495780266320753,
+      "runs": 10
+    }
+  ],
+  "laws_attested": false,
+  "continuous_timing": {
+    "schema_version": "qg1-continuous-timing-v1",
+    "timing_mode": "continuous",
+    "cells": [
+      {
+        "schema_version": "qg1-continuous-timing-v1",
+        "fixture": "bulk/xlarge/1/positions_on",
+        "timing_mode": "continuous",
+        "corpus": {
+          "schema_version": "qg1-continuous-timing-v1",
+          "identity": "qg1-native/prepared-prefix-v1/b9840b4df07535f8908563bfc6b9c627f7e27edbafd6cbc6483a32a70d3c9f76",
+          "generator_seed": 5860671082139239762,
+          "positions": "positions_on",
+          "doc_count": 1000000,
+          "id_bytes": 18000000,
+          "title_bytes": 24888890,
+          "content_bytes": 875330940,
+          "metadata_bytes": 249868689,
+          "total_bytes": 1168088519,
+          "titled_docs": 1000000,
+          "metadata_entries": 11000000,
+          "corpus_xxh3": "b2b049593f55d93a"
+        },
+        "rounds_quill": 33,
+        "rounds_tantivy": 33,
+        "last_quill_receipt": {
+          "schema_version": "qg1-continuous-timing-v1",
+          "engine": "quill",
+          "timing_source": "continuous_monotonic_window",
+          "quiescence": "quill_sealed_synchronous_commit",
+          "feed_calls": 200,
+          "accepted_docs": 1000000,
+          "processed_docs": 1000000,
+          "committed_docs": 1000000,
+          "searchable_docs": 1000000,
+          "accepted_bytes": 1168088519,
+          "processed_bytes": 1168088519,
+          "committed_bytes": {
+            "structurally_unobservable": {
+              "seam": "LexicalRead exposes doc_count only; engine-side committed/searchable byte totals await the H2 actual-work receipts seam"
+            }
+          },
+          "searchable_bytes": {
+            "structurally_unobservable": {
+              "seam": "LexicalRead exposes doc_count only; engine-side committed/searchable byte totals await the H2 actual-work receipts seam"
+            }
+          },
+          "periodic_commits": 18,
+          "percall_sum_ns": 26743649404,
+          "timeline": {
+            "feed_complete_ns": 26575741666,
+            "commit_complete_ns": 26825332718,
+            "searchable_verified_ns": 26892898242,
+            "quiescence_joined_ns": 26893050867,
+            "window_total_ns": 26893050867
+          },
+          "terminal_probe_query": "singleton",
+          "terminal_probe_hits": 1
+        },
+        "last_tantivy_receipt": {
+          "schema_version": "qg1-continuous-timing-v1",
+          "engine": "tantivy",
+          "timing_source": "continuous_monotonic_window",
+          "quiescence": "tantivy_merging_threads_joined",
+          "feed_calls": 200,
+          "accepted_docs": 1000000,
+          "processed_docs": 1000000,
+          "committed_docs": 1000000,
+          "searchable_docs": 1000000,
+          "accepted_bytes": 1168088519,
+          "processed_bytes": 1168088519,
+          "committed_bytes": {
+            "structurally_unobservable": {
+              "seam": "LexicalRead exposes doc_count only; engine-side committed/searchable byte totals await the H2 actual-work receipts seam"
+            }
+          },
+          "searchable_bytes": {
+            "structurally_unobservable": {
+              "seam": "LexicalRead exposes doc_count only; engine-side committed/searchable byte totals await the H2 actual-work receipts seam"
+            }
+          },
+          "periodic_commits": 10,
+          "percall_sum_ns": 13644000589,
+          "timeline": {
+            "feed_complete_ns": 13535232051,
+            "commit_complete_ns": 13722294224,
+            "searchable_verified_ns": 13722415151,
+            "quiescence_joined_ns": 13731338690,
+            "window_total_ns": 13731338690
+          },
+          "terminal_probe_query": "singleton",
+          "terminal_probe_hits": 1
+        },
+        "all_windows_validated": true
+      }
+    ]
+  },
+  "work_receipts": {
+    "schema_version": "qg1-work-receipt-v1",
+    "mode": "on",
+    "cells": [
+      {
+        "schema_version": "qg1-work-receipt-v1",
+        "fixture": "bulk/xlarge/1/positions_on",
+        "rounds_quill": 33,
+        "rounds_tantivy": 33,
+        "last_quill_receipt": {
+          "schema_version": "qg1-work-receipt-v1",
+          "binding": {
+            "run_id": "qg1-trj-h1h2-ccc37c8e-clean-r10-20260731T0349Z-t1",
+            "pid": 2811343,
+            "parent_pid": 2810628,
+            "machine_fingerprint": "linux-x86_64-threadripperje-128thread-AMD_Ryzen_Threadripper_PRO_5995WX_64-Cores",
+            "build_profile": "release-perf",
+            "executable_sha256": "53ab4c0975f0ad2148e37f35641dfd56e78acd8048d01cdb8b1194aa8ab9b637",
+            "git_rev": "ccc37c8e611cd313201108ffe9260376a977b4bd",
+            "gate": "QG-1",
+            "fixture": "bulk/xlarge/1/positions_on",
+            "metric": "docs_per_second",
+            "engine": "quill",
+            "timing_mode": "continuous",
+            "corpus_identity": "qg1-native/prepared-prefix-v1/b9840b4df07535f8908563bfc6b9c627f7e27edbafd6cbc6483a32a70d3c9f76",
+            "corpus_manifest_sha256": "0a77def1cf79d6e576bf782250158b09ac49a824796b5ce6e8cee84b4a231d70",
+            "window_started_ns": 1320476460637,
+            "window_ended_ns": 1347369511504
+          },
+          "counters": {
+            "feed_calls": 200,
+            "accepted_docs": 1000000,
+            "processed_docs": 1000000,
+            "committed_docs": 1000000,
+            "searchable_docs": 1000000,
+            "accepted_bytes": 1168088519,
+            "processed_bytes": 1168088519,
+            "committed_corpus_bytes": {
+              "structurally_unobservable": {
+                "seam": "no engine seam retains fed corpus bytes; LexicalRead exposes doc_count and segment stats expose serialized sizes, a different quantity recorded under index footprint"
+              }
+            },
+            "searchable_corpus_bytes": {
+              "structurally_unobservable": {
+                "seam": "no engine seam retains fed corpus bytes; LexicalRead exposes doc_count and segment stats expose serialized sizes, a different quantity recorded under index footprint"
+              }
+            },
+            "periodic_commits": 18,
+            "terminal_commit_calls": 1
+          },
+          "footprint": {
+            "committed_index_bytes": {
+              "observed": {
+                "bytes": 1613473820,
+                "seam": "quill KeeperSnapshot::loaded_manifest().manifest.segments[].file_len (exact FSLX lengths, backend-independent)"
+              }
+            },
+            "committed_segment_count": {
+              "observed": {
+                "bytes": 10,
+                "seam": "quill KeeperSnapshot::loaded_manifest().manifest.segments.len()"
+              }
+            }
+          },
+          "queue": {
+            "synchronous_no_queue": {
+              "seam": "QuillIndex::index_documents/commit are synchronous; the ingest hand-off has no queue"
+            }
+          },
+          "concurrency": {
+            "configured_threads": 1,
+            "observed_width": {
+              "observed": {
+                "threads": 1,
+                "seam": "rayon::current_num_threads inside the bench-pinned Quill pool"
+              }
+            },
+            "wall_ns": 26893050867,
+            "process_cpu": {
+              "observed": {
+                "cpu_ns": 26920000000,
+                "seam": "linux:/proc/self/stat utime+stime"
+              }
+            },
+            "active_concurrency_integral": {
+              "derived_from_process_cpu_identity": {
+                "integral_thread_ns": 26920000000,
+                "mean_active_millithreads": 1001
+              }
+            },
+            "role_cpu_ns": {
+              "asupersync_runtime": 0,
+              "bench_caller": 26880000000,
+              "unattributed": 0
+            },
+            "unattributed_cpu_ns": 40000000,
+            "live_thread_census": {
+              "sampled": {
+                "platform": "linux",
+                "seam": "linux:/proc/self/task/<tid>/{stat,comm}",
+                "clock_tick_hz": 100,
+                "threads": [
+                  {
+                    "tid": 2811343,
+                    "name": "perf_matrix-cle",
+                    "role": "unattributed",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 2811353,
+                    "name": "asupersync-work",
+                    "role": "asupersync_runtime",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 2837689,
+                    "name": "qg-rayon-0",
+                    "role": "bench_caller",
+                    "window_cpu_ns": 26880000000
+                  }
+                ],
+                "truncated": false,
+                "caveats": [
+                  {
+                    "clock_tick_granularity": {
+                      "tick_ns": 10000000
+                    }
+                  },
+                  "exited_thread_cpu_unattributed"
+                ]
+              }
+            },
+            "measured_call_sum_ns": 26743649404
+          },
+          "phases": [
+            {
+              "phase": "first_feed",
+              "window_elapsed_ns": 0
+            },
+            {
+              "phase": "feed_complete",
+              "window_elapsed_ns": 26575741666
+            },
+            {
+              "phase": "commit_complete",
+              "window_elapsed_ns": 26825332718
+            },
+            {
+              "phase": "searchable_verified",
+              "window_elapsed_ns": 26892898242
+            },
+            {
+              "phase": "quiescence_joined",
+              "window_elapsed_ns": 26893050867
+            }
+          ],
+          "terminal": {
+            "join": "quill_synchronous_commit",
+            "drained": true,
+            "pending_docs_zero": true,
+            "terminal_reason": "completed",
+            "retryable": false
+          },
+          "collection_overhead": {
+            "calibrated_census_sample_ns": 167634,
+            "census_samples_in_window": 3,
+            "bounded_symmetric": true
+          },
+          "receipt_xxh3": "17a59e9ed43809b0"
+        },
+        "last_tantivy_receipt": {
+          "schema_version": "qg1-work-receipt-v1",
+          "binding": {
+            "run_id": "qg1-trj-h1h2-ccc37c8e-clean-r10-20260731T0349Z-t1",
+            "pid": 2811343,
+            "parent_pid": 2810628,
+            "machine_fingerprint": "linux-x86_64-threadripperje-128thread-AMD_Ryzen_Threadripper_PRO_5995WX_64-Cores",
+            "build_profile": "release-perf",
+            "executable_sha256": "53ab4c0975f0ad2148e37f35641dfd56e78acd8048d01cdb8b1194aa8ab9b637",
+            "git_rev": "ccc37c8e611cd313201108ffe9260376a977b4bd",
+            "gate": "QG-1",
+            "fixture": "bulk/xlarge/1/positions_on",
+            "metric": "docs_per_second",
+            "engine": "tantivy",
+            "timing_mode": "continuous",
+            "corpus_identity": "qg1-native/prepared-prefix-v1/b9840b4df07535f8908563bfc6b9c627f7e27edbafd6cbc6483a32a70d3c9f76",
+            "corpus_manifest_sha256": "0a77def1cf79d6e576bf782250158b09ac49a824796b5ce6e8cee84b4a231d70",
+            "window_started_ns": 1347447461211,
+            "window_ended_ns": 1361178799901
+          },
+          "counters": {
+            "feed_calls": 200,
+            "accepted_docs": 1000000,
+            "processed_docs": 1000000,
+            "committed_docs": 1000000,
+            "searchable_docs": 1000000,
+            "accepted_bytes": 1168088519,
+            "processed_bytes": 1168088519,
+            "committed_corpus_bytes": {
+              "structurally_unobservable": {
+                "seam": "no engine seam retains fed corpus bytes; LexicalRead exposes doc_count and segment stats expose serialized sizes, a different quantity recorded under index footprint"
+              }
+            },
+            "searchable_corpus_bytes": {
+              "structurally_unobservable": {
+                "seam": "no engine seam retains fed corpus bytes; LexicalRead exposes doc_count and segment stats expose serialized sizes, a different quantity recorded under index footprint"
+              }
+            },
+            "periodic_commits": 10,
+            "terminal_commit_calls": 1
+          },
+          "footprint": {
+            "committed_index_bytes": {
+              "observed": {
+                "bytes": 600822785,
+                "seam": "TantivyIndex::benchmark_index_layout (managed segment files via Directory::open_read)"
+              }
+            },
+            "committed_segment_count": {
+              "observed": {
+                "bytes": 14,
+                "seam": "TantivyIndex::benchmark_index_layout searchable segment count"
+              }
+            }
+          },
+          "queue": {
+            "structurally_unobservable": {
+              "seam": "tantivy 0.26.1 IndexWriter AddOperation channel (crossbeam bounded(10_000)) exposes no depth accessor; observing occupancy requires patching tantivy"
+            }
+          },
+          "concurrency": {
+            "configured_threads": 1,
+            "observed_width": {
+              "observed": {
+                "threads": 1,
+                "seam": "TantivyIndex::benchmark_materialized_writer_threads"
+              }
+            },
+            "wall_ns": 13731338690,
+            "process_cpu": {
+              "observed": {
+                "cpu_ns": 23190000000,
+                "seam": "linux:/proc/self/stat utime+stime"
+              }
+            },
+            "active_concurrency_integral": {
+              "derived_from_process_cpu_identity": {
+                "integral_thread_ns": 23190000000,
+                "mean_active_millithreads": 1688
+              }
+            },
+            "role_cpu_ns": {
+              "asupersync_runtime": 0,
+              "bench_caller": 5330000000,
+              "tantivy_docstore_compressor": 20000000,
+              "tantivy_index_worker": 130000000,
+              "tantivy_merge_worker": 2220000000,
+              "tantivy_segment_updater": 1380000000,
+              "unattributed": 0
+            },
+            "unattributed_cpu_ns": 14110000000,
+            "live_thread_census": {
+              "sampled": {
+                "platform": "linux",
+                "seam": "linux:/proc/self/task/<tid>/{stat,comm}",
+                "clock_tick_hz": 100,
+                "threads": [
+                  {
+                    "tid": 2811343,
+                    "name": "perf_matrix-cle",
+                    "role": "bench_caller",
+                    "window_cpu_ns": 5330000000
+                  },
+                  {
+                    "tid": 2811353,
+                    "name": "asupersync-work",
+                    "role": "asupersync_runtime",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 2838252,
+                    "name": "segment_updater",
+                    "role": "tantivy_segment_updater",
+                    "window_cpu_ns": 1380000000
+                  },
+                  {
+                    "tid": 2838253,
+                    "name": "merge_thread_0",
+                    "role": "tantivy_merge_worker",
+                    "window_cpu_ns": 2220000000
+                  },
+                  {
+                    "tid": 2838254,
+                    "name": "merge_thread_1",
+                    "role": "tantivy_merge_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 2838255,
+                    "name": "merge_thread_2",
+                    "role": "tantivy_merge_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 2838256,
+                    "name": "merge_thread_3",
+                    "role": "tantivy_merge_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 2838485,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 130000000
+                  },
+                  {
+                    "tid": 2838489,
+                    "name": "docstore-compre",
+                    "role": "tantivy_docstore_compressor",
+                    "window_cpu_ns": 20000000
+                  },
+                  {
+                    "tid": 2838490,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 2838491,
+                    "name": "watch-callbacks",
+                    "role": "unattributed",
+                    "window_cpu_ns": 0
+                  }
+                ],
+                "truncated": false,
+                "caveats": [
+                  {
+                    "clock_tick_granularity": {
+                      "tick_ns": 10000000
+                    }
+                  },
+                  "exited_thread_cpu_unattributed"
+                ]
+              }
+            },
+            "measured_call_sum_ns": 13644000589
+          },
+          "phases": [
+            {
+              "phase": "first_feed",
+              "window_elapsed_ns": 0
+            },
+            {
+              "phase": "feed_complete",
+              "window_elapsed_ns": 13535232051
+            },
+            {
+              "phase": "commit_complete",
+              "window_elapsed_ns": 13722294224
+            },
+            {
+              "phase": "searchable_verified",
+              "window_elapsed_ns": 13722415151
+            },
+            {
+              "phase": "quiescence_joined",
+              "window_elapsed_ns": 13731338690
+            }
+          ],
+          "terminal": {
+            "join": {
+              "tantivy_workers_joined": {
+                "join_elapsed_ns": 7133319,
+                "searchable_segments_before": 14,
+                "searchable_segments_after": 14,
+                "writer_rearmed": false
+              }
+            },
+            "drained": true,
+            "pending_docs_zero": true,
+            "terminal_reason": "completed",
+            "retryable": false
+          },
+          "collection_overhead": {
+            "calibrated_census_sample_ns": 91211,
+            "census_samples_in_window": 3,
+            "bounded_symmetric": true
+          },
+          "receipt_xxh3": "e5236c05ed0709c1"
+        },
+        "all_receipts_validated": true
+      }
+    ]
+  }
+}

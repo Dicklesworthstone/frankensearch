@@ -8297,3 +8297,70 @@ on CV.
   were added during hostile review. Full narrative and consolidated raw rows:
   `docs/evidence/e8h/p8-retry-local-qg2-span-inline-20260730.md` and
   `docs/evidence/e8h/p8-retry-local-qg2-span-inline-raw-20260730.json`.
+
+## 2026-07-31 — QG-1 continuous/receipted Threadripper sweep: Tantivy raw throughput peaks at width 4; STRUCTURAL / NO-CLAIM (`bd-h6eh`, BlackThrush)
+
+- **Comparison class: INCUMBENT. Actual legacy incumbent: Tantivy 0.26.1.**
+  Pinned Tantivy ran beside Quill in every same-process, same-invocation
+  comparison. The measured source was
+  `ccc37c8e611cd313201108ffe9260376a977b4bd`; exact ELF SHA-256
+  `53ab4c0975f0ad2148e37f35641dfd56e78acd8048d01cdb8b1194aa8ab9b637`
+  was self-reported from inside the process and matched all nine terminal
+  row receipts. The build used `rch exec --base ccc37c8e... --clean-overlay
+  --no-overlay`, selected `ovh-b`, and synchronized zero overlay files.
+- **Machine/workload:** every row ran on `threadripperje`, boot
+  `b107a2c6-9fac-40df-a637-c3a772b0ad57`, AMD Ryzen Threadripper PRO
+  5995WX 64-Cores / 128 logical CPUs. Deterministic one-million-document
+  `bulk/xlarge`, positions on, one excluded warmup, ten paired blocks,
+  continuous timing, work receipts on. Every width exited 0 with 66/66
+  receipts, zero H1/H2 wall mismatches, zero terminal failures, matching
+  evidence identity, and equal final H1/H2 walls.
+- **Corrected null law:** effect median-CI excludes 1;
+  `abs(effect_median - 1) > 2 * max(T/T null half-width, Q/Q null
+  half-width)`; and both A/A null medians are within 2% of 1. CV is
+  provenance only.
+
+| requested | Quill docs/s | Tantivy docs/s | Q/T median [95% CI] | corrected null | Quill active eq med | Tantivy active eq med | positive dedicated workers med Q/T |
+|---:|---:|---:|---:|---|---:|---:|---:|
+| 1 | 35,551.521 | 71,930.065 | `0.499882 [0.487438, 0.511549]` | PASS | 0.999 | 1.704 | 0 / 5 |
+| 2 | 36,505.685 | 116,424.790 | `0.312842 [0.306422, 0.321050]` | FAIL: T/T center | 0.999 | 2.690 | 0 / 6 |
+| 4 | 37,270.193 | 132,936.059 | `0.277612 [0.273338, 0.284961]` | FAIL: T/T center | 0.999 | 4.639 | 0 / 9 |
+| 8 | 35,409.346 | 126,257.903 | `0.281265 [0.269878, 0.286662]` | PASS | 0.999 | 6.169 | 0 / 13 |
+| 16 | 33,473.596 | 117,564.256 | `0.285757 [0.270176, 0.300316]` | FAIL: T/T center | 1.001 | 6.235 | 0 / 21 |
+| 32 | 25,712.146 | 109,380.264 | `0.230809 [0.210160, 0.254111]` | FAIL: T/T center | 1.001 | 6.950 | 0 / 37 |
+| 64 | 22,417.172 | 89,304.888 | `0.248270 [0.233913, 0.269171]` | PASS | 1.009 | 7.160 | 0 / 69 |
+| 96 | 24,465.701 | 64,092.430 | `0.382646 [0.344567, 0.413863]` | PASS | 1.050 | 7.147 | 36 / 101 |
+| 128 | 22,408.810 | 79,804.620 | `0.275095 [0.267489, 0.311525]` | FAIL: T/T center | 1.052 | 9.132 | 38 / 130 |
+
+Active equivalents are receipt-window process CPU integrals, not configured
+workers. Positive dedicated workers count any live worker with a positive
+10 ms `/proc` CPU tick; exited threads may be unattributed. The separate
+live census sees `requested - 1` Quill Rayon workers and `2 * requested`
+Tantivy index workers plus support threads, but that is liveness rather than
+productive concurrency. At requested 128, Tantivy has a median 130 positive
+dedicated workers yet only 9.132 active equivalents.
+
+**Status: STRUCTURAL / NO-CLAIM.** Tantivy reaches `1.619x` width-1
+throughput at width 2 and a `1.848x` raw apex at width 4. Relative to that
+apex, widths 8/16/32/64/96/128 deliver
+`0.950x/0.884x/0.823x/0.672x/0.482x/0.600x`. Its observed throughput scaling
+stops at requested width 4; the structural opportunity is to beat this low
+productive-concurrency ceiling rather than mirror its worker explosion.
+This is not a QG verdict: every row has `laws_attested=false`, the normative
+selection is incomplete, and the sequential null blocks are disjoint from
+the effect block without an effect order/drift gate. QG-1 remains inactive
+and the unmeasured placeholder remains authoritative.
+
+Raw bundle:
+`.bench-history/attempts/qg1-trj-h1h2-ccc37c8e-clean-r10-20260731T0349Z/`;
+aggregate SHA-256
+`a1d4323d69d5c587ecefa99f85032615659f45d22b2f56ee3d77606995058e68`.
+Full card:
+`docs/evidence/e8h/qg1-trj-thread-sweep-20260731.md`.
+
+**Retry predicate:** run the complete normative 74-cell bundle and its
+immediate same-ELF reproduction. Interleave null and effect blocks or
+explicitly gate effect order/drift, ratchet-bind continuous timing and
+work-receipt modes, and retain exact host, executable, wall, and actual-
+activity receipts. Do not activate QG-1, label a PASS/MISS, or gate on CV
+from this tranche.

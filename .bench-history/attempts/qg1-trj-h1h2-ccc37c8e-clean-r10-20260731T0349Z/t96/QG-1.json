@@ -1,0 +1,2334 @@
+{
+  "schema_version": "quill-perf-artifact-v5",
+  "gate": "Qg1",
+  "bench_elf_sha256": "53ab4c0975f0ad2148e37f35641dfd56e78acd8048d01cdb8b1194aa8ab9b637",
+  "machine_fingerprint": "linux-x86_64-threadripperje-128thread-AMD_Ryzen_Threadripper_PRO_5995WX_64-Cores",
+  "execution": {
+    "host_identity": "threadripperje",
+    "producer_os": "linux",
+    "physical_cores": 64,
+    "logical_threads": 128,
+    "process_available_threads": 128,
+    "configured_engine_thread_widths": [
+      96
+    ],
+    "runtime_detected_isa": [
+      "aes",
+      "avx2",
+      "bmi2",
+      "fma",
+      "vaes"
+    ],
+    "cpu_affinity_allowed_list": "0-127",
+    "affinity_or_cpuset_cap": null
+  },
+  "git_rev": "ccc37c8e611cd313201108ffe9260376a977b4bd",
+  "run_window": "qg1-trj-h1h2-ccc37c8e-clean-r10-20260731",
+  "run_id": "qg1-trj-h1h2-ccc37c8e-clean-r10-20260731T0349Z-t96",
+  "corpus_manifest_hash": "1ad6b5bc688218e515ad0f9dc4e39f8b007171c21a19d7e026c875e902675461",
+  "manifest_sha256": "bc7b97c1b5cbf07e46fdbd662f490290f60e3fa94f4c0cddc93020ed36cc0592",
+  "cells": [
+    {
+      "fixture": "bulk/xlarge/96/positions_on",
+      "metric": "docs_per_second",
+      "engine": "quill",
+      "unit": "docs/s",
+      "value": 24465.701215084257,
+      "p50": 24465.701215084257,
+      "median_ci95_low": 24087.332146680536,
+      "median_ci95_high": 25441.34397344501,
+      "p95": 25647.08137135109,
+      "p99": 25647.08137135109,
+      "mad": 717.7604941920181,
+      "cv_pct": 3.1793641158618824,
+      "runs": 10
+    },
+    {
+      "fixture": "bulk/xlarge/96/positions_on",
+      "metric": "docs_per_second",
+      "engine": "tantivy",
+      "unit": "docs/s",
+      "value": 64092.429865660626,
+      "p50": 64092.429865660626,
+      "median_ci95_low": 59856.03540525897,
+      "median_ci95_high": 72651.53658676629,
+      "p95": 74665.18912341143,
+      "p99": 74665.18912341143,
+      "mad": 6081.712786735712,
+      "cv_pct": 9.52501392342617,
+      "runs": 10
+    },
+    {
+      "fixture": "bulk/xlarge/96/positions_on",
+      "metric": "docs_per_second_quill_over_tantivy",
+      "engine": "paired_ab",
+      "unit": "ratio",
+      "value": 0.382646136250422,
+      "p50": 0.382646136250422,
+      "median_ci95_low": 0.34456698484809856,
+      "median_ci95_high": 0.413862728984998,
+      "p95": 0.41930053742905854,
+      "p99": 0.41930053742905854,
+      "mad": 0.03297721179647525,
+      "cv_pct": 9.717842701221228,
+      "runs": 10
+    },
+    {
+      "fixture": "bulk/xlarge/96/positions_on",
+      "metric": "docs_per_second_tantivy_over_tantivy",
+      "engine": "paired_null",
+      "unit": "ratio",
+      "value": 0.9994706318808786,
+      "p50": 0.9994706318808786,
+      "median_ci95_low": 0.9855681920658683,
+      "median_ci95_high": 1.021700005257525,
+      "p95": 1.05379233210299,
+      "p99": 1.05379233210299,
+      "mad": 0.018627991328877047,
+      "cv_pct": 2.561018252442982,
+      "runs": 10
+    },
+    {
+      "fixture": "bulk/xlarge/96/positions_on",
+      "metric": "docs_per_second_quill_over_quill",
+      "engine": "paired_null_quill",
+      "unit": "ratio",
+      "value": 1.004594023178155,
+      "p50": 1.004594023178155,
+      "median_ci95_low": 0.9386840912678618,
+      "median_ci95_high": 1.0404805857033204,
+      "p95": 1.0843110815076162,
+      "p99": 1.0843110815076162,
+      "mad": 0.018046486631781433,
+      "cv_pct": 8.351139808670322,
+      "runs": 10
+    }
+  ],
+  "laws_attested": false,
+  "continuous_timing": {
+    "schema_version": "qg1-continuous-timing-v1",
+    "timing_mode": "continuous",
+    "cells": [
+      {
+        "schema_version": "qg1-continuous-timing-v1",
+        "fixture": "bulk/xlarge/96/positions_on",
+        "timing_mode": "continuous",
+        "corpus": {
+          "schema_version": "qg1-continuous-timing-v1",
+          "identity": "qg1-native/prepared-prefix-v1/b9840b4df07535f8908563bfc6b9c627f7e27edbafd6cbc6483a32a70d3c9f76",
+          "generator_seed": 5860671082139239762,
+          "positions": "positions_on",
+          "doc_count": 1000000,
+          "id_bytes": 18000000,
+          "title_bytes": 24888890,
+          "content_bytes": 875330940,
+          "metadata_bytes": 249868689,
+          "total_bytes": 1168088519,
+          "titled_docs": 1000000,
+          "metadata_entries": 11000000,
+          "corpus_xxh3": "b2b049593f55d93a"
+        },
+        "rounds_quill": 33,
+        "rounds_tantivy": 33,
+        "last_quill_receipt": {
+          "schema_version": "qg1-continuous-timing-v1",
+          "engine": "quill",
+          "timing_source": "continuous_monotonic_window",
+          "quiescence": "quill_sealed_synchronous_commit",
+          "feed_calls": 200,
+          "accepted_docs": 1000000,
+          "processed_docs": 1000000,
+          "committed_docs": 1000000,
+          "searchable_docs": 1000000,
+          "accepted_bytes": 1168088519,
+          "processed_bytes": 1168088519,
+          "committed_bytes": {
+            "structurally_unobservable": {
+              "seam": "LexicalRead exposes doc_count only; engine-side committed/searchable byte totals await the H2 actual-work receipts seam"
+            }
+          },
+          "searchable_bytes": {
+            "structurally_unobservable": {
+              "seam": "LexicalRead exposes doc_count only; engine-side committed/searchable byte totals await the H2 actual-work receipts seam"
+            }
+          },
+          "periodic_commits": 23,
+          "percall_sum_ns": 40805808730,
+          "timeline": {
+            "feed_complete_ns": 40512961367,
+            "commit_complete_ns": 40900362845,
+            "searchable_verified_ns": 41014565018,
+            "quiescence_joined_ns": 41017303002,
+            "window_total_ns": 41017303002
+          },
+          "terminal_probe_query": "singleton",
+          "terminal_probe_hits": 1
+        },
+        "last_tantivy_receipt": {
+          "schema_version": "qg1-continuous-timing-v1",
+          "engine": "tantivy",
+          "timing_source": "continuous_monotonic_window",
+          "quiescence": "tantivy_merging_threads_joined",
+          "feed_calls": 200,
+          "accepted_docs": 1000000,
+          "processed_docs": 1000000,
+          "committed_docs": 1000000,
+          "searchable_docs": 1000000,
+          "accepted_bytes": 1168088519,
+          "processed_bytes": 1168088519,
+          "committed_bytes": {
+            "structurally_unobservable": {
+              "seam": "LexicalRead exposes doc_count only; engine-side committed/searchable byte totals await the H2 actual-work receipts seam"
+            }
+          },
+          "searchable_bytes": {
+            "structurally_unobservable": {
+              "seam": "LexicalRead exposes doc_count only; engine-side committed/searchable byte totals await the H2 actual-work receipts seam"
+            }
+          },
+          "periodic_commits": 7,
+          "percall_sum_ns": 13896827017,
+          "timeline": {
+            "feed_complete_ns": 9192543228,
+            "commit_complete_ns": 9395421907,
+            "searchable_verified_ns": 9395801538,
+            "quiescence_joined_ns": 14133208422,
+            "window_total_ns": 14133208422
+          },
+          "terminal_probe_query": "singleton",
+          "terminal_probe_hits": 1
+        },
+        "all_windows_validated": true
+      }
+    ]
+  },
+  "work_receipts": {
+    "schema_version": "qg1-work-receipt-v1",
+    "mode": "on",
+    "cells": [
+      {
+        "schema_version": "qg1-work-receipt-v1",
+        "fixture": "bulk/xlarge/96/positions_on",
+        "rounds_quill": 33,
+        "rounds_tantivy": 33,
+        "last_quill_receipt": {
+          "schema_version": "qg1-work-receipt-v1",
+          "binding": {
+            "run_id": "qg1-trj-h1h2-ccc37c8e-clean-r10-20260731T0349Z-t96",
+            "pid": 3276613,
+            "parent_pid": 2810628,
+            "machine_fingerprint": "linux-x86_64-threadripperje-128thread-AMD_Ryzen_Threadripper_PRO_5995WX_64-Cores",
+            "build_profile": "release-perf",
+            "executable_sha256": "53ab4c0975f0ad2148e37f35641dfd56e78acd8048d01cdb8b1194aa8ab9b637",
+            "git_rev": "ccc37c8e611cd313201108ffe9260376a977b4bd",
+            "gate": "QG-1",
+            "fixture": "bulk/xlarge/96/positions_on",
+            "metric": "docs_per_second",
+            "engine": "quill",
+            "timing_mode": "continuous",
+            "corpus_identity": "qg1-native/prepared-prefix-v1/b9840b4df07535f8908563bfc6b9c627f7e27edbafd6cbc6483a32a70d3c9f76",
+            "corpus_manifest_sha256": "0a77def1cf79d6e576bf782250158b09ac49a824796b5ce6e8cee84b4a231d70",
+            "window_started_ns": 1668088580528,
+            "window_ended_ns": 1709105883530
+          },
+          "counters": {
+            "feed_calls": 200,
+            "accepted_docs": 1000000,
+            "processed_docs": 1000000,
+            "committed_docs": 1000000,
+            "searchable_docs": 1000000,
+            "accepted_bytes": 1168088519,
+            "processed_bytes": 1168088519,
+            "committed_corpus_bytes": {
+              "structurally_unobservable": {
+                "seam": "no engine seam retains fed corpus bytes; LexicalRead exposes doc_count and segment stats expose serialized sizes, a different quantity recorded under index footprint"
+              }
+            },
+            "searchable_corpus_bytes": {
+              "structurally_unobservable": {
+                "seam": "no engine seam retains fed corpus bytes; LexicalRead exposes doc_count and segment stats expose serialized sizes, a different quantity recorded under index footprint"
+              }
+            },
+            "periodic_commits": 23,
+            "terminal_commit_calls": 1
+          },
+          "footprint": {
+            "committed_index_bytes": {
+              "observed": {
+                "bytes": 1654922224,
+                "seam": "quill KeeperSnapshot::loaded_manifest().manifest.segments[].file_len (exact FSLX lengths, backend-independent)"
+              }
+            },
+            "committed_segment_count": {
+              "observed": {
+                "bytes": 200,
+                "seam": "quill KeeperSnapshot::loaded_manifest().manifest.segments.len()"
+              }
+            }
+          },
+          "queue": {
+            "synchronous_no_queue": {
+              "seam": "QuillIndex::index_documents/commit are synchronous; the ingest hand-off has no queue"
+            }
+          },
+          "concurrency": {
+            "configured_threads": 96,
+            "observed_width": {
+              "observed": {
+                "threads": 96,
+                "seam": "rayon::current_num_threads inside the bench-pinned Quill pool"
+              }
+            },
+            "wall_ns": 41017303002,
+            "process_cpu": {
+              "observed": {
+                "cpu_ns": 47400000000,
+                "seam": "linux:/proc/self/stat utime+stime"
+              }
+            },
+            "active_concurrency_integral": {
+              "derived_from_process_cpu_identity": {
+                "integral_thread_ns": 47400000000,
+                "mean_active_millithreads": 1155
+              }
+            },
+            "role_cpu_ns": {
+              "asupersync_runtime": 0,
+              "bench_caller": 40890000000,
+              "rayon_worker": 5920000000,
+              "unattributed": 0
+            },
+            "unattributed_cpu_ns": 590000000,
+            "live_thread_census": {
+              "sampled": {
+                "platform": "linux",
+                "seam": "linux:/proc/self/task/<tid>/{stat,comm}",
+                "clock_tick_hz": 100,
+                "threads": [
+                  {
+                    "tid": 3276613,
+                    "name": "perf_matrix-cle",
+                    "role": "unattributed",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3276618,
+                    "name": "asupersync-work",
+                    "role": "asupersync_runtime",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376290,
+                    "name": "qg-rayon-0",
+                    "role": "rayon_worker",
+                    "window_cpu_ns": 10000000
+                  },
+                  {
+                    "tid": 3376291,
+                    "name": "qg-rayon-1",
+                    "role": "rayon_worker",
+                    "window_cpu_ns": 100000000
+                  },
+                  {
+                    "tid": 3376292,
+                    "name": "qg-rayon-2",
+                    "role": "rayon_worker",
+                    "window_cpu_ns": 100000000
+                  },
+                  {
+                    "tid": 3376293,
+                    "name": "qg-rayon-3",
+                    "role": "rayon_worker",
+                    "window_cpu_ns": 100000000
+                  },
+                  {
+                    "tid": 3376294,
+                    "name": "qg-rayon-4",
+                    "role": "rayon_worker",
+                    "window_cpu_ns": 100000000
+                  },
+                  {
+                    "tid": 3376295,
+                    "name": "qg-rayon-5",
+                    "role": "rayon_worker",
+                    "window_cpu_ns": 100000000
+                  },
+                  {
+                    "tid": 3376296,
+                    "name": "qg-rayon-6",
+                    "role": "rayon_worker",
+                    "window_cpu_ns": 10000000
+                  },
+                  {
+                    "tid": 3376297,
+                    "name": "qg-rayon-7",
+                    "role": "rayon_worker",
+                    "window_cpu_ns": 10000000
+                  },
+                  {
+                    "tid": 3376298,
+                    "name": "qg-rayon-8",
+                    "role": "rayon_worker",
+                    "window_cpu_ns": 100000000
+                  },
+                  {
+                    "tid": 3376299,
+                    "name": "qg-rayon-9",
+                    "role": "rayon_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376300,
+                    "name": "qg-rayon-10",
+                    "role": "rayon_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376301,
+                    "name": "qg-rayon-11",
+                    "role": "rayon_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376302,
+                    "name": "qg-rayon-12",
+                    "role": "rayon_worker",
+                    "window_cpu_ns": 90000000
+                  },
+                  {
+                    "tid": 3376303,
+                    "name": "qg-rayon-13",
+                    "role": "rayon_worker",
+                    "window_cpu_ns": 100000000
+                  },
+                  {
+                    "tid": 3376304,
+                    "name": "qg-rayon-14",
+                    "role": "rayon_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376305,
+                    "name": "qg-rayon-15",
+                    "role": "rayon_worker",
+                    "window_cpu_ns": 100000000
+                  },
+                  {
+                    "tid": 3376306,
+                    "name": "qg-rayon-16",
+                    "role": "rayon_worker",
+                    "window_cpu_ns": 100000000
+                  },
+                  {
+                    "tid": 3376307,
+                    "name": "qg-rayon-17",
+                    "role": "rayon_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376308,
+                    "name": "qg-rayon-18",
+                    "role": "rayon_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376309,
+                    "name": "qg-rayon-19",
+                    "role": "rayon_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376310,
+                    "name": "qg-rayon-20",
+                    "role": "rayon_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376311,
+                    "name": "qg-rayon-21",
+                    "role": "rayon_worker",
+                    "window_cpu_ns": 90000000
+                  },
+                  {
+                    "tid": 3376312,
+                    "name": "qg-rayon-22",
+                    "role": "rayon_worker",
+                    "window_cpu_ns": 100000000
+                  },
+                  {
+                    "tid": 3376313,
+                    "name": "qg-rayon-23",
+                    "role": "rayon_worker",
+                    "window_cpu_ns": 100000000
+                  },
+                  {
+                    "tid": 3376314,
+                    "name": "qg-rayon-24",
+                    "role": "rayon_worker",
+                    "window_cpu_ns": 100000000
+                  },
+                  {
+                    "tid": 3376315,
+                    "name": "qg-rayon-25",
+                    "role": "rayon_worker",
+                    "window_cpu_ns": 110000000
+                  },
+                  {
+                    "tid": 3376316,
+                    "name": "qg-rayon-26",
+                    "role": "rayon_worker",
+                    "window_cpu_ns": 100000000
+                  },
+                  {
+                    "tid": 3376317,
+                    "name": "qg-rayon-27",
+                    "role": "rayon_worker",
+                    "window_cpu_ns": 100000000
+                  },
+                  {
+                    "tid": 3376318,
+                    "name": "qg-rayon-28",
+                    "role": "rayon_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376319,
+                    "name": "qg-rayon-29",
+                    "role": "rayon_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376320,
+                    "name": "qg-rayon-30",
+                    "role": "rayon_worker",
+                    "window_cpu_ns": 100000000
+                  },
+                  {
+                    "tid": 3376321,
+                    "name": "qg-rayon-31",
+                    "role": "rayon_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376322,
+                    "name": "qg-rayon-32",
+                    "role": "rayon_worker",
+                    "window_cpu_ns": 110000000
+                  },
+                  {
+                    "tid": 3376323,
+                    "name": "qg-rayon-33",
+                    "role": "rayon_worker",
+                    "window_cpu_ns": 110000000
+                  },
+                  {
+                    "tid": 3376324,
+                    "name": "qg-rayon-34",
+                    "role": "rayon_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376325,
+                    "name": "qg-rayon-35",
+                    "role": "rayon_worker",
+                    "window_cpu_ns": 100000000
+                  },
+                  {
+                    "tid": 3376326,
+                    "name": "qg-rayon-36",
+                    "role": "rayon_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376327,
+                    "name": "qg-rayon-37",
+                    "role": "rayon_worker",
+                    "window_cpu_ns": 110000000
+                  },
+                  {
+                    "tid": 3376328,
+                    "name": "qg-rayon-38",
+                    "role": "rayon_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376329,
+                    "name": "qg-rayon-39",
+                    "role": "rayon_worker",
+                    "window_cpu_ns": 100000000
+                  },
+                  {
+                    "tid": 3376330,
+                    "name": "qg-rayon-40",
+                    "role": "rayon_worker",
+                    "window_cpu_ns": 100000000
+                  },
+                  {
+                    "tid": 3376331,
+                    "name": "qg-rayon-41",
+                    "role": "rayon_worker",
+                    "window_cpu_ns": 110000000
+                  },
+                  {
+                    "tid": 3376332,
+                    "name": "qg-rayon-42",
+                    "role": "rayon_worker",
+                    "window_cpu_ns": 100000000
+                  },
+                  {
+                    "tid": 3376333,
+                    "name": "qg-rayon-43",
+                    "role": "rayon_worker",
+                    "window_cpu_ns": 100000000
+                  },
+                  {
+                    "tid": 3376334,
+                    "name": "qg-rayon-44",
+                    "role": "rayon_worker",
+                    "window_cpu_ns": 110000000
+                  },
+                  {
+                    "tid": 3376335,
+                    "name": "qg-rayon-45",
+                    "role": "rayon_worker",
+                    "window_cpu_ns": 110000000
+                  },
+                  {
+                    "tid": 3376336,
+                    "name": "qg-rayon-46",
+                    "role": "rayon_worker",
+                    "window_cpu_ns": 100000000
+                  },
+                  {
+                    "tid": 3376337,
+                    "name": "qg-rayon-47",
+                    "role": "rayon_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376338,
+                    "name": "qg-rayon-48",
+                    "role": "rayon_worker",
+                    "window_cpu_ns": 100000000
+                  },
+                  {
+                    "tid": 3376339,
+                    "name": "qg-rayon-49",
+                    "role": "rayon_worker",
+                    "window_cpu_ns": 110000000
+                  },
+                  {
+                    "tid": 3376340,
+                    "name": "qg-rayon-50",
+                    "role": "rayon_worker",
+                    "window_cpu_ns": 100000000
+                  },
+                  {
+                    "tid": 3376341,
+                    "name": "qg-rayon-51",
+                    "role": "rayon_worker",
+                    "window_cpu_ns": 100000000
+                  },
+                  {
+                    "tid": 3376342,
+                    "name": "qg-rayon-52",
+                    "role": "rayon_worker",
+                    "window_cpu_ns": 110000000
+                  },
+                  {
+                    "tid": 3376343,
+                    "name": "qg-rayon-53",
+                    "role": "rayon_worker",
+                    "window_cpu_ns": 110000000
+                  },
+                  {
+                    "tid": 3376344,
+                    "name": "qg-rayon-54",
+                    "role": "rayon_worker",
+                    "window_cpu_ns": 100000000
+                  },
+                  {
+                    "tid": 3376345,
+                    "name": "qg-rayon-55",
+                    "role": "rayon_worker",
+                    "window_cpu_ns": 100000000
+                  },
+                  {
+                    "tid": 3376346,
+                    "name": "qg-rayon-56",
+                    "role": "rayon_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376347,
+                    "name": "qg-rayon-57",
+                    "role": "rayon_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376348,
+                    "name": "qg-rayon-58",
+                    "role": "rayon_worker",
+                    "window_cpu_ns": 100000000
+                  },
+                  {
+                    "tid": 3376349,
+                    "name": "qg-rayon-59",
+                    "role": "rayon_worker",
+                    "window_cpu_ns": 100000000
+                  },
+                  {
+                    "tid": 3376350,
+                    "name": "qg-rayon-60",
+                    "role": "rayon_worker",
+                    "window_cpu_ns": 100000000
+                  },
+                  {
+                    "tid": 3376351,
+                    "name": "qg-rayon-61",
+                    "role": "rayon_worker",
+                    "window_cpu_ns": 100000000
+                  },
+                  {
+                    "tid": 3376352,
+                    "name": "qg-rayon-62",
+                    "role": "rayon_worker",
+                    "window_cpu_ns": 100000000
+                  },
+                  {
+                    "tid": 3376353,
+                    "name": "qg-rayon-63",
+                    "role": "rayon_worker",
+                    "window_cpu_ns": 100000000
+                  },
+                  {
+                    "tid": 3376354,
+                    "name": "qg-rayon-64",
+                    "role": "rayon_worker",
+                    "window_cpu_ns": 110000000
+                  },
+                  {
+                    "tid": 3376355,
+                    "name": "qg-rayon-65",
+                    "role": "rayon_worker",
+                    "window_cpu_ns": 110000000
+                  },
+                  {
+                    "tid": 3376356,
+                    "name": "qg-rayon-66",
+                    "role": "rayon_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376357,
+                    "name": "qg-rayon-67",
+                    "role": "rayon_worker",
+                    "window_cpu_ns": 100000000
+                  },
+                  {
+                    "tid": 3376358,
+                    "name": "qg-rayon-68",
+                    "role": "rayon_worker",
+                    "window_cpu_ns": 100000000
+                  },
+                  {
+                    "tid": 3376359,
+                    "name": "qg-rayon-69",
+                    "role": "rayon_worker",
+                    "window_cpu_ns": 100000000
+                  },
+                  {
+                    "tid": 3376360,
+                    "name": "qg-rayon-70",
+                    "role": "rayon_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376361,
+                    "name": "qg-rayon-71",
+                    "role": "rayon_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376362,
+                    "name": "qg-rayon-72",
+                    "role": "rayon_worker",
+                    "window_cpu_ns": 110000000
+                  },
+                  {
+                    "tid": 3376363,
+                    "name": "qg-rayon-73",
+                    "role": "rayon_worker",
+                    "window_cpu_ns": 100000000
+                  },
+                  {
+                    "tid": 3376364,
+                    "name": "qg-rayon-74",
+                    "role": "rayon_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376365,
+                    "name": "qg-rayon-75",
+                    "role": "rayon_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376366,
+                    "name": "qg-rayon-76",
+                    "role": "rayon_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376367,
+                    "name": "qg-rayon-77",
+                    "role": "rayon_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376368,
+                    "name": "qg-rayon-78",
+                    "role": "rayon_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376369,
+                    "name": "qg-rayon-79",
+                    "role": "rayon_worker",
+                    "window_cpu_ns": 100000000
+                  },
+                  {
+                    "tid": 3376370,
+                    "name": "qg-rayon-80",
+                    "role": "rayon_worker",
+                    "window_cpu_ns": 90000000
+                  },
+                  {
+                    "tid": 3376371,
+                    "name": "qg-rayon-81",
+                    "role": "rayon_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376372,
+                    "name": "qg-rayon-82",
+                    "role": "rayon_worker",
+                    "window_cpu_ns": 100000000
+                  },
+                  {
+                    "tid": 3376373,
+                    "name": "qg-rayon-83",
+                    "role": "rayon_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376374,
+                    "name": "qg-rayon-84",
+                    "role": "rayon_worker",
+                    "window_cpu_ns": 100000000
+                  },
+                  {
+                    "tid": 3376375,
+                    "name": "qg-rayon-85",
+                    "role": "rayon_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376376,
+                    "name": "qg-rayon-86",
+                    "role": "rayon_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376377,
+                    "name": "qg-rayon-87",
+                    "role": "rayon_worker",
+                    "window_cpu_ns": 100000000
+                  },
+                  {
+                    "tid": 3376378,
+                    "name": "qg-rayon-88",
+                    "role": "rayon_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376379,
+                    "name": "qg-rayon-89",
+                    "role": "rayon_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376380,
+                    "name": "qg-rayon-90",
+                    "role": "rayon_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376381,
+                    "name": "qg-rayon-91",
+                    "role": "rayon_worker",
+                    "window_cpu_ns": 90000000
+                  },
+                  {
+                    "tid": 3376382,
+                    "name": "qg-rayon-92",
+                    "role": "rayon_worker",
+                    "window_cpu_ns": 100000000
+                  },
+                  {
+                    "tid": 3376383,
+                    "name": "qg-rayon-93",
+                    "role": "bench_caller",
+                    "window_cpu_ns": 40890000000
+                  },
+                  {
+                    "tid": 3376384,
+                    "name": "qg-rayon-94",
+                    "role": "rayon_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376385,
+                    "name": "qg-rayon-95",
+                    "role": "rayon_worker",
+                    "window_cpu_ns": 0
+                  }
+                ],
+                "truncated": false,
+                "caveats": [
+                  {
+                    "clock_tick_granularity": {
+                      "tick_ns": 10000000
+                    }
+                  },
+                  "exited_thread_cpu_unattributed"
+                ]
+              }
+            },
+            "measured_call_sum_ns": 40805808730
+          },
+          "phases": [
+            {
+              "phase": "first_feed",
+              "window_elapsed_ns": 0
+            },
+            {
+              "phase": "feed_complete",
+              "window_elapsed_ns": 40512961367
+            },
+            {
+              "phase": "commit_complete",
+              "window_elapsed_ns": 40900362845
+            },
+            {
+              "phase": "searchable_verified",
+              "window_elapsed_ns": 41014565018
+            },
+            {
+              "phase": "quiescence_joined",
+              "window_elapsed_ns": 41017303002
+            }
+          ],
+          "terminal": {
+            "join": "quill_synchronous_commit",
+            "drained": true,
+            "pending_docs_zero": true,
+            "terminal_reason": "completed",
+            "retryable": false
+          },
+          "collection_overhead": {
+            "calibrated_census_sample_ns": 2372660,
+            "census_samples_in_window": 3,
+            "bounded_symmetric": true
+          },
+          "receipt_xxh3": "926d572a86bfa78a"
+        },
+        "last_tantivy_receipt": {
+          "schema_version": "qg1-work-receipt-v1",
+          "binding": {
+            "run_id": "qg1-trj-h1h2-ccc37c8e-clean-r10-20260731T0349Z-t96",
+            "pid": 3276613,
+            "parent_pid": 2810628,
+            "machine_fingerprint": "linux-x86_64-threadripperje-128thread-AMD_Ryzen_Threadripper_PRO_5995WX_64-Cores",
+            "build_profile": "release-perf",
+            "executable_sha256": "53ab4c0975f0ad2148e37f35641dfd56e78acd8048d01cdb8b1194aa8ab9b637",
+            "git_rev": "ccc37c8e611cd313201108ffe9260376a977b4bd",
+            "gate": "QG-1",
+            "fixture": "bulk/xlarge/96/positions_on",
+            "metric": "docs_per_second",
+            "engine": "tantivy",
+            "timing_mode": "continuous",
+            "corpus_identity": "qg1-native/prepared-prefix-v1/b9840b4df07535f8908563bfc6b9c627f7e27edbafd6cbc6483a32a70d3c9f76",
+            "corpus_manifest_sha256": "0a77def1cf79d6e576bf782250158b09ac49a824796b5ce6e8cee84b4a231d70",
+            "window_started_ns": 1653942547798,
+            "window_ended_ns": 1668075756220
+          },
+          "counters": {
+            "feed_calls": 200,
+            "accepted_docs": 1000000,
+            "processed_docs": 1000000,
+            "committed_docs": 1000000,
+            "searchable_docs": 1000000,
+            "accepted_bytes": 1168088519,
+            "processed_bytes": 1168088519,
+            "committed_corpus_bytes": {
+              "structurally_unobservable": {
+                "seam": "no engine seam retains fed corpus bytes; LexicalRead exposes doc_count and segment stats expose serialized sizes, a different quantity recorded under index footprint"
+              }
+            },
+            "searchable_corpus_bytes": {
+              "structurally_unobservable": {
+                "seam": "no engine seam retains fed corpus bytes; LexicalRead exposes doc_count and segment stats expose serialized sizes, a different quantity recorded under index footprint"
+              }
+            },
+            "periodic_commits": 7,
+            "terminal_commit_calls": 1
+          },
+          "footprint": {
+            "committed_index_bytes": {
+              "observed": {
+                "bytes": 617813035,
+                "seam": "TantivyIndex::benchmark_index_layout (managed segment files via Directory::open_read)"
+              }
+            },
+            "committed_segment_count": {
+              "observed": {
+                "bytes": 77,
+                "seam": "TantivyIndex::benchmark_index_layout searchable segment count"
+              }
+            }
+          },
+          "queue": {
+            "structurally_unobservable": {
+              "seam": "tantivy 0.26.1 IndexWriter AddOperation channel (crossbeam bounded(10_000)) exposes no depth accessor; observing occupancy requires patching tantivy"
+            }
+          },
+          "concurrency": {
+            "configured_threads": 96,
+            "observed_width": {
+              "observed": {
+                "threads": 96,
+                "seam": "TantivyIndex::benchmark_materialized_writer_threads"
+              }
+            },
+            "wall_ns": 14133208422,
+            "process_cpu": {
+              "observed": {
+                "cpu_ns": 89940000000,
+                "seam": "linux:/proc/self/stat utime+stime"
+              }
+            },
+            "active_concurrency_integral": {
+              "derived_from_process_cpu_identity": {
+                "integral_thread_ns": 89940000000,
+                "mean_active_millithreads": 6363
+              }
+            },
+            "role_cpu_ns": {
+              "asupersync_runtime": 10000000,
+              "bench_caller": 6270000000,
+              "tantivy_docstore_compressor": 0,
+              "tantivy_index_worker": 0,
+              "tantivy_merge_worker": 9600000000,
+              "tantivy_segment_updater": 1270000000,
+              "unattributed": 0
+            },
+            "unattributed_cpu_ns": 72790000000,
+            "live_thread_census": {
+              "sampled": {
+                "platform": "linux",
+                "seam": "linux:/proc/self/task/<tid>/{stat,comm}",
+                "clock_tick_hz": 100,
+                "threads": [
+                  {
+                    "tid": 3276613,
+                    "name": "perf_matrix-cle",
+                    "role": "bench_caller",
+                    "window_cpu_ns": 6270000000
+                  },
+                  {
+                    "tid": 3276618,
+                    "name": "asupersync-work",
+                    "role": "asupersync_runtime",
+                    "window_cpu_ns": 10000000
+                  },
+                  {
+                    "tid": 3374283,
+                    "name": "segment_updater",
+                    "role": "tantivy_segment_updater",
+                    "window_cpu_ns": 1270000000
+                  },
+                  {
+                    "tid": 3374284,
+                    "name": "merge_thread_0",
+                    "role": "tantivy_merge_worker",
+                    "window_cpu_ns": 3050000000
+                  },
+                  {
+                    "tid": 3374285,
+                    "name": "merge_thread_1",
+                    "role": "tantivy_merge_worker",
+                    "window_cpu_ns": 2590000000
+                  },
+                  {
+                    "tid": 3374286,
+                    "name": "merge_thread_2",
+                    "role": "tantivy_merge_worker",
+                    "window_cpu_ns": 2510000000
+                  },
+                  {
+                    "tid": 3374287,
+                    "name": "merge_thread_3",
+                    "role": "tantivy_merge_worker",
+                    "window_cpu_ns": 1450000000
+                  },
+                  {
+                    "tid": 3375979,
+                    "name": "docstore-compre",
+                    "role": "tantivy_docstore_compressor",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3375984,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3375985,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3375986,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3375987,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3375988,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3375989,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3375990,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3375991,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3375992,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3375993,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3375994,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3375995,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3375996,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3375997,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3375998,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3375999,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376000,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376001,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376002,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376003,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376004,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376005,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376006,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376007,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376008,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376009,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376010,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376011,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376012,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376013,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376014,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376015,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376016,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376017,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376018,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376019,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376020,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376021,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376022,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376023,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376024,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376025,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376026,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376027,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376028,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376029,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376030,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376031,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376032,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376033,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376034,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376035,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376036,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376037,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376038,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376039,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376040,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376041,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376042,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376043,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376044,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376045,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376046,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376047,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376048,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376049,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376050,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376051,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376052,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376053,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376054,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376055,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376056,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376057,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376058,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376059,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376060,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376061,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376062,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376063,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376064,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376065,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376066,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376067,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376068,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376069,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376070,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376071,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376072,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376073,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376074,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376075,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376076,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376077,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376078,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376079,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376080,
+                    "name": "watch-callbacks",
+                    "role": "unattributed",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376081,
+                    "name": "watch-callbacks",
+                    "role": "unattributed",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376082,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376083,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376084,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376085,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376086,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376087,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376088,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376089,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376090,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376091,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376092,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376093,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376094,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376095,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376096,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376097,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376098,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376099,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376100,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376101,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376102,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376103,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376104,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376105,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376106,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376107,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376108,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376109,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376110,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376111,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376112,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376113,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376114,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376115,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376116,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376117,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376118,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376119,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376120,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376121,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376122,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376123,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376124,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376125,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376126,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376127,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376128,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376129,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376130,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376131,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376132,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376133,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376134,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376135,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376136,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376137,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376138,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376139,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376140,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376141,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376142,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376143,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376144,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376145,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376146,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376147,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376148,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376149,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376150,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376151,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376152,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376153,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376154,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376155,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376156,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376157,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376158,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376159,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376160,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376161,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376162,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376163,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376164,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376165,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376166,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376167,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376168,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376169,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376170,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376171,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376172,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376173,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376174,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376175,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376176,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376177,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376179,
+                    "name": "watch-callbacks",
+                    "role": "unattributed",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376183,
+                    "name": "docstore-compre",
+                    "role": "tantivy_docstore_compressor",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 3376184,
+                    "name": "watch-callbacks",
+                    "role": "unattributed",
+                    "window_cpu_ns": 0
+                  }
+                ],
+                "truncated": false,
+                "caveats": [
+                  {
+                    "clock_tick_granularity": {
+                      "tick_ns": 10000000
+                    }
+                  },
+                  "exited_thread_cpu_unattributed"
+                ]
+              }
+            },
+            "measured_call_sum_ns": 13896827017
+          },
+          "phases": [
+            {
+              "phase": "first_feed",
+              "window_elapsed_ns": 0
+            },
+            {
+              "phase": "feed_complete",
+              "window_elapsed_ns": 9192543228
+            },
+            {
+              "phase": "commit_complete",
+              "window_elapsed_ns": 9395421907
+            },
+            {
+              "phase": "searchable_verified",
+              "window_elapsed_ns": 9395801538
+            },
+            {
+              "phase": "quiescence_joined",
+              "window_elapsed_ns": 14133208422
+            }
+          ],
+          "terminal": {
+            "join": {
+              "tantivy_workers_joined": {
+                "join_elapsed_ns": 4593019654,
+                "searchable_segments_before": 70,
+                "searchable_segments_after": 7,
+                "writer_rearmed": false
+              }
+            },
+            "drained": true,
+            "pending_docs_zero": true,
+            "terminal_reason": "completed",
+            "retryable": false
+          },
+          "collection_overhead": {
+            "calibrated_census_sample_ns": 584213,
+            "census_samples_in_window": 3,
+            "bounded_symmetric": true
+          },
+          "receipt_xxh3": "16dea7f4b22d8d14"
+        },
+        "all_receipts_validated": true
+      }
+    ]
+  }
+}
