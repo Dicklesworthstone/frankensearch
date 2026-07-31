@@ -669,7 +669,7 @@ fn validate_platform_gate_policy(config: &LocalPerfRunConfig) -> Result<(), Loca
     }
     if config.profile.hardware_class_id() == HardwareClassId::M4Macos {
         return Err(LocalPerfRunError::Invalid(
-            "m4-macos.scheduler-10 remains a required, runnable registry applicability profile, but this producer cannot emit promotion-admissible M4 evidence until it can attest the actual executing image through a supported O_EXEC or loaded-image mechanism; use the diagnostic Apple profiling path until an attesting producer lands"
+            "m4-macos.scheduler-10 remains a required, runnable static registry applicability plan; that static plan does not attest a live M4 host, and this producer cannot emit promotion-admissible M4 evidence until it can attest the actual executing image through a supported O_EXEC or loaded-image mechanism; use the diagnostic Apple profiling path until an attesting producer lands"
                 .to_owned(),
         ));
     }
@@ -2779,8 +2779,13 @@ mod tests {
     }
 
     #[test]
-    fn m4_registry_applicability_remains_required_while_promotion_fails_closed() {
+    fn m4_static_registry_plan_remains_required_while_live_promotion_fails_closed() {
         let registry = MachineClassRegistry::frozen().expect("frozen registry");
+        assert_eq!(
+            PerfGate::ALL.len(),
+            10,
+            "the static registry proof must cover every normative gate"
+        );
         for gate in PerfGate::ALL {
             let config = policy_config(gate);
             let resolved =
@@ -2808,19 +2813,20 @@ mod tests {
                 assert!(
                     error
                         .to_string()
-                        .contains("required, runnable registry applicability profile")
+                        .contains("required, runnable static registry applicability plan")
                 );
                 assert!(
                     error
                         .to_string()
                         .contains("cannot emit promotion-admissible M4 evidence")
                 );
+                assert!(error.to_string().contains("does not attest a live M4 host"));
             }
         }
     }
 
     #[test]
-    fn smt2_128_admits_the_full_canonical_qg1_width_horizon() {
+    fn smt2_128_static_qg1_plan_pins_the_full_canonical_horizon() {
         let registry = MachineClassRegistry::frozen().expect("frozen registry");
         let config = LocalPerfRunConfig {
             gate: PerfGate::Qg1,
@@ -2836,8 +2842,19 @@ mod tests {
             resolved.capacity_semantics,
             ExecutionCapacitySemantics::LogicalThreads
         );
-        assert_eq!(resolved.execution_capacity, 128);
-        assert_eq!(resolved.max_exercised_cell_width, 128);
+        assert_eq!(resolved.applicability_plan.cells.len(), 74);
+        assert_eq!(
+            resolved
+                .applicability_plan
+                .cell_count(PerfCellApplicability::Required),
+            72
+        );
+        assert_eq!(
+            resolved
+                .applicability_plan
+                .cell_count(PerfCellApplicability::Diagnostic),
+            2
+        );
         assert_eq!(
             resolved
                 .applicability_plan
@@ -2845,15 +2862,33 @@ mod tests {
             0
         );
         assert_eq!(
+            resolved
+                .applicability_plan
+                .binding()
+                .profile_contract_sha256,
+            "09a6c596bc866faa72a9e3f34e7ea58c78751eec9172cfe6294eca4b9005d3e1"
+        );
+        let runnable_widths = resolved
+            .applicability_plan
+            .cells
+            .iter()
+            .filter(|cell| cell.applicability.is_runnable())
+            .map(|cell| cell.configured_threads)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(
+            runnable_widths,
+            [1, 2, 4, 8, 16, 32, 64, 96, 128]
+                .into_iter()
+                .collect::<BTreeSet<_>>()
+        );
+        assert_eq!(resolved.execution_capacity, 128);
+        assert_eq!(resolved.max_exercised_cell_width, 128);
+        assert_eq!(
             resolved.applicability_plan.max_runnable_cell_width(),
             Some(128)
         );
-        assert!(
-            resolved
-                .applicability_plan
-                .cell_count(PerfCellApplicability::Required)
-                > 0
-        );
+        // This pins the immutable static plan only; it is not a live-host
+        // execution or residency attestation.
     }
 
     #[test]
