@@ -3616,7 +3616,7 @@ impl QuillWriterState {
         let built = {
             let plans = self.plan_parallel_shard_flushes(&nonempty)?;
             plans
-                .into_par_iter()
+                .par_iter()
                 .map(Self::build_planned_shard_flush)
                 .collect::<Result<Vec<_>, _>>()?
         };
@@ -3694,7 +3694,7 @@ impl QuillWriterState {
     }
 
     fn build_planned_shard_flush(
-        plan: ShardFlushPlan<'_>,
+        plan: &ShardFlushPlan<'_>,
     ) -> Result<BuiltShardFlush, QuillIndexError> {
         let state = plan.state;
         let seal_span = tracing::info_span!(
