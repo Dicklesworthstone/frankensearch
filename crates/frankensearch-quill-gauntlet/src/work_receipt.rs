@@ -491,6 +491,14 @@ pub enum CensusCaveat {
     /// role-resolved CPU; their time is folded into the process total and
     /// surfaces as the unattributed residual.
     ExitedThreadCpuUnattributed,
+    /// The non-atomic process and per-thread reads could not form an exact
+    /// decomposition because the sampled role sum exceeded the independently
+    /// observed process delta. The process observation is preserved exactly;
+    /// role aggregation is omitted for this window.
+    RoleCpuDecompositionUnavailable {
+        observed_process_cpu_ns: u64,
+        sampled_role_cpu_ns: u64,
+    },
     /// The live thread list exceeded [`MAX_CENSUS_THREADS`]; only the first
     /// `retained` were kept.
     TruncatedThreadList { observed: u64, retained: u64 },
@@ -792,6 +800,36 @@ pub fn resolve_role_census(
             })
         }
     }
+}
+
+fn reconcile_role_cpu_decomposition(
+    process_cpu: &CpuTimeObservation,
+    census: &mut RoleCensus,
+    role_cpu_ns: &mut BTreeMap<String, u64>,
+) -> u64 {
+    let CpuTimeObservation::Observed { cpu_ns, .. } = process_cpu else {
+        return 0;
+    };
+    let role_sum: u64 = role_cpu_ns.values().sum();
+    if role_sum <= *cpu_ns {
+        return cpu_ns - role_sum;
+    }
+
+    // `/proc/self/stat` and the per-thread `/proc/self/task/*/stat` files are
+    // sampled at different instants. A tick landing between those reads can
+    // make the role sum exceed the independently observed process delta.
+    // Preserve both underlying observations, but drop the derived role
+    // aggregation rather than rewriting the process total or scaling roles.
+    if let RoleCensus::Sampled(sample) = census {
+        sample
+            .caveats
+            .push(CensusCaveat::RoleCpuDecompositionUnavailable {
+                observed_process_cpu_ns: *cpu_ns,
+                sampled_role_cpu_ns: role_sum,
+            });
+    }
+    role_cpu_ns.clear();
+    *cpu_ns
 }
 
 // ─── Observed quantities ────────────────────────────────────────────────────
@@ -1602,7 +1640,14 @@ impl WorkReceipt {
     #[must_use]
     pub fn bounded_log_line(&self) -> String {
         fn clip(value: &str, max: usize) -> &str {
-            &value[..value.len().min(max)]
+            let mut end = value.len().min(max);
+            while !value.is_char_boundary(end) {
+                end -= 1;
+            }
+            match value.get(..end) {
+                Some(clipped) => clipped,
+                None => "",
+            }
         }
         let role_counts = self.concurrency.live_thread_census.role_counts();
         let mut roles = String::new();
@@ -1968,7 +2013,7 @@ impl WorkReceiptCollector {
                 clock_tick_hz: self.window_census_clock_hz,
             }
         };
-        let census = resolve_role_census(&merged_raw, &baseline_census, self.caller_tid);
+        let mut census = resolve_role_census(&merged_raw, &baseline_census, self.caller_tid);
         let mut role_cpu_ns: BTreeMap<String, u64> = BTreeMap::new();
         if let RoleCensus::Sampled(sample) = &census {
             for thread in &sample.threads {
@@ -1977,40 +2022,8 @@ impl WorkReceiptCollector {
                     .or_insert(0) += thread.window_cpu_ns;
             }
         }
-        let unattributed_cpu_ns = match &process_cpu {
-            CpuTimeObservation::Observed { cpu_ns, .. } => {
-                let role_sum: u64 = role_cpu_ns.values().sum();
-                cpu_ns.saturating_sub(role_sum)
-            }
-            CpuTimeObservation::Unavailable { .. } => 0,
-        };
-        // Census reads and the process-stat read are not atomic, so under
-        // tick-granularity skew the per-thread sum can exceed the process
-        // delta by a tick or two. Scaling roles down would fabricate values
-        // nobody observed; instead the process total is floored at the
-        // observed role sum (both readings come from the same kernel
-        // counters) so the decomposition stays an exact identity over
-        // observed numbers.
-        let process_cpu = match process_cpu {
-            CpuTimeObservation::Observed { cpu_ns, seam } => {
-                let role_sum: u64 = role_cpu_ns.values().sum();
-                CpuTimeObservation::Observed {
-                    cpu_ns: cpu_ns.max(role_sum),
-                    seam,
-                }
-            }
-            unavailable @ CpuTimeObservation::Unavailable { .. } => unavailable,
-        };
-        let integral = match (&process_cpu, integral) {
-            (
-                CpuTimeObservation::Observed { cpu_ns, .. },
-                ActiveConcurrencyIntegral::DerivedFromProcessCpuIdentity { .. },
-            ) => ActiveConcurrencyIntegral::DerivedFromProcessCpuIdentity {
-                integral_thread_ns: *cpu_ns,
-                mean_active_millithreads: cpu_ns.saturating_mul(1000) / wall_ns.max(1),
-            },
-            (_, other) => other,
-        };
+        let unattributed_cpu_ns =
+            reconcile_role_cpu_decomposition(&process_cpu, &mut census, &mut role_cpu_ns);
         let receipt = WorkReceipt {
             schema_version: WORK_RECEIPT_SCHEMA_VERSION.to_owned(),
             binding: ReceiptBinding {
@@ -2058,7 +2071,7 @@ impl WorkReceiptCollector {
                 role_cpu_ns,
                 unattributed_cpu_ns,
                 live_thread_census: census,
-                measured_call_sum_ns: self.measured_call_sum_ns.min(wall_ns),
+                measured_call_sum_ns: self.measured_call_sum_ns,
             },
             phases: self.phases,
             terminal,
@@ -2186,6 +2199,60 @@ mod tests {
             window_started_ns: 1_000,
             window_ended_ns: 8_000,
         }
+    }
+
+    fn collector_binding() -> CollectorBinding {
+        CollectorBinding {
+            run_id: "collector-test".to_owned(),
+            machine_fingerprint: "machine-test".to_owned(),
+            build_profile: "dev".to_owned(),
+            executable_sha256: "e".repeat(64),
+            git_rev: "abcdef012345".to_owned(),
+            gate: "QG-1".to_owned(),
+            fixture: "bulk/tiny/1/positions_on".to_owned(),
+            metric: "docs_per_second".to_owned(),
+            engine: "quill".to_owned(),
+            timing_mode: "per-call".to_owned(),
+            corpus_identity: "qg1-native/prepared-prefix-v1/test".to_owned(),
+            corpus_manifest_sha256: "c".repeat(64),
+        }
+    }
+
+    fn finish_test_collector(measured_sum_ns: u64, wall_ns: u64) -> WorkReceipt {
+        let mut collector = WorkReceiptCollector::new(collector_binding(), 1);
+        collector.begin_window();
+        collector.on_phase(LifecyclePhase::FirstFeed, 0);
+        collector.record_feed_batch(6, 2_048);
+        collector.record_feed_batch(6, 2_048);
+        collector.on_phase(LifecyclePhase::FeedComplete, wall_ns / 3);
+        collector.on_phase(LifecyclePhase::CommitComplete, wall_ns / 2);
+        collector.record_committed(
+            12,
+            EngineByteObservation::Observed {
+                bytes: 65_536,
+                seam: "test seam: engine layout accessor".to_owned(),
+            },
+            EngineByteObservation::Observed {
+                bytes: 1,
+                seam: "test seam: engine segment accessor".to_owned(),
+            },
+        );
+        collector.record_searchable(12);
+        collector.on_phase(
+            LifecyclePhase::SearchableVerified,
+            wall_ns.saturating_mul(3) / 4,
+        );
+        collector.record_queue(QueueObservation::SynchronousNoQueue {
+            seam: "test seam: synchronous writer".to_owned(),
+        });
+        collector.record_width(WidthObservation::Observed {
+            threads: 1,
+            seam: "test seam: pool accessor".to_owned(),
+        });
+        collector.record_measured_sum_ns(measured_sum_ns);
+        collector.record_terminal(TerminalJoin::QuillSynchronousCommit, "completed", false);
+        collector.on_phase(LifecyclePhase::QuiescenceJoined, wall_ns);
+        collector.finish(10_000).expect("assemble receipt")
     }
 
     fn census(engine: &str) -> RoleCensus {
@@ -2373,6 +2440,66 @@ mod tests {
                 .validate(&expectation(engine))
                 .unwrap_or_else(|error| panic!("{engine} receipt must validate: {error}"));
         }
+    }
+
+    #[test]
+    fn role_tick_skew_never_rewrites_observed_process_cpu() {
+        let process_cpu = CpuTimeObservation::Observed {
+            cpu_ns: 2_500,
+            seam: PROCESS_CPU_SEAM.to_owned(),
+        };
+        let mut census = census("quill");
+        let mut role_cpu_ns = BTreeMap::from([
+            ("bench_caller".to_owned(), 2_000),
+            ("rayon_worker".to_owned(), 1_000),
+        ]);
+
+        let unattributed =
+            reconcile_role_cpu_decomposition(&process_cpu, &mut census, &mut role_cpu_ns);
+
+        assert_eq!(
+            process_cpu,
+            CpuTimeObservation::Observed {
+                cpu_ns: 2_500,
+                seam: PROCESS_CPU_SEAM.to_owned(),
+            },
+            "the independent process observation must remain byte-for-byte unchanged"
+        );
+        assert!(
+            role_cpu_ns.is_empty(),
+            "an irreconcilable role decomposition must be omitted"
+        );
+        assert_eq!(unattributed, 2_500);
+        let caveat_present = match census {
+            RoleCensus::Sampled(sample) => sample.caveats.iter().any(|caveat| {
+                matches!(
+                    caveat,
+                    CensusCaveat::RoleCpuDecompositionUnavailable {
+                        observed_process_cpu_ns: 2_500,
+                        sampled_role_cpu_ns: 3_000,
+                    }
+                )
+            }),
+            RoleCensus::Unavailable { .. } => false,
+        };
+        assert!(caveat_present, "tick skew must carry the typed caveat");
+    }
+
+    #[test]
+    fn bounded_log_line_is_utf8_boundary_safe() {
+        let mut receipt = good_receipt("quill");
+        receipt.binding.run_id = format!("{}é", "r".repeat(63));
+        receipt.binding.fixture = format!("{}🦀", "f".repeat(47));
+        receipt.terminal.terminal_reason = format!("{}é", "t".repeat(47));
+
+        let line = receipt.bounded_log_line();
+
+        assert!(line.starts_with("[qg1-work-receipt] "));
+        assert!(line.contains(&"r".repeat(63)));
+        assert!(line.contains(&"f".repeat(47)));
+        assert!(line.contains(&"t".repeat(47)));
+        assert!(!line.contains('é'));
+        assert!(!line.contains('🦀'));
     }
 
     #[test]
@@ -2995,55 +3122,7 @@ mod tests {
 
     #[test]
     fn collector_assembles_a_valid_receipt_end_to_end() {
-        let collector_binding = CollectorBinding {
-            run_id: "collector-test".to_owned(),
-            machine_fingerprint: "machine-test".to_owned(),
-            build_profile: "dev".to_owned(),
-            executable_sha256: "e".repeat(64),
-            git_rev: "abcdef012345".to_owned(),
-            gate: "QG-1".to_owned(),
-            fixture: "bulk/tiny/1/positions_on".to_owned(),
-            metric: "docs_per_second".to_owned(),
-            engine: "quill".to_owned(),
-            timing_mode: "per-call".to_owned(),
-            corpus_identity: "qg1-native/prepared-prefix-v1/test".to_owned(),
-            corpus_manifest_sha256: "c".repeat(64),
-        };
-        let mut collector = WorkReceiptCollector::new(collector_binding, 1);
-        collector.begin_window();
-        let origin = Instant::now();
-        let elapsed = |origin: Instant| u64::try_from(origin.elapsed().as_nanos()).expect("ns");
-        collector.on_phase(LifecyclePhase::FirstFeed, 0);
-        collector.record_feed_batch(6, 2_048);
-        collector.record_feed_batch(6, 2_048);
-        // Do a little real work so the window is not degenerate.
-        std::thread::sleep(std::time::Duration::from_millis(2));
-        collector.on_phase(LifecyclePhase::FeedComplete, elapsed(origin));
-        collector.on_phase(LifecyclePhase::CommitComplete, elapsed(origin));
-        collector.record_committed(
-            12,
-            EngineByteObservation::Observed {
-                bytes: 65_536,
-                seam: "test seam: engine layout accessor".to_owned(),
-            },
-            EngineByteObservation::Observed {
-                bytes: 1,
-                seam: "test seam: engine segment accessor".to_owned(),
-            },
-        );
-        collector.record_searchable(12);
-        collector.on_phase(LifecyclePhase::SearchableVerified, elapsed(origin));
-        collector.record_queue(QueueObservation::SynchronousNoQueue {
-            seam: "test seam: synchronous writer".to_owned(),
-        });
-        collector.record_width(WidthObservation::Observed {
-            threads: 1,
-            seam: "test seam: pool accessor".to_owned(),
-        });
-        collector.record_measured_sum_ns(1_000_000);
-        collector.record_terminal(TerminalJoin::QuillSynchronousCommit, "completed", false);
-        collector.on_phase(LifecyclePhase::QuiescenceJoined, elapsed(origin));
-        let receipt = collector.finish(10_000).expect("assemble receipt");
+        let receipt = finish_test_collector(1_000_000, 2_000_000);
         let expectation = WorkReceiptExpectation {
             engine: "quill".to_owned(),
             doc_count: 12,
@@ -3073,6 +3152,25 @@ mod tests {
         assert!(line.contains("terminal=completed"));
         assert!(line.contains("retryable=false"));
         assert!(!line.contains('\n'));
+    }
+
+    #[test]
+    fn collector_preserves_measured_sum_that_exceeds_wall_for_rejection() {
+        let wall_ns = 2_000_000;
+        let measured_sum_ns = wall_ns + 1;
+        let receipt = finish_test_collector(measured_sum_ns, wall_ns);
+
+        assert_eq!(
+            receipt.concurrency.measured_call_sum_ns, measured_sum_ns,
+            "collector output must preserve the invalid observation"
+        );
+        assert!(matches!(
+            receipt.validate(&expectation("quill")),
+            Err(WorkReceiptError::MeasuredExceedsWall {
+                measured_sum_ns: observed,
+                wall_ns: observed_wall,
+            }) if observed == measured_sum_ns && observed_wall == wall_ns
+        ));
     }
 
     #[test]
