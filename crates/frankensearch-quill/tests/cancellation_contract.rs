@@ -22,6 +22,8 @@ use frankensearch_core::{
 use frankensearch_quill::QuillConfig;
 #[cfg(feature = "conformance-internals")]
 use frankensearch_quill::index::ConformanceCancellationStage;
+#[cfg(feature = "pruning-conformance")]
+use frankensearch_quill::index::ConformancePruningExecutionMode;
 use frankensearch_quill::index::{QuillIndex, QuillIndexError};
 use frankensearch_quill::snippet::SnippetConfig;
 
@@ -54,6 +56,48 @@ async fn fixture_index(cx: &Cx) -> QuillIndex {
     LexicalWrite::commit(&index, cx)
         .await
         .expect("commit fixture corpus");
+    index
+}
+
+#[cfg(feature = "pruning-conformance")]
+async fn two_segment_pruning_trace_fixture(cx: &Cx) -> QuillIndex {
+    let index = QuillIndex::in_memory(deterministic_config()).expect("in-memory index");
+    for (document_id, text) in [
+        ("trace-segment-0", "alpha first sealed segment"),
+        ("trace-segment-1", "alpha second sealed segment"),
+    ] {
+        LexicalWrite::index_document(&index, cx, &IndexableDocument::new(document_id, text))
+            .await
+            .expect("ingest one pruning-trace segment");
+        LexicalWrite::commit(&index, cx)
+            .await
+            .expect("seal one pruning-trace segment");
+    }
+    assert_eq!(
+        index.snapshot().segments().len(),
+        2,
+        "fixture commit boundaries must remain observable"
+    );
+    assert_eq!(
+        index
+            .snapshot()
+            .segments()
+            .iter()
+            .map(|segment| segment.doc_count())
+            .collect::<Vec<_>>(),
+        vec![1, 1],
+        "each committed boundary must contain one real scored document"
+    );
+    assert_eq!(
+        index.snapshot().doc_count(),
+        2,
+        "Keeper must expose both committed documents"
+    );
+    assert_eq!(
+        index.doc_count(),
+        2,
+        "the public composite view must expose the same two live documents"
+    );
     index
 }
 
@@ -404,6 +448,75 @@ fn real_public_search_methods_cancel_during_collection_and_retry_exactly() {
                 );
             }
         }
+    });
+}
+
+#[cfg(all(feature = "conformance-internals", feature = "pruning-conformance"))]
+#[test]
+fn pruning_conformance_traced_public_search_discards_partial_receipt_and_replays_exactly() {
+    asupersync::test_utils::run_test_with_cx(|cx| async move {
+        let index = two_segment_pruning_trace_fixture(&cx).await;
+        let snapshot_before = index.search_snapshot();
+        let (control_page, control_receipt) = index
+            .search_paginated_with_conformance_pruning_trace(&cx, QUERY, LIMIT, 0, false)
+            .expect("noncancelled traced control");
+        assert_eq!(
+            control_receipt.execution_mode(),
+            ConformancePruningExecutionMode::Serial
+        );
+        assert_eq!(
+            control_receipt
+                .segments()
+                .iter()
+                .map(|segment| segment.segment_ordinal())
+                .collect::<Vec<_>>(),
+            vec![0, 1],
+            "control receipt must be complete and dense"
+        );
+
+        let controller = index.conformance_cancellation_controller();
+        controller
+            .arm(ConformanceCancellationStage::PruningTraceSegmentRecorded, 1)
+            .expect("arm cancellation after the first recorded segment");
+        let error = index
+            .search_paginated_with_conformance_pruning_trace(&cx, QUERY, LIMIT, 0, false)
+            .expect_err("a traced public search must not publish a partial receipt");
+        assert!(
+            matches!(error, QuillIndexError::Cancelled { phase: "search" }),
+            "expected typed search cancellation, got {error:?}"
+        );
+        assert!(controller.fired());
+        assert_eq!(
+            controller.observed_checkpoints(),
+            1,
+            "the request must fail immediately after its first recorded receipt"
+        );
+        assert_eq!(
+            controller.recorded_pruning_receipts_at_fire(),
+            1,
+            "the checkpoint must fire only after one receipt mutation succeeded"
+        );
+        assert_eq!(
+            controller.discarded_pruning_trace_sessions(),
+            1,
+            "the cancelled invocation must fail and discard its partial trace session"
+        );
+        assert!(
+            cx.is_cancel_requested(),
+            "the typed segment boundary must cancel the real request Cx"
+        );
+        assert!(
+            Arc::ptr_eq(&snapshot_before, &index.search_snapshot()),
+            "failed tracing must not perturb the published snapshot"
+        );
+
+        controller.disarm();
+        cx.set_cancel_requested(false);
+        let (retry_page, retry_receipt) = index
+            .search_paginated_with_conformance_pruning_trace(&cx, QUERY, LIMIT, 0, false)
+            .expect("clean traced replay");
+        assert_eq!(retry_page, control_page);
+        assert_eq!(retry_receipt, control_receipt);
     });
 }
 

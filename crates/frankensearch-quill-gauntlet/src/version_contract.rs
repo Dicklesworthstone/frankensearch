@@ -31,35 +31,6 @@ pub struct OracleVersionContract {
     pub source_dirty_allowed: bool,
 }
 
-impl OracleVersionContract {
-    /// Validate the source state supplied by a runner before admitting evidence.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error for a mismatched revision or a dirty source tree. Build
-    /// workers do not infer Git state; the runner must supply it explicitly.
-    pub fn validate_source_state(
-        &self,
-        observed_revision: &str,
-        source_dirty: bool,
-    ) -> Result<(), GauntletError> {
-        if observed_revision != self.lexical_git_revision {
-            return Err(GauntletError::InvalidContract {
-                reason: format!(
-                    "lexical revision {observed_revision} does not match {}",
-                    self.lexical_git_revision
-                ),
-            });
-        }
-        if source_dirty && !self.source_dirty_allowed {
-            return Err(GauntletError::InvalidContract {
-                reason: "dirty lexical source is not admissible evidence".to_owned(),
-            });
-        }
-        Ok(())
-    }
-}
-
 /// One Q1 obligation with its executable enforcement surface.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -676,26 +647,17 @@ mod tests {
     }
 
     #[test]
-    fn embedded_oracle_contract_is_exact_and_rejects_dirty_source() {
+    fn embedded_oracle_dependency_and_reviewed_baseline_contract_is_exact() {
         let contract = oracle_version_contract().expect("valid oracle contract");
         assert_eq!(contract.tantivy_version, TANTIVY_VERSION);
         assert_eq!(contract.tantivy_checksum_sha256, TANTIVY_CHECKSUM_SHA256);
         assert_eq!(contract.lexical_git_revision.len(), 40);
-        assert!(
-            contract
-                .validate_source_state(&contract.lexical_git_revision, false)
-                .is_ok()
+        assert_eq!(contract.lexical_package, "frankensearch-lexical");
+        assert_eq!(
+            contract.lexical_package_version,
+            frankensearch_lexical::FRANKENSEARCH_LEXICAL_CRATE_VERSION,
         );
-        assert!(
-            contract
-                .validate_source_state(&contract.lexical_git_revision, true)
-                .is_err()
-        );
-        assert!(
-            contract
-                .validate_source_state(&"0".repeat(40), false)
-                .is_err()
-        );
+        assert!(!contract.source_dirty_allowed);
     }
 
     #[test]

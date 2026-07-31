@@ -41,10 +41,9 @@ use crate::generator::{
     MAX_QUERY_ID_BYTES, QUERY_MANIFEST_SCHEMA_VERSION, QueryManifest, QuerySuiteSource,
     QuerySyntax, RangeClass, StructuredFilterClass, SyntheticCorpus, is_canonical_query_id,
 };
-use crate::version_contract::oracle_version_contract;
 
 /// Schema version for deterministic campaign reports.
-pub const CAMPAIGN_REPORT_SCHEMA_VERSION: u32 = 5;
+pub const CAMPAIGN_REPORT_SCHEMA_VERSION: u32 = 6;
 /// Schema version for the append-only machine-readable Divergence Register.
 pub const DIVERGENCE_REGISTER_LEDGER_SCHEMA_VERSION: u32 = 1;
 /// Redaction policy required by committed Divergence Register evidence.
@@ -71,7 +70,7 @@ const LEXICAL_MISMATCH_SIGNATURE_DOMAIN: &[u8] =
     b"frankensearch/quill/lexical-mismatch-signature/v1\0";
 const LEXICAL_QUERY_CONTRACT_DOMAIN: &[u8] = b"frankensearch/quill/lexical-query-contract/v1\0";
 const LEXICAL_INDEX_IDENTITY_DOMAIN: &[u8] = b"frankensearch/quill/lexical-index-identity/v1\0";
-const CAMPAIGN_REPORT_HASH_DOMAIN: &[u8] = b"frankensearch/quill/campaign-report/v5\0";
+const CAMPAIGN_REPORT_HASH_DOMAIN: &[u8] = b"frankensearch/quill/campaign-report/v6\0";
 const DIVERGENCE_REGISTRY_HASH_DOMAIN: &[u8] = b"frankensearch/quill/divergence-registry/v1\0";
 const DIVERGENCE_REGISTER_LEDGER_HASH_DOMAIN: &[u8] =
     b"frankensearch/quill/divergence-register-ledger/v1\0";
@@ -1895,11 +1894,12 @@ where
 impl CampaignProvenance {
     /// Collect the full immutable provenance for one campaign execution.
     ///
-    /// Subject Git state is read from the invoking checkout unless explicitly
-    /// overridden. Oracle state defaults to the committed oracle version
-    /// contract and may likewise be overridden by a complete revision/dirty
-    /// pair. The CI path supplies both pairs explicitly. Toolchain facts come
-    /// from the executing `rustc` and workspace `Cargo.lock`.
+    /// The shared producer Git state is read from the invoking checkout unless
+    /// explicitly overridden. Both linked wrappers are stamped with that one
+    /// build identity; the historical lexical baseline and pinned Tantivy
+    /// dependency remain separate in
+    /// [`crate::version_contract::OracleVersionContract`]. Toolchain facts
+    /// come from the executing `rustc` and workspace `Cargo.lock`.
     ///
     /// # Errors
     ///
@@ -1911,6 +1911,10 @@ impl CampaignProvenance {
         selection: &CampaignSelection,
         semantic_contract: &SemanticContract,
     ) -> Result<Self, GauntletError> {
+        reject_legacy_oracle_provenance_overrides(
+            std::env::var_os("GAUNTLET_ORACLE_REVISION").as_deref(),
+            std::env::var_os("GAUNTLET_ORACLE_DIRTY").as_deref(),
+        )?;
         corpus_manifest.validate_contract()?;
         semantic_contract.validate()?;
         let corpus_manifest_hash = corpus_manifest.manifest_hash()?;
@@ -1927,7 +1931,8 @@ impl CampaignProvenance {
         };
         let (subject_git_revision, subject_source_dirty) =
             collect_git_state("GAUNTLET_SUBJECT_REVISION", "GAUNTLET_SUBJECT_DIRTY")?;
-        let (oracle_git_revision, oracle_source_dirty) = collect_oracle_git_state()?;
+        let oracle_git_revision = subject_git_revision.clone();
+        let oracle_source_dirty = subject_source_dirty;
         let cargo_lock_sha256 = hash_workspace_lockfile()?;
         let rustc_version_verbose = collect_rustc_verbose()?;
         let unicode_normalization_version = locked_crate_version("unicode-normalization")?;
@@ -1997,6 +2002,10 @@ impl CampaignProvenance {
 
         if !is_git_revision(&self.subject_git_revision)
             || !is_git_revision(&self.oracle_git_revision)
+            || self.subject_source_dirty
+            || self.oracle_source_dirty
+            || self.subject_git_revision != self.oracle_git_revision
+            || self.subject_source_dirty != self.oracle_source_dirty
             || self.subject_git_revision != engines.subject.source_revision
             || self.subject_source_dirty != engines.subject.source_dirty
             || self.oracle_git_revision != engines.oracle.source_revision
@@ -2095,19 +2104,16 @@ fn collect_git_state(revision_env: &str, dirty_env: &str) -> Result<(String, boo
     Ok((revision.trim().to_owned(), !porcelain.trim().is_empty()))
 }
 
-fn collect_oracle_git_state() -> Result<(String, bool), GauntletError> {
-    const REVISION_ENV: &str = "GAUNTLET_ORACLE_REVISION";
-    const DIRTY_ENV: &str = "GAUNTLET_ORACLE_DIRTY";
-    match (std::env::var(REVISION_ENV), std::env::var(DIRTY_ENV)) {
-        (Ok(revision), Ok(dirty)) => Ok((revision, parse_dirty_state(&dirty, DIRTY_ENV)?)),
-        (Err(std::env::VarError::NotPresent), Err(std::env::VarError::NotPresent)) => {
-            let contract = oracle_version_contract()?;
-            Ok((contract.lexical_git_revision, false))
-        }
-        _ => Err(campaign_error(format!(
-            "provenance overrides {REVISION_ENV} and {DIRTY_ENV} must be supplied together as valid UTF-8"
-        ))),
+fn reject_legacy_oracle_provenance_overrides(
+    legacy_revision: Option<&std::ffi::OsStr>,
+    legacy_dirty: Option<&std::ffi::OsStr>,
+) -> Result<(), GauntletError> {
+    if legacy_revision.is_some() || legacy_dirty.is_some() {
+        return Err(campaign_error(
+            "GAUNTLET_ORACLE_REVISION and GAUNTLET_ORACLE_DIRTY are obsolete and forbidden: both linked wrappers must use the one GAUNTLET_SUBJECT producer identity; the pinned Tantivy dependency is carried by the oracle version contract",
+        ));
     }
+    Ok(())
 }
 
 fn parse_dirty_state(value: &str, label: &str) -> Result<bool, GauntletError> {
@@ -2342,7 +2348,7 @@ impl CampaignReport {
         self.semantic_contract.validate()?;
         self.config.validate()?;
         self.divergence_registry.validate()?;
-        if matches!(self.schema_version, 3 | 4) {
+        if matches!(self.schema_version, 3 | 4 | 5) {
             return Err(campaign_error(
                 "legacy campaign report schema lacks the current total lexical contract and is non-admissible; rerun the campaign",
             ));
@@ -3639,7 +3645,7 @@ fn lexical_case_summary(
 ) -> Result<CampaignLexicalCaseSummary, GauntletError> {
     match evidence {
         ArtifactLexicalContractEvidence::LegacyPreV3Missing => Err(campaign_error(
-            "legacy lexical evidence cannot produce a v5 case summary",
+            "legacy lexical evidence cannot produce a current case summary",
         )),
         ArtifactLexicalContractEvidence::RankEnvelopeOnly => {
             Ok(CampaignLexicalCaseSummary::RankEnvelopeOnly)
@@ -6027,7 +6033,7 @@ pub fn persist_shrunk_reproduction(
 #[cfg(test)]
 mod tests {
     #[cfg(feature = "tantivy-oracle")]
-    use std::io::{self, Write};
+    use std::io::{self, Read, Write};
     #[cfg(feature = "tantivy-oracle")]
     use std::sync::Arc;
     use std::sync::Mutex;
@@ -6052,6 +6058,8 @@ mod tests {
     use crate::version_contract::oracle_version_contract;
 
     use super::*;
+
+    const TEST_PRODUCER_REVISION: &str = "1111111111111111111111111111111111111111";
 
     #[cfg(feature = "tantivy-oracle")]
     #[derive(Clone, Debug)]
@@ -6106,17 +6114,6 @@ mod tests {
     #[cfg(feature = "tantivy-oracle")]
     fn trace_field_u64(line: &str, field: &str) -> Option<u64> {
         trace_field_text(line, field)?.parse().ok()
-    }
-
-    #[cfg(feature = "tantivy-oracle")]
-    fn trace_last_field_u64(line: &str, field: &str) -> Option<u64> {
-        let prefix = format!("{field}=");
-        let start = line.rfind(&prefix)?.saturating_add(prefix.len());
-        let value = line.get(start..)?;
-        let end = value
-            .find(|ch: char| ch.is_ascii_whitespace() || matches!(ch, ',' | '}'))
-            .unwrap_or(value.len());
-        value.get(..end)?.parse().ok()
     }
 
     #[cfg(feature = "tantivy-oracle")]
@@ -6706,7 +6703,7 @@ mod tests {
             family: EngineFamily::Quill,
             implementation: "scripted-quill-subject".to_owned(),
             crate_version: env!("CARGO_PKG_VERSION").to_owned(),
-            source_revision: "runner-test-subject".to_owned(),
+            source_revision: TEST_PRODUCER_REVISION.to_owned(),
             source_dirty: false,
             config_hash: "runner-test-quill-config".to_owned(),
         }
@@ -6718,7 +6715,7 @@ mod tests {
             family: EngineFamily::Tantivy,
             implementation: "frankensearch-lexical/tantivy-index".to_owned(),
             crate_version: version.lexical_package_version,
-            source_revision: version.lexical_git_revision,
+            source_revision: TEST_PRODUCER_REVISION.to_owned(),
             source_dirty: false,
             config_hash: TANTIVY_ORACLE_CONFIG_HASH.to_owned(),
         }
@@ -7390,25 +7387,18 @@ mod tests {
         root: &std::path::Path,
         fixture: &Fixture,
     ) -> Result<CampaignReport, GauntletError> {
-        // The fixed subject label and contract-sourced oracle revision make
-        // repeated report bytes comparable. This self-contained test is
-        // deterministic regression coverage, not independently observed live
-        // Git provenance.
-        let lexical_revision = oracle_version_contract()
-            .expect("oracle version contract")
-            .lexical_git_revision;
+        // One fixed synthetic producer identity makes repeated report bytes
+        // comparable. This self-contained test is deterministic regression
+        // coverage, not independently observed live Git provenance.
+        let producer_revision = "d".repeat(40);
         let config = frankensearch_quill::QuillConfig {
             deterministic_ingest: true,
             ..frankensearch_quill::QuillConfig::default()
         };
-        let mut subject = crate::engine::QuillSubject::in_memory(
-            config,
-            "g1a-deterministic-regression-not-live-provenance",
-            false,
-        )
-        .expect("fresh scalar Quill subject");
+        let mut subject = crate::engine::QuillSubject::in_memory(config, &producer_revision, false)
+            .expect("fresh scalar Quill subject");
         let mut oracle =
-            crate::engine::TantivyOracle::in_memory_scalar_g1a(&lexical_revision, false)
+            crate::engine::TantivyOracle::in_memory_scalar_g1a(&producer_revision, false)
                 .expect("fresh scalar G1a Tantivy oracle");
         let campaign = DifferentialCampaignRunner::new(
             ArtifactStore::new(root),
@@ -7436,35 +7426,822 @@ mod tests {
             .await
     }
 
-    #[cfg(feature = "tantivy-oracle")]
+    #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
     const UNION_HORIZON_QUERY: &str = "content:alpha OR content:beta OR content:gamma";
-    #[cfg(feature = "tantivy-oracle")]
+    #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
     const UNION_HORIZON_DOCUMENT_COUNT: usize = 9_001;
-    #[cfg(feature = "tantivy-oracle")]
+    #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
     const UNION_HORIZON_TWO_SEGMENT_SPLIT: usize = 257;
-    #[cfg(feature = "tantivy-oracle")]
-    const UNION_HORIZON_TIE_EXPANSION: u64 = 1;
-    #[cfg(feature = "tantivy-oracle")]
+    #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
+    const UNION_HORIZON_LATE_TIE_EXPANSION: u64 = 1;
+    #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
+    const UNION_HORIZON_MATRIX_TIE_EXPANSION: u64 = 4;
+    #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
     const UNION_HORIZON_RANKED_DOCUMENT_TOKENS: usize = 128;
 
-    #[cfg(feature = "tantivy-oracle")]
-    #[derive(Clone, Debug, PartialEq, Eq)]
+    #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
+    const UNION_HORIZON_ARTIFACT_SCHEMA_VERSION: &str =
+        "frankensearch.salej-union-horizon-evidence.v3";
+    #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
+    const UNION_HORIZON_ARTIFACT_HASH_DOMAIN: &[u8] =
+        b"frankensearch/quill/salej-union-horizon-evidence/v3\0";
+    #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
+    const UNION_HORIZON_COMPLETION_SCHEMA_VERSION: &str =
+        "frankensearch.salej-union-horizon-completion.v2";
+    #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
+    const UNION_HORIZON_COMPLETION_HASH_DOMAIN: &[u8] =
+        b"frankensearch/quill/salej-union-horizon-completion/v2\0";
+
+    #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    enum UnionHorizonSegmentLayout {
+        Single,
+        Two,
+        Eight,
+    }
+
+    #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
+    impl UnionHorizonSegmentLayout {
+        const ALL: [Self; 3] = [Self::Single, Self::Two, Self::Eight];
+
+        const fn label(self) -> &'static str {
+            match self {
+                Self::Single => "single",
+                Self::Two => "two",
+                Self::Eight => "eight",
+            }
+        }
+
+        const fn expected_execution_mode(
+            self,
+        ) -> frankensearch_quill::ConformancePruningExecutionMode {
+            match self {
+                Self::Single | Self::Two => {
+                    frankensearch_quill::ConformancePruningExecutionMode::Serial
+                }
+                Self::Eight => frankensearch_quill::ConformancePruningExecutionMode::Rayon,
+            }
+        }
+
+        fn ranges(self) -> Vec<std::ops::Range<usize>> {
+            let boundaries: &[usize] = match self {
+                Self::Single => &[0, UNION_HORIZON_DOCUMENT_COUNT],
+                Self::Two => &[
+                    0,
+                    UNION_HORIZON_TWO_SEGMENT_SPLIT,
+                    UNION_HORIZON_DOCUMENT_COUNT,
+                ],
+                // Seven uniquely sized prefix leaves retain the exact
+                // 257-document prefix and 8,744-document target tail while
+                // crossing the shipping eight-segment fan-out threshold
+                // naturally. Unique cardinalities make every Tantivy native
+                // segment address independently resolvable.
+                Self::Eight => &[
+                    0,
+                    1,
+                    3,
+                    6,
+                    10,
+                    15,
+                    21,
+                    UNION_HORIZON_TWO_SEGMENT_SPLIT,
+                    UNION_HORIZON_DOCUMENT_COUNT,
+                ],
+            };
+            boundaries.windows(2).map(|pair| pair[0]..pair[1]).collect()
+        }
+
+        fn range_for_ordinal(self, ordinal: usize) -> std::ops::Range<usize> {
+            self.ranges()
+                .into_iter()
+                .find(|range| range.contains(&ordinal))
+                .expect("UNION_HORIZON ordinal belongs to one segment")
+        }
+
+        const fn target_segment_start(self) -> usize {
+            match self {
+                Self::Single => 0,
+                Self::Two | Self::Eight => UNION_HORIZON_TWO_SEGMENT_SPLIT,
+            }
+        }
+    }
+
+    #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct UnionHorizonBuildIdentity {
+        source_git_revision: String,
+        source_git_dirty: bool,
+        source_verification: UnionHorizonSourceVerification,
+        cargo_lock_sha256: String,
+        rustc_version_verbose: String,
+        target_triple: String,
+        cargo_profile: String,
+        enabled_features: Vec<String>,
+        enabled_features_sha256: String,
+        test_executable_sha256: String,
+        test_executable_byte_len: u64,
+    }
+
+    #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    enum UnionHorizonSourceVerification {
+        /// `build.rs` rediscovered the exact repository root and verified any
+        /// explicit identity against its live Git revision and dirty state.
+        GitCheckoutVerified,
+        /// A Git-less build accepted caller-supplied revision metadata only
+        /// for diagnostic execution. This state can never publish evidence.
+        ExplicitUnverified,
+        /// Neither an exact checkout nor explicit diagnostic identity existed.
+        Unavailable,
+    }
+
+    #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct UnionHorizonOracleDependencyIdentity {
+        tantivy_version: String,
+        tantivy_checksum_sha256: String,
+        lexical_package: String,
+        lexical_package_version: String,
+        pinned_lexical_contract_revision: String,
+    }
+
+    #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
     struct UnionHorizonTraceReceipt {
+        limit: u64,
+        segment_doc_start: u32,
         segment_doc_count: u64,
-        plan: String,
-        pruning_windows: u64,
-        blocks_skipped: u64,
-        candidate_docs: u64,
+        refills: Vec<frankensearch_quill::ConformancePruningRefillReceipt>,
     }
 
-    #[cfg(feature = "tantivy-oracle")]
-    #[derive(Clone, Debug, PartialEq, Eq)]
+    #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct UnionHorizonTracedHitReceipt {
+        document_id: String,
+        global_docid: u32,
+        score_bits: u32,
+    }
+
+    #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct UnionHorizonTracedResultReceipt {
+        limit: u64,
+        hits: Vec<UnionHorizonTracedHitReceipt>,
+        total_count: Option<u64>,
+        doc_count: u64,
+        diagnostic_count: u64,
+    }
+
+    #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct UnionHorizonTantivySegmentReceipt {
+        segment_ord: u32,
+        max_doc: u32,
+        num_docs: u32,
+    }
+
+    #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct UnionHorizonTopologyReceipt {
+        quill_segment_doc_counts: Vec<u32>,
+        tantivy_segments: Vec<UnionHorizonTantivySegmentReceipt>,
+    }
+
+    #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
     struct UnionHorizonProof {
+        layout: UnionHorizonSegmentLayout,
+        build_identity: UnionHorizonBuildIdentity,
+        oracle_dependency: UnionHorizonOracleDependencyIdentity,
         comparisons: Vec<HarnessRun>,
-        trace: UnionHorizonTraceReceipt,
+        traced_results: Vec<UnionHorizonTracedResultReceipt>,
+        target_traces: Vec<UnionHorizonTraceReceipt>,
+        complete_pruning_traces: Vec<frankensearch_quill::ConformancePruningTraceReceipt>,
+        topology: UnionHorizonTopologyReceipt,
     }
 
-    #[cfg(feature = "tantivy-oracle")]
+    #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    enum UnionHorizonProofKind {
+        LateWinner,
+        TieMatrix,
+    }
+
+    #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
+    impl UnionHorizonProofKind {
+        const fn label(self) -> &'static str {
+            match self {
+                Self::LateWinner => "late-winner",
+                Self::TieMatrix => "tie-matrix",
+            }
+        }
+    }
+
+    #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
+    fn union_horizon_quill_config() -> frankensearch_quill::QuillConfig {
+        frankensearch_quill::QuillConfig {
+            deterministic_ingest: true,
+            // The proof needs eight independently searchable sealed leaves to
+            // exercise the shipping Rayon query branch. The default fanout of
+            // eight would merge on the eighth commit; nine is the smallest
+            // production-valid value that preserves this exact topology.
+            tier_fanout: 9,
+            ..frankensearch_quill::QuillConfig::default()
+        }
+    }
+
+    #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
+    fn union_horizon_expected_corpus_hash(proof_kind: UnionHorizonProofKind) -> &'static str {
+        static LATE_WINNER: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        static TIE_MATRIX: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        match proof_kind {
+            UnionHorizonProofKind::LateWinner => LATE_WINNER
+                .get_or_init(|| make_union_horizon_fixture().corpus_hash)
+                .as_str(),
+            UnionHorizonProofKind::TieMatrix => TIE_MATRIX
+                .get_or_init(|| make_union_horizon_tie_fixture().corpus_hash)
+                .as_str(),
+        }
+    }
+
+    #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct UnionHorizonEvidenceArtifact {
+        schema_version: String,
+        run_id: String,
+        proof_kind: UnionHorizonProofKind,
+        proofs: Vec<UnionHorizonProof>,
+        artifact_sha256: String,
+    }
+
+    #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct PublishedUnionHorizonArtifact {
+        path: std::path::PathBuf,
+        raw_file_sha256: String,
+        byte_len: u64,
+    }
+
+    #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct UnionHorizonCompletionEntry {
+        proof_kind: UnionHorizonProofKind,
+        filename: String,
+        semantic_sha256: String,
+        raw_file_sha256: String,
+        byte_len: u64,
+        artifact: UnionHorizonEvidenceArtifact,
+    }
+
+    #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct UnionHorizonCompletionManifest {
+        schema_version: String,
+        run_id: String,
+        build_identity: UnionHorizonBuildIdentity,
+        artifacts: Vec<UnionHorizonCompletionEntry>,
+        manifest_sha256: String,
+    }
+
+    #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
+    impl UnionHorizonCompletionManifest {
+        fn seal(run_id: String, mut artifacts: Vec<UnionHorizonCompletionEntry>) -> Self {
+            artifacts.sort_by_key(|entry| entry.proof_kind);
+            let mut manifest = Self {
+                schema_version: UNION_HORIZON_COMPLETION_SCHEMA_VERSION.to_owned(),
+                run_id,
+                build_identity: union_horizon_build_identity(),
+                artifacts,
+                manifest_sha256: String::new(),
+            };
+            manifest.validate_structure();
+            manifest.manifest_sha256 = manifest.preimage_sha256();
+            manifest.verify();
+            manifest
+        }
+
+        fn preimage_sha256(&self) -> String {
+            let mut preimage = self.clone();
+            preimage.manifest_sha256.clear();
+            let bytes = serde_json::to_vec(&preimage)
+                .expect("serialize canonical UNION_HORIZON completion preimage");
+            let mut hasher = Sha256::new();
+            hasher.update(UNION_HORIZON_COMPLETION_HASH_DOMAIN);
+            hasher.update(bytes);
+            lower_hex(&hasher.finalize())
+        }
+
+        fn validate_structure(&self) {
+            assert_eq!(
+                self.schema_version, UNION_HORIZON_COMPLETION_SCHEMA_VERSION,
+                "UNION_HORIZON completion schema drifted",
+            );
+            assert!(
+                !self.run_id.is_empty()
+                    && self.run_id.bytes().all(|byte| {
+                        byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_')
+                    }),
+                "UNION_HORIZON completion run ID must be path-safe",
+            );
+            assert_eq!(
+                self.build_identity,
+                union_horizon_build_identity(),
+                "UNION_HORIZON completion must bind the executing test binary",
+            );
+            assert!(
+                union_horizon_identity_is_publishable(&self.build_identity),
+                "UNION_HORIZON completion requires clean Git-verified source",
+            );
+            assert_eq!(
+                self.artifacts
+                    .iter()
+                    .map(|entry| entry.proof_kind)
+                    .collect::<Vec<_>>(),
+                vec![
+                    UnionHorizonProofKind::LateWinner,
+                    UnionHorizonProofKind::TieMatrix,
+                ],
+                "UNION_HORIZON completion requires exactly both proof kinds",
+            );
+            for entry in &self.artifacts {
+                assert!(
+                    !entry.filename.is_empty()
+                        && entry.filename.bytes().all(|byte| {
+                            byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.')
+                        })
+                        && entry.filename.ends_with(".json"),
+                    "UNION_HORIZON completion contains an unsafe artifact filename",
+                );
+                assert_lower_hex(
+                    &entry.semantic_sha256,
+                    64,
+                    "UNION_HORIZON completion semantic identity",
+                );
+                assert_lower_hex(
+                    &entry.raw_file_sha256,
+                    64,
+                    "UNION_HORIZON completion raw identity",
+                );
+                assert!(entry.byte_len > 0);
+                entry.artifact.verify();
+                assert_eq!(
+                    entry.artifact.run_id, self.run_id,
+                    "UNION_HORIZON completion cannot embed a proof from another run",
+                );
+                assert_eq!(
+                    entry.artifact.proof_kind, entry.proof_kind,
+                    "UNION_HORIZON completion proof kind does not match its embedded artifact",
+                );
+                assert_eq!(
+                    entry.artifact.artifact_sha256, entry.semantic_sha256,
+                    "UNION_HORIZON completion semantic identity does not match its embedded artifact",
+                );
+                assert!(
+                    entry
+                        .artifact
+                        .proofs
+                        .iter()
+                        .all(|proof| proof.build_identity == self.build_identity),
+                    "UNION_HORIZON completion artifact does not bind the manifest executable",
+                );
+                let canonical_artifact_bytes = serde_json::to_vec_pretty(&entry.artifact)
+                    .expect("serialize embedded UNION_HORIZON artifact");
+                assert_eq!(
+                    u64::try_from(canonical_artifact_bytes.len())
+                        .expect("embedded UNION_HORIZON artifact length fits u64"),
+                    entry.byte_len,
+                    "UNION_HORIZON completion artifact length is not canonical",
+                );
+                assert_eq!(
+                    sha256_hex(&canonical_artifact_bytes),
+                    entry.raw_file_sha256,
+                    "UNION_HORIZON completion raw identity is not canonical",
+                );
+                assert_eq!(
+                    entry.filename,
+                    format!(
+                        "{}-{}-{}-{}.json",
+                        entry.artifact.run_id,
+                        entry.artifact.proof_kind.label(),
+                        entry.artifact.artifact_sha256,
+                        entry.raw_file_sha256,
+                    ),
+                    "UNION_HORIZON completion artifact filename is not canonical",
+                );
+            }
+        }
+
+        fn verify(&self) {
+            self.validate_structure();
+            assert_lower_hex(
+                &self.manifest_sha256,
+                64,
+                "UNION_HORIZON completion manifest identity",
+            );
+            assert_eq!(
+                self.manifest_sha256,
+                self.preimage_sha256(),
+                "UNION_HORIZON completion identity does not match its canonical preimage",
+            );
+        }
+    }
+
+    #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
+    impl UnionHorizonEvidenceArtifact {
+        fn seal(
+            run_id: String,
+            proof_kind: UnionHorizonProofKind,
+            proofs: Vec<UnionHorizonProof>,
+        ) -> Self {
+            let mut artifact = Self {
+                schema_version: UNION_HORIZON_ARTIFACT_SCHEMA_VERSION.to_owned(),
+                run_id,
+                proof_kind,
+                proofs,
+                artifact_sha256: String::new(),
+            };
+            artifact.validate_structure();
+            artifact.artifact_sha256 = artifact.preimage_sha256();
+            artifact.verify();
+            artifact
+        }
+
+        fn preimage_sha256(&self) -> String {
+            let mut preimage = self.clone();
+            // `run_id` is publication metadata, not semantic evidence.  Two
+            // invocations that prove the same layouts against the same binary
+            // must therefore have the same content identity.
+            preimage.run_id.clear();
+            preimage.artifact_sha256.clear();
+            let bytes = serde_json::to_vec(&preimage)
+                .expect("serialize canonical UNION_HORIZON artifact preimage");
+            let mut hasher = Sha256::new();
+            hasher.update(UNION_HORIZON_ARTIFACT_HASH_DOMAIN);
+            hasher.update(bytes);
+            lower_hex(&hasher.finalize())
+        }
+
+        fn validate_structure(&self) {
+            assert_eq!(
+                self.schema_version, UNION_HORIZON_ARTIFACT_SCHEMA_VERSION,
+                "UNION_HORIZON artifact schema drifted",
+            );
+            assert!(
+                !self.run_id.is_empty()
+                    && self.run_id.bytes().all(|byte| {
+                        byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_')
+                    }),
+                "UNION_HORIZON run ID must be a non-empty path-safe ASCII token",
+            );
+            assert_eq!(
+                self.proofs.len(),
+                UnionHorizonSegmentLayout::ALL.len(),
+                "UNION_HORIZON artifact must contain every segment layout",
+            );
+            let expected_limits = [1_u64, 20, 100];
+            let expected_seed = match self.proof_kind {
+                UnionHorizonProofKind::LateWinner => 0x6202_4096,
+                UnionHorizonProofKind::TieMatrix => 0x6202_71E5,
+            };
+            let expected_fixture_prefix = match self.proof_kind {
+                UnionHorizonProofKind::LateWinner => "union-horizon-k",
+                UnionHorizonProofKind::TieMatrix => "union-horizon-ties-k",
+            };
+            let expected_corpus_hash = union_horizon_expected_corpus_hash(self.proof_kind);
+            let expected_subject_config_hash =
+                crate::engine::quill_config_hash(&union_horizon_quill_config());
+            for (proof, expected_layout) in self.proofs.iter().zip(UnionHorizonSegmentLayout::ALL) {
+                assert_eq!(
+                    proof.layout, expected_layout,
+                    "UNION_HORIZON artifact layouts must be complete and canonical",
+                );
+                let expected_doc_counts = proof
+                    .layout
+                    .ranges()
+                    .iter()
+                    .map(|range| {
+                        u32::try_from(range.len())
+                            .expect("UNION_HORIZON expected segment count fits u32")
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    proof.topology.quill_segment_doc_counts, expected_doc_counts,
+                    "UNION_HORIZON Quill topology must equal the declared layout",
+                );
+                let mut expected_tantivy_doc_counts = expected_doc_counts.clone();
+                expected_tantivy_doc_counts.sort_unstable_by(|left, right| right.cmp(left));
+                assert!(
+                    proof
+                        .topology
+                        .tantivy_segments
+                        .iter()
+                        .enumerate()
+                        .all(|(ordinal, segment)| {
+                            u32::try_from(ordinal).is_ok_and(|expected_ordinal| {
+                                segment.segment_ord == expected_ordinal
+                                    && segment.max_doc == segment.num_docs
+                            })
+                        }),
+                    "UNION_HORIZON Tantivy topology must retain dense native ordinals with no deletes",
+                );
+                assert_eq!(
+                    proof
+                        .topology
+                        .tantivy_segments
+                        .iter()
+                        .map(|segment| segment.num_docs)
+                        .collect::<Vec<_>>(),
+                    expected_tantivy_doc_counts,
+                    "UNION_HORIZON Tantivy topology must equal the declared layout",
+                );
+                assert_eq!(
+                    proof.comparisons.len(),
+                    expected_limits.len(),
+                    "UNION_HORIZON comparison matrix must contain every canonical limit",
+                );
+                assert_eq!(
+                    proof.traced_results.len(),
+                    expected_limits.len(),
+                    "UNION_HORIZON traced-result matrix must contain every canonical limit",
+                );
+                assert_eq!(
+                    proof.target_traces.len(),
+                    expected_limits.len(),
+                    "UNION_HORIZON target trace matrix must contain every canonical limit",
+                );
+                assert_eq!(
+                    proof.complete_pruning_traces.len(),
+                    expected_limits.len(),
+                    "UNION_HORIZON complete trace matrix must contain every canonical limit",
+                );
+                for ((((run, traced_result), target_trace), trace), expected_limit) in proof
+                    .comparisons
+                    .iter()
+                    .zip(&proof.traced_results)
+                    .zip(&proof.target_traces)
+                    .zip(&proof.complete_pruning_traces)
+                    .zip(expected_limits)
+                {
+                    run.engines
+                        .validate_gauntlet_contract()
+                        .expect("UNION_HORIZON engine identity contract");
+                    assert_eq!(run.engines.comparison_mode, ComparisonMode::CrossEngine);
+                    assert_eq!(
+                        run.engines.semantic_contract.as_ref(),
+                        Some(&SemanticContract::scalar_g1a()),
+                        "UNION_HORIZON engines must bind the scalar G1a semantic contract",
+                    );
+                    assert_eq!(
+                        run.engines.subject.family,
+                        EngineFamily::Quill,
+                        "UNION_HORIZON subject must be Quill",
+                    );
+                    assert_eq!(
+                        run.engines.subject.implementation,
+                        "frankensearch-quill/scalar-index",
+                    );
+                    assert_eq!(
+                        run.engines.subject.crate_version,
+                        frankensearch_quill::FRANKENSEARCH_QUILL_CRATE_VERSION,
+                        "UNION_HORIZON subject wrapper package version drifted",
+                    );
+                    assert_eq!(
+                        run.engines.subject.config_hash, expected_subject_config_hash,
+                        "UNION_HORIZON subject configuration drifted from deterministic fanout nine",
+                    );
+                    assert_eq!(
+                        run.engines.oracle.family,
+                        EngineFamily::Tantivy,
+                        "UNION_HORIZON oracle must be Tantivy",
+                    );
+                    assert_eq!(
+                        run.engines.oracle.implementation,
+                        "frankensearch-lexical/tantivy-index",
+                    );
+                    assert_eq!(
+                        run.engines.oracle.crate_version,
+                        proof.oracle_dependency.lexical_package_version,
+                        "UNION_HORIZON oracle wrapper package version drifted",
+                    );
+                    assert_eq!(
+                        run.engines.oracle.config_hash, TANTIVY_ORACLE_CONFIG_HASH,
+                        "UNION_HORIZON oracle configuration drifted",
+                    );
+                    for descriptor in [&run.engines.subject, &run.engines.oracle] {
+                        assert_eq!(
+                            descriptor.source_revision, proof.build_identity.source_git_revision,
+                            "UNION_HORIZON engine descriptor must identify the compiled wrapper build",
+                        );
+                        assert_eq!(
+                            descriptor.source_dirty, proof.build_identity.source_git_dirty,
+                            "UNION_HORIZON engine descriptor dirty state must identify the compiled wrapper build",
+                        );
+                    }
+                    assert_eq!(run.case.limit, expected_limit);
+                    assert_eq!(
+                        run.case.fixture_id,
+                        format!("{expected_fixture_prefix}{expected_limit}"),
+                    );
+                    assert_eq!(run.case.query, UNION_HORIZON_QUERY);
+                    assert_eq!(run.case.offset, 0);
+                    assert_eq!(
+                        run.case.tie_expansion_limit,
+                        match self.proof_kind {
+                            UnionHorizonProofKind::LateWinner => {
+                                UNION_HORIZON_LATE_TIE_EXPANSION
+                            }
+                            UnionHorizonProofKind::TieMatrix => {
+                                UNION_HORIZON_MATRIX_TIE_EXPANSION
+                            }
+                        },
+                    );
+                    assert!(!run.case.count_requested);
+                    assert_eq!(run.case.snippet_max_chars, None);
+                    assert_eq!(
+                        run.case.metadata.generator_id.as_deref(),
+                        Some(GENERATOR_ID),
+                    );
+                    assert_eq!(run.case.metadata.generator_seed, Some(expected_seed));
+                    assert_eq!(
+                        run.case.metadata.corpus_hash.as_deref(),
+                        Some(expected_corpus_hash),
+                        "UNION_HORIZON case must bind the exact deterministic 9,001-document fixture",
+                    );
+                    assert_eq!(run.comparator_config, ComparatorConfig::default());
+                    run.case
+                        .validate_observations(
+                            &run.engines,
+                            &run.comparison.subject,
+                            &run.comparison.oracle,
+                        )
+                        .expect("UNION_HORIZON observation contract");
+                    assert_eq!(
+                        compare_observations(
+                            run.comparison.subject.clone(),
+                            run.comparison.oracle.clone(),
+                            run.comparator_config,
+                        )
+                        .expect("recompute UNION_HORIZON comparison"),
+                        run.comparison,
+                        "UNION_HORIZON comparison must equal its sealed observations",
+                    );
+                    match self.proof_kind {
+                        UnionHorizonProofKind::LateWinner => {
+                            assert_union_horizon_late_comparison(
+                                run,
+                                expected_limit,
+                                proof.layout,
+                                &proof.topology.tantivy_segments,
+                            );
+                        }
+                        UnionHorizonProofKind::TieMatrix => {
+                            assert_union_horizon_tie_comparison(
+                                run,
+                                expected_limit,
+                                proof.layout,
+                                &proof.topology.tantivy_segments,
+                            );
+                        }
+                    }
+                    assert_union_horizon_traced_result(run, expected_limit, traced_result);
+                    assert_union_horizon_complete_trace_semantics(proof.layout, trace);
+                    assert_eq!(
+                        trace.execution_mode(),
+                        proof.layout.expected_execution_mode(),
+                        "UNION_HORIZON artifact recorded the wrong shipping execution branch",
+                    );
+                    assert_eq!(
+                        trace
+                            .segments()
+                            .iter()
+                            .map(|segment| {
+                                u32::try_from(segment.segment_doc_count())
+                                    .expect("UNION_HORIZON segment count fits u32")
+                            })
+                            .collect::<Vec<_>>(),
+                        proof.topology.quill_segment_doc_counts,
+                        "UNION_HORIZON artifact trace is not a complete topology receipt",
+                    );
+                    assert!(
+                        trace
+                            .segments()
+                            .iter()
+                            .enumerate()
+                            .all(|(ordinal, segment)| {
+                                u64::try_from(ordinal)
+                                    .is_ok_and(|expected| expected == segment.segment_ordinal())
+                            }),
+                        "UNION_HORIZON complete trace segment ordinals must be dense and ordered",
+                    );
+                    let target_segment = trace
+                        .segments()
+                        .last()
+                        .expect("UNION_HORIZON trace contains the target segment");
+                    assert_eq!(target_trace.limit, expected_limit);
+                    assert_eq!(
+                        target_trace.segment_doc_start,
+                        u32::try_from(proof.layout.target_segment_start())
+                            .expect("UNION_HORIZON target start fits u32"),
+                    );
+                    assert_eq!(
+                        target_trace.segment_doc_count,
+                        target_segment.segment_doc_count(),
+                    );
+                    assert_eq!(
+                        target_trace.refills,
+                        target_segment.refills(),
+                        "UNION_HORIZON target trace must be an exact projection of the complete receipt",
+                    );
+                    let revalidated_target = match self.proof_kind {
+                        UnionHorizonProofKind::LateWinner => union_horizon_late_trace_receipt(
+                            expected_limit,
+                            target_trace.segment_doc_start,
+                            target_trace.segment_doc_count,
+                            trace.segments(),
+                        ),
+                        UnionHorizonProofKind::TieMatrix => union_horizon_tie_trace_receipt(
+                            expected_limit,
+                            target_trace.segment_doc_start,
+                            target_trace.segment_doc_count,
+                            trace.segments(),
+                        ),
+                    };
+                    assert_eq!(
+                        *target_trace, revalidated_target,
+                        "UNION_HORIZON target receipt failed semantic revalidation",
+                    );
+                }
+            }
+            let first = self
+                .proofs
+                .first()
+                .expect("UNION_HORIZON artifact contains proofs");
+            assert_eq!(
+                first.build_identity,
+                union_horizon_build_identity(),
+                "UNION_HORIZON artifact must identify the verifier's compiled producer build",
+            );
+            assert_eq!(
+                first.oracle_dependency,
+                union_horizon_oracle_dependency_identity(),
+                "UNION_HORIZON artifact must bind the compiled oracle dependency contract",
+            );
+            assert!(
+                self.proofs.iter().all(|proof| {
+                    proof.build_identity == first.build_identity
+                        && proof.oracle_dependency == first.oracle_dependency
+                }),
+                "UNION_HORIZON artifact must bind one subject binary and one oracle dependency",
+            );
+            let first_engines = &first
+                .comparisons
+                .first()
+                .expect("UNION_HORIZON proof contains comparisons")
+                .engines;
+            assert!(
+                self.proofs.iter().all(|proof| {
+                    proof
+                        .comparisons
+                        .iter()
+                        .all(|run| run.engines == *first_engines)
+                }),
+                "UNION_HORIZON artifact must bind one exact engine pair across every layout and query",
+            );
+        }
+
+        fn verify(&self) {
+            self.validate_structure();
+            assert!(
+                self.artifact_sha256.len() == 64
+                    && self
+                        .artifact_sha256
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+                "UNION_HORIZON artifact identity must be lowercase SHA-256",
+            );
+            assert_eq!(
+                self.artifact_sha256,
+                self.preimage_sha256(),
+                "UNION_HORIZON artifact identity does not match its canonical preimage",
+            );
+        }
+    }
+
+    #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
     fn union_horizon_ranked_content(gamma_frequency: usize) -> Vec<u8> {
         assert!(
             gamma_frequency < UNION_HORIZON_RANKED_DOCUMENT_TOKENS,
@@ -7481,7 +8258,7 @@ mod tests {
         tokens.join(" ").into_bytes()
     }
 
-    #[cfg(feature = "tantivy-oracle")]
+    #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
     fn make_union_horizon_fixture() -> Fixture {
         let snapshot = RepositorySnapshot::from_entries(
             "union-horizon-late-winner",
@@ -7530,7 +8307,7 @@ mod tests {
                     query: UNION_HORIZON_QUERY.to_owned(),
                     limit,
                     offset: 0,
-                    count_requested: true,
+                    count_requested: false,
                     filters: crate::generator::GeneratedQueryFilters::default(),
                     expected_divergence: None,
                     source: "runner.rs UNION_HORIZON late-winner regression".to_owned(),
@@ -7546,69 +8323,1092 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "tantivy-oracle")]
-    fn union_horizon_trace_receipt(logs: &str, segment_doc_count: u64) -> UnionHorizonTraceReceipt {
-        use frankensearch_quill::tracing_conventions::ARGUS_SCORE;
+    #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
+    fn union_horizon_tie_frequency(ordinal: usize) -> Option<usize> {
+        match ordinal {
+            0 | 9_000 => Some(120),
+            1..=17 | 19..=95 => Some(120 - ordinal),
+            18 | 8_500 | 8_501 => Some(102),
+            96 | 8_502 | 8_503 => Some(24),
+            97 => Some(23),
+            _ => None,
+        }
+    }
 
-        let matching = logs
-            .lines()
-            .filter(|line| is_stage_close(line, ARGUS_SCORE))
-            // Close records contain the outer query span before the nested
-            // score span, and both carry `doc_count`. Select the innermost
-            // (last) field so a multi-segment query's aggregate count cannot
-            // masquerade as the target segment's count.
-            .filter(|line| trace_last_field_u64(line, "doc_count") == Some(segment_doc_count))
-            .filter(|line| trace_has_text_field(line, "plan", "max_score"))
+    #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
+    fn make_union_horizon_tie_fixture() -> Fixture {
+        let snapshot = RepositorySnapshot::from_entries(
+            "union-horizon-tie-matrix",
+            (0..UNION_HORIZON_DOCUMENT_COUNT).map(|ordinal| {
+                let bytes = union_horizon_tie_frequency(ordinal).map_or_else(
+                    || {
+                        if ordinal < 4_096 {
+                            b"alpha beta".to_vec()
+                        } else {
+                            b"alpha".to_vec()
+                        }
+                    },
+                    union_horizon_ranked_content,
+                );
+                RepositoryEntry {
+                    relative_path: std::path::PathBuf::from(format!("docs/{ordinal:05}.txt")),
+                    bytes,
+                }
+            }),
+        )
+        .expect("UNION_HORIZON tie repository snapshot");
+        let corpus_hash = snapshot
+            .manifest
+            .manifest_hash()
+            .expect("UNION_HORIZON tie corpus hash");
+        let query_suite = GeneratedQuerySuite::from_cases(
+            QueryGeneratorSpec {
+                seed: 0x6202_71E5,
+                default_limit: 100,
+                include_shared_relevance_queries: false,
+            },
+            &corpus_hash,
+            [1_u64, 20, 100]
+                .into_iter()
+                .map(|limit| GeneratedQueryCase {
+                    id: format!("union-horizon-ties-k{limit}"),
+                    syntax: QuerySyntax::Default,
+                    query_kind: GeneratedQueryKind::Boolean,
+                    query: UNION_HORIZON_QUERY.to_owned(),
+                    limit,
+                    offset: 0,
+                    count_requested: false,
+                    filters: crate::generator::GeneratedQueryFilters::default(),
+                    expected_divergence: None,
+                    source: "runner.rs UNION_HORIZON cutoff-tie matrix".to_owned(),
+                })
+                .collect(),
+        )
+        .expect("UNION_HORIZON tie query suite");
+        Fixture {
+            documents: snapshot.documents,
+            corpus_manifest: snapshot.manifest,
+            corpus_hash,
+            query_suite,
+        }
+    }
+
+    #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
+    fn union_horizon_target_refills(
+        limit: u64,
+        segment_doc_count: u64,
+        segments: &[frankensearch_quill::ConformanceSegmentPruningReceipt],
+    ) -> Vec<frankensearch_quill::ConformancePruningRefillReceipt> {
+        let matching = segments
+            .iter()
+            .filter(|receipt| receipt.segment_doc_count().eq(&segment_doc_count))
             .collect::<Vec<_>>();
         assert_eq!(
             matching.len(),
             1,
-            "UNION_HORIZON target segment must emit exactly one MaxScore close receipt; \
-             segment_doc_count={segment_doc_count} logs={logs}",
+            "UNION_HORIZON limit={limit} must expose exactly one target-segment receipt: \
+             segment_doc_count={segment_doc_count} receipts={segments:#?}",
         );
-        let score = matching[0];
-        let receipt = UnionHorizonTraceReceipt {
-            segment_doc_count,
-            plan: trace_field_text(score, "plan")
-                .expect("UNION_HORIZON score plan")
-                .to_owned(),
-            pruning_windows: trace_field_u64(score, "pruning_windows")
-                .expect("UNION_HORIZON pruning-window count"),
-            blocks_skipped: trace_field_u64(score, "blocks_skipped")
-                .expect("UNION_HORIZON skipped-block count"),
-            candidate_docs: trace_field_u64(score, "candidate_docs")
-                .expect("UNION_HORIZON candidate count"),
-        };
-        assert_eq!(trace_field_u64(score, "segments_touched"), Some(1));
-        assert_eq!(receipt.plan, "max_score");
-        assert_eq!(receipt.pruning_windows, 2);
-        assert_eq!(receipt.blocks_skipped, 0);
-        assert_eq!(receipt.candidate_docs, 1);
-        receipt
+        matching[0].refills().to_vec()
     }
 
-    #[cfg(feature = "tantivy-oracle")]
+    #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
+    fn assert_union_horizon_refill_geometry(
+        limit: u64,
+        segment_doc_start: u32,
+        refills: &[frankensearch_quill::ConformancePruningRefillReceipt],
+    ) {
+        assert_eq!(
+            refills.len(),
+            3,
+            "UNION_HORIZON limit={limit} target segment must execute one exhaustive and two \
+             competitive refills: {refills:#?}",
+        );
+        for (index, refill) in refills.iter().enumerate() {
+            let expected_start = u64::from(segment_doc_start)
+                + u64::try_from(index).expect("refill index fits u64") * 4_096;
+            assert_eq!(u64::from(refill.window_start()), expected_start);
+            assert_eq!(
+                refill.ordinal(),
+                u64::try_from(index).expect("refill index fits u64") + 1,
+            );
+            assert_eq!(
+                refill.horizon_end(),
+                u64::from(refill.window_start()) + 4_096,
+            );
+        }
+        let late = refills[2];
+        assert!(
+            u64::from(late.window_start()) <= 9_000 && 9_000 < late.horizon_end(),
+            "UNION_HORIZON final refill must contain global document 9000: {late:?}",
+        );
+    }
+
+    #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
+    fn union_horizon_late_trace_receipt(
+        limit: u64,
+        segment_doc_start: u32,
+        segment_doc_count: u64,
+        segments: &[frankensearch_quill::ConformanceSegmentPruningReceipt],
+    ) -> UnionHorizonTraceReceipt {
+        use frankensearch_quill::ConformancePruningStrategy;
+
+        let refills = union_horizon_target_refills(limit, segment_doc_count, segments);
+        assert_union_horizon_refill_geometry(limit, segment_doc_start, &refills);
+        let initial = refills[0];
+        assert_eq!(initial.strategy(), ConformancePruningStrategy::Exhaustive);
+        assert_eq!(initial.cutoff_bits(), None);
+        assert!(!initial.buffer_empty());
+        assert!(initial.live_work_remains());
+
+        let empty_competitive = refills[1];
+        let late_competitive = refills[2];
+        for refill in [empty_competitive, late_competitive] {
+            assert_eq!(refill.strategy(), ConformancePruningStrategy::MaxScore);
+            let cutoff = f32::from_bits(
+                refill
+                    .cutoff_bits()
+                    .expect("competitive refill must bind cutoff bits"),
+            );
+            assert!(cutoff.is_finite() && cutoff > 0.0);
+        }
+        assert_eq!(empty_competitive.candidate_docs(), 0);
+        assert!(empty_competitive.buffer_empty());
+        assert!(empty_competitive.live_work_remains());
+        assert_eq!(late_competitive.candidate_docs(), 1);
+        assert!(!late_competitive.buffer_empty());
+        assert!(!late_competitive.live_work_remains());
+        let empty_cutoff =
+            f32::from_bits(empty_competitive.cutoff_bits().expect("empty cutoff bits"));
+        let late_cutoff = f32::from_bits(late_competitive.cutoff_bits().expect("late cutoff bits"));
+        assert!(
+            !matches!(
+                late_cutoff.total_cmp(&empty_cutoff),
+                std::cmp::Ordering::Less
+            ),
+            "UNION_HORIZON competitive cutoff regressed from {empty_cutoff:?} to {late_cutoff:?}",
+        );
+
+        UnionHorizonTraceReceipt {
+            limit,
+            segment_doc_start,
+            segment_doc_count,
+            refills,
+        }
+    }
+
+    #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
+    fn union_horizon_tie_trace_receipt(
+        limit: u64,
+        segment_doc_start: u32,
+        segment_doc_count: u64,
+        segments: &[frankensearch_quill::ConformanceSegmentPruningReceipt],
+    ) -> UnionHorizonTraceReceipt {
+        use frankensearch_quill::ConformancePruningStrategy;
+
+        let refills = union_horizon_target_refills(limit, segment_doc_count, segments);
+        assert_union_horizon_refill_geometry(limit, segment_doc_start, &refills);
+        let initial = refills[0];
+        assert_eq!(initial.strategy(), ConformancePruningStrategy::Exhaustive);
+        assert_eq!(initial.cutoff_bits(), None);
+        assert!(!initial.buffer_empty());
+        assert!(initial.live_work_remains());
+
+        let competitive = &refills[1..];
+        let cutoffs = competitive
+            .iter()
+            .map(|refill| {
+                assert_eq!(refill.strategy(), ConformancePruningStrategy::MaxScore);
+                let cutoff = f32::from_bits(
+                    refill
+                        .cutoff_bits()
+                        .expect("tie-matrix competitive refill must bind cutoff bits"),
+                );
+                assert!(cutoff.is_finite() && cutoff > 0.0);
+                cutoff
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            cutoffs
+                .windows(2)
+                .all(|pair| !matches!(pair[1].total_cmp(&pair[0]), std::cmp::Ordering::Less)),
+            "UNION_HORIZON tie-matrix cutoff regressed: {cutoffs:?}",
+        );
+        assert!(competitive[0].live_work_remains());
+        let late = competitive[1];
+        assert!(u64::from(late.window_start()) >= 2 * 4_096);
+        assert!(
+            late.candidate_docs() > 0,
+            "UNION_HORIZON tie-matrix final horizon must emit a competitive candidate",
+        );
+        assert!(!late.buffer_empty());
+        assert!(!late.live_work_remains());
+
+        UnionHorizonTraceReceipt {
+            limit,
+            segment_doc_start,
+            segment_doc_count,
+            refills,
+        }
+    }
+
+    #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
+    fn assert_union_horizon_complete_trace_semantics(
+        layout: UnionHorizonSegmentLayout,
+        trace: &frankensearch_quill::ConformancePruningTraceReceipt,
+    ) {
+        use frankensearch_quill::ConformancePruningStrategy;
+
+        assert_eq!(trace.execution_mode(), layout.expected_execution_mode());
+        let ranges = layout.ranges();
+        assert_eq!(trace.segments().len(), ranges.len());
+        for (segment_ordinal, (segment, range)) in trace.segments().iter().zip(ranges).enumerate() {
+            assert_eq!(
+                segment.segment_ordinal(),
+                u64::try_from(segment_ordinal).expect("UNION_HORIZON segment ordinal fits u64"),
+            );
+            assert_eq!(
+                segment.segment_doc_count(),
+                u64::try_from(range.len()).expect("UNION_HORIZON segment length fits u64"),
+            );
+            let expected_refill_count = range.len().div_ceil(4_096);
+            assert_eq!(
+                segment.refills().len(),
+                expected_refill_count,
+                "UNION_HORIZON segment {segment_ordinal} must witness every union horizon",
+            );
+            for (refill_ordinal, refill) in segment.refills().iter().enumerate() {
+                let window_start = range.start + refill_ordinal * 4_096;
+                let window_doc_count = (range.end - window_start).min(4_096);
+                assert_eq!(
+                    refill.ordinal(),
+                    u64::try_from(refill_ordinal + 1)
+                        .expect("UNION_HORIZON refill ordinal fits u64"),
+                );
+                assert_eq!(
+                    refill.window_start(),
+                    u32::try_from(window_start).expect("UNION_HORIZON window start fits u32"),
+                );
+                assert_eq!(
+                    refill.horizon_end(),
+                    u64::try_from(window_start + 4_096)
+                        .expect("UNION_HORIZON horizon end fits u64"),
+                );
+                assert!(
+                    refill.candidate_docs()
+                        <= u64::try_from(window_doc_count)
+                            .expect("UNION_HORIZON window count fits u64"),
+                    "UNION_HORIZON refill admitted more candidates than its physical window",
+                );
+                assert_eq!(
+                    refill.buffer_empty(),
+                    refill.candidate_docs() == 0,
+                    "UNION_HORIZON direct-term fixture must bind candidate and buffer emptiness",
+                );
+                assert_eq!(
+                    refill.live_work_remains(),
+                    refill_ordinal + 1 < expected_refill_count,
+                    "UNION_HORIZON refill liveness must end exactly with the segment",
+                );
+                if refill_ordinal == 0 {
+                    assert_eq!(refill.strategy(), ConformancePruningStrategy::Exhaustive);
+                    assert_eq!(refill.cutoff_bits(), None);
+                    assert_eq!(
+                        refill.candidate_docs(),
+                        u64::try_from(window_doc_count)
+                            .expect("UNION_HORIZON initial window count fits u64"),
+                    );
+                } else {
+                    assert_eq!(refill.strategy(), ConformancePruningStrategy::MaxScore);
+                    let cutoff = f32::from_bits(
+                        refill
+                            .cutoff_bits()
+                            .expect("UNION_HORIZON competitive refill binds cutoff bits"),
+                    );
+                    assert!(cutoff.is_finite() && cutoff > 0.0);
+                }
+            }
+        }
+    }
+
+    #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
+    fn union_horizon_traced_result_receipt(
+        limit: u64,
+        traced: &frankensearch_quill::QuillSearchResult,
+    ) -> UnionHorizonTracedResultReceipt {
+        UnionHorizonTracedResultReceipt {
+            limit,
+            hits: traced
+                .hits
+                .iter()
+                .map(|hit| UnionHorizonTracedHitReceipt {
+                    document_id: hit.document_id.clone(),
+                    global_docid: hit.global_docid,
+                    score_bits: hit.score.to_bits(),
+                })
+                .collect(),
+            total_count: traced.total_count,
+            doc_count: traced.doc_count,
+            diagnostic_count: u64::try_from(traced.diagnostics.len())
+                .expect("UNION_HORIZON diagnostic count fits u64"),
+        }
+    }
+
+    #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
+    fn assert_union_horizon_traced_result(
+        run: &HarnessRun,
+        expected_limit: u64,
+        traced: &UnionHorizonTracedResultReceipt,
+    ) {
+        assert_eq!(traced.limit, expected_limit);
+        assert_eq!(traced.total_count, None);
+        assert_eq!(
+            traced.doc_count,
+            u64::try_from(UNION_HORIZON_DOCUMENT_COUNT)
+                .expect("UNION_HORIZON document count fits u64"),
+        );
+        assert_eq!(traced.diagnostic_count, 0);
+        assert_eq!(
+            traced.hits.len(),
+            usize::try_from(expected_limit).expect("UNION_HORIZON limit fits usize"),
+        );
+        assert_eq!(traced.hits.len(), run.comparison.subject.hits.len());
+        for (traced_hit, observed_hit) in traced.hits.iter().zip(&run.comparison.subject.hits) {
+            assert_eq!(traced_hit.document_id, observed_hit.doc_id);
+            assert_eq!(traced_hit.score_bits, observed_hit.score_bits);
+            assert_eq!(
+                observed_hit.native_tie_key,
+                NativeTieKey::QuillDocId {
+                    doc_id: traced_hit.global_docid,
+                },
+                "UNION_HORIZON traced global document ID must equal the sealed subject tie key",
+            );
+        }
+    }
+
+    #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
+    fn union_horizon_document_ordinal(document_id: &str) -> usize {
+        document_id
+            .strip_prefix("repo:docs/")
+            .and_then(|value| value.strip_suffix(".txt"))
+            .expect("UNION_HORIZON document identity shape")
+            .parse()
+            .expect("UNION_HORIZON document ordinal")
+    }
+
+    #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
+    fn union_horizon_build_identity() -> UnionHorizonBuildIdentity {
+        static IDENTITY: std::sync::OnceLock<UnionHorizonBuildIdentity> =
+            std::sync::OnceLock::new();
+        IDENTITY
+            .get_or_init(|| {
+                let source_git_revision = env!("QUILL_PERF_PRODUCER_GIT_REVISION").to_owned();
+                let source_git_dirty = match env!("QUILL_PERF_PRODUCER_GIT_DIRTY") {
+                    "true" => true,
+                    "false" => false,
+                    other => {
+                        assert!(
+                            matches!(other, "true" | "false"),
+                            "embedded UNION_HORIZON dirty state must be true or false",
+                        );
+                        true
+                    }
+                };
+                let source_verification = match env!("QUILL_PERF_PRODUCER_SOURCE_VERIFICATION") {
+                    "git_checkout_verified" => UnionHorizonSourceVerification::GitCheckoutVerified,
+                    "explicit_unverified" => UnionHorizonSourceVerification::ExplicitUnverified,
+                    "unavailable" => UnionHorizonSourceVerification::Unavailable,
+                    other => {
+                        panic!("unknown embedded UNION_HORIZON source verification mode {other:?}")
+                    }
+                };
+                let cargo_lock_sha256 = env!("QUILL_PERF_PRODUCER_CARGO_LOCK_SHA256").to_owned();
+                let rustc_version_verbose = String::from_utf8(decode_lower_hex(
+                    env!("QUILL_PERF_PRODUCER_RUSTC_VV_HEX"),
+                    "embedded rustc -Vv",
+                ))
+                .expect("embedded rustc -Vv identity must be UTF-8");
+                let target_triple = env!("QUILL_PERF_PRODUCER_TARGET_TRIPLE").to_owned();
+                let cargo_profile = env!("QUILL_PERF_PRODUCER_CARGO_PROFILE").to_owned();
+                let enabled_features = env!("QUILL_PERF_PRODUCER_ENABLED_FEATURES")
+                    .split(',')
+                    .filter(|feature| !feature.is_empty())
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>();
+                let enabled_features_sha256 =
+                    env!("QUILL_PERF_PRODUCER_ENABLED_FEATURES_SHA256").to_owned();
+                let (test_executable_sha256, test_executable_byte_len) =
+                    union_horizon_current_executable_identity();
+
+                assert_lower_hex(
+                    &source_git_revision,
+                    40,
+                    "embedded UNION_HORIZON Git revision",
+                );
+                assert_lower_hex(
+                    &cargo_lock_sha256,
+                    64,
+                    "embedded UNION_HORIZON Cargo.lock identity",
+                );
+                assert_lower_hex(
+                    &enabled_features_sha256,
+                    64,
+                    "embedded UNION_HORIZON feature-set identity",
+                );
+                assert_eq!(
+                    enabled_features_sha256,
+                    sha256_hex(enabled_features.join("\n").as_bytes()),
+                    "embedded UNION_HORIZON feature set does not match its digest",
+                );
+                assert!(
+                    enabled_features
+                        .windows(2)
+                        .all(|pair| pair[0].as_str() < pair[1].as_str()),
+                    "embedded UNION_HORIZON feature set must be sorted and unique",
+                );
+                assert!(
+                    enabled_features
+                        .iter()
+                        .any(|feature| feature == "pruning_conformance")
+                        && enabled_features
+                            .iter()
+                            .any(|feature| feature == "tantivy_oracle"),
+                    "UNION_HORIZON executable must enable both proof features",
+                );
+                assert!(
+                    !rustc_version_verbose.is_empty()
+                        && rustc_version_verbose.len() <= 16 * 1024
+                        && rustc_version_verbose.contains("release:")
+                        && rustc_version_verbose.contains("host:"),
+                    "embedded UNION_HORIZON rustc identity is incomplete",
+                );
+                assert!(
+                    !target_triple.is_empty() && !cargo_profile.is_empty(),
+                    "embedded UNION_HORIZON target and Cargo profile must be present",
+                );
+                assert_lower_hex(
+                    &test_executable_sha256,
+                    64,
+                    "UNION_HORIZON test executable identity",
+                );
+                assert!(
+                    test_executable_byte_len > 0,
+                    "UNION_HORIZON test executable must be nonempty",
+                );
+
+                UnionHorizonBuildIdentity {
+                    source_git_revision,
+                    source_git_dirty,
+                    source_verification,
+                    cargo_lock_sha256,
+                    rustc_version_verbose,
+                    target_triple,
+                    cargo_profile,
+                    enabled_features,
+                    enabled_features_sha256,
+                    test_executable_sha256,
+                    test_executable_byte_len,
+                }
+            })
+            .clone()
+    }
+
+    #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
+    fn assert_lower_hex(value: &str, expected_len: usize, label: &str) {
+        assert!(
+            value.len() == expected_len
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+            "{label} must be {expected_len} lowercase hexadecimal characters",
+        );
+    }
+
+    #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
+    fn decode_lower_hex(value: &str, label: &str) -> Vec<u8> {
+        assert!(
+            value.len().is_multiple_of(2)
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+            "{label} must be canonical lowercase hexadecimal",
+        );
+        value
+            .as_bytes()
+            .chunks_exact(2)
+            .map(|pair| {
+                let high = char::from(pair[0])
+                    .to_digit(16)
+                    .expect("validated hexadecimal nibble");
+                let low = char::from(pair[1])
+                    .to_digit(16)
+                    .expect("validated hexadecimal nibble");
+                u8::try_from(high * 16 + low).expect("two hexadecimal nibbles fit u8")
+            })
+            .collect()
+    }
+
+    #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
+    fn union_horizon_current_executable_identity() -> (String, u64) {
+        #[cfg(target_os = "linux")]
+        let path = std::path::PathBuf::from("/proc/self/exe");
+        #[cfg(not(target_os = "linux"))]
+        let path =
+            std::env::current_exe().expect("resolve current UNION_HORIZON test executable path");
+        let mut file = std::fs::File::open(&path).unwrap_or_else(|error| {
+            panic!(
+                "open current UNION_HORIZON test executable {}: {error}",
+                path.display(),
+            )
+        });
+        let metadata = file
+            .metadata()
+            .expect("stat current UNION_HORIZON test executable");
+        assert!(
+            metadata.is_file(),
+            "current UNION_HORIZON test executable must be a regular file",
+        );
+        let mut hasher = Sha256::new();
+        let mut byte_len = 0_u64;
+        let mut buffer = [0_u8; 64 * 1024];
+        loop {
+            let read = file
+                .read(&mut buffer)
+                .expect("stream current UNION_HORIZON test executable");
+            if read == 0 {
+                break;
+            }
+            hasher.update(&buffer[..read]);
+            byte_len = byte_len
+                .checked_add(u64::try_from(read).expect("read length fits u64"))
+                .expect("UNION_HORIZON executable length cannot overflow u64");
+        }
+        assert_eq!(
+            byte_len,
+            metadata.len(),
+            "UNION_HORIZON executable changed while its identity was captured",
+        );
+        (lower_hex(&hasher.finalize()), byte_len)
+    }
+
+    #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
+    fn assert_union_horizon_executable_still_matches(identity: &UnionHorizonBuildIdentity) {
+        let (sha256, byte_len) = union_horizon_current_executable_identity();
+        assert_eq!(
+            (sha256, byte_len),
+            (
+                identity.test_executable_sha256.clone(),
+                identity.test_executable_byte_len,
+            ),
+            "the executing UNION_HORIZON binary changed after its build identity was sealed",
+        );
+    }
+
+    #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
+    fn union_horizon_identity_is_publishable(identity: &UnionHorizonBuildIdentity) -> bool {
+        cfg!(target_os = "linux")
+            && !identity.source_git_dirty
+            && matches!(
+                identity.source_verification,
+                UnionHorizonSourceVerification::GitCheckoutVerified
+            )
+    }
+
+    #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
+    fn union_horizon_validated_build_identity() -> UnionHorizonBuildIdentity {
+        const REVISION_ENV: &str = "GAUNTLET_SUBJECT_REVISION";
+        const DIRTY_ENV: &str = "GAUNTLET_SUBJECT_DIRTY";
+        reject_legacy_oracle_provenance_overrides(
+            std::env::var_os("GAUNTLET_ORACLE_REVISION").as_deref(),
+            std::env::var_os("GAUNTLET_ORACLE_DIRTY").as_deref(),
+        )
+        .unwrap_or_else(|error| panic!("invalid UNION_HORIZON legacy identity input: {error}"));
+        let embedded = union_horizon_build_identity();
+        let revision = match std::env::var(REVISION_ENV) {
+            Ok(value) => Some(value),
+            Err(std::env::VarError::NotPresent) => None,
+            Err(std::env::VarError::NotUnicode(_)) => {
+                panic!("{REVISION_ENV} must be valid Unicode")
+            }
+        };
+        let dirty = match std::env::var(DIRTY_ENV) {
+            Ok(value) => Some(value),
+            Err(std::env::VarError::NotPresent) => None,
+            Err(std::env::VarError::NotUnicode(_)) => {
+                panic!("{DIRTY_ENV} must be valid Unicode")
+            }
+        };
+        validate_union_horizon_runtime_identity_override(
+            &embedded,
+            revision.as_deref(),
+            dirty.as_deref(),
+        )
+        .unwrap_or_else(|reason| panic!("invalid UNION_HORIZON runtime identity: {reason}"));
+        embedded
+    }
+
+    #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
+    fn validate_union_horizon_runtime_identity_override(
+        embedded: &UnionHorizonBuildIdentity,
+        revision: Option<&str>,
+        dirty: Option<&str>,
+    ) -> Result<(), String> {
+        match (revision, dirty) {
+            (None, None) => Ok(()),
+            (Some(revision), Some(dirty)) => {
+                let dirty = match dirty {
+                    "true" => true,
+                    "false" => false,
+                    _ => {
+                        return Err(
+                            "GAUNTLET_SUBJECT_DIRTY must be exactly true or false".to_owned()
+                        );
+                    }
+                };
+                if revision != embedded.source_git_revision {
+                    return Err(
+                        "runtime revision does not equal the compiled producer revision".to_owned(),
+                    );
+                }
+                if dirty != embedded.source_git_dirty {
+                    return Err(
+                        "runtime dirty state does not equal the compiled producer dirty state"
+                            .to_owned(),
+                    );
+                }
+                Ok(())
+            }
+            _ => Err(
+                "GAUNTLET_SUBJECT_REVISION and GAUNTLET_SUBJECT_DIRTY must be supplied together"
+                    .to_owned(),
+            ),
+        }
+    }
+
+    #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
+    fn union_horizon_oracle_dependency_identity() -> UnionHorizonOracleDependencyIdentity {
+        let contract = oracle_version_contract().expect("UNION_HORIZON oracle version contract");
+        UnionHorizonOracleDependencyIdentity {
+            tantivy_version: contract.tantivy_version,
+            tantivy_checksum_sha256: contract.tantivy_checksum_sha256,
+            lexical_package: contract.lexical_package,
+            lexical_package_version: contract.lexical_package_version,
+            pinned_lexical_contract_revision: contract.lexical_git_revision,
+        }
+    }
+
+    #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
+    fn union_horizon_observed_envelope(observation: &EngineObservation) -> BTreeMap<String, u32> {
+        let mut envelope = BTreeMap::new();
+        for hit in observation.hits.iter().chain(&observation.cutoff_tie_group) {
+            if let Some(prior_bits) = envelope.insert(hit.doc_id.clone(), hit.score_bits) {
+                assert_eq!(
+                    prior_bits, hit.score_bits,
+                    "UNION_HORIZON observation changed score bits across ranked and tie evidence",
+                );
+            }
+        }
+        envelope
+    }
+
+    #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
+    fn assert_union_horizon_late_comparison(
+        run: &HarnessRun,
+        limit: u64,
+        layout: UnionHorizonSegmentLayout,
+        tantivy_segments: &[UnionHorizonTantivySegmentReceipt],
+    ) {
+        assert_eq!(run.comparison.status, ComparisonStatus::Exact);
+        assert_eq!(run.comparison.rank_class, RankClass::RankExact);
+        assert!(run.comparison.divergences.is_empty());
+        assert_eq!(run.comparison.subject.match_count, CountState::NotRequested);
+        assert_eq!(run.comparison.oracle.match_count, CountState::NotRequested);
+        assert_eq!(
+            run.comparison.subject.doc_count,
+            u64::try_from(UNION_HORIZON_DOCUMENT_COUNT)
+                .expect("UNION_HORIZON document count fits u64"),
+        );
+        assert_eq!(
+            run.comparison.oracle.doc_count,
+            u64::try_from(UNION_HORIZON_DOCUMENT_COUNT)
+                .expect("UNION_HORIZON document count fits u64"),
+        );
+        assert!(run.comparison.subject.snippets.is_empty());
+        assert!(run.comparison.oracle.snippets.is_empty());
+
+        let subject_rows = run
+            .comparison
+            .subject
+            .hits
+            .iter()
+            .map(|hit| (hit.doc_id.as_str(), hit.score_bits))
+            .collect::<Vec<_>>();
+        let oracle_rows = run
+            .comparison
+            .oracle
+            .hits
+            .iter()
+            .map(|hit| (hit.doc_id.as_str(), hit.score_bits))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            subject_rows.len(),
+            usize::try_from(limit).expect("UNION_HORIZON limit fits usize"),
+        );
+        assert_eq!(subject_rows, oracle_rows);
+        assert_eq!(
+            subject_rows.first().map(|(document_id, _)| *document_id),
+            Some("repo:docs/09000.txt"),
+            "UNION_HORIZON late winner must rank first",
+        );
+        assert!(
+            subject_rows.windows(2).all(|rows| {
+                matches!(
+                    f32::from_bits(rows[0].1).total_cmp(&f32::from_bits(rows[1].1)),
+                    std::cmp::Ordering::Greater
+                )
+            }),
+            "UNION_HORIZON limit={limit} ranked prefix must have strictly descending unique scores",
+        );
+        if limit == 100 {
+            assert_eq!(subject_rows.len(), 100);
+            assert_eq!(subject_rows[0].0, "repo:docs/09000.txt");
+            for (rank, ordinal) in (0..=98).rev().enumerate() {
+                assert_eq!(
+                    subject_rows[rank + 1].0,
+                    format!("repo:docs/{ordinal:05}.txt"),
+                    "UNION_HORIZON ranked-anchor identity drifted at rank {}",
+                    rank + 1,
+                );
+            }
+        }
+
+        let subject_ties = run
+            .comparison
+            .subject
+            .cutoff_tie_group
+            .iter()
+            .map(|hit| (hit.doc_id.as_str(), hit.score_bits))
+            .collect::<Vec<_>>();
+        let oracle_ties = run
+            .comparison
+            .oracle
+            .cutoff_tie_group
+            .iter()
+            .map(|hit| (hit.doc_id.as_str(), hit.score_bits))
+            .collect::<Vec<_>>();
+        assert_eq!(subject_ties, oracle_ties);
+        assert!(
+            run.comparison.subject.cutoff_tie_complete && run.comparison.oracle.cutoff_tie_complete,
+            "UNION_HORIZON limit={limit} requires complete cutoff-tie evidence",
+        );
+        assert_union_horizon_native_addresses(run, layout, tantivy_segments);
+    }
+
+    #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
+    fn assert_union_horizon_tie_comparison(
+        run: &HarnessRun,
+        limit: u64,
+        layout: UnionHorizonSegmentLayout,
+        tantivy_segments: &[UnionHorizonTantivySegmentReceipt],
+    ) {
+        let expected_tie_count = match limit {
+            1 => 2,
+            _ => 3,
+        };
+        assert_eq!(run.comparison.subject.match_count, CountState::NotRequested,);
+        assert_eq!(run.comparison.oracle.match_count, CountState::NotRequested,);
+        assert_eq!(
+            run.comparison.subject.doc_count,
+            u64::try_from(UNION_HORIZON_DOCUMENT_COUNT)
+                .expect("UNION_HORIZON document count fits u64"),
+        );
+        assert_eq!(
+            run.comparison.oracle.doc_count,
+            u64::try_from(UNION_HORIZON_DOCUMENT_COUNT)
+                .expect("UNION_HORIZON document count fits u64"),
+        );
+        assert!(run.comparison.subject.snippets.is_empty());
+        assert!(run.comparison.oracle.snippets.is_empty());
+        assert_eq!(
+            run.comparison.subject.hits.len(),
+            usize::try_from(limit).expect("UNION_HORIZON limit fits usize"),
+        );
+        assert_eq!(
+            run.comparison.oracle.hits.len(),
+            usize::try_from(limit).expect("UNION_HORIZON limit fits usize"),
+        );
+        if matches!(layout, UnionHorizonSegmentLayout::Single) {
+            assert_eq!(run.comparison.status, ComparisonStatus::Exact);
+            assert_eq!(run.comparison.rank_class, RankClass::RankExact);
+            assert!(run.comparison.divergences.is_empty());
+            let subject_rows = run
+                .comparison
+                .subject
+                .hits
+                .iter()
+                .map(|hit| (hit.doc_id.as_str(), hit.score_bits))
+                .collect::<Vec<_>>();
+            let oracle_rows = run
+                .comparison
+                .oracle
+                .hits
+                .iter()
+                .map(|hit| (hit.doc_id.as_str(), hit.score_bits))
+                .collect::<Vec<_>>();
+            assert_eq!(subject_rows, oracle_rows);
+        } else {
+            assert_eq!(run.comparison.status, ComparisonStatus::Classified);
+            assert_eq!(run.comparison.rank_class, RankClass::TieOrder);
+            assert!(
+                !run.comparison.divergences.is_empty()
+                    && run.comparison.divergences.iter().all(|divergence| {
+                        matches!(divergence.class, DivergenceClass::TieOrder)
+                    }),
+                "UNION_HORIZON two-segment tie proof admitted a non-TieOrder divergence: {:#?}",
+                run.comparison,
+            );
+        }
+
+        assert!(
+            run.comparison.subject.cutoff_tie_complete && run.comparison.oracle.cutoff_tie_complete,
+            "UNION_HORIZON tie matrix requires a lower-score completion sentinel",
+        );
+        assert_eq!(
+            run.comparison.subject.cutoff_tie_group.len(),
+            expected_tie_count,
+        );
+        assert_eq!(
+            run.comparison.oracle.cutoff_tie_group.len(),
+            expected_tie_count,
+        );
+        let subject_ties = run
+            .comparison
+            .subject
+            .cutoff_tie_group
+            .iter()
+            .map(|hit| (hit.doc_id.as_str(), hit.score_bits))
+            .collect::<BTreeMap<_, _>>();
+        let oracle_ties = run
+            .comparison
+            .oracle
+            .cutoff_tie_group
+            .iter()
+            .map(|hit| (hit.doc_id.as_str(), hit.score_bits))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(subject_ties, oracle_ties);
+        assert_eq!(
+            subject_ties
+                .values()
+                .copied()
+                .collect::<BTreeSet<_>>()
+                .len(),
+            1,
+            "UNION_HORIZON cutoff group must be an exact-score tie",
+        );
+        let tie_ordinals = subject_ties
+            .keys()
+            .map(|document_id| union_horizon_document_ordinal(document_id))
+            .collect::<Vec<_>>();
+        assert!(
+            [1, 20, 100].contains(&limit),
+            "UNION_HORIZON tie matrix has an unsupported limit {limit}",
+        );
+        let expected_tie_ordinals = match limit {
+            1 => vec![0, 9_000],
+            20 => vec![18, 8_500, 8_501],
+            100 => vec![96, 8_502, 8_503],
+            _ => Vec::new(),
+        };
+        assert_eq!(
+            tie_ordinals, expected_tie_ordinals,
+            "UNION_HORIZON cutoff tie membership drifted",
+        );
+        assert!(
+            tie_ordinals.iter().any(|ordinal| *ordinal < 4_096)
+                && tie_ordinals.iter().any(|ordinal| *ordinal > 4_095),
+            "UNION_HORIZON tie group must cross the refill boundary",
+        );
+        if !matches!(layout, UnionHorizonSegmentLayout::Single) {
+            assert!(
+                tie_ordinals
+                    .iter()
+                    .map(|ordinal| layout.range_for_ordinal(*ordinal).start)
+                    .collect::<BTreeSet<_>>()
+                    .len()
+                    > 1,
+                "UNION_HORIZON tie group must cross the explicit segment split",
+            );
+        }
+        assert_union_horizon_native_addresses(run, layout, tantivy_segments);
+        assert_eq!(
+            union_horizon_observed_envelope(&run.comparison.subject),
+            union_horizon_observed_envelope(&run.comparison.oracle),
+            "UNION_HORIZON ranked plus expanded tie envelope diverged",
+        );
+        let observed_envelope = union_horizon_observed_envelope(&run.comparison.subject);
+        let mut score_cardinality = BTreeMap::<u32, usize>::new();
+        for score_bits in observed_envelope.values() {
+            *score_cardinality.entry(*score_bits).or_default() += 1;
+        }
+        let subject_cutoff_bits = run
+            .comparison
+            .subject
+            .hits
+            .last()
+            .expect("UNION_HORIZON subject cutoff hit")
+            .score_bits;
+        let oracle_cutoff_bits = run
+            .comparison
+            .oracle
+            .hits
+            .last()
+            .expect("UNION_HORIZON oracle cutoff hit")
+            .score_bits;
+        assert_eq!(subject_cutoff_bits, oracle_cutoff_bits);
+        let subject_singleton_strata = run
+            .comparison
+            .subject
+            .hits
+            .iter()
+            .filter(|hit| {
+                score_cardinality
+                    .get(&hit.score_bits)
+                    .is_some_and(|count| matches!(count, &1))
+            })
+            .map(|hit| (&hit.doc_id, hit.score_bits))
+            .collect::<Vec<_>>();
+        let oracle_singleton_strata = run
+            .comparison
+            .oracle
+            .hits
+            .iter()
+            .filter(|hit| {
+                score_cardinality
+                    .get(&hit.score_bits)
+                    .is_some_and(|count| matches!(count, &1))
+            })
+            .map(|hit| (&hit.doc_id, hit.score_bits))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            subject_singleton_strata, oracle_singleton_strata,
+            "UNION_HORIZON every singleton score stratum must remain RankExact",
+        );
+    }
+
+    #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
+    fn assert_union_horizon_native_addresses(
+        run: &HarnessRun,
+        layout: UnionHorizonSegmentLayout,
+        tantivy_segments: &[UnionHorizonTantivySegmentReceipt],
+    ) {
+        for hit in run
+            .comparison
+            .subject
+            .hits
+            .iter()
+            .chain(&run.comparison.subject.cutoff_tie_group)
+        {
+            let ordinal = union_horizon_document_ordinal(&hit.doc_id);
+            let NativeTieKey::QuillDocId { doc_id } = &hit.native_tie_key else {
+                assert!(
+                    matches!(&hit.native_tie_key, NativeTieKey::QuillDocId { .. }),
+                    "UNION_HORIZON subject must preserve its native global document ID",
+                );
+                continue;
+            };
+            assert_eq!(
+                usize::try_from(*doc_id).expect("Quill global document ID fits usize"),
+                ordinal,
+                "UNION_HORIZON Quill global document ID must equal the external ordinal",
+            );
+        }
+
+        for hit in run
+            .comparison
+            .oracle
+            .hits
+            .iter()
+            .chain(&run.comparison.oracle.cutoff_tie_group)
+        {
+            let ordinal = union_horizon_document_ordinal(&hit.doc_id);
+            let expected_range = layout.range_for_ordinal(ordinal);
+            let NativeTieKey::TantivyDocAddress {
+                segment_ord,
+                doc_id,
+            } = &hit.native_tie_key
+            else {
+                assert!(
+                    matches!(&hit.native_tie_key, NativeTieKey::TantivyDocAddress { .. }),
+                    "UNION_HORIZON oracle must preserve native Tantivy DocAddress",
+                );
+                continue;
+            };
+            let matching_segments = tantivy_segments
+                .iter()
+                .filter(|segment| {
+                    usize::try_from(segment.num_docs)
+                        .is_ok_and(|count| count == expected_range.len())
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                matching_segments.len(),
+                1,
+                "UNION_HORIZON explicit ingest range must resolve to exactly one Tantivy segment",
+            );
+            let expected_segment = matching_segments[0];
+            assert_eq!(
+                expected_segment.max_doc, expected_segment.num_docs,
+                "UNION_HORIZON oracle topology must contain no deletes",
+            );
+            assert_eq!(
+                usize::try_from(expected_segment.num_docs)
+                    .expect("segment document count fits usize"),
+                expected_range.len(),
+                "UNION_HORIZON hit resolved through a segment with the wrong cardinality",
+            );
+            assert_eq!(
+                segment_ord, &expected_segment.segment_ord,
+                "UNION_HORIZON Tantivy native segment ordinal must match the explicit ingest range",
+            );
+            assert_eq!(
+                usize::try_from(*doc_id).expect("Tantivy local document ID fits usize"),
+                ordinal - expected_range.start,
+                "UNION_HORIZON Tantivy local document ID must match the explicit ingest range",
+            );
+        }
+    }
+
+    #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
     async fn run_union_horizon_proof(
         cx: &Cx,
         fixture: &Fixture,
-        segment_split: Option<usize>,
+        layout: UnionHorizonSegmentLayout,
+        proof_kind: UnionHorizonProofKind,
     ) -> UnionHorizonProof {
-        let lexical_revision = oracle_version_contract()
-            .expect("oracle version contract")
-            .lexical_git_revision;
-        let config = frankensearch_quill::QuillConfig {
-            deterministic_ingest: true,
-            ..frankensearch_quill::QuillConfig::default()
-        };
+        let build_identity = union_horizon_validated_build_identity();
+        let oracle_dependency = union_horizon_oracle_dependency_identity();
+        let config = union_horizon_quill_config();
         let mut subject = crate::engine::QuillSubject::in_memory(
             config,
-            "union-horizon-deterministic-regression-not-live-provenance",
-            false,
+            build_identity.source_git_revision.clone(),
+            build_identity.source_git_dirty,
         )
         .expect("fresh UNION_HORIZON Quill subject");
-        let mut oracle =
-            crate::engine::TantivyOracle::in_memory_scalar_g1a(&lexical_revision, false)
-                .expect("fresh UNION_HORIZON Tantivy oracle");
+        assert_eq!(
+            subject.config().tier_fanout,
+            9,
+            "UNION_HORIZON eight-leaf fixture must not trigger the default eight-way merge",
+        );
+        let mut oracle = crate::engine::TantivyOracle::in_memory_scalar_g1a(
+            &build_identity.source_git_revision,
+            build_identity.source_git_dirty,
+        )
+        .expect("fresh UNION_HORIZON current-build Tantivy oracle");
+        oracle
+            .index()
+            .oracle_disable_auto_merge(cx)
+            .await
+            .expect("disable UNION_HORIZON Tantivy auto-merge");
         subject
             .claim_fresh_campaign()
             .expect("claim UNION_HORIZON Quill subject");
@@ -7616,13 +9416,9 @@ mod tests {
             .claim_fresh_campaign()
             .expect("claim UNION_HORIZON Tantivy oracle");
 
-        let split = segment_split.unwrap_or(fixture.documents.len());
-        let ranges = [0..split, split..fixture.documents.len()];
-        for range in ranges {
-            if range.is_empty() {
-                continue;
-            }
-            let documents = fixture.documents[range]
+        let ranges = layout.ranges();
+        for range in &ranges {
+            let documents = fixture.documents[range.clone()]
                 .iter()
                 .cloned()
                 .map(frankensearch_core::IndexableDocument::from)
@@ -7657,21 +9453,10 @@ mod tests {
             .mark_committed()
             .expect("commit UNION_HORIZON Tantivy campaign");
 
-        let expected_segment_doc_counts = segment_split.map_or_else(
-            || {
-                vec![
-                    u32::try_from(UNION_HORIZON_DOCUMENT_COUNT)
-                        .expect("UNION_HORIZON document count fits u32"),
-                ]
-            },
-            |split| {
-                vec![
-                    u32::try_from(split).expect("UNION_HORIZON segment split fits u32"),
-                    u32::try_from(UNION_HORIZON_DOCUMENT_COUNT - split)
-                        .expect("UNION_HORIZON tail segment count fits u32"),
-                ]
-            },
-        );
+        let expected_segment_doc_counts = ranges
+            .iter()
+            .map(|range| u32::try_from(range.len()).expect("UNION_HORIZON segment length fits u32"))
+            .collect::<Vec<_>>();
         let snapshot = subject
             .index()
             .expect("UNION_HORIZON Quill index")
@@ -7685,9 +9470,49 @@ mod tests {
             actual_segment_doc_counts, expected_segment_doc_counts,
             "UNION_HORIZON Quill segment shape drifted",
         );
-        if let Some(split) = segment_split {
-            assert_eq!(9_000_usize - split, 8_743);
-            assert!(9_000_usize - split >= 2 * 4_096);
+        let tantivy_segments = oracle
+            .index()
+            .oracle_segment_layout()
+            .expect("UNION_HORIZON Tantivy segment layout")
+            .into_iter()
+            .map(|segment| UnionHorizonTantivySegmentReceipt {
+                segment_ord: segment.segment_ord,
+                max_doc: segment.max_doc,
+                num_docs: segment.num_docs,
+            })
+            .collect::<Vec<_>>();
+        let mut expected_tantivy_doc_counts = expected_segment_doc_counts.clone();
+        expected_tantivy_doc_counts.sort_unstable_by(|left, right| right.cmp(left));
+        let actual_tantivy_doc_counts = tantivy_segments
+            .iter()
+            .map(|segment| {
+                assert_eq!(
+                    segment.max_doc, segment.num_docs,
+                    "UNION_HORIZON oracle topology must contain no deletes",
+                );
+                segment.num_docs
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            actual_tantivy_doc_counts, expected_tantivy_doc_counts,
+            "UNION_HORIZON Tantivy native searchable-segment order drifted",
+        );
+        assert!(
+            tantivy_segments
+                .iter()
+                .enumerate()
+                .all(|(ordinal, segment)| {
+                    u32::try_from(ordinal).is_ok_and(|observed| observed == segment.segment_ord)
+                }),
+            "UNION_HORIZON Tantivy segment ordinals must be dense and ordered",
+        );
+        let topology = UnionHorizonTopologyReceipt {
+            quill_segment_doc_counts: actual_segment_doc_counts,
+            tantivy_segments: tantivy_segments.clone(),
+        };
+        if !matches!(layout, UnionHorizonSegmentLayout::Single) {
+            assert_eq!(9_000_usize - layout.target_segment_start(), 8_743);
+            assert!(9_000_usize - layout.target_segment_start() >= 2 * 4_096);
         }
 
         let target_id = fixture
@@ -7707,7 +9532,10 @@ mod tests {
                 query: query.query.clone(),
                 limit: query.limit,
                 offset: query.offset,
-                tie_expansion_limit: UNION_HORIZON_TIE_EXPANSION,
+                tie_expansion_limit: match proof_kind {
+                    UnionHorizonProofKind::LateWinner => UNION_HORIZON_LATE_TIE_EXPANSION,
+                    UnionHorizonProofKind::TieMatrix => UNION_HORIZON_MATRIX_TIE_EXPANSION,
+                },
                 count_requested: query.count_requested,
                 snippet_max_chars: None,
                 metadata: DifferentialCaseMetadata {
@@ -7716,145 +9544,653 @@ mod tests {
                     corpus_hash: Some(fixture.corpus_hash.clone()),
                 },
             };
-            let run = harness
+            let mut run = harness
                 .run(cx, &subject, &oracle, &case)
                 .await
                 .unwrap_or_else(|error| {
                     panic!(
-                        "UNION_HORIZON segment_split={segment_split:?} limit={} failed: {error}",
+                        "UNION_HORIZON layout={} limit={} failed: {error}",
+                        layout.label(),
                         query.limit,
                     )
                 });
-            assert_eq!(
-                run.comparison.status,
-                ComparisonStatus::Exact,
-                "UNION_HORIZON limit={} comparison report: {:#?}",
-                query.limit,
-                run.comparison,
-            );
-            assert_eq!(
-                run.comparison.rank_class,
-                RankClass::RankExact,
-                "UNION_HORIZON limit={} comparison report: {:#?}",
-                query.limit,
-                run.comparison,
-            );
-            let subject_rows = run
-                .comparison
-                .subject
-                .hits
-                .iter()
-                .map(|hit| (hit.doc_id.as_str(), hit.score_bits))
-                .collect::<Vec<_>>();
-            let oracle_rows = run
-                .comparison
-                .oracle
-                .hits
-                .iter()
-                .map(|hit| (hit.doc_id.as_str(), hit.score_bits))
-                .collect::<Vec<_>>();
-            assert_eq!(
-                subject_rows, oracle_rows,
-                "UNION_HORIZON limit={} IDs or score bits diverged",
-                query.limit,
-            );
-            assert_eq!(
-                subject_rows.first().map(|(doc_id, _)| *doc_id),
-                Some(target_id),
-                "UNION_HORIZON late winner must rank first",
-            );
-            assert!(
-                subject_rows.windows(2).all(|rows| {
-                    f32::from_bits(rows[0].1).total_cmp(&f32::from_bits(rows[1].1))
-                        == std::cmp::Ordering::Greater
-                }),
-                "UNION_HORIZON limit={} ranked prefix must have strictly descending unique scores",
-                query.limit,
-            );
-            if query.limit == 100 {
-                assert_eq!(
-                    subject_rows.len(),
-                    100,
-                    "UNION_HORIZON top-100 proof must return the complete ranked prefix",
-                );
-                assert_eq!(subject_rows[0].0, "repo:docs/09000.txt");
-                for (rank, ordinal) in (0..=98).rev().enumerate() {
-                    assert_eq!(
-                        subject_rows[rank + 1].0,
-                        format!("repo:docs/{ordinal:05}.txt"),
-                        "UNION_HORIZON ranked-anchor identity drifted at rank {}",
-                        rank + 1,
+            run.engines
+                .bind_semantic_contract(SemanticContract::scalar_g1a())
+                .expect("bind UNION_HORIZON scalar G1a contract");
+            match proof_kind {
+                UnionHorizonProofKind::LateWinner => {
+                    assert_union_horizon_late_comparison(
+                        &run,
+                        query.limit,
+                        layout,
+                        &tantivy_segments,
+                    );
+                }
+                UnionHorizonProofKind::TieMatrix => {
+                    assert_union_horizon_tie_comparison(
+                        &run,
+                        query.limit,
+                        layout,
+                        &tantivy_segments,
                     );
                 }
             }
-            let subject_ties = run
-                .comparison
-                .subject
-                .cutoff_tie_group
-                .iter()
-                .map(|hit| (hit.doc_id.as_str(), hit.score_bits))
-                .collect::<Vec<_>>();
-            let oracle_ties = run
-                .comparison
-                .oracle
-                .cutoff_tie_group
-                .iter()
-                .map(|hit| (hit.doc_id.as_str(), hit.score_bits))
-                .collect::<Vec<_>>();
-            assert_eq!(
-                subject_ties, oracle_ties,
-                "UNION_HORIZON limit={} cutoff tie evidence diverged",
-                query.limit,
-            );
-            assert!(
-                run.comparison.subject.cutoff_tie_complete
-                    && run.comparison.oracle.cutoff_tie_complete,
-                "UNION_HORIZON limit={} requires complete cutoff-tie evidence",
-                query.limit,
-            );
             comparisons.push(run);
         }
 
-        let trace_buffer = Arc::new(Mutex::new(Vec::<u8>::new()));
-        let writer_buffer = Arc::clone(&trace_buffer);
-        let subscriber = tracing_subscriber::fmt()
-            .with_ansi(false)
-            .with_env_filter("off,frankensearch.quill=info")
-            .with_span_events(tracing_subscriber::fmt::format::FmtSpan::CLOSE)
-            .with_writer(move || TraceLogWriter {
-                buffer: Arc::clone(&writer_buffer),
-            })
-            .finish();
-        let traced = tracing::subscriber::with_default(subscriber, || {
-            subject
-                .index()
-                .expect("UNION_HORIZON Quill index")
-                .search_paginated(cx, UNION_HORIZON_QUERY, 1, 0, false)
-        })
-        .expect("trace UNION_HORIZON Quill search");
-        assert_eq!(traced.hits.len(), 1);
-        assert_eq!(traced.hits[0].document_id, target_id);
-        assert_eq!(traced.hits[0].global_docid, 9_000);
-        let logs = String::from_utf8(
-            trace_buffer
-                .lock()
-                .expect("UNION_HORIZON trace buffer lock")
-                .clone(),
-        )
-        .expect("UNION_HORIZON trace is UTF-8");
-        let segment_doc_count = segment_split.map_or_else(
-            || {
-                u64::try_from(UNION_HORIZON_DOCUMENT_COUNT)
-                    .expect("UNION_HORIZON document count fits u64")
-            },
-            |split| {
-                u64::try_from(UNION_HORIZON_DOCUMENT_COUNT - split)
-                    .expect("UNION_HORIZON tail segment count fits u64")
-            },
-        );
-        let trace = union_horizon_trace_receipt(&logs, segment_doc_count);
+        let segment_doc_start = u32::try_from(layout.target_segment_start())
+            .expect("UNION_HORIZON segment start fits u32");
+        let segment_doc_count =
+            u64::try_from(UNION_HORIZON_DOCUMENT_COUNT - layout.target_segment_start())
+                .expect("UNION_HORIZON target segment count fits u64");
+        let mut traced_results = Vec::new();
+        let mut target_traces = Vec::new();
+        let mut complete_pruning_traces = Vec::new();
+        for (query_ordinal, query) in fixture.query_suite.cases.iter().enumerate() {
+            let index = subject.index().expect("UNION_HORIZON Quill index");
+            let (traced, trace_receipt) = index
+                .search_paginated_with_conformance_pruning_trace(
+                    cx,
+                    UNION_HORIZON_QUERY,
+                    usize::try_from(query.limit).expect("UNION_HORIZON limit fits usize"),
+                    0,
+                    false,
+                )
+                .expect("trace UNION_HORIZON Quill search");
+            let traced_result = union_horizon_traced_result_receipt(query.limit, &traced);
+            assert_union_horizon_traced_result(
+                &comparisons[query_ordinal],
+                query.limit,
+                &traced_result,
+            );
+            assert_union_horizon_complete_trace_semantics(layout, &trace_receipt);
+            assert_eq!(
+                trace_receipt.execution_mode(),
+                layout.expected_execution_mode(),
+                "UNION_HORIZON layout={} used the wrong shipping collection branch",
+                layout.label(),
+            );
+            assert_eq!(
+                trace_receipt
+                    .segments()
+                    .iter()
+                    .map(|receipt| {
+                        u32::try_from(receipt.segment_doc_count())
+                            .expect("UNION_HORIZON receipt doc count fits u32")
+                    })
+                    .collect::<Vec<_>>(),
+                topology.quill_segment_doc_counts,
+                "UNION_HORIZON complete pruning receipt must match the full Quill topology",
+            );
+            assert_eq!(
+                traced.hits.len(),
+                usize::try_from(query.limit).expect("UNION_HORIZON limit fits usize"),
+            );
+            assert_eq!(
+                traced.total_count, None,
+                "UNION_HORIZON typed path proof must remain count-free",
+            );
+            if matches!(proof_kind, UnionHorizonProofKind::LateWinner) {
+                assert_eq!(traced.hits[0].document_id, target_id);
+                assert_eq!(traced.hits[0].global_docid, 9_000);
+            }
+            traced_results.push(traced_result);
+            target_traces.push(match proof_kind {
+                UnionHorizonProofKind::LateWinner => union_horizon_late_trace_receipt(
+                    query.limit,
+                    segment_doc_start,
+                    segment_doc_count,
+                    trace_receipt.segments(),
+                ),
+                UnionHorizonProofKind::TieMatrix => union_horizon_tie_trace_receipt(
+                    query.limit,
+                    segment_doc_start,
+                    segment_doc_count,
+                    trace_receipt.segments(),
+                ),
+            });
+            complete_pruning_traces.push(trace_receipt);
+        }
 
-        UnionHorizonProof { comparisons, trace }
+        UnionHorizonProof {
+            layout,
+            build_identity,
+            oracle_dependency,
+            comparisons,
+            traced_results,
+            target_traces,
+            complete_pruning_traces,
+            topology,
+        }
+    }
+
+    #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
+    fn union_horizon_artifact_run_id() -> String {
+        const ARTIFACT_ROOT_ENV: &str = "GAUNTLET_UNION_HORIZON_ARTIFACT_ROOT";
+        const RUN_ID_ENV: &str = "GAUNTLET_UNION_HORIZON_RUN_ID";
+        let artifact_root = std::env::var_os(ARTIFACT_ROOT_ENV);
+        let run_id = std::env::var(RUN_ID_ENV);
+        match (artifact_root, run_id) {
+            (Some(_), Ok(run_id)) => run_id,
+            (None, Err(std::env::VarError::NotPresent)) => {
+                let identity = union_horizon_build_identity();
+                format!(
+                    "local-{}",
+                    identity
+                        .source_git_revision
+                        .get(..12)
+                        .expect("validated UNION_HORIZON revision has 12 characters"),
+                )
+            }
+            (Some(_), Err(error)) => {
+                panic!(
+                    "{RUN_ID_ENV} must be valid Unicode when {ARTIFACT_ROOT_ENV} is configured: {error}",
+                )
+            }
+            (None, Ok(_) | Err(std::env::VarError::NotUnicode(_))) => {
+                panic!("{ARTIFACT_ROOT_ENV} must be configured when {RUN_ID_ENV} is present",)
+            }
+        }
+    }
+
+    #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
+    fn decode_union_horizon_artifact_bytes(
+        bytes: &[u8],
+        expected_raw_file_sha256: &str,
+    ) -> UnionHorizonEvidenceArtifact {
+        assert!(
+            expected_raw_file_sha256.len() == 64
+                && expected_raw_file_sha256
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+            "UNION_HORIZON raw-file identity must be lowercase SHA-256",
+        );
+        assert_eq!(
+            sha256_hex(bytes),
+            expected_raw_file_sha256,
+            "UNION_HORIZON uploaded bytes do not match their publication receipt",
+        );
+        let artifact: UnionHorizonEvidenceArtifact =
+            serde_json::from_slice(bytes).expect("decode published UNION_HORIZON artifact");
+        let canonical_bytes = serde_json::to_vec_pretty(&artifact)
+            .expect("re-encode canonical UNION_HORIZON artifact bytes");
+        assert_eq!(
+            bytes, canonical_bytes,
+            "UNION_HORIZON strict decoder requires the publisher's exact canonical bytes; unknown, duplicate, reordered, or alternate-spelling JSON is inadmissible",
+        );
+        artifact.verify();
+        artifact
+    }
+
+    #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
+    fn assert_union_horizon_artifact_rejected(
+        artifact: &UnionHorizonEvidenceArtifact,
+        mutate: impl FnOnce(&mut UnionHorizonEvidenceArtifact),
+    ) {
+        let mut tampered = artifact.clone();
+        mutate(&mut tampered);
+        assert_ne!(
+            tampered, *artifact,
+            "UNION_HORIZON hostile mutation must change the artifact",
+        );
+        tampered.artifact_sha256 = tampered.preimage_sha256();
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| tampered.verify())).is_err(),
+            "tampered UNION_HORIZON artifact unexpectedly verified",
+        );
+    }
+
+    #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
+    fn persist_union_horizon_artifact(
+        artifact: &UnionHorizonEvidenceArtifact,
+    ) -> Option<PublishedUnionHorizonArtifact> {
+        const ARTIFACT_ROOT_ENV: &str = "GAUNTLET_UNION_HORIZON_ARTIFACT_ROOT";
+        let root = std::env::var_os(ARTIFACT_ROOT_ENV).map(std::path::PathBuf::from)?;
+        assert_union_horizon_executable_still_matches(
+            &artifact
+                .proofs
+                .first()
+                .expect("UNION_HORIZON artifact contains proofs")
+                .build_identity,
+        );
+        assert!(
+            artifact
+                .proofs
+                .first()
+                .is_some_and(|proof| union_horizon_identity_is_publishable(&proof.build_identity)),
+            "persisted UNION_HORIZON evidence requires a clean Git-verified compiled producer build",
+        );
+        assert!(
+            root.is_relative()
+                && root.starts_with("target/coverage")
+                && !root
+                    .components()
+                    .any(|component| component == std::path::Component::ParentDir),
+            "UNION_HORIZON artifacts must use a relative target/coverage path so RCH returns them",
+        );
+        let bytes =
+            serde_json::to_vec_pretty(artifact).expect("serialize sealed UNION_HORIZON artifact");
+        let raw_file_sha256 = sha256_hex(&bytes);
+        let filename = format!(
+            "{}-{}-{}-{}.json",
+            artifact.run_id,
+            artifact.proof_kind.label(),
+            artifact.artifact_sha256,
+            raw_file_sha256,
+        );
+        let target_name = std::ffi::OsString::from(&filename);
+        let temporary_name =
+            std::ffi::OsString::from(format!(".tmp-{}-{filename}", std::process::id()));
+        let target = root.join(&target_name);
+        let directory = crate::artifact::PinnedDirectory::ensure_path(&root)
+            .expect("pin UNION_HORIZON artifact directory without following symlinks");
+        directory
+            .publish_unique_no_clobber(&temporary_name, &target_name, &bytes)
+            .unwrap_or_else(|error| {
+                panic!(
+                    "atomically publish UNION_HORIZON artifact without replacing {}: {error}",
+                    target.display(),
+                )
+            });
+        let published_bytes = directory
+            .read_regular_bounded(
+                &target_name,
+                u64::try_from(bytes.len()).expect("UNION_HORIZON artifact length fits u64"),
+            )
+            .expect("reload published UNION_HORIZON artifact through its pinned directory");
+        let reloaded = decode_union_horizon_artifact_bytes(&published_bytes, &raw_file_sha256);
+        assert_eq!(
+            &reloaded, artifact,
+            "published UNION_HORIZON artifact changed during durable round-trip",
+        );
+        assert_union_horizon_executable_still_matches(
+            &artifact
+                .proofs
+                .first()
+                .expect("UNION_HORIZON artifact contains proofs")
+                .build_identity,
+        );
+        Some(PublishedUnionHorizonArtifact {
+            path: target,
+            raw_file_sha256,
+            byte_len: u64::try_from(published_bytes.len())
+                .expect("UNION_HORIZON artifact byte length fits u64"),
+        })
+    }
+
+    #[cfg(all(
+        feature = "tantivy-oracle",
+        feature = "pruning-conformance",
+        any(
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "tvos",
+            target_os = "watchos"
+        )
+    ))]
+    fn validate_union_horizon_completed_bundle(
+        directory: &crate::artifact::PinnedDirectory,
+        manifest: &UnionHorizonCompletionManifest,
+        completion_name: &std::ffi::OsStr,
+    ) {
+        manifest.verify();
+        assert_union_horizon_executable_still_matches(&manifest.build_identity);
+
+        let canonical_completion_bytes = serde_json::to_vec_pretty(manifest)
+            .expect("serialize canonical UNION_HORIZON completion manifest");
+        let completion_raw_sha256 = sha256_hex(&canonical_completion_bytes);
+        let expected_completion_name = std::ffi::OsString::from(format!(
+            "completion-{}-{}.json",
+            manifest.manifest_sha256, completion_raw_sha256,
+        ));
+        assert_eq!(
+            completion_name, expected_completion_name,
+            "UNION_HORIZON completion filename is not bound to its canonical bytes",
+        );
+
+        let mut expected_names = manifest
+            .artifacts
+            .iter()
+            .map(|entry| std::ffi::OsString::from(&entry.filename))
+            .collect::<std::collections::BTreeSet<_>>();
+        assert!(
+            expected_names.insert(expected_completion_name),
+            "UNION_HORIZON completion filename must be distinct from both proofs",
+        );
+        assert_eq!(
+            directory
+                .entry_names(expected_names.len())
+                .expect("enumerate exact completed UNION_HORIZON bundle"),
+            expected_names,
+            "completed UNION_HORIZON bundle contains a missing, extra, renamed, or substituted entry",
+        );
+
+        let reloaded_completion = directory
+            .read_regular_bounded(
+                completion_name,
+                u64::try_from(canonical_completion_bytes.len())
+                    .expect("completion manifest length fits u64"),
+            )
+            .expect("reread completed manifest through pinned directory");
+        assert_eq!(
+            reloaded_completion, canonical_completion_bytes,
+            "completed UNION_HORIZON manifest changed after sealing",
+        );
+
+        for entry in &manifest.artifacts {
+            let name = std::ffi::OsStr::new(&entry.filename);
+            let bytes = directory
+                .read_regular_bounded(name, entry.byte_len)
+                .expect("reread completed proof through pinned directory");
+            assert_eq!(
+                u64::try_from(bytes.len()).expect("completed proof length fits u64"),
+                entry.byte_len,
+                "completed UNION_HORIZON proof length changed after manifest sealing",
+            );
+            assert_eq!(
+                sha256_hex(&bytes),
+                entry.raw_file_sha256,
+                "completed UNION_HORIZON proof bytes changed after manifest sealing",
+            );
+            let artifact = decode_union_horizon_artifact_bytes(&bytes, &entry.raw_file_sha256);
+            assert_eq!(
+                artifact, entry.artifact,
+                "completed UNION_HORIZON proof does not equal its self-contained manifest copy",
+            );
+        }
+
+        assert_eq!(
+            directory
+                .entry_names(expected_names.len())
+                .expect("re-enumerate exact completed UNION_HORIZON bundle"),
+            expected_names,
+            "completed UNION_HORIZON bundle changed during final verification",
+        );
+        assert_union_horizon_executable_still_matches(&manifest.build_identity);
+    }
+
+    #[cfg(all(
+        feature = "tantivy-oracle",
+        feature = "pruning-conformance",
+        any(
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "tvos",
+            target_os = "watchos"
+        )
+    ))]
+    fn publish_union_horizon_completion_manifest() -> (
+        PublishedUnionHorizonArtifact,
+        UnionHorizonCompletionManifest,
+    ) {
+        const ARTIFACT_ROOT_ENV: &str = "GAUNTLET_UNION_HORIZON_ARTIFACT_ROOT";
+        const MAX_ARTIFACT_BYTES: u64 = 16 * 1024 * 1024;
+
+        let root = std::env::var_os(ARTIFACT_ROOT_ENV)
+            .map(std::path::PathBuf::from)
+            .expect("completion requires an explicit UNION_HORIZON artifact root");
+        let run_id = union_horizon_artifact_run_id();
+        let build_identity = union_horizon_build_identity();
+        assert_union_horizon_executable_still_matches(&build_identity);
+        assert!(
+            root.ends_with(&run_id),
+            "UNION_HORIZON admitted evidence root must be isolated by exact run ID",
+        );
+        let directory = crate::artifact::PinnedDirectory::ensure_path(&root)
+            .expect("pin UNION_HORIZON completion directory");
+        let names = directory
+            .entry_names(3)
+            .expect("enumerate bounded UNION_HORIZON proof bundle");
+        assert_eq!(
+            names.len(),
+            2,
+            "completion requires exactly the late-winner and tie-matrix artifacts",
+        );
+
+        let mut entries = Vec::with_capacity(2);
+        for name in names {
+            let filename = name
+                .to_str()
+                .expect("UNION_HORIZON artifact filenames must be UTF-8")
+                .to_owned();
+            let raw_file_sha256 = filename
+                .strip_suffix(".json")
+                .and_then(|stem| stem.rsplit_once('-').map(|(_, raw)| raw))
+                .expect("UNION_HORIZON artifact filename carries its raw SHA-256")
+                .to_owned();
+            let bytes = directory
+                .read_regular_bounded(&name, MAX_ARTIFACT_BYTES)
+                .expect("read proof artifact through pinned completion directory");
+            let artifact = decode_union_horizon_artifact_bytes(&bytes, &raw_file_sha256);
+            assert_eq!(
+                artifact.run_id, run_id,
+                "completion cannot combine artifacts from different CI invocations",
+            );
+            assert_eq!(
+                filename,
+                format!(
+                    "{}-{}-{}-{}.json",
+                    artifact.run_id,
+                    artifact.proof_kind.label(),
+                    artifact.artifact_sha256,
+                    raw_file_sha256,
+                ),
+                "UNION_HORIZON artifact filename is not bound to its canonical evidence",
+            );
+            let proof_kind = artifact.proof_kind;
+            let semantic_sha256 = artifact.artifact_sha256.clone();
+            entries.push(UnionHorizonCompletionEntry {
+                proof_kind,
+                filename,
+                semantic_sha256,
+                raw_file_sha256,
+                byte_len: u64::try_from(bytes.len())
+                    .expect("UNION_HORIZON proof artifact length fits u64"),
+                artifact,
+            });
+        }
+
+        let manifest = UnionHorizonCompletionManifest::seal(run_id, entries);
+        let bytes = serde_json::to_vec_pretty(&manifest)
+            .expect("serialize sealed UNION_HORIZON completion manifest");
+        let raw_file_sha256 = sha256_hex(&bytes);
+        let filename = format!(
+            "completion-{}-{}.json",
+            manifest.manifest_sha256, raw_file_sha256,
+        );
+        let target_name = std::ffi::OsString::from(&filename);
+        let temporary_name =
+            std::ffi::OsString::from(format!(".tmp-{}-{filename}", std::process::id()));
+        directory
+            .publish_unique_no_clobber(&temporary_name, &target_name, &bytes)
+            .expect("publish no-clobber UNION_HORIZON completion manifest");
+        let reloaded_bytes = directory
+            .read_regular_bounded(
+                &target_name,
+                u64::try_from(bytes.len()).expect("completion manifest length fits u64"),
+            )
+            .expect("reread completion manifest through pinned directory");
+        assert_eq!(sha256_hex(&reloaded_bytes), raw_file_sha256);
+        let reloaded: UnionHorizonCompletionManifest = serde_json::from_slice(&reloaded_bytes)
+            .expect("strictly decode UNION_HORIZON completion manifest");
+        assert_eq!(
+            reloaded_bytes,
+            serde_json::to_vec_pretty(&reloaded)
+                .expect("re-encode canonical UNION_HORIZON completion manifest"),
+            "completion manifest must retain its exact canonical bytes",
+        );
+        reloaded.verify();
+        assert_eq!(reloaded, manifest);
+        assert_union_horizon_executable_still_matches(&manifest.build_identity);
+        validate_union_horizon_completed_bundle(&directory, &manifest, &target_name);
+        eprintln!(
+            "{}",
+            serde_json::json!({
+                "event": "salej_union_horizon_completion",
+                "schema_version": manifest.schema_version,
+                "run_id": manifest.run_id,
+                "manifest_sha256": manifest.manifest_sha256,
+                "raw_file_sha256": raw_file_sha256,
+                "artifact_count": manifest.artifacts.len(),
+                "test_executable_sha256": manifest.build_identity.test_executable_sha256,
+            }),
+        );
+        (
+            PublishedUnionHorizonArtifact {
+                path: root.join(target_name),
+                raw_file_sha256,
+                byte_len: u64::try_from(reloaded_bytes.len())
+                    .expect("completion manifest byte length fits u64"),
+            },
+            manifest,
+        )
+    }
+
+    #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
+    fn log_union_horizon_evidence(
+        artifact: &UnionHorizonEvidenceArtifact,
+        publication: Option<&PublishedUnionHorizonArtifact>,
+    ) {
+        for proof in &artifact.proofs {
+            let execution_mode = match proof.layout.expected_execution_mode() {
+                frankensearch_quill::ConformancePruningExecutionMode::Serial => "serial",
+                frankensearch_quill::ConformancePruningExecutionMode::Rayon => "rayon",
+            };
+            eprintln!(
+                "{}",
+                serde_json::json!({
+                    "event": "salej_union_horizon_layout_proof",
+                    "schema_version": artifact.schema_version,
+                    "run_id": artifact.run_id,
+                    "proof_kind": artifact.proof_kind.label(),
+                    "layout": proof.layout.label(),
+                    "execution_mode": execution_mode,
+                    "query_count": proof.comparisons.len(),
+                    "quill_segment_doc_counts": proof.topology.quill_segment_doc_counts,
+                    "tantivy_segment_doc_counts": proof
+                        .topology
+                        .tantivy_segments
+                        .iter()
+                        .map(|segment| segment.num_docs)
+                        .collect::<Vec<_>>(),
+                    "complete_trace_count": proof.complete_pruning_traces.len(),
+                    "artifact_sha256": artifact.artifact_sha256,
+                }),
+            );
+        }
+        eprintln!(
+            "{}",
+            serde_json::json!({
+                "event": "salej_union_horizon_artifact",
+                "schema_version": artifact.schema_version,
+                "run_id": artifact.run_id,
+                "proof_kind": artifact.proof_kind.label(),
+                "proof_count": artifact.proofs.len(),
+                "artifact_sha256": artifact.artifact_sha256,
+                "raw_file_sha256": publication.map(|receipt| &receipt.raw_file_sha256),
+                "byte_len": publication.map(|receipt| receipt.byte_len),
+                "persisted": publication.is_some(),
+                "path": publication.map(|receipt| receipt.path.display().to_string()),
+            }),
+        );
+    }
+
+    #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
+    fn union_horizon_trace_geometry(
+        trace: &UnionHorizonTraceReceipt,
+    ) -> Vec<(
+        u64,
+        u32,
+        u64,
+        frankensearch_quill::ConformancePruningStrategy,
+        bool,
+        bool,
+    )> {
+        trace
+            .refills
+            .iter()
+            .map(|refill| {
+                (
+                    refill.ordinal(),
+                    refill.window_start(),
+                    refill.horizon_end(),
+                    refill.strategy(),
+                    refill.buffer_empty(),
+                    refill.live_work_remains(),
+                )
+            })
+            .collect()
+    }
+
+    #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
+    async fn run_union_horizon_layout_matrix(
+        cx: &Cx,
+        fixture: &Fixture,
+        proof_kind: UnionHorizonProofKind,
+    ) -> UnionHorizonEvidenceArtifact {
+        let mut proofs = Vec::with_capacity(UnionHorizonSegmentLayout::ALL.len());
+        for layout in UnionHorizonSegmentLayout::ALL {
+            let first = run_union_horizon_proof(cx, fixture, layout, proof_kind).await;
+            let second = run_union_horizon_proof(cx, fixture, layout, proof_kind).await;
+            assert_eq!(
+                first,
+                second,
+                "UNION_HORIZON proof kind={} layout={} changed across fresh rebuilds",
+                proof_kind.label(),
+                layout.label(),
+            );
+            proofs.push(first);
+        }
+
+        let serial = proofs
+            .iter()
+            .find(|proof| matches!(proof.layout, UnionHorizonSegmentLayout::Two))
+            .expect("UNION_HORIZON matrix contains the two-segment serial proof");
+        let rayon = proofs
+            .iter()
+            .find(|proof| matches!(proof.layout, UnionHorizonSegmentLayout::Eight))
+            .expect("UNION_HORIZON matrix contains the eight-segment Rayon proof");
+        assert_eq!(serial.target_traces.len(), rayon.target_traces.len());
+        for (serial_trace, rayon_trace) in serial.target_traces.iter().zip(&rayon.target_traces) {
+            assert_eq!(serial_trace.limit, rayon_trace.limit);
+            assert_eq!(
+                serial_trace.segment_doc_start,
+                rayon_trace.segment_doc_start
+            );
+            assert_eq!(
+                serial_trace.segment_doc_count,
+                rayon_trace.segment_doc_count
+            );
+            assert_eq!(
+                union_horizon_trace_geometry(serial_trace),
+                union_horizon_trace_geometry(rayon_trace),
+                "UNION_HORIZON refill geometry and liveness must be invariant across serial and Rayon execution",
+            );
+            // The serial collector reaches the target tail with a global heap
+            // populated by prefix segments. Rayon intentionally gives each
+            // segment a fresh local heap before merging. Exact cutoff bits and
+            // admitted-candidate counts are therefore branch-local evidence,
+            // not a valid cross-branch equality contract.
+        }
+        assert_eq!(
+            serial.comparisons.len(),
+            rayon.comparisons.len(),
+            "UNION_HORIZON serial and Rayon query matrices must have equal cardinality",
+        );
+        for (serial_run, rayon_run) in serial.comparisons.iter().zip(&rayon.comparisons) {
+            assert_eq!(
+                serial_run.comparison.subject, rayon_run.comparison.subject,
+                "UNION_HORIZON subject observation must be invariant across serial and Rayon execution",
+            );
+        }
+
+        let artifact =
+            UnionHorizonEvidenceArtifact::seal(union_horizon_artifact_run_id(), proof_kind, proofs);
+        let publication = persist_union_horizon_artifact(&artifact);
+        log_union_horizon_evidence(&artifact, publication.as_ref());
+        artifact
     }
 
     #[test]
@@ -8215,6 +10551,25 @@ mod tests {
             assert!(subject.index_calls.load(Ordering::Relaxed) > 0);
             assert!(oracle.index_calls.load(Ordering::Relaxed) > 0);
         });
+    }
+
+    #[test]
+    fn legacy_oracle_provenance_overrides_fail_closed() {
+        use std::ffi::OsStr;
+
+        assert!(reject_legacy_oracle_provenance_overrides(None, None).is_ok());
+        for (revision, dirty) in [
+            (Some(OsStr::new("a")), None),
+            (None, Some(OsStr::new("false"))),
+            (Some(OsStr::new("a")), Some(OsStr::new("false"))),
+        ] {
+            let error = reject_legacy_oracle_provenance_overrides(revision, dirty)
+                .expect_err("legacy split-wrapper provenance must be rejected");
+            assert!(
+                error.to_string().contains("obsolete and forbidden"),
+                "unexpected legacy provenance failure: {error}",
+            );
+        }
     }
 
     #[test]
@@ -8833,12 +11188,12 @@ mod tests {
             let mut wrong_summary = report.clone();
             wrong_summary.query_classes[0].total += 1;
             assert!(wrong_summary.canonical_bytes().is_err());
-            for legacy_version in [3, 4] {
+            for legacy_version in [3, 4, 5] {
                 let mut legacy = report.clone();
                 legacy.schema_version = legacy_version;
                 let error = legacy
                     .validate_contract()
-                    .expect_err("pre-v5 report must require a campaign rerun");
+                    .expect_err("pre-v6 report must require a campaign rerun");
                 assert!(matches!(
                     error,
                     GauntletError::InvalidCampaign { ref reason }
@@ -9154,20 +11509,654 @@ mod tests {
         assert_scalar_g1a_trace_contract(&logs);
     }
 
-    #[cfg(feature = "tantivy-oracle")]
+    #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
     #[test]
-    fn union_horizon_late_winner_matches_tantivy_across_fresh_segment_shapes() {
+    fn salej_runtime_identity_rejects_revision_or_dirty_state_rewrites() {
+        assert!(
+            reject_legacy_oracle_provenance_overrides(
+                Some(std::ffi::OsStr::new(
+                    "062a5e5b2d41653b1c8b07888eda1a765e421f49"
+                )),
+                None,
+            )
+            .is_err(),
+            "Salej must reject obsolete per-oracle provenance inputs before execution",
+        );
+        let compiled = union_horizon_build_identity();
+        #[cfg(target_os = "linux")]
+        let executable_path = std::path::PathBuf::from("/proc/self/exe");
+        #[cfg(not(target_os = "linux"))]
+        let executable_path =
+            std::env::current_exe().expect("resolve independently hashed test executable path");
+        let mut executable = std::fs::File::open(&executable_path)
+            .unwrap_or_else(|error| panic!("open independently hashed test executable: {error}"));
+        let mut independent_hasher = Sha256::new();
+        let mut independent_len = 0_u64;
+        let mut independent_buffer = [0_u8; 17 * 1024 + 3];
+        loop {
+            let read = executable
+                .read(&mut independent_buffer)
+                .expect("independently stream test executable");
+            if read == 0 {
+                break;
+            }
+            independent_hasher.update(&independent_buffer[..read]);
+            independent_len = independent_len
+                .checked_add(u64::try_from(read).expect("independent read length fits u64"))
+                .expect("independent executable length cannot overflow u64");
+        }
+        assert_eq!(
+            compiled.test_executable_sha256,
+            lower_hex(&independent_hasher.finalize()),
+            "streamed executable identity must match an independent chunking strategy",
+        );
+        assert_eq!(compiled.test_executable_byte_len, independent_len);
+
+        let mut embedded = compiled.clone();
+        embedded.source_git_revision = "a".repeat(40);
+        embedded.source_git_dirty = true;
+        embedded.source_verification = UnionHorizonSourceVerification::ExplicitUnverified;
+        assert!(validate_union_horizon_runtime_identity_override(&embedded, None, None).is_ok());
+        assert!(
+            validate_union_horizon_runtime_identity_override(
+                &embedded,
+                Some(&embedded.source_git_revision),
+                Some("true"),
+            )
+            .is_ok()
+        );
+        for (revision, dirty) in [
+            (Some(embedded.source_git_revision.as_str()), None),
+            (None, Some("true")),
+            (
+                Some("cccccccccccccccccccccccccccccccccccccccc"),
+                Some("true"),
+            ),
+            (Some(embedded.source_git_revision.as_str()), Some("false")),
+            (Some(embedded.source_git_revision.as_str()), Some("0")),
+        ] {
+            assert!(
+                validate_union_horizon_runtime_identity_override(&embedded, revision, dirty)
+                    .is_err(),
+                "runtime identity rewrite unexpectedly passed: revision={revision:?} dirty={dirty:?}",
+            );
+        }
+        assert!(
+            !union_horizon_identity_is_publishable(&embedded),
+            "plain explicit identity must remain diagnostic-only",
+        );
+        embedded.source_git_dirty = false;
+        assert!(
+            !union_horizon_identity_is_publishable(&embedded),
+            "runtime clean metadata cannot upgrade an unverified source identity",
+        );
+        embedded.source_verification = UnionHorizonSourceVerification::GitCheckoutVerified;
+        #[cfg(target_os = "linux")]
+        assert!(
+            union_horizon_identity_is_publishable(&embedded),
+            "a clean build-time Git verification is publishable on Linux",
+        );
+        #[cfg(not(target_os = "linux"))]
+        assert!(
+            !union_horizon_identity_is_publishable(&embedded),
+            "non-Linux builds remain diagnostic-only until executable identity is pinned without a path race",
+        );
+    }
+
+    #[cfg(all(
+        feature = "tantivy-oracle",
+        feature = "pruning-conformance",
+        any(
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "tvos",
+            target_os = "watchos"
+        )
+    ))]
+    #[test]
+    fn salej_union_horizon_publication_never_replaces_an_existing_artifact() {
+        let root = tempfile::tempdir()
+            .expect("create UNION_HORIZON no-replace test directory")
+            .keep();
+        let first_temporary = std::ffi::OsStr::new(".tmp-first.json");
+        let second_temporary = std::ffi::OsStr::new(".tmp-second.json");
+        let target_name = std::ffi::OsStr::new("sealed.json");
+        let directory = crate::artifact::PinnedDirectory::ensure_path(&root)
+            .expect("pin no-replace test directory");
+        directory
+            .publish_unique_no_clobber(first_temporary, target_name, b"sealed")
+            .expect("publish initial sealed artifact");
+
+        assert!(
+            directory
+                .publish_unique_no_clobber(second_temporary, target_name, b"candidate")
+                .is_err(),
+            "UNION_HORIZON publication must fail when the destination already exists",
+        );
+        assert_eq!(
+            directory
+                .read_regular_bounded(target_name, 6)
+                .expect("read preserved no-replace target"),
+            b"sealed",
+        );
+        assert_eq!(
+            directory
+                .entry_names(4)
+                .expect("list pinned no-replace directory"),
+            [std::ffi::OsString::from(target_name)]
+                .into_iter()
+                .collect(),
+            "failed no-replace publication must not create a staging entry",
+        );
+    }
+
+    #[cfg(all(
+        feature = "tantivy-oracle",
+        feature = "pruning-conformance",
+        any(target_os = "linux", target_os = "macos")
+    ))]
+    #[test]
+    fn salej_union_horizon_publication_rejects_symlinks_and_survives_root_swap() {
+        use std::os::unix::fs::symlink;
+
+        let parent = tempfile::tempdir().expect("create pinned-directory test parent");
+        let real = parent.path().join("real");
+        let decoy = parent.path().join("decoy");
+        std::fs::create_dir(&real).expect("create real evidence root");
+        std::fs::create_dir(&decoy).expect("create decoy evidence root");
+
+        let ancestor_link = parent.path().join("ancestor-link");
+        symlink(&real, &ancestor_link).expect("create hostile ancestor symlink");
+        assert!(
+            crate::artifact::PinnedDirectory::ensure_path(&ancestor_link.join("child")).is_err(),
+            "artifact roots must reject ancestor symlinks",
+        );
+        let final_target = real.join("final-target");
+        std::fs::create_dir(&final_target).expect("create final symlink target");
+        let final_link = real.join("final-link");
+        symlink(&final_target, &final_link).expect("create hostile final symlink");
+        assert!(
+            crate::artifact::PinnedDirectory::ensure_path(&final_link).is_err(),
+            "artifact roots must reject final-component symlinks",
+        );
+
+        let directory =
+            crate::artifact::PinnedDirectory::ensure_path(&real).expect("pin real evidence root");
+        let moved = parent.path().join("moved-real");
+        std::fs::rename(&real, &moved).expect("move pinned root away from ambient path");
+        std::fs::rename(&decoy, &real).expect("replace ambient root with decoy");
+        let temporary_name = std::ffi::OsStr::new(".tmp-root-swap.json");
+        let target_name = std::ffi::OsStr::new("sealed.json");
+        directory
+            .publish_unique_no_clobber(temporary_name, target_name, b"descriptor-bound")
+            .expect("publish through the retained directory descriptor");
+        assert_eq!(
+            directory
+                .read_regular_bounded(target_name, 16)
+                .expect("reread through retained directory descriptor"),
+            b"descriptor-bound",
+        );
+        assert!(
+            !real.join(target_name).exists(),
+            "ambient replacement root must not receive the sealed artifact",
+        );
+        assert_eq!(
+            std::fs::read(moved.join(target_name)).expect("read descriptor-bound path witness"),
+            b"descriptor-bound",
+        );
+
+        let external = parent.path().join("external.json");
+        std::fs::write(&external, b"hostile").expect("write hostile symlink target");
+        let symlink_name = std::ffi::OsStr::new("symlink.json");
+        symlink(&external, moved.join(symlink_name)).expect("create hostile evidence symlink");
+        assert!(
+            directory.read_regular_bounded(symlink_name, 16).is_err(),
+            "artifact reread must require a regular no-follow file",
+        );
+    }
+
+    #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
+    #[test]
+    fn salej_union_horizon_late_winner_matches_tantivy_across_fresh_segment_shapes() {
         let fixture = make_union_horizon_fixture();
         asupersync::test_utils::run_test_with_cx(|cx| async move {
-            for segment_split in [None, Some(UNION_HORIZON_TWO_SEGMENT_SPLIT)] {
-                let first = run_union_horizon_proof(&cx, &fixture, segment_split).await;
-                let second = run_union_horizon_proof(&cx, &fixture, segment_split).await;
-                assert_eq!(
-                    first, second,
-                    "UNION_HORIZON segment_split={segment_split:?} changed across fresh rebuilds",
+            let artifact =
+                run_union_horizon_layout_matrix(&cx, &fixture, UnionHorizonProofKind::LateWinner)
+                    .await;
+            artifact.verify();
+
+            let mut stale_seal = artifact.clone();
+            stale_seal.artifact_sha256 = "0".repeat(64);
+            assert!(
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| stale_seal.verify()))
+                    .is_err(),
+                "UNION_HORIZON stale semantic seal must fail on an otherwise valid artifact",
+            );
+
+            assert_union_horizon_artifact_rejected(&artifact, |tampered| {
+                tampered.proofs[0].comparisons[0].engines.semantic_contract = None;
+            });
+            assert_union_horizon_artifact_rejected(&artifact, |tampered| {
+                tampered.proofs[0].comparisons[0]
+                    .engines
+                    .subject
+                    .crate_version = "0.0.0".to_owned();
+            });
+            assert_union_horizon_artifact_rejected(&artifact, |tampered| {
+                tampered.proofs[0].comparisons[0]
+                    .engines
+                    .subject
+                    .config_hash = "alternate-fanout".to_owned();
+            });
+            assert_union_horizon_artifact_rejected(&artifact, |tampered| {
+                tampered.proofs[0].build_identity.test_executable_sha256 = "0".repeat(64);
+            });
+            assert_union_horizon_artifact_rejected(&artifact, |tampered| {
+                tampered.proofs[0].build_identity.test_executable_byte_len += 1;
+            });
+            assert_union_horizon_artifact_rejected(&artifact, |tampered| {
+                tampered.proofs[0]
+                    .build_identity
+                    .rustc_version_verbose
+                    .push_str("hostile compiler rewrite");
+            });
+            assert_union_horizon_artifact_rejected(&artifact, |tampered| {
+                tampered.proofs[0].build_identity.target_triple = "unknown-target".to_owned();
+            });
+            assert_union_horizon_artifact_rejected(&artifact, |tampered| {
+                tampered.proofs[0].build_identity.cargo_profile = "hostile".to_owned();
+            });
+            assert_union_horizon_artifact_rejected(&artifact, |tampered| {
+                let identity = &mut tampered.proofs[0].build_identity;
+                identity.enabled_features.push("hostile_feature".to_owned());
+                identity.enabled_features.sort();
+                identity.enabled_features_sha256 =
+                    sha256_hex(identity.enabled_features.join("\n").as_bytes());
+            });
+            assert_union_horizon_artifact_rejected(&artifact, |tampered| {
+                let source_verification =
+                    &mut tampered.proofs[0].build_identity.source_verification;
+                *source_verification = match source_verification {
+                    UnionHorizonSourceVerification::GitCheckoutVerified => {
+                        UnionHorizonSourceVerification::ExplicitUnverified
+                    }
+                    UnionHorizonSourceVerification::ExplicitUnverified
+                    | UnionHorizonSourceVerification::Unavailable => {
+                        UnionHorizonSourceVerification::GitCheckoutVerified
+                    }
+                };
+            });
+            assert_union_horizon_artifact_rejected(&artifact, |tampered| {
+                tampered.proofs[0].comparisons[0].case.metadata.corpus_hash = Some("d".repeat(64));
+            });
+            assert_union_horizon_artifact_rejected(&artifact, |tampered| {
+                let run = &mut tampered.proofs[0].comparisons[0];
+                run.comparison.subject.doc_count = 42;
+                run.comparison.oracle.doc_count = 42;
+            });
+            assert_union_horizon_artifact_rejected(&artifact, |tampered| {
+                tampered.proofs[0].traced_results[0].hits[0].global_docid = 8_999;
+            });
+            assert_union_horizon_artifact_rejected(&artifact, |tampered| {
+                let run = &mut tampered.proofs[0].comparisons[1];
+                let (first, remaining) = run.comparison.subject.hits.split_at_mut(1);
+                std::mem::swap(&mut first[0].doc_id, &mut remaining[0].doc_id);
+                std::mem::swap(
+                    &mut first[0].native_tie_key,
+                    &mut remaining[0].native_tie_key,
                 );
-            }
+                run.comparison = compare_observations(
+                    run.comparison.subject.clone(),
+                    run.comparison.oracle.clone(),
+                    run.comparator_config,
+                )
+                .expect("recompute hostile UNION_HORIZON rank mismatch");
+            });
+            assert_union_horizon_artifact_rejected(&artifact, |tampered| {
+                tampered.proofs[1].topology.tantivy_segments[0].max_doc += 1;
+            });
+            assert_union_horizon_artifact_rejected(&artifact, |tampered| {
+                let NativeTieKey::QuillDocId { doc_id } =
+                    &mut tampered.proofs[0].comparisons[0].comparison.subject.hits[0]
+                        .native_tie_key
+                else {
+                    panic!("UNION_HORIZON hostile fixture lost its Quill native key")
+                };
+                *doc_id += 1;
+            });
+            assert_union_horizon_artifact_rejected(&artifact, |tampered| {
+                let mut trace =
+                    serde_json::to_value(&tampered.proofs[2].complete_pruning_traces[0])
+                        .expect("encode hostile UNION_HORIZON non-target trace");
+                trace["segments"][0]["refills"][0]["candidate_docs"] =
+                    serde_json::Value::from(0_u64);
+                tampered.proofs[2].complete_pruning_traces[0] = serde_json::from_value(trace)
+                    .expect("decode hostile UNION_HORIZON non-target trace");
+            });
+            assert_union_horizon_artifact_rejected(&artifact, |tampered| {
+                let forged_revision = "c".repeat(40);
+                for proof in &mut tampered.proofs {
+                    for run in &mut proof.comparisons {
+                        run.engines
+                            .subject
+                            .source_revision
+                            .clone_from(&forged_revision);
+                        run.engines
+                            .oracle
+                            .source_revision
+                            .clone_from(&forged_revision);
+                    }
+                }
+            });
+            assert_union_horizon_artifact_rejected(&artifact, |tampered| {
+                let historical_revision = tampered.proofs[0]
+                    .oracle_dependency
+                    .pinned_lexical_contract_revision
+                    .clone();
+                tampered.proofs[0].comparisons[0]
+                    .engines
+                    .oracle
+                    .source_revision = historical_revision;
+            });
+            assert_union_horizon_artifact_rejected(&artifact, |tampered| {
+                let subject_dirty = tampered.proofs[0].comparisons[0]
+                    .engines
+                    .subject
+                    .source_dirty;
+                tampered.proofs[0].comparisons[0]
+                    .engines
+                    .oracle
+                    .source_dirty = !subject_dirty;
+            });
+            assert_union_horizon_artifact_rejected(&artifact, |tampered| {
+                tampered.proofs[0].oracle_dependency.tantivy_version = "0.0.0".to_owned();
+            });
+            assert_union_horizon_artifact_rejected(&artifact, |tampered| {
+                tampered.proofs[0].oracle_dependency.tantivy_checksum_sha256 = "0".repeat(64);
+            });
+            assert_union_horizon_artifact_rejected(&artifact, |tampered| {
+                tampered.proofs[0].oracle_dependency.lexical_package = "other".to_owned();
+            });
+            assert_union_horizon_artifact_rejected(&artifact, |tampered| {
+                tampered.proofs[0].oracle_dependency.lexical_package_version = "0.0.0".to_owned();
+            });
+            assert_union_horizon_artifact_rejected(&artifact, |tampered| {
+                tampered.proofs[0]
+                    .oracle_dependency
+                    .pinned_lexical_contract_revision = "0".repeat(40);
+            });
+
+            let mut republished = artifact.clone();
+            republished.run_id = "independent-publication".to_owned();
+            assert_eq!(
+                republished.preimage_sha256(),
+                artifact.artifact_sha256,
+                "UNION_HORIZON semantic identity must not depend on CI run metadata",
+            );
+            republished.artifact_sha256 = republished.preimage_sha256();
+            republished.verify();
+
+            let raw_bytes =
+                serde_json::to_vec_pretty(&artifact).expect("serialize UNION_HORIZON seal test");
+            let raw_file_sha256 = sha256_hex(&raw_bytes);
+            assert_eq!(
+                decode_union_horizon_artifact_bytes(&raw_bytes, &raw_file_sha256),
+                artifact,
+            );
+            let mut tampered: serde_json::Value =
+                serde_json::from_slice(&raw_bytes).expect("decode UNION_HORIZON tamper fixture");
+            tampered["proofs"][0]["comparisons"][0]["engines"]["oracle"]["unsealed_extension"] =
+                serde_json::Value::Bool(true);
+            let tampered_bytes =
+                serde_json::to_vec_pretty(&tampered).expect("encode UNION_HORIZON tamper fixture");
+            assert!(
+                std::panic::catch_unwind(|| {
+                    decode_union_horizon_artifact_bytes(&tampered_bytes, &raw_file_sha256);
+                })
+                .is_err(),
+                "UNION_HORIZON raw-file receipt must reject even a semantically ignored nested field",
+            );
+            let tampered_raw_file_sha256 = sha256_hex(&tampered_bytes);
+            assert!(
+                std::panic::catch_unwind(|| {
+                    decode_union_horizon_artifact_bytes(&tampered_bytes, &tampered_raw_file_sha256);
+                })
+                .is_err(),
+                "UNION_HORIZON strict typed reload must reject an unknown nested field even when its raw-file hash is recomputed",
+            );
+            let canonical = String::from_utf8(raw_bytes.clone())
+                .expect("UNION_HORIZON canonical artifact is UTF-8");
+            let encoded_run_id =
+                serde_json::to_string(&artifact.run_id).expect("encode UNION_HORIZON run ID");
+            let run_id_field = format!("\"run_id\": {encoded_run_id},");
+            let duplicate_run_id = canonical.replacen(
+                &run_id_field,
+                &format!("{run_id_field}\n  {run_id_field}"),
+                1,
+            );
+            assert_ne!(duplicate_run_id, canonical);
+            let duplicate_run_id_bytes = duplicate_run_id.into_bytes();
+            let duplicate_run_id_sha256 = sha256_hex(&duplicate_run_id_bytes);
+            assert!(
+                std::panic::catch_unwind(|| {
+                    decode_union_horizon_artifact_bytes(
+                        &duplicate_run_id_bytes,
+                        &duplicate_run_id_sha256,
+                    );
+                })
+                .is_err(),
+                "UNION_HORIZON exact-byte reload must reject duplicate known JSON fields",
+            );
+            let compact_bytes =
+                serde_json::to_vec(&artifact).expect("serialize compact UNION_HORIZON artifact");
+            let compact_sha256 = sha256_hex(&compact_bytes);
+            assert!(
+                std::panic::catch_unwind(|| {
+                    decode_union_horizon_artifact_bytes(&compact_bytes, &compact_sha256);
+                })
+                .is_err(),
+                "UNION_HORIZON exact-byte reload must reject alternate JSON formatting",
+            );
         });
+    }
+
+    #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
+    #[test]
+    fn salej_union_horizon_cutoff_ties_are_exact_or_registered_across_fresh_segment_shapes() {
+        let fixture = make_union_horizon_tie_fixture();
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let artifact =
+                run_union_horizon_layout_matrix(&cx, &fixture, UnionHorizonProofKind::TieMatrix)
+                    .await;
+            artifact.verify();
+            assert_union_horizon_artifact_rejected(&artifact, |tampered| {
+                let run = &mut tampered.proofs[1].comparisons[1];
+                let original_score_bits = run.comparison.subject.hits[0].score_bits;
+                let original_score = f32::from_bits(original_score_bits);
+                assert!(
+                    original_score.is_finite() && original_score.is_sign_positive(),
+                    "UNION_HORIZON hostile tie-score fixture must be positive and finite",
+                );
+                run.comparison.subject.hits[0].score_bits = original_score_bits
+                    .checked_add(1)
+                    .expect("positive finite score bits have one higher finite encoding");
+                run.comparison = compare_observations(
+                    run.comparison.subject.clone(),
+                    run.comparison.oracle.clone(),
+                    run.comparator_config,
+                )
+                .expect("recompute hostile UNION_HORIZON tie-matrix score mismatch");
+            });
+        });
+    }
+
+    #[cfg(all(
+        feature = "tantivy-oracle",
+        feature = "pruning-conformance",
+        any(target_os = "linux", target_os = "macos")
+    ))]
+    fn assert_union_horizon_completion_rejected(
+        manifest: &UnionHorizonCompletionManifest,
+        mutate: impl FnOnce(&mut UnionHorizonCompletionManifest),
+    ) {
+        let mut tampered = manifest.clone();
+        mutate(&mut tampered);
+        tampered.manifest_sha256 = tampered.preimage_sha256();
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| tampered.verify())).is_err(),
+            "tampered UNION_HORIZON completion manifest unexpectedly verified",
+        );
+    }
+
+    #[cfg(all(
+        feature = "tantivy-oracle",
+        feature = "pruning-conformance",
+        any(target_os = "linux", target_os = "macos")
+    ))]
+    fn write_union_horizon_bundle_fixture(
+        root: &std::path::Path,
+        manifest: &UnionHorizonCompletionManifest,
+    ) -> std::ffi::OsString {
+        std::fs::create_dir(root).expect("create hostile completion-bundle fixture root");
+        for entry in &manifest.artifacts {
+            let bytes = serde_json::to_vec_pretty(&entry.artifact)
+                .expect("serialize hostile completion-bundle proof fixture");
+            assert_eq!(sha256_hex(&bytes), entry.raw_file_sha256);
+            std::fs::write(root.join(&entry.filename), bytes)
+                .expect("write hostile completion-bundle proof fixture");
+        }
+        let completion_bytes = serde_json::to_vec_pretty(manifest)
+            .expect("serialize hostile completion-bundle manifest fixture");
+        let completion_name = std::ffi::OsString::from(format!(
+            "completion-{}-{}.json",
+            manifest.manifest_sha256,
+            sha256_hex(&completion_bytes),
+        ));
+        std::fs::write(root.join(&completion_name), completion_bytes)
+            .expect("write hostile completion-bundle manifest fixture");
+        completion_name
+    }
+
+    #[cfg(all(
+        feature = "tantivy-oracle",
+        feature = "pruning-conformance",
+        any(target_os = "linux", target_os = "macos")
+    ))]
+    fn assert_union_horizon_bundle_validation_panics(
+        directory: &crate::artifact::PinnedDirectory,
+        manifest: &UnionHorizonCompletionManifest,
+        completion_name: &std::ffi::OsStr,
+        context: &str,
+    ) {
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                validate_union_horizon_completed_bundle(directory, manifest, completion_name);
+            }))
+            .is_err(),
+            "hostile UNION_HORIZON bundle unexpectedly verified: {context}",
+        );
+    }
+
+    #[cfg(all(
+        feature = "tantivy-oracle",
+        feature = "pruning-conformance",
+        any(target_os = "linux", target_os = "macos")
+    ))]
+    #[test]
+    #[ignore = "requires an isolated, clean-Git evidence publication environment"]
+    fn salej_complete_union_horizon_evidence_bundle() {
+        let build_identity = union_horizon_validated_build_identity();
+        assert!(
+            union_horizon_identity_is_publishable(&build_identity),
+            "Salej completion requires a clean Linux Git-verified build; diagnostic Gitless snapshots must fail before executing the evidence matrix",
+        );
+        salej_runtime_identity_rejects_revision_or_dirty_state_rewrites();
+        salej_union_horizon_publication_never_replaces_an_existing_artifact();
+        salej_union_horizon_publication_rejects_symlinks_and_survives_root_swap();
+        salej_union_horizon_late_winner_matches_tantivy_across_fresh_segment_shapes();
+        salej_union_horizon_cutoff_ties_are_exact_or_registered_across_fresh_segment_shapes();
+        let (completion, manifest) = publish_union_horizon_completion_manifest();
+        assert!(completion.path.ends_with(".json"));
+        assert_lower_hex(
+            &completion.raw_file_sha256,
+            64,
+            "UNION_HORIZON completion raw identity",
+        );
+        assert!(completion.byte_len > 0);
+        manifest.verify();
+
+        assert_union_horizon_completion_rejected(&manifest, |tampered| {
+            tampered.build_identity.test_executable_sha256 = "0".repeat(64);
+        });
+        assert_union_horizon_completion_rejected(&manifest, |tampered| {
+            tampered.artifacts[0].raw_file_sha256 = "0".repeat(64);
+        });
+        assert_union_horizon_completion_rejected(&manifest, |tampered| {
+            tampered.artifacts[1].proof_kind = UnionHorizonProofKind::LateWinner;
+        });
+
+        let wrong_name_parent = tempfile::tempdir().expect("wrong-name bundle parent");
+        let wrong_name_root = wrong_name_parent.path().join("bundle");
+        let wrong_name_completion = write_union_horizon_bundle_fixture(&wrong_name_root, &manifest);
+        let wrong_name_directory = crate::artifact::PinnedDirectory::ensure_path(&wrong_name_root)
+            .expect("pin wrong-name bundle fixture");
+        std::fs::rename(
+            wrong_name_root.join(&manifest.artifacts[0].filename),
+            wrong_name_root.join("same-count-substitution.json"),
+        )
+        .expect("rename one proof without changing bundle cardinality");
+        assert_union_horizon_bundle_validation_panics(
+            &wrong_name_directory,
+            &manifest,
+            &wrong_name_completion,
+            "same-count filename substitution",
+        );
+
+        let mutated_parent = tempfile::tempdir().expect("mutated bundle parent");
+        let mutated_root = mutated_parent.path().join("bundle");
+        let mutated_completion = write_union_horizon_bundle_fixture(&mutated_root, &manifest);
+        let mutated_directory = crate::artifact::PinnedDirectory::ensure_path(&mutated_root)
+            .expect("pin mutated bundle fixture");
+        std::fs::write(mutated_root.join(&manifest.artifacts[0].filename), b"{}")
+            .expect("mutate proof bytes after pinning");
+        assert_union_horizon_bundle_validation_panics(
+            &mutated_directory,
+            &manifest,
+            &mutated_completion,
+            "proof content mutation",
+        );
+
+        let missing_parent = tempfile::tempdir().expect("missing bundle parent");
+        let missing_root = missing_parent.path().join("bundle");
+        let missing_completion = write_union_horizon_bundle_fixture(&missing_root, &manifest);
+        let missing_directory = crate::artifact::PinnedDirectory::ensure_path(&missing_root)
+            .expect("pin missing-entry bundle fixture");
+        std::fs::rename(
+            missing_root.join(&manifest.artifacts[0].filename),
+            missing_parent.path().join("moved-proof.json"),
+        )
+        .expect("move proof outside the completed bundle");
+        assert_union_horizon_bundle_validation_panics(
+            &missing_directory,
+            &manifest,
+            &missing_completion,
+            "missing proof",
+        );
+
+        let extra_parent = tempfile::tempdir().expect("extra bundle parent");
+        let extra_root = extra_parent.path().join("bundle");
+        let extra_completion = write_union_horizon_bundle_fixture(&extra_root, &manifest);
+        let extra_directory = crate::artifact::PinnedDirectory::ensure_path(&extra_root)
+            .expect("pin extra-entry bundle fixture");
+        std::fs::write(extra_root.join("extra.json"), b"diagnostic")
+            .expect("add extra completed-bundle entry");
+        assert_union_horizon_bundle_validation_panics(
+            &extra_directory,
+            &manifest,
+            &extra_completion,
+            "extra entry",
+        );
     }
 
     #[cfg(feature = "tantivy-oracle")]
@@ -9789,8 +12778,6 @@ mod tests {
     #[test]
     fn tantivy_campaign_adapter_enforces_the_one_shot_lifecycle() {
         let fixture = make_fixture();
-        let version = oracle_version_contract().expect("oracle version");
-        let revision = version.lexical_git_revision;
         let contract = SemanticContract::shipping_default();
         let query = fixture
             .query_suite
@@ -9804,8 +12791,8 @@ mod tests {
         evidence_case.offset = query.offset;
         evidence_case.count_requested = query.count_requested;
         asupersync::test_utils::run_test_with_cx(|cx| async move {
-            let mut before_begin =
-                crate::TantivyOracle::in_memory(&revision, false).expect("oracle before begin");
+            let mut before_begin = crate::TantivyOracle::in_memory(TEST_PRODUCER_REVISION, false)
+                .expect("oracle before begin");
             assert!(matches!(
                 before_begin.index_batch(&cx, &fixture.documents[..1]).await,
                 Err(GauntletError::InvalidCampaign { .. })
@@ -9823,8 +12810,8 @@ mod tests {
                 Err(GauntletError::InvalidCampaign { .. })
             ));
 
-            let mut before_commit =
-                crate::TantivyOracle::in_memory(&revision, false).expect("oracle before commit");
+            let mut before_commit = crate::TantivyOracle::in_memory(TEST_PRODUCER_REVISION, false)
+                .expect("oracle before commit");
             before_commit
                 .begin_corpus(&cx, &fixture.corpus_manifest, &contract)
                 .await
@@ -9856,7 +12843,7 @@ mod tests {
                 Err(GauntletError::InvalidCampaign { .. })
             ));
 
-            let mut oracle = crate::TantivyOracle::in_memory(&revision, false)
+            let mut oracle = crate::TantivyOracle::in_memory(TEST_PRODUCER_REVISION, false)
                 .expect("committed in-memory oracle");
             oracle
                 .begin_corpus(&cx, &fixture.corpus_manifest, &contract)
@@ -9898,10 +12885,9 @@ mod tests {
         use frankensearch_core::LexicalSearch;
 
         let fixture = make_fixture();
-        let version = oracle_version_contract().expect("oracle version");
         let contract = SemanticContract::shipping_default();
         asupersync::test_utils::run_test_with_cx(|cx| async move {
-            let mut oracle = crate::TantivyOracle::in_memory(&version.lexical_git_revision, false)
+            let mut oracle = crate::TantivyOracle::in_memory(TEST_PRODUCER_REVISION, false)
                 .expect("fresh oracle");
             oracle
                 .index_documents(
@@ -10526,9 +13512,6 @@ mod tests {
     fn live_campaign_engines(
         provenance: &CampaignProvenance,
     ) -> (crate::engine::QuillSubject, crate::engine::TantivyOracle) {
-        let lexical_revision = oracle_version_contract()
-            .expect("oracle version contract")
-            .lexical_git_revision;
         let config = frankensearch_quill::QuillConfig {
             deterministic_ingest: true,
             ..frankensearch_quill::QuillConfig::default()
@@ -10540,7 +13523,7 @@ mod tests {
         )
         .expect("fresh scalar Quill subject");
         let oracle = crate::engine::TantivyOracle::in_memory_scalar_g1a(
-            &lexical_revision,
+            &provenance.oracle_git_revision,
             provenance.oracle_source_dirty,
         )
         .expect("fresh scalar G1a Tantivy oracle");
@@ -10554,9 +13537,6 @@ mod tests {
         crate::engine::CassQuillSubject,
         crate::engine::CassTantivyOracle,
     ) {
-        let lexical_revision = oracle_version_contract()
-            .expect("oracle version contract")
-            .lexical_git_revision;
         let config = frankensearch_quill::QuillConfig {
             deterministic_ingest: true,
             glob_expansion_limit: 4_096,
@@ -10569,7 +13549,7 @@ mod tests {
         )
         .expect("fresh CASS Quill subject");
         let oracle = crate::engine::CassTantivyOracle::in_memory(
-            &lexical_revision,
+            &provenance.oracle_git_revision,
             provenance.oracle_source_dirty,
         )
         .expect("fresh CASS Tantivy oracle");
@@ -11652,18 +14632,15 @@ mod tests {
     #[test]
     fn harvested_14_score_bits_preserve_ranked_and_counted_orders() {
         let fixture = make_scalar_g1a_regression_fixture();
-        let lexical_revision = oracle_version_contract()
-            .expect("oracle version contract")
-            .lexical_git_revision;
+        let producer_revision = "e".repeat(40);
         let config = frankensearch_quill::QuillConfig {
             deterministic_ingest: true,
             ..frankensearch_quill::QuillConfig::default()
         };
-        let mut subject =
-            crate::engine::QuillSubject::in_memory(config, "harvested-14-score-regression", false)
-                .expect("fresh scalar Quill subject");
+        let mut subject = crate::engine::QuillSubject::in_memory(config, &producer_revision, false)
+            .expect("fresh scalar Quill subject");
         let mut oracle =
-            crate::engine::TantivyOracle::in_memory_scalar_g1a(&lexical_revision, false)
+            crate::engine::TantivyOracle::in_memory_scalar_g1a(&producer_revision, false)
                 .expect("fresh scalar G1a Tantivy oracle");
         let semantic_contract = SemanticContract::scalar_g1a();
 

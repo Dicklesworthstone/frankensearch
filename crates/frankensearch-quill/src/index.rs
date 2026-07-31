@@ -10,6 +10,8 @@ use std::ops::{Bound, Deref};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 #[cfg(feature = "conformance-internals")]
+use std::sync::Mutex as StdMutex;
+#[cfg(feature = "conformance-internals")]
 use std::sync::atomic::{AtomicBool, AtomicU8};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -25,6 +27,8 @@ use frankensearch_core::{
 #[cfg(feature = "durability")]
 use frankensearch_durability::FileProtector;
 use rayon::prelude::*;
+#[cfg(feature = "pruning-conformance")]
+use serde::{Deserialize, Serialize};
 #[cfg(feature = "conformance-internals")]
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -38,6 +42,8 @@ use crate::argus::{
     QueryWorkCheckpoint, QueryWorkKind, ReferenceScorer, ScorerClause, SealedPostingCursor,
     TermRecordOption, TermScorer, TopDocsCollector,
 };
+#[cfg(feature = "pruning-conformance")]
+use crate::argus::{ConformanceUnionRefill, ConformanceUnionRefillStrategy};
 use crate::config::QuillConfig;
 use crate::delta::DeltaSnapshot;
 use crate::error::QuillError;
@@ -1517,6 +1523,476 @@ struct QueryFuelState {
     position_docs: AtomicU64,
 }
 
+/// Refill strategy observed by the exact pruning-conformance witness.
+#[cfg(feature = "pruning-conformance")]
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ConformancePruningStrategy {
+    /// Full window scoring without a competitive cutoff.
+    Exhaustive,
+    /// Direct-term MaxScore candidate selection.
+    MaxScore,
+    /// Block-Max WAND candidate selection.
+    BlockMaxWand,
+}
+
+/// One exact direct-term union refill from a conformance-only search.
+#[cfg(feature = "pruning-conformance")]
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConformancePruningRefillReceipt {
+    ordinal: u64,
+    window_start: u32,
+    horizon_end: u64,
+    cutoff_bits: Option<u32>,
+    strategy: ConformancePruningStrategy,
+    candidate_docs: u64,
+    buffer_empty: bool,
+    live_work_remains: bool,
+}
+
+#[cfg(feature = "pruning-conformance")]
+impl ConformancePruningRefillReceipt {
+    /// One-based refill ordinal within the segment scorer.
+    #[must_use]
+    pub const fn ordinal(&self) -> u64 {
+        self.ordinal
+    }
+
+    /// Inclusive global document identifier that starts this window.
+    #[must_use]
+    pub const fn window_start(&self) -> u32 {
+        self.window_start
+    }
+
+    /// Exclusive global document bound for this window.
+    #[must_use]
+    pub const fn horizon_end(&self) -> u64 {
+        self.horizon_end
+    }
+
+    /// Exact competitive cutoff bits, or `None` before the heap is full.
+    #[must_use]
+    pub const fn cutoff_bits(&self) -> Option<u32> {
+        self.cutoff_bits
+    }
+
+    /// Scoring strategy used for this refill.
+    #[must_use]
+    pub const fn strategy(&self) -> ConformancePruningStrategy {
+        self.strategy
+    }
+
+    /// Number of documents admitted by the selected strategy.
+    #[must_use]
+    pub const fn candidate_docs(&self) -> u64 {
+        self.candidate_docs
+    }
+
+    /// Whether the refill produced no buffered scored document.
+    #[must_use]
+    pub const fn buffer_empty(&self) -> bool {
+        self.buffer_empty
+    }
+
+    /// Whether at least one posting cursor remains beyond this window.
+    #[must_use]
+    pub const fn live_work_remains(&self) -> bool {
+        self.live_work_remains
+    }
+}
+
+/// Ordered refill receipts for one immutable Quill segment.
+#[cfg(feature = "pruning-conformance")]
+#[doc(hidden)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConformanceSegmentPruningReceipt {
+    segment_ordinal: u64,
+    segment_doc_count: u64,
+    refills: Vec<ConformancePruningRefillReceipt>,
+}
+
+#[cfg(feature = "pruning-conformance")]
+impl ConformanceSegmentPruningReceipt {
+    /// Stable ordinal in the committed Quill snapshot.
+    #[must_use]
+    pub const fn segment_ordinal(&self) -> u64 {
+        self.segment_ordinal
+    }
+
+    /// Physical document cardinality of the scored segment.
+    #[must_use]
+    pub const fn segment_doc_count(&self) -> u64 {
+        self.segment_doc_count
+    }
+
+    /// Ordered refill events observed while collecting this segment.
+    #[must_use]
+    pub fn refills(&self) -> &[ConformancePruningRefillReceipt] {
+        &self.refills
+    }
+}
+
+#[cfg(feature = "pruning-conformance")]
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ConformancePruningExecutionMode {
+    /// The shipping collector scored sealed segments in snapshot order.
+    Serial,
+    /// The shipping collector scored sealed segments through Rayon fan-out.
+    Rayon,
+}
+
+#[cfg(feature = "pruning-conformance")]
+impl ConformancePruningExecutionMode {
+    const SERIAL_CODE: u8 = 1;
+    const RAYON_CODE: u8 = 2;
+
+    const fn code(self) -> u8 {
+        match self {
+            Self::Serial => Self::SERIAL_CODE,
+            Self::Rayon => Self::RAYON_CODE,
+        }
+    }
+
+    const fn from_code(code: u8) -> Option<Self> {
+        match code {
+            Self::SERIAL_CODE => Some(Self::Serial),
+            Self::RAYON_CODE => Some(Self::Rayon),
+            _ => None,
+        }
+    }
+}
+
+#[cfg(feature = "pruning-conformance")]
+#[doc(hidden)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConformancePruningTraceReceipt {
+    execution_mode: ConformancePruningExecutionMode,
+    segments: Vec<ConformanceSegmentPruningReceipt>,
+}
+
+#[cfg(feature = "pruning-conformance")]
+impl ConformancePruningTraceReceipt {
+    /// Actual shipping collection branch used by this exact search invocation.
+    #[must_use]
+    pub const fn execution_mode(&self) -> ConformancePruningExecutionMode {
+        self.execution_mode
+    }
+
+    /// Complete receipts in dense Quill segment order.
+    #[must_use]
+    pub fn segments(&self) -> &[ConformanceSegmentPruningReceipt] {
+        &self.segments
+    }
+}
+
+#[cfg(feature = "pruning-conformance")]
+#[derive(Debug)]
+enum ConformancePruningTraceState {
+    Collecting {
+        expected_segments: usize,
+        execution_mode: Option<ConformancePruningExecutionMode>,
+        receipts: Vec<ConformanceSegmentPruningReceipt>,
+    },
+    Completed,
+    Failed,
+}
+
+#[cfg(feature = "pruning-conformance")]
+#[derive(Debug)]
+struct ConformancePruningTraceSession {
+    state: StdMutex<ConformancePruningTraceState>,
+    cancellation_arm_generation: Option<u64>,
+}
+
+#[cfg(feature = "pruning-conformance")]
+impl ConformancePruningTraceSession {
+    #[cfg(test)]
+    fn new(expected_segments: usize) -> Self {
+        Self::new_for_cancellation_arm(expected_segments, None)
+    }
+
+    fn new_for_cancellation_arm(
+        expected_segments: usize,
+        cancellation_arm_generation: Option<u64>,
+    ) -> Self {
+        Self {
+            state: StdMutex::new(ConformancePruningTraceState::Collecting {
+                expected_segments,
+                execution_mode: None,
+                receipts: Vec::new(),
+            }),
+            cancellation_arm_generation,
+        }
+    }
+
+    const fn cancellation_arm_generation(&self) -> Option<u64> {
+        self.cancellation_arm_generation
+    }
+
+    fn bind_execution_mode(
+        &self,
+        execution_mode: ConformancePruningExecutionMode,
+    ) -> Result<(), QuillIndexError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| invalid_state("pruning-conformance receipt lock is poisoned"))?;
+        match &mut *state {
+            ConformancePruningTraceState::Collecting {
+                execution_mode: slot,
+                ..
+            } if slot.is_none() => {
+                *slot = Some(execution_mode);
+                Ok(())
+            }
+            ConformancePruningTraceState::Collecting { .. } => {
+                *state = ConformancePruningTraceState::Failed;
+                Err(invalid_state(
+                    "pruning-conformance execution mode was already bound",
+                ))
+            }
+            ConformancePruningTraceState::Completed => Err(invalid_state(
+                "pruning-conformance trace session is already completed",
+            )),
+            ConformancePruningTraceState::Failed => Err(invalid_state(
+                "pruning-conformance trace session has failed",
+            )),
+        }
+    }
+
+    #[cfg(test)]
+    fn record(
+        &self,
+        segment_ordinal: u64,
+        segment_doc_count: u64,
+        refills: &[ConformanceUnionRefill],
+    ) -> Result<u64, QuillIndexError> {
+        self.record_inner(segment_ordinal, segment_doc_count, refills, None)
+    }
+
+    fn record_and_checkpoint(
+        &self,
+        segment_ordinal: u64,
+        segment_doc_count: u64,
+        refills: &[ConformanceUnionRefill],
+        controller: &ConformanceCancellationController,
+        cx: &Cx,
+    ) -> Result<u64, QuillIndexError> {
+        self.record_inner(
+            segment_ordinal,
+            segment_doc_count,
+            refills,
+            Some((controller, cx)),
+        )
+    }
+
+    fn record_inner(
+        &self,
+        segment_ordinal: u64,
+        segment_doc_count: u64,
+        refills: &[ConformanceUnionRefill],
+        checkpoint: Option<(&ConformanceCancellationController, &Cx)>,
+    ) -> Result<u64, QuillIndexError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| invalid_state("pruning-conformance receipt lock is poisoned"))?;
+        let ConformancePruningTraceState::Collecting {
+            expected_segments,
+            execution_mode,
+            receipts,
+        } = &mut *state
+        else {
+            return match &*state {
+                ConformancePruningTraceState::Completed => Err(invalid_state(
+                    "pruning-conformance trace session is already completed",
+                )),
+                ConformancePruningTraceState::Failed => Err(invalid_state(
+                    "pruning-conformance trace session has failed",
+                )),
+                ConformancePruningTraceState::Collecting { .. } => {
+                    Err(invalid_state("pruning-conformance trace state is invalid"))
+                }
+            };
+        };
+        let Some(execution_mode) = *execution_mode else {
+            *state = ConformancePruningTraceState::Failed;
+            return Err(invalid_state(
+                "pruning-conformance execution mode was not bound before recording",
+            ));
+        };
+        let expected_segments = u64::try_from(*expected_segments)
+            .map_err(|_| invalid_state("pruning-conformance segment count does not fit u64"))?;
+        if segment_ordinal >= expected_segments {
+            *state = ConformancePruningTraceState::Failed;
+            return Err(invalid_state(format!(
+                "pruning-conformance segment ordinal {segment_ordinal} exceeds expected count \
+                 {expected_segments}",
+            )));
+        }
+        if receipts
+            .iter()
+            .any(|receipt| receipt.segment_ordinal == segment_ordinal)
+        {
+            *state = ConformancePruningTraceState::Failed;
+            return Err(invalid_state(format!(
+                "pruning-conformance segment ordinal {segment_ordinal} was recorded twice",
+            )));
+        }
+        let refills = refills
+            .iter()
+            .map(|refill| ConformancePruningRefillReceipt {
+                ordinal: refill.ordinal,
+                window_start: refill.window_start,
+                horizon_end: refill.horizon_end,
+                cutoff_bits: refill.cutoff_bits,
+                strategy: match refill.strategy {
+                    ConformanceUnionRefillStrategy::Exhaustive => {
+                        ConformancePruningStrategy::Exhaustive
+                    }
+                    ConformanceUnionRefillStrategy::MaxScore => {
+                        ConformancePruningStrategy::MaxScore
+                    }
+                    ConformanceUnionRefillStrategy::BlockMaxWand => {
+                        ConformancePruningStrategy::BlockMaxWand
+                    }
+                },
+                candidate_docs: refill.candidate_docs,
+                buffer_empty: refill.buffer_empty,
+                live_work_remains: refill.live_work_remains,
+            })
+            .collect();
+        receipts.push(ConformanceSegmentPruningReceipt {
+            segment_ordinal,
+            segment_doc_count,
+            refills,
+        });
+        let recorded_receipts = match u64::try_from(receipts.len()) {
+            Ok(recorded_receipts) => recorded_receipts,
+            Err(_) => {
+                *state = ConformancePruningTraceState::Failed;
+                return Err(invalid_state(
+                    "pruning-conformance recorded receipt count does not fit u64",
+                ));
+            }
+        };
+        if let Some((controller, cx)) = checkpoint
+            && let Err(error) = controller.checkpoint_pruning_trace_segment_recorded(
+                cx,
+                recorded_receipts,
+                self.cancellation_arm_generation,
+                execution_mode,
+            )
+        {
+            *state = ConformancePruningTraceState::Failed;
+            return Err(error);
+        }
+        Ok(recorded_receipts)
+    }
+
+    fn complete(&self) -> Result<ConformancePruningTraceReceipt, QuillIndexError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| invalid_state("pruning-conformance receipt lock is poisoned"))?;
+        let collecting = std::mem::replace(&mut *state, ConformancePruningTraceState::Failed);
+        let ConformancePruningTraceState::Collecting {
+            expected_segments,
+            execution_mode,
+            mut receipts,
+        } = collecting
+        else {
+            return match collecting {
+                ConformancePruningTraceState::Completed => Err(invalid_state(
+                    "pruning-conformance trace session is already completed",
+                )),
+                ConformancePruningTraceState::Failed => Err(invalid_state(
+                    "pruning-conformance trace session has failed",
+                )),
+                ConformancePruningTraceState::Collecting { .. } => {
+                    Err(invalid_state("pruning-conformance trace state is invalid"))
+                }
+            };
+        };
+        let execution_mode = execution_mode
+            .ok_or_else(|| invalid_state("pruning-conformance execution mode was never bound"))?;
+        receipts.sort_by_key(|receipt| receipt.segment_ordinal);
+        if receipts.len() != expected_segments
+            || !receipts.iter().enumerate().all(|(ordinal, receipt)| {
+                u64::try_from(ordinal).is_ok_and(|ordinal| ordinal == receipt.segment_ordinal)
+            })
+        {
+            return Err(invalid_state(format!(
+                "pruning-conformance trace is incomplete: expected {expected_segments} dense \
+                 segment receipts, observed {}",
+                receipts.len(),
+            )));
+        }
+        *state = ConformancePruningTraceState::Completed;
+        Ok(ConformancePruningTraceReceipt {
+            execution_mode,
+            segments: receipts,
+        })
+    }
+
+    fn fail(&self) {
+        if let Ok(mut state) = self.state.lock() {
+            *state = ConformancePruningTraceState::Failed;
+        }
+    }
+}
+
+#[cfg(feature = "pruning-conformance")]
+#[derive(Debug)]
+struct ConformancePruningTraceGuard {
+    session: Arc<ConformancePruningTraceSession>,
+    controller: Arc<ConformanceCancellationController>,
+    finished: bool,
+}
+
+#[cfg(feature = "pruning-conformance")]
+impl ConformancePruningTraceGuard {
+    fn new(expected_segments: usize, controller: Arc<ConformanceCancellationController>) -> Self {
+        let cancellation_arm_generation = controller.active_pruning_trace_arm_generation();
+        Self {
+            session: Arc::new(ConformancePruningTraceSession::new_for_cancellation_arm(
+                expected_segments,
+                cancellation_arm_generation,
+            )),
+            controller,
+            finished: false,
+        }
+    }
+
+    fn session(&self) -> &ConformancePruningTraceSession {
+        self.session.as_ref()
+    }
+
+    fn complete(mut self) -> Result<ConformancePruningTraceReceipt, QuillIndexError> {
+        let receipt = self.session.complete()?;
+        self.finished = true;
+        Ok(receipt)
+    }
+}
+
+#[cfg(feature = "pruning-conformance")]
+impl Drop for ConformancePruningTraceGuard {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.session.fail();
+            if let Some(arm_generation) = self.session.cancellation_arm_generation() {
+                self.controller
+                    .note_discarded_pruning_trace_session(arm_generation);
+            }
+        }
+    }
+}
+
 /// Deterministic request-cancellation checkpoints exposed only to the
 /// conformance harness.
 ///
@@ -1535,6 +2011,8 @@ pub enum ConformanceCancellationStage {
     FusionHydration = 2,
     /// The retained commit transaction immediately before publication.
     CommitPublication = 3,
+    /// One sealed-segment pruning receipt has been recorded successfully.
+    PruningTraceSegmentRecorded = 4,
 }
 
 /// Fixed-size conformance receipt for the complete retained scalar writer
@@ -1657,6 +2135,7 @@ impl ConformanceCancellationStage {
             Self::QueryCollection => 1,
             Self::FusionHydration => 2,
             Self::CommitPublication => 3,
+            Self::PruningTraceSegmentRecorded => 4,
         }
     }
 }
@@ -1670,8 +2149,14 @@ impl ConformanceCancellationStage {
 #[derive(Debug, Default)]
 pub struct ConformanceCancellationController {
     stage: AtomicU8,
+    arm_generation: AtomicU64,
+    arm_transition_lock: StdMutex<()>,
     trigger_ordinal: AtomicU64,
     observed_checkpoints: AtomicU64,
+    recorded_pruning_receipts_at_fire: AtomicU64,
+    #[cfg(feature = "pruning-conformance")]
+    pruning_trace_execution_mode_at_fire: AtomicU8,
+    discarded_pruning_trace_sessions: AtomicU64,
     fired: AtomicBool,
 }
 
@@ -1696,6 +2181,9 @@ impl ConformanceCancellationController {
                 "conformance cancellation trigger ordinal must be nonzero",
             ));
         }
+        let arm_transition = self.arm_transition_lock.lock().map_err(|_| {
+            invalid_state("conformance cancellation arm transition lock is poisoned")
+        })?;
         self.stage
             .compare_exchange(
                 Self::DISARMED,
@@ -1704,11 +2192,27 @@ impl ConformanceCancellationController {
                 Ordering::Acquire,
             )
             .map_err(|_| invalid_state("conformance cancellation controller is already armed"))?;
+        let Some(arm_generation) = self.arm_generation.load(Ordering::Relaxed).checked_add(1)
+        else {
+            self.stage.store(Self::DISARMED, Ordering::Release);
+            return Err(invalid_state(
+                "conformance cancellation arm generation is exhausted",
+            ));
+        };
+        self.arm_generation.store(arm_generation, Ordering::Relaxed);
         self.trigger_ordinal
             .store(trigger_ordinal, Ordering::Relaxed);
         self.observed_checkpoints.store(0, Ordering::Relaxed);
+        self.recorded_pruning_receipts_at_fire
+            .store(0, Ordering::Relaxed);
+        #[cfg(feature = "pruning-conformance")]
+        self.pruning_trace_execution_mode_at_fire
+            .store(0, Ordering::Relaxed);
+        self.discarded_pruning_trace_sessions
+            .store(0, Ordering::Relaxed);
         self.fired.store(false, Ordering::Relaxed);
         self.stage.store(stage.code(), Ordering::Release);
+        drop(arm_transition);
         Ok(())
     }
 
@@ -1717,6 +2221,7 @@ impl ConformanceCancellationController {
     /// The caller must clear the real [`Cx`] explicitly. Keeping those actions
     /// separate proves the request context remains the cancellation authority.
     pub fn disarm(&self) {
+        let _arm_transition = self.arm_transition_lock.lock().ok();
         self.stage.store(Self::DISARMED, Ordering::Release);
     }
 
@@ -1724,6 +2229,34 @@ impl ConformanceCancellationController {
     #[must_use]
     pub fn observed_checkpoints(&self) -> u64 {
         self.observed_checkpoints.load(Ordering::Acquire)
+    }
+
+    /// Successfully recorded pruning receipts at the exact firing boundary.
+    ///
+    /// This stays zero for every non-pruning cancellation stage. A nonzero
+    /// value proves the pruning checkpoint ran only after receipt mutation
+    /// succeeded; it does not infer how much unrecorded scorer work remained.
+    #[must_use]
+    pub fn recorded_pruning_receipts_at_fire(&self) -> u64 {
+        self.recorded_pruning_receipts_at_fire
+            .load(Ordering::Acquire)
+    }
+
+    /// Shipping sealed-segment execution branch at the pruning fire boundary.
+    #[cfg(feature = "pruning-conformance")]
+    #[must_use]
+    pub fn pruning_trace_execution_mode_at_fire(&self) -> Option<ConformancePruningExecutionMode> {
+        ConformancePruningExecutionMode::from_code(
+            self.pruning_trace_execution_mode_at_fire
+                .load(Ordering::Acquire),
+        )
+    }
+
+    /// Invocation-bound pruning trace sessions failed and discarded since arm.
+    #[must_use]
+    pub fn discarded_pruning_trace_sessions(&self) -> u64 {
+        self.discarded_pruning_trace_sessions
+            .load(Ordering::Acquire)
     }
 
     /// Whether the current arm requested cancellation on its real [`Cx`].
@@ -1737,6 +2270,50 @@ impl ConformanceCancellationController {
     }
 
     fn checkpoint(&self, stage: ConformanceCancellationStage, cx: &Cx) {
+        self.checkpoint_with_pruning_receipts(stage, cx, None, None);
+    }
+
+    #[cfg(feature = "pruning-conformance")]
+    fn checkpoint_pruning_trace_segment_recorded(
+        &self,
+        cx: &Cx,
+        recorded_receipts: u64,
+        expected_arm_generation: Option<u64>,
+        execution_mode: ConformancePruningExecutionMode,
+    ) -> Result<(), QuillIndexError> {
+        if recorded_receipts == 0 {
+            return Err(invalid_state(
+                "pruning-trace cancellation checkpoint requires a successful receipt",
+            ));
+        }
+        let Some(expected_arm_generation) = expected_arm_generation else {
+            return Ok(());
+        };
+        let _arm_transition = self.arm_transition_lock.lock().map_err(|_| {
+            invalid_state("conformance cancellation arm transition lock is poisoned")
+        })?;
+        if self.stage.load(Ordering::Acquire)
+            != ConformanceCancellationStage::PruningTraceSegmentRecorded.code()
+            || self.arm_generation.load(Ordering::Acquire) != expected_arm_generation
+        {
+            return Ok(());
+        }
+        self.checkpoint_with_pruning_receipts(
+            ConformanceCancellationStage::PruningTraceSegmentRecorded,
+            cx,
+            Some(recorded_receipts),
+            Some(execution_mode.code()),
+        );
+        Ok(())
+    }
+
+    fn checkpoint_with_pruning_receipts(
+        &self,
+        stage: ConformanceCancellationStage,
+        cx: &Cx,
+        recorded_receipts: Option<u64>,
+        pruning_execution_mode_code: Option<u8>,
+    ) {
         if self.stage.load(Ordering::Acquire) != stage.code() {
             return;
         }
@@ -1747,6 +2324,17 @@ impl ConformanceCancellationController {
         if ordinal != self.trigger_ordinal.load(Ordering::Acquire) {
             return;
         }
+        if let Some(recorded_receipts) = recorded_receipts {
+            self.recorded_pruning_receipts_at_fire
+                .store(recorded_receipts, Ordering::Release);
+        }
+        #[cfg(feature = "pruning-conformance")]
+        if let Some(execution_mode_code) = pruning_execution_mode_code {
+            self.pruning_trace_execution_mode_at_fire
+                .store(execution_mode_code, Ordering::Release);
+        }
+        #[cfg(not(feature = "pruning-conformance"))]
+        let _ = pruning_execution_mode_code;
         self.fired.store(true, Ordering::Release);
         tracing::info!(
             target: crate::tracing_conventions::TARGET,
@@ -1756,6 +2344,28 @@ impl ConformanceCancellationController {
             "deterministic conformance checkpoint requested cancellation on the real Cx"
         );
         cx.set_cancel_requested(true);
+    }
+
+    #[cfg(feature = "pruning-conformance")]
+    fn active_pruning_trace_arm_generation(&self) -> Option<u64> {
+        let _arm_transition = self.arm_transition_lock.lock().ok()?;
+        (self.stage.load(Ordering::Acquire)
+            == ConformanceCancellationStage::PruningTraceSegmentRecorded.code())
+        .then(|| self.arm_generation.load(Ordering::Acquire))
+    }
+
+    #[cfg(feature = "pruning-conformance")]
+    fn note_discarded_pruning_trace_session(&self, expected_arm_generation: u64) {
+        let Ok(_arm_transition) = self.arm_transition_lock.lock() else {
+            return;
+        };
+        if self.stage.load(Ordering::Acquire)
+            == ConformanceCancellationStage::PruningTraceSegmentRecorded.code()
+            && self.arm_generation.load(Ordering::Acquire) == expected_arm_generation
+        {
+            self.discarded_pruning_trace_sessions
+                .fetch_add(1, Ordering::AcqRel);
+        }
     }
 }
 
@@ -4436,6 +5046,34 @@ impl QuillReader {
         self.search_paginated_on(cx, query, limit, offset, exact_count, published.as_ref())
     }
 
+    #[cfg(feature = "pruning-conformance")]
+    fn search_paginated_with_conformance_pruning_trace(
+        &self,
+        cx: &Cx,
+        query: &str,
+        limit: usize,
+        offset: usize,
+        exact_count: bool,
+    ) -> Result<(QuillSearchResult, ConformancePruningTraceReceipt), QuillIndexError> {
+        let published = self.published_snapshot.load();
+        let expected_segments = published.keeper_snapshot().segments().len();
+        let guard = ConformancePruningTraceGuard::new(
+            expected_segments,
+            Arc::clone(&self.conformance_controller),
+        );
+        let result = self.search_paginated_on_inner(
+            cx,
+            query,
+            limit,
+            offset,
+            exact_count,
+            Some(guard.session()),
+            published.as_ref(),
+        )?;
+        let receipt = guard.complete()?;
+        Ok((result, receipt))
+    }
+
     fn search_paginated_on(
         &self,
         cx: &Cx,
@@ -4443,6 +5081,30 @@ impl QuillReader {
         limit: usize,
         offset: usize,
         exact_count: bool,
+        snapshot: &QuillSearchSnapshot,
+    ) -> Result<QuillSearchResult, QuillIndexError> {
+        self.search_paginated_on_inner(
+            cx,
+            query,
+            limit,
+            offset,
+            exact_count,
+            #[cfg(feature = "pruning-conformance")]
+            None,
+            snapshot,
+        )
+    }
+
+    fn search_paginated_on_inner(
+        &self,
+        cx: &Cx,
+        query: &str,
+        limit: usize,
+        offset: usize,
+        exact_count: bool,
+        #[cfg(feature = "pruning-conformance")] pruning_trace: Option<
+            &ConformancePruningTraceSession,
+        >,
         snapshot: &QuillSearchSnapshot,
     ) -> Result<QuillSearchResult, QuillIndexError> {
         let keeper = snapshot.keeper_snapshot();
@@ -4526,7 +5188,7 @@ impl QuillReader {
             );
             parsed
         };
-        let result = self.execute_ranked_query(
+        let result = self.execute_ranked_query_inner(
             cx,
             &parsed.query,
             snapshot,
@@ -4534,6 +5196,8 @@ impl QuillReader {
             offset,
             exact_count,
             parsed.diagnostics,
+            #[cfg(feature = "pruning-conformance")]
+            pruning_trace,
         )?;
         let result_count = u64::try_from(result.hits.len()).unwrap_or(u64::MAX);
         query_span.record("result_count", result_count);
@@ -4804,6 +5468,8 @@ impl QuillReader {
             snapshot,
             rank_pruning,
             topdocs_root,
+            #[cfg(feature = "pruning-conformance")]
+            None,
             fan_out && !metering,
         )?;
         let collected = collector.finish()?;
@@ -4814,6 +5480,7 @@ impl QuillReader {
             .collect())
     }
 
+    #[cfg(any(test, feature = "bench-internals"))]
     fn execute_ranked_query(
         &self,
         cx: &Cx,
@@ -4823,6 +5490,32 @@ impl QuillReader {
         offset: usize,
         exact_count: bool,
         diagnostics: Vec<QueryDiagnostic>,
+    ) -> Result<QuillSearchResult, QuillIndexError> {
+        self.execute_ranked_query_inner(
+            cx,
+            query,
+            snapshot,
+            limit,
+            offset,
+            exact_count,
+            diagnostics,
+            #[cfg(feature = "pruning-conformance")]
+            None,
+        )
+    }
+
+    fn execute_ranked_query_inner(
+        &self,
+        cx: &Cx,
+        query: &Query,
+        snapshot: &QuillSearchSnapshot,
+        limit: usize,
+        offset: usize,
+        exact_count: bool,
+        diagnostics: Vec<QueryDiagnostic>,
+        #[cfg(feature = "pruning-conformance")] pruning_trace: Option<
+            &ConformancePruningTraceSession,
+        >,
     ) -> Result<QuillSearchResult, QuillIndexError> {
         validate_query_lowering(query, 1.0, self.schema)?;
         let work_upper_bound =
@@ -4853,6 +5546,9 @@ impl QuillReader {
             .map(|segment| u64::from(segment.doc_count()))
             .sum();
         let fan_out = sealed_segment_fanout(keeper.segments().len(), sealed_docs) && !metering;
+        #[cfg(feature = "pruning-conformance")]
+        let fan_out = fan_out
+            && pruning_trace.is_none_or(|trace| trace.cancellation_arm_generation().is_none());
         self.collect_sealed_segments(
             cx,
             &checkpoint,
@@ -4861,6 +5557,8 @@ impl QuillReader {
             snapshot,
             rank_pruning,
             topdocs_root,
+            #[cfg(feature = "pruning-conformance")]
+            pruning_trace,
             fan_out,
         )?;
         for delta in snapshot.delta_snapshots() {
@@ -4961,18 +5659,32 @@ impl QuillReader {
         snapshot: &QuillSearchSnapshot,
         rank_pruning: bool,
         topdocs_root: bool,
+        #[cfg(feature = "pruning-conformance")] pruning_trace: Option<
+            &ConformancePruningTraceSession,
+        >,
         fan_out: bool,
     ) -> Result<(), QuillIndexError> {
         let keeper = snapshot.keeper_snapshot();
+        #[cfg(feature = "pruning-conformance")]
+        if let Some(trace) = pruning_trace {
+            trace.bind_execution_mode(if fan_out {
+                ConformancePruningExecutionMode::Rayon
+            } else {
+                ConformancePruningExecutionMode::Serial
+            })?;
+        }
         if fan_out {
             check_cancel(cx, "search")?;
             let template = collector.empty_like()?;
             let schema = self.schema;
             let glob_expansion_limit = self.config.glob_expansion_limit;
+            let segment_count = keeper.segments().len();
             let partials = keeper
                 .segments()
                 .par_iter()
-                .map(|segment| {
+                .enumerate()
+                .map(|(segment_ordinal, segment)| {
+                    debug_assert!(segment_ordinal < segment_count);
                     checkpoint.admit(QueryWorkKind::Segment, 1)?;
                     let mut local = template.empty_like()?;
                     let score_span = tracing::info_span!(
@@ -5004,6 +5716,19 @@ impl QuillReader {
                     )?;
                     local.collect(&mut scorer, segment)?;
                     record_pruning_telemetry(&score_span, scorer.pruning_telemetry());
+                    #[cfg(feature = "pruning-conformance")]
+                    if let Some(trace) = pruning_trace {
+                        trace.record_and_checkpoint(
+                            u64::try_from(segment_ordinal).map_err(|_| {
+                                invalid_state("Quill segment ordinal does not fit u64")
+                            })?,
+                            u64::from(segment.doc_count()),
+                            scorer.conformance_union_refills(),
+                            &self.conformance_controller,
+                            cx,
+                        )?;
+                        check_cancel(cx, "search")?;
+                    }
                     Ok(local)
                 })
                 .collect::<Result<Vec<_>, QuillIndexError>>()?;
@@ -5012,7 +5737,9 @@ impl QuillReader {
                 collector.merge(partial)?;
             }
         } else {
-            for segment in keeper.segments() {
+            let segment_count = keeper.segments().len();
+            for (segment_ordinal, segment) in keeper.segments().iter().enumerate() {
+                debug_assert!(segment_ordinal < segment_count);
                 checkpoint.admit(QueryWorkKind::Segment, 1)?;
                 let score_span = tracing::info_span!(
                     target: crate::tracing_conventions::TARGET,
@@ -5043,6 +5770,18 @@ impl QuillReader {
                 )?;
                 collector.collect(&mut scorer, segment)?;
                 record_pruning_telemetry(&score_span, scorer.pruning_telemetry());
+                #[cfg(feature = "pruning-conformance")]
+                if let Some(trace) = pruning_trace {
+                    trace.record_and_checkpoint(
+                        u64::try_from(segment_ordinal)
+                            .map_err(|_| invalid_state("Quill segment ordinal does not fit u64"))?,
+                        u64::from(segment.doc_count()),
+                        scorer.conformance_union_refills(),
+                        &self.conformance_controller,
+                        cx,
+                    )?;
+                    check_cancel(cx, "search")?;
+                }
             }
         }
         Ok(())
@@ -5654,6 +6393,8 @@ impl QuillIndex {
             snapshot,
             rank_pruning,
             topdocs_root,
+            #[cfg(feature = "pruning-conformance")]
+            None,
             fan_out && !metering,
         )
     }
@@ -5783,6 +6524,32 @@ impl QuillIndex {
     #[must_use]
     pub fn conformance_cancellation_controller(&self) -> Arc<ConformanceCancellationController> {
         Arc::clone(&self.reader.conformance_controller)
+    }
+
+    /// Execute one ranked search with an invocation-bound pruning trace.
+    ///
+    /// # Errors
+    ///
+    /// Returns the ordinary typed query failure, or a typed conformance error
+    /// if the exact invocation does not produce one dense receipt per sealed
+    /// segment. Partial receipts are failed and discarded before return.
+    #[cfg(feature = "pruning-conformance")]
+    #[doc(hidden)]
+    pub fn search_paginated_with_conformance_pruning_trace(
+        &self,
+        cx: &Cx,
+        query: &str,
+        limit: usize,
+        offset: usize,
+        exact_count: bool,
+    ) -> Result<(QuillSearchResult, ConformancePruningTraceReceipt), QuillIndexError> {
+        self.reader.search_paginated_with_conformance_pruning_trace(
+            cx,
+            query,
+            limit,
+            offset,
+            exact_count,
+        )
     }
 
     /// Capture a fixed-size digest receipt for the complete retained scalar
@@ -9155,6 +9922,207 @@ mod tests {
         "\"shared left\"",
         "ord:[0 TO 39]",
     ];
+
+    #[cfg(feature = "pruning-conformance")]
+    #[test]
+    fn pruning_conformance_session_is_dense_one_shot_and_fail_closed() {
+        let completed = ConformancePruningTraceSession::new(2);
+        completed
+            .bind_execution_mode(ConformancePruningExecutionMode::Rayon)
+            .expect("bind exact shipping branch");
+        completed
+            .record(1, 7, &[])
+            .expect("record second segment first");
+        completed
+            .record(0, 5, &[])
+            .expect("record first segment second");
+        let receipt = completed.complete().expect("complete dense trace");
+        assert_eq!(
+            receipt.execution_mode(),
+            ConformancePruningExecutionMode::Rayon
+        );
+        assert_eq!(
+            receipt
+                .segments()
+                .iter()
+                .map(ConformanceSegmentPruningReceipt::segment_ordinal)
+                .collect::<Vec<_>>(),
+            vec![0, 1],
+        );
+        assert_eq!(
+            receipt
+                .segments()
+                .iter()
+                .map(ConformanceSegmentPruningReceipt::segment_doc_count)
+                .collect::<Vec<_>>(),
+            vec![5, 7],
+        );
+        assert!(matches!(
+            completed.complete(),
+            Err(QuillIndexError::InvalidState { detail })
+                if detail.contains("already completed")
+        ));
+
+        let record_before_bind = ConformancePruningTraceSession::new(1);
+        assert!(matches!(
+            record_before_bind.record(0, 1, &[]),
+            Err(QuillIndexError::InvalidState { detail })
+                if detail.contains("was not bound before recording")
+        ));
+        assert!(matches!(
+            record_before_bind.bind_execution_mode(ConformancePruningExecutionMode::Serial),
+            Err(QuillIndexError::InvalidState { detail })
+                if detail.contains("has failed")
+        ));
+
+        let double_bind = ConformancePruningTraceSession::new(1);
+        double_bind
+            .bind_execution_mode(ConformancePruningExecutionMode::Serial)
+            .expect("bind one exact execution mode");
+        assert!(matches!(
+            double_bind.bind_execution_mode(ConformancePruningExecutionMode::Rayon),
+            Err(QuillIndexError::InvalidState { detail })
+                if detail.contains("already bound")
+        ));
+        assert!(matches!(
+            double_bind.record(0, 1, &[]),
+            Err(QuillIndexError::InvalidState { detail })
+                if detail.contains("has failed")
+        ));
+
+        let out_of_range = ConformancePruningTraceSession::new(1);
+        out_of_range
+            .bind_execution_mode(ConformancePruningExecutionMode::Serial)
+            .expect("bind out-of-range session");
+        assert!(matches!(
+            out_of_range.record(1, 1, &[]),
+            Err(QuillIndexError::InvalidState { detail })
+                if detail.contains("exceeds expected count")
+        ));
+        assert!(matches!(
+            out_of_range.record(0, 1, &[]),
+            Err(QuillIndexError::InvalidState { detail })
+                if detail.contains("has failed")
+        ));
+
+        let duplicate = ConformancePruningTraceSession::new(1);
+        duplicate
+            .bind_execution_mode(ConformancePruningExecutionMode::Serial)
+            .expect("bind serial path");
+        duplicate.record(0, 1, &[]).expect("first receipt");
+        assert!(matches!(
+            duplicate.record(0, 1, &[]),
+            Err(QuillIndexError::InvalidState { detail })
+                if detail.contains("recorded twice")
+        ));
+        assert!(matches!(
+            duplicate.complete(),
+            Err(QuillIndexError::InvalidState { detail })
+                if detail.contains("has failed")
+        ));
+
+        let incomplete = ConformancePruningTraceSession::new(2);
+        incomplete
+            .bind_execution_mode(ConformancePruningExecutionMode::Serial)
+            .expect("bind incomplete serial path");
+        incomplete
+            .record(0, 1, &[])
+            .expect("record partial receipt");
+        assert!(matches!(
+            incomplete.complete(),
+            Err(QuillIndexError::InvalidState { detail })
+                if detail.contains("trace is incomplete")
+        ));
+        assert!(matches!(
+            incomplete.record(1, 1, &[]),
+            Err(QuillIndexError::InvalidState { detail })
+                if detail.contains("has failed")
+        ));
+
+        let dropped_controller = Arc::new(ConformanceCancellationController::default());
+        dropped_controller
+            .arm(
+                ConformanceCancellationStage::PruningTraceSegmentRecorded,
+                u64::MAX,
+            )
+            .expect("arm dropped-session accounting");
+        let dropped_guard = ConformancePruningTraceGuard::new(1, Arc::clone(&dropped_controller));
+        let dropped_session = Arc::clone(&dropped_guard.session);
+        dropped_session
+            .bind_execution_mode(ConformancePruningExecutionMode::Serial)
+            .expect("bind guard-owned session");
+        dropped_session
+            .record(0, 1, &[])
+            .expect("record partial guard-owned receipt");
+        drop(dropped_guard);
+        assert!(matches!(
+            dropped_session.complete(),
+            Err(QuillIndexError::InvalidState { detail })
+                if detail.contains("has failed")
+        ));
+        assert_eq!(
+            dropped_controller.discarded_pruning_trace_sessions(),
+            1,
+            "dropping an incomplete invocation records one discarded session"
+        );
+
+        let generation_controller = Arc::new(ConformanceCancellationController::default());
+        generation_controller
+            .arm(
+                ConformanceCancellationStage::PruningTraceSegmentRecorded,
+                u64::MAX,
+            )
+            .expect("arm stale generation");
+        let stale_guard = ConformancePruningTraceGuard::new(1, Arc::clone(&generation_controller));
+        stale_guard
+            .session()
+            .bind_execution_mode(ConformancePruningExecutionMode::Serial)
+            .expect("bind stale guard");
+        generation_controller.disarm();
+        generation_controller
+            .arm(
+                ConformanceCancellationStage::PruningTraceSegmentRecorded,
+                u64::MAX,
+            )
+            .expect("arm successor generation");
+        drop(stale_guard);
+        assert_eq!(
+            generation_controller.discarded_pruning_trace_sessions(),
+            0,
+            "a stale guard must not contaminate a later arm generation"
+        );
+        let current_guard =
+            ConformancePruningTraceGuard::new(1, Arc::clone(&generation_controller));
+        current_guard
+            .session()
+            .bind_execution_mode(ConformancePruningExecutionMode::Serial)
+            .expect("bind current guard");
+        drop(current_guard);
+        assert_eq!(
+            generation_controller.discarded_pruning_trace_sessions(),
+            1,
+            "the current arm generation must retain its own discarded-session count"
+        );
+
+        let exhausted_controller = ConformanceCancellationController::default();
+        exhausted_controller
+            .arm_generation
+            .store(u64::MAX, Ordering::Relaxed);
+        assert!(matches!(
+            exhausted_controller.arm(
+                ConformanceCancellationStage::PruningTraceSegmentRecorded,
+                1,
+            ),
+            Err(QuillIndexError::InvalidState { detail })
+                if detail.contains("arm generation is exhausted")
+        ));
+        assert_eq!(
+            exhausted_controller.stage.load(Ordering::Acquire),
+            ConformanceCancellationController::DISARMED,
+            "generation exhaustion must leave the controller disarmed"
+        );
+    }
+
     #[cfg(feature = "bench-internals")]
     const POSITIONLESS_QG_FIELDS: [FieldDescriptor; 5] = [
         FieldDescriptor {
@@ -10458,7 +11426,15 @@ mod tests {
             "alpha", "beta", "gamma", "delta", "epsilon", "zeta", "shared", "rare", "quill",
             "argus",
         ];
-        let index = QuillIndex::in_memory(deterministic_config()).expect("memory index");
+        let tier_fanout = segments
+            .checked_add(1)
+            .expect("fan-out fixture segment count leaves room for its tier policy");
+        let index = QuillIndex::in_memory(QuillConfig {
+            deterministic_ingest: true,
+            tier_fanout,
+            ..QuillConfig::default()
+        })
+        .expect("memory index");
         let mut state = seed | 1;
         let mut next = move || {
             state ^= state << 13;
@@ -10579,6 +11555,167 @@ mod tests {
             SEGMENT_FANOUT_THRESHOLD - 1,
         ));
         assert!(sealed_segment_fanout(16, u64::MAX));
+    }
+
+    #[cfg(feature = "pruning-conformance")]
+    #[test]
+    fn pruning_conformance_invocation_bound_traces_do_not_cross_concurrent_searches() {
+        run_with_cx(|cx| async move {
+            let index =
+                segment_fanout_fixture_index(&cx, SEGMENT_COUNT_FANOUT_THRESHOLD, 64, 0x51A7).await;
+            let expected_doc_counts = index
+                .snapshot()
+                .segments()
+                .iter()
+                .map(|segment| u64::from(segment.doc_count()))
+                .collect::<Vec<_>>();
+            let query = "shared OR alpha";
+            let (first, (second, ordinary)) = rayon::join(
+                || {
+                    index
+                        .search_paginated_with_conformance_pruning_trace(&cx, query, 20, 0, false)
+                        .expect("first concurrent traced search")
+                },
+                || {
+                    rayon::join(
+                        || {
+                            index
+                                .search_paginated_with_conformance_pruning_trace(
+                                    &cx, query, 20, 0, false,
+                                )
+                                .expect("second concurrent traced search")
+                        },
+                        || {
+                            index
+                                .search_paginated(&cx, query, 20, 0, false)
+                                .expect("concurrent ordinary search")
+                        },
+                    )
+                },
+            );
+
+            assert_eq!(first.0, second.0);
+            assert_eq!(first.0, ordinary);
+            for receipt in [&first.1, &second.1] {
+                assert_eq!(
+                    receipt.execution_mode(),
+                    ConformancePruningExecutionMode::Rayon,
+                );
+                assert_eq!(receipt.segments().len(), expected_doc_counts.len());
+                assert_eq!(
+                    receipt
+                        .segments()
+                        .iter()
+                        .map(ConformanceSegmentPruningReceipt::segment_ordinal)
+                        .collect::<Vec<_>>(),
+                    (0..u64::try_from(expected_doc_counts.len())
+                        .expect("fan-out segment count fits u64"))
+                        .collect::<Vec<_>>(),
+                );
+                assert_eq!(
+                    receipt
+                        .segments()
+                        .iter()
+                        .map(ConformanceSegmentPruningReceipt::segment_doc_count)
+                        .collect::<Vec<_>>(),
+                    expected_doc_counts,
+                );
+            }
+        });
+    }
+
+    #[cfg(feature = "pruning-conformance")]
+    #[test]
+    fn pruning_conformance_cancellation_forces_high_fanout_trace_to_serial() {
+        run_with_cx(|cx| async move {
+            let index =
+                segment_fanout_fixture_index(&cx, SEGMENT_COUNT_FANOUT_THRESHOLD, 64, 0x5A1E).await;
+            let controller = index.conformance_cancellation_controller();
+            controller
+                .arm(ConformanceCancellationStage::PruningTraceSegmentRecorded, 1)
+                .expect("arm high-fanout pruning cancellation");
+
+            let error = index
+                .search_paginated_with_conformance_pruning_trace(
+                    &cx,
+                    "shared OR alpha",
+                    20,
+                    0,
+                    false,
+                )
+                .expect_err("armed high-fanout trace must cancel after its first receipt");
+            assert!(matches!(
+                error,
+                QuillIndexError::Cancelled { phase: "search" }
+            ));
+            assert_eq!(controller.observed_checkpoints(), 1);
+            assert_eq!(controller.recorded_pruning_receipts_at_fire(), 1);
+            assert_eq!(
+                controller.pruning_trace_execution_mode_at_fire(),
+                Some(ConformancePruningExecutionMode::Serial),
+                "the injected invocation must replace schedule-dependent Rayon receipt order with serial segment order",
+            );
+            assert_eq!(controller.discarded_pruning_trace_sessions(), 1);
+
+            controller.disarm();
+            cx.set_cancel_requested(false);
+            let (_, receipt) = index
+                .search_paginated_with_conformance_pruning_trace(
+                    &cx,
+                    "shared OR alpha",
+                    20,
+                    0,
+                    false,
+                )
+                .expect("unarmed high-fanout replay");
+            assert_eq!(
+                receipt.execution_mode(),
+                ConformancePruningExecutionMode::Rayon,
+                "ordinary traced high-fanout searches must retain the shipping Rayon branch",
+            );
+        });
+    }
+
+    #[cfg(feature = "pruning-conformance")]
+    #[test]
+    fn pruning_conformance_stale_session_cannot_checkpoint_rearmed_controller() {
+        run_with_cx(|cx| async move {
+            let controller = ConformanceCancellationController::default();
+            controller
+                .arm(ConformanceCancellationStage::PruningTraceSegmentRecorded, 1)
+                .expect("arm stale-session generation");
+            let stale_generation = controller
+                .active_pruning_trace_arm_generation()
+                .expect("capture stale pruning generation");
+            let stale_session =
+                ConformancePruningTraceSession::new_for_cancellation_arm(1, Some(stale_generation));
+            stale_session
+                .bind_execution_mode(ConformancePruningExecutionMode::Serial)
+                .expect("bind stale session");
+
+            controller.disarm();
+            controller
+                .arm(ConformanceCancellationStage::PruningTraceSegmentRecorded, 1)
+                .expect("arm replacement generation");
+            assert_eq!(
+                stale_session
+                    .record_and_checkpoint(0, 1, &[], &controller, &cx)
+                    .expect("record stale receipt without crossing generations"),
+                1,
+            );
+            assert_eq!(controller.observed_checkpoints(), 0);
+            assert_eq!(controller.recorded_pruning_receipts_at_fire(), 0);
+            assert_eq!(controller.pruning_trace_execution_mode_at_fire(), None);
+            assert!(!controller.fired());
+            assert!(!cx.is_cancel_requested());
+            assert_eq!(
+                stale_session
+                    .complete()
+                    .expect("complete generation-isolated stale session")
+                    .execution_mode(),
+                ConformancePruningExecutionMode::Serial,
+            );
+        });
     }
 
     #[test]

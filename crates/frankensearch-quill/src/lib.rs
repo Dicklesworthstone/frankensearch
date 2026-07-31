@@ -30,6 +30,9 @@ pub mod snippet;
 pub mod stats;
 pub mod tracing_conventions;
 
+/// Exact linked Quill package version for provenance-bearing consumers.
+pub const FRANKENSEARCH_QUILL_CRATE_VERSION: &str = env!("CARGO_PKG_VERSION");
+
 pub use config::QuillConfig;
 pub use error::{QuillError, map_lock_error};
 pub use grimoire::{
@@ -37,6 +40,12 @@ pub use grimoire::{
     TERM_BLOCK_TARGET_BYTES, TERM_RESTART_INTERVAL, TermCursor, TermDictionary,
     TermDictionaryError, TermDictionaryLimits, TermInput, TermMatch, TermMetadata, TermRef,
     TermScratch, TermSectionLengths,
+};
+#[cfg(feature = "pruning-conformance")]
+#[doc(hidden)]
+pub use index::{
+    ConformancePruningExecutionMode, ConformancePruningRefillReceipt, ConformancePruningStrategy,
+    ConformancePruningTraceReceipt, ConformanceSegmentPruningReceipt,
 };
 pub use index::{
     QUILL_LEXICAL_BACKEND, QuillDocumentWitness, QuillHit, QuillIndex, QuillIndexError,

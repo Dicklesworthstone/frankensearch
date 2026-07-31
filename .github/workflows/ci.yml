@@ -226,10 +226,46 @@ jobs:
         env:
           GAUNTLET_SUBJECT_REVISION: ${{ github.sha }}
           GAUNTLET_SUBJECT_DIRTY: "false"
-          GAUNTLET_ORACLE_REVISION: 062a5e5b2d41653b1c8b07888eda1a765e421f49
-          GAUNTLET_ORACLE_DIRTY: "false"
           GAUNTLET_ARTIFACT_ROOT: target/coverage/quill-gauntlet-pr
         run: cargo test -p frankensearch-quill-gauntlet --features tantivy-oracle runner::tests::live_ -- --nocapture
+
+      - name: Salej partial pruning-receipt cancellation PR gate
+        if: matrix.os == 'ubuntu-latest'
+        timeout-minutes: 15
+        run: cargo test -p frankensearch-quill --features pruning-conformance --test cancellation_contract pruning_conformance_traced_public_search_discards_partial_receipt_and_replays_exactly -- --exact --nocapture
+
+      - name: Salej pruning-trace lifecycle unit PR gate
+        if: matrix.os == 'ubuntu-latest'
+        timeout-minutes: 15
+        run: cargo test -p frankensearch-quill --lib --features pruning-conformance pruning_conformance_ -- --nocapture --test-threads=1
+
+      - name: Salej UNION_HORIZON exactness PR gate
+        if: matrix.os == 'ubuntu-latest'
+        timeout-minutes: 30
+        env:
+          GAUNTLET_SUBJECT_REVISION: ${{ github.sha }}
+          GAUNTLET_SUBJECT_DIRTY: "false"
+          GAUNTLET_UNION_HORIZON_ARTIFACT_ROOT: target/coverage/quill-gauntlet-salej/${{ github.run_id }}-${{ github.run_attempt }}
+          GAUNTLET_UNION_HORIZON_RUN_ID: ${{ github.run_id }}-${{ github.run_attempt }}
+        run: cargo test -p frankensearch-quill-gauntlet --features tantivy-oracle,pruning-conformance runner::tests::salej_complete_union_horizon_evidence_bundle -- --ignored --exact --nocapture --test-threads=1
+
+      - name: Upload admitted Salej UNION_HORIZON evidence
+        if: success() && matrix.os == 'ubuntu-latest'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: quill-gauntlet-salej-${{ github.run_id }}-${{ github.run_attempt }}
+          path: target/coverage/quill-gauntlet-salej/${{ github.run_id }}-${{ github.run_attempt }}/completion-*.json
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload non-admissible Salej failure attempt
+        if: failure() && matrix.os == 'ubuntu-latest'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: quill-gauntlet-salej-attempt-${{ github.run_id }}-${{ github.run_attempt }}
+          path: target/coverage/quill-gauntlet-salej/${{ github.run_id }}-${{ github.run_attempt }}/**
+          if-no-files-found: warn
+          retention-days: 14
 
       - name: Upload Quill oracle PR campaign artifacts
         if: always() && matrix.os == 'ubuntu-latest'
@@ -651,8 +687,6 @@ jobs:
           RCH_TEST_TIMEOUT_SEC: "4200"
           GAUNTLET_SUBJECT_REVISION: ${{ github.sha }}
           GAUNTLET_SUBJECT_DIRTY: "false"
-          GAUNTLET_ORACLE_REVISION: 062a5e5b2d41653b1c8b07888eda1a765e421f49
-          GAUNTLET_ORACLE_DIRTY: "false"
           GAUNTLET_ARTIFACT_ROOT: target/coverage/quill-gauntlet-nightly
         run: RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- cargo test --profile release -p frankensearch-quill-gauntlet --features tantivy-oracle runner::tests::live_both_profiles_campaign_nightly_full_lane -- --ignored --exact --nocapture
 

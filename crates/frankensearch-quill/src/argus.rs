@@ -2709,6 +2709,16 @@ impl<'a> ReferenceScorer<'a> {
             .map_or_else(PruningTelemetry::default, PruningTelemetry::from)
     }
 
+    /// Return exact refill receipts for method-bound conformance only.
+    #[cfg(feature = "pruning-conformance")]
+    #[must_use]
+    pub(crate) fn conformance_union_refills(&self) -> &[ConformanceUnionRefill] {
+        let ScorerNode::Union(union) = &self.node else {
+            return &[];
+        };
+        &union.conformance_refills
+    }
+
     #[cfg(test)]
     pub(crate) fn pruning_window_counts(&self) -> Option<(u64, u64)> {
         self.union_pruning_stats()
@@ -3791,6 +3801,33 @@ enum UnionPruningStrategy {
     BlockMaxWand,
 }
 
+/// Exact refill strategy captured only by tests and method-bound conformance.
+#[cfg(any(test, feature = "pruning-conformance"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ConformanceUnionRefillStrategy {
+    Exhaustive,
+    MaxScore,
+    BlockMaxWand,
+}
+
+/// Typed, bounded witness for one direct-term union refill.
+///
+/// Window bounds and cutoff bits are intentionally absent from shipping
+/// builds. The conformance harness uses them to prove temporal path coverage
+/// without scraping operational logs or exposing terms/document identities.
+#[cfg(any(test, feature = "pruning-conformance"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ConformanceUnionRefill {
+    pub(crate) ordinal: u64,
+    pub(crate) window_start: u32,
+    pub(crate) horizon_end: u64,
+    pub(crate) cutoff_bits: Option<u32>,
+    pub(crate) strategy: ConformanceUnionRefillStrategy,
+    pub(crate) candidate_docs: u64,
+    pub(crate) buffer_empty: bool,
+    pub(crate) live_work_remains: bool,
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct UnionPruningStats {
     max_score_windows: u64,
@@ -3874,6 +3911,8 @@ struct BufferedUnionScorer<'a> {
     current_score: f32,
     segment_num_docs: u32,
     pruning_stats: UnionPruningStats,
+    #[cfg(any(test, feature = "pruning-conformance"))]
+    conformance_refills: Vec<ConformanceUnionRefill>,
     /// Whole-group score ceiling captured once at construction, before the
     /// first refill drains any child into [`Self::score_window`].
     ///
@@ -3930,6 +3969,8 @@ impl<'a> BufferedUnionScorer<'a> {
             current_score: 0.0,
             segment_num_docs,
             pruning_stats: UnionPruningStats::default(),
+            #[cfg(any(test, feature = "pruning-conformance"))]
+            conformance_refills: Vec::new(),
             group_ceiling,
         };
         if scorer.refill()? {
@@ -4025,11 +4066,64 @@ impl<'a> BufferedUnionScorer<'a> {
                 .pruning_stats
                 .candidate_docs
                 .saturating_add(u64::try_from(candidates.docs.len()).unwrap_or(u64::MAX));
+            #[cfg(any(test, feature = "pruning-conformance"))]
+            let strategy = match candidates.strategy {
+                UnionPruningStrategy::MaxScore => ConformanceUnionRefillStrategy::MaxScore,
+                UnionPruningStrategy::BlockMaxWand => ConformanceUnionRefillStrategy::BlockMaxWand,
+            };
+            #[cfg(any(test, feature = "pruning-conformance"))]
+            let candidate_docs = u64::try_from(candidates.docs.len()).unwrap_or(u64::MAX);
             self.fill_candidate_window(window_start, horizon_end, &candidates.docs)?;
+            #[cfg(any(test, feature = "pruning-conformance"))]
+            self.record_conformance_refill(
+                window_start,
+                horizon_end,
+                Some(cutoff.to_bits()),
+                strategy,
+                candidate_docs,
+            );
             return Ok(true);
         }
         self.fill_exhaustive_window(window_start, horizon_end)?;
+        #[cfg(any(test, feature = "pruning-conformance"))]
+        self.record_conformance_refill(
+            window_start,
+            horizon_end,
+            cutoff.filter(|value| value.is_finite()).map(f32::to_bits),
+            ConformanceUnionRefillStrategy::Exhaustive,
+            u64::try_from(
+                self.score_window
+                    .iter()
+                    .filter(|score| score.is_some())
+                    .count(),
+            )
+            .unwrap_or(u64::MAX),
+        );
         Ok(true)
+    }
+
+    #[cfg(any(test, feature = "pruning-conformance"))]
+    fn record_conformance_refill(
+        &mut self,
+        window_start: u32,
+        horizon_end: u64,
+        cutoff_bits: Option<u32>,
+        strategy: ConformanceUnionRefillStrategy,
+        candidate_docs: u64,
+    ) {
+        let ordinal = u64::try_from(self.conformance_refills.len())
+            .unwrap_or(u64::MAX)
+            .saturating_add(1);
+        self.conformance_refills.push(ConformanceUnionRefill {
+            ordinal,
+            window_start,
+            horizon_end,
+            cutoff_bits,
+            strategy,
+            candidate_docs,
+            buffer_empty: self.score_window.iter().all(Option::is_none),
+            live_work_remains: !self.active.is_empty(),
+        });
     }
 
     fn fill_exhaustive_window(
@@ -8932,7 +9026,7 @@ mod tests {
     /// exhaustive buffer, attempt exactly one competitive refill and stop when
     /// that window contains no candidates. Production must keep refilling
     /// because a later horizon can still contain an essential-term winner.
-    fn collect_one_competitive_refill_for_negative_control(
+    fn collect_until_first_empty_competitive_refill_for_negative_control(
         union: &mut BufferedUnionScorer<'_>,
         collector: &mut TopDocsCollector,
     ) -> Result<(), ArgusError> {
@@ -8950,6 +9044,40 @@ mod tests {
             );
         }
         Ok(())
+    }
+
+    /// Conservative control that keeps applying the first legitimate
+    /// competitive cutoff while still allowing the real collector heap to
+    /// improve. The retained cutoff can admit extra work but cannot exclude a
+    /// document admitted by a later, higher cutoff.
+    fn collect_with_first_competitive_cutoff_for_control(
+        union: &mut BufferedUnionScorer<'_>,
+        collector: &mut TopDocsCollector,
+    ) -> Result<(UnionPruningStats, Vec<u32>), ArgusError> {
+        let mut first_cutoff = None;
+        let mut refreshed_cutoff_bits = Vec::new();
+        while let Some(doc) = union.doc() {
+            collector.record_live(doc, Some(union.score()?))?;
+            if union.advance_buffered().is_some() {
+                continue;
+            }
+            loop {
+                let refreshed_cutoff = collector.competitive_cutoff_score();
+                if let Some(refreshed_cutoff) = refreshed_cutoff {
+                    first_cutoff.get_or_insert(refreshed_cutoff);
+                }
+                if !union.refill_with_cutoff(first_cutoff.or(refreshed_cutoff))? {
+                    return Ok((union.pruning_stats, refreshed_cutoff_bits));
+                }
+                if let Some(refreshed_cutoff) = refreshed_cutoff {
+                    refreshed_cutoff_bits.push(refreshed_cutoff.to_bits());
+                }
+                if union.advance_buffered().is_some() {
+                    break;
+                }
+            }
+        }
+        Ok((union.pruning_stats, refreshed_cutoff_bits))
     }
 
     #[test]
@@ -9021,7 +9149,10 @@ mod tests {
         let ScorerNode::Union(broken_union) = &mut broken.node else {
             panic!("UNION_HORIZON fixture must lower to a buffered union");
         };
-        collect_one_competitive_refill_for_negative_control(broken_union, &mut broken_collector)?;
+        collect_until_first_empty_competitive_refill_for_negative_control(
+            broken_union,
+            &mut broken_collector,
+        )?;
         assert_eq!(broken_union.pruning_stats.max_score_windows, 1);
         assert_eq!(broken_union.pruning_stats.block_max_wand_windows, 0);
         assert_eq!(broken_union.pruning_stats.candidate_docs, 0);
@@ -9064,6 +9195,125 @@ mod tests {
         assert_eq!(stats.block_max_wand_windows, 0);
         assert_eq!(stats.candidate_docs, 1);
         assert_eq!(stats.blocks_skipped, 0);
+        Ok(())
+    }
+
+    #[test]
+    fn older_monotone_cutoff_is_exact_but_admits_more_candidates()
+    -> Result<(), Box<dyn std::error::Error>> {
+        const NUM_DOCS: u32 = 10_001;
+        const FIRST_DOC: u32 = 0;
+        const WINNER_DOC: u32 = 5_000;
+        const STALE_ONLY_DOC: u32 = 10_000;
+        let lengths = vec![Some(1); usize::try_from(NUM_DOCS)?];
+        let encoded_doclens = EncodedDocLenSection::encode(
+            0,
+            u64::from(NUM_DOCS),
+            &[1],
+            &[DocLenFieldInput::new(1, &lengths)],
+        )?;
+        let doclens = encoded_doclens.section(&[1])?;
+        let field = doclens.field(1).expect("field exists");
+        let snapshot = snapshot(1, u64::from(NUM_DOCS), u64::from(NUM_DOCS))?;
+        let rows_by_term = vec![
+            vec![Posting::new(FIRST_DOC, 1)],
+            vec![Posting::new(WINNER_DOC, 1)],
+            vec![Posting::new(STALE_ONLY_DOC, 1)],
+            vec![Posting::new(STALE_ONLY_DOC, 1)],
+        ];
+        // The low companion makes direct-term MaxScore admissible without
+        // changing the ordering we need to prove:
+        //
+        // * first cutoff ~= 2.0;
+        // * middle winner ~= 4.0;
+        // * stale-only document ~= 2.75.
+        //
+        // With the old cutoff, the 2.5 term remains essential and admits the
+        // stale-only document. With the refreshed cutoff, 2.5 + 0.25 is below
+        // the heap threshold and both terms are safely non-essential.
+        let boosts = [2.0, 4.0, 2.5, 0.25];
+        let encoded_terms = rows_by_term
+            .iter()
+            .map(|rows| {
+                EncodedPostingList::encode_with_block_max(rows, |doc| {
+                    field.fieldnorm_id(u64::from(doc))
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let posting_lists = encoded_terms
+            .iter()
+            .map(|(postings, _)| postings.posting_list())
+            .collect::<Result<Vec<_>, _>>()?;
+        let block_max = validated_block_max_entries(&encoded_terms, &posting_lists, field)?;
+
+        let mut exhaustive = sealed_union(
+            &posting_lists,
+            None,
+            field,
+            &snapshot,
+            &rows_by_term,
+            &boosts,
+            NUM_DOCS,
+        )?;
+        let mut exhaustive_collector = TopDocsCollector::new(1, 0)?;
+        exhaustive_collector.collect(&mut exhaustive, &AllLiveDocs)?;
+        let exhaustive_hits = exhaustive_collector.finish()?.hits;
+
+        let mut refreshed = sealed_union(
+            &posting_lists,
+            Some(&block_max),
+            field,
+            &snapshot,
+            &rows_by_term,
+            &boosts,
+            NUM_DOCS,
+        )?;
+        let mut refreshed_collector = TopDocsCollector::new(1, 0)?;
+        refreshed_collector.collect(&mut refreshed, &AllLiveDocs)?;
+        let refreshed_stats = refreshed
+            .union_pruning_stats()
+            .expect("top-level refreshed union retains pruning stats");
+        let refreshed_hits = refreshed_collector.finish()?.hits;
+
+        let mut fixed = sealed_union(
+            &posting_lists,
+            Some(&block_max),
+            field,
+            &snapshot,
+            &rows_by_term,
+            &boosts,
+            NUM_DOCS,
+        )?;
+        let mut fixed_collector = TopDocsCollector::new(1, 0)?;
+        let ScorerNode::Union(fixed_union) = &mut fixed.node else {
+            return Err(std::io::Error::other(
+                "cutoff-control fixture must lower to a buffered union",
+            )
+            .into());
+        };
+        let (fixed_stats, refreshed_cutoff_bits) =
+            collect_with_first_competitive_cutoff_for_control(fixed_union, &mut fixed_collector)?;
+        let fixed_hits = fixed_collector.finish()?.hits;
+
+        assert_hits_bit_exact(&refreshed_hits, &exhaustive_hits);
+        assert_hits_bit_exact(&fixed_hits, &exhaustive_hits);
+        assert_eq!(exhaustive_hits[0].global_docid, WINNER_DOC);
+        assert_eq!(refreshed_stats.max_score_windows, 2);
+        assert_eq!(fixed_stats.max_score_windows, 2);
+        assert_eq!(refreshed_stats.candidate_docs, 1);
+        assert_eq!(fixed_stats.candidate_docs, 2);
+        assert!(
+            fixed_stats.candidate_docs > refreshed_stats.candidate_docs,
+            "older cutoff must be no more selective than the refreshed cutoff",
+        );
+        assert_eq!(refreshed_cutoff_bits.len(), 2);
+        let first_cutoff = f32::from_bits(refreshed_cutoff_bits[0]);
+        let second_cutoff = f32::from_bits(refreshed_cutoff_bits[1]);
+        assert_eq!(
+            second_cutoff.total_cmp(&first_cutoff),
+            std::cmp::Ordering::Greater,
+            "the real collector cutoff must increase after the middle-horizon winner",
+        );
         Ok(())
     }
 
