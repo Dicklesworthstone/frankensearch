@@ -9781,7 +9781,7 @@ mod tests {
             let segment = &before_snapshot.segments()[0];
             assert_eq!(segment.term_dictionary_cache_counts().0, 1);
             assert_eq!(segment.term_dictionary_metadata_reuse_count(), 0);
-            let metadata_bytes = segment.term_dictionary_metadata_bytes();
+            let metadata_bytes = segment.term_dictionary_metadata_payload_bytes();
             assert!(metadata_bytes > 0, "validated metadata must be accounted");
             let baseline = index
                 .search_paginated(&cx, "shared", 10, 0, true)
@@ -9815,7 +9815,7 @@ mod tests {
                 "the successor generation must reuse the validated metadata"
             );
             assert_eq!(
-                rebound.term_dictionary_metadata_bytes(),
+                rebound.term_dictionary_metadata_payload_bytes(),
                 metadata_bytes,
                 "reuse must not grow persistent metadata bytes"
             );
