@@ -19,6 +19,7 @@ mod perf;
 mod perf_assembly;
 mod perf_evidence;
 mod perf_ratchet;
+mod qg2_contract;
 mod qg6_prepared;
 mod runner;
 mod version_contract;
@@ -156,6 +157,14 @@ pub use perf_ratchet::{
     PERF_REGRESSION_ROBUST_Z, PerfCellComparison, PerfEvidenceFile, PerfGateDecision,
     PerfRatchetEvaluation, PerfRatchetMode, PerfRatchetReason, PerfRatchetRequest,
     evaluate_perf_ratchet, is_explicit_bootstrap, is_explicit_bootstrap_for,
+};
+pub use qg2_contract::{
+    QG2_CANONICAL_CONTRACT, QG2_CONTRACT_REPORT_SCHEMA_VERSION, QG2_LOGICAL_SURFACE_COUNT,
+    QG2_PHYSICAL_LOCATOR_COUNT, QG2_SENTINEL_COUNT, Qg2CommitBoundary, Qg2ComparatorContract,
+    Qg2ContractDivergence, Qg2ContractReport, Qg2ContractStatus, Qg2DurabilityScope,
+    Qg2ExcludedOperation, Qg2PreservedValueReceipt, Qg2SentinelSummary, Qg2SourceNonregression,
+    Qg2StaleHistoryDisposition, Qg2StaleHistoryReceipt, Qg2StorageTopology, Qg2SurfaceReceipt,
+    Qg2TimingEnd, Qg2TimingStart, Qg2TopologySummary, validate_qg2_contract,
 };
 pub use qg6_prepared::{
     Qg6ArmLifecycle, Qg6ArmRole, Qg6Comparison, Qg6ExperimentIdentity, Qg6FourArmResultReceipts,

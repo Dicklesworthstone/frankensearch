@@ -49,6 +49,10 @@ path = "src/bin/quill_perf_ratchet.rs"
 name = "quill-perf-finalize"
 path = "src/bin/quill_perf_finalize.rs"
 
+[[bin]]
+name = "quill-qg2-contract"
+path = "src/bin/quill_qg2_contract.rs"
+
 [dev-dependencies]
 asupersync = { workspace = true, features = ["test-internals"] }
 criterion = { workspace = true }
