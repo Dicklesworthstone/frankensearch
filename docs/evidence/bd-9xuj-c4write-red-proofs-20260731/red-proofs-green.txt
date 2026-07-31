@@ -1,0 +1,65 @@
+=== bd-9xuj C4-write RED PROOFS GREEN transcript (FINAL bytes) ===
+date: 2026-07-31T16:04:55-04:00
+refresh.rs sha256: 33d9e386e5210a572381505071e0b31bc2007ac4ef49520696a2393be1466fc8
+base tree: c73dbe8eabbd39774b0d096a24fe274401c8e4ea
+     |                                              ^^^^^^^^^
+
+warning: `frankensearch-index` (lib) generated 5 warnings
+   Compiling frankensearch-fusion v0.2.1 (/data/tmp/claude-1000/-data-projects-frankensearch/6ba18fed-10c5-4855-b287-a7067faf4133/scratchpad/t2-worktree/crates/frankensearch-fusion)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 3.70s
+     Running unittests src/lib.rs (/data/projects/frankensearch/target/debug/deps/frankensearch_fusion-b9ea2b55249cf0ab)
+
+running 49 tests
+test refresh::tests::config_builder_methods ... ok
+test refresh::tests::config_clone ... ok
+test refresh::tests::config_debug ... ok
+test refresh::tests::config_with_index_config ... ok
+test refresh::tests::config_index_config_override ... ok
+test refresh::tests::config_index_dir_from_new ... ok
+test refresh::tests::config_defaults ... ok
+test refresh::tests::metrics_default_all_zeros ... ok
+test refresh::tests::metrics_snapshot ... ok
+test refresh::tests::metrics_snapshot_debug ... ok
+test refresh::tests::metrics_snapshot_equality ... ok
+test refresh::tests::metrics_individual_increments ... ok
+test refresh::tests::metrics_snapshot_clone_copy ... ok
+test refresh::tests::metrics_snapshot_inequality ... ok
+test refresh::tests::metrics_concurrent_increments ... ok
+test refresh::tests::refresh_metrics_debug_format ... ok
+test refresh::tests::index_dir_accessor ... ok
+test refresh::tests::worker_new_without_quality_debug ... ok
+test refresh::tests::two_faced_embedder_refused_at_bound_record_seam ... ok
+test refresh::tests::worker_with_quality_embedder_sets_embedder ... ok
+test refresh::tests::worker_metrics_accessor_returns_shared_arc ... ok
+test refresh::tests::failed_embedding_requeues_jobs ... ok
+test refresh::tests::run_cycle_empty_queue_returns_zero ... ok
+test refresh::tests::debug_format ... ok
+test refresh::tests::copied_certificate_foreign_producer_rejects ... ok
+test refresh::tests::certified_sibling_producer_refused_attestation_unavailable ... ok
+test refresh::tests::identityless_incremental_refusal_preserves_active_generation ... ok
+test refresh::tests::run_cycle_embeds_and_rebuilds_index ... ok
+test refresh::tests::run_cycle_records_content_hashes ... ok
+test refresh::tests::run_cycle_metrics_timing_nonzero ... ok
+test refresh::tests::live_v2_same_producer_cycle_refuses_composite_authority_with_zero_side_effects ... ok
+test refresh::tests::publish_staged_canonical_refuses_split_generation ... ok
+test refresh::tests::pre_drain_refusal_does_not_charge_embedding_or_rebuild_metrics ... ok
+test refresh::tests::duplicate_doc_id_keeps_latest_in_cycle ... ok
+test refresh::tests::quality_embedder_failure_proceeds_with_fast_only ... ok
+test refresh::tests::identityless_incremental_refusal_does_not_overwrite_existing_doc ... ok
+test refresh::tests::run_cycle_empty_after_prior_cycle_returns_zero ... ok
+test refresh::tests::run_cycle_respects_max_docs_per_cycle ... ok
+test refresh::tests::same_id_same_dimension_changed_space_cannot_bypass_identityless_refusal ... ok
+test refresh::tests::cross_space_attempt_rejects_with_typed_space_identity ... ok
+test refresh::tests::bootstrap_publishes_declared_identity_never_attested ... ok
+test refresh::tests::run_cycle_with_quality_embedder ... ok
+test refresh::tests::identityless_rebuild_refusal_preserves_tombstones_and_wal_residents ... ok
+test refresh::tests::identityless_refusal_preserves_prior_quality_tier ... ok
+test refresh::tests::unchanged_ids_cannot_exhaust_retry_budget_while_legacy_generation_is_blocked ... ok
+test refresh::tests::live_v2_quality_without_quality_embedder_refuses_republication ... ok
+test refresh::tests::staging_never_resurrects_tombstoned_rows ... ok
+test refresh::tests::staging_same_producer_merges_and_republishes_attested_v2 ... ok
+test refresh::tests::staging_quality_tier_carries_and_binds ... ok
+
+test result: ok. 49 passed; 0 failed; 0 ignored; 0 measured; 884 filtered out; finished in 1.59s
+
+EXIT_STATUS=0
