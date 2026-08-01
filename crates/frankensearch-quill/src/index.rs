@@ -10712,8 +10712,8 @@ mod tests {
             );
             assert_eq!(
                 borrowed_views_after,
-                borrowed_views_before.saturating_add(4),
-                "doc-frequency, two cursor opens, and the first search must borrow views; the remaining 31 searches must use the immutable-snapshot result cache"
+                borrowed_views_before.saturating_add(7),
+                "doc-frequency, two cursor opens, and four field-specific views for the first search must be borrowed; the remaining 31 searches must use the immutable-snapshot result cache"
             );
         });
     }
