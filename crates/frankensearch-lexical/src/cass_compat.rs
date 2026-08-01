@@ -2401,6 +2401,7 @@ pub fn cass_parse_boolean_query(query: &str) -> Vec<CassQueryToken> {
     }
 }
 
+#[cfg(feature = "tantivy-oracle")]
 fn cass_parse_boolean_query_bounded(
     query: &str,
     max_tokens: usize,
@@ -2498,6 +2499,7 @@ fn cass_classify_query_word(word: String) -> CassQueryToken {
     }
 }
 
+#[cfg(feature = "tantivy-oracle")]
 fn cass_push_query_token(
     tokens: &mut Vec<CassQueryToken>,
     token: CassQueryToken,
