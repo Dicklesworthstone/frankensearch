@@ -524,6 +524,42 @@ pub struct ParsedQuery {
     pub was_truncated: bool,
 }
 
+/// One token consumed by the native CASS grammar, including its source offset.
+///
+/// This is an evidence boundary rather than a second lexer: values are projected
+/// from the private token stream that [`CassQueryParser`] actually lowers. Text
+/// is intentionally retained here only in memory; durable gauntlet artifacts
+/// must redact it before persistence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CassQueryToken {
+    /// A term operand and its starting UTF-8 byte offset.
+    Term { text: String, byte_offset: usize },
+    /// A quoted phrase operand and its opening-quote byte offset.
+    Phrase { text: String, byte_offset: usize },
+    /// An explicit conjunction.
+    And { byte_offset: usize },
+    /// An explicit disjunction.
+    Or { byte_offset: usize },
+    /// An explicit or prefix negation.
+    Not { byte_offset: usize },
+}
+
+/// Complete in-memory witness emitted by the real native CASS parser.
+///
+/// `parsed` is exactly the value returned by [`CassQueryParser::parse`]. The
+/// additional fields expose the parser's actual token stream and the named
+/// CASS sanitization transform so a conformance adapter does not reconstruct
+/// either value from the source corpus.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CassParsedQueryObservation {
+    /// Lowered query tree, classification, diagnostics, and truncation state.
+    pub parsed: ParsedQuery,
+    /// Shipping CASS sanitization applied to the admitted query prefix.
+    pub sanitized_query: String,
+    /// Ordered tokens consumed by the native grammar.
+    pub tokens: Vec<CassQueryToken>,
+}
+
 /// Invalid schema configuration for the shipping default parser.
 #[derive(Debug, Clone, Error, PartialEq, Eq)]
 pub enum QueryParserConfigError {
@@ -3436,6 +3472,20 @@ impl CassQueryParser {
     /// Parse one CASS query and append its structured filters.
     #[must_use]
     pub fn parse(&self, raw_query: &str, filters: &CassQueryFilters) -> ParsedQuery {
+        self.parse_observed(raw_query, filters).parsed
+    }
+
+    /// Parse one CASS query and retain the exact lexer/lowering witness.
+    ///
+    /// This calls the same implementation as [`Self::parse`]. It exists for
+    /// dev-only conformance adapters that must observe the real parser boundary
+    /// without echoing or independently reparsing the input corpus.
+    #[must_use]
+    pub fn parse_observed(
+        &self,
+        raw_query: &str,
+        filters: &CassQueryFilters,
+    ) -> CassParsedQueryObservation {
         let (truncated_query, was_truncated) = truncated_prefix(raw_query);
         let mut diagnostics = Vec::new();
         if was_truncated {
@@ -3452,6 +3502,7 @@ impl CassQueryParser {
             );
         }
         let tokens = cass_lex(truncated_query, &mut diagnostics);
+        let observed_tokens = tokens.iter().map(CassLexToken::observed).collect();
         let mut grammar = CassGrammar {
             parser: *self,
             tokens,
@@ -3466,11 +3517,15 @@ impl CassQueryParser {
             }
         });
         let query = self.apply_filters(root, filters);
-        ParsedQuery {
-            query,
-            explanation: classify_query(truncated_query),
-            diagnostics: grammar.diagnostics,
-            was_truncated,
+        CassParsedQueryObservation {
+            parsed: ParsedQuery {
+                query,
+                explanation: classify_query(truncated_query),
+                diagnostics: grammar.diagnostics,
+                was_truncated,
+            },
+            sanitized_query: cass_sanitize_query(truncated_query),
+            tokens: observed_tokens,
         }
     }
 
@@ -3690,6 +3745,30 @@ enum CassLexToken {
     And { offset: usize },
     Or { offset: usize },
     Not { offset: usize },
+}
+
+impl CassLexToken {
+    fn observed(&self) -> CassQueryToken {
+        match self {
+            Self::Term { text, offset } => CassQueryToken::Term {
+                text: text.clone(),
+                byte_offset: *offset,
+            },
+            Self::Phrase { text, offset } => CassQueryToken::Phrase {
+                text: text.clone(),
+                byte_offset: *offset,
+            },
+            Self::And { offset } => CassQueryToken::And {
+                byte_offset: *offset,
+            },
+            Self::Or { offset } => CassQueryToken::Or {
+                byte_offset: *offset,
+            },
+            Self::Not { offset } => CassQueryToken::Not {
+                byte_offset: *offset,
+            },
+        }
+    }
 }
 
 fn cass_lex(query: &str, diagnostics: &mut Vec<QueryDiagnostic>) -> Vec<CassLexToken> {
@@ -4614,6 +4693,52 @@ mod tests {
 
     fn cass_parser() -> CassQueryParser {
         CassQueryParser::new(CASS_SEMANTIC_SCHEMA).expect("CASS schema supports its parser")
+    }
+
+    #[test]
+    fn cass_parser_observation_uses_the_real_lexer_and_admitted_prefix() {
+        let parser = cass_parser();
+        let raw = "c++ \"exact phrase\" OR -deprecated";
+        let filters = CassQueryFilters::default();
+        let observed = parser.parse_observed(raw, &filters);
+
+        assert_eq!(observed.parsed, parser.parse(raw, &filters));
+        assert_eq!(
+            observed.sanitized_query,
+            "c   \"exact phrase\" OR -deprecated"
+        );
+        assert_eq!(
+            observed.tokens,
+            vec![
+                CassQueryToken::Term {
+                    text: "c++".to_owned(),
+                    byte_offset: 0,
+                },
+                CassQueryToken::Phrase {
+                    text: "exact phrase".to_owned(),
+                    byte_offset: 4,
+                },
+                CassQueryToken::Or { byte_offset: 19 },
+                CassQueryToken::Not { byte_offset: 22 },
+                CassQueryToken::Term {
+                    text: "deprecated".to_owned(),
+                    byte_offset: 23,
+                },
+            ]
+        );
+
+        let mut oversized = "auth".to_owned();
+        oversized.push_str(&" ".repeat(MAX_QUERY_LENGTH - oversized.chars().count()));
+        oversized.push_str("private-tail");
+        let truncated = parser.parse_observed(&oversized, &filters);
+        assert!(truncated.parsed.was_truncated);
+        assert!(!truncated.sanitized_query.contains("private-tail"));
+        assert!(truncated.tokens.iter().all(|token| {
+            !matches!(
+                token,
+                CassQueryToken::Term { text, .. } if text.contains("private-tail")
+            )
+        }));
     }
 
     fn cass_filters_from_fixture(case: &Value) -> CassQueryFilters {

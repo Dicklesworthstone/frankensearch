@@ -1134,9 +1134,79 @@ impl CassTantivyIndex {
         limit: usize,
         tie_expansion_limit: usize,
     ) -> SearchResult<crate::OracleQueryObservation> {
-        let searcher = self.reader()?.searcher();
         let fields = self.fields();
         let query = cass_build_tantivy_query(raw_query, filters, &fields);
+        self.cass_oracle_observe_built_query(&*query, limit, tie_expansion_limit)
+    }
+
+    /// Observe the real CASS query build and retrieval boundaries without the
+    /// compatibility API's silent match-none fallback.
+    ///
+    /// The returned in-memory witness carries plaintext parser values only so
+    /// the gauntlet can immediately redact them. It is not an artifact DTO.
+    /// Query construction is total here: a regex, lowering, reader, search, or
+    /// document-loading failure is retained as [`CassOracleProfileOutcome::Error`]
+    /// instead of becoming an indistinguishable successful empty result.
+    #[cfg(feature = "tantivy-oracle")]
+    #[must_use]
+    pub fn cass_oracle_observe_query_profile(
+        &self,
+        raw_query: &str,
+        filters: &CassQueryFilters,
+        limit: usize,
+        tie_expansion_limit: usize,
+    ) -> CassOracleProfileObservation {
+        self.cass_oracle_observe_query_profile_with_regex_factory(
+            raw_query,
+            filters,
+            limit,
+            tie_expansion_limit,
+            cass_regex_query_cached,
+        )
+    }
+
+    #[cfg(feature = "tantivy-oracle")]
+    fn cass_oracle_observe_query_profile_with_regex_factory(
+        &self,
+        raw_query: &str,
+        filters: &CassQueryFilters,
+        limit: usize,
+        tie_expansion_limit: usize,
+        regex_query_factory: CassRegexQueryFactory,
+    ) -> CassOracleProfileObservation {
+        let tokens = cass_parse_boolean_query(raw_query);
+        let has_boolean_operators = cass_tokens_have_boolean_operators(&tokens);
+        let fields = self.fields();
+        let outcome = cass_try_build_tantivy_query_from_tokens(
+            tokens.clone(),
+            has_boolean_operators,
+            filters,
+            &fields,
+            regex_query_factory,
+        )
+        .and_then(|query| self.cass_oracle_observe_built_query(&*query, limit, tie_expansion_limit))
+        .map_or_else(
+            CassOracleProfileOutcome::Error,
+            CassOracleProfileOutcome::Success,
+        );
+        CassOracleProfileObservation {
+            sanitized_query: cass_sanitize_query(raw_query),
+            tokens,
+            has_boolean_operators,
+            filters: filters.clone(),
+            outcome,
+        }
+    }
+
+    #[cfg(feature = "tantivy-oracle")]
+    fn cass_oracle_observe_built_query(
+        &self,
+        query: &dyn Query,
+        limit: usize,
+        tie_expansion_limit: usize,
+    ) -> SearchResult<crate::OracleQueryObservation> {
+        let searcher = self.reader()?.searcher();
+        let fields = self.fields();
 
         // Fetch past `limit` so the cutoff tie group can be observed whole; a
         // truncated group is reported through `cutoff_tie_complete` instead of
@@ -1146,7 +1216,7 @@ impl CassTantivyIndex {
         } else {
             limit.saturating_add(tie_expansion_limit)
         };
-        let search_result = crate::execute_query_with_offset(&searcher, &*query, fetch_limit, 0)?;
+        let search_result = crate::execute_query_with_offset(&searcher, query, fetch_limit, 0)?;
 
         let mut materialized = Vec::with_capacity(search_result.hits.len());
         for hit in search_result.hits {
@@ -1983,7 +2053,7 @@ pub enum CassSourceFilter {
 }
 
 /// Cass-compatible lexical filters applied directly in Tantivy.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct CassQueryFilters {
     pub agents: Vec<String>,
     pub workspaces: Vec<String>,
@@ -2005,6 +2075,36 @@ pub enum CassQueryToken {
     Or,
     /// NOT operator (negates the next term/phrase).
     Not,
+}
+
+/// In-memory evidence from the real fallible Tantivy CASS query boundary.
+///
+/// This type deliberately retains plaintext only between the adapter and the
+/// gauntlet's redaction step. It must never be serialized directly. The
+/// profile-specific `ArtifactStore` v4 DTO owns any durable representation.
+#[cfg(feature = "tantivy-oracle")]
+#[derive(Debug)]
+pub struct CassOracleProfileObservation {
+    /// Shipping CASS sanitization of the raw query.
+    pub sanitized_query: String,
+    /// Ordered tokens passed to the actual Tantivy query builder.
+    pub tokens: Vec<CassQueryToken>,
+    /// Whether the builder selected its explicit Boolean grammar.
+    pub has_boolean_operators: bool,
+    /// Structured filters consumed by the real query builder.
+    pub filters: CassQueryFilters,
+    /// Native rank/tie/count result or the original typed failure.
+    pub outcome: CassOracleProfileOutcome,
+}
+
+/// Total result of one fallible Tantivy CASS profile attempt.
+#[cfg(feature = "tantivy-oracle")]
+#[derive(Debug)]
+pub enum CassOracleProfileOutcome {
+    /// Query construction and retrieval succeeded.
+    Success(crate::OracleQueryObservation),
+    /// Query construction or retrieval failed with its original typed error.
+    Error(SearchError),
 }
 
 /// Sanitize query string to match the `hyphen_normalize` tokenizer for cass indexes.
@@ -2938,6 +3038,51 @@ mod cass_query_tests {
             "ranks must be the native fetched order",
         );
 
+        let profiled_filters = CassQueryFilters {
+            agents: vec!["claude".to_owned()],
+            source_filter: CassSourceFilter::Local,
+            ..CassQueryFilters::default()
+        };
+        let profile = index.cass_oracle_observe_query_profile(
+            "c++ \"alpha active\" OR -deprecated",
+            &profiled_filters,
+            10,
+            8,
+        );
+        assert_eq!(
+            profile.sanitized_query,
+            "c   \"alpha active\" OR -deprecated"
+        );
+        assert_eq!(
+            profile.tokens,
+            vec![
+                CassQueryToken::Term("c++".to_owned()),
+                CassQueryToken::Phrase("alpha active".to_owned()),
+                CassQueryToken::Or,
+                CassQueryToken::Not,
+                CassQueryToken::Term("deprecated".to_owned()),
+            ]
+        );
+        assert!(profile.has_boolean_operators);
+        assert_eq!(profile.filters, profiled_filters);
+        let profile_retrieval = match profile.outcome {
+            CassOracleProfileOutcome::Success(retrieval) => retrieval,
+            CassOracleProfileOutcome::Error(error) => {
+                panic!("fallible CASS profile unexpectedly failed: {error:?}")
+            }
+        };
+        assert_eq!(
+            profile_retrieval,
+            index
+                .cass_oracle_observe_query(
+                    "c++ \"alpha active\" OR -deprecated",
+                    &profiled_filters,
+                    10,
+                    8,
+                )
+                .expect("legacy CASS observation for parity")
+        );
+
         // An empty CASS query is a filter-only browse, NOT the default
         // profile's empty short-circuit: it must still match every document.
         let browse = index
@@ -3627,6 +3772,28 @@ mod cass_query_tests {
             hits.is_empty(),
             "a negated regex construction failure must not widen to AllQuery"
         );
+
+        #[cfg(feature = "tantivy-oracle")]
+        {
+            let profile = index.cass_oracle_observe_query_profile_with_regex_factory(
+                raw_query,
+                &CassQueryFilters::default(),
+                10,
+                8,
+                force_regex_construction_failure,
+            );
+            assert_eq!(
+                profile.tokens,
+                vec![
+                    CassQueryToken::Not,
+                    CassQueryToken::Term("*legacy".to_owned())
+                ]
+            );
+            assert!(matches!(
+                profile.outcome,
+                CassOracleProfileOutcome::Error(_)
+            ));
+        }
     }
 
     #[test]
