@@ -596,6 +596,148 @@ jobs:
             echo "- Perf gate artifacts: \`perf_regression_gate_policy.json\`, \`perf_regression_gate_result.json\`."
           } >> "${GITHUB_STEP_SUMMARY}"
 
+  salej-conformance:
+    name: Salej conformance (${{ matrix.os }}, ${{ matrix.architecture }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            architecture: x86_64
+          - os: macos-15
+            architecture: arm64
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Assert exact runner architecture
+        shell: bash
+        run: |
+          set -euo pipefail
+          observed="$(uname -m)"
+          if [[ "${observed}" != "${{ matrix.architecture }}" ]]; then
+            echo "Expected ${{ matrix.architecture }} but GitHub assigned ${observed}" >&2
+            exit 1
+          fi
+          {
+            echo "### Salej runner identity"
+            echo "- image: ${{ matrix.os }}"
+            echo "- architecture: ${observed}"
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Install nightly toolchain
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
+        with:
+          toolchain: nightly-2026-07-20
+          components: rustfmt, clippy
+
+      - name: Prepare path dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          deps_dir="$(cd "$GITHUB_WORKSPACE/.." && pwd)"
+          asupersync_ref="15e6b6920fa0ad3e6d843ea55186eed754389ad2"
+          frankensqlite_ref="5c99eeb93d789c1309d5c46a540289369ff39535"
+          fast_cmaes_ref="17f633e2c24bdd0c358310949066e5922b9e17b5"
+
+          clone_or_update() {
+            local repo_url="$1"
+            local dest_path="$2"
+            local ref="$3"
+            if [[ -d "${dest_path}/.git" ]]; then
+              git -C "${dest_path}" fetch --depth 1 origin "${ref}"
+            else
+              git clone --no-checkout "${repo_url}" "${dest_path}"
+              git -C "${dest_path}" fetch --depth 1 origin "${ref}"
+            fi
+            git -C "${dest_path}" checkout --detach FETCH_HEAD
+          }
+
+          clone_or_update "https://github.com/Dicklesworthstone/asupersync.git" "${deps_dir}/asupersync" "${asupersync_ref}"
+          clone_or_update "https://github.com/Dicklesworthstone/frankensqlite.git" "${deps_dir}/frankensqlite" "${frankensqlite_ref}"
+          clone_or_update "https://github.com/Dicklesworthstone/fast_cmaes.git" "${deps_dir}/fast_cmaes" "${fast_cmaes_ref}"
+
+          while IFS= read -r -d '' manifest; do
+            if [[ "$RUNNER_OS" == "macOS" ]]; then
+              sed -i '' -e "s|/data/projects/|${deps_dir}/|g" "$manifest"
+            else
+              sed -i -e "s|/data/projects/|${deps_dir}/|g" "$manifest"
+            fi
+          done < <(find "$GITHUB_WORKSPACE" -name Cargo.toml -print0)
+
+      - name: Cache Salej Cargo registry and target
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: salej-${{ matrix.os }}-nightly
+          cache-targets: true
+
+      - name: Clippy Quill pruning-conformance surface
+        run: cargo clippy -p frankensearch-quill --all-targets --features pruning-conformance -- -D warnings
+
+      - name: Clippy Salej gauntlet feature surface
+        run: cargo clippy -p frankensearch-quill-gauntlet --all-targets --features tantivy-oracle,pruning-conformance -- -D warnings
+
+      - name: Salej partial pruning-receipt cancellation contract
+        timeout-minutes: 15
+        run: cargo test -p frankensearch-quill --features pruning-conformance --test cancellation_contract pruning_conformance_traced_public_search_discards_partial_receipt_and_replays_exactly -- --exact --nocapture
+
+      - name: Salej pruning-trace lifecycle units
+        timeout-minutes: 15
+        run: cargo test -p frankensearch-quill --lib --features pruning-conformance pruning_conformance_ -- --nocapture --test-threads=1
+
+      - name: Salej full nonignored Apple-Silicon matrix
+        if: matrix.os == 'macos-15'
+        timeout-minutes: 75
+        env:
+          GAUNTLET_SUBJECT_REVISION: ${{ github.sha }}
+          GAUNTLET_SUBJECT_DIRTY: "false"
+        run: cargo test -p frankensearch-quill-gauntlet --features tantivy-oracle,pruning-conformance runner::tests::salej_ -- --nocapture --test-threads=1
+
+      - name: Salej Ubuntu provenance and interruption gaps
+        if: matrix.os == 'ubuntu-latest'
+        timeout-minutes: 30
+        env:
+          GAUNTLET_SUBJECT_REVISION: ${{ github.sha }}
+          GAUNTLET_SUBJECT_DIRTY: "false"
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p frankensearch-quill-gauntlet --features tantivy-oracle,pruning-conformance runner::tests::salej_runtime_identity_rejects_revision_or_dirty_state_rewrites -- --exact --nocapture --test-threads=1
+          cargo test -p frankensearch-quill-gauntlet --features tantivy-oracle,pruning-conformance runner::tests::salej_diagnostic_source_identity_accepts_degraded_provenance_without_upgrading_it -- --exact --nocapture --test-threads=1
+          cargo test -p frankensearch-quill-gauntlet --features tantivy-oracle,pruning-conformance runner::tests::salej_union_horizon_offset_page_matches_control_with_real_tombstones -- --exact --nocapture --test-threads=1
+          cargo test -p frankensearch-quill-gauntlet --features tantivy-oracle,pruning-conformance runner::tests::salej_union_horizon_cancellation_at_final_collection_checkpoint_is_atomic -- --exact --nocapture --test-threads=1
+          cargo test -p frankensearch-quill-gauntlet --features tantivy-oracle,pruning-conformance runner::tests::salej_union_horizon_minimum_fuel_boundary_is_atomic_and_deterministic -- --exact --nocapture --test-threads=1
+
+      - name: Salej sealed UNION_HORIZON diagnostic bundle
+        if: matrix.os == 'ubuntu-latest'
+        timeout-minutes: 60
+        env:
+          GAUNTLET_SUBJECT_REVISION: ${{ github.sha }}
+          GAUNTLET_SUBJECT_DIRTY: "false"
+          GAUNTLET_UNION_HORIZON_ARTIFACT_ROOT: target/coverage/quill-gauntlet-salej/${{ github.run_id }}-${{ github.run_attempt }}
+          GAUNTLET_UNION_HORIZON_RUN_ID: ${{ github.run_id }}-${{ github.run_attempt }}
+        run: cargo test -p frankensearch-quill-gauntlet --features tantivy-oracle,pruning-conformance runner::tests::salej_complete_union_horizon_diagnostic_bundle -- --ignored --exact --nocapture --test-threads=1
+
+      - name: Upload Salej UNION_HORIZON diagnostic bundle
+        if: success() && matrix.os == 'ubuntu-latest'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: quill-gauntlet-salej-diagnostic-${{ github.run_id }}-${{ github.run_attempt }}
+          path: target/coverage/quill-gauntlet-salej/${{ github.run_id }}-${{ github.run_attempt }}/*.json
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload non-admissible Salej failure attempt
+        if: failure() && matrix.os == 'ubuntu-latest'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: quill-gauntlet-salej-attempt-${{ github.run_id }}-${{ github.run_attempt }}
+          path: target/coverage/quill-gauntlet-salej/${{ github.run_id }}-${{ github.run_attempt }}/**
+          if-no-files-found: warn
+          retention-days: 14
+
   ann-path-identity:
     name: ANN path identity (${{ matrix.os }})
     runs-on: ${{ matrix.os }}

@@ -20,6 +20,7 @@ use serde::{Deserialize, Serialize};
 use xxhash_rust::xxh3::xxh3_64;
 
 use crate::GauntletError;
+use crate::artifact::GauntletProducerBuildIdentity;
 use crate::comparator::{
     ComparatorConfig, ComparisonReport, CountState, EngineObservation, NativeTieKey, RankedHit,
     compare_observations,
@@ -106,6 +107,28 @@ impl EngineDescriptor {
     }
 }
 
+fn is_canonical_git_revision(value: &str) -> bool {
+    value.len() == 40
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn validate_recorded_producer_source(
+    observed_revision: &str,
+    source_dirty: bool,
+) -> Result<(), GauntletError> {
+    if !is_canonical_git_revision(observed_revision)
+        && !(observed_revision == "unavailable" && source_dirty)
+    {
+        return Err(GauntletError::InvalidContract {
+            reason: "recorded producer revision must be a canonical lowercase 40-hex Git identity or the conservative dirty unavailable sentinel"
+                .to_owned(),
+        });
+    }
+    Ok(())
+}
+
 /// Subject/oracle pair with mode-specific distinctness validation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct EnginePairIdentity {
@@ -179,6 +202,12 @@ impl EnginePairIdentity {
                 reason: "engine identity is not self-consistent".to_owned(),
             });
         }
+        for descriptor in [&self.subject, &self.oracle] {
+            validate_recorded_producer_source(
+                &descriptor.source_revision,
+                descriptor.source_dirty,
+            )?;
+        }
         if self.comparison_mode == ComparisonMode::CrossEngine {
             let oracle_version = oracle_version_contract()?;
             let expected_config_hash = if self.semantic_contract.as_ref()
@@ -190,12 +219,12 @@ impl EnginePairIdentity {
             };
             if self.oracle.implementation != "frankensearch-lexical/tantivy-index"
                 || self.oracle.crate_version != oracle_version.lexical_package_version
-                || self.oracle.source_revision != oracle_version.lexical_git_revision
+                || self.oracle.source_revision != self.subject.source_revision
+                || self.oracle.source_dirty != self.subject.source_dirty
                 || self.oracle.config_hash != expected_config_hash
-                || self.oracle.source_dirty
             {
                 return Err(GauntletError::InvalidContract {
-                    reason: "oracle descriptor does not match the lexical version contract"
+                    reason: "oracle descriptor does not bind the shared producer and the independently pinned lexical dependency contract"
                         .to_owned(),
                 });
             }
@@ -581,6 +610,8 @@ impl DifferentialHarness {
             subject.descriptor(),
             oracle.descriptor(),
         )?;
+        GauntletProducerBuildIdentity::compiled()?.validate_engines(&engines)?;
+        engines.validate_gauntlet_contract()?;
         self.comparator_config.validate_contract()?;
         case.validate_shape()?;
         let subject_observation = subject.observe(cx, case).await?;
@@ -638,7 +669,7 @@ impl QuillSubject {
         let descriptor = EngineDescriptor {
             family: EngineFamily::Quill,
             implementation: "frankensearch-quill/scalar-index".to_owned(),
-            crate_version: env!("CARGO_PKG_VERSION").to_owned(),
+            crate_version: frankensearch_quill::FRANKENSEARCH_QUILL_CRATE_VERSION.to_owned(),
             source_revision: source_revision.into(),
             source_dirty,
             config_hash,
@@ -1090,7 +1121,7 @@ impl CassQuillSubject {
         let descriptor = EngineDescriptor {
             family: EngineFamily::Quill,
             implementation: "frankensearch-quill/cass-index".to_owned(),
-            crate_version: env!("CARGO_PKG_VERSION").to_owned(),
+            crate_version: frankensearch_quill::FRANKENSEARCH_QUILL_CRATE_VERSION.to_owned(),
             source_revision: source_revision.into(),
             source_dirty,
             config_hash: format!("cass-semantic-v1:{}", quill_config_hash(&config)),
@@ -1548,14 +1579,14 @@ impl TantivyOracle {
         semantic_contract: SemanticContract,
     ) -> Result<Self, GauntletError> {
         let contract = oracle_version_contract()?;
-        contract.validate_source_state(observed_lexical_revision, source_dirty)?;
+        validate_recorded_producer_source(observed_lexical_revision, source_dirty)?;
         Ok(Self {
             index,
             descriptor: EngineDescriptor {
                 family: EngineFamily::Tantivy,
                 implementation: "frankensearch-lexical/tantivy-index".to_owned(),
                 crate_version: contract.lexical_package_version,
-                source_revision: contract.lexical_git_revision,
+                source_revision: observed_lexical_revision.to_owned(),
                 source_dirty,
                 config_hash: TANTIVY_ORACLE_CONFIG_HASH.to_owned(),
             },
@@ -1932,12 +1963,12 @@ impl CassTantivyOracle {
         source_dirty: bool,
     ) -> Result<Self, GauntletError> {
         let contract = oracle_version_contract()?;
-        contract.validate_source_state(observed_lexical_revision, source_dirty)?;
+        validate_recorded_producer_source(observed_lexical_revision, source_dirty)?;
         let descriptor = EngineDescriptor {
             family: EngineFamily::Tantivy,
             implementation: "frankensearch-lexical/tantivy-index".to_owned(),
             crate_version: contract.lexical_package_version,
-            source_revision: contract.lexical_git_revision,
+            source_revision: observed_lexical_revision.to_owned(),
             source_dirty,
             config_hash: CASS_TANTIVY_ORACLE_CONFIG_HASH.to_owned(),
         };
@@ -2232,8 +2263,14 @@ mod tests {
         fields: &QG_POSITIONLESS_FIELDS,
     };
 
+    fn test_producer_source() -> (String, bool) {
+        let identity = GauntletProducerBuildIdentity::compiled().expect("compiled producer");
+        (identity.source_git_revision, identity.source_git_dirty)
+    }
+
     #[cfg(feature = "perf-harness")]
     fn qg_position_mode_subject(positions: bool) -> QuillSubject {
+        let (producer_revision, producer_dirty) = test_producer_source();
         let config = e55_config();
         let schema = if positions {
             frankensearch_quill::DEFAULT_SCHEMA
@@ -2243,9 +2280,9 @@ mod tests {
         let descriptor = EngineDescriptor {
             family: EngineFamily::Quill,
             implementation: "frankensearch-quill/scalar-index".to_owned(),
-            crate_version: env!("CARGO_PKG_VERSION").to_owned(),
-            source_revision: "qg-position-mode-smoke".to_owned(),
-            source_dirty: false,
+            crate_version: frankensearch_quill::FRANKENSEARCH_QUILL_CRATE_VERSION.to_owned(),
+            source_revision: producer_revision,
+            source_dirty: producer_dirty,
             config_hash: format!(
                 "{}-positions_{}",
                 quill_config_hash(&config),
@@ -2268,9 +2305,7 @@ mod tests {
 
     #[cfg(feature = "perf-harness")]
     fn qg_position_mode_oracle(positions: bool) -> TantivyOracle {
-        let revision = oracle_version_contract()
-            .expect("oracle version contract")
-            .lexical_git_revision;
+        let (revision, dirty) = test_producer_source();
         let index = frankensearch_lexical::TantivyIndex::in_memory_with_benchmark_config(
             50_000_000, 1, positions,
         )
@@ -2278,7 +2313,7 @@ mod tests {
         TantivyOracle::from_index_with_campaign_freshness(
             index,
             &revision,
-            false,
+            dirty,
             true,
             crate::runner::SemanticContract::scalar_g1a(),
         )
@@ -4146,11 +4181,12 @@ mod tests {
     #[test]
     fn cass_identity_requires_the_cass_oracle_config_hash() {
         let version = oracle_version_contract().expect("oracle version contract");
+        let producer_revision = "a".repeat(40);
         let subject = EngineDescriptor {
             family: EngineFamily::Quill,
             implementation: "frankensearch-quill/cass-index".to_owned(),
-            crate_version: env!("CARGO_PKG_VERSION").to_owned(),
-            source_revision: "subject-revision".to_owned(),
+            crate_version: frankensearch_quill::FRANKENSEARCH_QUILL_CRATE_VERSION.to_owned(),
+            source_revision: producer_revision.clone(),
             source_dirty: false,
             config_hash: "cass-subject-config".to_owned(),
         };
@@ -4158,7 +4194,7 @@ mod tests {
             family: EngineFamily::Tantivy,
             implementation: "frankensearch-lexical/tantivy-index".to_owned(),
             crate_version: version.lexical_package_version,
-            source_revision: version.lexical_git_revision,
+            source_revision: producer_revision,
             source_dirty: false,
             config_hash: TANTIVY_ORACLE_CONFIG_HASH.to_owned(),
         };
@@ -4208,6 +4244,91 @@ mod tests {
             assert!(matches!(
                 harness.run(&cx, &first, &second, &case).await,
                 Err(GauntletError::EngineIdentityCollision { .. })
+            ));
+        });
+        assert_eq!(observe_calls.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn contract_guard_rejects_before_engine_execution() {
+        let observe_calls = Arc::new(AtomicUsize::new(0));
+        let (producer_revision, producer_dirty) = test_producer_source();
+        let subject = CountingEngine {
+            descriptor: EngineDescriptor {
+                family: EngineFamily::Quill,
+                implementation: "counting-quill".to_owned(),
+                crate_version: frankensearch_quill::FRANKENSEARCH_QUILL_CRATE_VERSION.to_owned(),
+                source_revision: producer_revision.clone(),
+                source_dirty: producer_dirty,
+                config_hash: "quill-config".to_owned(),
+            },
+            observe_calls: Arc::clone(&observe_calls),
+        };
+        let oracle = CountingEngine {
+            descriptor: EngineDescriptor {
+                family: EngineFamily::Tantivy,
+                implementation: "frankensearch-lexical/tantivy-index".to_owned(),
+                crate_version: oracle_version_contract()
+                    .expect("oracle version contract")
+                    .lexical_package_version,
+                source_revision: producer_revision,
+                source_dirty: producer_dirty,
+                config_hash: "hostile-wrong-oracle-config".to_owned(),
+            },
+            observe_calls: Arc::clone(&observe_calls),
+        };
+        let harness = DifferentialHarness::default();
+        let case = DifferentialCase::new("contract-preflight", "anything", 10);
+
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            assert!(matches!(
+                harness.run(&cx, &subject, &oracle, &case).await,
+                Err(GauntletError::InvalidContract { .. })
+            ));
+        });
+        assert_eq!(observe_calls.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn producer_guard_rejects_a_canonical_fabrication_before_engine_execution() {
+        let observe_calls = Arc::new(AtomicUsize::new(0));
+        let compiled = GauntletProducerBuildIdentity::compiled().expect("compiled producer");
+        let fabricated_revision = if compiled.source_git_revision == "f".repeat(40) {
+            "e".repeat(40)
+        } else {
+            "f".repeat(40)
+        };
+        let subject = CountingEngine {
+            descriptor: EngineDescriptor {
+                family: EngineFamily::Quill,
+                implementation: "counting-quill".to_owned(),
+                crate_version: frankensearch_quill::FRANKENSEARCH_QUILL_CRATE_VERSION.to_owned(),
+                source_revision: fabricated_revision.clone(),
+                source_dirty: false,
+                config_hash: "quill-config".to_owned(),
+            },
+            observe_calls: Arc::clone(&observe_calls),
+        };
+        let oracle = CountingEngine {
+            descriptor: EngineDescriptor {
+                family: EngineFamily::Tantivy,
+                implementation: "frankensearch-lexical/tantivy-index".to_owned(),
+                crate_version: oracle_version_contract()
+                    .expect("oracle version contract")
+                    .lexical_package_version,
+                source_revision: fabricated_revision,
+                source_dirty: false,
+                config_hash: TANTIVY_ORACLE_CONFIG_HASH.to_owned(),
+            },
+            observe_calls: Arc::clone(&observe_calls),
+        };
+        let harness = DifferentialHarness::default();
+        let case = DifferentialCase::new("producer-preflight", "anything", 10);
+
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            assert!(matches!(
+                harness.run(&cx, &subject, &oracle, &case).await,
+                Err(GauntletError::InvalidContract { .. })
             ));
         });
         assert_eq!(observe_calls.load(Ordering::Relaxed), 0);
@@ -4809,13 +4930,11 @@ mod tests {
     #[cfg(feature = "tantivy-oracle")]
     #[test]
     fn e410_controlled_public_search_semantics_match_oracle() {
-        let revision = oracle_version_contract()
-            .expect("oracle version contract")
-            .lexical_git_revision;
-        let mut subject = QuillSubject::in_memory(e55_config(), "e410-subject", false)
+        let (revision, dirty) = test_producer_source();
+        let mut subject = QuillSubject::in_memory(e55_config(), revision.clone(), dirty)
             .expect("E4.10 Quill subject");
         let mut oracle =
-            TantivyOracle::in_memory_scalar_g1a(&revision, false).expect("E4.10 Tantivy oracle");
+            TantivyOracle::in_memory_scalar_g1a(&revision, dirty).expect("E4.10 Tantivy oracle");
         let documents = vec![
             frankensearch_core::IndexableDocument::new("title-hit", "quiet filler")
                 .with_title("Needle"),
@@ -4945,12 +5064,10 @@ mod tests {
     #[cfg(feature = "tantivy-oracle")]
     #[test]
     fn e410_limit_count_and_order_semantics_match_oracle() {
-        let revision = oracle_version_contract()
-            .expect("oracle version contract")
-            .lexical_git_revision;
-        let mut subject = QuillSubject::in_memory(e55_config(), "e410-limits-subject", false)
+        let (revision, dirty) = test_producer_source();
+        let mut subject = QuillSubject::in_memory(e55_config(), revision.clone(), dirty)
             .expect("E4.10 limits Quill subject");
-        let mut oracle = TantivyOracle::in_memory_scalar_g1a(&revision, false)
+        let mut oracle = TantivyOracle::in_memory_scalar_g1a(&revision, dirty)
             .expect("E4.10 limits Tantivy oracle");
         // Every document carries "shared" exactly once at a distinct document
         // length, so the counted match-all case has five distinct scores;
@@ -5468,12 +5585,46 @@ mod tests {
 
     #[cfg(feature = "tantivy-oracle")]
     #[test]
-    fn oracle_constructor_rejects_dirty_or_mismatched_source() {
+    fn oracle_constructor_records_dirty_diagnostics_but_rejects_malformed_source() {
         let revision = oracle_version_contract()
             .expect("version contract")
             .lexical_git_revision;
-        assert!(TantivyOracle::in_memory(&revision, true).is_err());
-        assert!(TantivyOracle::in_memory(&"0".repeat(40), false).is_err());
+        let dirty = TantivyOracle::in_memory(&revision, true)
+            .expect("dirty producer identity remains recordable diagnostic provenance");
+        assert!(dirty.descriptor().source_dirty);
+        let unavailable = TantivyOracle::in_memory("unavailable", true)
+            .expect("conservative unavailable producer identity remains recordable");
+        assert_eq!(unavailable.descriptor().source_revision, "unavailable");
+        assert!(TantivyOracle::in_memory("unavailable", false).is_err());
+        assert!(TantivyOracle::in_memory(&"0".repeat(39), false).is_err());
+        assert!(TantivyOracle::in_memory(&"A".repeat(40), false).is_err());
+    }
+
+    #[cfg(feature = "tantivy-oracle")]
+    #[test]
+    fn oracle_descriptor_keeps_compiled_producer_separate_from_dependency_contract() {
+        let contract = oracle_version_contract().expect("version contract");
+        let producer_revision = "f".repeat(40);
+        assert_ne!(producer_revision, contract.lexical_git_revision);
+
+        let oracle = TantivyOracle::in_memory(&producer_revision, false).expect("clean oracle");
+        assert_eq!(oracle.descriptor().source_revision, producer_revision);
+        assert_eq!(
+            oracle_version_contract()
+                .expect("independent version contract")
+                .lexical_git_revision,
+            contract.lexical_git_revision,
+        );
+    }
+
+    #[test]
+    fn quill_descriptor_uses_the_linked_quill_package_version() {
+        let subject =
+            QuillSubject::in_memory(e55_config(), "a".repeat(40), false).expect("Quill subject");
+        assert_eq!(
+            subject.descriptor().crate_version,
+            frankensearch_quill::FRANKENSEARCH_QUILL_CRATE_VERSION
+        );
     }
 
     #[cfg(feature = "tantivy-oracle")]

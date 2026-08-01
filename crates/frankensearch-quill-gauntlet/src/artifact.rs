@@ -23,7 +23,7 @@ use crate::runner::{
 };
 use crate::version_contract::{OracleVersionContract, oracle_version_contract};
 
-pub const OBJECT_SCHEMA_VERSION: u32 = 3;
+pub const OBJECT_SCHEMA_VERSION: u32 = 5;
 pub const CANONICALIZATION_VERSION: u32 = 1;
 /// Current mutable run-manifest schema.
 ///
@@ -33,10 +33,292 @@ pub const RUN_MANIFEST_SCHEMA_VERSION: u32 = 2;
 const HASH_DOMAIN_V1: &[u8] = b"frankensearch-quill-gauntlet:artifact-object:v1\0";
 const HASH_DOMAIN_V2: &[u8] = b"frankensearch-quill-gauntlet:artifact-object:v2\0";
 const HASH_DOMAIN_V3: &[u8] = b"frankensearch-quill-gauntlet:artifact-object:v3\0";
+const HASH_DOMAIN_V5: &[u8] = b"frankensearch-quill-gauntlet:artifact-object:v5\0";
+const PRODUCER_BUILD_IDENTITY_HASH_DOMAIN: &[u8] =
+    b"frankensearch-quill-gauntlet:producer-build-identity:v1\0";
+const PRODUCER_BUILD_IDENTITY_SCHEMA_VERSION: u32 = 1;
+const PRODUCER_CONTRACT_VERSION_V4: &str = "frankensearch.quill-local-perf-producer.v4";
 const MAX_CAMPAIGN_RESERVATION_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_CAMPAIGN_REPORT_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const MAX_CAMPAIGN_RUN_MANIFEST_BYTES: u64 = 2 * 1024 * 1024;
 const MAX_CAMPAIGN_OBJECT_BYTES: u64 = 512 * 1024 * 1024;
+
+/// How the gauntlet build script established the source identity embedded in
+/// the exact producer binary.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GauntletProducerSourceVerification {
+    /// Decode-only sentinel for artifact schemas that predate this identity.
+    #[default]
+    LegacyMissing,
+    /// The build script resolved the exact repository root and Git state.
+    GitCheckoutVerified,
+    /// A Git-less diagnostic build recorded an explicit caller identity.
+    ExplicitUnverified,
+    /// Neither a repository identity nor a complete explicit identity existed.
+    Unavailable,
+}
+
+/// Build-script-sealed identity of the binary that produced an artifact.
+///
+/// Current artifact construction compares this complete record against the
+/// values compiled into the executing gauntlet. Callers therefore cannot make
+/// two engine descriptors agree on a fabricated source revision and have that
+/// agreement mistaken for producer provenance. Dirty and unverified builds
+/// remain recordable diagnostics; verified campaign admission rejects them.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GauntletProducerBuildIdentity {
+    pub schema_version: u32,
+    pub producer_contract_version: String,
+    pub source_git_revision: String,
+    pub source_git_dirty: bool,
+    pub source_verification: GauntletProducerSourceVerification,
+    pub cargo_lock_sha256: String,
+    pub rustc_version_verbose_hex: String,
+    pub target_triple: String,
+    pub cargo_profile: String,
+    pub enabled_features: Vec<String>,
+    pub enabled_features_sha256: String,
+    pub executable_sha256: String,
+    pub executable_byte_len: u64,
+}
+
+impl GauntletProducerBuildIdentity {
+    pub(crate) fn compiled() -> Result<Self, GauntletError> {
+        let source_git_dirty = match env!("QUILL_PERF_PRODUCER_GIT_DIRTY") {
+            "true" => true,
+            "false" => false,
+            _ => {
+                return Err(GauntletError::InvalidContract {
+                    reason: "compiled producer dirty state is not canonical".to_owned(),
+                });
+            }
+        };
+        let source_verification = match env!("QUILL_PERF_PRODUCER_SOURCE_VERIFICATION") {
+            "git_checkout_verified" => GauntletProducerSourceVerification::GitCheckoutVerified,
+            "explicit_unverified" => GauntletProducerSourceVerification::ExplicitUnverified,
+            "unavailable" => GauntletProducerSourceVerification::Unavailable,
+            _ => {
+                return Err(GauntletError::InvalidContract {
+                    reason: "compiled producer source-verification mode is unknown".to_owned(),
+                });
+            }
+        };
+        let (executable_sha256, executable_byte_len) = current_executable_identity()?;
+        let identity = Self {
+            schema_version: PRODUCER_BUILD_IDENTITY_SCHEMA_VERSION,
+            producer_contract_version: env!("QUILL_PERF_PRODUCER_CONTRACT_VERSION").to_owned(),
+            source_git_revision: env!("QUILL_PERF_PRODUCER_GIT_REVISION").to_owned(),
+            source_git_dirty,
+            source_verification,
+            cargo_lock_sha256: env!("QUILL_PERF_PRODUCER_CARGO_LOCK_SHA256").to_owned(),
+            rustc_version_verbose_hex: env!("QUILL_PERF_PRODUCER_RUSTC_VV_HEX").to_owned(),
+            target_triple: env!("QUILL_PERF_PRODUCER_TARGET_TRIPLE").to_owned(),
+            cargo_profile: env!("QUILL_PERF_PRODUCER_CARGO_PROFILE").to_owned(),
+            enabled_features: env!("QUILL_PERF_PRODUCER_ENABLED_FEATURES")
+                .split(',')
+                .filter(|feature| !feature.is_empty())
+                .map(str::to_owned)
+                .collect(),
+            enabled_features_sha256: env!("QUILL_PERF_PRODUCER_ENABLED_FEATURES_SHA256").to_owned(),
+            executable_sha256,
+            executable_byte_len,
+        };
+        identity.validate_structure()?;
+        Ok(identity)
+    }
+
+    pub(crate) fn identity_hash(&self) -> Result<String, GauntletError> {
+        self.validate_structure()?;
+        let mut hasher = Sha256::new();
+        hasher.update(PRODUCER_BUILD_IDENTITY_HASH_DOMAIN);
+        hasher.update(serde_json::to_vec(self)?);
+        Ok(lower_hex(&hasher.finalize()))
+    }
+
+    pub(crate) fn rustc_version_verbose(&self) -> Result<String, GauntletError> {
+        let bytes = decode_lower_hex(&self.rustc_version_verbose_hex).ok_or_else(|| {
+            GauntletError::InvalidContract {
+                reason: "compiled producer rustc identity is not canonical lowercase hex"
+                    .to_owned(),
+            }
+        })?;
+        String::from_utf8(bytes).map_err(|error| GauntletError::InvalidContract {
+            reason: format!("compiled producer rustc identity is not UTF-8: {error}"),
+        })
+    }
+
+    fn validate_structure(&self) -> Result<(), GauntletError> {
+        let source_is_well_formed = match self.source_verification {
+            GauntletProducerSourceVerification::GitCheckoutVerified
+            | GauntletProducerSourceVerification::ExplicitUnverified => {
+                is_lower_hex_len(&self.source_git_revision, 40)
+            }
+            GauntletProducerSourceVerification::Unavailable => {
+                self.source_git_revision == "unavailable" && self.source_git_dirty
+            }
+            GauntletProducerSourceVerification::LegacyMissing => false,
+        };
+        let cargo_lock_is_well_formed = self.cargo_lock_sha256 == "unavailable"
+            || is_lower_hex_len(&self.cargo_lock_sha256, 64);
+        let rustc_is_well_formed = !self.rustc_version_verbose_hex.is_empty()
+            && self.rustc_version_verbose_hex.len() <= 32 * 1024
+            && self.rustc_version_verbose_hex.len().is_multiple_of(2)
+            && is_lower_hex_text(&self.rustc_version_verbose_hex);
+        let text_is_well_formed = [self.target_triple.as_str(), self.cargo_profile.as_str()]
+            .into_iter()
+            .all(|value| {
+                !value.is_empty()
+                    && value.len() <= 256
+                    && value.trim() == value
+                    && value.bytes().all(|byte| byte.is_ascii_graphic())
+            });
+        let features_are_canonical = self.enabled_features.iter().all(|feature| {
+            !feature.is_empty()
+                && feature.len() <= 128
+                && feature.bytes().all(|byte| {
+                    byte.is_ascii_lowercase()
+                        || byte.is_ascii_digit()
+                        || matches!(byte, b'_' | b'-')
+                })
+        }) && self
+            .enabled_features
+            .windows(2)
+            .all(|pair| pair[0] < pair[1]);
+        let mut feature_hasher = Sha256::new();
+        feature_hasher.update(self.enabled_features.join("\n").as_bytes());
+        let expected_features_sha256 = lower_hex(&feature_hasher.finalize());
+        if self.schema_version != PRODUCER_BUILD_IDENTITY_SCHEMA_VERSION
+            || self.producer_contract_version != PRODUCER_CONTRACT_VERSION_V4
+            || !source_is_well_formed
+            || !cargo_lock_is_well_formed
+            || !rustc_is_well_formed
+            || !text_is_well_formed
+            || !features_are_canonical
+            || !is_lower_hex_len(&self.enabled_features_sha256, 64)
+            || self.enabled_features_sha256 != expected_features_sha256
+            || !is_lower_hex_len(&self.executable_sha256, 64)
+            || self.executable_byte_len == 0
+        {
+            return Err(GauntletError::InvalidContract {
+                reason: "artifact producer build identity is missing, malformed, or internally inconsistent"
+                    .to_owned(),
+            });
+        }
+        Ok(())
+    }
+
+    pub(crate) fn validate_engines(
+        &self,
+        engines: &EnginePairIdentity,
+    ) -> Result<(), GauntletError> {
+        for descriptor in [&engines.subject, &engines.oracle] {
+            if descriptor.source_revision != self.source_git_revision
+                || descriptor.source_dirty != self.source_git_dirty
+            {
+                return Err(GauntletError::InvalidContract {
+                    reason: "engine descriptor is not bound to the artifact's sealed producer build identity"
+                        .to_owned(),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_admissible(&self) -> Result<(), GauntletError> {
+        self.validate_structure()?;
+        if self.source_verification != GauntletProducerSourceVerification::GitCheckoutVerified
+            || self.source_git_dirty
+            || !is_lower_hex_len(&self.cargo_lock_sha256, 64)
+        {
+            return Err(GauntletError::InvalidContract {
+                reason: "admissible artifact evidence requires a clean Git-verified producer and an exact Cargo.lock identity"
+                    .to_owned(),
+            });
+        }
+        Ok(())
+    }
+}
+
+fn current_executable_identity() -> Result<(String, u64), GauntletError> {
+    static IDENTITY: std::sync::OnceLock<Result<(String, u64), String>> =
+        std::sync::OnceLock::new();
+    IDENTITY
+        .get_or_init(capture_current_executable_identity)
+        .clone()
+        .map_err(|reason| GauntletError::InvalidContract { reason })
+}
+
+fn capture_current_executable_identity() -> Result<(String, u64), String> {
+    #[cfg(target_os = "linux")]
+    let path = PathBuf::from("/proc/self/exe");
+    #[cfg(not(target_os = "linux"))]
+    let path = std::env::current_exe()
+        .map_err(|error| format!("cannot resolve the producer executable: {error}"))?;
+    let mut file = File::open(&path)
+        .map_err(|error| format!("cannot open the producer executable: {error}"))?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| format!("cannot stat the producer executable: {error}"))?;
+    if !metadata.is_file() {
+        return Err("producer executable identity requires a regular file".to_owned());
+    }
+    let mut hasher = Sha256::new();
+    let mut byte_len = 0_u64;
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .map_err(|error| format!("cannot hash the producer executable: {error}"))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+        byte_len = byte_len
+            .checked_add(u64::try_from(read).map_err(|error| {
+                format!("producer executable read length does not fit u64: {error}")
+            })?)
+            .ok_or_else(|| "producer executable length overflowed u64".to_owned())?;
+    }
+    if byte_len == 0 || byte_len != metadata.len() {
+        return Err("producer executable changed while its identity was captured".to_owned());
+    }
+    Ok((lower_hex(&hasher.finalize()), byte_len))
+}
+
+fn is_lower_hex_text(value: &str) -> bool {
+    value
+        .bytes()
+        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn decode_lower_hex(value: &str) -> Option<Vec<u8>> {
+    if !value.len().is_multiple_of(2) || !is_lower_hex_text(value) {
+        return None;
+    }
+    value
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|pair| {
+            let high = lower_hex_nibble(pair[0])?;
+            let low = lower_hex_nibble(pair[1])?;
+            Some((high << 4) | low)
+        })
+        .collect()
+}
+
+const fn lower_hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        _ => None,
+    }
+}
+
+fn is_lower_hex_len(value: &str, expected_len: usize) -> bool {
+    value.len() == expected_len && is_lower_hex_text(value)
+}
 
 /// Immutable campaign context omitted from legacy one-case artifacts.
 ///
@@ -60,7 +342,7 @@ pub struct CampaignArtifactContext {
     pub registered_divergence: Option<DivergenceRegisterEntry>,
 }
 
-/// Explicit total-contract scope carried by every v3 artifact.
+/// Explicit total-contract scope carried by every current artifact.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "scope", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ArtifactLexicalContractEvidence {
@@ -82,6 +364,8 @@ pub struct ArtifactObject {
     pub object_schema_version: u32,
     pub canonicalization_version: u32,
     pub oracle_version: OracleVersionContract,
+    #[serde(default)]
+    pub producer_build_identity: GauntletProducerBuildIdentity,
     pub engines: EnginePairIdentity,
     pub case: crate::DifferentialCase,
     pub comparator_config: ComparatorConfig,
@@ -103,6 +387,7 @@ impl ArtifactObject {
             object_schema_version: OBJECT_SCHEMA_VERSION,
             canonicalization_version: CANONICALIZATION_VERSION,
             oracle_version: oracle_version_contract()?,
+            producer_build_identity: GauntletProducerBuildIdentity::compiled()?,
             engines: run.engines,
             case: run.case,
             comparator_config: run.comparator_config,
@@ -143,8 +428,9 @@ impl ArtifactObject {
     /// Compute the versioned, domain-separated object address.
     ///
     /// Legacy v1/v2 objects retain their historical XXH3-64 address so they can
-    /// be decoded and diagnosed. Current v3 evidence uses SHA-256; a 64-bit
-    /// non-cryptographic digest is not an admissible durable evidence seal.
+    /// be decoded and diagnosed. Legacy v3 and current v5 objects use distinct
+    /// SHA-256 domains. Reserved pre-policy v4 has no registered hash domain
+    /// and is never admissible evidence.
     ///
     /// For a legacy object decoded from historical bytes, this method hashes
     /// the DTO's current canonical reserialization, including fields added
@@ -163,29 +449,25 @@ impl ArtifactObject {
     }
 
     pub(crate) fn validate(&self) -> Result<(), GauntletError> {
-        if matches!(self.object_schema_version, 1 | 2) {
-            return Err(GauntletError::InvalidContract {
-                reason: format!(
-                    "legacy artifact v{} lacks the current total lexical contract and is non-admissible; rerun the campaign",
-                    self.object_schema_version
-                ),
-            });
-        }
-        if self.object_schema_version != OBJECT_SCHEMA_VERSION
-            || self.canonicalization_version != CANONICALIZATION_VERSION
+        validate_current_object_schema(self.object_schema_version)
+            .map_err(|reason| GauntletError::InvalidContract { reason })?;
+        if self.canonicalization_version != CANONICALIZATION_VERSION
             || self.oracle_version != oracle_version_contract()?
         {
             return Err(GauntletError::InvalidContract {
-                reason: "artifact object schema or embedded oracle contract is invalid".to_owned(),
+                reason: "artifact canonicalization or embedded oracle contract is invalid"
+                    .to_owned(),
             });
         }
+        self.producer_build_identity.validate_structure()?;
+        self.producer_build_identity
+            .validate_engines(&self.engines)?;
         self.engines.validate_gauntlet_contract()?;
         if self.engines.comparison_mode == crate::ComparisonMode::CrossEngine
-            && (self.engines.oracle.crate_version != self.oracle_version.lexical_package_version
-                || self.engines.oracle.source_revision != self.oracle_version.lexical_git_revision)
+            && self.engines.oracle.crate_version != self.oracle_version.lexical_package_version
         {
             return Err(GauntletError::InvalidContract {
-                reason: "artifact oracle identity does not match its embedded version contract"
+                reason: "artifact oracle package does not match its independently embedded version contract"
                     .to_owned(),
             });
         }
@@ -228,6 +510,11 @@ impl ArtifactObject {
             });
         }
         Ok(())
+    }
+
+    pub(crate) fn validate_admissible(&self) -> Result<(), GauntletError> {
+        self.validate()?;
+        self.producer_build_identity.validate_admissible()
     }
 }
 
@@ -392,6 +679,7 @@ pub struct PreparedArtifact {
     run_manifest: RunManifest,
     run_manifest_bytes: Vec<u8>,
     run_location: PreparedRunLocation,
+    producer_build_identity: GauntletProducerBuildIdentity,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -489,12 +777,13 @@ impl ArtifactStore {
         Ok(())
     }
 
-    /// Encode an object and run manifest without writing files.
+    /// Encode an admissible standalone object and run manifest without writing
+    /// files.
     ///
     /// # Errors
     ///
-    /// Returns an error for invalid identities/contracts, unsafe run IDs, or
-    /// serialization failures.
+    /// Returns an error for invalid identities/contracts, a dirty or
+    /// unverified producer, unsafe run IDs, or serialization failures.
     pub fn prepare(
         &self,
         run_id: &str,
@@ -502,11 +791,42 @@ impl ArtifactStore {
         provenance: BTreeMap<String, String>,
     ) -> Result<PreparedArtifact, GauntletError> {
         let run_path = self.root.join("runs").join(format!("{run_id}.json"));
+        let compiled_producer = GauntletProducerBuildIdentity::compiled()?;
         self.prepare_at(
             run_id,
             run_path,
             PreparedRunLocation::Standalone,
             false,
+            true,
+            &compiled_producer,
+            object,
+            provenance,
+        )
+    }
+
+    /// Encode a standalone diagnostic object without claiming admissible
+    /// evidence. The compiled producer binding remains exact, while dirty or
+    /// explicitly unverified source state stays recordable.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for malformed identity, a fabricated producer binding,
+    /// an unsafe run ID, or serialization failure.
+    pub fn prepare_diagnostic(
+        &self,
+        run_id: &str,
+        object: &ArtifactObject,
+        provenance: BTreeMap<String, String>,
+    ) -> Result<PreparedArtifact, GauntletError> {
+        let run_path = self.root.join("runs").join(format!("{run_id}.json"));
+        let compiled_producer = GauntletProducerBuildIdentity::compiled()?;
+        self.prepare_at(
+            run_id,
+            run_path,
+            PreparedRunLocation::Standalone,
+            false,
+            false,
+            &compiled_producer,
             object,
             provenance,
         )
@@ -527,6 +847,7 @@ impl ArtifactStore {
             .join(campaign_run_id)
             .join("cases")
             .join(format!("q{ordinal:06}.json"));
+        let compiled_producer = GauntletProducerBuildIdentity::compiled()?;
         self.prepare_at(
             &run_id,
             run_path,
@@ -535,6 +856,8 @@ impl ArtifactStore {
                 ordinal,
             },
             true,
+            false,
+            &compiled_producer,
             object,
             provenance,
         )
@@ -546,11 +869,22 @@ impl ArtifactStore {
         run_path: PathBuf,
         run_location: PreparedRunLocation,
         require_campaign_context: bool,
+        require_admissible: bool,
+        expected_producer: &GauntletProducerBuildIdentity,
         object: &ArtifactObject,
         provenance: BTreeMap<String, String>,
     ) -> Result<PreparedArtifact, GauntletError> {
         validate_run_id(run_id)?;
         object.validate()?;
+        if require_admissible {
+            object.producer_build_identity.validate_admissible()?;
+        }
+        if &object.producer_build_identity != expected_producer {
+            return Err(GauntletError::InvalidContract {
+                reason: "artifact producer identity does not match the executing compiled producer"
+                    .to_owned(),
+            });
+        }
         if object.campaign.is_some() != require_campaign_context {
             return Err(GauntletError::InvalidPreparedArtifact {
                 reason: "artifact campaign context does not match its run namespace".to_owned(),
@@ -584,6 +918,7 @@ impl ArtifactStore {
             run_manifest,
             run_manifest_bytes,
             run_location,
+            producer_build_identity: object.producer_build_identity.clone(),
         })
     }
 
@@ -748,6 +1083,7 @@ impl ArtifactStore {
             None
         };
         let mut expected_case_names = std::collections::BTreeSet::new();
+        let mut campaign_producer_identity: Option<GauntletProducerBuildIdentity> = None;
         let mut evidence = report.begin_evidence_validation()?;
         for (ordinal, (query, result)) in selected.iter().zip(&report.cases).enumerate() {
             let case_name = OsString::from(format!("q{ordinal:06}.json"));
@@ -799,11 +1135,8 @@ impl ArtifactStore {
                 })?
                 .read_regular_bounded(&object_name, MAX_CAMPAIGN_OBJECT_BYTES)?;
             let object: ArtifactObject = serde_json::from_slice(&object_bytes)?;
-            if matches!(object.object_schema_version, 1 | 2) {
-                return Err(GauntletError::InvalidPreparedArtifact {
-                    reason: "legacy artifact schema lacks the current total lexical contract and is non-admissible; rerun the campaign".to_owned(),
-                });
-            }
+            validate_current_object_schema(object.object_schema_version)
+                .map_err(|reason| GauntletError::InvalidPreparedArtifact { reason })?;
             let object_hash = hash_object_bytes(&object_bytes, object.object_schema_version)?;
             if !canonical_json_matches(&object, &object_bytes)?
                 || object_hash != run_manifest.object_hash
@@ -811,6 +1144,21 @@ impl ArtifactStore {
                 return Err(GauntletError::InvalidPreparedArtifact {
                     reason: "campaign object bytes or content address are inconsistent".to_owned(),
                 });
+            }
+            if report.config.require_provenance {
+                object.validate_admissible()?;
+            } else {
+                object.validate()?;
+            }
+            if let Some(expected_identity) = &campaign_producer_identity {
+                if &object.producer_build_identity != expected_identity {
+                    return Err(GauntletError::InvalidPreparedArtifact {
+                        reason: "campaign case artifacts were produced by different binaries"
+                            .to_owned(),
+                    });
+                }
+            } else {
+                campaign_producer_identity = Some(object.producer_build_identity.clone());
             }
             drop(object_bytes);
             evidence.observe(Some((&object, &object_hash)))?;
@@ -837,6 +1185,11 @@ impl ArtifactStore {
     fn validate_prepared(&self, prepared: &PreparedArtifact) -> Result<(), GauntletError> {
         let object: ArtifactObject = serde_json::from_slice(&prepared.object_bytes)?;
         object.validate()?;
+        if object.producer_build_identity != prepared.producer_build_identity {
+            return Err(GauntletError::InvalidPreparedArtifact {
+                reason: "prepared artifact producer identity changed after creation".to_owned(),
+            });
+        }
         if !canonical_json_matches(&object, &prepared.object_bytes)?
             || hash_object_bytes(&prepared.object_bytes, object.object_schema_version)?
                 != prepared.object_hash
@@ -907,9 +1260,15 @@ fn hash_object_bytes(bytes: &[u8], schema_version: u32) -> Result<String, Gauntl
             hasher.update(bytes);
             Ok(format!("{:016x}", hasher.digest()))
         }
-        OBJECT_SCHEMA_VERSION => {
+        3 => {
             let mut hasher = Sha256::new();
             hasher.update(HASH_DOMAIN_V3);
+            hasher.update(bytes);
+            Ok(lower_hex(&hasher.finalize()))
+        }
+        5 => {
+            let mut hasher = Sha256::new();
+            hasher.update(HASH_DOMAIN_V5);
             hasher.update(bytes);
             Ok(lower_hex(&hasher.finalize()))
         }
@@ -918,6 +1277,22 @@ fn hash_object_bytes(bytes: &[u8], schema_version: u32) -> Result<String, Gauntl
                 "artifact object schema version {schema_version} has no registered hash domain"
             ),
         }),
+    }
+}
+
+fn validate_current_object_schema(schema_version: u32) -> Result<(), String> {
+    match schema_version {
+        OBJECT_SCHEMA_VERSION => Ok(()),
+        1 | 2 | 3 => Err(format!(
+            "legacy artifact v{schema_version} lacks the current total lexical contract and is non-admissible; rerun the campaign"
+        )),
+        4 => Err(
+            "reserved pre-policy artifact v4 is non-admissible; rerun under the complete current evidence contract"
+                .to_owned(),
+        ),
+        _ => Err(format!(
+            "artifact object schema version {schema_version} is unsupported and non-admissible; rerun under the complete current evidence contract"
+        )),
     }
 }
 
@@ -1604,20 +1979,24 @@ mod tests {
 
     fn sample_object() -> ArtifactObject {
         let oracle_version = oracle_version_contract().expect("version contract");
+        let producer_build_identity =
+            GauntletProducerBuildIdentity::compiled().expect("compiled producer identity");
+        let producer_revision = producer_build_identity.source_git_revision.clone();
+        let producer_dirty = producer_build_identity.source_git_dirty;
         let subject = EngineDescriptor {
             family: EngineFamily::Quill,
             implementation: "quill-stub".to_owned(),
             crate_version: "0.2.1".to_owned(),
-            source_revision: "stub".to_owned(),
-            source_dirty: false,
+            source_revision: producer_revision.clone(),
+            source_dirty: producer_dirty,
             config_hash: "01".to_owned(),
         };
         let oracle = EngineDescriptor {
             family: EngineFamily::Tantivy,
             implementation: "frankensearch-lexical/tantivy-index".to_owned(),
             crate_version: oracle_version.lexical_package_version.clone(),
-            source_revision: oracle_version.lexical_git_revision.clone(),
-            source_dirty: false,
+            source_revision: producer_revision,
+            source_dirty: producer_dirty,
             config_hash: TANTIVY_ORACLE_CONFIG_HASH.to_owned(),
         };
         let subject_observation = representative_observation(
@@ -1674,6 +2053,7 @@ mod tests {
             object_schema_version: OBJECT_SCHEMA_VERSION,
             canonicalization_version: CANONICALIZATION_VERSION,
             oracle_version,
+            producer_build_identity,
             engines: EnginePairIdentity::new(ComparisonMode::CrossEngine, subject, oracle)
                 .expect("distinct engines"),
             case,
@@ -1722,15 +2102,46 @@ mod tests {
         object
     }
 
+    fn golden_producer_build_identity() -> GauntletProducerBuildIdentity {
+        let mut feature_hasher = Sha256::new();
+        feature_hasher.update([]);
+        GauntletProducerBuildIdentity {
+            schema_version: PRODUCER_BUILD_IDENTITY_SCHEMA_VERSION,
+            producer_contract_version: PRODUCER_CONTRACT_VERSION_V4.to_owned(),
+            source_git_revision: "a".repeat(40),
+            source_git_dirty: false,
+            source_verification: GauntletProducerSourceVerification::GitCheckoutVerified,
+            cargo_lock_sha256: "b".repeat(64),
+            rustc_version_verbose_hex: "72757374632d5656".to_owned(),
+            target_triple: "x86_64-unknown-linux-gnu".to_owned(),
+            cargo_profile: "test".to_owned(),
+            enabled_features: Vec::new(),
+            enabled_features_sha256: lower_hex(&feature_hasher.finalize()),
+            executable_sha256: "c".repeat(64),
+            executable_byte_len: 12_345,
+        }
+    }
+
+    fn bind_producer_identity(
+        object: &mut ArtifactObject,
+        identity: GauntletProducerBuildIdentity,
+    ) {
+        object.engines.subject.source_revision = identity.source_git_revision.clone();
+        object.engines.subject.source_dirty = identity.source_git_dirty;
+        object.engines.oracle.source_revision = identity.source_git_revision.clone();
+        object.engines.oracle.source_dirty = identity.source_git_dirty;
+        object.producer_build_identity = identity;
+    }
+
     #[test]
     fn run_ids_reference_one_immutable_object() {
         let object = sample_object();
         let store = ArtifactStore::default();
         let first = store
-            .prepare("run-one", &object, BTreeMap::new())
+            .prepare_diagnostic("run-one", &object, BTreeMap::new())
             .expect("first preparation");
         let second = store
-            .prepare("run-two", &object, BTreeMap::new())
+            .prepare_diagnostic("run-two", &object, BTreeMap::new())
             .expect("second preparation");
 
         assert_eq!(first.object_hash, second.object_hash);
@@ -1761,12 +2172,147 @@ mod tests {
     }
 
     #[test]
-    fn prepare_rejects_oracle_descriptor_outside_version_contract() {
+    fn prepare_rejects_oracle_descriptor_outside_compiled_producer() {
         let mut object = sample_object();
         object.engines.oracle.source_revision = "f".repeat(40);
         assert!(
             ArtifactStore::default()
-                .prepare("bad-oracle-pin", &object, BTreeMap::new())
+                .prepare("bad-oracle-producer", &object, BTreeMap::new())
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn prepare_rejects_two_descriptors_that_agree_on_a_fabricated_build_identity() {
+        let mut object = sample_object();
+        bind_producer_identity(&mut object, golden_producer_build_identity());
+        object
+            .validate()
+            .expect("fabricated build is structurally self-consistent diagnostic data");
+        let error = ArtifactStore::default()
+            .prepare("fabricated-producer", &object, BTreeMap::new())
+            .expect_err("preparation must compare against the compiled producer identity");
+        assert!(matches!(
+            error,
+            GauntletError::InvalidContract { ref reason }
+                if reason.contains("does not match the executing compiled producer")
+        ));
+    }
+
+    #[test]
+    fn dirty_or_unverified_producers_remain_diagnostic_but_are_not_admissible() {
+        let mut dirty = sample_object();
+        dirty.producer_build_identity.source_git_dirty = true;
+        dirty.engines.subject.source_dirty = true;
+        dirty.engines.oracle.source_dirty = true;
+        dirty
+            .validate()
+            .expect("truthful dirty producer identity remains structurally recordable");
+        assert!(matches!(
+            dirty.validate_admissible(),
+            Err(GauntletError::InvalidContract { ref reason })
+                if reason.contains("clean Git-verified producer")
+        ));
+
+        let mut unverified = sample_object();
+        unverified.producer_build_identity.source_git_revision = "d".repeat(40);
+        unverified.engines.subject.source_revision = "d".repeat(40);
+        unverified.engines.oracle.source_revision = "d".repeat(40);
+        unverified.producer_build_identity.source_verification =
+            GauntletProducerSourceVerification::ExplicitUnverified;
+        unverified
+            .validate()
+            .expect("truthful unverified producer identity remains structurally recordable");
+        assert!(matches!(
+            unverified.validate_admissible(),
+            Err(GauntletError::InvalidContract { ref reason })
+                if reason.contains("clean Git-verified producer")
+        ));
+    }
+
+    #[test]
+    fn admissible_preparation_accepts_one_clean_verified_sealed_identity() {
+        let store = ArtifactStore::default();
+        let mut object = sample_object();
+        let producer_identity = golden_producer_build_identity();
+        bind_producer_identity(&mut object, producer_identity.clone());
+        let prepared = store
+            .prepare_at(
+                "admissible-production",
+                store.root().join("runs/admissible-production.json"),
+                PreparedRunLocation::Standalone,
+                false,
+                true,
+                &producer_identity,
+                &object,
+                BTreeMap::new(),
+            )
+            .expect("clean Git-verified exact producer identity is admissible");
+        assert_eq!(prepared.producer_build_identity, producer_identity);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn explicit_unverified_diagnostic_can_persist_but_not_use_admissible_prepare() {
+        let temp = tempfile::tempdir().expect("temporary parent");
+        let store = ArtifactStore::new(temp.path().join("gauntlet"));
+        let mut object = sample_object();
+        let mut diagnostic_identity = object.producer_build_identity.clone();
+        diagnostic_identity.source_git_revision = "d".repeat(40);
+        diagnostic_identity.source_verification =
+            GauntletProducerSourceVerification::ExplicitUnverified;
+        bind_producer_identity(&mut object, diagnostic_identity.clone());
+
+        let admissible_error = store
+            .prepare("unverified-production", &object, BTreeMap::new())
+            .expect_err("unverified build must not enter the admissible standalone namespace");
+        assert!(matches!(
+            admissible_error,
+            GauntletError::InvalidContract { ref reason }
+                if reason.contains("clean Git-verified producer")
+        ));
+
+        let run_path = store.root().join("runs/unverified-diagnostic.json");
+        let prepared = store
+            .prepare_at(
+                "unverified-diagnostic",
+                run_path,
+                PreparedRunLocation::Standalone,
+                false,
+                false,
+                &diagnostic_identity,
+                &object,
+                BTreeMap::new(),
+            )
+            .expect("explicit diagnostic preparation remains available");
+        store
+            .persist(&prepared)
+            .expect("explicit diagnostic publication remains durable");
+        assert!(prepared.object_path().is_file());
+        assert!(prepared.run_path().is_file());
+    }
+
+    #[test]
+    fn prepare_rejects_build_identity_field_tampering() {
+        let mut object = sample_object();
+        object.producer_build_identity.cargo_lock_sha256 = "c".repeat(64);
+        object
+            .validate()
+            .expect("tampered lock hash remains structurally canonical");
+        assert!(
+            ArtifactStore::default()
+                .prepare_diagnostic("tampered-build", &object, BTreeMap::new())
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn prepare_rejects_tampered_independent_oracle_contract_pin() {
+        let mut object = sample_object();
+        object.oracle_version.lexical_git_revision = "f".repeat(40);
+        assert!(
+            ArtifactStore::default()
+                .prepare("bad-oracle-contract", &object, BTreeMap::new())
                 .is_err()
         );
     }
@@ -1850,6 +2396,28 @@ mod tests {
     }
 
     #[test]
+    fn committed_v3_object_is_decode_only_and_cannot_reinterpret_the_contract_pin_as_source() {
+        const LEGACY_V3_BYTES: &[u8] = include_bytes!("../fixtures/artifact-object-v3.json");
+        let object: ArtifactObject =
+            serde_json::from_slice(LEGACY_V3_BYTES).expect("decode committed v3 object");
+        assert_eq!(object.object_schema_version, 3);
+        assert_eq!(
+            hash_object_bytes(LEGACY_V3_BYTES, 3).expect("registered v3 diagnostic address"),
+            "6a1e822aa157626b7abd1b7f7b496b7c44c4006928376ae23653137e88227506"
+        );
+        let error = object
+            .validate()
+            .expect_err("v3 producer provenance must require a campaign rerun");
+        assert!(matches!(
+            error,
+            GauntletError::InvalidContract { ref reason }
+                if reason.contains("legacy artifact")
+                    && reason.contains("non-admissible")
+                    && reason.contains("rerun")
+        ));
+    }
+
+    #[test]
     fn reserved_v4_pre_policy_fixture_is_not_admissible_as_current_evidence() {
         // Salej's diagnostic proof bundle is deliberately independent from the
         // generic ArtifactStore schema. Keep this pre-policy v4 shape only as a
@@ -1862,7 +2430,7 @@ mod tests {
         assert!(matches!(
             object.validate(),
             Err(GauntletError::InvalidContract { ref reason })
-                if reason.contains("schema or embedded oracle contract")
+                if reason.contains("reserved pre-policy artifact v4")
         ));
         assert!(matches!(
             hash_object_bytes(PRE_POLICY_V4_BYTES, 4),
@@ -1872,10 +2440,26 @@ mod tests {
     }
 
     #[test]
+    fn unknown_future_object_schema_is_never_interpreted_as_current_evidence() {
+        let mut object = sample_object();
+        object.object_schema_version = OBJECT_SCHEMA_VERSION.saturating_add(1);
+        assert!(matches!(
+            object.validate(),
+            Err(GauntletError::InvalidContract { ref reason })
+                if reason.contains("unsupported") && reason.contains("non-admissible")
+        ));
+        assert!(matches!(
+            object.object_hash(),
+            Err(GauntletError::InvalidContract { ref reason })
+                if reason.contains("no registered hash domain")
+        ));
+    }
+
+    #[test]
     fn legacy_run_manifest_cannot_reference_a_current_sha256_object() {
         let store = ArtifactStore::default();
         let mut prepared = store
-            .prepare("legacy-run-manifest", &sample_object(), BTreeMap::new())
+            .prepare_diagnostic("legacy-run-manifest", &sample_object(), BTreeMap::new())
             .expect("prepare current artifact");
         assert_eq!(
             prepared.run_manifest.schema_version,
@@ -1924,15 +2508,16 @@ mod tests {
 
     #[test]
     fn canonical_object_golden_bytes_and_hash_are_pinned() {
-        let object = sample_object();
+        let mut object = sample_object();
+        bind_producer_identity(&mut object, golden_producer_build_identity());
         let canonical = object.canonical_bytes().unwrap();
-        let golden_with_newline = include_bytes!("../fixtures/artifact-object-v3.json");
+        let golden_with_newline = include_bytes!("../fixtures/artifact-object-v5.json");
         let golden = golden_with_newline
             .strip_suffix(b"\n")
             .expect("golden fixture must end in exactly one LF");
         assert_eq!(
             object.object_hash().unwrap(),
-            "f6267a769cdc6ecf067619d2502e014be77183e94cb7c93bfd0b80a0d98aac83"
+            "b1413738df8834c270a270a6757a72f209066ff40fd4c82ab24ddfa219b7fddf"
         );
         assert_eq!(canonical, golden);
     }
@@ -1980,7 +2565,7 @@ mod tests {
         let first_store = ArtifactStore::new(temp.path().join("first"));
         let second_store = ArtifactStore::new(temp.path().join("second"));
         let prepared = first_store
-            .prepare("run-one", &sample_object(), BTreeMap::new())
+            .prepare_diagnostic("run-one", &sample_object(), BTreeMap::new())
             .expect("prepare artifact");
 
         first_store.persist(&prepared).expect("first publication");
@@ -2003,10 +2588,10 @@ mod tests {
             .reserve_campaign_run("foo", br#"{"schema_version":1}"#)
             .expect("reserve campaign");
         let standalone_marker_name = store
-            .prepare("foo.campaign", &sample_object(), BTreeMap::new())
+            .prepare_diagnostic("foo.campaign", &sample_object(), BTreeMap::new())
             .expect("standalone marker-like ID");
         let standalone_case_name = store
-            .prepare("foo.q000000", &sample_object(), BTreeMap::new())
+            .prepare_diagnostic("foo.q000000", &sample_object(), BTreeMap::new())
             .expect("standalone case-like ID");
         let campaign_case = store
             .prepare_campaign_case("foo", 0, &sample_campaign_object(), BTreeMap::new())
@@ -2041,7 +2626,7 @@ mod tests {
         let store = Arc::new(ArtifactStore::new(temp.path().join("gauntlet")));
         let prepared = Arc::new(
             store
-                .prepare("concurrent", &sample_object(), BTreeMap::new())
+                .prepare_diagnostic("concurrent", &sample_object(), BTreeMap::new())
                 .expect("prepare artifact"),
         );
         let barrier = Arc::new(Barrier::new(2));
@@ -2080,7 +2665,7 @@ mod tests {
         let temp = tempfile::tempdir().expect("temporary parent");
         let store = ArtifactStore::new(temp.path().join("gauntlet"));
         let prepared = store
-            .prepare("resume-staging", &sample_object(), BTreeMap::new())
+            .prepare_diagnostic("resume-staging", &sample_object(), BTreeMap::new())
             .expect("prepare artifact");
         std::fs::create_dir(store.root()).expect("create store root");
         std::fs::create_dir(store.root().join("objects")).expect("create objects directory");
@@ -2112,14 +2697,14 @@ mod tests {
         let temp = tempfile::tempdir().expect("temporary parent");
         let store = ArtifactStore::new(temp.path().join("gauntlet"));
         let first = store
-            .prepare(
+            .prepare_diagnostic(
                 "same-run",
                 &sample_object(),
                 BTreeMap::from([("worker".to_owned(), "one".to_owned())]),
             )
             .expect("first preparation");
         let second = store
-            .prepare(
+            .prepare_diagnostic(
                 "same-run",
                 &sample_object(),
                 BTreeMap::from([("worker".to_owned(), "two".to_owned())]),
@@ -2143,7 +2728,7 @@ mod tests {
             .join("gauntlet");
         let store = ArtifactStore::new(root.clone());
         let prepared = store
-            .prepare("nested-root", &sample_object(), BTreeMap::new())
+            .prepare_diagnostic("nested-root", &sample_object(), BTreeMap::new())
             .expect("prepare nested-root artifact");
 
         store
@@ -2168,7 +2753,7 @@ mod tests {
         symlink(&redirect, root.join("objects")).expect("create symlink");
         let store = ArtifactStore::new(root);
         let prepared = store
-            .prepare("symlink", &sample_object(), BTreeMap::new())
+            .prepare_diagnostic("symlink", &sample_object(), BTreeMap::new())
             .expect("prepare artifact");
         assert!(matches!(
             store.persist(&prepared),
@@ -2188,7 +2773,7 @@ mod tests {
         symlink(&redirect, &link).expect("create ancestor symlink");
         let store = ArtifactStore::new(link.join("gauntlet"));
         let prepared = store
-            .prepare("symlink-ancestor", &sample_object(), BTreeMap::new())
+            .prepare_diagnostic("symlink-ancestor", &sample_object(), BTreeMap::new())
             .expect("prepare artifact");
         assert!(matches!(
             store.persist(&prepared),

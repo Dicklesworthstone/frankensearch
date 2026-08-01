@@ -29,8 +29,8 @@ use thiserror::Error;
 
 pub use artifact::{
     ArtifactLexicalContractEvidence, ArtifactObject, ArtifactStore, CANONICALIZATION_VERSION,
-    CampaignArtifactContext, OBJECT_SCHEMA_VERSION, PreparedArtifact, RUN_MANIFEST_SCHEMA_VERSION,
-    RunManifest,
+    CampaignArtifactContext, GauntletProducerBuildIdentity, GauntletProducerSourceVerification,
+    OBJECT_SCHEMA_VERSION, PreparedArtifact, RUN_MANIFEST_SCHEMA_VERSION, RunManifest,
 };
 pub use comparator::{
     AstDifference, AstLoweringKind, ComparatorConfig, ComparisonReport, ComparisonStatus,
