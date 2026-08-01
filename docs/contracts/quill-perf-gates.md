@@ -43,7 +43,8 @@ reconstruction rather than falling back to explanatory text.
       # immutable threshold object
   QG-<n>.<hardware-class>.<execution-profile>.<date>.<run-id>.evidence.json
       # immutable receipt-bound evidence object
-  QG-<n>.unmeasured.latest.json          # explicit bootstrap quarantine
+  QG-<n>.v7.unmeasured.latest.json       # current explicit bootstrap quarantine
+  QG-<n>.unmeasured.latest.json          # immutable historical v6 placeholder
 ```
 Measured latest pointers use schema
 `frankensearch.perf-history-pointer.v2` and fields
@@ -52,7 +53,7 @@ run_id, threshold_file,
 threshold_sha256, evidence_file, evidence_sha256}` and resolve both halves of
 one generation from the same directory. Neither half, its A/A band, nor its
 destination may cross the immutable hardware/profile key. Current threshold
-schema `quill-perf-artifact-v6` uses
+schema `quill-perf-artifact-v7` uses
 `{schema_version, gate, applicability_plan, bench_elf_sha256,
 machine_fingerprint, execution, git_rev,
 run_window, run_id, corpus_manifest_hash, manifest_sha256, cells: [{fixture,
@@ -63,6 +64,12 @@ laws_attested}`. Candidate and rerun share `run_window` but must have distinct
 benchmark process itself before Criterion emits any output. The ratchet script
 (quill-e8.2) refuses a missing/malformed ELF identity, fewer than 10 samples,
 an invalid median CI, or comparisons across differing `corpus_manifest_hash`.
+Every selected threshold cell carries its complete canonical engine-row group,
+and `execution.configured_engine_thread_widths` is the exact sorted set
+reconstructed from those selected cells. A partial measured threshold is
+durable only with `laws_attested=false`; `laws_attested=true` means the artifact
+contains the complete runnable applicability plan, never merely a selected
+slice.
 
 The bootstrap files contain no measurements. They make the absence of a real
 hardware/profile baseline visible without fabricating a number and force hosted
@@ -70,10 +77,14 @@ replay to fail closed as `Block` or `Quarantine`, never `Allow`. A full,
 evidence-admissible candidate/rerun pair may establish
 the first measured baseline and activate the gate with either a PASS or MISS
 target verdict. The exemption is deliberately narrow: only the exact
-`quill-perf-artifact-v6` sentinel for the evaluated gate and manifest may omit
+`quill-perf-artifact-v7` sentinel for the evaluated gate and manifest may omit
 `applicability_plan`, execution, baseline evidence, and a baseline runner
 receipt. Supplying evidence or identity for that sentinel is rejected as
 fabrication; near-sentinels and measured legacy artifacts receive no exemption.
+The ten original v6 placeholders remain immutable historical inputs after the
+v7 bump and are rejected precisely as stale-schema artifacts. The separately
+versioned `QG-<n>.v7.unmeasured.latest.json` files are the current authoritative
+sentinels; their canonical pretty JSON has exactly one terminal newline.
 Candidate and rerun still require two independent, verified, post-exit
 `frankensearch.perf-runner-completion.v6` receipts. That first MISS baseline is
 a reference point, not a speed claim.
@@ -120,10 +131,12 @@ runnable cell is `Required`. A diagnostic-only plan therefore has no `Required`
 cells; the evidence fold must emit
 `evidence.gate_without_required_cells`/`NoDecision` and can never produce an
 `Allow` claim. The v2 plan hash also binds the normalized manifest SHA-256 and
-the gate's declared primary target width. Evidence v4 must contain exactly the
-union of `Required` and `Diagnostic` cells with matching roles. Missing runnable
-cells, extra cells, role changes, and any measured `NotApplicable` cell fail
-closed.
+the gate's declared primary target width. Evidence v5 may durably retain a
+bounded partial runnable selection for diagnosis, but such evidence is always
+non-adjudicable. Ratchet admission requires exactly the union of `Required` and
+`Diagnostic` cells with matching roles. Extra cells, role changes, measured
+`NotApplicable` cells, and any incomplete selection presented for adjudication
+fail closed.
 
 Runtime availability is independent of release requirement. M4 remains held
 until the producer can attest the actual loaded image; M5 remains unavailable
@@ -162,13 +175,13 @@ different operation scope, or when they are derived from the exact same raw
 blocks; a separate Criterion measurement stream cannot be reconciled as if it
 were the paired evidence.
 
-The v6 QG writer's `paired_ab`, `paired_null` (Tantivy/Tantivy), and
+The v7 QG writer's `paired_ab`, `paired_null` (Tantivy/Tantivy), and
 `paired_null_quill` rows are diagnostics only.
-Decision-grade output is the `quill-perf-evidence-v4` artifact (`bd-uh2f` /
-`bd-uh2f.1`), which the harness emits beside every v6 artifact from the
+Decision-grade output is the `quill-perf-evidence-v5` artifact (`bd-uh2f` /
+`bd-uh2f.1`), which the harness emits beside every v7 artifact from the
 exact same raw paired blocks.
 
-## Evidence artifacts (`quill-perf-evidence-v4`)
+## Evidence artifacts (`quill-perf-evidence-v5`)
 
 One `<gate>.evidence.json` (plus a derived `<gate>.evidence.md` table) per
 gate, sealed with an embedded SHA-256 over its own canonical JSON. Every cell
@@ -181,14 +194,27 @@ ELF SHA-256, git revision plus dirty-state hash, `Cargo.lock` hash,
 the exact NUL-separated and NUL-terminated argv SHA-256,
 rustc/target/profile/features, host identity, host-wide physical cores and
 logical threads, producer OS, process-available concurrency, configured engine
-thread widths, runtime-detected ISA, effective affinity/cpuset cap, governor and
+thread widths, registry-admitted execution capacity, the distinct per-gate
+maximum exercised cell width, runtime-detected ISA, effective affinity/cpuset cap, governor and
 load, peak RSS with its method (`unsupported` is reported honestly, never a
 zero), and corpus/query-set hashes with generator coordinates. QG-1 and QG-8
 add per-cell Quill and Tantivy concurrency witnesses: each observation has a
 positive count and proves `min == max ==` the normative configured width. A
 configuration parameter alone is never described as observed concurrency.
+The rustc/target/profile/feature strings and host label/fingerprint/load are
+benchmark-reported diagnostic context sealed into the exact evidence bytes;
+they are not additional independent receipt facts. The v6 receipt instead
+projects the clean source and lockfile, held ELF, exact argv, controlled
+environment, target OS/architecture compatibility, registry class, hardware,
+topology, runtime ISA, affinity, governor, and execution envelope. Those
+receipt-projected facts—not the diagnostic hostname label—supply promotion
+authority.
+Process availability must be at least the registered execution capacity but
+need not equal it: scheduler-managed Apple profiles deliberately admit a
+ten-worker pool on a fourteen-CPU M4 host, while the sealed runner request and
+worker witnesses prove the exact ten-worker execution contract.
 
-Version 4 additionally binds the exact
+Version 5 additionally binds the exact
 `frankensearch.quill-machine-class-registry.v2` registry and the complete
 profile-qualified applicability-plan identity. It persists the producer OS,
 immutable hardware/profile key, registry-derived capacity semantics, execution
@@ -196,9 +222,23 @@ capacity and per-gate maximum width, explicit execution request and start/end
 snapshots, every recomputed hardware/cpuset/snapshot/execution hash, and the
 SHA-256 plus exact bytes of one verified
 `frankensearch.perf-runner-completion.v6` receipt and its exact
-`frankensearch.perf-runner-artifact-manifest.v2` manifest. The manifest hashes
-the actual run log, canonical v6 threshold artifact, and exact pre-binding v4
-evidence bytes and names their profile, gate, run ID, and run window.
+`frankensearch.perf-runner-artifact-manifest.v3` manifest. The manifest hashes
+the actual run log, canonical v7 threshold artifact, and exact pre-binding v5
+evidence bytes. It also binds the exact matrix, normalized performance
+manifest, machine registry, profile contract, class/profile, capacity
+semantics, execution capacity, maximum exercised width, applicability-plan
+hash, gate, run ID, and run window. Verified reload reconstructs that plan from
+the embedded contracts instead of trusting the manifest's declaration.
+`default_flip_disposition` is deliberately not duplicated as a manifest
+top-level field: the canonical applicability-plan hash commits it, and verified
+reload reconstructs and compares the complete plan. The manifest's evidence
+digest names the exact pre-binding evidence bytes; the later receipt-bound
+evidence embeds that manifest, so using the final evidence digest here would
+create a circular seal.
+QG-1 multi-shard aggregation uses `quill-perf-evidence-assembly-v2` so an
+assembly cannot silently retain the prior nested threshold, evidence, or
+runner-manifest generations. Every retained source independently reloads under
+the current strict schemas before the assembly seal is admitted.
 The v6 completion receipt also binds producer contract
 `frankensearch.quill-local-perf-producer.v4`, build-time Git revision and dirty
 posture, build-time `Cargo.lock` SHA-256, and the SHA-256 independently computed
@@ -220,7 +260,7 @@ re-admits the embedded receipt and manifest against the frozen registry;
 resealing an outer artifact cannot legitimize a stale, drifted, mixed,
 incomplete, or tampered identity. An explicit `unverified` binding remains
 durable for diagnosis but is never ratchet-admissible.
-The v6 threshold artifact's applicability and execution blocks are only
+The v7 threshold artifact's applicability and execution blocks are only
 compatibility projections:
 promotion requires it to equal the sealed current-evidence execution block and
 to agree with the verified receipt and reconstructed plan's hardware/profile
@@ -266,7 +306,7 @@ executable file, hashes the held descriptor, and executes through the descriptor
 while setting canonical `argv[0]`. After an observed thermal/start capture, the
 frozen registry admits the exact hardware/execution/durability envelope before
 the log is opened or the benchmark child is spawned. The live benchmark writes
-the current v4 evidence artifact with an explicit `unverified` binding and exact
+the current v5 evidence artifact with an explicit `unverified` binding and exact
 NUL-delimited process-argv hash while the child runs. The producer keeps the
 lease and held roots/images across the exact child, log synchronization, end
 probes, manifest construction, receipt sealing, terminal registry admission,
@@ -274,9 +314,12 @@ and an in-memory bind-and-reverify preview. A nonzero or signaled child writes a
 separately sealed `frankensearch.perf-runner-attempt.v2` diagnostic receipt and
 can never emit or be parsed as a promotion completion. After every promotion
 check passes, the producer writes the manifest and diagnostic-only
-`frankensearch.perf-run-precommit.v4` `PRECOMMIT.json`, syncs them, rechecks the
+`frankensearch.perf-run-precommit.v5` `PRECOMMIT.json`, syncs them, rechecks the
 lease, roots, source, held benchmark, and held producer, and writes the
-ratchet-required v6 receipt last as the sole finalization commit boundary.
+ratchet-required v6 receipt, followed by its exact receipt-bound v5 evidence.
+After reloading and jointly verifying that pair, it atomically publishes the
+H2 attempt receipt last; that outer receipt is the sole complete-shard commit
+boundary.
 The canonical `environment-policy.json` preimage is written under the held run
 directory before the child starts, re-read by descriptor, and hashed directly
 by both completion and attempt receipts; `PRECOMMIT.json` inventories that same
@@ -319,7 +362,7 @@ advisory lock on the canonical history directory before resolving any baseline
 and holds that same directory-inode lock through immutable-generation
 publication and latest-pointer replacement. Under the lock, a profile with no
 measured latest pointer accepts only the canonical
-`QG-<n>.unmeasured.latest.json` bootstrap in that promotion directory. Once a
+`QG-<n>.v7.unmeasured.latest.json` bootstrap in that promotion directory. Once a
 profile-qualified latest pointer exists, the baseline path must canonicalize to
 that exact pointer and parse as its measured v2 generation; copied, direct,
 stale, and bootstrap-replay baselines are rejected without a history write.

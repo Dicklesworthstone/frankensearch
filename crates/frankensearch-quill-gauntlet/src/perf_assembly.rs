@@ -39,7 +39,7 @@ use crate::{
 use crate::{MachineIdentity, PeakRssEvidence};
 
 /// Wire version of the strict offline assembly artifact.
-pub const PERF_EVIDENCE_ASSEMBLY_SCHEMA_VERSION: &str = "quill-perf-evidence-assembly-v1";
+pub const PERF_EVIDENCE_ASSEMBLY_SCHEMA_VERSION: &str = "quill-perf-evidence-assembly-v2";
 /// Wire version of the independently sealed derived QG-1 matrix manifest.
 pub const PERF_EVIDENCE_ASSEMBLY_MATRIX_SCHEMA_VERSION: &str =
     "quill-perf-evidence-assembly-matrix-v1";
@@ -67,7 +67,7 @@ pub const PERF_ASSEMBLY_ENGINE_LIFECYCLE_NO_CLAIM_CODE: &str = "qg1.engine_lifec
 pub const PERF_ASSEMBLY_PROCESS_TREE_NO_CLAIM_CODE: &str =
     "qg1.process_tree_quiescence_unavailable";
 
-const ASSEMBLY_HASH_DOMAIN: &[u8] = b"frankensearch.quill.perf-evidence-assembly.v1\0";
+const ASSEMBLY_HASH_DOMAIN: &[u8] = b"frankensearch.quill.perf-evidence-assembly.v2\0";
 const MATRIX_MANIFEST_HASH_DOMAIN: &[u8] =
     b"frankensearch.quill.perf-evidence-assembly-matrix.v1\0";
 const SEMANTIC_CELL_SET_HASH_DOMAIN: &[u8] =
@@ -373,9 +373,10 @@ pub enum PerfEvidenceAssemblyCompleteness {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PerfEvidenceAssemblyReadiness {
-    /// Every Required cell is present and independently claim-eligible.
+    /// Every runnable cell is present and every Required cell is independently
+    /// claim-eligible.
     ReadyForAdjudication,
-    /// One or more Required cells are absent.
+    /// One or more Required or Diagnostic cells are absent.
     NoClaimIncomplete,
     /// The profile has no Required cells and therefore cannot make a claim.
     NoClaimNoRequiredCells,
@@ -1127,6 +1128,7 @@ fn verify_threshold_evidence_join(
         || threshold.run_id != evidence.provenance.run_id
         || threshold.corpus_manifest_hash != evidence.provenance.corpus.corpus_sha256
         || threshold.manifest_sha256 != evidence.provenance.manifest_sha256
+        || threshold.manifest_sha256 != evidence.applicability_plan.normalized_perf_manifest_sha256
         || threshold.laws_attested != (evidence.cells.len() == runnable_count)
         || threshold.cells != threshold_projection_from_evidence(evidence)?
     {
@@ -1190,12 +1192,10 @@ fn load_completed_attempt(
                     .to_owned(),
         });
     }
-    let threshold_artifact: PerfGateArtifact = serde_json::from_slice(&threshold_bytes)?;
-    if canonical_threshold_bytes(&threshold_artifact)? != threshold_bytes {
-        return Err(PerfEvidenceAssemblyError::InvalidAttemptBundle {
-            reason: "threshold artifact is not exact canonical pretty JSON".to_owned(),
-        });
-    }
+    let threshold_artifact = PerfGateArtifact::from_verified_measured_slice(&threshold_bytes)
+        .map_err(|error| PerfEvidenceAssemblyError::InvalidAttemptBundle {
+            reason: format!("threshold artifact failed strict verified reload: {error}"),
+        })?;
     verify_threshold_evidence_join(&threshold_artifact, &artifact)?;
     let identity = artifact.machine_class.identity().ok_or_else(|| {
         PerfEvidenceAssemblyError::InvalidAttemptBundle {
@@ -1221,6 +1221,7 @@ fn load_completed_attempt(
     if manifest_bytes != canonical_manifest
         || sha256_hex(&manifest_bytes) != manifest.manifest_sha256()
         || process.receipt.runner_artifact_manifest_sha256() != Some(manifest.manifest_sha256())
+        || manifest.manifest().applicability_plan() != &artifact.applicability_plan
     {
         return Err(PerfEvidenceAssemblyError::InvalidAttemptBundle {
             reason: "root artifact manifest differs from the exact nested manifest".to_owned(),
@@ -1709,7 +1710,7 @@ impl PerfEvidenceAssemblyArtifact {
         self.retry_predicate.as_deref()
     }
 
-    /// Bounded retry predicate for optional full Diagnostic coverage.
+    /// Bounded retry predicate for mandatory full Diagnostic coverage.
     #[must_use]
     pub fn diagnostic_retry_predicate(&self) -> Option<&str> {
         self.diagnostic_retry_predicate.as_deref()
@@ -1786,8 +1787,7 @@ impl PerfEvidenceAssemblyArtifact {
     /// # Errors
     ///
     /// Returns the Required-coverage error first, then a separately typed
-    /// Diagnostic-coverage error. Missing diagnostics never block
-    /// [`Self::require_adjudicable`].
+    /// Diagnostic-coverage error. Missing diagnostics block adjudication.
     pub fn require_full_plan_coverage(&self) -> Result<(), PerfEvidenceAssemblyError> {
         self.require_complete()?;
         if self.missing_diagnostic_cell_ids.is_empty() {
@@ -1811,7 +1811,7 @@ impl PerfEvidenceAssemblyArtifact {
     /// Returns the ordinary incomplete error for holes, or a typed durable
     /// `NoClaim` error carrying exact cell/status/reason diagnostics.
     pub fn require_adjudicable(&self) -> Result<(), PerfEvidenceAssemblyError> {
-        self.require_complete()?;
+        self.require_full_plan_coverage()?;
         if self.readiness == PerfEvidenceAssemblyReadiness::ReadyForAdjudication {
             Ok(())
         } else {
@@ -1908,6 +1908,17 @@ impl PerfEvidenceAssemblyArtifact {
                     reason: format!("assembly is not strict JSON: {error}"),
                 }
             })?;
+        let found_schema = probe
+            .get("schema_version")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| PerfEvidenceAssemblyError::Malformed {
+                reason: "assembly has no string schema_version".to_owned(),
+            })?;
+        if found_schema != PERF_EVIDENCE_ASSEMBLY_SCHEMA_VERSION {
+            return Err(PerfEvidenceAssemblyError::SchemaMismatch {
+                found: found_schema.to_owned(),
+            });
+        }
         let artifact: Self = serde_json::from_value(probe.clone()).map_err(|error| {
             PerfEvidenceAssemblyError::Malformed {
                 reason: format!("assembly does not decode as the current schema: {error}"),
@@ -2736,6 +2747,7 @@ fn derive_assembly(
     let readiness = derive_readiness(
         required_cells,
         missing_required_cell_ids.len(),
+        missing_diagnostic_cell_ids.len(),
         required_non_adjudicable_cells,
         required_non_adjudicable_sources,
     );
@@ -2789,10 +2801,11 @@ fn derive_assembly(
 const fn derive_readiness(
     required_cells: usize,
     missing_required_cells: usize,
+    missing_diagnostic_cells: usize,
     non_adjudicable_required_cells: usize,
     blocking_source_no_claims: usize,
 ) -> PerfEvidenceAssemblyReadiness {
-    if missing_required_cells != 0 {
+    if missing_required_cells != 0 || missing_diagnostic_cells != 0 {
         PerfEvidenceAssemblyReadiness::NoClaimIncomplete
     } else if required_cells == 0 {
         PerfEvidenceAssemblyReadiness::NoClaimNoRequiredCells
@@ -3037,7 +3050,7 @@ fn semantic_runner_identity(
                 "run_id",
                 "run_log_sha256",
                 "threshold_artifact_sha256",
-                "evidence_artifact_sha256",
+                "prebinding_evidence_artifact_sha256",
             ],
         )?,
     })
@@ -3403,7 +3416,7 @@ pub enum PerfEvidenceAssemblyError {
     #[error("QG-1 semantic cell-set hash does not match retained measurements")]
     SemanticCellSetMismatch,
     /// The persisted schema is obsolete or names another artifact family.
-    #[error("QG-1 assembly schema is {found}; current is quill-perf-evidence-assembly-v1")]
+    #[error("QG-1 assembly schema is {found}; current is quill-perf-evidence-assembly-v2")]
     SchemaMismatch {
         /// Schema found in the input.
         found: String,
@@ -3454,12 +3467,13 @@ mod tests {
     use crate::{
         EngineConcurrencyObservation, EvidenceCellSpec, ExecutionProfileId, HardwareClassId,
         PairedExperimentResult, PerfConcurrencyEngine, PerfConcurrencyObserver,
-        PerfConcurrencyWitness, PerfMetricSemantics, PerfOperationScope, PerfRawSample,
-        PerfSampleArm, PerfSampleOrder, PerfSamplePhase, PerfSampleProvenance,
-        estimate_paired_experiment, seeded_balanced_pair_order,
+        PerfConcurrencyWitness, PerfRawSample, PerfSampleArm, PerfSampleOrder, PerfSamplePhase,
+        PerfSampleProvenance, estimate_paired_experiment, seeded_balanced_pair_order,
     };
 
     const RUN_WINDOW: &str = "qg1-h4-test-window";
+    const TEST_MACHINE_FINGERPRINT: &str =
+        "linux-x86_64-test-machine-128thread-AMD_Ryzen_Threadripper_PRO_5995WX_64-Cores";
 
     fn private_tempdir(label: &str) -> TempDir {
         let directory = tempdir().unwrap_or_else(|error| panic!("{label}: {error}"));
@@ -3511,10 +3525,7 @@ mod tests {
     }
 
     fn estimator_config() -> PairedEstimatorConfig {
-        let mut config = PairedEstimatorConfig::predeclared(0x4834_5eed);
-        config.bootstrap_resamples = 100;
-        config.min_pairs = 4;
-        config
+        PairedEstimatorConfig::predeclared(0x4834_5eed)
     }
 
     fn build_identity(identity: TestIdentity) -> BuildIdentity {
@@ -3551,24 +3562,29 @@ mod tests {
             ),
             build: build_identity(identity),
             machine: MachineIdentity {
-                fingerprint: "test-machine".to_owned(),
+                fingerprint: TEST_MACHINE_FINGERPRINT.to_owned(),
                 os: "linux".to_owned(),
                 arch: "x86_64".to_owned(),
-                logical_cpus: 128,
+                logical_cpus: 64,
                 execution: PerfExecutionProvenance {
                     host_identity: "test-machine".to_owned(),
                     producer_os: PerfProducerOs::Linux,
                     physical_cores: 64,
                     logical_threads: 128,
                     process_available_threads: 64,
+                    execution_capacity: 64,
+                    max_exercised_cell_width: 64,
                     configured_engine_thread_widths: configured_widths,
-                    runtime_detected_isa: vec!["avx2".to_owned()],
+                    runtime_detected_isa: ["aes", "avx2", "bmi2", "fma", "vaes"]
+                        .into_iter()
+                        .map(str::to_owned)
+                        .collect(),
                     cpu_affinity_allowed_list: Some("0-63".to_owned()),
                     affinity_or_cpuset_cap: Some(
-                        "physical-64 profile: one hardware thread per physical core".to_owned(),
+                        "Cpus_allowed_list=0-63 (64 of 128 host logical threads)".to_owned(),
                     ),
                 },
-                cpu_governor: None,
+                cpu_governor: Some("performance".to_owned()),
                 load_average_start: Some(f64::from(run_variation % 100) / 10.0),
                 load_average_end: Some(f64::from(run_variation % 80) / 10.0),
             },
@@ -3594,7 +3610,7 @@ mod tests {
             executable_sha256: identity.executable.to_string().repeat(64),
             corpus_sha256: identity.corpus.to_string().repeat(64),
             input_identity: None,
-            worker_id: "test-machine".to_owned(),
+            worker_id: TEST_MACHINE_FINGERPRINT.to_owned(),
             build_profile: "test".to_owned(),
         }
     }
@@ -3625,13 +3641,16 @@ mod tests {
         treatment_elapsed_ns: u64,
         sample_id_base: u64,
     ) -> Vec<PerfRawSample> {
-        let scope = PerfOperationScope {
-            operation_id: "qg1.bulk_index_publish".to_owned(),
-            version: 1,
-            semantics: PerfMetricSemantics::Throughput,
-            unit: "docs/s".to_owned(),
-        };
+        let scope = crate::perf::perf_operation_scope(
+            PerfGate::Qg1,
+            "bulk/tiny/1/positions_on",
+            "docs_per_second",
+        );
         let provenance = sample_provenance(run_id, identity);
+        #[allow(clippy::cast_precision_loss)]
+        let control_observed = 10_000.0 * 1_000_000_000.0 / control_elapsed_ns as f64;
+        #[allow(clippy::cast_precision_loss)]
+        let treatment_observed = 10_000.0 * 1_000_000_000.0 / treatment_elapsed_ns as f64;
         let orders = seeded_balanced_pair_order(30, 0x4834_5eed).expect("balanced pair order");
         let mut samples = Vec::with_capacity(60);
         for (index, first_arm) in orders.into_iter().enumerate() {
@@ -3658,9 +3677,9 @@ mod tests {
                 provenance: provenance.clone(),
                 started_ns: control_start,
                 ended_ns: control_start + control_elapsed_ns,
-                work_units: Some(10_000),
+                work_units: None,
                 byte_count: Some(1_000_000),
-                observed_value: None,
+                observed_value: Some(control_observed),
                 group_id: None,
                 qg6_sample_binding: None,
             });
@@ -3678,9 +3697,9 @@ mod tests {
                 provenance: provenance.clone(),
                 started_ns: treatment_start,
                 ended_ns: treatment_start + treatment_elapsed_ns,
-                work_units: Some(10_000),
+                work_units: None,
                 byte_count: Some(1_000_000),
-                observed_value: None,
+                observed_value: Some(treatment_observed),
                 group_id: None,
                 qg6_sample_binding: None,
             });
@@ -3742,6 +3761,25 @@ mod tests {
                     },
                 ],
             });
+        let retarget = |source: &PairedExperimentResult| {
+            let mut result = source.clone();
+            let scope = crate::perf::perf_operation_scope(
+                PerfGate::Qg1,
+                &contract.spec.fixture,
+                &contract.spec.metric,
+            );
+            result.scope = scope.clone();
+            for sample in result
+                .effect_samples
+                .iter_mut()
+                .chain(&mut result.null_samples)
+            {
+                sample.scope = scope.clone();
+            }
+            result
+        };
+        let paired = retarget(paired);
+        let treatment_null = retarget(treatment_null);
         let mut cell = EvidenceCell::evaluate(
             EvidenceCellSpec {
                 gate: PerfGate::Qg1,
@@ -3754,11 +3792,11 @@ mod tests {
                 cold_cache: None,
                 concurrency_witness,
             },
-            paired.clone(),
+            paired,
             policy,
         )
         .expect("evaluate QG-1 test cell");
-        cell.attach_treatment_arm_null(treatment_null.clone(), policy)
+        cell.attach_treatment_arm_null(treatment_null, policy)
             .expect("attach same-invocation Q/Q null");
         cell
     }
@@ -4193,7 +4231,7 @@ mod tests {
             .collect::<BTreeSet<_>>();
         assert!(codes.contains(PERF_ASSEMBLY_ENGINE_LIFECYCLE_NO_CLAIM_CODE));
         assert!(codes.contains(PERF_ASSEMBLY_PROCESS_TREE_NO_CLAIM_CODE));
-        if assembly.is_complete() && assembly.counts().required_cells() != 0 {
+        if assembly.has_full_plan_coverage() && assembly.counts().required_cells() != 0 {
             assert_eq!(
                 assembly.readiness(),
                 PerfEvidenceAssemblyReadiness::NoClaimInvalidEvidence
@@ -4317,7 +4355,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_diagnostics_do_not_hide_h2_lifecycle_no_claims() {
+    fn missing_diagnostics_block_adjudication_before_h2_lifecycle_no_claims() {
         let ordinals = ordinals_for(PerfCellApplicability::Required);
         let midpoint = ordinals.len() / 2;
         let shards = vec![
@@ -4342,9 +4380,16 @@ mod tests {
         assert!(!assembly.has_full_plan_coverage());
         assert!(assembly.missing_required_cell_ids().is_empty());
         assert_eq!(assembly.missing_diagnostic_cell_ids().len(), 2);
-        assert_h2_lifecycle_boundary(&assembly);
+        assert_eq!(
+            assembly.readiness(),
+            PerfEvidenceAssemblyReadiness::NoClaimIncomplete
+        );
         assert!(matches!(
             assembly.require_full_plan_coverage(),
+            Err(PerfEvidenceAssemblyError::IncompleteDiagnosticCoverage { missing: 2, .. })
+        ));
+        assert!(matches!(
+            assembly.require_adjudicable(),
             Err(PerfEvidenceAssemblyError::IncompleteDiagnosticCoverage { missing: 2, .. })
         ));
     }
@@ -4382,11 +4427,11 @@ mod tests {
 
     #[test]
     fn arbitrary_partial_source_no_claim_cannot_be_laundered_into_readiness() {
-        let required = ordinals_for(PerfCellApplicability::Required);
-        let midpoint = required.len() / 2;
+        let ordinals = runnable_ordinals();
+        let midpoint = ordinals.len() / 2;
         let shards = vec![
             shard_with_partial_code(
-                &required[..midpoint],
+                &ordinals[..midpoint],
                 "source-no-claim-a",
                 "source-no-claim-runner-a",
                 None,
@@ -4394,7 +4439,7 @@ mod tests {
                 "evidence.incomplete_gate_selection",
             ),
             shard(
-                &required[midpoint..],
+                &ordinals[midpoint..],
                 "source-no-claim-b",
                 "source-no-claim-runner-b",
                 None,
@@ -4465,7 +4510,7 @@ mod tests {
     #[test]
     fn zero_required_profile_is_explicit_durable_no_claim() {
         assert_eq!(
-            derive_readiness(0, 0, 0, 0),
+            derive_readiness(0, 0, 0, 0, 0),
             PerfEvidenceAssemblyReadiness::NoClaimNoRequiredCells
         );
     }
@@ -4807,6 +4852,23 @@ mod tests {
                 &serde_json::to_vec_pretty(&value).unwrap()
             ),
             Err(PerfEvidenceAssemblyError::Malformed { .. })
+        ));
+    }
+
+    #[test]
+    fn stale_outer_schema_rejects_before_legacy_nested_shape_decoding() {
+        let stale = serde_json::to_vec_pretty(&serde_json::json!({
+            "schema_version": "quill-perf-evidence-assembly-v1",
+            "source_shards": [{
+                "threshold_artifact": {"schema_version": "quill-perf-artifact-v6"},
+                "artifact": {"schema_version": "quill-perf-evidence-v4"},
+            }],
+        }))
+        .expect("stale assembly probe");
+        assert!(matches!(
+            PerfEvidenceAssemblyArtifact::from_verified_slice(&stale),
+            Err(PerfEvidenceAssemblyError::SchemaMismatch { ref found })
+                if found == "quill-perf-evidence-assembly-v1"
         ));
     }
 
@@ -5220,8 +5282,8 @@ mod tests {
         let bytes = serde_json::to_vec_pretty(&source).expect("canonical hostile evidence bytes");
         assert!(matches!(
             PerfEvidenceArtifact::from_verified_slice(&bytes),
-            Err(EvidenceArtifactError::InvalidProvenance { ref reason })
-                if reason.contains("runner evidence-artifact binding rejected")
+            Err(EvidenceArtifactError::InconsistentArtifact { ref reason })
+                if reason.contains("not applicable to profile")
         ));
     }
 
@@ -5254,24 +5316,23 @@ mod tests {
     }
 
     #[test]
-    fn uniformly_stale_normative_manifest_is_rejected() {
+    fn stale_normative_manifest_is_rejected_at_source_integrity_boundary() {
         let ordinals = runnable_ordinals();
-        let stale = shard(
+        let mut stale = shard(
             &ordinals,
             "stale-manifest",
             "stale-manifest-runner",
             None,
-            TestIdentity {
-                manifest: Some('8'),
-                ..TestIdentity::PRIMARY
-            },
+            TestIdentity::PRIMARY,
         );
+        stale.provenance.manifest_sha256 = "8".repeat(64);
+        stale.artifact_sha256.clear();
+        let unsealed = serde_json::to_string_pretty(&stale).expect("stale unsealed evidence");
+        stale.artifact_sha256 = sha256_hex(unsealed.as_bytes());
         assert!(matches!(
-            assemble_test(vec![stale], Vec::new()),
-            Err(PerfEvidenceAssemblyError::IncompatibleShard {
-                field: "manifest_sha256",
-                ..
-            })
+            stale.verify_integrity(),
+            Err(EvidenceArtifactError::InvalidProvenance { ref reason })
+                if reason.contains("manifest digest differs")
         ));
     }
 }

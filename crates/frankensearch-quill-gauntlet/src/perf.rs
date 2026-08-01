@@ -23,7 +23,7 @@ use crate::machine_class_registry::{
 };
 
 /// Version of the JSON emitted by the QG matrix harness.
-pub const PERF_ARTIFACT_SCHEMA_VERSION: &str = "quill-perf-artifact-v6";
+pub const PERF_ARTIFACT_SCHEMA_VERSION: &str = "quill-perf-artifact-v7";
 /// Read-only schema identifier for historical gate artifacts that lack
 /// auditable host topology and effective-thread provenance.
 pub const LEGACY_PERF_ARTIFACT_SCHEMA_VERSION_V3: &str = "quill-perf-artifact-v3";
@@ -1948,6 +1948,13 @@ impl PairedExperimentResult {
     ///
     /// Returns [`PairedEstimatorError::InconsistentSummary`] on any mismatch.
     pub fn verify_recomputed(&self) -> Result<(), PairedEstimatorError> {
+        if self.config != PairedEstimatorConfig::predeclared(self.config.bootstrap_seed) {
+            return Err(PairedEstimatorError::InvalidConfig {
+                reason: "persisted evidence must use the exact predeclared estimator thresholds; \
+                         only the bootstrap seed may vary"
+                    .to_owned(),
+            });
+        }
         let recomputed =
             estimate_paired_experiment(&self.effect_samples, &self.null_samples, &self.config)?;
         if recomputed == *self {
@@ -2704,8 +2711,11 @@ impl PerfProducerOs {
 /// Auditable host topology and effective execution width for one benchmark
 /// artifact.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PerfExecutionProvenance {
-    /// Stable host name, not merely an architecture family label.
+    /// Benchmark-reported host name used only as a diagnostic correlation
+    /// label. Receipt-admitted hardware, topology, and execution facts—not
+    /// this hostname string—authorize a machine profile.
     pub host_identity: String,
     /// Operating system of the producer that captured this persisted
     /// provenance. Validation must never depend on the reader's host OS.
@@ -2717,6 +2727,18 @@ pub struct PerfExecutionProvenance {
     /// Concurrency available to the benchmark process after scheduler and
     /// cgroup constraints.
     pub process_available_threads: usize,
+    /// Registry-admitted execution capacity for the immutable profile.
+    ///
+    /// This is the profile's verified worker envelope, not the widest cell
+    /// selected by this invocation.
+    pub execution_capacity: u64,
+    /// Widest canonical cell the applicability plan permits this profile to
+    /// exercise for the gate.
+    ///
+    /// A scheduler profile may intentionally have a larger execution capacity
+    /// than this literal matrix width (for example capacity 10 with maximum
+    /// exercised width 8).
+    pub max_exercised_cell_width: u64,
     /// Exact engine thread-width knobs configured by the selected cells.
     ///
     /// This is configuration provenance, never a claim that every configured
@@ -2735,7 +2757,11 @@ impl PerfExecutionProvenance {
     /// Capture host-wide topology beside the exact widths selected by this
     /// invocation.
     #[must_use]
-    pub fn capture(configured_engine_thread_widths: impl IntoIterator<Item = usize>) -> Self {
+    pub fn capture(
+        execution_capacity: u64,
+        max_exercised_cell_width: u64,
+        configured_engine_thread_widths: impl IntoIterator<Item = usize>,
+    ) -> Self {
         let (physical_cores, logical_threads) = host_cpu_topology()
             .expect("performance evidence requires host physical/logical CPU topology");
         let process_available_threads = std::thread::available_parallelism().map_or(1, usize::from);
@@ -2775,6 +2801,8 @@ impl PerfExecutionProvenance {
             physical_cores,
             logical_threads,
             process_available_threads,
+            execution_capacity,
+            max_exercised_cell_width,
             configured_engine_thread_widths,
             runtime_detected_isa: runtime_detected_isa(),
             cpu_affinity_allowed_list,
@@ -2794,11 +2822,18 @@ impl PerfExecutionProvenance {
             && self.physical_cores > 0
             && self.logical_threads >= self.physical_cores
             && self.process_available_threads > 0
+            && self.process_available_threads <= self.logical_threads
+            && self.execution_capacity > 0
+            && self.max_exercised_cell_width > 0
+            && self.max_exercised_cell_width <= self.execution_capacity
+            && u64::try_from(self.process_available_threads)
+                .is_ok_and(|available| available >= self.execution_capacity)
             && !self.configured_engine_thread_widths.is_empty()
-            && self
-                .configured_engine_thread_widths
-                .iter()
-                .all(|threads| *threads > 0)
+            && self.configured_engine_thread_widths.iter().all(|threads| {
+                *threads > 0
+                    && u64::try_from(*threads)
+                        .is_ok_and(|width| width <= self.max_exercised_cell_width)
+            })
             && self
                 .configured_engine_thread_widths
                 .windows(2)
@@ -2811,6 +2846,20 @@ impl PerfExecutionProvenance {
                     .is_some_and(|value| !value.trim().is_empty()),
                 PerfProducerOs::Macos => true,
             }
+    }
+
+    /// Whether process-available concurrency represents the registry's
+    /// capacity semantics without collapsing scheduler workers into host CPUs.
+    #[must_use]
+    pub fn matches_capacity_semantics(&self, semantics: ExecutionCapacitySemantics) -> bool {
+        u64::try_from(self.process_available_threads).is_ok_and(|available| match semantics {
+            ExecutionCapacitySemantics::SchedulerWorkers => available >= self.execution_capacity,
+            ExecutionCapacitySemantics::PhysicalCores
+            | ExecutionCapacitySemantics::LogicalThreads
+            | ExecutionCapacitySemantics::DiagnosticWorkerBudget => {
+                available == self.execution_capacity
+            }
+        })
     }
 }
 
@@ -2915,20 +2964,33 @@ fn linux_cpu_allowed_list() -> Option<String> {
 }
 
 fn parse_cpu_list_count(value: &str) -> Option<usize> {
-    let mut count = 0_usize;
+    parse_cpu_list_ids(value).map(|ids| ids.len())
+}
+
+/// Parse a Linux CPU-list projection into its exact unique logical CPU IDs.
+pub fn parse_cpu_list_ids(value: &str) -> Option<BTreeSet<u64>> {
+    let mut ids = BTreeSet::new();
     for component in value.split(',') {
         let component = component.trim();
         let (first, last) = component
             .split_once('-')
             .map_or((component, component), |(first, last)| (first, last));
-        let first = first.parse::<usize>().ok()?;
-        let last = last.parse::<usize>().ok()?;
+        let first = first.parse::<u64>().ok()?;
+        let last = last.parse::<u64>().ok()?;
         if last < first {
             return None;
         }
-        count = count.checked_add(last.checked_sub(first)?.checked_add(1)?)?;
+        let width = last.checked_sub(first)?.checked_add(1)?;
+        if width > 1_048_576 || u64::try_from(ids.len()).ok()?.checked_add(width)? > 1_048_576 {
+            return None;
+        }
+        for id in first..=last {
+            if !ids.insert(id) {
+                return None;
+            }
+        }
     }
-    (count > 0).then_some(count)
+    (!ids.is_empty()).then_some(ids)
 }
 
 pub fn runtime_detected_isa() -> Vec<String> {
@@ -3019,21 +3081,122 @@ pub struct PerfCellResult {
     pub distribution: DistributionSummary,
 }
 
+type PerfCellResultContract = (String, String, String, String);
+
+/// Canonical display/storage unit for one normative performance metric.
+#[must_use]
+pub fn perf_metric_unit(metric: &str) -> &'static str {
+    match metric {
+        "docs_per_second" | "updates_per_second" | "tokenize_docs_per_second" => "docs/s",
+        "commit_latency_ms"
+        | "latency_ms"
+        | "open_latency_ms"
+        | "update_to_searchable_ms"
+        | "wall_clock_ms" => "ms",
+        "peak_rss_bytes" => "bytes",
+        "index_bytes_per_document" => "bytes/doc",
+        "tantivy_nodes" => "nodes",
+        _ => "ratio",
+    }
+}
+
+/// Reconstruct the exact operation scope emitted for one canonical cell.
+#[must_use]
+pub fn perf_operation_scope(gate: PerfGate, fixture: &str, metric: &str) -> PerfOperationScope {
+    let semantics = match metric {
+        "docs_per_second" | "tokenize_docs_per_second" | "updates_per_second" => {
+            PerfMetricSemantics::GaugeHigherIsBetter
+        }
+        _ => PerfMetricSemantics::GaugeLowerIsBetter,
+    };
+    PerfOperationScope {
+        operation_id: format!("{gate}.{fixture}.{metric}"),
+        version: 1,
+        semantics,
+        unit: perf_metric_unit(metric).to_owned(),
+    }
+}
+
+fn result_contract(cell: &PerfCellResult) -> PerfCellResultContract {
+    (
+        cell.fixture.clone(),
+        cell.metric.clone(),
+        cell.engine.clone(),
+        cell.unit.clone(),
+    )
+}
+
+fn expected_result_contracts(gate: PerfGate, spec: &PerfCellSpec) -> Vec<PerfCellResultContract> {
+    if gate == PerfGate::Qg10 {
+        return vec![(
+            spec.fixture.clone(),
+            spec.metric.clone(),
+            "default_feature_graph".to_owned(),
+            "nodes".to_owned(),
+        )];
+    }
+    let absolute_engine = if spec.metric == "tokenize_docs_per_second" {
+        "quill_tokenizer"
+    } else {
+        "quill"
+    };
+    let oracle_engine = if spec.metric == "tokenize_docs_per_second" {
+        "quill_tokenizer_null"
+    } else {
+        "tantivy"
+    };
+    let mut contracts = vec![
+        (
+            spec.fixture.clone(),
+            spec.metric.clone(),
+            absolute_engine.to_owned(),
+            perf_metric_unit(&spec.metric).to_owned(),
+        ),
+        (
+            spec.fixture.clone(),
+            spec.metric.clone(),
+            oracle_engine.to_owned(),
+            perf_metric_unit(&spec.metric).to_owned(),
+        ),
+        (
+            spec.fixture.clone(),
+            format!("{}_quill_over_tantivy", spec.metric),
+            "paired_ab".to_owned(),
+            "ratio".to_owned(),
+        ),
+        (
+            spec.fixture.clone(),
+            format!("{}_tantivy_over_tantivy", spec.metric),
+            "paired_null".to_owned(),
+            "ratio".to_owned(),
+        ),
+    ];
+    if gate == PerfGate::Qg1 {
+        contracts.push((
+            spec.fixture.clone(),
+            format!("{}_quill_over_quill", spec.metric),
+            "paired_null_quill".to_owned(),
+            "ratio".to_owned(),
+        ));
+    }
+    contracts
+}
+
 /// Per-gate JSON artifact matching the committed E0.6 schema contract.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct PerfGateArtifact {
     pub schema_version: String,
     pub gate: PerfGate,
-    /// Required on every measured v6 artifact. `None` exists only for the
-    /// exact unmeasured v6 sentinel and explicit read-only legacy loaders.
+    /// Required on every measured v7 artifact. `None` exists only for the
+    /// exact unmeasured v7 sentinel and explicit read-only legacy loaders.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub applicability_plan: Option<PerfApplicabilityPlanBinding>,
     /// SHA-256 emitted by the benchmark process for its own executing ELF.
     pub bench_elf_sha256: String,
     pub machine_fingerprint: String,
-    /// Required on measured v6 artifacts. `None` exists only for the exact
-    /// unmeasured v6 sentinel and the explicit read-only v3 loader.
+    /// Required on measured v7 artifacts. `None` exists only for the exact
+    /// unmeasured v7 sentinel and the explicit read-only v3 loader.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub execution: Option<PerfExecutionProvenance>,
     pub git_rev: String,
@@ -3048,6 +3211,224 @@ pub struct PerfGateArtifact {
 }
 
 impl PerfGateArtifact {
+    fn validate_selected_cells(
+        &self,
+        plan: &PerfApplicabilityPlan,
+    ) -> Result<(BTreeSet<usize>, bool), GauntletError> {
+        let invalid = |reason: String| GauntletError::InvalidPreparedArtifact { reason };
+        let matrix = PerfMatrixSpec::complete();
+        let canonical_cells = matrix.for_gate(self.gate);
+        if canonical_cells.len() != plan.cells.len() {
+            return Err(invalid(
+                "threshold plan does not classify the complete canonical gate".to_owned(),
+            ));
+        }
+
+        let mut expected_by_ordinal = BTreeMap::new();
+        let mut contract_to_ordinal = BTreeMap::new();
+        for (spec, classification) in canonical_cells.into_iter().zip(&plan.cells) {
+            if !classification.applicability.is_runnable() {
+                continue;
+            }
+            let contracts = expected_result_contracts(self.gate, spec)
+                .into_iter()
+                .collect::<BTreeSet<_>>();
+            for contract in &contracts {
+                if contract_to_ordinal
+                    .insert(contract.clone(), classification.ordinal)
+                    .is_some()
+                {
+                    return Err(invalid(
+                        "canonical threshold row contract is ambiguous".to_owned(),
+                    ));
+                }
+            }
+            expected_by_ordinal.insert(classification.ordinal, contracts);
+        }
+
+        let mut seen = BTreeSet::new();
+        let mut selected_by_ordinal = BTreeMap::<usize, BTreeSet<_>>::new();
+        for cell in &self.cells {
+            let contract = result_contract(cell);
+            if !seen.insert(contract.clone()) {
+                return Err(invalid(format!(
+                    "threshold repeats cell row {}/{}/{}/{}",
+                    contract.0, contract.1, contract.2, contract.3
+                )));
+            }
+            let ordinal = contract_to_ordinal.get(&contract).ok_or_else(|| {
+                invalid(format!(
+                    "threshold row {}/{}/{}/{} is not part of the runnable canonical plan",
+                    contract.0, contract.1, contract.2, contract.3
+                ))
+            })?;
+            selected_by_ordinal
+                .entry(*ordinal)
+                .or_default()
+                .insert(contract);
+        }
+        if selected_by_ordinal.is_empty() {
+            return Err(invalid(
+                "a measured threshold requires at least one complete canonical cell".to_owned(),
+            ));
+        }
+
+        let mut selected_widths = BTreeSet::new();
+        for (ordinal, selected) in &selected_by_ordinal {
+            let expected = expected_by_ordinal.get(ordinal).ok_or_else(|| {
+                invalid(format!(
+                    "threshold selected non-runnable canonical cell ordinal {ordinal}"
+                ))
+            })?;
+            if selected != expected {
+                return Err(invalid(format!(
+                    "threshold canonical cell ordinal {ordinal} has missing, extra, or altered engine rows"
+                )));
+            }
+            let configured_threads = plan
+                .cells
+                .get(*ordinal)
+                .ok_or_else(|| invalid(format!("threshold plan omits cell ordinal {ordinal}")))?
+                .configured_threads;
+            selected_widths.insert(configured_threads);
+        }
+        Ok((
+            selected_widths,
+            selected_by_ordinal.len() == expected_by_ordinal.len(),
+        ))
+    }
+
+    /// Parse and verify one current measured threshold artifact.
+    ///
+    /// This loader intentionally rejects unmeasured sentinels and historical
+    /// schemas. It reconstructs the applicability plan from the compiled
+    /// matrix, normative performance manifest, and frozen machine registry;
+    /// artifact-provided hashes never establish their own validity.
+    ///
+    /// # Errors
+    ///
+    /// Returns a strict JSON or contract error when the bytes are
+    /// noncanonical, stale, incomplete, or do not reconstruct exactly.
+    pub fn from_verified_measured_slice(bytes: &[u8]) -> Result<Self, GauntletError> {
+        let artifact = serde_json::from_slice::<Self>(bytes)?;
+        if serde_json::to_vec_pretty(&artifact)? != bytes {
+            return Err(GauntletError::InvalidPreparedArtifact {
+                reason: "threshold artifact is not exact canonical pretty JSON".to_owned(),
+            });
+        }
+        artifact.verify_current_measured_contract()?;
+        Ok(artifact)
+    }
+
+    /// Reconstruct the exact plan and verify this current measured artifact's
+    /// matrix, manifest, registry, profile, capacity, and plan envelope.
+    ///
+    /// # Errors
+    ///
+    /// Returns a bounded contract error for sentinels, legacy schemas, or any
+    /// field that differs from fresh canonical reconstruction.
+    pub fn verify_current_measured_contract(&self) -> Result<PerfApplicabilityPlan, GauntletError> {
+        let invalid = |reason: String| GauntletError::InvalidPreparedArtifact { reason };
+        if self.schema_version != PERF_ARTIFACT_SCHEMA_VERSION {
+            return Err(invalid(format!(
+                "measured threshold schema is {:?}, expected {:?}",
+                self.schema_version, PERF_ARTIFACT_SCHEMA_VERSION
+            )));
+        }
+        let binding = self.applicability_plan.as_ref().ok_or_else(|| {
+            invalid("current measured threshold has no applicability-plan binding".to_owned())
+        })?;
+        if binding.gate != self.gate {
+            return Err(invalid(
+                "threshold gate differs from its applicability-plan gate".to_owned(),
+            ));
+        }
+        let registry = MachineClassRegistry::frozen().map_err(|error| {
+            invalid(format!(
+                "frozen machine registry rejected threshold verification: {error}"
+            ))
+        })?;
+        let plan = PerfMatrixSpec::complete()
+            .applicability_plan(&registry, binding.profile, binding.gate)
+            .map_err(|error| {
+                invalid(format!(
+                    "threshold applicability plan does not reconstruct: {error}"
+                ))
+            })?;
+        if plan.binding != *binding {
+            return Err(invalid(
+                "threshold applicability-plan binding differs from canonical reconstruction"
+                    .to_owned(),
+            ));
+        }
+        if self.manifest_sha256 != binding.normalized_perf_manifest_sha256 {
+            return Err(invalid(
+                "threshold manifest digest differs from its reconstructed plan".to_owned(),
+            ));
+        }
+        let execution = self.execution.as_ref().ok_or_else(|| {
+            invalid("current measured threshold has no execution provenance".to_owned())
+        })?;
+        if !execution.is_complete() {
+            return Err(invalid(
+                "current measured threshold has incomplete execution provenance".to_owned(),
+            ));
+        }
+        if !execution.matches_capacity_semantics(plan.capacity_semantics) {
+            return Err(invalid(
+                "threshold process availability contradicts its capacity semantics".to_owned(),
+            ));
+        }
+        if plan.execution_capacity != Some(execution.execution_capacity)
+            || plan.max_exercised_cell_width != Some(execution.max_exercised_cell_width)
+        {
+            return Err(invalid(
+                "threshold execution capacity/maximum differs from its reconstructed plan"
+                    .to_owned(),
+            ));
+        }
+        let (selected_widths, complete_selection) = self.validate_selected_cells(&plan)?;
+        if execution.configured_engine_thread_widths
+            != selected_widths.iter().copied().collect::<Vec<_>>()
+        {
+            return Err(invalid(
+                "threshold configured engine widths differ from its actual selected canonical cells"
+                    .to_owned(),
+            ));
+        }
+        if self.laws_attested != complete_selection {
+            return Err(invalid(
+                "threshold laws_attested must equal exact full runnable-plan coverage".to_owned(),
+            ));
+        }
+        let measured_label =
+            |value: &str| !value.trim().is_empty() && !value.eq_ignore_ascii_case("unmeasured");
+        let git_revision = matches!(self.git_rev.len(), 40 | 64)
+            && self
+                .git_rev
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte));
+        if !measured_label(&self.machine_fingerprint)
+            || !measured_label(&self.run_window)
+            || !measured_label(&self.run_id)
+            || !git_revision
+        {
+            return Err(invalid(
+                "measured threshold requires a concrete machine, run/window, and lowercase Git revision identity"
+                    .to_owned(),
+            ));
+        }
+        if !is_lower_hex_digest(&self.bench_elf_sha256)
+            || !is_lower_hex_digest(&self.corpus_manifest_hash)
+            || !is_lower_hex_digest(&self.manifest_sha256)
+        {
+            return Err(invalid(
+                "threshold identity digests must be lowercase SHA-256".to_owned(),
+            ));
+        }
+        Ok(plan)
+    }
+
     /// Encode canonical pretty JSON.
     ///
     /// # Errors
@@ -3065,13 +3446,16 @@ impl PerfGateArtifact {
             let _ = writeln!(
                 table,
                 "host={} | physical_cores={} | logical_threads={} | \
-                 process_available_threads={} | configured_engine_thread_widths={:?} | \
+                 process_available_threads={} | execution_capacity={} | \
+                 max_exercised_cell_width={} | configured_engine_thread_widths={:?} | \
                  runtime_detected_isa={:?} | cpu_affinity_allowed_list={} | \
                  affinity_or_cpuset_cap={}",
                 execution.host_identity,
                 execution.physical_cores,
                 execution.logical_threads,
                 execution.process_available_threads,
+                execution.execution_capacity,
+                execution.max_exercised_cell_width,
                 execution.configured_engine_thread_widths,
                 execution.runtime_detected_isa,
                 execution
@@ -3130,8 +3514,10 @@ impl PerfGateArtifact {
     }
 }
 
-/// Deterministic machine label that is specific enough to reject accidental
-/// cross-machine ratchet comparisons.
+/// Deterministic benchmark-reported machine label for diagnostic correlation.
+///
+/// Receipt-admitted hardware/profile facts remain authoritative for ratchet
+/// comparisons; this label alone never authorizes a cross-machine decision.
 #[must_use]
 pub fn machine_fingerprint() -> String {
     let logical_threads = host_cpu_topology()
@@ -3358,6 +3744,22 @@ mod tests {
             .expect("canonical QG-1 applicability plan")
     }
 
+    fn threshold_rows(gate: PerfGate, specs: &[&PerfCellSpec]) -> Vec<PerfCellResult> {
+        let distribution = DistributionSummary::from_samples(&[1.0; PERF_MIN_RUNS])
+            .expect("constant threshold distribution");
+        specs
+            .iter()
+            .flat_map(|spec| expected_result_contracts(gate, spec))
+            .map(|(fixture, metric, engine, unit)| PerfCellResult {
+                fixture,
+                metric,
+                engine,
+                unit,
+                distribution: distribution.clone(),
+            })
+            .collect()
+    }
+
     #[test]
     fn prepared_input_fingerprint_binds_each_component_independently() {
         let identity = PerfInputIdentity {
@@ -3426,19 +3828,7 @@ mod tests {
     }
 
     fn estimator_config() -> PairedEstimatorConfig {
-        PairedEstimatorConfig {
-            bootstrap_seed: 0x5eed_1234_5678_9abc,
-            bootstrap_resamples: PERF_BOOTSTRAP_RESAMPLES,
-            min_pairs: PERF_MIN_RUNS,
-            max_order_imbalance: 0,
-            max_null_center_log: 1.05_f64.ln(),
-            max_null_ci_half_width_log: 1.10_f64.ln(),
-            max_null_log_mad: 1.05_f64.ln(),
-            max_null_order_effect_log: 1.05_f64.ln(),
-            max_null_drift_log: 1.05_f64.ln(),
-            summary_direction_dead_band_log: 1.000_001_f64.ln(),
-            max_reproduction_delta_log: 1.02_f64.ln(),
-        }
+        PairedEstimatorConfig::predeclared(0x5eed_1234_5678_9abc)
     }
 
     fn operation_scope(semantics: PerfMetricSemantics) -> PerfOperationScope {
@@ -4019,7 +4409,7 @@ mod tests {
                 16,
                 Some(64),
                 Some(64),
-                "2157d4c9c1e2a604f6f1468ad278798126fae81b5aed107dc411e520cc009fcd",
+                "2b9d450b21a3b051a5b05a479709dbbca482d7d27f1221ddd77adaed2934f5b3",
             ),
             (
                 ExecutionProfileId::Smt2_128,
@@ -4028,7 +4418,7 @@ mod tests {
                 0,
                 Some(128),
                 Some(128),
-                "ddc419dfe3fd66444f3a14be2ca04c0affb6ee7e4074b4bfcfa1236069759638",
+                "bb66e93d76bee49640023abbc56738361dc6d9729eb4f8739af228df9785a56e",
             ),
             (
                 ExecutionProfileId::Scheduler10,
@@ -4037,10 +4427,12 @@ mod tests {
                 40,
                 Some(10),
                 Some(8),
-                "3ef9f339e897ff6c0ac108853b2d470aeb5f23d93398885506f7faa593076a70",
+                "24787b922c8ce58fd6166a7475def35e498986500b7fa27e88a05a566a0bbdc5",
             ),
         ];
         let mut plan_hashes = BTreeSet::new();
+        let mut observed_plan_hashes = Vec::new();
+        let mut expected_plan_hashes = Vec::new();
         for (
             profile,
             required,
@@ -4079,10 +4471,8 @@ mod tests {
             );
             assert_eq!(plan.binding.registry_sha256, MACHINE_CLASS_REGISTRY_SHA256);
             assert!(is_lower_hex_digest(&plan.binding.profile_contract_sha256));
-            assert_eq!(
-                plan.binding.applicability_plan_sha256, expected_plan_sha256,
-                "{profile:?} plan hash must remain frozen"
-            );
+            observed_plan_hashes.push((profile, plan.binding.applicability_plan_sha256.clone()));
+            expected_plan_hashes.push((profile, expected_plan_sha256.to_owned()));
             assert!(
                 plan.cells
                     .iter()
@@ -4104,6 +4494,10 @@ mod tests {
                 "each execution profile requires a distinct plan hash"
             );
         }
+        assert_eq!(
+            observed_plan_hashes, expected_plan_hashes,
+            "all profile plan hashes must remain frozen"
+        );
     }
 
     #[test]
@@ -4716,7 +5110,7 @@ mod tests {
         assert_eq!(manifest.matches("activated = false").count(), 10);
         assert_eq!(
             perf_manifest_contract_sha256(manifest),
-            "82e978f1aafe9c8b0164c5151f84e43445cf24951c12f0963ff077cd2733e387",
+            "404c0e24c9f3f4919e3b9c3213e722c77bcdb89ea2f991d0a66dc67eafd0fc89",
             "the normalized all-inactive manifest digest must remain frozen"
         );
         assert_eq!(
@@ -4814,13 +5208,19 @@ mod tests {
     }
 
     #[test]
-    fn artifact_v6_json_roundtrips_and_binds_profile_and_plan_identity() {
-        let distribution = DistributionSummary::from_samples(&[1.0; PERF_MIN_RUNS])
-            .expect("constant distribution");
+    fn artifact_v7_json_roundtrips_and_binds_profile_plan_and_capacity_identity() {
         let registry = MachineClassRegistry::frozen().expect("frozen machine registry");
-        let applicability_plan = qg1_plan(&registry, ExecutionProfileId::Physical64)
-            .binding()
-            .clone();
+        let plan = qg1_plan(&registry, ExecutionProfileId::Smt2_128);
+        let applicability_plan = plan.binding().clone();
+        let matrix = PerfMatrixSpec::complete();
+        let selected_specs = matrix
+            .for_gate(PerfGate::Qg1)
+            .into_iter()
+            .zip(&plan.cells)
+            .filter_map(|(spec, classification)| {
+                classification.applicability.is_runnable().then_some(spec)
+            })
+            .collect::<Vec<_>>();
         let artifact = PerfGateArtifact {
             schema_version: PERF_ARTIFACT_SCHEMA_VERSION.to_owned(),
             gate: PerfGate::Qg1,
@@ -4833,28 +5233,24 @@ mod tests {
                 physical_cores: 64,
                 logical_threads: 128,
                 process_available_threads: 128,
+                execution_capacity: 128,
+                max_exercised_cell_width: 128,
                 configured_engine_thread_widths: vec![1, 2, 4, 8, 16, 32, 64, 96, 128],
                 runtime_detected_isa: vec!["avx2".to_owned(), "bmi2".to_owned(), "fma".to_owned()],
                 cpu_affinity_allowed_list: Some("0-127".to_owned()),
                 affinity_or_cpuset_cap: None,
             }),
-            git_rev: "0123456789abcdef".to_owned(),
+            git_rev: "0123456789abcdef0123456789abcdef01234567".to_owned(),
             run_window: "test-window".to_owned(),
             run_id: "candidate".to_owned(),
             corpus_manifest_hash: "a".repeat(64),
-            manifest_sha256: "b".repeat(64),
-            cells: vec![PerfCellResult {
-                fixture: "bulk/tiny/1/positions_on".to_owned(),
-                metric: "docs_per_second".to_owned(),
-                engine: "quill".to_owned(),
-                unit: "docs/s".to_owned(),
-                distribution,
-            }],
+            manifest_sha256: applicability_plan.normalized_perf_manifest_sha256.clone(),
+            cells: threshold_rows(PerfGate::Qg1, &selected_specs),
             laws_attested: true,
         };
         let json = artifact.to_json_pretty().expect("artifact JSON");
         let value: serde_json::Value = serde_json::from_str(&json).expect("decode artifact");
-        assert_eq!(PERF_ARTIFACT_SCHEMA_VERSION, "quill-perf-artifact-v6");
+        assert_eq!(PERF_ARTIFACT_SCHEMA_VERSION, "quill-perf-artifact-v7");
         assert_eq!(
             value["schema_version"].as_str(),
             Some(PERF_ARTIFACT_SCHEMA_VERSION)
@@ -4876,8 +5272,8 @@ mod tests {
         ] {
             assert!(value.get(key).is_some(), "missing required field {key}");
         }
-        let decoded: PerfGateArtifact =
-            serde_json::from_str(&json).expect("round-trip typed v6 artifact");
+        let decoded = PerfGateArtifact::from_verified_measured_slice(json.as_bytes())
+            .expect("round-trip verified typed v7 artifact");
         assert_eq!(decoded, artifact);
         assert_eq!(
             decoded.applicability_plan.as_ref(),
@@ -4889,8 +5285,11 @@ mod tests {
         profile_drift
             .applicability_plan
             .as_mut()
-            .expect("measured v6 binding")
-            .profile = profile_key(HardwareClassId::TrjZen35995wx, ExecutionProfileId::Smt2_128);
+            .expect("measured v7 binding")
+            .profile = profile_key(
+            HardwareClassId::TrjZen35995wx,
+            ExecutionProfileId::Physical64,
+        );
         let profile_drift_json = profile_drift
             .to_json_pretty()
             .expect("serialize profile-drifted artifact");
@@ -4904,7 +5303,7 @@ mod tests {
         plan_drift
             .applicability_plan
             .as_mut()
-            .expect("measured v6 binding")
+            .expect("measured v7 binding")
             .applicability_plan_sha256 = "d".repeat(64);
         let plan_drift_json = plan_drift
             .to_json_pretty()
@@ -4922,6 +5321,364 @@ mod tests {
         assert!(table.contains("sampled"));
         assert!(
             table.contains("configured_engine_thread_widths=[1, 2, 4, 8, 16, 32, 64, 96, 128]")
+        );
+        assert!(table.contains("execution_capacity=128"));
+        assert!(table.contains("max_exercised_cell_width=128"));
+
+        assert_eq!(
+            artifact
+                .verify_current_measured_contract()
+                .expect("verified measured threshold"),
+            plan
+        );
+
+        let mut capacity_drift = artifact.clone();
+        capacity_drift
+            .execution
+            .as_mut()
+            .expect("measured v7 execution provenance")
+            .execution_capacity = 64;
+        assert!(
+            !capacity_drift
+                .execution
+                .as_ref()
+                .expect("mutated execution provenance")
+                .is_complete(),
+            "capacity below the process and selected width must fail closed"
+        );
+
+        let mut maximum_drift = artifact.clone();
+        maximum_drift
+            .execution
+            .as_mut()
+            .expect("measured v7 execution provenance")
+            .max_exercised_cell_width = 64;
+        assert!(
+            !maximum_drift
+                .execution
+                .as_ref()
+                .expect("mutated execution provenance")
+                .is_complete(),
+            "a selected width above the plan maximum must fail closed"
+        );
+
+        let mut strict_execution = serde_json::to_value(
+            artifact
+                .execution
+                .as_ref()
+                .expect("measured v7 execution provenance"),
+        )
+        .expect("serialize strict execution provenance");
+        strict_execution
+            .as_object_mut()
+            .expect("execution provenance is an object")
+            .insert("caller_thread_budget".to_owned(), serde_json::json!(128));
+        assert!(
+            serde_json::from_value::<PerfExecutionProvenance>(strict_execution).is_err(),
+            "unknown caller-authoritative capacity fields must be rejected"
+        );
+    }
+
+    #[test]
+    fn measured_threshold_verified_reload_reconstructs_every_gate_and_rejects_drift() {
+        let registry = MachineClassRegistry::frozen().expect("frozen machine registry");
+        let profile = profile_key(
+            HardwareClassId::TrjZen35995wx,
+            ExecutionProfileId::Physical64,
+        );
+        for gate in PerfGate::ALL {
+            let matrix = PerfMatrixSpec::complete();
+            let plan = matrix
+                .applicability_plan(&registry, profile, gate)
+                .expect("canonical per-gate plan");
+            let execution_capacity = plan.execution_capacity.expect("bounded profile capacity");
+            let max_exercised_cell_width = plan
+                .max_exercised_cell_width
+                .expect("bounded per-gate maximum");
+            let runnable = matrix
+                .for_gate(gate)
+                .into_iter()
+                .zip(&plan.cells)
+                .filter(|(_, classification)| classification.applicability.is_runnable())
+                .collect::<Vec<_>>();
+            let (selected_spec, selected_classification) = runnable[0];
+            let artifact = PerfGateArtifact {
+                schema_version: PERF_ARTIFACT_SCHEMA_VERSION.to_owned(),
+                gate,
+                applicability_plan: Some(plan.binding().clone()),
+                bench_elf_sha256: "c".repeat(64),
+                machine_fingerprint: "linux-x86_64-test".to_owned(),
+                execution: Some(PerfExecutionProvenance {
+                    host_identity: "test-host".to_owned(),
+                    producer_os: PerfProducerOs::Linux,
+                    physical_cores: 64,
+                    logical_threads: 128,
+                    process_available_threads: usize::try_from(execution_capacity)
+                        .expect("test capacity fits usize"),
+                    execution_capacity,
+                    max_exercised_cell_width,
+                    configured_engine_thread_widths: vec![
+                        selected_classification.configured_threads,
+                    ],
+                    runtime_detected_isa: vec![
+                        "avx2".to_owned(),
+                        "bmi2".to_owned(),
+                        "fma".to_owned(),
+                    ],
+                    cpu_affinity_allowed_list: Some("0-63".to_owned()),
+                    affinity_or_cpuset_cap: Some(
+                        "Cpus_allowed_list=0-63 (64 of 128 host logical threads)".to_owned(),
+                    ),
+                }),
+                git_rev: "0".repeat(40),
+                run_window: "test-window".to_owned(),
+                run_id: format!("{}-verified-reload", gate.label()),
+                corpus_manifest_hash: "a".repeat(64),
+                manifest_sha256: plan.binding.normalized_perf_manifest_sha256.clone(),
+                cells: threshold_rows(gate, &[selected_spec]),
+                laws_attested: runnable.len() == 1,
+            };
+            let bytes = serde_json::to_vec_pretty(&artifact).expect("canonical threshold bytes");
+            let reloaded = PerfGateArtifact::from_verified_measured_slice(&bytes)
+                .expect("strict measured threshold reload");
+            assert_eq!(reloaded, artifact);
+
+            let mut noncanonical = bytes.clone();
+            noncanonical.push(b'\n');
+            assert!(PerfGateArtifact::from_verified_measured_slice(&noncanonical).is_err());
+
+            let mut missing_engine_row = artifact.clone();
+            missing_engine_row.cells.pop();
+            assert!(
+                missing_engine_row
+                    .verify_current_measured_contract()
+                    .is_err(),
+                "a partial canonical engine-row group must fail strict reload for {gate}"
+            );
+
+            let mut duplicate_engine_row = artifact.clone();
+            duplicate_engine_row.cells.push(artifact.cells[0].clone());
+            assert!(
+                duplicate_engine_row
+                    .verify_current_measured_contract()
+                    .is_err(),
+                "a duplicate engine row must fail strict reload for {gate}"
+            );
+
+            let mut altered_cell_spec = artifact.clone();
+            altered_cell_spec.cells[0].unit.push_str("-tampered");
+            assert!(
+                altered_cell_spec
+                    .verify_current_measured_contract()
+                    .is_err(),
+                "an altered cell fixture/metric/engine/unit contract must fail for {gate}"
+            );
+
+            let mut width_projection_drift = artifact.clone();
+            width_projection_drift
+                .execution
+                .as_mut()
+                .expect("measured execution")
+                .configured_engine_thread_widths =
+                vec![selected_classification.configured_threads.saturating_add(1)];
+            assert!(
+                width_projection_drift
+                    .verify_current_measured_contract()
+                    .is_err(),
+                "configured widths must reconstruct from actual selected cells for {gate}"
+            );
+
+            let mut law_scope_drift = artifact.clone();
+            law_scope_drift.laws_attested = !law_scope_drift.laws_attested;
+            assert!(
+                law_scope_drift.verify_current_measured_contract().is_err(),
+                "laws_attested must exactly describe full runnable coverage for {gate}"
+            );
+
+            for identity_field in ["machine_fingerprint", "run_window", "run_id"] {
+                let mut identity_drift = artifact.clone();
+                match identity_field {
+                    "machine_fingerprint" => identity_drift.machine_fingerprint.clear(),
+                    "run_window" => identity_drift.run_window = "unmeasured".to_owned(),
+                    "run_id" => identity_drift.run_id.clear(),
+                    _ => unreachable!("enumerated threshold identity field"),
+                }
+                assert!(
+                    identity_drift.verify_current_measured_contract().is_err(),
+                    "invalid measured identity field {identity_field} must fail for {gate}"
+                );
+            }
+            let mut git_identity_drift = artifact.clone();
+            git_identity_drift.git_rev = "not-a-git-revision".to_owned();
+            assert!(
+                git_identity_drift
+                    .verify_current_measured_contract()
+                    .is_err()
+            );
+
+            let mut manifest_drift = artifact.clone();
+            manifest_drift.manifest_sha256 = "0".repeat(64);
+            assert!(manifest_drift.verify_current_measured_contract().is_err());
+
+            let mut capacity_drift = artifact.clone();
+            capacity_drift
+                .execution
+                .as_mut()
+                .expect("measured execution")
+                .execution_capacity += 1;
+            assert!(capacity_drift.verify_current_measured_contract().is_err());
+
+            let mut incomplete_execution = artifact.clone();
+            incomplete_execution
+                .execution
+                .as_mut()
+                .expect("measured execution")
+                .host_identity
+                .clear();
+            assert!(
+                incomplete_execution
+                    .verify_current_measured_contract()
+                    .is_err(),
+                "empty host identity must fail the shared strict loader"
+            );
+
+            let mut zero_process_width = artifact.clone();
+            zero_process_width
+                .execution
+                .as_mut()
+                .expect("measured execution")
+                .process_available_threads = 0;
+            assert!(
+                zero_process_width
+                    .verify_current_measured_contract()
+                    .is_err(),
+                "zero process width must fail the shared strict loader"
+            );
+
+            let mut unsorted_widths = artifact.clone();
+            unsorted_widths
+                .execution
+                .as_mut()
+                .expect("measured execution")
+                .configured_engine_thread_widths = vec![2, 1];
+            assert!(
+                unsorted_widths.verify_current_measured_contract().is_err(),
+                "noncanonical configured widths must fail the shared strict loader"
+            );
+
+            let mut plan_drift = artifact.clone();
+            plan_drift
+                .applicability_plan
+                .as_mut()
+                .expect("measured plan")
+                .gate_matrix_contract_sha256 = "0".repeat(64);
+            assert!(plan_drift.verify_current_measured_contract().is_err());
+
+            let mut schema_drift = artifact;
+            schema_drift.schema_version = "quill-perf-artifact-v6".to_owned();
+            assert!(schema_drift.verify_current_measured_contract().is_err());
+        }
+    }
+
+    #[test]
+    fn measured_threshold_rejects_a_complete_not_applicable_cell_group() {
+        let registry = MachineClassRegistry::frozen().expect("frozen machine registry");
+        let matrix = PerfMatrixSpec::complete();
+        let profile = profile_key(
+            HardwareClassId::TrjZen35995wx,
+            ExecutionProfileId::Physical64,
+        );
+        let plan = matrix
+            .applicability_plan(&registry, profile, PerfGate::Qg1)
+            .expect("physical QG-1 plan");
+        let classified = matrix
+            .for_gate(PerfGate::Qg1)
+            .into_iter()
+            .zip(&plan.cells)
+            .collect::<Vec<_>>();
+        let selected = classified
+            .iter()
+            .find(|(_, entry)| entry.applicability.is_runnable())
+            .expect("runnable physical QG-1 cell");
+        let not_applicable = classified
+            .iter()
+            .find(|(_, entry)| entry.applicability == PerfCellApplicability::NotApplicable)
+            .expect("non-applicable physical QG-1 cell");
+        let mut artifact = PerfGateArtifact {
+            schema_version: PERF_ARTIFACT_SCHEMA_VERSION.to_owned(),
+            gate: PerfGate::Qg1,
+            applicability_plan: Some(plan.binding().clone()),
+            bench_elf_sha256: "c".repeat(64),
+            machine_fingerprint: "linux-x86_64-test".to_owned(),
+            execution: Some(PerfExecutionProvenance {
+                host_identity: "test-host".to_owned(),
+                producer_os: PerfProducerOs::Linux,
+                physical_cores: 64,
+                logical_threads: 128,
+                process_available_threads: 64,
+                execution_capacity: 64,
+                max_exercised_cell_width: 64,
+                configured_engine_thread_widths: vec![selected.1.configured_threads],
+                runtime_detected_isa: vec!["avx2".to_owned()],
+                cpu_affinity_allowed_list: Some("0-63".to_owned()),
+                affinity_or_cpuset_cap: Some(
+                    "Cpus_allowed_list=0-63 (64 of 128 host logical threads)".to_owned(),
+                ),
+            }),
+            git_rev: "0".repeat(40),
+            run_window: "test-window".to_owned(),
+            run_id: "qg1-not-applicable-hostile".to_owned(),
+            corpus_manifest_hash: "a".repeat(64),
+            manifest_sha256: plan.binding.normalized_perf_manifest_sha256.clone(),
+            cells: threshold_rows(PerfGate::Qg1, &[selected.0]),
+            laws_attested: false,
+        };
+        artifact
+            .verify_current_measured_contract()
+            .expect("valid partial QG-1 threshold");
+        artifact
+            .cells
+            .extend(threshold_rows(PerfGate::Qg1, &[not_applicable.0]));
+        assert!(
+            artifact.verify_current_measured_contract().is_err(),
+            "a fully populated non-applicable cell group must fail strict reload"
+        );
+    }
+
+    #[test]
+    fn scheduler_capacity_is_distinct_from_host_process_availability() {
+        let mut execution = PerfExecutionProvenance {
+            host_identity: "m4-test-host".to_owned(),
+            producer_os: PerfProducerOs::Macos,
+            physical_cores: 14,
+            logical_threads: 14,
+            process_available_threads: 14,
+            execution_capacity: 10,
+            max_exercised_cell_width: 8,
+            configured_engine_thread_widths: vec![1, 2, 4, 8],
+            runtime_detected_isa: vec!["aes".to_owned(), "neon".to_owned(), "sha2".to_owned()],
+            cpu_affinity_allowed_list: None,
+            affinity_or_cpuset_cap: None,
+        };
+        assert!(
+            execution.is_complete(),
+            "a scheduler-managed ten-worker pool must remain representable on a fourteen-CPU M4 host"
+        );
+        assert!(execution.matches_capacity_semantics(ExecutionCapacitySemantics::SchedulerWorkers));
+        assert!(!execution.matches_capacity_semantics(ExecutionCapacitySemantics::PhysicalCores));
+
+        execution.process_available_threads = 9;
+        assert!(
+            !execution.is_complete(),
+            "process availability below the registered scheduler capacity must fail closed"
+        );
+        assert!(
+            !execution.matches_capacity_semantics(ExecutionCapacitySemantics::SchedulerWorkers)
+        );
+        execution.process_available_threads = 15;
+        assert!(
+            !execution.is_complete(),
+            "process availability cannot exceed the attested host topology"
         );
     }
 

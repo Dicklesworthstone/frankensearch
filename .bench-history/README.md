@@ -36,35 +36,39 @@ Full, sealed runs that do not earn promotion live under
 evidence, but they are not baselines and never replace either a promoted
 `*.latest.json` file or an unmeasured bootstrap placeholder.
 
-The committed `*.unmeasured.latest.json` files are explicit bootstrap
-placeholders, not performance evidence. The current bootstrap is the exact
-canonical pretty-JSON serialization of the `quill-perf-artifact-v6` sentinel,
-with no trailing newline. It contains no cells, has `laws_attested=false`, and
-cannot produce `Allow` when replayed as evidence. Only that exact
-sentinel bound to the evaluated gate and final manifest may omit
-`applicability_plan`, execution, baseline evidence, and identity; supplying
-evidence or identity is rejected as fabrication. Candidate and rerun still
-require two independent typed-producer finalizations, including their actual
-logs, exact v2 manifests, and verified post-exit v6 receipts. Once that full
-pair passes evidence admission, the gate may be activated and the first real
-hardware/profile baseline committed with its separate PASS/MISS target verdict.
-A target MISS remains a MISS in every claim surface even though the measurement
-gate is active.
+The committed `QG-<n>.unmeasured.latest.json` files are explicit historical
+bootstrap placeholders, not performance evidence. Their exact bytes remain the
+canonical pretty-JSON serialization of the old `quill-perf-artifact-v6`
+sentinel, with no trailing newline. They contain no cells, have
+`laws_attested=false`, and cannot produce `Allow` when replayed as evidence.
+The current v7 loader rejects them as stale-schema inputs. The separately
+versioned `QG-<n>.v7.unmeasured.latest.json` files are the authoritative current
+sentinels; each is exact canonical pretty JSON with one terminal newline and is
+bound to the current normalized manifest hash. Candidate and rerun require two independent typed-producer
+finalizations, including their actual logs, exact v3 manifests, and verified
+post-exit v6 receipts. Once a current bootstrap and that full pair pass evidence
+admission, the gate may be activated and the first real hardware/profile
+baseline committed with its separate PASS/MISS target verdict. A target MISS
+remains a MISS in every claim surface even though the measurement gate is
+active.
 
-Threshold schema `quill-perf-artifact-v6` records the profile applicability
+Current threshold schema `quill-perf-artifact-v7` records the profile applicability
 binding, SHA-256 self-reported by the executing benchmark ELF, auditable
 execution topology, exact runtime ISA, configured engine widths, per-cell
 observed concurrency where required, and a deterministic bootstrap 95%
 confidence interval on every median. Current decision evidence is
-`quill-perf-evidence-v4`; it reconstructs the frozen registry-v2 applicability
-plan, requires exactly every `Required` plus `Diagnostic` runnable cell with
-its exact role, and rejects any measured `NotApplicable` cell. It binds
-producer OS, typed producer v4, exact v2 run-log/threshold/pre-binding-evidence
+`quill-perf-evidence-v5`; it reconstructs the frozen registry-v2 applicability
+plan and rejects any measured `NotApplicable` cell. Bounded partial selections
+remain durable, non-adjudicable diagnostic evidence; their stored fold may be
+`NoDecision` or `MeasuredProvisional`, but they are never ratchet-admissible.
+Ratchet admission requires exactly every `Required` plus `Diagnostic` runnable
+cell with its exact role. It binds
+producer OS, typed producer v4, exact v3 run-log/threshold/pre-binding-evidence
 manifest, and v6 completion receipt. QG-1 carries same-invocation
 Tantivy/Tantivy and Quill/Quill A/A nulls. The ratchet uses those median
 intervals and the required 2x null-floor margin; `cv_pct` remains provenance
 and never decides admission. Historical measured v3 threshold artifacts remain
-read-only and cannot silently become v6 claims.
+read-only and cannot silently become v7 claims.
 
 The retained `QG-2.trj-zen3-16c.latest.json` and dated 2026-07-28 siblings are
 legacy pre-fix diagnostic evidence, not an activated baseline and not a

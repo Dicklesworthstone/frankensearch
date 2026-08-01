@@ -332,7 +332,7 @@ fn candidate_applicability_plan(
     let Some(binding) = request.candidate.applicability_plan.as_ref() else {
         state.fatal(
             "perf.ratchet.measured_applicability_plan_missing",
-            "measured v6 candidate threshold artifact requires an exact applicability-plan \
+            "measured v7 candidate threshold artifact requires an exact applicability-plan \
              binding",
         );
         return None;
@@ -355,6 +355,13 @@ fn validate_threshold_plan_scope(
         }
         return;
     }
+    if let Err(error) = artifact.verify_current_measured_contract() {
+        state.fatal(
+            "perf.ratchet.threshold_verified_reload_failed",
+            format!("{role} measured threshold failed strict reconstruction: {error}"),
+        );
+        return;
+    }
     match artifact.applicability_plan.as_ref() {
         Some(binding) if binding == plan.binding() => {}
         Some(binding) => state.fatal(
@@ -372,7 +379,7 @@ fn validate_threshold_plan_scope(
         None => state.fatal(
             "perf.ratchet.measured_applicability_plan_missing",
             format!(
-                "{role} measured v6 threshold artifact requires an exact applicability-plan \
+                "{role} measured v7 threshold artifact requires an exact applicability-plan \
                  binding"
             ),
         ),
@@ -497,7 +504,7 @@ fn validate_machine_profile_promotion(
             state.fatal(
                 "perf.ratchet.evidence_applicability_plan_mismatch",
                 format!(
-                    "{role} v4 evidence does not bind the exact candidate profile/applicability \
+                    "{role} v5 evidence does not bind the exact candidate profile/applicability \
                      plan"
                 ),
             );
@@ -554,10 +561,13 @@ fn validate_machine_profile_promotion(
         if artifact_manifest.gate() != artifact.gate.label()
             || artifact_manifest.run_id() != artifact.run_id
             || artifact_manifest.run_window() != artifact.run_window
+            || artifact_manifest.applicability_plan() != plan.binding()
         {
             state.fatal(
                 "perf.ratchet.runner_manifest_run_mismatch",
-                format!("{role} artifact manifest names a different gate, run ID, or run window"),
+                format!(
+                    "{role} artifact manifest names a different gate, run, or applicability plan"
+                ),
             );
             continue;
         }
@@ -880,12 +890,17 @@ fn validate_execution_projection_binding(
         );
         return;
     };
-    if maximum > execution_capacity || projected.process_available_threads != execution_capacity {
+    if maximum > execution_capacity
+        || usize::try_from(projected.execution_capacity) != Ok(execution_capacity)
+        || usize::try_from(projected.max_exercised_cell_width) != Ok(maximum)
+        || !projected.matches_capacity_semantics(plan.capacity_semantics)
+    {
         state.fatal(
             "perf.ratchet.execution_projection_capacity_mismatch",
             format!(
-                "{role} projected process capacity does not equal the verified profile capacity \
-                 or cannot contain the plan maximum"
+                "{role} projected execution capacity or maximum differs from the verified \
+                 applicability-plan envelope, or process availability contradicts its capacity \
+                 semantics"
             ),
         );
     }
@@ -1257,7 +1272,7 @@ fn validate_artifact<'a>(
         state.fatal(
             "perf.ratchet.measured_applicability_plan_missing",
             format!(
-                "{role} measured v6 threshold artifact requires an exact applicability-plan \
+                "{role} measured v7 threshold artifact requires an exact applicability-plan \
                  binding"
             ),
         );
@@ -1395,7 +1410,7 @@ fn validate_current_evidence(
         state.fatal(
             "perf.ratchet.evidence_applicability_plan_mismatch",
             format!(
-                "{role} v4 evidence does not bind the exact threshold profile/applicability plan"
+                "{role} v5 evidence does not bind the exact threshold profile/applicability plan"
             ),
         );
         return false;
@@ -3088,13 +3103,16 @@ mod tests {
     use super::*;
     use crate::perf_evidence::qg6_test_fixture;
     use crate::{
-        BuildIdentity, CorpusIdentity, DistributionSummary, EvidenceCell, EvidenceCellSpec,
-        EvidencePolicy, EvidenceProvenance, MachineIdentity, PairedEstimatorConfig,
-        PeakRssEvidence, PerfCellResult, PerfMetricSemantics, PerfOperationScope, PerfRawSample,
-        PerfSampleArm, PerfSampleOrder, PerfSamplePhase, PerfSampleProvenance,
-        estimate_paired_experiment, seeded_balanced_pair_order,
+        BuildIdentity, CorpusIdentity, DistributionSummary, EvidenceArtifactError, EvidenceCell,
+        EvidenceCellSpec, EvidencePolicy, EvidenceProvenance, MachineIdentity,
+        PairedEstimatorConfig, PeakRssEvidence, PerfCellResult, PerfRawSample, PerfSampleArm,
+        PerfSampleOrder, PerfSamplePhase, PerfSampleProvenance, estimate_paired_experiment,
+        seeded_balanced_pair_order,
     };
     use sha2::{Digest, Sha256};
+
+    const TEST_MACHINE_FINGERPRINT: &str =
+        "linux-x86_64-test-machine-128thread-AMD_Ryzen_Threadripper_PRO_5995WX_64-Cores";
 
     fn reseal_evidence_without_verification(evidence: &mut PerfEvidenceArtifact) {
         const HEX_DIGITS: &[u8; 16] = b"0123456789abcdef";
@@ -3122,17 +3140,18 @@ mod tests {
         serde_json::to_vec_pretty(artifact).expect("test threshold artifact bytes")
     }
 
-    fn bind_test_evidence(
+    fn try_bind_test_evidence(
         artifact: &PerfGateArtifact,
         evidence: &mut PerfEvidenceArtifact,
         run_label: &str,
-    ) {
+    ) -> Result<(), EvidenceArtifactError> {
         evidence.machine_class = crate::MachineClassEvidenceBinding::unverified(
             "sealed runner receipt has not been bound",
         );
         evidence.gate_decision = None;
         evidence.artifact_sha256.clear();
-        seal_evidence(evidence);
+        reseal_evidence_without_verification(evidence);
+        evidence.verify_integrity()?;
         let evidence_bytes =
             serde_json::to_vec_pretty(evidence).expect("pre-binding evidence bytes");
         let threshold_bytes = threshold_artifact_bytes(artifact);
@@ -3156,10 +3175,51 @@ mod tests {
             &threshold_bytes,
             &evidence_bytes,
         );
-        evidence
-            .bind_machine_class_identity(identity, &threshold_bytes, &evidence_bytes)
+        evidence.bind_machine_class_identity(identity, &threshold_bytes, &evidence_bytes)?;
+        reseal_evidence_without_verification(evidence);
+        evidence.verify_integrity()
+    }
+
+    fn bind_test_evidence(
+        artifact: &PerfGateArtifact,
+        evidence: &mut PerfEvidenceArtifact,
+        run_label: &str,
+    ) {
+        try_bind_test_evidence(artifact, evidence, run_label)
             .expect("bind test evidence to exact receipt artifacts");
-        seal_evidence(evidence);
+    }
+
+    fn mutate_cell_sample_provenance(
+        evidence: &mut PerfEvidenceArtifact,
+        mut mutate: impl FnMut(&mut PerfSampleProvenance),
+    ) {
+        fn mutate_experiment(
+            experiment: &mut crate::PairedExperimentResult,
+            mutate: &mut impl FnMut(&mut PerfSampleProvenance),
+        ) {
+            mutate(&mut experiment.provenance);
+            for sample in experiment
+                .effect_samples
+                .iter_mut()
+                .chain(&mut experiment.null_samples)
+            {
+                mutate(&mut sample.provenance);
+            }
+        }
+
+        for cell in &mut evidence.cells {
+            if let EvidenceCellBody::Paired {
+                paired,
+                treatment_arm_null,
+                ..
+            } = &mut cell.body
+            {
+                mutate_experiment(paired, &mut mutate);
+                if let Some(treatment_arm_null) = treatment_arm_null {
+                    mutate_experiment(treatment_arm_null, &mut mutate);
+                }
+            }
+        }
     }
 
     fn distribution(value: f64) -> DistributionSummary {
@@ -3198,13 +3258,24 @@ mod tests {
         applicability_plan(gate).binding
     }
 
-    fn execution_provenance() -> PerfExecutionProvenance {
+    fn normalized_manifest_sha256() -> String {
+        plan_binding(PerfGate::Qg2).normalized_perf_manifest_sha256
+    }
+
+    fn execution_provenance(gate: PerfGate) -> PerfExecutionProvenance {
+        let plan = applicability_plan(gate);
         PerfExecutionProvenance {
             host_identity: "test-machine".to_owned(),
             producer_os: crate::PerfProducerOs::Linux,
             physical_cores: 64,
             logical_threads: 128,
             process_available_threads: 64,
+            execution_capacity: plan
+                .execution_capacity
+                .expect("test profile has a frozen execution capacity"),
+            max_exercised_cell_width: plan
+                .max_exercised_cell_width
+                .expect("test profile has a frozen gate maximum"),
             configured_engine_thread_widths: vec![1],
             runtime_detected_isa: ["aes", "avx2", "bmi2", "fma", "vaes"]
                 .into_iter()
@@ -3212,7 +3283,7 @@ mod tests {
                 .collect(),
             cpu_affinity_allowed_list: Some("0-63".to_owned()),
             affinity_or_cpuset_cap: Some(
-                "physical-64 profile: one hardware thread per physical core".to_owned(),
+                "Cpus_allowed_list=0-63 (64 of 128 host logical threads)".to_owned(),
             ),
         }
     }
@@ -3229,26 +3300,33 @@ mod tests {
             run_window: "unmeasured".to_owned(),
             run_id: "unmeasured".to_owned(),
             corpus_manifest_hash: ZERO_SHA256.to_owned(),
-            manifest_sha256: "b".repeat(64),
+            manifest_sha256: normalized_manifest_sha256(),
             cells: Vec::new(),
             laws_attested: false,
         }
     }
 
     fn qg2_artifact(revision: &str, quill: f64, oracle: f64) -> PerfGateArtifact {
+        let revision = if revision == "new" {
+            "1".repeat(40)
+        } else if revision == "old" {
+            "0".repeat(40)
+        } else {
+            revision.to_owned()
+        };
         let ratio = quill / oracle;
         PerfGateArtifact {
             schema_version: PERF_ARTIFACT_SCHEMA_VERSION.to_owned(),
             gate: PerfGate::Qg2,
             applicability_plan: Some(plan_binding(PerfGate::Qg2)),
             bench_elf_sha256: "c".repeat(64),
-            machine_fingerprint: "linux-x86_64-test".to_owned(),
-            execution: Some(execution_provenance()),
-            git_rev: revision.to_owned(),
+            machine_fingerprint: TEST_MACHINE_FINGERPRINT.to_owned(),
+            execution: Some(execution_provenance(PerfGate::Qg2)),
+            git_rev: revision.clone(),
             run_window: "test-window".to_owned(),
             run_id: format!("{revision}-{quill}-{oracle}"),
             corpus_manifest_hash: "a".repeat(64),
-            manifest_sha256: "b".repeat(64),
+            manifest_sha256: normalized_manifest_sha256(),
             cells: vec![
                 PerfCellResult {
                     fixture: "bulk/medium/1/positions_on".to_owned(),
@@ -3296,18 +3374,17 @@ mod tests {
         } else {
             revision.to_owned()
         };
-        let scope = PerfOperationScope {
-            operation_id: "qg2.bulk_index".to_owned(),
-            version: 1,
-            semantics: PerfMetricSemantics::GaugeHigherIsBetter,
-            unit: "docs/s".to_owned(),
-        };
+        let scope = crate::perf::perf_operation_scope(
+            PerfGate::Qg2,
+            "bulk/medium/1/positions_on",
+            "docs_per_second",
+        );
         let sample_provenance = PerfSampleProvenance {
             run_id: run_id.to_owned(),
             executable_sha256: "c".repeat(64),
             corpus_sha256: "a".repeat(64),
             input_identity: None,
-            worker_id: "linux-x86_64-test".to_owned(),
+            worker_id: TEST_MACHINE_FINGERPRINT.to_owned(),
             build_profile: "release-perf".to_owned(),
         };
         let order = seeded_balanced_pair_order(PERF_MIN_RUNS, 0x5152_0002).expect("balanced order");
@@ -3381,13 +3458,13 @@ mod tests {
             gate: PerfGate::Qg2,
             applicability_plan: Some(plan_binding(PerfGate::Qg2)),
             bench_elf_sha256: "c".repeat(64),
-            machine_fingerprint: "linux-x86_64-test".to_owned(),
-            execution: Some(execution_provenance()),
+            machine_fingerprint: TEST_MACHINE_FINGERPRINT.to_owned(),
+            execution: Some(execution_provenance(PerfGate::Qg2)),
             git_rev: revision.clone(),
             run_window: "test-window".to_owned(),
             run_id: run_id.to_owned(),
             corpus_manifest_hash: "a".repeat(64),
-            manifest_sha256: "b".repeat(64),
+            manifest_sha256: normalized_manifest_sha256(),
             cells: vec![
                 PerfCellResult {
                     fixture: "bulk/medium/1/positions_on".to_owned(),
@@ -3429,7 +3506,7 @@ mod tests {
             EvidenceProvenance {
                 run_id: run_id.to_owned(),
                 run_window: "test-window".to_owned(),
-                manifest_sha256: "b".repeat(64),
+                manifest_sha256: normalized_manifest_sha256(),
                 build: BuildIdentity {
                     executable_sha256: "c".repeat(64),
                     git_revision: revision,
@@ -3444,12 +3521,12 @@ mod tests {
                     cargo_features: vec!["perf-harness".to_owned()],
                 },
                 machine: MachineIdentity {
-                    fingerprint: "linux-x86_64-test".to_owned(),
+                    fingerprint: TEST_MACHINE_FINGERPRINT.to_owned(),
                     os: "linux".to_owned(),
                     arch: "x86_64".to_owned(),
                     logical_cpus: 64,
-                    execution: execution_provenance(),
-                    cpu_governor: None,
+                    execution: execution_provenance(PerfGate::Qg2),
+                    cpu_governor: Some("performance".to_owned()),
                     load_average_start: None,
                     load_average_end: None,
                 },
@@ -3508,12 +3585,7 @@ mod tests {
         fixture: &str,
     ) -> (PerfGateArtifact, PerfEvidenceArtifact) {
         assert!(GROUPS > 0, "QG-6 test fixture requires a group pattern");
-        let scope = PerfOperationScope {
-            operation_id: "qg6.prepared_query".to_owned(),
-            version: 1,
-            semantics: PerfMetricSemantics::GaugeLowerIsBetter,
-            unit: "ms".to_owned(),
-        };
+        let scope = crate::perf::perf_operation_scope(PerfGate::Qg6, fixture, "latency_ms");
         let (input_identity, semantic_contract) =
             qg6_test_fixture::contract_for(query_class, document_count, k);
         let sample_provenance = PerfSampleProvenance {
@@ -3521,7 +3593,7 @@ mod tests {
             executable_sha256: "c".repeat(64),
             corpus_sha256: "a".repeat(64),
             input_identity: Some(input_identity.clone()),
-            worker_id: "linux-x86_64-test".to_owned(),
+            worker_id: TEST_MACHINE_FINGERPRINT.to_owned(),
             build_profile: "release-perf".to_owned(),
         };
         let order = seeded_balanced_pair_order(crate::QG6_QUERY_GROUPS * 3, 0x5156_0006)
@@ -3614,13 +3686,13 @@ mod tests {
             gate: PerfGate::Qg6,
             applicability_plan: Some(plan_binding(PerfGate::Qg6)),
             bench_elf_sha256: "c".repeat(64),
-            machine_fingerprint: "linux-x86_64-test".to_owned(),
-            execution: Some(execution_provenance()),
+            machine_fingerprint: TEST_MACHINE_FINGERPRINT.to_owned(),
+            execution: Some(execution_provenance(PerfGate::Qg6)),
             git_rev: "1".repeat(40),
             run_window: "test-window".to_owned(),
             run_id: run_id.to_owned(),
             corpus_manifest_hash: "a".repeat(64),
-            manifest_sha256: "b".repeat(64),
+            manifest_sha256: normalized_manifest_sha256(),
             cells: vec![
                 PerfCellResult {
                     fixture: fixture.to_owned(),
@@ -3662,7 +3734,7 @@ mod tests {
             EvidenceProvenance {
                 run_id: run_id.to_owned(),
                 run_window: "test-window".to_owned(),
-                manifest_sha256: "b".repeat(64),
+                manifest_sha256: normalized_manifest_sha256(),
                 build: BuildIdentity {
                     executable_sha256: "c".repeat(64),
                     git_revision: "1".repeat(40),
@@ -3677,12 +3749,12 @@ mod tests {
                     cargo_features: vec!["perf-harness".to_owned()],
                 },
                 machine: MachineIdentity {
-                    fingerprint: "linux-x86_64-test".to_owned(),
+                    fingerprint: TEST_MACHINE_FINGERPRINT.to_owned(),
                     os: "linux".to_owned(),
                     arch: "x86_64".to_owned(),
                     logical_cpus: 64,
-                    execution: execution_provenance(),
-                    cpu_governor: None,
+                    execution: execution_provenance(PerfGate::Qg6),
+                    cpu_governor: Some("performance".to_owned()),
                     load_average_start: None,
                     load_average_end: None,
                 },
@@ -3806,7 +3878,7 @@ mod tests {
                 rerun_runner_identity: None,
                 gate_activated: activated,
                 mode,
-                expected_manifest_sha256: &"b".repeat(64),
+                expected_manifest_sha256: &normalized_manifest_sha256(),
                 evidence: Vec::new(),
             },
             DecisionState::default(),
@@ -3834,7 +3906,7 @@ mod tests {
                 rerun_runner_identity: None,
                 gate_activated: true,
                 mode: PerfRatchetMode::Promotion,
-                expected_manifest_sha256: &"b".repeat(64),
+                expected_manifest_sha256: &normalized_manifest_sha256(),
                 evidence: Vec::new(),
             },
             DecisionState::default(),
@@ -3863,7 +3935,7 @@ mod tests {
             rerun_runner_identity: rerun_evidence.machine_class.identity(),
             gate_activated: true,
             mode: PerfRatchetMode::Promotion,
-            expected_manifest_sha256: &"b".repeat(64),
+            expected_manifest_sha256: &normalized_manifest_sha256(),
             evidence: Vec::new(),
         })
     }
@@ -4089,9 +4161,7 @@ mod tests {
     #[test]
     fn sealed_execution_projection_cannot_override_verified_receipt_topology() {
         let ratios = [[1.0; 3]; 4];
-        let (baseline, baseline_evidence) = qg6_complete_pair("baseline", ratios);
         let (mut candidate, mut candidate_evidence) = qg6_complete_pair("candidate", ratios);
-        let (rerun, rerun_evidence) = qg6_complete_pair("rerun", ratios);
         candidate
             .execution
             .as_mut()
@@ -4102,31 +4172,17 @@ mod tests {
             .machine
             .execution
             .physical_cores = 63;
-        bind_test_evidence(
+        let error = try_bind_test_evidence(
             &candidate,
             &mut candidate_evidence,
             "candidate-forged-topology",
-        );
-        let expected_profile = candidate_evidence
-            .machine_class
-            .identity()
-            .expect("candidate identity")
-            .profile();
-
-        let result = evaluate_verified_promotion(
-            &baseline,
-            &baseline_evidence,
-            &candidate,
-            &candidate_evidence,
-            &rerun,
-            &rerun_evidence,
-            expected_profile,
-        );
-
-        assert_eq!(result.decision, PerfGateDecision::Block);
-        assert!(result.reasons.iter().any(|reason| {
-            reason.code == "perf.ratchet.execution_projection_receipt_topology_mismatch"
-        }));
+        )
+        .expect_err("forged topology must fail before ratchet evaluation");
+        assert!(matches!(
+            error,
+            EvidenceArtifactError::InvalidProvenance { ref reason }
+                if reason.contains("topology") && reason.contains("verified runner hardware")
+        ));
     }
 
     #[test]
@@ -4220,7 +4276,7 @@ mod tests {
             rerun_runner_identity: rerun_evidence.machine_class.identity(),
             gate_activated: true,
             mode: PerfRatchetMode::Promotion,
-            expected_manifest_sha256: &"b".repeat(64),
+            expected_manifest_sha256: &normalized_manifest_sha256(),
             evidence: Vec::new(),
         });
 
@@ -4264,7 +4320,7 @@ mod tests {
             rerun_runner_identity: rerun_evidence.machine_class.identity(),
             gate_activated: true,
             mode: PerfRatchetMode::Promotion,
-            expected_manifest_sha256: &"b".repeat(64),
+            expected_manifest_sha256: &normalized_manifest_sha256(),
             evidence: Vec::new(),
         });
 
@@ -4305,16 +4361,15 @@ mod tests {
             rerun_runner_identity: rerun_evidence.machine_class.identity(),
             gate_activated: true,
             mode: PerfRatchetMode::Promotion,
-            expected_manifest_sha256: &"b".repeat(64),
+            expected_manifest_sha256: &normalized_manifest_sha256(),
             evidence: Vec::new(),
         });
 
         assert_eq!(result.decision, PerfGateDecision::Block);
-        assert!(
-            result.reasons.iter().any(|reason| {
-                reason.code == "perf.ratchet.threshold_applicability_plan_mismatch"
-            })
-        );
+        assert!(result.reasons.iter().any(|reason| {
+            reason.code == "perf.ratchet.threshold_verified_reload_failed"
+                && reason.message.contains("rerun")
+        }));
         assert!(result.comparisons.is_empty());
     }
 
@@ -4338,7 +4393,7 @@ mod tests {
             rerun_runner_identity: rerun_evidence.machine_class.identity(),
             gate_activated: true,
             mode: PerfRatchetMode::Promotion,
-            expected_manifest_sha256: &"b".repeat(64),
+            expected_manifest_sha256: &normalized_manifest_sha256(),
             evidence: Vec::new(),
         });
 
@@ -4379,7 +4434,7 @@ mod tests {
             rerun_runner_identity: rerun_evidence.machine_class.identity(),
             gate_activated: true,
             mode: PerfRatchetMode::Promotion,
-            expected_manifest_sha256: &"b".repeat(64),
+            expected_manifest_sha256: &normalized_manifest_sha256(),
             evidence: Vec::new(),
         });
 
@@ -4415,7 +4470,7 @@ mod tests {
             rerun_runner_identity: rerun_evidence.machine_class.identity(),
             gate_activated: true,
             mode: PerfRatchetMode::Promotion,
-            expected_manifest_sha256: &"b".repeat(64),
+            expected_manifest_sha256: &normalized_manifest_sha256(),
             evidence: Vec::new(),
         });
 
@@ -4456,7 +4511,7 @@ mod tests {
             rerun_runner_identity: rerun_evidence.machine_class.identity(),
             gate_activated: true,
             mode: PerfRatchetMode::Promotion,
-            expected_manifest_sha256: &"b".repeat(64),
+            expected_manifest_sha256: &normalized_manifest_sha256(),
             evidence: Vec::new(),
         });
 
@@ -4515,7 +4570,7 @@ mod tests {
             rerun_runner_identity: rerun_evidence.machine_class.identity(),
             gate_activated: true,
             mode: PerfRatchetMode::Promotion,
-            expected_manifest_sha256: &"b".repeat(64),
+            expected_manifest_sha256: &normalized_manifest_sha256(),
             evidence: Vec::new(),
         });
 
@@ -4606,11 +4661,16 @@ mod tests {
         );
 
         assert_ne!(result.decision, PerfGateDecision::Allow);
-        assert!(result.reasons.iter().any(|reason| {
-            reason.code == "perf.ratchet.incomplete_matrix"
-                || reason.code == "perf.ratchet.current_evidence_integrity_failed"
-                || reason.code == "perf.ratchet.current_evidence_incomplete_plan"
-        }));
+        assert!(
+            result.reasons.iter().any(|reason| {
+                reason.code == "perf.ratchet.threshold_verified_reload_failed"
+                    || reason.code == "perf.ratchet.incomplete_matrix"
+                    || reason.code == "perf.ratchet.current_evidence_integrity_failed"
+                    || reason.code == "perf.ratchet.current_evidence_incomplete_plan"
+            }),
+            "filtered artifacts escaped every strict rejection seam: {:?}",
+            result.reasons
+        );
     }
 
     #[test]
@@ -4675,7 +4735,7 @@ mod tests {
             rerun_runner_identity: Some(&alternate_producer),
             gate_activated: true,
             mode: PerfRatchetMode::Promotion,
-            expected_manifest_sha256: &"b".repeat(64),
+            expected_manifest_sha256: &normalized_manifest_sha256(),
             evidence: Vec::new(),
         });
 
@@ -4695,7 +4755,17 @@ mod tests {
         let (baseline, baseline_evidence) = qg6_complete_pair("baseline", ratios);
         let (candidate, candidate_evidence) = qg6_complete_pair("candidate", ratios);
         let (rerun, mut rerun_evidence) = qg6_complete_pair("rerun", ratios);
-        rerun_evidence.provenance.build.executable_sha256 = "7".repeat(64);
+        let alternate_executable = "7".repeat(64);
+        rerun_evidence
+            .provenance
+            .build
+            .executable_sha256
+            .clone_from(&alternate_executable);
+        mutate_cell_sample_provenance(&mut rerun_evidence, |provenance| {
+            provenance
+                .executable_sha256
+                .clone_from(&alternate_executable);
+        });
         rerun_evidence.machine_class = crate::MachineClassEvidenceBinding::unverified(
             "sealed runner receipt has not been bound",
         );
@@ -4751,7 +4821,7 @@ mod tests {
             rerun_runner_identity: Some(&alternate_benchmark),
             gate_activated: true,
             mode: PerfRatchetMode::Promotion,
-            expected_manifest_sha256: &"b".repeat(64),
+            expected_manifest_sha256: &normalized_manifest_sha256(),
             evidence: Vec::new(),
         });
 
@@ -4791,7 +4861,7 @@ mod tests {
             rerun_runner_identity: rerun_evidence.machine_class.identity(),
             gate_activated: true,
             mode: PerfRatchetMode::Promotion,
-            expected_manifest_sha256: &"b".repeat(64),
+            expected_manifest_sha256: &normalized_manifest_sha256(),
             evidence: Vec::new(),
         });
 
@@ -4812,7 +4882,11 @@ mod tests {
         let (candidate, candidate_evidence) = qg6_complete_pair("candidate", ratios);
         let (rerun, mut rerun_evidence) = qg6_complete_pair("rerun", ratios);
         rerun_evidence.policy.max_raw_samples += 1;
-        bind_test_evidence(&rerun, &mut rerun_evidence, "rerun-mixed-policy");
+        reseal_evidence_without_verification(&mut rerun_evidence);
+        assert!(matches!(
+            rerun_evidence.verify_integrity(),
+            Err(EvidenceArtifactError::InvalidPolicy { .. })
+        ));
         let expected_profile = candidate_evidence
             .machine_class
             .identity()
@@ -4831,7 +4905,7 @@ mod tests {
             rerun_runner_identity: rerun_evidence.machine_class.identity(),
             gate_activated: true,
             mode: PerfRatchetMode::Promotion,
-            expected_manifest_sha256: &"b".repeat(64),
+            expected_manifest_sha256: &normalized_manifest_sha256(),
             evidence: Vec::new(),
         });
 
@@ -4840,7 +4914,7 @@ mod tests {
             result
                 .reasons
                 .iter()
-                .any(|reason| reason.code == "perf.ratchet.mixed_evidence_policy")
+                .any(|reason| reason.code == "perf.ratchet.machine_evidence_integrity_failed")
         );
         assert!(result.comparisons.is_empty());
     }
@@ -4856,6 +4930,10 @@ mod tests {
             .provenance
             .run_id
             .clone_from(&candidate_evidence.provenance.run_id);
+        let reused_run_id = candidate_evidence.provenance.run_id.clone();
+        mutate_cell_sample_provenance(&mut baseline_evidence, |provenance| {
+            provenance.run_id.clone_from(&reused_run_id);
+        });
         bind_test_evidence(&baseline, &mut baseline_evidence, "baseline-reused-run");
         let expected_profile = candidate_evidence
             .machine_class
@@ -4875,7 +4953,7 @@ mod tests {
             rerun_runner_identity: rerun_evidence.machine_class.identity(),
             gate_activated: true,
             mode: PerfRatchetMode::Promotion,
-            expected_manifest_sha256: &"b".repeat(64),
+            expected_manifest_sha256: &normalized_manifest_sha256(),
             evidence: Vec::new(),
         });
 
@@ -4940,7 +5018,7 @@ mod tests {
             rerun_runner_identity: rerun_evidence.machine_class.identity(),
             gate_activated: true,
             mode: PerfRatchetMode::Promotion,
-            expected_manifest_sha256: &"b".repeat(64),
+            expected_manifest_sha256: &normalized_manifest_sha256(),
             evidence: Vec::new(),
         });
 
@@ -4970,10 +5048,10 @@ mod tests {
             PerfRatchetMode::Promotion,
         );
 
-        assert_eq!(result.decision, PerfGateDecision::Quarantine);
+        assert_eq!(result.decision, PerfGateDecision::Block);
         assert!(result.reasons.iter().any(|reason| {
-            reason.code == "perf.ratchet.rerun_laws_not_attested"
-                && reason.message.contains("same-revision rerun")
+            reason.code == "perf.ratchet.threshold_verified_reload_failed"
+                && reason.message.contains("rerun")
         }));
     }
 
@@ -5080,7 +5158,7 @@ mod tests {
                 rerun_runner_identity: None,
                 gate_activated: true,
                 mode: PerfRatchetMode::Promotion,
-                expected_manifest_sha256: &"b".repeat(64),
+                expected_manifest_sha256: &normalized_manifest_sha256(),
                 evidence: Vec::new(),
             },
             DecisionState::default(),
@@ -5132,7 +5210,7 @@ mod tests {
         let legacy_cells = validate_artifact(
             &artifact,
             PerfGate::Qg6,
-            &"b".repeat(64),
+            &normalized_manifest_sha256(),
             "candidate",
             &mut state,
         );
@@ -5144,7 +5222,11 @@ mod tests {
             "candidate",
             &mut state,
         );
-        assert!(!state.fatal);
+        assert!(
+            !state.fatal,
+            "unexpected fatal reasons: {:?}",
+            state.reasons
+        );
         assert!(
             !state
                 .reasons
@@ -5217,7 +5299,7 @@ mod tests {
             qg6_complete_pair("rerun", [[0.80; 3], [1.0; 3], [1.0; 3], [1.25; 3]]);
         let mut baseline = candidate.clone();
         baseline.run_id = "baseline".to_owned();
-        baseline.git_rev = "old".to_owned();
+        baseline.git_rev = "0".repeat(40);
 
         let candidate_hierarchy =
             exact_qg6_hierarchical_cell(&candidate_evidence, "query/identifier/k10/100k")
@@ -5263,7 +5345,7 @@ mod tests {
         let (rerun, rerun_evidence) = qg6_complete_pair("rerun", [[1.01; 3]; 4]);
         let mut baseline = candidate.clone();
         baseline.run_id = "baseline".to_owned();
-        baseline.git_rev = "old".to_owned();
+        baseline.git_rev = "0".repeat(40);
 
         let result = evaluate_with_current(
             &baseline,
@@ -5317,7 +5399,7 @@ mod tests {
         let cells = validate_artifact(
             &artifact,
             PerfGate::Qg6,
-            &"b".repeat(64),
+            &normalized_manifest_sha256(),
             "candidate",
             &mut state,
         );
@@ -5360,7 +5442,7 @@ mod tests {
         let cells = validate_artifact(
             &artifact,
             PerfGate::Qg6,
-            &"b".repeat(64),
+            &normalized_manifest_sha256(),
             "candidate",
             &mut state,
         );
@@ -5425,7 +5507,7 @@ mod tests {
         let cells = validate_artifact(
             &artifact,
             PerfGate::Qg6,
-            &"b".repeat(64),
+            &normalized_manifest_sha256(),
             "candidate",
             &mut state,
         );
@@ -5466,7 +5548,7 @@ mod tests {
         let cells = validate_artifact(
             &artifact,
             PerfGate::Qg6,
-            &"b".repeat(64),
+            &normalized_manifest_sha256(),
             "candidate",
             &mut state,
         );
@@ -5492,7 +5574,7 @@ mod tests {
         let missing_cells = validate_artifact(
             &artifact,
             PerfGate::Qg6,
-            &"b".repeat(64),
+            &normalized_manifest_sha256(),
             "candidate",
             &mut missing_state,
         );
@@ -5611,12 +5693,17 @@ mod tests {
         let candidate_cells = validate_artifact(
             &candidate,
             PerfGate::Qg6,
-            &"b".repeat(64),
+            &normalized_manifest_sha256(),
             "candidate",
             &mut state,
         );
-        let rerun_cells =
-            validate_artifact(&rerun, PerfGate::Qg6, &"b".repeat(64), "rerun", &mut state);
+        let rerun_cells = validate_artifact(
+            &rerun,
+            PerfGate::Qg6,
+            &normalized_manifest_sha256(),
+            "rerun",
+            &mut state,
+        );
         compare_reproduction(
             &candidate,
             &rerun,
@@ -5659,14 +5746,14 @@ mod tests {
         let baseline_cells = validate_artifact(
             &baseline,
             PerfGate::Qg6,
-            &"b".repeat(64),
+            &normalized_manifest_sha256(),
             "baseline",
             &mut state,
         );
         let candidate_cells = validate_artifact(
             &candidate,
             PerfGate::Qg6,
-            &"b".repeat(64),
+            &normalized_manifest_sha256(),
             "candidate",
             &mut state,
         );
@@ -5889,7 +5976,7 @@ mod tests {
             rerun_runner_identity: None,
             gate_activated: false,
             mode: PerfRatchetMode::RegressionAlarm,
-            expected_manifest_sha256: &"b".repeat(64),
+            expected_manifest_sha256: &normalized_manifest_sha256(),
             evidence: Vec::new(),
         });
 
@@ -5949,7 +6036,7 @@ mod tests {
             rerun_runner_identity: rerun_evidence.machine_class.identity(),
             gate_activated: true,
             mode: PerfRatchetMode::Promotion,
-            expected_manifest_sha256: &"b".repeat(64),
+            expected_manifest_sha256: &normalized_manifest_sha256(),
             evidence: Vec::new(),
         });
         assert_eq!(
@@ -5974,7 +6061,7 @@ mod tests {
     }
 
     #[test]
-    fn every_committed_unmeasured_placeholder_is_the_exact_current_manifest_sentinel() {
+    fn preserved_v6_placeholders_are_canonical_but_not_current_v7_sentinels() {
         let manifest = include_str!("../../../docs/contracts/quill-perf-gates.toml");
         let manifest_sha256 = crate::perf_manifest_contract_sha256(manifest);
         for raw in [
@@ -5999,9 +6086,40 @@ mod tests {
                 "{} placeholder bytes are not exact canonical pretty JSON",
                 artifact.gate
             );
+            assert_eq!(artifact.schema_version, "quill-perf-artifact-v6");
+            assert!(
+                !is_explicit_bootstrap_for(&artifact, artifact.gate, &manifest_sha256),
+                "{} legacy placeholder must not satisfy the current-schema sentinel exemption",
+                artifact.gate
+            );
+        }
+    }
+
+    #[test]
+    fn versioned_v7_placeholders_are_exact_current_bootstrap_sentinels() {
+        let manifest = include_str!("../../../docs/contracts/quill-perf-gates.toml");
+        let manifest_sha256 = crate::perf_manifest_contract_sha256(manifest);
+        for raw in [
+            include_str!("../../../.bench-history/QG-1.v7.unmeasured.latest.json"),
+            include_str!("../../../.bench-history/QG-2.v7.unmeasured.latest.json"),
+            include_str!("../../../.bench-history/QG-3.v7.unmeasured.latest.json"),
+            include_str!("../../../.bench-history/QG-4.v7.unmeasured.latest.json"),
+            include_str!("../../../.bench-history/QG-5.v7.unmeasured.latest.json"),
+            include_str!("../../../.bench-history/QG-6.v7.unmeasured.latest.json"),
+            include_str!("../../../.bench-history/QG-7.v7.unmeasured.latest.json"),
+            include_str!("../../../.bench-history/QG-8.v7.unmeasured.latest.json"),
+            include_str!("../../../.bench-history/QG-9.v7.unmeasured.latest.json"),
+            include_str!("../../../.bench-history/QG-10.v7.unmeasured.latest.json"),
+        ] {
+            let artifact =
+                serde_json::from_str::<PerfGateArtifact>(raw).expect("current placeholder");
+            let mut canonical =
+                serde_json::to_vec_pretty(&artifact).expect("canonical current placeholder");
+            canonical.push(b'\n');
+            assert_eq!(raw.as_bytes(), canonical.as_slice());
             assert!(
                 is_explicit_bootstrap_for(&artifact, artifact.gate, &manifest_sha256),
-                "{} is not the exact current-schema sentinel",
+                "{} current placeholder must satisfy the narrow sentinel exemption",
                 artifact.gate
             );
         }
@@ -6034,7 +6152,7 @@ mod tests {
                 rerun_runner_identity: rerun_identity,
                 gate_activated: true,
                 mode: PerfRatchetMode::Promotion,
-                expected_manifest_sha256: &"b".repeat(64),
+                expected_manifest_sha256: &normalized_manifest_sha256(),
                 evidence: Vec::new(),
             })
         };

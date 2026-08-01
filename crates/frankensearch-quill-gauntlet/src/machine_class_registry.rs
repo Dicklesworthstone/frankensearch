@@ -16,20 +16,22 @@ use serde_json::{Map, Number, Value};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
+use crate::perf::{PerfApplicabilityPlan, PerfApplicabilityPlanBinding, PerfMatrixSpec};
+
 /// Reviewed commit containing the normative registry.
 pub const MACHINE_CLASS_REGISTRY_SPEC_COMMIT: &str = "483e59a1d6edeb237462e4f54e92ab273f13a5ae";
 /// Exact Git blob of the normative registry.
-pub const MACHINE_CLASS_REGISTRY_GIT_BLOB: &str = "04eabf6a9daa6ec3239f1f8e5ccb2256921c7a72";
+pub const MACHINE_CLASS_REGISTRY_GIT_BLOB: &str = "fe68e97c8e66accd0abaa9a4e3146134c271e964";
 /// SHA-256 of the exact normative registry file bytes.
 pub const MACHINE_CLASS_REGISTRY_SHA256: &str =
-    "c1f7d209a50de2ff22df73d177797c27e3f3c448e8859f268bb858cf83a04fe6";
+    "798338985ea28fc9b726bd2d8a260294777f5a701e012be91348465e5483b86c";
 /// Registry schema accepted by this consumer.
 pub const MACHINE_CLASS_REGISTRY_SCHEMA_VERSION: &str =
     "frankensearch.quill-machine-class-registry.v2";
 /// Schema for the exact post-exit artifact manifest bound into one runner
 /// completion receipt.
 pub const RUNNER_ARTIFACT_MANIFEST_SCHEMA_VERSION: &str =
-    "frankensearch.perf-runner-artifact-manifest.v2";
+    "frankensearch.perf-runner-artifact-manifest.v3";
 /// Strict schema carried by every typed runner-completion receipt.
 pub const RUNNER_RECEIPT_SCHEMA_VERSION: &str = "frankensearch.perf-runner-completion.v6";
 /// Build-time and executing-ELF identity required from the typed local
@@ -676,11 +678,15 @@ pub struct RunnerArtifactManifest {
     schema_version: String,
     gate: String,
     profile: MachineProfileKey,
+    capacity_semantics: ExecutionCapacitySemantics,
+    execution_capacity: u64,
+    max_exercised_cell_width: u64,
+    applicability_plan: PerfApplicabilityPlanBinding,
     run_id: String,
     run_window: String,
     run_log_sha256: String,
     threshold_artifact_sha256: String,
-    evidence_artifact_sha256: String,
+    prebinding_evidence_artifact_sha256: String,
 }
 
 impl RunnerArtifactManifest {
@@ -688,26 +694,56 @@ impl RunnerArtifactManifest {
     ///
     /// The returned object still has to be serialized and named by the sealed
     /// runner receipt before it can be admitted.
-    #[must_use]
+    ///
+    /// # Errors
+    ///
+    /// Returns [`MachineClassError`] when the frozen registry cannot be
+    /// admitted, the applicability plan does not reconstruct from that
+    /// registry, or any required bounded identity is absent or invalid.
     pub fn from_artifacts(
-        gate: impl Into<String>,
-        profile: MachineProfileKey,
+        applicability_plan: &PerfApplicabilityPlan,
         run_id: impl Into<String>,
         run_window: impl Into<String>,
         run_log_bytes: &[u8],
         threshold_artifact_bytes: &[u8],
         evidence_artifact_bytes: &[u8],
-    ) -> Self {
-        Self {
+    ) -> Result<Self, MachineClassError> {
+        let registry = MachineClassRegistry::frozen()?;
+        applicability_plan
+            .verify_against(&PerfMatrixSpec::complete(), &registry)
+            .map_err(|error| {
+                MachineClassError::new(
+                    MachineClassReason::CompletionUnverified,
+                    format!("artifact manifest applicability plan is invalid: {error}"),
+                )
+            })?;
+        let execution_capacity = applicability_plan.execution_capacity.ok_or_else(|| {
+            MachineClassError::new(
+                MachineClassReason::CompletionUnverified,
+                "artifact manifest applicability plan has no bounded execution capacity",
+            )
+        })?;
+        let max_exercised_cell_width =
+            applicability_plan.max_exercised_cell_width.ok_or_else(|| {
+                MachineClassError::new(
+                    MachineClassReason::CompletionUnverified,
+                    "artifact manifest applicability plan has no bounded maximum cell width",
+                )
+            })?;
+        Ok(Self {
             schema_version: RUNNER_ARTIFACT_MANIFEST_SCHEMA_VERSION.to_owned(),
-            gate: gate.into(),
-            profile,
+            gate: applicability_plan.binding.gate.label().to_owned(),
+            profile: applicability_plan.binding.profile,
+            capacity_semantics: applicability_plan.capacity_semantics,
+            execution_capacity,
+            max_exercised_cell_width,
+            applicability_plan: applicability_plan.binding.clone(),
             run_id: run_id.into(),
             run_window: run_window.into(),
             run_log_sha256: sha256_hex(run_log_bytes),
             threshold_artifact_sha256: sha256_hex(threshold_artifact_bytes),
-            evidence_artifact_sha256: sha256_hex(evidence_artifact_bytes),
-        }
+            prebinding_evidence_artifact_sha256: sha256_hex(evidence_artifact_bytes),
+        })
     }
 
     /// Canonical compact JSON bytes used by the runner completion digest.
@@ -730,6 +766,30 @@ impl RunnerArtifactManifest {
     #[must_use]
     pub const fn profile(&self) -> MachineProfileKey {
         self.profile
+    }
+
+    /// Meaning of the execution capacity sealed by this manifest.
+    #[must_use]
+    pub const fn capacity_semantics(&self) -> ExecutionCapacitySemantics {
+        self.capacity_semantics
+    }
+
+    /// Exact registry-derived execution capacity sealed by this manifest.
+    #[must_use]
+    pub const fn execution_capacity(&self) -> u64 {
+        self.execution_capacity
+    }
+
+    /// Widest canonical cell admitted for this profile and gate.
+    #[must_use]
+    pub const fn max_exercised_cell_width(&self) -> u64 {
+        self.max_exercised_cell_width
+    }
+
+    /// Exact matrix, manifest, registry, profile, and plan identity.
+    #[must_use]
+    pub const fn applicability_plan(&self) -> &PerfApplicabilityPlanBinding {
+        &self.applicability_plan
     }
 
     /// Producer run ID sealed by this manifest.
@@ -922,7 +982,7 @@ impl VerifiedRunnerIdentity {
         let manifest = &binding.manifest;
         if manifest.run_log_sha256 != sha256_hex(run_log_bytes)
             || manifest.threshold_artifact_sha256 != sha256_hex(threshold_artifact_bytes)
-            || manifest.evidence_artifact_sha256 != sha256_hex(evidence_artifact_bytes)
+            || manifest.prebinding_evidence_artifact_sha256 != sha256_hex(evidence_artifact_bytes)
         {
             return Err(MachineClassError::new(
                 MachineClassReason::CompletionUnverified,
@@ -995,7 +1055,9 @@ impl VerifiedRunnerIdentity {
             )
         })?;
         validate_artifact_manifest_binding(self, binding)?;
-        if binding.manifest.evidence_artifact_sha256 != sha256_hex(evidence_artifact_bytes) {
+        if binding.manifest.prebinding_evidence_artifact_sha256
+            != sha256_hex(evidence_artifact_bytes)
+        {
             return Err(MachineClassError::new(
                 MachineClassReason::CompletionUnverified,
                 "artifact manifest does not name the supplied pre-binding evidence bytes",
@@ -1100,15 +1162,46 @@ fn validate_artifact_manifest_binding(
     let manifest = &binding.manifest;
     if manifest.schema_version != RUNNER_ARTIFACT_MANIFEST_SCHEMA_VERSION
         || manifest.gate.trim().is_empty()
+        || manifest.execution_capacity == 0
+        || manifest.max_exercised_cell_width == 0
+        || manifest.max_exercised_cell_width > manifest.execution_capacity
         || manifest.run_id.trim().is_empty()
         || manifest.run_window.trim().is_empty()
         || !is_sha256(&manifest.run_log_sha256)
         || !is_sha256(&manifest.threshold_artifact_sha256)
-        || !is_sha256(&manifest.evidence_artifact_sha256)
+        || !is_sha256(&manifest.prebinding_evidence_artifact_sha256)
     {
         return Err(MachineClassError::new(
             MachineClassReason::CompletionUnverified,
             "artifact manifest schema, run identity, or digests are invalid",
+        ));
+    }
+    let registry = MachineClassRegistry::frozen()?;
+    let expected_plan = PerfMatrixSpec::complete()
+        .applicability_plan(
+            &registry,
+            manifest.applicability_plan.profile,
+            manifest.applicability_plan.gate,
+        )
+        .map_err(|error| {
+            MachineClassError::new(
+                MachineClassReason::CompletionUnverified,
+                format!("artifact manifest applicability plan does not reconstruct: {error}"),
+            )
+        })?;
+    if manifest.applicability_plan != expected_plan.binding
+        || manifest.gate != expected_plan.binding.gate.label()
+        || manifest.profile != expected_plan.binding.profile
+        || manifest.capacity_semantics != expected_plan.capacity_semantics
+        || expected_plan.execution_capacity != Some(manifest.execution_capacity)
+        || expected_plan.max_exercised_cell_width != Some(manifest.max_exercised_cell_width)
+        || manifest.applicability_plan.registry_schema_version
+            != identity.canonicalization.registry_schema_version
+        || manifest.applicability_plan.registry_sha256 != identity.canonicalization.registry_sha256
+    {
+        return Err(MachineClassError::new(
+            MachineClassReason::CompletionUnverified,
+            "artifact manifest applicability identity does not equal the canonical plan",
         ));
     }
     let completion = identity.completion.as_object().ok_or_else(|| {
@@ -1132,6 +1225,9 @@ fn validate_artifact_manifest_binding(
         || manifest.run_log_sha256 != completion_string("run_log_sha256")?
         || manifest.gate != identity.admission_context.gate
         || manifest.profile != identity.profile
+        || manifest.capacity_semantics != identity.capacity_semantics
+        || manifest.execution_capacity != identity.execution_capacity
+        || manifest.max_exercised_cell_width != identity.max_exercised_cell_width
     {
         return Err(MachineClassError::new(
             MachineClassReason::CompletionUnverified,
@@ -2820,11 +2916,15 @@ fn validate_registry_artifact_manifest_contract(registry: &Value) -> Result<(), 
         "schema_version",
         "gate",
         "profile",
+        "capacity_semantics",
+        "execution_capacity",
+        "max_exercised_cell_width",
+        "applicability_plan",
         "run_id",
         "run_window",
         "run_log_sha256",
         "threshold_artifact_sha256",
-        "evidence_artifact_sha256",
+        "prebinding_evidence_artifact_sha256",
     ];
     let canonical_encoding = contract.canonical_encoding.to_ascii_lowercase();
     let manifest_precedence_present = registry
@@ -2847,8 +2947,12 @@ fn validate_registry_artifact_manifest_contract(registry: &Value) -> Result<(), 
                         .and_then(Value::as_str)
                         .is_some_and(|text| {
                             text.contains("Every fresh candidate and rerun")
-                                && text.contains("exact v2 artifact manifest")
+                                && text.contains("exact v3 artifact manifest")
                                 && text.contains("profile key")
+                                && text.contains("capacity semantics")
+                                && text.contains("execution capacity")
+                                && text.contains("maximum exercised width")
+                                && text.contains("applicability-plan binding")
                                 && text.contains("actual run log")
                                 && text.contains("canonical threshold bytes")
                                 && text.contains("exact pre-binding evidence bytes")
@@ -3836,14 +3940,20 @@ fn bind_test_identity_to_artifacts(
         .expect("test receipt run-log digest");
     assert_eq!(receipt_run_log_sha256, sha256_hex(run_log_bytes));
     let manifest = RunnerArtifactManifest::from_artifacts(
-        gate,
-        bare.profile(),
+        &PerfMatrixSpec::complete()
+            .applicability_plan(
+                &MachineClassRegistry::frozen().expect("frozen registry"),
+                bare.profile(),
+                gate.parse().expect("normative gate"),
+            )
+            .expect("test applicability plan"),
         run_id,
         run_window,
         run_log_bytes,
         threshold_artifact_bytes,
         evidence_artifact_bytes,
-    );
+    )
+    .expect("test artifact manifest");
     let manifest_bytes = manifest.to_json_bytes().expect("test artifact manifest");
     let mut receipt =
         serde_json::from_str::<Value>(bare.receipt_json()).expect("test runner receipt JSON");
@@ -4145,7 +4255,7 @@ mod tests {
         assert_eq!(sha256_hex(REGISTRY_BYTES), MACHINE_CLASS_REGISTRY_SHA256);
         assert_eq!(
             MACHINE_CLASS_REGISTRY_GIT_BLOB,
-            "04eabf6a9daa6ec3239f1f8e5ccb2256921c7a72"
+            "fe68e97c8e66accd0abaa9a4e3146134c271e964"
         );
         let registry = MachineClassRegistry::frozen().expect("frozen registry");
         assert_eq!(
@@ -4814,14 +4924,20 @@ mod tests {
         )
         .expect("canonical test profile");
         let manifest = RunnerArtifactManifest::from_artifacts(
-            "QG-2",
-            profile,
+            &PerfMatrixSpec::complete()
+                .applicability_plan(
+                    &MachineClassRegistry::frozen().expect("frozen registry"),
+                    profile,
+                    "QG-2".parse().expect("normative gate"),
+                )
+                .expect("test applicability plan"),
             "candidate-a",
             "window-a",
             b"exact run log",
             b"exact threshold",
             b"exact pre-binding evidence",
-        );
+        )
+        .expect("test artifact manifest");
         let canonical = manifest.to_json_bytes().expect("canonical manifest");
         parse_artifact_manifest_binding(&canonical).expect("canonical manifest admission");
 
@@ -4848,6 +4964,132 @@ mod tests {
             assert!(
                 parse_artifact_manifest_binding(rejected).is_err(),
                 "noncanonical or structurally invalid manifest was admitted"
+            );
+        }
+    }
+
+    #[test]
+    fn artifact_manifest_rejects_plan_and_capacity_substitution_after_receipt_rehash() {
+        let gate = "QG-2";
+        let run_label = "manifest-envelope";
+        let run_log = b"runner-log:manifest-envelope";
+        let threshold = b"exact threshold";
+        let evidence = b"exact pre-binding evidence";
+        let bare = admitted_test_identity_for_run(
+            gate,
+            &"d".repeat(40),
+            &"c".repeat(64),
+            &"a".repeat(64),
+            &"f".repeat(64),
+            &"2".repeat(64),
+            run_label,
+        );
+        let registry = MachineClassRegistry::frozen().expect("frozen registry");
+        let plan = PerfMatrixSpec::complete()
+            .applicability_plan(
+                &registry,
+                bare.profile(),
+                gate.parse().expect("normative gate"),
+            )
+            .expect("test applicability plan");
+        let original = RunnerArtifactManifest::from_artifacts(
+            &plan,
+            "candidate-a",
+            "window-a",
+            run_log,
+            threshold,
+            evidence,
+        )
+        .expect("test artifact manifest");
+        assert_eq!(original.profile(), plan.binding.profile);
+        assert_eq!(original.capacity_semantics(), plan.capacity_semantics);
+        assert_eq!(Some(original.execution_capacity()), plan.execution_capacity);
+        assert_eq!(
+            Some(original.max_exercised_cell_width()),
+            plan.max_exercised_cell_width
+        );
+        assert_eq!(original.applicability_plan(), plan.binding());
+
+        let mut manifest = original.clone();
+        manifest.gate = "QG-1".to_owned();
+        let mut mutations = vec![("gate", manifest)];
+        let mut manifest = original.clone();
+        manifest.profile =
+            MachineProfileKey::new(HardwareClassId::TrjZen35995wx, ExecutionProfileId::Smt2_128)
+                .expect("alternate profile");
+        mutations.push(("profile", manifest));
+        let mut manifest = original.clone();
+        manifest.capacity_semantics = ExecutionCapacitySemantics::LogicalThreads;
+        mutations.push(("capacity_semantics", manifest));
+        let mut manifest = original.clone();
+        manifest.execution_capacity += 1;
+        mutations.push(("execution_capacity", manifest));
+        let mut manifest = original.clone();
+        manifest.max_exercised_cell_width += 1;
+        mutations.push(("max_exercised_cell_width", manifest));
+        let mut manifest = original.clone();
+        manifest.applicability_plan.profile =
+            MachineProfileKey::new(HardwareClassId::TrjZen35995wx, ExecutionProfileId::Smt2_128)
+                .expect("alternate plan profile");
+        mutations.push(("applicability_plan.profile", manifest));
+        let mut manifest = original.clone();
+        manifest
+            .applicability_plan
+            .registry_schema_version
+            .push_str("-stale");
+        mutations.push(("applicability_plan.registry_schema_version", manifest));
+        let mut manifest = original.clone();
+        manifest.applicability_plan.registry_sha256 = "0".repeat(64);
+        mutations.push(("applicability_plan.registry_sha256", manifest));
+        let mut manifest = original.clone();
+        manifest.applicability_plan.profile_contract_sha256 = "0".repeat(64);
+        mutations.push(("applicability_plan.profile_contract_sha256", manifest));
+        let mut manifest = original.clone();
+        manifest.applicability_plan.gate = "QG-1".parse().expect("normative gate");
+        mutations.push(("applicability_plan.gate", manifest));
+        let mut manifest = original.clone();
+        manifest.applicability_plan.normalized_perf_manifest_sha256 = "0".repeat(64);
+        mutations.push((
+            "applicability_plan.normalized_perf_manifest_sha256",
+            manifest,
+        ));
+        let mut manifest = original.clone();
+        manifest.applicability_plan.primary_target_cell_width = Some(1);
+        mutations.push(("applicability_plan.primary_target_cell_width", manifest));
+        let mut manifest = original.clone();
+        manifest
+            .applicability_plan
+            .matrix_contract_schema_version
+            .push_str("-stale");
+        mutations.push((
+            "applicability_plan.matrix_contract_schema_version",
+            manifest,
+        ));
+        let mut manifest = original.clone();
+        manifest.applicability_plan.gate_matrix_contract_sha256 = "0".repeat(64);
+        mutations.push(("applicability_plan.gate_matrix_contract_sha256", manifest));
+        let mut manifest = original.clone();
+        manifest.applicability_plan.applicability_plan_sha256 = "0".repeat(64);
+        mutations.push(("applicability_plan.applicability_plan_sha256", manifest));
+
+        for (field, manifest) in mutations {
+            let manifest_bytes = manifest.to_json_bytes().expect("mutated manifest bytes");
+            let mut receipt = serde_json::from_str::<Value>(bare.receipt_json())
+                .expect("test runner receipt JSON");
+            set_path(
+                &mut receipt,
+                "completion.artifact_manifest_sha256",
+                Value::String(sha256_hex(&manifest_bytes)),
+            );
+            let receipt_bytes = serde_json::to_vec(&receipt).expect("test runner receipt bytes");
+            let identity = registry
+                .admit(&receipt_bytes, bare.admission_context())
+                .expect("receipt with rehashed manifest");
+            assert!(
+                identity
+                    .bind_artifact_manifest(&manifest_bytes, run_log, threshold, evidence,)
+                    .is_err(),
+                "manifest mutation {field} survived strict binding"
             );
         }
     }
