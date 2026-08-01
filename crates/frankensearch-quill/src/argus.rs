@@ -4154,28 +4154,24 @@ impl<'a> BufferedUnionScorer<'a> {
             }
             return Ok(Some(candidates));
         }
-        let direct_terms = self
-            .active
-            .iter()
-            .all(ReferenceScorer::competitive_is_direct_term);
-        let total_cost = self
-            .active
-            .iter()
-            .map(ReferenceScorer::cost)
-            .fold(0_u64, u64::saturating_add);
-        let physical_block_max = self
-            .active
-            .iter()
-            .all(ReferenceScorer::competitive_supports_block_max);
         let strategy = match self.active.len() {
             2..=MAX_SCORE_MAX_CLAUSES
-                if direct_terms && physical_block_max && total_cost >= BMW_MIN_TOTAL_COST =>
+                if self
+                    .active
+                    .iter()
+                    .all(ReferenceScorer::competitive_is_direct_term) =>
             {
-                UnionPruningStrategy::BlockMaxWand
+                UnionPruningStrategy::MaxScore
             }
-            2..=MAX_SCORE_MAX_CLAUSES if direct_terms => UnionPruningStrategy::MaxScore,
             2..=MAX_SCORE_MAX_CLAUSES => return Ok(None),
-            BMW_MIN_CLAUSES.. if total_cost >= BMW_MIN_TOTAL_COST => {
+            BMW_MIN_CLAUSES..
+                if self
+                    .active
+                    .iter()
+                    .map(ReferenceScorer::cost)
+                    .fold(0_u64, u64::saturating_add)
+                    >= BMW_MIN_TOTAL_COST =>
+            {
                 UnionPruningStrategy::BlockMaxWand
             }
             _ => return Ok(None),
@@ -9296,84 +9292,6 @@ mod tests {
         assert_eq!(candidate_counted.total_count, Some(7_021));
         assert_eq!(candidate_counted.total_count, oracle_counted.total_count);
         assert_eq!(counted_stats, UnionPruningStats::default());
-        Ok(())
-    }
-
-    #[test]
-    fn two_term_block_max_wand_matches_exhaustive_and_skips_tail_blocks()
-    -> Result<(), Box<dyn std::error::Error>> {
-        const NUM_DOCS: u32 = 8_192;
-        let lengths = vec![Some(8); usize::try_from(NUM_DOCS).expect("fixture count fits usize")];
-        let encoded_doclens = EncodedDocLenSection::encode(
-            0,
-            u64::from(NUM_DOCS),
-            &[1],
-            &[DocLenFieldInput::new(1, &lengths)],
-        )?;
-        let doclens = encoded_doclens.section(&[1])?;
-        let field = doclens.field(1).expect("field exists");
-        let snapshot = snapshot(1, u64::from(NUM_DOCS) * 8, u64::from(NUM_DOCS))?;
-        let rows_by_term = (0..2)
-            .map(|term_index| {
-                (0..NUM_DOCS)
-                    .map(|doc| {
-                        let frequency = if term_index == 0 && doc == 1 {
-                            32
-                        } else if term_index == 0 && doc == 4_352 {
-                            64
-                        } else {
-                            1
-                        };
-                        Posting::new(doc, frequency)
-                    })
-                    .collect::<Vec<_>>()
-            })
-            .collect::<Vec<_>>();
-        let boosts = [4.0, 0.01];
-        let fieldnorm_id = fieldnorm_to_id(8);
-        let encoded_terms = rows_by_term
-            .iter()
-            .map(|rows| EncodedPostingList::encode_with_block_max(rows, |_| Some(fieldnorm_id)))
-            .collect::<Result<Vec<_>, _>>()?;
-        let posting_lists = encoded_terms
-            .iter()
-            .map(|(postings, _)| postings.posting_list())
-            .collect::<Result<Vec<_>, _>>()?;
-        let block_max = validated_block_max_entries(&encoded_terms, &posting_lists, field)?;
-
-        let mut oracle = sealed_union(
-            &posting_lists,
-            None,
-            field,
-            &snapshot,
-            &rows_by_term,
-            &boosts,
-            NUM_DOCS,
-        )?;
-        let mut oracle_collector = TopDocsCollector::new(1, 0)?;
-        oracle_collector.collect(&mut oracle, &AllLiveDocs)?;
-        let oracle_hits = oracle_collector.finish()?.hits;
-        let mut candidate = sealed_union(
-            &posting_lists,
-            Some(&block_max),
-            field,
-            &snapshot,
-            &rows_by_term,
-            &boosts,
-            NUM_DOCS,
-        )?;
-        let mut candidate_collector = TopDocsCollector::new(1, 0)?;
-        candidate_collector.collect(&mut candidate, &AllLiveDocs)?;
-        let stats = candidate
-            .union_pruning_stats()
-            .expect("top-level union retains pruning stats");
-        let candidate_hits = candidate_collector.finish()?.hits;
-
-        assert_hits_bit_exact(&candidate_hits, &oracle_hits);
-        assert_eq!(candidate_hits[0].global_docid, 4_352);
-        assert_eq!(stats.max_score_windows, 0);
-        assert_eq!(stats.block_max_wand_windows, 1);
-        assert!(stats.blocks_skipped > 0);
         Ok(())
     }
 

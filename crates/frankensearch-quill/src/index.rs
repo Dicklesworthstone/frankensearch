@@ -7216,9 +7216,8 @@ fn prunable_scorer_shape(query: &Query, inherited_boost: f32) -> Option<Prunable
 fn query_has_prunable_root_union(query: &Query, inherited_boost: f32) -> bool {
     match prunable_scorer_shape(query, inherited_boost) {
         Some(PrunableScorerShape::Union { children, kind }) => match kind {
-            // Direct-term roots take `MaxScore` or block-max WAND. High-cost
-            // roots with physical block metadata can use WAND even below the
-            // nine-clause width threshold.
+            // Direct-term roots take `MaxScore` (2..=8 clauses) or block-max
+            // WAND (9+), both term-granular.
             UnionChildKind::DirectTerms => {
                 matches!(children, 2..=MAX_SCORE_MAX_CLAUSES | BMW_MIN_CLAUSES..)
             }
