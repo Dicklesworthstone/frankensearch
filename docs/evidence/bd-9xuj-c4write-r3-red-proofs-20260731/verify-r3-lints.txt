@@ -1,0 +1,11 @@
+== VERIFY @ r3 tip: clippy --no-deps -p frankensearch-index -p frankensearch-fusion --all-targets ==
+      1 warning: `frankensearch-fusion` (lib) generated 1 warning
+      1 warning: `frankensearch-index` (bench "dot_product") generated 1 warning
+      1 warning: `frankensearch-index` (lib test) generated 5 warnings (5 duplicates)
+      1 warning: `frankensearch-index` (lib) generated 5 warnings
+      1 warning: constant `TELEMETRY_TIMESTAMP_FALLBACK_RFC3339` is never used
+      6 warning: use of deprecated method `wide::i16x8::mul_widen`: renamed to `widening_mul`
+EXIT_STATUS=0
+
+== fmt --check both crates ==
+EXIT_STATUS=0

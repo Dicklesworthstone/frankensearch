@@ -1,0 +1,7 @@
+== UBS changed files, parent 7095b1da vs r3 head ==
+parent: Files 2, Critical 4, Warning 1842, Info 273
+head:   Files 2, Critical 4, Warning 1949, Info 299
+critical sites parent: two_tier.rs:3589-3592 (one pre-existing 4-line panic! block, ANN-role invariant)
+critical sites head:   two_tier.rs:3748-3751 (the SAME block, line-shifted by insertions)
+finding CLASSES: diff of sorted class lists parent vs head = empty (CLASSES_IDENTICAL)
+warning/info deltas scale with the added test lines; no new class, no new critical.
