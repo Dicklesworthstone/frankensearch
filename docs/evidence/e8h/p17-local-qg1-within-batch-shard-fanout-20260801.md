@@ -136,10 +136,47 @@ requires `>= 2`. The single-shard body is byte-identical to the pre-change code
 (verified mechanically: 106 lines, re-indent only), so threads=1 ingest is
 unchanged **by construction**, not by measurement.
 
-A measured threads=1 control was attempted but did not complete: the shared
-cargo build directory was held by a peer swarm for the remainder of the session.
-The construction argument stands on its own, but a measured control is still
-owed and is the cheapest next confirmation.
+A measured threads=1 control **was run and is VOID.** On the lever ELF,
+`bulk/medium/1/positions_on` returned `ab_median=0.476968` but
+`null_median=1.182305` with CI **[1.056888, 1.272724] — which excludes 1.0**.
+Two identical Tantivy arms disagreed by 18% inside one invocation, so the run
+failed its own admissibility check and **its A/B number is not reportable**. The
+host was carrying a peer swarm at the time (load average 26 -> 55 across the
+session).
+
+This is recorded rather than dropped because it is the control that matters: the
+two primary runs both had admissible nulls (1.0237, 1.0261), and this one did
+not, which is the harness discriminating valid from invalid occasions rather
+than a result worth quoting. **A measured threads=1 control is still owed.**
+
+## Re-profile: what the fan-out did NOT leave behind
+
+A flat `perf record -F 999` of the lever ELF on the same cell, run by executing
+the bench binary directly (no cargo, so no build-directory lock):
+
+- **Parallelism is real**: 15 rayon worker threads carry samples. Rayon does not
+  name its workers, so they inherit the process `comm` and are invisible to a
+  `--sort comm` view — they only appear under `--sort tid`. A per-thread-id
+  split is mandatory to see this lever at all.
+- **The seal is NOT the next lever.** The whole seal path sums to **~0.55%**:
+  `EncodedPositionList::encode_with_limits` 0.22%, `collect_flush_rows` 0.19%,
+  `encode_posting_block` 0.08%, `stable_radix_partition_serial` 0.06%.
+  Parallelising `prepare_shard_flush` across shards at commit — the obvious
+  next move, and one P15 never tested — would have been a **REJECT**. Profiling
+  first cost minutes and saved implementing it.
+- **The admission probe is NOT the next lever either.** The per-document
+  duplicate-id check (`resolve_document_id`, `BTreeSet<String>` lookup and
+  insert) does not appear anywhere in the top 30, contradicting the prior
+  hypothesis that it was the Amdahl residue.
+- What remains on the main thread is **generator overhead** (`document_at` 1.86%
+  + `core::fmt::write` 1.20% + `pad_integral` 1.11% = 4.17%, charged to BOTH
+  arms) and the **allocator family** (`_int_free_chunk` 1.68% +
+  `malloc_consolidate` 1.49% + `_int_malloc` 1.17% = 4.34%). The 1.94%
+  `serde_json::serialize_str` is the *Tantivy* arm's metadata serialization on
+  its driving thread; Quill's canonicalization moved into the parallel region.
+- Tantivy additionally spends ~11% of profile on background work Quill defers
+  (`merge_thread_0..3` 7.69%, `docstore-compress` 2.64%, `segment_updater`
+  0.84%).
 
 ## Honest limits
 
