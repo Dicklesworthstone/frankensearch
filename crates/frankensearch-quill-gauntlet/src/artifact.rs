@@ -1362,6 +1362,10 @@ impl CampaignCompletionReceipt {
 /// deeper replay validation after a coherent hostile rewrite. It grants no
 /// authority and is absent from non-test builds.
 #[cfg(all(test, feature = "tantivy-oracle"))]
+#[expect(
+    clippy::redundant_pub_crate,
+    reason = "the authority-bearing fixture is intentionally limited to the parent test boundary"
+)]
 pub(super) fn campaign_completion_receipt_fixture(
     report: &CampaignReport,
 ) -> Result<(OsString, Vec<u8>), GauntletError> {
