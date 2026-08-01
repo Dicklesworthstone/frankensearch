@@ -1535,7 +1535,10 @@ impl<S: BuildHasher> TermInterner<S> {
 
     /// Ids sorted by composite key bytes — exactly the on-disk TERMDICT order
     /// (FSLX §5.1: the BE field prefix makes byte order equal (field, term)
-    /// order). Called once per flush; cost is the sort, not paid per token.
+    /// order). Called once per flush. Large buckets use an in-place MSD radix
+    /// partition so shared prefixes are inspected once per byte instead of by
+    /// every comparison; small buckets finish with the comparison sorter to
+    /// avoid clearing a 257-way histogram for a handful of ids.
     ///
     /// # Panics
     /// Panics if the id space exceeds `u32` (unreachable; see [`Self::intern`]).
@@ -1543,8 +1546,81 @@ impl<S: BuildHasher> TermInterner<S> {
     pub fn sorted_ids(&self) -> Vec<u32> {
         let mut ids: Vec<u32> =
             (0..u32::try_from(self.spans.len()).expect("term id space exceeds u32")).collect();
-        ids.sort_unstable_by(|a, b| self.composite_key(*a).cmp(self.composite_key(*b)));
+        self.sort_ids_msd(&mut ids);
         ids
+    }
+
+    fn sort_ids_msd(&self, ids: &mut [u32]) {
+        const RADIX: usize = 257;
+        const SMALL_BUCKET: usize = 24;
+
+        if ids.len() < 2 {
+            return;
+        }
+
+        let mut pending = Vec::with_capacity(64);
+        pending.push((0_usize, ids.len(), 0_usize));
+        let mut counts = [0_usize; RADIX];
+        let mut starts = [0_usize; RADIX];
+        let mut next = [0_usize; RADIX];
+
+        while let Some((lo, hi, depth)) = pending.pop() {
+            if hi - lo <= SMALL_BUCKET {
+                ids[lo..hi]
+                    .sort_unstable_by(|a, b| self.composite_key(*a).cmp(self.composite_key(*b)));
+                continue;
+            }
+
+            counts.fill(0);
+            for &id in &ids[lo..hi] {
+                let digit = self
+                    .composite_key(id)
+                    .get(depth)
+                    .map_or(0, |byte| usize::from(*byte) + 1);
+                counts[digit] += 1;
+            }
+
+            let mut cursor = lo;
+            for bucket in 0..RADIX {
+                starts[bucket] = cursor;
+                next[bucket] = cursor;
+                cursor += counts[bucket];
+            }
+            debug_assert_eq!(cursor, hi);
+
+            // American-flag partitioning: every swap fills one destination
+            // slot, so the pass is linear and needs no second id array.
+            for bucket in 0..RADIX {
+                let end = starts[bucket] + counts[bucket];
+                while next[bucket] < end {
+                    let source = next[bucket];
+                    let id = ids[source];
+                    let destination_bucket = self
+                        .composite_key(id)
+                        .get(depth)
+                        .map_or(0, |byte| usize::from(*byte) + 1);
+                    if destination_bucket == bucket {
+                        next[bucket] += 1;
+                    } else {
+                        let destination = next[destination_bucket];
+                        debug_assert!(
+                            destination < starts[destination_bucket] + counts[destination_bucket]
+                        );
+                        ids.swap(source, destination);
+                        next[destination_bucket] += 1;
+                    }
+                }
+            }
+
+            // Bucket zero is the end-of-key sentinel and is already final.
+            // Push in reverse so low-byte buckets are processed first, keeping
+            // the traversal deterministic even though the partition is not.
+            for bucket in (1..RADIX).rev() {
+                if counts[bucket] > 1 {
+                    pending.push((starts[bucket], starts[bucket] + counts[bucket], depth + 1));
+                }
+            }
+        }
     }
 
     /// Approximate live bytes held, for the shard flush trigger.
@@ -6984,6 +7060,30 @@ mod tests {
             .map(|id| interner.field_and_term(*id).0)
             .collect();
         assert_eq!(fields, vec![0, 0, 1, 1, 258]);
+    }
+
+    #[test]
+    fn msd_sorted_ids_match_comparison_oracle_on_shared_prefixes() {
+        let mut interner = TermInterner::new();
+        let mut rng = DeterministicRng(0x6d73_642d_7465_726d);
+        for ordinal in (0_u32..4_096).rev() {
+            let field_ord = u16::try_from(rng.choose(513)).expect("bounded field ordinal");
+            let mut term = vec![b'a'; rng.choose(96)];
+            term.extend_from_slice(&rng.next().to_be_bytes());
+            term.extend_from_slice(&ordinal.to_be_bytes());
+            interner.intern(field_ord, &term);
+        }
+        interner.intern(0, b"");
+        interner.intern(0, b"a");
+        interner.intern(0, b"a\0");
+        interner.intern(u16::MAX, b"\xff");
+
+        let actual = interner.sorted_ids();
+        let mut expected =
+            (0..u32::try_from(interner.len()).expect("bounded term count")).collect::<Vec<_>>();
+        expected
+            .sort_unstable_by(|a, b| interner.composite_key(*a).cmp(interner.composite_key(*b)));
+        assert_eq!(actual, expected);
     }
 
     #[test]
