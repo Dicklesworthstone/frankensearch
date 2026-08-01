@@ -17148,10 +17148,18 @@ mod tests {
                 ..QuillConfig::default()
             })
             .expect("construct phrase-seam index");
+            // Seed the deterministic accumulator below the internal bulk-parallel
+            // threshold. The following call must then stay on the scalar wrapper
+            // route, giving this cursor test one segment without coupling its
+            // seam oracle to the independent four-segment bulk-ingest policy.
             index
-                .index_documents(&cx, &documents)
+                .index_documents(&cx, &documents[..1])
                 .await
-                .expect("index phrase-seam corpus");
+                .expect("seed phrase-seam corpus");
+            index
+                .index_documents(&cx, &documents[1..])
+                .await
+                .expect("index remaining phrase-seam corpus");
             index.commit(&cx).await.expect("commit phrase-seam corpus");
 
             let snapshot = index.snapshot();
