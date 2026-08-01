@@ -7230,7 +7230,10 @@ fn query_has_prunable_root_union(query: &Query, inherited_boost: f32) -> bool {
             }
             UnionChildKind::Mixed => false,
         },
-        Some(PrunableScorerShape::Empty | PrunableScorerShape::Term) | None => false,
+        // A direct term consumes its physical blocks in `TermScorer` and can
+        // skip every block whose best `(score, docid)` cannot beat TopDocs.
+        Some(PrunableScorerShape::Term) => true,
+        Some(PrunableScorerShape::Empty) | None => false,
     }
 }
 
@@ -13758,6 +13761,11 @@ mod tests {
     #[test]
     fn rank_pruning_gate_matches_runtime_union_capabilities() {
         let parser = DefaultQueryParser::new(DEFAULT_SCHEMA).expect("bind shipping parser");
+        let direct_one = parser.parse("content:alpha");
+        assert!(
+            query_has_prunable_root_union(&direct_one.query, 1.0),
+            "a direct term is block-max TopDocs-capable"
+        );
         let direct_two = parser.parse("content:alpha OR content:beta");
         assert!(
             query_has_prunable_root_union(&direct_two.query, 1.0),
