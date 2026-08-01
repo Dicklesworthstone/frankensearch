@@ -19,6 +19,7 @@ use frankensearch_core::LexicalSearch;
 use crate::GauntletError;
 use crate::artifact::{
     ArtifactLexicalContractEvidence, ArtifactObject, ArtifactStore, CampaignArtifactContext,
+    GauntletProducerBuildIdentity,
 };
 use crate::comparator::{
     ComparatorConfig, ComparisonReport, ComparisonStatus, Divergence, DivergenceClass,
@@ -31,7 +32,7 @@ use crate::comparator::{
 use crate::engine::GauntletEngine;
 use crate::engine::{
     ComparisonMode, DifferentialCase, DifferentialCaseMetadata, EngineDescriptor,
-    EnginePairIdentity, HarnessRun, MAX_SNIPPET_CHARS,
+    EnginePairIdentity, HARNESS_RUN_SCHEMA_VERSION, HarnessRun, MAX_SNIPPET_CHARS,
 };
 #[cfg(feature = "tantivy-oracle")]
 use crate::generator::GeneratedSourceFilter;
@@ -44,7 +45,7 @@ use crate::generator::{
 use crate::version_contract::oracle_version_contract;
 
 /// Schema version for deterministic campaign reports.
-pub const CAMPAIGN_REPORT_SCHEMA_VERSION: u32 = 5;
+pub const CAMPAIGN_REPORT_SCHEMA_VERSION: u32 = 6;
 /// Schema version for the append-only machine-readable Divergence Register.
 pub const DIVERGENCE_REGISTER_LEDGER_SCHEMA_VERSION: u32 = 1;
 /// Redaction policy required by committed Divergence Register evidence.
@@ -71,7 +72,7 @@ const LEXICAL_MISMATCH_SIGNATURE_DOMAIN: &[u8] =
     b"frankensearch/quill/lexical-mismatch-signature/v1\0";
 const LEXICAL_QUERY_CONTRACT_DOMAIN: &[u8] = b"frankensearch/quill/lexical-query-contract/v1\0";
 const LEXICAL_INDEX_IDENTITY_DOMAIN: &[u8] = b"frankensearch/quill/lexical-index-identity/v1\0";
-const CAMPAIGN_REPORT_HASH_DOMAIN: &[u8] = b"frankensearch/quill/campaign-report/v5\0";
+const CAMPAIGN_REPORT_HASH_DOMAIN: &[u8] = b"frankensearch/quill/campaign-report/v6\0";
 const DIVERGENCE_REGISTRY_HASH_DOMAIN: &[u8] = b"frankensearch/quill/divergence-registry/v1\0";
 const DIVERGENCE_REGISTER_LEDGER_HASH_DOMAIN: &[u8] =
     b"frankensearch/quill/divergence-register-ledger/v1\0";
@@ -1786,6 +1787,7 @@ pub enum CampaignLexicalCoverageSummary {
 pub struct CampaignReport {
     pub schema_version: u32,
     pub run_id: String,
+    pub producer_build_identity: GauntletProducerBuildIdentity,
     pub engines: EnginePairIdentity,
     pub semantic_contract: SemanticContract,
     pub config: CampaignConfig,
@@ -1817,6 +1819,7 @@ pub struct CampaignReport {
 struct CampaignRunReservation<'a> {
     schema_version: u32,
     run_id: &'a str,
+    producer_build_identity: &'a GauntletProducerBuildIdentity,
     engines: &'a EnginePairIdentity,
     semantic_contract: &'a SemanticContract,
     config: &'a CampaignConfig,
@@ -1840,17 +1843,12 @@ struct CampaignRunReservation<'a> {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CampaignProvenance {
-    /// Subject engine source commit.
-    pub subject_git_revision: String,
-    /// Whether the subject source tree had uncommitted changes.
-    pub subject_source_dirty: bool,
-    /// Oracle engine source commit.
-    pub oracle_git_revision: String,
-    /// Whether the oracle source tree had uncommitted changes.
-    pub oracle_source_dirty: bool,
-    /// SHA-256 of the workspace `Cargo.lock`.
+    /// Domain-separated hash of the complete producer binary identity carried
+    /// by the report, reservation, and every case object.
+    pub producer_build_identity_sha256: String,
+    /// Build-script-captured SHA-256 of the producer's `Cargo.lock`.
     pub cargo_lock_sha256: String,
-    /// Full `rustc -Vv` output (release, commit, date, host).
+    /// Build-script-captured full `rustc -Vv` output.
     pub rustc_version_verbose: String,
     /// Exact dated channel from `rust-toolchain.toml`, cross-checked against
     /// `rustup`'s active toolchain.
@@ -1895,11 +1893,10 @@ where
 impl CampaignProvenance {
     /// Collect the full immutable provenance for one campaign execution.
     ///
-    /// Subject Git state is read from the invoking checkout unless explicitly
-    /// overridden. Oracle state defaults to the committed oracle version
-    /// contract and may likewise be overridden by a complete revision/dirty
-    /// pair. The CI path supplies both pairs explicitly. Toolchain facts come
-    /// from the executing `rustc` and workspace `Cargo.lock`.
+    /// Producer source, toolchain, features, lockfile, and executable facts are
+    /// copied from the build-script-sealed identity of the exact executing
+    /// binary. Runtime-only Unicode/toolchain facts are captured alongside it
+    /// and checked again at creation admission, never during archival replay.
     ///
     /// # Errors
     ///
@@ -1925,19 +1922,15 @@ impl CampaignProvenance {
             CorpusSourceManifest::SharedFixtures { .. }
             | CorpusSourceManifest::Repository { .. } => None,
         };
-        let (subject_git_revision, subject_source_dirty) =
-            collect_git_state("GAUNTLET_SUBJECT_REVISION", "GAUNTLET_SUBJECT_DIRTY")?;
-        let (oracle_git_revision, oracle_source_dirty) = collect_oracle_git_state()?;
-        let cargo_lock_sha256 = hash_workspace_lockfile()?;
-        let rustc_version_verbose = collect_rustc_verbose()?;
+        let producer_build_identity = GauntletProducerBuildIdentity::compiled()?;
+        let producer_build_identity_sha256 = producer_build_identity.identity_hash()?;
+        let cargo_lock_sha256 = producer_build_identity.cargo_lock_sha256.clone();
+        let rustc_version_verbose = producer_build_identity.rustc_version_verbose()?;
         let unicode_normalization_version = locked_crate_version("unicode-normalization")?;
         let query_profile_sha256 =
             query_profile_sha256(query_manifest, selection, semantic_contract)?;
         Ok(Self {
-            subject_git_revision,
-            subject_source_dirty,
-            oracle_git_revision,
-            oracle_source_dirty,
+            producer_build_identity_sha256,
             cargo_lock_sha256,
             rustc_version_verbose,
             rust_toolchain_channel: collect_dated_toolchain_channel()?,
@@ -1962,8 +1955,9 @@ impl CampaignProvenance {
         })
     }
 
-    fn validate_for_campaign(
+    fn validate_stored(
         &self,
+        producer_build_identity: &GauntletProducerBuildIdentity,
         engines: &EnginePairIdentity,
         semantic_contract: &SemanticContract,
         config: &CampaignConfig,
@@ -1975,12 +1969,6 @@ impl CampaignProvenance {
             CorpusSourceManifest::SharedFixtures { .. }
             | CorpusSourceManifest::Repository { .. } => None,
         };
-        let expected_unicode_version = format!(
-            "{}.{}.{}",
-            char::UNICODE_VERSION.0,
-            char::UNICODE_VERSION.1,
-            char::UNICODE_VERSION.2
-        );
         let expected_query_profile =
             query_profile_sha256(query_manifest, &config.selection, semantic_contract)?;
         let expected_corpus_manifest_hash = corpus_manifest.manifest_hash()?;
@@ -1995,20 +1983,20 @@ impl CampaignProvenance {
                         .any(|line| line.starts_with(label))
                 });
 
-        if !is_git_revision(&self.subject_git_revision)
-            || !is_git_revision(&self.oracle_git_revision)
-            || self.subject_git_revision != engines.subject.source_revision
-            || self.subject_source_dirty != engines.subject.source_dirty
-            || self.oracle_git_revision != engines.oracle.source_revision
-            || self.oracle_source_dirty != engines.oracle.source_dirty
+        producer_build_identity.validate_structure()?;
+        producer_build_identity.validate_engines(engines)?;
+        let producer_hash = producer_build_identity.identity_hash()?;
+        let producer_rustc = producer_build_identity.rustc_version_verbose()?;
+        if !is_lower_sha256(&self.producer_build_identity_sha256)
+            || self.producer_build_identity_sha256 != producer_hash
             || !is_lower_sha256(&self.cargo_lock_sha256)
-            || self.cargo_lock_sha256 != hash_workspace_lockfile()?
+            || self.cargo_lock_sha256 != producer_build_identity.cargo_lock_sha256
             || !rustc_is_complete
-            || self.rustc_version_verbose != collect_rustc_verbose()?
-            || self.rust_toolchain_channel != collect_dated_toolchain_channel()?
-            || self.unicode_version != expected_unicode_version
-            || self.unicode_normalization_version != locked_crate_version("unicode-normalization")?
-            || self.unicode_normalization_table_version != unicode_normalization_table_version()
+            || self.rustc_version_verbose != producer_rustc
+            || !is_bounded_text(&self.rust_toolchain_channel, 256)
+            || !is_numeric_version(&self.unicode_version)
+            || !is_bounded_text(&self.unicode_normalization_version, 256)
+            || !is_bounded_text(&self.unicode_normalization_table_version, 256)
             || self.query_generator_id != GENERATOR_ID
             || self.query_generator_id != query_manifest.generator_id
             || self.query_generator_schema_version != QUERY_MANIFEST_SCHEMA_VERSION
@@ -2025,11 +2013,65 @@ impl CampaignProvenance {
             || self.corpus_seed != expected_corpus_seed
         {
             return Err(campaign_error(
-                "campaign provenance is missing, malformed, or does not match the exact engines, toolchain, Unicode tables, corpus, and query profile",
+                "stored campaign provenance is missing, malformed, or does not match its producer, engines, corpus, and query profile",
             ));
         }
         Ok(())
     }
+
+    fn validate_for_creation(
+        &self,
+        producer_build_identity: &GauntletProducerBuildIdentity,
+        engines: &EnginePairIdentity,
+        semantic_contract: &SemanticContract,
+        config: &CampaignConfig,
+        corpus_manifest: &CorpusManifest,
+        query_manifest: &QueryManifest,
+    ) -> Result<(), GauntletError> {
+        self.validate_stored(
+            producer_build_identity,
+            engines,
+            semantic_contract,
+            config,
+            corpus_manifest,
+            query_manifest,
+        )?;
+        producer_build_identity.validate_matches_compiled()?;
+        producer_build_identity.validate_admissible()?;
+        let expected_unicode_version = format!(
+            "{}.{}.{}",
+            char::UNICODE_VERSION.0,
+            char::UNICODE_VERSION.1,
+            char::UNICODE_VERSION.2
+        );
+        if self.cargo_lock_sha256 != hash_workspace_lockfile()?
+            || self.rustc_version_verbose != collect_rustc_verbose()?
+            || self.rust_toolchain_channel != collect_dated_toolchain_channel()?
+            || self.unicode_version != expected_unicode_version
+            || self.unicode_normalization_version != locked_crate_version("unicode-normalization")?
+            || self.unicode_normalization_table_version != unicode_normalization_table_version()
+        {
+            return Err(campaign_error(
+                "campaign creation environment does not match its sealed producer and provenance",
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn is_bounded_text(value: &str, max_bytes: usize) -> bool {
+    !value.is_empty() && value.len() <= max_bytes && value.trim() == value && !value.contains('\0')
+}
+
+fn is_numeric_version(value: &str) -> bool {
+    let mut parts = value.split('.');
+    let valid_part =
+        |part: &str| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit());
+    matches!(
+        (parts.next(), parts.next(), parts.next(), parts.next()),
+        (Some(major), Some(minor), Some(patch), None)
+            if valid_part(major) && valid_part(minor) && valid_part(patch)
+    )
 }
 
 #[derive(Serialize)]
@@ -2342,9 +2384,9 @@ impl CampaignReport {
         self.semantic_contract.validate()?;
         self.config.validate()?;
         self.divergence_registry.validate()?;
-        if matches!(self.schema_version, 3 | 4) {
+        if matches!(self.schema_version, 3 | 4 | 5) {
             return Err(campaign_error(
-                "legacy campaign report schema lacks the current total lexical contract and is non-admissible; rerun the campaign",
+                "legacy campaign report schema lacks the current producer/run identity contract and is non-admissible; rerun the campaign",
             ));
         }
         if self.schema_version != CAMPAIGN_REPORT_SCHEMA_VERSION {
@@ -2358,6 +2400,9 @@ impl CampaignReport {
         )?;
         rebuilt_engines.bind_semantic_contract(self.semantic_contract.clone())?;
         self.engines.validate_gauntlet_contract()?;
+        self.producer_build_identity.validate_structure()?;
+        self.producer_build_identity
+            .validate_engines(&self.engines)?;
         if rebuilt_engines != self.engines {
             return Err(campaign_error(
                 "campaign report engine and semantic identities are inconsistent",
@@ -2378,7 +2423,8 @@ impl CampaignReport {
             ));
         }
         match (&self.provenance, self.config.require_provenance) {
-            (Some(provenance), _) => provenance.validate_for_campaign(
+            (Some(provenance), _) => provenance.validate_stored(
+                &self.producer_build_identity,
                 &self.engines,
                 &self.semantic_contract,
                 &self.config,
@@ -2455,12 +2501,32 @@ impl CampaignReport {
         Ok(())
     }
 
+    pub(crate) fn validate_creation_environment(&self) -> Result<(), GauntletError> {
+        self.validate_contract()?;
+        self.producer_build_identity.validate_matches_compiled()?;
+        match (&self.provenance, self.config.require_provenance) {
+            (Some(provenance), _) => provenance.validate_for_creation(
+                &self.producer_build_identity,
+                &self.engines,
+                &self.semantic_contract,
+                &self.config,
+                &self.corpus_manifest,
+                &self.query_suite.manifest,
+            ),
+            (None, false) => Ok(()),
+            (None, true) => Err(campaign_error(
+                "production campaign report is missing required provenance",
+            )),
+        }
+    }
+
     pub(crate) fn reservation_bytes_unchecked(&self) -> Result<Vec<u8>, GauntletError> {
         let selected = self.config.selection.select(&self.query_suite.cases)?;
         let divergence_registry_hash = self.divergence_registry.registry_hash()?;
         let reservation = CampaignRunReservation {
             schema_version: self.schema_version,
             run_id: &self.run_id,
+            producer_build_identity: &self.producer_build_identity,
             engines: &self.engines,
             semantic_contract: &self.semantic_contract,
             config: &self.config,
@@ -2988,6 +3054,12 @@ pub struct DifferentialCampaignRunner {
     provenance: Option<CampaignProvenance>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CampaignAdmission {
+    Diagnostic,
+    BuiltInEvidence,
+}
+
 impl DifferentialCampaignRunner {
     /// Construct a runner after validating every fail-closed policy input.
     ///
@@ -3016,9 +3088,31 @@ impl DifferentialCampaignRunner {
     /// Every production campaign run stamps it into the reservation and the
     /// report; regression fixtures deliberately leave it absent.
     #[must_use]
-    pub fn with_provenance(mut self, provenance: CampaignProvenance) -> Self {
+    pub(crate) fn with_provenance(mut self, provenance: CampaignProvenance) -> Self {
         self.provenance = Some(provenance);
         self
+    }
+
+    /// Collect and attach provenance from the exact executing producer and the
+    /// runner's already-validated campaign policy. This is the public path for
+    /// typed built-in evidence; callers cannot inject a replacement identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when any producer, corpus, query, toolchain, or Unicode
+    /// fact cannot be captured exactly.
+    pub fn with_collected_provenance(
+        mut self,
+        corpus_manifest: &CorpusManifest,
+        query_manifest: &QueryManifest,
+    ) -> Result<Self, GauntletError> {
+        self.provenance = Some(CampaignProvenance::collect(
+            corpus_manifest,
+            query_manifest,
+            &self.config.selection,
+            &self.semantic_contract,
+        )?);
+        Ok(self)
     }
 
     /// Verify, index, execute, compare, and persist one differential campaign.
@@ -3076,9 +3170,121 @@ impl DifferentialCampaignRunner {
         corpus_manifest: &CorpusManifest,
         query_suite: &GeneratedQuerySuite,
     ) -> Result<CampaignReport, GauntletError> {
+        self.run_replay_internal(
+            cx,
+            run_id,
+            subject,
+            oracle,
+            documents,
+            corpus_manifest,
+            query_suite,
+            CampaignAdmission::Diagnostic,
+        )
+        .await
+    }
+
+    /// Run provenance-bearing replacement evidence through the concrete
+    /// Quill subject and pinned Tantivy oracle. Custom trait implementations
+    /// intentionally cannot call this admission path.
+    #[cfg(feature = "tantivy-oracle")]
+    #[allow(clippy::too_many_arguments)]
+    pub async fn run_quill_tantivy_evidence_replay(
+        &self,
+        cx: &Cx,
+        run_id: &str,
+        subject: &mut crate::engine::QuillSubject,
+        oracle: &mut crate::engine::TantivyOracle,
+        documents: &dyn GeneratedCorpusReplay,
+        corpus_manifest: &CorpusManifest,
+        query_suite: &GeneratedQuerySuite,
+    ) -> Result<CampaignReport, GauntletError> {
+        self.run_replay_internal(
+            cx,
+            run_id,
+            subject,
+            oracle,
+            documents,
+            corpus_manifest,
+            query_suite,
+            CampaignAdmission::BuiltInEvidence,
+        )
+        .await
+    }
+
+    /// Slice-backed variant of [`Self::run_quill_tantivy_evidence_replay`].
+    #[cfg(feature = "tantivy-oracle")]
+    #[allow(clippy::too_many_arguments)]
+    pub async fn run_quill_tantivy_evidence(
+        &self,
+        cx: &Cx,
+        run_id: &str,
+        subject: &mut crate::engine::QuillSubject,
+        oracle: &mut crate::engine::TantivyOracle,
+        documents: &[GeneratedDocument],
+        corpus_manifest: &CorpusManifest,
+        query_suite: &GeneratedQuerySuite,
+    ) -> Result<CampaignReport, GauntletError> {
+        let replay = BorrowedCorpus(documents);
+        self.run_quill_tantivy_evidence_replay(
+            cx,
+            run_id,
+            subject,
+            oracle,
+            &replay,
+            corpus_manifest,
+            query_suite,
+        )
+        .await
+    }
+
+    /// Run provenance-bearing CASS-profile evidence through the concrete
+    /// Quill and pinned Tantivy adapters.
+    #[cfg(feature = "tantivy-oracle")]
+    #[allow(clippy::too_many_arguments)]
+    pub async fn run_cass_quill_tantivy_evidence(
+        &self,
+        cx: &Cx,
+        run_id: &str,
+        subject: &mut crate::engine::CassQuillSubject,
+        oracle: &mut crate::engine::CassTantivyOracle,
+        documents: &[GeneratedDocument],
+        corpus_manifest: &CorpusManifest,
+        query_suite: &GeneratedQuerySuite,
+    ) -> Result<CampaignReport, GauntletError> {
+        let replay = BorrowedCorpus(documents);
+        self.run_replay_internal(
+            cx,
+            run_id,
+            subject,
+            oracle,
+            &replay,
+            corpus_manifest,
+            query_suite,
+            CampaignAdmission::BuiltInEvidence,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn run_replay_internal(
+        &self,
+        cx: &Cx,
+        run_id: &str,
+        subject: &mut dyn DifferentialCampaignEngine,
+        oracle: &mut dyn DifferentialCampaignEngine,
+        documents: &dyn GeneratedCorpusReplay,
+        corpus_manifest: &CorpusManifest,
+        query_suite: &GeneratedQuerySuite,
+        admission: CampaignAdmission,
+    ) -> Result<CampaignReport, GauntletError> {
         self.config.validate()?;
         self.registry.validate()?;
         validate_campaign_run_id(run_id)?;
+        if self.config.require_provenance && admission != CampaignAdmission::BuiltInEvidence {
+            return Err(campaign_error(
+                "open custom-engine campaigns are diagnostic-only; provenance-bearing evidence requires a typed built-in subject/oracle entrypoint",
+            ));
+        }
         corpus_manifest.verify_documents(documents.replay())?;
         let corpus_manifest_hash = corpus_manifest.manifest_hash()?;
         query_suite.manifest.verify(&query_suite.cases)?;
@@ -3121,11 +3327,13 @@ impl DifferentialCampaignRunner {
             }
             CampaignContractMode::RankEnvelopeOnly | CampaignContractMode::CoreLexicalV3 => {}
         }
+        let producer_build_identity = GauntletProducerBuildIdentity::compiled()?;
         let mut engines = EnginePairIdentity::new(
             ComparisonMode::CrossEngine,
             subject.descriptor(),
             oracle.descriptor(),
         )?;
+        producer_build_identity.validate_engines(&engines)?;
         let subject_semantics = subject.semantic_contract();
         let oracle_semantics = oracle.semantic_contract();
         subject_semantics.validate()?;
@@ -3139,7 +3347,8 @@ impl DifferentialCampaignRunner {
         engines.bind_semantic_contract(self.semantic_contract.clone())?;
         engines.validate_gauntlet_contract()?;
         match (&self.provenance, self.config.require_provenance) {
-            (Some(provenance), _) => provenance.validate_for_campaign(
+            (Some(provenance), _) => provenance.validate_for_creation(
+                &producer_build_identity,
                 &engines,
                 &self.semantic_contract,
                 &self.config,
@@ -3158,6 +3367,7 @@ impl DifferentialCampaignRunner {
         let reservation = CampaignRunReservation {
             schema_version: CAMPAIGN_REPORT_SCHEMA_VERSION,
             run_id,
+            producer_build_identity: &producer_build_identity,
             engines: &engines,
             semantic_contract: &self.semantic_contract,
             config: &self.config,
@@ -3331,6 +3541,7 @@ impl DifferentialCampaignRunner {
                         query_suite.manifest.source,
                         &query_suite.manifest.source_identity_sha256,
                         query_suite.manifest.spec.seed,
+                        &producer_build_identity,
                         &engines,
                         corpus_manifest.document_count,
                         evidence_case,
@@ -3372,6 +3583,7 @@ impl DifferentialCampaignRunner {
         let report = CampaignReport {
             schema_version: CAMPAIGN_REPORT_SCHEMA_VERSION,
             run_id: run_id.to_owned(),
+            producer_build_identity,
             engines,
             semantic_contract: self.semantic_contract.clone(),
             config: self.config.clone(),
@@ -3423,6 +3635,7 @@ impl DifferentialCampaignRunner {
         query_suite_source: QuerySuiteSource,
         query_source_identity_sha256: &str,
         query_seed: u64,
+        producer_build_identity: &GauntletProducerBuildIdentity,
         engines: &EnginePairIdentity,
         expected_doc_count: u64,
         evidence_case: DifferentialCase,
@@ -3503,6 +3716,8 @@ impl DifferentialCampaignRunner {
             }
         };
         let run = HarnessRun {
+            schema_version: HARNESS_RUN_SCHEMA_VERSION,
+            producer_build_identity: producer_build_identity.clone(),
             engines: engines.clone(),
             case: evidence_case,
             comparator_config: self.config.comparator_config,

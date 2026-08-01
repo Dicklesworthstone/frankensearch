@@ -23,7 +23,7 @@ use crate::runner::{
 };
 use crate::version_contract::{OracleVersionContract, oracle_version_contract};
 
-pub const OBJECT_SCHEMA_VERSION: u32 = 5;
+pub const OBJECT_SCHEMA_VERSION: u32 = 6;
 pub const CANONICALIZATION_VERSION: u32 = 1;
 /// Current mutable run-manifest schema.
 ///
@@ -34,6 +34,7 @@ const HASH_DOMAIN_V1: &[u8] = b"frankensearch-quill-gauntlet:artifact-object:v1\
 const HASH_DOMAIN_V2: &[u8] = b"frankensearch-quill-gauntlet:artifact-object:v2\0";
 const HASH_DOMAIN_V3: &[u8] = b"frankensearch-quill-gauntlet:artifact-object:v3\0";
 const HASH_DOMAIN_V5: &[u8] = b"frankensearch-quill-gauntlet:artifact-object:v5\0";
+const HASH_DOMAIN_V6: &[u8] = b"frankensearch-quill-gauntlet:artifact-object:v6\0";
 const PRODUCER_BUILD_IDENTITY_HASH_DOMAIN: &[u8] =
     b"frankensearch-quill-gauntlet:producer-build-identity:v1\0";
 const PRODUCER_BUILD_IDENTITY_SCHEMA_VERSION: u32 = 1;
@@ -149,7 +150,7 @@ impl GauntletProducerBuildIdentity {
         })
     }
 
-    fn validate_structure(&self) -> Result<(), GauntletError> {
+    pub(crate) fn validate_structure(&self) -> Result<(), GauntletError> {
         let source_is_well_formed = match self.source_verification {
             GauntletProducerSourceVerification::GitCheckoutVerified
             | GauntletProducerSourceVerification::ExplicitUnverified => {
@@ -226,7 +227,18 @@ impl GauntletProducerBuildIdentity {
         Ok(())
     }
 
-    fn validate_admissible(&self) -> Result<(), GauntletError> {
+    pub(crate) fn validate_matches_compiled(&self) -> Result<(), GauntletError> {
+        self.validate_structure()?;
+        if self != &Self::compiled()? {
+            return Err(GauntletError::InvalidContract {
+                reason: "producer identity does not match the exact executing gauntlet binary"
+                    .to_owned(),
+            });
+        }
+        Ok(())
+    }
+
+    pub(crate) fn validate_admissible(&self) -> Result<(), GauntletError> {
         self.validate_structure()?;
         if self.source_verification != GauntletProducerSourceVerification::GitCheckoutVerified
             || self.source_git_dirty
@@ -382,12 +394,13 @@ impl ArtifactObject {
     /// # Errors
     ///
     /// Returns an error when the committed oracle version contract is invalid.
-    pub fn from_run(run: HarnessRun) -> Result<Self, GauntletError> {
+    pub fn from_diagnostic_run(run: HarnessRun) -> Result<Self, GauntletError> {
+        run.validate_for_creation()?;
         Ok(Self {
             object_schema_version: OBJECT_SCHEMA_VERSION,
             canonicalization_version: CANONICALIZATION_VERSION,
             oracle_version: oracle_version_contract()?,
-            producer_build_identity: GauntletProducerBuildIdentity::compiled()?,
+            producer_build_identity: run.producer_build_identity,
             engines: run.engines,
             case: run.case,
             comparator_config: run.comparator_config,
@@ -395,6 +408,10 @@ impl ArtifactObject {
             lexical_contract: ArtifactLexicalContractEvidence::RankEnvelopeOnly,
             campaign: None,
         })
+    }
+
+    pub(crate) fn from_run(run: HarnessRun) -> Result<Self, GauntletError> {
+        Self::from_diagnostic_run(run)
     }
 
     /// Build an immutable object for one case in a generated campaign.
@@ -428,9 +445,9 @@ impl ArtifactObject {
     /// Compute the versioned, domain-separated object address.
     ///
     /// Legacy v1/v2 objects retain their historical XXH3-64 address so they can
-    /// be decoded and diagnosed. Legacy v3 and current v5 objects use distinct
-    /// SHA-256 domains. Reserved pre-policy v4 has no registered hash domain
-    /// and is never admissible evidence.
+    /// be decoded and diagnosed. Legacy v3, pre-run-identity v5, and current
+    /// v6 objects use distinct SHA-256 domains. Reserved pre-policy v4 has no
+    /// registered hash domain and is never admissible evidence.
     ///
     /// For a legacy object decoded from historical bytes, this method hashes
     /// the DTO's current canonical reserialization, including fields added
@@ -784,7 +801,7 @@ impl ArtifactStore {
     ///
     /// Returns an error for invalid identities/contracts, a dirty or
     /// unverified producer, unsafe run IDs, or serialization failures.
-    pub fn prepare(
+    pub(crate) fn prepare(
         &self,
         run_id: &str,
         object: &ArtifactObject,
@@ -1022,7 +1039,7 @@ impl ArtifactStore {
     /// Validate all stored case evidence and atomically publish the sole
     /// campaign-completion marker.
     pub(crate) fn complete_campaign(&self, report: &CampaignReport) -> Result<(), GauntletError> {
-        report.validate_contract()?;
+        report.validate_creation_environment()?;
         validate_run_id(&report.run_id)?;
         let (root, campaign) = self.open_pinned_campaign(&report.run_id)?;
         self.verify_campaign_evidence(&root, &campaign, report)?;
@@ -1150,6 +1167,13 @@ impl ArtifactStore {
             } else {
                 object.validate()?;
             }
+            if object.producer_build_identity != report.producer_build_identity {
+                return Err(GauntletError::InvalidPreparedArtifact {
+                    reason:
+                        "campaign case producer identity does not match the reservation and report"
+                            .to_owned(),
+                });
+            }
             if let Some(expected_identity) = &campaign_producer_identity {
                 if &object.producer_build_identity != expected_identity {
                     return Err(GauntletError::InvalidPreparedArtifact {
@@ -1272,6 +1296,12 @@ fn hash_object_bytes(bytes: &[u8], schema_version: u32) -> Result<String, Gauntl
             hasher.update(bytes);
             Ok(lower_hex(&hasher.finalize()))
         }
+        6 => {
+            let mut hasher = Sha256::new();
+            hasher.update(HASH_DOMAIN_V6);
+            hasher.update(bytes);
+            Ok(lower_hex(&hasher.finalize()))
+        }
         _ => Err(GauntletError::InvalidContract {
             reason: format!(
                 "artifact object schema version {schema_version} has no registered hash domain"
@@ -1288,6 +1318,10 @@ fn validate_current_object_schema(schema_version: u32) -> Result<(), String> {
         )),
         4 => Err(
             "reserved pre-policy artifact v4 is non-admissible; rerun under the complete current evidence contract"
+                .to_owned(),
+        ),
+        5 => Err(
+            "pre-run-identity artifact v5 is non-admissible; rerun with producer identity captured before observation"
                 .to_owned(),
         ),
         _ => Err(format!(

@@ -567,11 +567,37 @@ pub trait GauntletEngine: Send + Sync {
 
 /// Result of one harness execution before it is encoded as an artifact object.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct HarnessRun {
+    /// Identity-bearing schema. Decode-only pre-identity runs deserialize to
+    /// zero and are rejected before they can be persisted.
+    #[serde(default)]
+    pub schema_version: u32,
+    /// Exact binary identity captured before either adapter was observed.
+    #[serde(default)]
+    pub producer_build_identity: GauntletProducerBuildIdentity,
     pub engines: EnginePairIdentity,
     pub case: DifferentialCase,
     pub comparator_config: ComparatorConfig,
     pub comparison: ComparisonReport,
+}
+
+/// Current serialized harness-run schema.
+pub const HARNESS_RUN_SCHEMA_VERSION: u32 = 2;
+
+impl HarnessRun {
+    pub(crate) fn validate_for_creation(&self) -> Result<(), GauntletError> {
+        if self.schema_version != HARNESS_RUN_SCHEMA_VERSION {
+            return Err(GauntletError::InvalidContract {
+                reason: "legacy or unknown harness-run schema cannot produce current evidence"
+                    .to_owned(),
+            });
+        }
+        self.producer_build_identity.validate_matches_compiled()?;
+        self.producer_build_identity
+            .validate_engines(&self.engines)?;
+        Ok(())
+    }
 }
 
 /// Pure orchestration shell around engine adapters and the comparator.
@@ -605,12 +631,13 @@ impl DifferentialHarness {
         oracle: &dyn GauntletEngine,
         case: &DifferentialCase,
     ) -> Result<HarnessRun, GauntletError> {
+        let producer_build_identity = GauntletProducerBuildIdentity::compiled()?;
         let engines = EnginePairIdentity::new(
             self.comparison_mode,
             subject.descriptor(),
             oracle.descriptor(),
         )?;
-        GauntletProducerBuildIdentity::compiled()?.validate_engines(&engines)?;
+        producer_build_identity.validate_engines(&engines)?;
         engines.validate_gauntlet_contract()?;
         self.comparator_config.validate_contract()?;
         case.validate_shape()?;
@@ -623,6 +650,8 @@ impl DifferentialHarness {
             self.comparator_config,
         )?;
         Ok(HarnessRun {
+            schema_version: HARNESS_RUN_SCHEMA_VERSION,
+            producer_build_identity,
             engines,
             case: case.clone(),
             comparator_config: self.comparator_config,
