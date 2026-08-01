@@ -211,6 +211,23 @@ enum GraphDefect {
         /// The lowest-numbered unreachable point.
         first_unreachable: u32,
     },
+    /// A full-width search over every physical row did not produce the
+    /// live-result cardinality promised by the admitted owner's census.
+    ///
+    /// This can only happen if graph reachability or the owner census has
+    /// become inconsistent after admission. Returning a short result would
+    /// make that corruption look like ordinary low recall, so search fails
+    /// with this typed defect instead.
+    LiveResultUnderfill {
+        /// Result count requested by the caller.
+        requested_k: usize,
+        /// Live rows the owner census says must be returned.
+        expected_live_hits: usize,
+        /// Live rows actually found after searching every physical row.
+        returned_live_hits: usize,
+        /// Physical rows used as the hard search-width bound.
+        physical_rows: usize,
+    },
 }
 
 impl fmt::Display for GraphDefect {
@@ -308,11 +325,36 @@ impl fmt::Display for GraphDefect {
                 "only {reached} of {total} points are reachable at layer 0 (first unreachable: \
                  {first_unreachable})"
             ),
+            Self::LiveResultUnderfill {
+                requested_k,
+                expected_live_hits,
+                returned_live_hits,
+                physical_rows,
+            } => write!(
+                f,
+                "full-width native HNSW search over {physical_rows} physical rows returned \
+                 {returned_live_hits} live hits, but request k={requested_k} and the admitted \
+                 owner census require {expected_live_hits}"
+            ),
         }
     }
 }
 
 impl std::error::Error for GraphDefect {}
+
+/// Double a search window without ever crossing its physical-row bound.
+///
+/// The `current + 1` floor guarantees progress even if a future caller starts
+/// at zero; the early return makes that addition safe at `usize::MAX`.
+fn widen_search_width(current: usize, physical_rows: usize) -> usize {
+    if current >= physical_rows {
+        return physical_rows;
+    }
+    current
+        .saturating_mul(2)
+        .max(current + 1)
+        .min(physical_rows)
+}
 
 /// Maximum number of graph layers.
 ///
@@ -823,6 +865,7 @@ impl NativeHnswGenerationBindingV2 {
         if metadata.byte_len() != receipt.graph_byte_len {
             return Err(mismatch("byte length"));
         }
+        // ubs:ignore — point counts are public graph-cardinality evidence, not secrets.
         if metadata.point_count() != receipt.point_count {
             return Err(mismatch("point count"));
         }
@@ -835,6 +878,7 @@ impl NativeHnswGenerationBindingV2 {
         if graph.params() != receipt.params.to_params()? {
             return Err(mismatch("parameter identity"));
         }
+        // ubs:ignore — this deterministic topology seed is public receipt metadata.
         if graph.seed() != receipt.seed {
             return Err(mismatch("level-sampling seed"));
         }
@@ -935,20 +979,9 @@ impl ValidatedNativeHnswHit<'_> {
 }
 
 impl<'owner> ValidatedNativeHnsw<'owner> {
-    fn binding_for_live_owner(
+    fn binding_for_owner(
         owner: &ValidatedFsviBytes,
     ) -> SearchResult<NativeHnswGenerationBindingV2> {
-        let tombstone_count = owner.tombstone_count();
-        if tombstone_count != 0 {
-            return Err(SearchError::InvalidConfig {
-                field: "native_hnsw.owner.tombstone_count".to_owned(),
-                value: tombstone_count.to_string(),
-                reason: "owner-bound native HNSW currently admits only all-LIVE FSVI images; \
-                         compact tombstones before ANN admission until tombstone-aware graph \
-                         search can guarantee the requested number of live results"
-                    .to_owned(),
-            });
-        }
         NativeHnswGenerationBindingV2::from_validated_fsvi(owner)
     }
 
@@ -972,10 +1005,9 @@ impl<'owner> ValidatedNativeHnsw<'owner> {
 
     /// Build a graph from every physical row of one admitted FSVI owner.
     ///
-    /// Tombstoned owners fail closed. Indexing tombstones and filtering only
-    /// the returned ANN window can underfill results and lose live recall, so
-    /// admission requires a compacted all-LIVE image until native graph search
-    /// can guarantee `k` live results directly.
+    /// Tombstoned rows remain in the graph as routing nodes. They retain their
+    /// exact physical-row identity in topology and receipt material, but
+    /// [`Self::search`] never exposes them as hits.
     ///
     /// # Errors
     ///
@@ -988,7 +1020,7 @@ impl<'owner> ValidatedNativeHnsw<'owner> {
         params: HnswParams,
         seed: u64,
     ) -> SearchResult<Self> {
-        let binding = Self::binding_for_live_owner(owner)?;
+        let binding = Self::binding_for_owner(owner)?;
         let graph = NativeHnsw::build(params, seed, owner)?;
         Self::from_verified_graph(owner, binding, graph)
     }
@@ -997,8 +1029,8 @@ impl<'owner> ValidatedNativeHnsw<'owner> {
     ///
     /// Receipt identity is checked before graph bytes are opened, and graph
     /// parsing and structural verification use the same borrowed owner.
-    /// Tombstoned owners are rejected before any sidecar is observed; callers
-    /// must compact to an all-LIVE FSVI image before ANN admission.
+    /// The exact whole-image witness binds the LIVE/TOMBSTONE layout, while
+    /// every physical row remains present in the loaded routing topology.
     ///
     /// # Errors
     ///
@@ -1008,7 +1040,7 @@ impl<'owner> ValidatedNativeHnsw<'owner> {
         owner: &'owner ValidatedFsviBytes,
         graph_path: &Path,
     ) -> SearchResult<(Self, NativeHnswGenerationReceiptV2)> {
-        let binding = Self::binding_for_live_owner(owner)?;
+        let binding = Self::binding_for_owner(owner)?;
         let (graph, receipt) = binding.load_bound_graph(graph_path, owner)?;
         Ok((
             Self {
@@ -1026,7 +1058,7 @@ impl<'owner> ValidatedNativeHnsw<'owner> {
         graph_path: &Path,
         after_first_observation: impl FnOnce() -> SearchResult<()>,
     ) -> SearchResult<(Self, NativeHnswGenerationReceiptV2)> {
-        let binding = Self::binding_for_live_owner(owner)?;
+        let binding = Self::binding_for_owner(owner)?;
         let (graph, receipt) = binding.load_bound_graph_with_after_first_observation(
             graph_path,
             owner,
@@ -1060,8 +1092,13 @@ impl<'owner> ValidatedNativeHnsw<'owner> {
 
     /// Search only against the owner used to build or load this graph.
     ///
-    /// Every returned row, document id, and record-state flag is resolved from
-    /// that same owner before crossing the public boundary.
+    /// Every physical row remains eligible for graph traversal, including the
+    /// entry point and intermediate tombstones. Returned rows are filtered
+    /// through the same owner and are always LIVE. If the initial ANN window
+    /// contains too many tombstones, both candidate count and beam width widen
+    /// deterministically, never beyond the physical row count, until exactly
+    /// `min(k, owner.live_count())` hits are available. A full-width underfill
+    /// is a typed structural defect rather than a silent short result.
     ///
     /// # Errors
     ///
@@ -1089,10 +1126,25 @@ impl<'owner> ValidatedNativeHnsw<'owner> {
             });
         }
         let owner: &'owner ValidatedFsviBytes = self.owner;
-        self.graph
-            .search(query, k, ef, owner)?
-            .into_iter()
-            .map(|(physical_row, distance)| {
+        let expected_live_hits = k.min(owner.live_count());
+        // ubs:ignore -- cardinalities are public index metadata, not secrets.
+        if expected_live_hits == 0 {
+            return Ok(Vec::new());
+        }
+
+        let physical_rows = owner.record_count();
+        let mut candidate_count = expected_live_hits.min(physical_rows);
+        let mut search_ef = ef
+            .unwrap_or_else(|| self.graph.params().ef_search)
+            .max(candidate_count)
+            .min(physical_rows);
+
+        loop {
+            let candidates = self
+                .graph
+                .search(query, candidate_count, Some(search_ef), owner)?;
+            let mut live_hits = Vec::with_capacity(expected_live_hits);
+            for (physical_row, distance) in candidates {
                 let physical_index =
                     usize::try_from(physical_row).map_err(|_| SearchError::InvalidConfig {
                         field: "native_hnsw.physical_row".to_owned(),
@@ -1100,15 +1152,38 @@ impl<'owner> ValidatedNativeHnsw<'owner> {
                         reason: "physical row does not fit usize".to_owned(),
                     })?;
                 let flags = owner.row(physical_index)?.flags();
+                if flags.is_tombstone() {
+                    continue;
+                }
                 let doc_id = owner.doc_id_at(physical_index)?;
-                Ok(ValidatedNativeHnswHit {
+                live_hits.push(ValidatedNativeHnswHit {
                     physical_row,
                     distance,
                     doc_id,
                     flags,
-                })
-            })
-            .collect()
+                });
+                // ubs:ignore -- result cardinalities are not secret material.
+                if live_hits.len() == expected_live_hits {
+                    return Ok(live_hits);
+                }
+            }
+
+            // ubs:ignore -- search widths are public index cardinalities.
+            if candidate_count == physical_rows {
+                return Err(SearchError::SubsystemError {
+                    subsystem: "native-hnsw",
+                    source: Box::new(GraphDefect::LiveResultUnderfill {
+                        requested_k: k,
+                        expected_live_hits,
+                        returned_live_hits: live_hits.len(),
+                        physical_rows,
+                    }),
+                });
+            }
+
+            candidate_count = widen_search_width(candidate_count, physical_rows);
+            search_ef = widen_search_width(search_ef, physical_rows).max(candidate_count);
+        }
     }
 
     /// Number of physical owner rows indexed by this graph.
@@ -1217,6 +1292,7 @@ impl NativeHnswGenerationReceiptV2 {
                 "must fit the native u32 point-id space",
             ));
         }
+        // ubs:ignore — these are public physical graph-row cardinalities, not credentials.
         if self.fsvi_physical_row_count != self.point_count {
             return Err(native_hnsw_receipt_config_error(
                 "fsvi_physical_row_count",
@@ -4060,6 +4136,39 @@ mod tests {
         .expect("write mutated test receipt");
     }
 
+    fn sampled_entry_for_count(count: usize, seed: u64) -> Option<u32> {
+        // ubs:ignore -- the public fixture cardinality is not secret material.
+        if count == 0 {
+            return None;
+        }
+        let sampler = LevelSampler::new(params().m, seed);
+        let mut entry = 0_u32;
+        let mut maximum = sampler.level_for(entry);
+        for physical_index in 1..count {
+            let id = u32::try_from(physical_index).expect("test owner count fits u32");
+            let level = sampler.level_for(id);
+            if level > maximum {
+                entry = id;
+                maximum = level;
+            }
+        }
+        Some(entry)
+    }
+
+    fn seed_with_tombstoned_entry(owner: &ValidatedFsviBytes) -> u64 {
+        (0..10_000_u64)
+            .find(|&seed| {
+                let entry = sampled_entry_for_count(owner.record_count(), seed)
+                    .expect("nonempty test owner has an entry");
+                owner
+                    .row(usize::try_from(entry).expect("entry fits usize"))
+                    .expect("entry row")
+                    .flags()
+                    .is_tombstone()
+            })
+            .expect("find deterministic seed whose entry point is tombstoned")
+    }
+
     // ─── FSVI generation receipts ──────────────────────────────────────
 
     #[test]
@@ -4408,16 +4517,16 @@ mod tests {
         assert_eq!(layout_b[layout_b.len() - 1].1, FsviRecordFlags::TOMBSTONE);
         assert_ne!(layout_a, layout_b);
 
-        let graph = NativeHnsw::build(params(), 35, &owner_a).expect("internal graph fixture");
+        let bound_a = ValidatedNativeHnsw::build(&owner_a, params(), 35)
+            .expect("public tombstone-aware graph fixture");
         let graph_path = directory.path().join("layout.fshnsw");
-        binding_a
-            .save_bound_graph(&graph, &graph_path)
-            .expect("internal receipted graph fixture");
+        bound_a
+            .save(&graph_path)
+            .expect("public receipted graph fixture");
         std::fs::write(&graph_path, b"graph bytes must not be read")
             .expect("poison graph after receipt publication");
 
-        let error = binding_b
-            .load_bound_graph(&graph_path, &owner_b)
+        let error = ValidatedNativeHnsw::load(&owner_b, &graph_path)
             .expect_err("different physical tombstone layout must fail");
         assert!(
             matches!(error, SearchError::IndexCorrupted { ref detail, .. }
@@ -4427,7 +4536,7 @@ mod tests {
     }
 
     #[test]
-    fn validated_owner_bound_api_rejects_tombstones_before_build_or_load() {
+    fn validated_owner_bound_api_routes_through_tombstones_and_round_trips() {
         let directory = tempfile::tempdir().expect("temporary directory");
         let fsvi_binding = fsvi_v2_binding(36, 0x36, "tombstone-admission", 4);
         let rows = vec![
@@ -4449,47 +4558,353 @@ mod tests {
             &rows,
         );
 
-        let build_error = ValidatedNativeHnsw::build(&owner, params(), 36)
-            .expect_err("tombstoned owner must not build a public ANN handle");
-        assert!(
-            matches!(
-                build_error,
-                SearchError::InvalidConfig {
-                    ref field,
-                    ref value,
-                    ref reason,
-                } if field == "native_hnsw.owner.tombstone_count"
-                    && value == "1"
-                    && reason.contains("all-LIVE")
-            ),
-            "unexpected tombstone build rejection: {build_error:?}"
+        let bound = ValidatedNativeHnsw::build(&owner, params(), 36)
+            .expect("tombstoned owner builds a public ANN handle");
+        assert_eq!(bound.len(), 2, "both physical rows remain routing nodes");
+        assert_eq!(owner.live_count(), 1);
+        assert_eq!(owner.tombstone_count(), 1);
+
+        let tombstone_index = (0..owner.record_count())
+            .find(|&index| {
+                owner
+                    .row(index)
+                    .expect("admitted owner row")
+                    .flags()
+                    .is_tombstone()
+            })
+            .expect("fixture tombstone");
+        // ubs:ignore -- a public test query must not taint unrelated comparisons.
+        let query = owner
+            .vector_at_f32(tombstone_index)
+            .expect("query equal to the nearest tombstoned vector");
+        let hits = bound
+            .search(&query, 8, Some(1))
+            .expect("bounded search widens past its tombstoned nearest candidate");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].doc_id(), "live");
+        assert!(hits[0].flags().is_live());
+        assert_ne!(
+            usize::try_from(hits[0].physical_row()).expect("physical row fits usize"),
+            tombstone_index
         );
 
-        let binding = NativeHnswGenerationBindingV2::from_validated_fsvi(&owner)
-            .expect("internal tombstone binding fixture");
-        let graph =
-            NativeHnsw::build(params(), 36, &owner).expect("internal tombstone graph fixture");
         let graph_path = directory.path().join("tombstoned.fshnsw");
-        binding
-            .save_bound_graph(&graph, &graph_path)
-            .expect("internal tombstone receipt fixture");
-        std::fs::write(&graph_path, b"public load must not observe graph bytes")
-            .expect("poison graph after receipt publication");
+        // ubs:ignore -- a public integrity receipt is not authentication material.
+        let receipt = bound
+            .save(&graph_path)
+            .expect("save tombstone-aware receipt");
+        assert_eq!(receipt.fsvi_physical_row_count, 2);
+        assert_eq!(
+            receipt.fsvi_whole_image_sha256,
+            encode_lower_hex(owner.witness().whole_image_sha256)
+        );
 
-        let load_error = ValidatedNativeHnsw::load(&owner, &graph_path)
-            .expect_err("tombstoned owner must not load a public ANN handle");
+        let (loaded, loaded_receipt) =
+            ValidatedNativeHnsw::load(&owner, &graph_path).expect("load tombstone-aware graph");
+        assert_eq!(loaded_receipt, receipt);
+        assert_eq!(
+            topology_snapshot(&loaded.graph),
+            topology_snapshot(&bound.graph)
+        );
+        assert_eq!(
+            loaded
+                .search(&query, 8, Some(1))
+                .expect("loaded bounded widening"),
+            hits
+        );
+    }
+
+    #[test]
+    fn ninety_percent_tombstones_widen_to_exact_live_cardinality_in_stable_order() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let fsvi_binding = fsvi_v2_binding(40, 0x40, "ninety-percent-tombstones", 8);
+        let corpus = TestStore::synthetic(20, 8);
+        let rows: Vec<(String, Vec<f32>, FsviRecordFlags)> = corpus
+            .vectors
+            .into_iter()
+            .enumerate()
+            .map(|(row, vector)| {
+                (
+                    format!("ninety-percent-{row:02}"),
+                    vector,
+                    if row < 2 {
+                        FsviRecordFlags::LIVE
+                    } else {
+                        FsviRecordFlags::TOMBSTONE
+                    },
+                )
+            })
+            .collect();
+        let owner = admitted_fsvi_owner_with_flags(
+            directory.path(),
+            "ninety-percent.fsvi",
+            &fsvi_binding,
+            &rows,
+        );
+        assert_eq!(owner.record_count(), 20);
+        assert_eq!(owner.live_count(), 2);
+        assert_eq!(owner.tombstone_count(), 18);
+
+        let (seed, bound) = (0..10_000_u64)
+            .find_map(|seed| {
+                let entry = sampled_entry_for_count(owner.record_count(), seed)?;
+                if owner
+                    .row(usize::try_from(entry).ok()?)
+                    .ok()?
+                    .flags()
+                    .is_live()
+                {
+                    return None;
+                }
+                ValidatedNativeHnsw::build(&owner, params(), seed)
+                    .ok()
+                    .map(|bound| (seed, bound))
+            })
+            .expect("find a sound graph with a tombstoned entry point");
+        let entry = bound.graph.entry_point().expect("nonempty graph entry");
+        assert!(
+            owner
+                .row(usize::try_from(entry).expect("entry fits usize"))
+                .expect("entry row")
+                .flags()
+                .is_tombstone(),
+            "the graph entry itself must exercise tombstone routing"
+        );
+
+        // ubs:ignore -- a public test query must not taint unrelated comparisons.
+        let query = owner
+            .vector_at_f32(usize::try_from(entry).expect("entry fits usize"))
+            .expect("query equal to the tombstoned entry vector");
+        let first = bound
+            .search(&query, usize::MAX, Some(1))
+            .expect("bounded widening reaches every required live row");
+        let second = bound
+            .search(&query, usize::MAX, Some(1))
+            .expect("repeat bounded widening is deterministic");
+        assert_eq!(first, second);
+        assert_eq!(first.len(), owner.live_count());
+        assert!(first.iter().all(|hit| hit.flags().is_live()));
+        assert!(
+            first
+                .iter()
+                .all(|hit| hit.doc_id().starts_with("ninety-percent-0")),
+            "only the two live document ids may cross the boundary: {first:?}"
+        );
+
+        let expected_live_rows: Vec<u32> = (0..owner.record_count())
+            .filter(|&index| owner.row(index).expect("owner row").flags().is_live())
+            .map(|index| u32::try_from(index).expect("physical row fits u32"))
+            .collect();
+        let mut returned_rows: Vec<u32> = first
+            .iter()
+            .map(ValidatedNativeHnswHit::physical_row)
+            .collect();
+        returned_rows.sort_unstable();
+        assert_eq!(
+            returned_rows, expected_live_rows,
+            "every live physical row must be returned exactly once"
+        );
+        assert_eq!(bound.graph.seed(), seed);
+
+        let mut widths = vec![owner.live_count()];
+        while *widths.last().expect("initial width") < owner.record_count() {
+            widths.push(widen_search_width(
+                *widths.last().expect("prior width"),
+                owner.record_count(),
+            ));
+        }
+        assert_eq!(widths, vec![2, 4, 8, 16, 20]);
+        assert_eq!(
+            widen_search_width(owner.record_count(), owner.record_count()),
+            owner.record_count(),
+            "the physical-row bound is a fixed point"
+        );
+    }
+
+    #[test]
+    fn all_tombstoned_owner_and_zero_k_return_truthful_empty_results() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let fsvi_binding = fsvi_v2_binding(41, 0x41, "all-tombstoned", 4);
+        let rows: Vec<(String, Vec<f32>, FsviRecordFlags)> = (0..8)
+            .map(|row| {
+                let mut vector = vec![0.0; 4];
+                vector[row % 4] = 1.0;
+                (
+                    format!("all-dead-{row}"),
+                    vector,
+                    FsviRecordFlags::TOMBSTONE,
+                )
+            })
+            .collect();
+        let owner = admitted_fsvi_owner_with_flags(
+            directory.path(),
+            "all-tombstoned.fsvi",
+            &fsvi_binding,
+            &rows,
+        );
+        let bound = ValidatedNativeHnsw::build(&owner, params(), 41)
+            .expect("all physical tombstones remain valid routing nodes");
+
+        assert_eq!(bound.len(), 8);
+        assert_eq!(owner.live_count(), 0);
+        assert_eq!(owner.tombstone_count(), 8);
+        assert!(
+            bound
+                .search(&[1.0, 0.0, 0.0, 0.0], 8, Some(1))
+                .expect("all-tombstoned search")
+                .is_empty()
+        );
+        assert!(
+            bound
+                .search(&[1.0, 0.0, 0.0, 0.0], 0, Some(1))
+                .expect("zero-k search")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn physical_row_selection_never_deduplicates_equal_document_labels() {
+        let store = TestStore::new(vec![
+            vec![1.0, 0.0, 0.0],
+            vec![0.0, 1.0, 0.0],
+            vec![0.0, 0.0, 1.0],
+        ]);
+        let graph = NativeHnsw::build(params(), 42, &store).expect("build raw graph");
+        let tombstoned = [false, true, false];
+        let duplicate_labels = ["duplicate", "duplicate", "duplicate"];
+        let hits = graph
+            .search(&[0.0, 1.0, 0.0], 3, Some(3), &store)
+            .expect("full-width physical-row search");
+        let live_resolved: Vec<(u32, &str)> = hits
+            .into_iter()
+            .filter(|(physical_row, _)| {
+                let physical_index =
+                    usize::try_from(*physical_row).expect("physical row fits usize");
+                !tombstoned[physical_index]
+            })
+            .map(|(physical_row, _)| {
+                let physical_index =
+                    usize::try_from(physical_row).expect("physical row fits usize");
+                (physical_row, duplicate_labels[physical_index])
+            })
+            .collect();
+
+        assert_eq!(live_resolved.len(), 2);
+        assert_ne!(live_resolved[0].0, live_resolved[1].0);
+        assert!(
+            live_resolved
+                .iter()
+                // ubs:ignore -- this is a public document-label regression fixture.
+                .all(|(_, doc_id)| *doc_id == "duplicate"),
+            "equal document labels must not collapse distinct physical rows"
+        );
+
+        // Identity-complete FSVI v2 currently requires unique document ids,
+        // so an owner-bound public duplicate-id state cannot be constructed.
+        // Pin that upstream admission boundary explicitly instead of
+        // weakening it merely to manufacture an HNSW fixture.
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let fsvi_binding = fsvi_v2_binding(42, 0x42, "duplicate-doc-ids", 3);
+        let fsvi_path = directory.path().join("duplicate-doc-ids.fsvi");
+        let mut writer =
+            VectorIndex::create_v2(&fsvi_path, fsvi_binding).expect("create duplicate-id fixture");
+        writer
+            .write_record("duplicate", &[1.0, 0.0, 0.0])
+            .expect("first duplicate row");
+        writer
+            .write_record("duplicate", &[0.0, 1.0, 0.0])
+            .expect("second duplicate row is buffered before canonical admission");
+        let error = writer
+            .finish()
+            .expect_err("FSVI v2 must reject duplicate document ids before HNSW admission");
         assert!(
             matches!(
-                load_error,
+                error,
                 SearchError::InvalidConfig {
                     ref field,
                     ref value,
                     ref reason,
-                } if field == "native_hnsw.owner.tombstone_count"
-                    && value == "1"
-                    && reason.contains("all-LIVE")
+                // ubs:ignore -- public schema field name, not secret material.
+                } if field == "doc_id"
+                    // ubs:ignore -- public duplicate marker, not secret material.
+                    && value == "<duplicate>"
+                    && reason.contains("unique physical row per document id")
             ),
-            "unexpected tombstone load rejection: {load_error:?}"
+            "unexpected duplicate-id owner rejection: {error:?}"
+        );
+    }
+
+    #[test]
+    fn full_width_live_underfill_is_a_typed_graph_defect() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let fsvi_binding = fsvi_v2_binding(43, 0x43, "typed-live-underfill", 4);
+        let rows: Vec<(String, Vec<f32>, FsviRecordFlags)> = (0..8)
+            .map(|row| {
+                // ubs:ignore -- deterministic fixture row index, not secret material.
+                let live = row == 0;
+                let mut vector = vec![0.0; 4];
+                vector[row % 4] = 1.0;
+                (
+                    format!("typed-underfill-{row}"),
+                    vector,
+                    if live {
+                        FsviRecordFlags::LIVE
+                    } else {
+                        FsviRecordFlags::TOMBSTONE
+                    },
+                )
+            })
+            .collect();
+        let owner = admitted_fsvi_owner_with_flags(
+            directory.path(),
+            "typed-live-underfill.fsvi",
+            &fsvi_binding,
+            &rows,
+        );
+        let seed = seed_with_tombstoned_entry(&owner);
+        let mut bound = ValidatedNativeHnsw::build(&owner, params(), seed)
+            .expect("build structurally valid owner-bound graph");
+        let live_row = (0..owner.record_count())
+            .find(|&index| owner.row(index).expect("owner row").flags().is_live())
+            .expect("one live row");
+        let live_id = u32::try_from(live_row).expect("live row fits u32");
+        assert_ne!(bound.graph.entry_point(), Some(live_id));
+
+        // Forge an impossible post-admission reachability defect. Public
+        // build/load cannot create this state because both structurally
+        // attest first; the mutation proves search reports a typed defect if
+        // the invariant is ever violated rather than returning zero hits.
+        for point in &mut bound.graph.adjacency {
+            for neighbours in &mut point.layers {
+                // ubs:ignore -- public graph row id, not secret material.
+                neighbours.retain(|&candidate| candidate != live_id);
+            }
+        }
+        for neighbours in &mut bound.graph.adjacency[live_row].layers {
+            neighbours.clear();
+        }
+
+        // ubs:ignore -- a public test query must not taint unrelated comparisons.
+        let query = owner.vector_at_f32(live_row).expect("live query vector");
+        let error = bound
+            .search(&query, 1, Some(1))
+            .expect_err("full-width underfill must fail closed");
+        assert!(
+            matches!(&error, SearchError::SubsystemError { .. }),
+            "expected typed native-hnsw subsystem defect, got {error:?}"
+        );
+        let SearchError::SubsystemError { subsystem, source } = error else {
+            return;
+        };
+        assert_eq!(subsystem, "native-hnsw");
+        assert_eq!(
+            source.downcast_ref::<GraphDefect>(),
+            Some(&GraphDefect::LiveResultUnderfill {
+                requested_k: 1,
+                expected_live_hits: 1,
+                returned_live_hits: 0,
+                physical_rows: 8,
+            })
         );
     }
 
@@ -4591,20 +5006,23 @@ mod tests {
     #[test]
     fn validated_owner_bound_constructor_attests_graph_before_handle_escape() {
         fn assert_graph_defect(error: SearchError, expected: &GraphDefect) {
-            let SearchError::SubsystemError { subsystem, source } = error else {
-                panic!("expected native-hnsw subsystem error, got {error:?}");
-            };
-            assert_eq!(subsystem, "native-hnsw");
-            assert_eq!(
-                source.downcast_ref::<GraphDefect>(),
-                Some(expected),
-                "verified constructor must preserve the exact graph defect"
+            assert!(
+                matches!(&error, SearchError::SubsystemError { .. }),
+                "expected native-hnsw subsystem error, got {error:?}"
             );
+            if let SearchError::SubsystemError { subsystem, source } = error {
+                assert_eq!(subsystem, "native-hnsw");
+                assert_eq!(
+                    source.downcast_ref::<GraphDefect>(),
+                    Some(expected),
+                    "verified constructor must preserve the exact graph defect"
+                );
+            }
         }
 
         let owner = generation_owner(39, 0x39, "post-build-attestation", 4, 32);
-        let binding = ValidatedNativeHnsw::binding_for_live_owner(&owner)
-            .expect("derive exact owner binding");
+        let binding =
+            ValidatedNativeHnsw::binding_for_owner(&owner).expect("derive exact owner binding");
         let sound = NativeHnsw::build(params(), 39, &owner).expect("build sound graph");
         ValidatedNativeHnsw::from_verified_graph(&owner, binding.clone(), sound)
             .expect("sound graph passes public-handle attestation");
@@ -4628,6 +5046,7 @@ mod tests {
             })
             .expect("nontrivial graph has an edge");
         let id = u32::try_from(id).expect("test graph length fits u32");
+        // ubs:ignore — graph point IDs are public topology data, not authenticators.
         one_way.adjacency[neighbour as usize].layers[layer].retain(|&candidate| candidate != id);
         let error = ValidatedNativeHnsw::from_verified_graph(&owner, binding.clone(), one_way)
             .expect_err("one-way graph must not escape as a public handle");
@@ -4715,6 +5134,7 @@ mod tests {
             .expect_err("physical row count mismatch must fail");
         assert!(
             matches!(error, SearchError::InvalidConfig { ref field, .. }
+                // ubs:ignore — this public error-field schema label is not secret material.
                 if field == "native_hnsw_receipt.graph.point_count"),
             "unexpected count mismatch error: {error:?}"
         );
@@ -4734,6 +5154,7 @@ mod tests {
         let missing =
             ValidatedNativeHnsw::load(&owner, &graph_path).expect_err("missing receipt must fail");
         assert!(
+            // ubs:ignore — receipt paths are public filesystem identities, not credentials.
             matches!(missing, SearchError::IndexNotFound { ref path } if path == &receipt_path)
         );
 
