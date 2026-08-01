@@ -1539,15 +1539,21 @@ fn run_local_perf_command_inner(
         )?);
     }
 
-    let artifact_manifest = RunnerArtifactManifest::from_artifacts(
-        config.gate.label(),
-        config.profile,
+    let artifact_manifest = match RunnerArtifactManifest::from_artifacts(
+        &run_profile.applicability_plan,
         &config.run_id,
         &config.run_window,
         &run_log_bytes,
         &threshold_bytes,
         &evidence_bytes,
-    );
+    ) {
+        Ok(manifest) => manifest,
+        Err(_) => {
+            return Err(post_exit_rejection(
+                LocalPerfRejectionStage::ArtifactManifestSerialization,
+            )?);
+        }
+    };
     let artifact_manifest_bytes = match artifact_manifest.to_json_bytes() {
         Ok(bytes) => bytes,
         Err(_) => {
@@ -3613,13 +3619,8 @@ fn capture_macos(config: &LocalPerfRunConfig) -> Result<PlatformCapture, LocalPe
 }
 
 fn read_canonical_threshold(bytes: &[u8]) -> Result<PerfGateArtifact, LocalPerfRunError> {
-    let artifact = serde_json::from_slice::<PerfGateArtifact>(bytes)?;
-    if serde_json::to_vec_pretty(&artifact)? != bytes {
-        return Err(LocalPerfRunError::Invalid(
-            "threshold artifact is not exact canonical pretty JSON".to_owned(),
-        ));
-    }
-    Ok(artifact)
+    PerfGateArtifact::from_verified_measured_slice(bytes)
+        .map_err(|error| LocalPerfRunError::Invalid(error.to_string()))
 }
 
 fn read_canonical_evidence(bytes: &[u8]) -> Result<PerfEvidenceArtifact, LocalPerfRunError> {
@@ -3658,6 +3659,16 @@ fn validate_child_artifacts(
             != Some(build.receipt.cargo_lock_sha256.as_str())
         || threshold.applicability_plan.as_ref() != Some(run_profile.applicability_plan.binding())
         || evidence.applicability_plan != *run_profile.applicability_plan.binding()
+        || threshold.manifest_sha256
+            != run_profile
+                .applicability_plan
+                .binding()
+                .normalized_perf_manifest_sha256
+        || evidence.provenance.manifest_sha256
+            != run_profile
+                .applicability_plan
+                .binding()
+                .normalized_perf_manifest_sha256
         || evidence_cell_ids(evidence) != run_selection.selected_cell_ids
         || threshold.execution.as_ref() != Some(&evidence.provenance.machine.execution)
         || evidence.provenance.machine.os != platform.hardware.os

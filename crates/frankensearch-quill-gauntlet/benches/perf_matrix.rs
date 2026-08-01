@@ -4637,7 +4637,11 @@ fn bench_matrix(c: &mut Criterion, bench_elf_sha256: &str) {
         },
     };
     let configured_widths = configured_engine_widths(&selected);
-    let mut machine = MachineIdentity::capture(configured_widths.iter().copied());
+    let mut machine = MachineIdentity::capture(
+        runner.execution_capacity,
+        runner.max_exercised_cell_width,
+        configured_widths.iter().copied(),
+    );
     eprintln!(
         "[quill-perf-execution-provenance] {}",
         serde_json::to_string(&machine.execution).expect("serialize execution provenance")

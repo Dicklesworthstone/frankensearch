@@ -133,7 +133,7 @@
     "promotion_requires_zero_exit": true
   },
   "artifact_manifest_contract": {
-    "schema_version": "frankensearch.perf-runner-artifact-manifest.v2",
+    "schema_version": "frankensearch.perf-runner-artifact-manifest.v3",
     "unknown_field_policy": "reject",
     "duplicate_key_policy": "reject",
     "canonical_encoding": "Exact UTF-8 compact JSON emitted by the typed producer; the receipt hashes these bytes without reparsing or rewriting them.",
@@ -141,13 +141,17 @@
       "schema_version",
       "gate",
       "profile",
+      "capacity_semantics",
+      "execution_capacity",
+      "max_exercised_cell_width",
+      "applicability_plan",
       "run_id",
       "run_window",
       "run_log_sha256",
       "threshold_artifact_sha256",
-      "evidence_artifact_sha256"
+      "prebinding_evidence_artifact_sha256"
     ],
-    "binding_law": "The completion receipt artifact_manifest_sha256 must hash the exact manifest bytes. The manifest must name the exact canonical threshold artifact, exact pre-binding evidence artifact, exact run log, hardware/profile identity, gate, run ID, and run window supplied to finalization.",
+    "binding_law": "The completion receipt artifact_manifest_sha256 must hash the exact manifest bytes. The manifest must name the exact canonical threshold artifact, exact pre-binding evidence artifact, exact run log, hardware/profile identity, capacity semantics, execution capacity, maximum exercised cell width, complete applicability-plan binding, gate, run ID, and run window supplied to finalization. The applicability-plan binding must reconstruct exactly from the frozen matrix, normalized performance manifest, machine registry, and profile contract before the manifest is admitted.",
     "history_law": "A promoted candidate becomes a later baseline without role relabeling. Its bound evidence embeds the exact receipt and manifest and reconstructs the pre-binding evidence digest on every verified load."
   },
   "canonical_hash_contract": {
@@ -773,7 +777,7 @@
     {
       "id": "MC-MUST-021",
       "level": "MUST",
-      "text": "Every fresh candidate and rerun binds one exact v2 artifact manifest to the profile key, actual run log, canonical threshold bytes, exact pre-binding evidence bytes, gate, run ID, and run window before history opens."
+      "text": "Every fresh candidate and rerun binds one exact v3 artifact manifest to the profile key, capacity semantics, execution capacity, maximum exercised width, complete applicability-plan binding, actual run log, canonical threshold bytes, exact pre-binding evidence bytes, gate, run ID, and run window before history opens."
     },
     {
       "id": "MC-MUST-022",

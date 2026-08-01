@@ -12,9 +12,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use frankensearch_quill_gauntlet::{
     ExecutionProfileId, HardwareClassId, MachineClassAdmissionContext, MachineClassRegistry,
-    MachineProfileKey, PerfEvidenceArtifact, PerfEvidenceFile, PerfGate, PerfGateArtifact,
-    PerfGateDecision, PerfRatchetMode, PerfRatchetRequest, VerifiedRunnerIdentity,
-    evaluate_perf_ratchet, is_explicit_bootstrap_for, perf_manifest_contract_sha256,
+    MachineProfileKey, PERF_ARTIFACT_SCHEMA_VERSION, PerfEvidenceArtifact, PerfEvidenceFile,
+    PerfGate, PerfGateArtifact, PerfGateDecision, PerfRatchetMode, PerfRatchetRequest,
+    VerifiedRunnerIdentity, evaluate_perf_ratchet, is_explicit_bootstrap,
+    is_explicit_bootstrap_for, perf_manifest_contract_sha256,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -50,6 +51,13 @@ type LoadedEvidence = (PerfEvidenceArtifact, Vec<u8>);
 type AdmittedRunnerReceipt = (VerifiedRunnerIdentity, Vec<u8>, Vec<u8>, Vec<u8>);
 
 const HISTORY_POINTER_SCHEMA_VERSION: &str = "frankensearch.perf-history-pointer.v2";
+
+fn current_bootstrap_basename(gate: PerfGate) -> String {
+    let Some(version) = PERF_ARTIFACT_SCHEMA_VERSION.strip_prefix("quill-perf-artifact-") else {
+        return format!("{}.invalid-schema.unmeasured.latest.json", gate.label());
+    };
+    format!("{}.{version}.unmeasured.latest.json", gate.label())
+}
 
 #[derive(Debug)]
 struct Args {
@@ -765,8 +773,7 @@ fn validate_promotion_baseline_authority(
         return Ok(());
     }
 
-    let authoritative_bootstrap =
-        history_dir.join(format!("{}.unmeasured.latest.json", gate.label()));
+    let authoritative_bootstrap = history_dir.join(current_bootstrap_basename(gate));
     if supplied_baseline != normalize_path(&authoritative_bootstrap)?
         || !baseline_is_bootstrap
         || baseline_is_history_pointer
@@ -787,7 +794,12 @@ fn read_baseline(
     explicit_evidence_path: Option<&Path>,
 ) -> Result<LoadedBaseline, Box<dyn Error>> {
     let bytes = fs::read(path)?;
-    if serde_json::from_slice::<PerfGateArtifact>(&bytes).is_ok() {
+    let probe = serde_json::from_slice::<serde_json::Value>(&bytes)?;
+    let schema_version = probe
+        .get("schema_version")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| format!("baseline {} has no string schema_version", path.display()))?;
+    if schema_version == PERF_ARTIFACT_SCHEMA_VERSION {
         let (artifact, artifact_bytes) = read_artifact(path)?;
         let evidence = explicit_evidence_path
             .map(read_evidence_artifact)
@@ -801,13 +813,27 @@ fn read_baseline(
             pointer: None,
         });
     }
+    if schema_version.starts_with("quill-perf-artifact-v") {
+        return Err(format!(
+            "threshold artifact {} has stale schema {schema_version:?}; expected {PERF_ARTIFACT_SCHEMA_VERSION:?}",
+            path.display()
+        )
+        .into());
+    }
     if explicit_evidence_path.is_some() {
         return Err(
             "a history-pointer baseline resolves its own evidence; omit --baseline-evidence".into(),
         );
     }
 
-    let pointer = serde_json::from_slice::<HistoryPointer>(&bytes)?;
+    if schema_version != HISTORY_POINTER_SCHEMA_VERSION {
+        return Err(format!(
+            "baseline {} has unsupported schema {schema_version:?}; expected current threshold {PERF_ARTIFACT_SCHEMA_VERSION:?} or history pointer {HISTORY_POINTER_SCHEMA_VERSION:?}",
+            path.display()
+        )
+        .into());
+    }
+    let pointer = serde_json::from_value::<HistoryPointer>(probe)?;
     if pointer.schema_version != HISTORY_POINTER_SCHEMA_VERSION
         || serde_json::to_vec_pretty(&pointer)? != bytes
     {
@@ -873,9 +899,11 @@ fn read_artifact(path: &Path) -> Result<(PerfGateArtifact, Vec<u8>), Box<dyn Err
     let bytes = fs::read(path)?;
     let artifact = serde_json::from_slice::<PerfGateArtifact>(&bytes)?;
     let canonical = serde_json::to_vec_pretty(&artifact)?;
-    if bytes != canonical {
+    let mut canonical_bootstrap = canonical.clone();
+    canonical_bootstrap.push(b'\n');
+    if bytes != canonical && !(is_explicit_bootstrap(&artifact) && bytes == canonical_bootstrap) {
         return Err(format!(
-            "threshold artifact {} is not exact canonical pretty JSON",
+            "threshold artifact {} is not exact canonical pretty JSON (current bootstrap sentinels use exactly one terminal newline)",
             path.display()
         )
         .into());
@@ -1352,6 +1380,35 @@ mod tests {
     }
 
     #[test]
+    fn direct_historical_thresholds_fail_with_precise_stale_schema_error() {
+        let directory = tempfile::tempdir().expect("baseline directory");
+        for schema in [
+            "quill-perf-artifact-v4",
+            "quill-perf-artifact-v5",
+            "quill-perf-artifact-v6",
+        ] {
+            let path = directory.path().join(format!("{schema}.json"));
+            fs::write(
+                &path,
+                serde_json::to_vec_pretty(&serde_json::json!({
+                    "schema_version": schema,
+                }))
+                .expect("historical threshold probe"),
+            )
+            .expect("write historical threshold probe");
+            let error = read_baseline(&path, None)
+                .expect_err("historical direct threshold must fail closed")
+                .to_string();
+            assert!(
+                error.contains("stale schema")
+                    && error.contains(schema)
+                    && error.contains(PERF_ARTIFACT_SCHEMA_VERSION),
+                "unexpected stale-schema diagnostic: {error}"
+            );
+        }
+    }
+
+    #[test]
     fn runner_receipt_options_are_all_or_nothing() {
         let result = parse_args(
             [
@@ -1381,7 +1438,7 @@ mod tests {
                 "--manifest",
                 "manifest.toml",
                 "--baseline",
-                "QG-2.unmeasured.latest.json",
+                "QG-2.v7.unmeasured.latest.json",
                 "--candidate",
                 "candidate.json",
                 "--candidate-evidence",
@@ -1456,12 +1513,22 @@ mod tests {
         let bootstrap_directory = tempfile::tempdir().expect("bootstrap history directory");
         let canonical_bootstrap = bootstrap_directory
             .path()
-            .join("QG-2.unmeasured.latest.json");
+            .join(current_bootstrap_basename(PerfGate::Qg2));
         let bootstrap_bytes =
-            include_bytes!("../../../../.bench-history/QG-2.unmeasured.latest.json");
+            include_bytes!("../../../../.bench-history/QG-2.v7.unmeasured.latest.json");
         fs::write(&canonical_bootstrap, bootstrap_bytes).expect("canonical bootstrap");
         let mut bootstrap_args = test_args(bootstrap_directory.path());
         bootstrap_args.baseline = canonical_bootstrap.clone();
+        let loaded = read_baseline(&canonical_bootstrap, None)
+            .expect("actual CLI baseline loader admits the current versioned bootstrap");
+        assert!(is_explicit_bootstrap_for(
+            &loaded.artifact,
+            PerfGate::Qg2,
+            &perf_manifest_contract_sha256(include_str!(
+                "../../../../docs/contracts/quill-perf-gates.toml"
+            ))
+        ));
+        assert_eq!(loaded.artifact_bytes, bootstrap_bytes);
         assert!(
             validate_promotion_baseline_authority(&bootstrap_args, PerfGate::Qg2, true, false)
                 .is_ok()
@@ -1491,7 +1558,7 @@ mod tests {
         fs::write(&stale_pointer_copy, b"old-authoritative-pointer").expect("stale pointer copy");
         let measured_bootstrap = measured_directory
             .path()
-            .join("QG-2.unmeasured.latest.json");
+            .join(current_bootstrap_basename(PerfGate::Qg2));
         fs::write(&measured_bootstrap, bootstrap_bytes).expect("retained bootstrap");
         let mut measured_args = test_args(measured_directory.path());
 
@@ -1542,7 +1609,7 @@ mod tests {
     }
 
     #[test]
-    fn cli_recognizes_committed_bootstrap_without_baseline_identity() {
+    fn cli_rejects_preserved_v6_bootstrap_as_stale_after_v7_schema_bump() {
         let baseline = serde_json::from_str::<PerfGateArtifact>(include_str!(
             "../../../../.bench-history/QG-2.unmeasured.latest.json"
         ))
@@ -1550,7 +1617,7 @@ mod tests {
         let manifest = include_str!("../../../../docs/contracts/quill-perf-gates.toml");
         let manifest_sha256 = perf_manifest_contract_sha256(manifest);
 
-        assert!(is_explicit_bootstrap_for(
+        assert!(!is_explicit_bootstrap_for(
             &baseline,
             PerfGate::Qg2,
             &manifest_sha256
