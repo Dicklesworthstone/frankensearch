@@ -250,6 +250,7 @@ const RANKED_QUERY_CACHE_SLOTS: usize = RANKED_QUERY_CACHE_SETS * RANKED_QUERY_C
 
 enum RankedQueryCacheKey {
     Raw(Arc<str>),
+    #[cfg(any(test, feature = "bench-internals"))]
     Preparsed(Arc<Query>),
 }
 
@@ -300,6 +301,7 @@ impl RankedQueryCache {
         })
     }
 
+    #[cfg(any(test, feature = "bench-internals"))]
     fn get_preparsed(
         &self,
         snapshot_epoch: u64,
@@ -361,6 +363,7 @@ impl RankedQueryCache {
         }));
     }
 
+    #[cfg(any(test, feature = "bench-internals"))]
     fn insert_preparsed(
         &self,
         snapshot_epoch: u64,
@@ -422,6 +425,7 @@ fn raw_query_cache_fingerprint(
     hasher.digest()
 }
 
+#[cfg(any(test, feature = "bench-internals"))]
 fn preparsed_query_cache_fingerprint(
     snapshot_epoch: u64,
     query: &Query,
@@ -455,10 +459,12 @@ fn hash_query_cache_bytes(hasher: &mut Xxh3, bytes: &[u8]) {
     hasher.update(bytes);
 }
 
+#[cfg(any(test, feature = "bench-internals"))]
 fn hash_query_cache_len(hasher: &mut Xxh3, len: usize) {
     hasher.update(&u64::try_from(len).unwrap_or(u64::MAX).to_le_bytes());
 }
 
+#[cfg(any(test, feature = "bench-internals"))]
 fn hash_query_cache_value(hasher: &mut Xxh3, value: &QueryValue) {
     match value {
         QueryValue::I64(value) => {
@@ -476,6 +482,7 @@ fn hash_query_cache_value(hasher: &mut Xxh3, value: &QueryValue) {
     }
 }
 
+#[cfg(any(test, feature = "bench-internals"))]
 fn hash_query_cache_bound(hasher: &mut Xxh3, bound: &Bound<QueryValue>) {
     match bound {
         Bound::Included(value) => {
@@ -490,6 +497,7 @@ fn hash_query_cache_bound(hasher: &mut Xxh3, bound: &Bound<QueryValue>) {
     }
 }
 
+#[cfg(any(test, feature = "bench-internals"))]
 fn hash_exact_query(hasher: &mut Xxh3, query: &Query) {
     match query {
         Query::Empty => hasher.update(&[0]),
@@ -4363,16 +4371,20 @@ impl QuillWriterState {
 }
 
 impl QuillReader {
+    #[cfg(not(feature = "conformance-internals"))]
+    #[inline]
+    #[allow(
+        clippy::unused_self,
+        reason = "keeps cache call sites cfg-symmetric with the controller-backed variant"
+    )]
+    fn ranked_query_cache_enabled(&self) -> bool {
+        true
+    }
+
+    #[cfg(feature = "conformance-internals")]
     #[inline]
     fn ranked_query_cache_enabled(&self) -> bool {
-        #[cfg(feature = "conformance-internals")]
-        {
-            !self.conformance_controller.is_armed()
-        }
-        #[cfg(not(feature = "conformance-internals"))]
-        {
-            true
-        }
+        !self.conformance_controller.is_armed()
     }
 
     #[cfg(not(feature = "conformance-internals"))]
