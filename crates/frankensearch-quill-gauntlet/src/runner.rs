@@ -7437,6 +7437,8 @@ mod tests {
     const UNION_HORIZON_MATRIX_TIE_EXPANSION: u64 = 4;
     #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
     const UNION_HORIZON_RANKED_DOCUMENT_TOKENS: usize = 128;
+    #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
+    const UNION_HORIZON_TOMBSTONE_ORDINALS: [usize; 6] = [0, 4_095, 4_096, 8_191, 8_192, 8_999];
 
     #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
     const UNION_HORIZON_ARTIFACT_SCHEMA_VERSION: &str =
@@ -8714,6 +8716,211 @@ mod tests {
             .expect("UNION_HORIZON document identity shape")
             .parse()
             .expect("UNION_HORIZON document ordinal")
+    }
+
+    #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
+    fn union_horizon_tombstone_document_ids(fixture: &Fixture) -> Vec<String> {
+        UNION_HORIZON_TOMBSTONE_ORDINALS
+            .iter()
+            .map(|&ordinal| fixture.documents[ordinal].id.clone())
+            .collect()
+    }
+
+    #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
+    async fn build_tombstoned_union_horizon_single_segment_pair(
+        cx: &Cx,
+        fixture: &Fixture,
+    ) -> (crate::engine::QuillSubject, crate::engine::TantivyOracle) {
+        let build_identity = union_horizon_build_identity();
+        let oracle_dependency = union_horizon_oracle_dependency_identity();
+        let mut subject = crate::engine::QuillSubject::in_memory(
+            union_horizon_quill_config(),
+            build_identity.source_git_revision,
+            build_identity.source_git_dirty,
+        )
+        .expect("fresh tombstoned UNION_HORIZON Quill subject");
+        let mut oracle = crate::engine::TantivyOracle::in_memory_scalar_g1a(
+            &oracle_dependency.pinned_lexical_contract_revision,
+            false,
+        )
+        .expect("fresh tombstoned UNION_HORIZON Tantivy oracle");
+        oracle
+            .index()
+            .oracle_disable_auto_merge(cx)
+            .await
+            .expect("disable tombstoned UNION_HORIZON Tantivy auto-merge");
+        subject
+            .claim_fresh_campaign()
+            .expect("claim tombstoned UNION_HORIZON Quill subject");
+        oracle
+            .claim_fresh_campaign()
+            .expect("claim tombstoned UNION_HORIZON Tantivy oracle");
+
+        let documents = fixture
+            .documents
+            .iter()
+            .cloned()
+            .map(frankensearch_core::IndexableDocument::from)
+            .collect::<Vec<_>>();
+        subject
+            .index_mut()
+            .expect("tombstoned UNION_HORIZON Quill index")
+            .index_documents(cx, &documents)
+            .await
+            .expect("index tombstoned UNION_HORIZON Quill segment");
+        subject
+            .index_mut()
+            .expect("tombstoned UNION_HORIZON Quill index")
+            .commit(cx)
+            .await
+            .expect("commit tombstoned UNION_HORIZON Quill segment");
+        oracle
+            .index()
+            .index_documents(cx, &documents)
+            .await
+            .expect("index tombstoned UNION_HORIZON Tantivy segment");
+        oracle
+            .index()
+            .commit(cx)
+            .await
+            .expect("commit tombstoned UNION_HORIZON Tantivy segment");
+
+        let tombstone_document_ids = union_horizon_tombstone_document_ids(fixture);
+        let tombstone_document_id_refs = tombstone_document_ids
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            subject
+                .index()
+                .expect("tombstoned UNION_HORIZON Quill index")
+                .delete_documents(cx, &tombstone_document_id_refs)
+                .await
+                .expect("publish tombstoned UNION_HORIZON Quill successor"),
+            UNION_HORIZON_TOMBSTONE_ORDINALS.len(),
+        );
+        for document_id in &tombstone_document_ids {
+            oracle
+                .index()
+                .delete_document(cx, document_id)
+                .await
+                .expect("stage tombstoned UNION_HORIZON Tantivy delete");
+        }
+        oracle
+            .index()
+            .commit(cx)
+            .await
+            .expect("commit tombstoned UNION_HORIZON Tantivy deletes");
+        subject
+            .mark_committed()
+            .expect("commit tombstoned UNION_HORIZON Quill campaign");
+        oracle
+            .mark_committed()
+            .expect("commit tombstoned UNION_HORIZON Tantivy campaign");
+
+        let expected_live_documents = UNION_HORIZON_DOCUMENT_COUNT
+            .checked_sub(UNION_HORIZON_TOMBSTONE_ORDINALS.len())
+            .expect("UNION_HORIZON tombstones fit the fixture");
+        let snapshot = subject
+            .index()
+            .expect("tombstoned UNION_HORIZON Quill index")
+            .snapshot();
+        assert_eq!(snapshot.segments().len(), 1);
+        assert_eq!(snapshot.segments()[0].at_seal_doc_count(), 9_001);
+        assert_eq!(snapshot.segments()[0].tombstone_count(), 6);
+        assert_eq!(snapshot.segments()[0].doc_count(), 8_995);
+        assert_eq!(snapshot.at_seal_doc_count(), 9_001);
+        assert_eq!(snapshot.tombstone_count(), 6);
+        assert_eq!(snapshot.doc_count(), 8_995);
+        assert_eq!(
+            subject
+                .index()
+                .expect("tombstoned UNION_HORIZON Quill index")
+                .doc_count(),
+            8_995,
+        );
+        assert!(
+            !subject
+                .index()
+                .expect("tombstoned UNION_HORIZON Quill index")
+                .has_uncommitted_changes(),
+        );
+
+        let oracle_segments = oracle
+            .index()
+            .oracle_segment_layout()
+            .expect("tombstoned UNION_HORIZON Tantivy segment layout");
+        assert_eq!(oracle_segments.len(), 1);
+        assert_eq!(oracle_segments[0].max_doc, 9_001);
+        assert_eq!(oracle_segments[0].num_docs, 8_995);
+        assert_eq!(oracle.index().doc_count(), expected_live_documents);
+        (subject, oracle)
+    }
+
+    #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
+    fn tombstoned_union_horizon_case(
+        fixture: &Fixture,
+        fixture_id: &str,
+        limit: u64,
+        offset: u64,
+    ) -> DifferentialCase {
+        DifferentialCase {
+            fixture_id: fixture_id.to_owned(),
+            query: UNION_HORIZON_QUERY.to_owned(),
+            limit,
+            offset,
+            tie_expansion_limit: 1,
+            count_requested: false,
+            snippet_max_chars: None,
+            metadata: DifferentialCaseMetadata {
+                generator_id: Some(GENERATOR_ID.to_owned()),
+                generator_seed: Some(fixture.query_suite.manifest.spec.seed),
+                corpus_hash: Some(fixture.corpus_hash.clone()),
+            },
+        }
+    }
+
+    #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
+    fn union_horizon_fuel_diagnostics(
+        error: &frankensearch_quill::QuillIndexError,
+    ) -> (u64, u64, u64, u64, u64, u64) {
+        let frankensearch_quill::QuillIndexError::QueryFuelExhausted {
+            budget,
+            consumed,
+            segments_touched,
+            dictionary_blocks,
+            posting_blocks,
+            position_docs,
+        } = error
+        else {
+            panic!("expected typed UNION_HORIZON fuel exhaustion, got {error:?}");
+        };
+        (
+            *budget,
+            *consumed,
+            *segments_touched,
+            *dictionary_blocks,
+            *posting_blocks,
+            *position_docs,
+        )
+    }
+
+    #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
+    fn run_tombstoned_union_horizon_with_fuel(
+        cx: &Cx,
+        snapshot: &frankensearch_quill::KeeperSnapshot,
+        budget: u64,
+    ) -> Result<
+        (
+            frankensearch_quill::QuillSearchResult,
+            frankensearch_quill::ConformancePruningTraceReceipt,
+        ),
+        frankensearch_quill::QuillIndexError,
+    > {
+        let mut config = union_horizon_quill_config();
+        config.query_fuel_budget = budget;
+        frankensearch_quill::QuillIndex::from_in_memory_snapshot(snapshot.clone(), config)?
+            .search_paginated_with_conformance_pruning_trace(cx, UNION_HORIZON_QUERY, 1, 0, false)
     }
 
     #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
@@ -11785,6 +11992,405 @@ mod tests {
             directory.read_regular_bounded(symlink_name, 16).is_err(),
             "artifact reread must require a regular no-follow file",
         );
+    }
+
+    #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
+    #[test]
+    fn salej_union_horizon_offset_page_matches_control_with_real_tombstones() {
+        let fixture = make_union_horizon_fixture();
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let (subject, oracle) =
+                build_tombstoned_union_horizon_single_segment_pair(&cx, &fixture).await;
+            let harness = crate::engine::DifferentialHarness::new(
+                ComparisonMode::CrossEngine,
+                ComparatorConfig::default(),
+            );
+            let control_case =
+                tombstoned_union_horizon_case(&fixture, "union-horizon-tombstones-k27", 27, 0);
+            let page_case = tombstoned_union_horizon_case(
+                &fixture,
+                "union-horizon-tombstones-offset7-k20",
+                20,
+                7,
+            );
+            let mut control = harness
+                .run(&cx, &subject, &oracle, &control_case)
+                .await
+                .expect("run tombstoned UNION_HORIZON control");
+            let mut page = harness
+                .run(&cx, &subject, &oracle, &page_case)
+                .await
+                .expect("run tombstoned UNION_HORIZON offset page");
+            control
+                .engines
+                .bind_semantic_contract(SemanticContract::scalar_g1a())
+                .expect("bind tombstoned UNION_HORIZON control contract");
+            page.engines
+                .bind_semantic_contract(SemanticContract::scalar_g1a())
+                .expect("bind tombstoned UNION_HORIZON page contract");
+
+            for run in [&control, &page] {
+                assert_eq!(run.comparison.status, ComparisonStatus::Exact);
+                assert_eq!(run.comparison.rank_class, RankClass::RankExact);
+                assert!(run.comparison.divergences.is_empty());
+                assert_eq!(run.comparison.subject.match_count, CountState::NotRequested);
+                assert_eq!(run.comparison.oracle.match_count, CountState::NotRequested);
+                assert_eq!(run.comparison.subject.doc_count, 8_995);
+                assert_eq!(run.comparison.oracle.doc_count, 8_995);
+                assert!(run.comparison.subject.snippets.is_empty());
+                assert!(run.comparison.oracle.snippets.is_empty());
+            }
+
+            let control_subject_rows = control
+                .comparison
+                .subject
+                .hits
+                .iter()
+                .map(|hit| (hit.doc_id.clone(), hit.score_bits))
+                .collect::<Vec<_>>();
+            let control_oracle_rows = control
+                .comparison
+                .oracle
+                .hits
+                .iter()
+                .map(|hit| (hit.doc_id.clone(), hit.score_bits))
+                .collect::<Vec<_>>();
+            let page_subject_rows = page
+                .comparison
+                .subject
+                .hits
+                .iter()
+                .map(|hit| (hit.doc_id.clone(), hit.score_bits))
+                .collect::<Vec<_>>();
+            let page_oracle_rows = page
+                .comparison
+                .oracle
+                .hits
+                .iter()
+                .map(|hit| (hit.doc_id.clone(), hit.score_bits))
+                .collect::<Vec<_>>();
+            assert_eq!(control_subject_rows, control_oracle_rows);
+            assert_eq!(page_subject_rows, page_oracle_rows);
+            assert_eq!(control_subject_rows.len(), 27);
+            assert_eq!(page_subject_rows.len(), 20);
+            assert_eq!(page_subject_rows, control_subject_rows[7..27]);
+            assert_eq!(control_subject_rows[0].0, "repo:docs/09000.txt");
+            assert_eq!(
+                page_subject_rows
+                    .iter()
+                    .map(|(document_id, _)| document_id.clone())
+                    .collect::<Vec<_>>(),
+                (73..=92)
+                    .rev()
+                    .map(|ordinal| format!("repo:docs/{ordinal:05}.txt"))
+                    .collect::<Vec<_>>(),
+            );
+
+            let tombstone_document_ids = union_horizon_tombstone_document_ids(&fixture);
+            for rows in [
+                &control_subject_rows,
+                &control_oracle_rows,
+                &page_subject_rows,
+                &page_oracle_rows,
+            ] {
+                assert!(
+                    rows.iter()
+                        .all(|(document_id, _)| { !tombstone_document_ids.contains(document_id) })
+                );
+            }
+
+            let index = subject
+                .index()
+                .expect("tombstoned UNION_HORIZON Quill index");
+            let direct = index
+                .search_paginated(&cx, UNION_HORIZON_QUERY, 20, 7, false)
+                .expect("direct tombstoned UNION_HORIZON offset page");
+            let (traced, trace) = index
+                .search_paginated_with_conformance_pruning_trace(
+                    &cx,
+                    UNION_HORIZON_QUERY,
+                    20,
+                    7,
+                    false,
+                )
+                .expect("traced tombstoned UNION_HORIZON offset page");
+            assert_eq!(direct, traced);
+            assert_eq!(traced.doc_count, 8_995);
+            assert_eq!(traced.total_count, None);
+            assert!(traced.diagnostics.is_empty());
+            assert_eq!(
+                traced
+                    .hits
+                    .iter()
+                    .map(|hit| (hit.document_id.clone(), hit.score.to_bits()))
+                    .collect::<Vec<_>>(),
+                page_subject_rows,
+            );
+            assert_eq!(
+                trace.execution_mode(),
+                frankensearch_quill::ConformancePruningExecutionMode::Serial,
+            );
+            let late_trace = union_horizon_late_trace_receipt(20, 0, 8_995, trace.segments());
+            assert_eq!(late_trace.refills[0].window_start(), 0);
+            assert_eq!(late_trace.refills[1].window_start(), 4_096);
+            assert_eq!(late_trace.refills[2].window_start(), 8_192);
+        });
+    }
+
+    #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
+    #[test]
+    fn salej_union_horizon_cancellation_at_final_collection_checkpoint_is_atomic() {
+        let fixture = make_union_horizon_fixture();
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let (subject, _oracle) =
+                build_tombstoned_union_horizon_single_segment_pair(&cx, &fixture).await;
+            let index = subject
+                .index()
+                .expect("cancellation UNION_HORIZON Quill index");
+            let controller = index.conformance_cancellation_controller();
+            let snapshot_before = index.snapshot();
+            let writer_before = index
+                .conformance_pending_writer_state()
+                .expect("capture cancellation UNION_HORIZON writer state");
+            assert!(!index.has_uncommitted_changes());
+
+            controller
+                .arm(
+                    frankensearch_quill::index::ConformanceCancellationStage::QueryCollection,
+                    u64::MAX,
+                )
+                .expect("arm UNION_HORIZON checkpoint calibration");
+            let (control_result, control_trace) = index
+                .search_paginated_with_conformance_pruning_trace(
+                    &cx,
+                    UNION_HORIZON_QUERY,
+                    1,
+                    0,
+                    false,
+                )
+                .expect("calibrate UNION_HORIZON collection checkpoints");
+            let control_checkpoints = controller.observed_checkpoints();
+            assert!(control_checkpoints > 3);
+            assert!(!controller.fired());
+            assert_eq!(controller.recorded_pruning_receipts_at_fire(), 0);
+            assert_eq!(controller.discarded_pruning_trace_sessions(), 0);
+            assert_eq!(control_result.hits.len(), 1);
+            assert_eq!(control_result.hits[0].document_id, "repo:docs/09000.txt");
+            let control_late_trace =
+                union_horizon_late_trace_receipt(1, 0, 8_995, control_trace.segments());
+            assert_eq!(control_late_trace.refills.len(), 3);
+            assert_eq!(
+                control_late_trace.refills[2].candidate_docs(),
+                1,
+                "the final collection checkpoint belongs to the only admitted candidate in the late refill",
+            );
+            controller.disarm();
+
+            for attempt in 1..=2 {
+                controller
+                    .arm(
+                        frankensearch_quill::index::ConformanceCancellationStage::QueryCollection,
+                        control_checkpoints,
+                    )
+                    .expect("arm final UNION_HORIZON collection checkpoint");
+                let error = index
+                    .search_paginated_with_conformance_pruning_trace(
+                        &cx,
+                        UNION_HORIZON_QUERY,
+                        1,
+                        0,
+                        false,
+                    )
+                    .expect_err("final UNION_HORIZON collection checkpoint must cancel");
+                assert!(matches!(
+                    error,
+                    frankensearch_quill::QuillIndexError::Cancelled { phase: "search" }
+                ));
+                assert!(controller.fired());
+                assert_eq!(controller.observed_checkpoints(), control_checkpoints);
+                assert_eq!(controller.recorded_pruning_receipts_at_fire(), 0);
+                assert_eq!(controller.discarded_pruning_trace_sessions(), 0);
+                assert!(cx.is_cancel_requested());
+                assert!(Arc::ptr_eq(&snapshot_before, &index.snapshot()));
+                assert_eq!(
+                    index
+                        .conformance_pending_writer_state()
+                        .expect("capture cancelled UNION_HORIZON writer state"),
+                    writer_before,
+                );
+                assert!(!index.has_uncommitted_changes());
+                controller.disarm();
+                cx.set_cancel_requested(false);
+                assert!(
+                    !cx.is_cancel_requested(),
+                    "UNION_HORIZON cancellation attempt {attempt} must clear the real Cx before replay",
+                );
+            }
+
+            let (retry_result, retry_trace) = index
+                .search_paginated_with_conformance_pruning_trace(
+                    &cx,
+                    UNION_HORIZON_QUERY,
+                    1,
+                    0,
+                    false,
+                )
+                .expect("clean UNION_HORIZON replay after cancellation");
+            assert_eq!(retry_result, control_result);
+            assert_eq!(retry_trace, control_trace);
+            assert!(Arc::ptr_eq(&snapshot_before, &index.snapshot()));
+            assert_eq!(
+                index
+                    .conformance_pending_writer_state()
+                    .expect("capture replayed UNION_HORIZON writer state"),
+                writer_before,
+            );
+            assert!(!index.has_uncommitted_changes());
+        });
+    }
+
+    #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
+    #[test]
+    fn salej_union_horizon_minimum_fuel_boundary_is_atomic_and_deterministic() {
+        let fixture = make_union_horizon_fixture();
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let (subject, _oracle) =
+                build_tombstoned_union_horizon_single_segment_pair(&cx, &fixture).await;
+            let index = subject.index().expect("fuel UNION_HORIZON Quill index");
+            let source_snapshot = index.snapshot();
+            let (control_result, control_trace) = index
+                .search_paginated_with_conformance_pruning_trace(
+                    &cx,
+                    UNION_HORIZON_QUERY,
+                    1,
+                    0,
+                    false,
+                )
+                .expect("unbounded UNION_HORIZON fuel control");
+            assert_eq!(control_result.hits.len(), 1);
+            assert_eq!(control_result.hits[0].document_id, "repo:docs/09000.txt");
+            union_horizon_late_trace_receipt(1, 0, 8_995, control_trace.segments());
+
+            let mut successful_budget = 1_u64;
+            loop {
+                match run_tombstoned_union_horizon_with_fuel(
+                    &cx,
+                    source_snapshot.as_ref(),
+                    successful_budget,
+                ) {
+                    Ok(_) => break,
+                    Err(
+                        error @ frankensearch_quill::QuillIndexError::QueryFuelExhausted { .. },
+                    ) => {
+                        let diagnostics = union_horizon_fuel_diagnostics(&error);
+                        assert_eq!(diagnostics.0, successful_budget);
+                        assert_eq!(diagnostics.1, successful_budget);
+                        successful_budget = successful_budget
+                            .checked_mul(2)
+                            .expect("UNION_HORIZON fuel calibration budget overflow");
+                    }
+                    Err(error) => panic!(
+                        "unexpected UNION_HORIZON fuel calibration failure at budget {successful_budget}: {error:?}"
+                    ),
+                }
+            }
+            let mut lower = 1_u64;
+            while lower < successful_budget {
+                let midpoint = lower + (successful_budget - lower) / 2;
+                match run_tombstoned_union_horizon_with_fuel(
+                    &cx,
+                    source_snapshot.as_ref(),
+                    midpoint,
+                ) {
+                    Ok(_) => successful_budget = midpoint,
+                    Err(
+                        error @ frankensearch_quill::QuillIndexError::QueryFuelExhausted { .. },
+                    ) => {
+                        let diagnostics = union_horizon_fuel_diagnostics(&error);
+                        assert_eq!(diagnostics.0, midpoint);
+                        assert_eq!(diagnostics.1, midpoint);
+                        lower = midpoint + 1;
+                    }
+                    Err(error) => panic!(
+                        "unexpected UNION_HORIZON fuel bisection failure at budget {midpoint}: {error:?}"
+                    ),
+                }
+            }
+            let minimum_successful_budget = successful_budget;
+            assert_eq!(minimum_successful_budget, lower);
+            assert!(minimum_successful_budget > 1);
+            let failing_budget = minimum_successful_budget - 1;
+
+            let mut failing_config = union_horizon_quill_config();
+            failing_config.query_fuel_budget = failing_budget;
+            let failing_index = frankensearch_quill::QuillIndex::from_in_memory_snapshot(
+                source_snapshot.as_ref().clone(),
+                failing_config,
+            )
+            .expect("bind UNION_HORIZON failing fuel snapshot");
+            let failing_snapshot_before = failing_index.snapshot();
+            let failing_writer_before = failing_index
+                .conformance_pending_writer_state()
+                .expect("capture UNION_HORIZON failing fuel writer state");
+            assert!(!failing_index.has_uncommitted_changes());
+
+            let first_error = failing_index
+                .search_paginated_with_conformance_pruning_trace(
+                    &cx,
+                    UNION_HORIZON_QUERY,
+                    1,
+                    0,
+                    false,
+                )
+                .expect_err("N-1 UNION_HORIZON fuel must fail without a receipt");
+            let first_diagnostics = union_horizon_fuel_diagnostics(&first_error);
+            assert_eq!(first_diagnostics.0, failing_budget);
+            assert_eq!(first_diagnostics.1, failing_budget);
+            assert!(Arc::ptr_eq(
+                &failing_snapshot_before,
+                &failing_index.snapshot(),
+            ));
+            assert_eq!(
+                failing_index
+                    .conformance_pending_writer_state()
+                    .expect("capture first exhausted UNION_HORIZON writer state"),
+                failing_writer_before,
+            );
+            assert!(!failing_index.has_uncommitted_changes());
+
+            let second_error = failing_index
+                .search_paginated_with_conformance_pruning_trace(
+                    &cx,
+                    UNION_HORIZON_QUERY,
+                    1,
+                    0,
+                    false,
+                )
+                .expect_err("repeated N-1 UNION_HORIZON fuel must fail without a receipt");
+            let second_diagnostics = union_horizon_fuel_diagnostics(&second_error);
+            assert_eq!(second_diagnostics, first_diagnostics);
+            assert!(Arc::ptr_eq(
+                &failing_snapshot_before,
+                &failing_index.snapshot(),
+            ));
+            assert_eq!(
+                failing_index
+                    .conformance_pending_writer_state()
+                    .expect("capture repeated exhausted UNION_HORIZON writer state"),
+                failing_writer_before,
+            );
+            assert!(!failing_index.has_uncommitted_changes());
+
+            let (minimum_result, minimum_trace) = run_tombstoned_union_horizon_with_fuel(
+                &cx,
+                source_snapshot.as_ref(),
+                minimum_successful_budget,
+            )
+            .expect("minimum successful UNION_HORIZON fuel replay");
+            assert_eq!(minimum_result, control_result);
+            assert_eq!(minimum_trace, control_trace);
+            union_horizon_late_trace_receipt(1, 0, 8_995, minimum_trace.segments());
+        });
     }
 
     #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
