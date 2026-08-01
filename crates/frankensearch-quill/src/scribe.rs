@@ -975,7 +975,7 @@ impl ByteArena {
     pub fn with_chunk_size(chunk_size: usize) -> Self {
         let chunk_size = chunk_size.max(4096);
         Self {
-            chunks: vec![Vec::with_capacity(chunk_size)],
+            chunks: Vec::new(),
             chunk_size,
             active: 0,
         }
@@ -1001,6 +1001,10 @@ impl ByteArena {
                 offset: 0,
                 len: u32::try_from(bytes.len()).expect("arena span exceeds u32"),
             };
+        }
+        if self.chunks.is_empty() {
+            self.chunks.push(Vec::with_capacity(self.chunk_size));
+            self.active = 0;
         }
         let needs_new = {
             let chunk = &self.chunks[self.active];
@@ -1065,9 +1069,6 @@ impl ByteArena {
     /// retaining them would ratchet RSS on pathological inputs).
     pub fn reset(&mut self) {
         self.chunks.retain(|c| c.capacity() == self.chunk_size);
-        if self.chunks.is_empty() {
-            self.chunks.push(Vec::with_capacity(self.chunk_size));
-        }
         for chunk in &mut self.chunks {
             chunk.clear();
         }
@@ -6965,6 +6966,23 @@ mod tests {
             prev <= term_bytes_total.max(DEFAULT_ARENA_CHUNK_BYTES) * 10,
             "accounting should not wildly overestimate: {prev} vs {term_bytes_total}"
         );
+    }
+
+    #[test]
+    fn empty_arena_reserves_nothing_until_first_write() {
+        let mut arena = ByteArena::with_chunk_size(DEFAULT_ARENA_CHUNK_BYTES);
+        assert_eq!(arena.bytes_used(), 0);
+        assert_eq!(arena.bytes_reserved(), 0);
+        assert_eq!(arena.chunk_count(), 0);
+
+        arena.reset();
+        assert_eq!(arena.bytes_reserved(), 0);
+        assert_eq!(arena.chunk_count(), 0);
+
+        let span = arena.push(b"first-term");
+        assert_eq!(arena.resolve(span), b"first-term");
+        assert_eq!(arena.bytes_reserved(), DEFAULT_ARENA_CHUNK_BYTES);
+        assert_eq!(arena.chunk_count(), 1);
     }
 
     #[test]
