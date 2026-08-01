@@ -17883,6 +17883,15 @@ mod tests {
         }
 
         type ProvenanceMutation = fn(&mut CampaignProvenance);
+        // Stored v7 replay proves relational integrity, not external
+        // authentication. Facts duplicated elsewhere in the report retain
+        // well-formed-but-inconsistent mutations below. The toolchain channel
+        // and Unicode-version facts have no independent stored witness, so
+        // their mutations must exercise the frozen stored-shape contract.
+        // `provenance_matches_every_engine_toolchain_and_query_pin` separately
+        // proves that well-formed alternatives fail creation against the exact
+        // live producer; the authenticated F0 chain, not this integrity-only
+        // loader, rejects a coherent rewrite of every stored byte.
         let provenance_mutations: &[(&str, ProvenanceMutation)] = &[
             ("producer_build_identity_sha256", |value| {
                 value.producer_build_identity_sha256 = "0".repeat(64);
@@ -17894,16 +17903,16 @@ mod tests {
                 value.rustc_version_verbose.push_str("mismatch");
             }),
             ("rust_toolchain_channel", |value| {
-                value.rust_toolchain_channel = "nightly-1970-01-01".to_owned();
+                value.rust_toolchain_channel.clear();
             }),
             ("unicode_version", |value| {
-                value.unicode_version = "0.0.0".to_owned();
+                value.unicode_version = "0.0".to_owned();
             }),
             ("unicode_normalization_version", |value| {
-                value.unicode_normalization_version = "0.0.0".to_owned();
+                value.unicode_normalization_version.clear();
             }),
             ("unicode_normalization_table_version", |value| {
-                value.unicode_normalization_table_version = "0.0.0".to_owned();
+                value.unicode_normalization_table_version.clear();
             }),
             ("query_generator_id", |value| {
                 value.query_generator_id = "wrong-generator".to_owned();
