@@ -9932,22 +9932,16 @@ fn open_owned_cursor(
             count: posting_count,
         }
     })?;
-    let mut posting_cursor = postings.cursor()?;
-    let mut admitted_block = None;
-    while let Some(posting) = posting_cursor.current() {
-        let block = posting_cursor
-            .block_index()
-            .ok_or_else(|| invalid_state("positioned posting cursor has no block index"))?;
-        if admitted_block != Some(block) {
-            if let Some(checkpoint) = checkpoint {
+    let positions = if positioned {
+        // Preserve the historical fuel/cancellation boundary: every validated
+        // POSTINGS block is admitted before POSITIONS parsing begins. The
+        // subsequent paired cursor traverses those same blocks without
+        // charging them a second time.
+        if let Some(checkpoint) = checkpoint {
+            for _ in postings.blocks() {
                 checkpoint.admit(QueryWorkKind::PostingBlock, 1)?;
             }
-            admitted_block = Some(block);
         }
-        rows.push(posting);
-        posting_cursor.next()?;
-    }
-    let positions = if positioned {
         let position_span =
             found
                 .metadata
@@ -9960,16 +9954,62 @@ fn open_owned_cursor(
         let positions = PositionList::parse(position_bytes, &postings)?;
         let mut decoded = Vec::new();
         decoded
-            .try_reserve_exact(rows.len())
+            .try_reserve_exact(posting_count)
             .map_err(|_| invalid_state("could not allocate owned position rows"))?;
-        for ordinal in 0..found.metadata.doc_freq {
-            let row = positions
-                .positions_for_ordinal(ordinal)?
-                .collect::<Result<Vec<_>, _>>()?;
+
+        // Phrase lowering needs owned position rows, but ordinal-at-a-time
+        // lookup restarts at the beginning of each POSITIONS block. Traverse
+        // the paired posting/position streams once so every run is decoded
+        // exactly once before the cursor advances to the next posting.
+        let mut position_cursor = positions.cursor()?;
+        while let Some(posting) = position_cursor.current() {
+            let mut row = Vec::new();
+            if !position_cursor.decode_current_positions_into(&mut row)? {
+                return Err(invalid_state(
+                    "position cursor exhausted before its current posting",
+                ));
+            }
+            let frequency = usize::try_from(posting.freq)
+                .map_err(|_| invalid_state("posting frequency does not fit usize"))?;
+            if row.len() != frequency {
+                return Err(invalid_state(format!(
+                    "position run length {} does not match posting frequency {frequency}",
+                    row.len(),
+                )));
+            }
+            rows.push(posting);
             decoded.push(row);
+            position_cursor.next()?;
+        }
+        if rows.len() != posting_count {
+            return Err(invalid_state(format!(
+                "position cursor materialized {} of {posting_count} postings",
+                rows.len(),
+            )));
         }
         Some(decoded)
     } else {
+        let mut posting_cursor = postings.cursor()?;
+        let mut admitted_block = None;
+        while let Some(posting) = posting_cursor.current() {
+            let block = posting_cursor
+                .block_index()
+                .ok_or_else(|| invalid_state("posting cursor has no block index"))?;
+            if admitted_block != Some(block) {
+                if let Some(checkpoint) = checkpoint {
+                    checkpoint.admit(QueryWorkKind::PostingBlock, 1)?;
+                }
+                admitted_block = Some(block);
+            }
+            rows.push(posting);
+            posting_cursor.next()?;
+        }
+        if rows.len() != posting_count {
+            return Err(invalid_state(format!(
+                "posting cursor materialized {} of {posting_count} postings",
+                rows.len(),
+            )));
+        }
         None
     };
     Ok(OwnedPostingCursor {
@@ -17085,6 +17125,131 @@ mod tests {
                     .execute_docid_query(&cx, query, &default_snapshot)
                     .expect("default fuel budget must cover fixture docset collection");
             }
+        });
+    }
+
+    #[test]
+    fn owned_phrase_cursor_streams_positions_across_independent_block_seams() {
+        run_with_cx(|cx| async move {
+            const DOCUMENT_COUNT: usize = 270;
+            const TERM_FREQUENCY: usize = 24;
+
+            let content = std::iter::repeat_n("anchor", TERM_FREQUENCY)
+                .collect::<Vec<_>>()
+                .join(" ");
+            let documents = (0..DOCUMENT_COUNT)
+                .map(|ordinal| {
+                    IndexableDocument::new(format!("phrase-seam-{ordinal:03}"), content.clone())
+                })
+                .collect::<Vec<_>>();
+            let index = QuillIndex::in_memory(QuillConfig {
+                deterministic_ingest: true,
+                max_ingest_shards: 1,
+                ..QuillConfig::default()
+            })
+            .expect("construct phrase-seam index");
+            index
+                .index_documents(&cx, &documents)
+                .await
+                .expect("index phrase-seam corpus");
+            index.commit(&cx).await.expect("commit phrase-seam corpus");
+
+            let snapshot = index.snapshot();
+            assert_eq!(snapshot.segments().len(), 1);
+            let segment = &snapshot.segments()[0];
+            let dictionary =
+                open_dictionary(segment, DEFAULT_SCHEMA).expect("open phrase-seam term dictionary");
+            let found = dictionary
+                .lookup(CONTENT_FIELD, b"anchor")
+                .expect("look up phrase-seam term")
+                .expect("phrase-seam term is present");
+            assert_eq!(
+                usize::try_from(found.metadata.doc_freq).expect("document frequency fits usize"),
+                DOCUMENT_COUNT,
+            );
+
+            let postings_section =
+                required_section(segment, SectionKind::POSTINGS).expect("POSTINGS section");
+            let postings_bytes = span(
+                postings_section,
+                found.metadata.postings,
+                "phrase-seam POSTINGS",
+            )
+            .expect("slice phrase-seam postings");
+            let postings = PostingList::parse(postings_bytes, found.metadata.doc_freq)
+                .expect("parse phrase-seam postings");
+            let position_span = found.metadata.positions.expect("positioned anchor term");
+            let position_section =
+                required_section(segment, SectionKind::POSITIONS).expect("POSITIONS section");
+            let position_bytes = span(position_section, position_span, "phrase-seam POSITIONS")
+                .expect("slice phrase-seam positions");
+            let position_list = PositionList::parse(position_bytes, &postings)
+                .expect("parse phrase-seam positions");
+            assert!(postings.blocks().len() >= 2, "fixture needs posting seams");
+            assert!(
+                position_list.block_count() >= 2,
+                "fixture needs position seams"
+            );
+            assert_ne!(
+                postings.blocks()[1].base_posting_ordinal,
+                position_list.blocks()[1].base_posting_ordinal(),
+                "the first posting and position seams must be independent",
+            );
+            let legacy_position_rows = (0..found.metadata.doc_freq)
+                .map(|ordinal| {
+                    position_list
+                        .positions_for_ordinal(ordinal)?
+                        .collect::<Result<Vec<_>, _>>()
+                })
+                .collect::<Result<Vec<_>, PositionCodecError>>()
+                .expect("materialize legacy ordinal position rows");
+
+            crate::quiver::reset_position_run_work_for_test();
+            PositionList::parse(position_bytes, &postings)
+                .expect("measure the mandatory position-validation pass");
+            let (validation_decodes, validation_consumes) =
+                crate::quiver::position_run_work_for_test();
+            assert_eq!(validation_decodes, 0);
+            assert_eq!(validation_consumes, DOCUMENT_COUNT);
+
+            crate::quiver::reset_position_run_work_for_test();
+            let owned = open_owned_cursor(
+                segment,
+                DEFAULT_SCHEMA,
+                CONTENT_FIELD,
+                b"anchor",
+                true,
+                None,
+            )
+            .expect("materialize production phrase cursor");
+            let (owned_decodes, scan_consumes) = crate::quiver::position_run_work_for_test();
+            assert_eq!(owned_decodes, DOCUMENT_COUNT);
+            assert_eq!(
+                scan_consumes, validation_consumes,
+                "materialization may validate each run once but must not rescan preceding rows",
+            );
+            assert_eq!(owned.postings.len(), DOCUMENT_COUNT);
+            let position_rows = owned.positions.expect("owned position rows");
+            assert_eq!(position_rows.len(), DOCUMENT_COUNT);
+            assert_eq!(position_rows, legacy_position_rows);
+            let expected_frequency =
+                u32::try_from(TERM_FREQUENCY).expect("term frequency fits u32");
+            let expected_positions = (0..expected_frequency).collect::<Vec<_>>();
+            for (ordinal, (posting, positions)) in
+                owned.postings.iter().zip(&position_rows).enumerate()
+            {
+                assert_eq!(posting.freq, expected_frequency);
+                assert_eq!(positions, &expected_positions, "posting ordinal {ordinal}");
+            }
+
+            let phrase = index
+                .search_paginated(&cx, "\"anchor anchor\"", DOCUMENT_COUNT, 0, true)
+                .expect("execute checkpointed phrase query across both seam families");
+            assert_eq!(
+                phrase.total_count,
+                Some(u64::try_from(DOCUMENT_COUNT).expect("document count fits u64")),
+            );
+            assert_eq!(phrase.hits.len(), DOCUMENT_COUNT);
         });
     }
 
