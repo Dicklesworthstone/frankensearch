@@ -9,7 +9,9 @@
 use std::borrow::Cow;
 use std::cmp::Ordering;
 use std::ops::{Bound, Range};
+use std::sync::Arc;
 
+use arc_swap::ArcSwap;
 use thiserror::Error;
 
 use crate::schema::{FieldKind, SchemaDescriptor};
@@ -899,6 +901,148 @@ struct IndexRecord {
     relative_offset: u64,
 }
 
+#[derive(Clone, Debug)]
+struct CachedExactTerm {
+    fingerprint: u64,
+    field_ord: u16,
+    term: Arc<[u8]>,
+    found: Option<TermMatch>,
+}
+
+const EXACT_TERM_CACHE_SET_COUNT: usize = 64;
+const EXACT_TERM_CACHE_WAYS: usize = 4;
+const EXACT_TERM_CACHE_SLOTS: usize = EXACT_TERM_CACHE_SET_COUNT * EXACT_TERM_CACHE_WAYS;
+const EXACT_TERM_CACHE_SET_MASK: u8 = 63;
+const EXACT_TERM_CACHE_WAY_MASK: u8 = 3;
+
+/// Small set-associative sidecar for exact terms repeated by live queries.
+///
+/// The durable prefix-compressed dictionary remains the correctness oracle on
+/// a miss. Hits avoid both binary searches and the restart-group decode. The
+/// table retains only a bounded hot vocabulary, including verified misses, and
+/// publishes updates copy-on-write so concurrent readers never coordinate.
+#[derive(Debug)]
+struct ExactTermCache {
+    slots: ArcSwap<Vec<Option<CachedExactTerm>>>,
+}
+
+impl ExactTermCache {
+    fn new() -> Self {
+        Self {
+            slots: ArcSwap::from_pointee(Vec::new()),
+        }
+    }
+
+    fn fingerprint(field_ord: u16, term: &[u8]) -> u64 {
+        xxhash_rust::xxh3::xxh3_64(term) ^ u64::from(field_ord).wrapping_mul(0x9e37_79b9_7f4a_7c15)
+    }
+
+    fn set_start(fingerprint: u64) -> usize {
+        let [set_byte, ..] = fingerprint.to_le_bytes();
+        let set = usize::from(set_byte & EXACT_TERM_CACHE_SET_MASK);
+        set * EXACT_TERM_CACHE_WAYS
+    }
+
+    fn get(&self, field_ord: u16, term: &[u8]) -> Option<Option<TermMatch>> {
+        let fingerprint = Self::fingerprint(field_ord, term);
+        let start = Self::set_start(fingerprint);
+        let slots = self.slots.load();
+        let set = slots.get(start..start + EXACT_TERM_CACHE_WAYS)?;
+        set.iter().find_map(|slot| {
+            let entry = slot.as_ref()?;
+            (entry.fingerprint == fingerprint
+                && entry.field_ord == field_ord
+                && entry.term.as_ref() == term)
+                .then_some(entry.found)
+        })
+    }
+
+    fn insert(
+        &self,
+        field_ord: u16,
+        term: &[u8],
+        found: Option<TermMatch>,
+    ) -> Result<Option<TermMatch>, TermDictionaryError> {
+        let fingerprint = Self::fingerprint(field_ord, term);
+        let start = Self::set_start(fingerprint);
+        let mut owned_term = Vec::new();
+        owned_term
+            .try_reserve_exact(term.len())
+            .map_err(|_| TermDictionaryError::Allocation {
+                context: "exact-term cache key bytes",
+                count: term.len(),
+            })?;
+        owned_term.extend_from_slice(term);
+        let term: Arc<[u8]> = owned_term.into();
+
+        loop {
+            let current = self.slots.load_full();
+            if let Some(cached) =
+                current
+                    .get(start..start + EXACT_TERM_CACHE_WAYS)
+                    .and_then(|set| {
+                        set.iter().find_map(|slot| {
+                            let entry = slot.as_ref()?;
+                            (entry.fingerprint == fingerprint
+                                && entry.field_ord == field_ord
+                                && entry.term.as_ref() == term.as_ref())
+                            .then_some(entry.found)
+                        })
+                    })
+            {
+                return Ok(cached);
+            }
+
+            let mut next = Vec::new();
+            next.try_reserve_exact(EXACT_TERM_CACHE_SLOTS)
+                .map_err(|_| TermDictionaryError::Allocation {
+                    context: "exact-term cache slots",
+                    count: EXACT_TERM_CACHE_SLOTS,
+                })?;
+            if current.len() == EXACT_TERM_CACHE_SLOTS {
+                next.extend(current.iter().cloned());
+            } else {
+                next.resize_with(EXACT_TERM_CACHE_SLOTS, || None);
+            }
+            let set = next.get(start..start + EXACT_TERM_CACHE_WAYS).ok_or(
+                TermDictionaryError::SizeOverflow {
+                    field: "exact-term cache set",
+                },
+            )?;
+            let [_, _, _, _, way_byte, ..] = fingerprint.to_le_bytes();
+            let way = set
+                .iter()
+                .position(Option::is_none)
+                .unwrap_or_else(|| usize::from(way_byte & EXACT_TERM_CACHE_WAY_MASK));
+            let slot = next
+                .get_mut(start + way)
+                .ok_or(TermDictionaryError::SizeOverflow {
+                    field: "exact-term cache slot",
+                })?;
+            *slot = Some(CachedExactTerm {
+                fingerprint,
+                field_ord,
+                term: Arc::clone(&term),
+                found,
+            });
+            let next = Arc::new(next);
+            let previous = self.slots.compare_and_swap(&current, next);
+            if Arc::ptr_eq(&current, &previous) {
+                return Ok(found);
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn retained_entries(&self) -> usize {
+        self.slots
+            .load()
+            .iter()
+            .filter(|slot| slot.is_some())
+            .count()
+    }
+}
+
 /// Owned, allocation-bounded metadata produced by one complete TERMDICT
 /// validation.
 ///
@@ -915,6 +1059,7 @@ pub(crate) struct ValidatedTermDictionaryMetadata {
     blocks: Vec<BlockMeta>,
     restarts: Vec<RestartMeta>,
     term_count: u32,
+    exact_cache: ExactTermCache,
 }
 
 impl ValidatedTermDictionaryMetadata {
@@ -932,6 +1077,7 @@ pub struct TermDictionary<'a> {
     blocks: Cow<'a, [BlockMeta]>,
     restarts: Cow<'a, [RestartMeta]>,
     term_count: u32,
+    exact_cache: Option<&'a ExactTermCache>,
 }
 
 impl<'a> TermDictionary<'a> {
@@ -1010,6 +1156,7 @@ impl<'a> TermDictionary<'a> {
                 blocks: Cow::Owned(Vec::new()),
                 restarts: Cow::Owned(Vec::new()),
                 term_count: 0,
+                exact_cache: None,
             });
         }
 
@@ -1159,6 +1306,7 @@ impl<'a> TermDictionary<'a> {
             blocks: Cow::Owned(blocks),
             restarts: Cow::Owned(restarts),
             term_count: term_count_u32,
+            exact_cache: None,
         })
     }
 
@@ -1179,6 +1327,7 @@ impl<'a> TermDictionary<'a> {
             blocks,
             restarts,
             term_count,
+            exact_cache: _,
         } = parsed;
         Ok(ValidatedTermDictionaryMetadata {
             source_start: bytes.as_ptr() as usize,
@@ -1188,6 +1337,7 @@ impl<'a> TermDictionary<'a> {
             blocks: blocks.into_owned(),
             restarts: restarts.into_owned(),
             term_count,
+            exact_cache: ExactTermCache::new(),
         })
     }
 
@@ -1210,6 +1360,7 @@ impl<'a> TermDictionary<'a> {
             blocks: Cow::Borrowed(&metadata.blocks),
             restarts: Cow::Borrowed(&metadata.restarts),
             term_count: metadata.term_count,
+            exact_cache: Some(&metadata.exact_cache),
         })
     }
 
@@ -1267,6 +1418,28 @@ impl<'a> TermDictionary<'a> {
         scratch: &mut TermScratch,
     ) -> Result<Option<TermMatch>, TermDictionaryError> {
         validate_query_term(self.schema, field_ord, term)?;
+        if let Some(cache) = self.exact_cache
+            && let Some(found) = cache.get(field_ord, term)
+        {
+            return Ok(found);
+        }
+        let found = self.lookup_uncached_with_scratch(field_ord, term, scratch)?;
+        let Some(cache) = self.exact_cache else {
+            return Ok(found);
+        };
+        match cache.insert(field_ord, term, found) {
+            Ok(cached) => Ok(cached),
+            Err(TermDictionaryError::Allocation { .. }) => Ok(found),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn lookup_uncached_with_scratch(
+        &self,
+        field_ord: u16,
+        term: &[u8],
+        scratch: &mut TermScratch,
+    ) -> Result<Option<TermMatch>, TermDictionaryError> {
         build_composite_in(&mut scratch.target, field_ord, term, "lookup target")?;
         let target = scratch.target.as_slice();
         let Some(block_index) = self.block_for_key(target) else {
@@ -3182,6 +3355,7 @@ mod tests {
         let second = TermDictionary::from_validated_metadata(encoded.as_bytes(), &metadata)?;
         assert!(matches!(&first.blocks, Cow::Borrowed(_)));
         assert!(matches!(&first.restarts, Cow::Borrowed(_)));
+        assert_eq!(metadata.exact_cache.retained_entries(), 0);
         assert_eq!(first.term_count(), 33);
         assert_eq!(first.block_count(), second.block_count());
         assert_eq!(first.restart_count(), second.restart_count());
@@ -3192,6 +3366,16 @@ mod tests {
                 metadata: inputs[16].metadata,
             })
         );
+        assert_eq!(metadata.exact_cache.retained_entries(), 1);
+        assert_eq!(
+            second.lookup(0, b"term-00016")?,
+            first.lookup(0, b"term-00016")?
+        );
+        assert_eq!(metadata.exact_cache.retained_entries(), 1);
+        assert_eq!(first.lookup(0, b"term-missing")?, None);
+        assert_eq!(metadata.exact_cache.retained_entries(), 2);
+        assert_eq!(second.lookup(0, b"term-missing")?, None);
+        assert_eq!(metadata.exact_cache.retained_entries(), 2);
         assert_eq!(
             terms_from_cursor(second.cursor()?)?
                 .into_iter()
