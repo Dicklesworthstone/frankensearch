@@ -19,7 +19,7 @@ use thiserror::Error;
 use crate::perf::{PerfApplicabilityPlan, PerfApplicabilityPlanBinding, PerfMatrixSpec};
 
 /// Reviewed commit containing the normative registry.
-pub const MACHINE_CLASS_REGISTRY_SPEC_COMMIT: &str = "483e59a1d6edeb237462e4f54e92ab273f13a5ae";
+pub const MACHINE_CLASS_REGISTRY_SPEC_COMMIT: &str = "d251ddea584519aba64922d9720e02d941a9385d";
 /// Exact Git blob of the normative registry.
 pub const MACHINE_CLASS_REGISTRY_GIT_BLOB: &str = "fe68e97c8e66accd0abaa9a4e3146134c271e964";
 /// SHA-256 of the exact normative registry file bytes.
