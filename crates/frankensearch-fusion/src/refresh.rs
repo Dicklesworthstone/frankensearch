@@ -1790,11 +1790,28 @@ mod tests {
         dimension: usize,
         space_offset: f32,
         identity: EmbeddingIdentityBundleV1,
+        /// Direct spy counters (r3 audit item 3, #8366/#8367): every
+        /// `embed` / `embed_batch` invocation is counted at call time, so
+        /// refusal tests can assert ZERO embed-class work directly instead
+        /// of inferring it from worker metrics.
+        embed_calls: std::sync::atomic::AtomicUsize,
+        embed_batch_calls: std::sync::atomic::AtomicUsize,
     }
 
     impl StubEmbedder {
         fn new(id: &'static str, dimension: usize) -> Self {
             Self::in_space(id, dimension, 0.0)
+        }
+
+        /// Total direct `embed*`/`embed_batch*` invocations observed.
+        ///
+        /// The trait's `embed_bound` / `embed_batch_bound` defaults
+        /// delegate into `embed` / `embed_batch`, so a ZERO here proves no
+        /// embed-class method performed (or even started) any inference.
+        /// Counting happens synchronously at invocation, before the
+        /// returned future is polled, so an un-awaited call still counts.
+        fn embed_invocations(&self) -> usize {
+            self.embed_calls.load(Ordering::SeqCst) + self.embed_batch_calls.load(Ordering::SeqCst)
         }
 
         /// Same display id, different `space_offset` = a genuinely different
@@ -1812,6 +1829,8 @@ mod tests {
                 dimension,
                 space_offset,
                 identity,
+                embed_calls: std::sync::atomic::AtomicUsize::new(0),
+                embed_batch_calls: std::sync::atomic::AtomicUsize::new(0),
             }
         }
 
@@ -1826,6 +1845,8 @@ mod tests {
                 dimension,
                 space_offset: 0.0,
                 identity,
+                embed_calls: std::sync::atomic::AtomicUsize::new(0),
+                embed_batch_calls: std::sync::atomic::AtomicUsize::new(0),
             }
         }
 
@@ -1836,9 +1857,25 @@ mod tests {
 
     impl Embedder for StubEmbedder {
         fn embed<'a>(&'a self, _cx: &'a Cx, text: &'a str) -> SearchFuture<'a, Vec<f32>> {
+            self.embed_calls.fetch_add(1, Ordering::SeqCst);
             let dim = self.dimension;
             let seed = text.len() as f32 + self.space_offset;
             Box::pin(async move { Ok((0..dim).map(|i| (seed + i as f32).sin()).collect()) })
+        }
+
+        fn embed_batch<'a>(
+            &'a self,
+            cx: &'a Cx,
+            texts: &'a [&'a str],
+        ) -> SearchFuture<'a, Vec<Vec<f32>>> {
+            self.embed_batch_calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async move {
+                let mut out = Vec::with_capacity(texts.len());
+                for text in texts {
+                    out.push(self.embed(cx, text).await?);
+                }
+                Ok(out)
+            })
         }
 
         fn identity(&self) -> SearchResult<&EmbeddingIdentityBundleV1> {
@@ -2038,12 +2075,24 @@ mod tests {
         queue: Arc<EmbeddingQueue>,
         dir: &Path,
         dimension: usize,
-    ) -> (RefreshWorker, Arc<IndexCache>) {
+    ) -> (RefreshWorker, Arc<IndexCache>, Arc<StubEmbedder>) {
         let cache = make_cache(dir, dimension);
         let config = RefreshWorkerConfig::new(dir).with_poll_interval(Duration::from_millis(10));
         let fast = Arc::new(StubEmbedder::new("stub-fast", dimension));
-        let worker = RefreshWorker::new(config, queue, fast, cache.clone());
-        (worker, cache)
+        let worker = RefreshWorker::new(config, queue, fast.clone(), cache.clone());
+        (worker, cache, fast)
+    }
+
+    /// r3 audit item 3 (#8366/#8367): direct proof that a refusing call
+    /// performed zero `embed*`/`embed_batch*` work — the counting spy on
+    /// [`StubEmbedder`] replaces inference from worker metrics.
+    #[track_caller]
+    fn assert_no_embed_invocations_since(embedder: &StubEmbedder, baseline: usize) {
+        assert_eq!(
+            embedder.embed_invocations(),
+            baseline,
+            "a refusal path must not invoke embed*/embed_batch* on the embedder"
+        );
     }
 
     fn normalized(dim: usize, seed: f32) -> Vec<f32> {
@@ -2153,7 +2202,7 @@ mod tests {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             let dir = temp_index_dir("empty");
             let queue = make_queue(10);
-            let (worker, _cache) = make_worker(queue, &dir, 256);
+            let (worker, _cache, _embedder) = make_worker(queue, &dir, 256);
 
             let count = worker.run_cycle(&cx).await.unwrap();
             assert_eq!(count, 0);
@@ -2168,7 +2217,7 @@ mod tests {
             submit(&queue, "doc-1", "Hello world");
             submit(&queue, "doc-2", "Goodbye world");
 
-            let (worker, cache) = make_worker(queue.clone(), &dir, 256);
+            let (worker, cache, _embedder) = make_worker(queue.clone(), &dir, 256);
 
             let count = worker.run_cycle(&cx).await.unwrap();
             assert_eq!(count, 2);
@@ -2196,7 +2245,7 @@ mod tests {
             let dir = temp_index_dir("declared-not-attested");
             let queue = make_queue(100);
             submit(&queue, "doc-1", "Hello world");
-            let (worker, cache) = make_worker(queue.clone(), &dir, 256);
+            let (worker, cache, embedder) = make_worker(queue.clone(), &dir, 256);
             worker.run_cycle(&cx).await.unwrap();
 
             let current = cache.current();
@@ -2223,6 +2272,7 @@ mod tests {
             // generation is live v1 and the next cycle keeps the typed
             // containment refusal.
             submit(&queue, "doc-2", "Second document");
+            let embed_baseline = embedder.embed_invocations();
             let error = worker
                 .run_cycle(&cx)
                 .await
@@ -2232,6 +2282,7 @@ mod tests {
                 "refresh.fast_index_identity",
                 "identityless-fsvi-v1",
             );
+            assert_no_embed_invocations_since(&embedder, embed_baseline);
 
             // Staging refuses the same way: declared-not-attested rejects.
             let jobs = queue.drain_batch();
@@ -2244,6 +2295,7 @@ mod tests {
                 "refresh.fast_index_identity",
                 "identityless-fsvi-v1",
             );
+            assert_no_embed_invocations_since(&embedder, embed_baseline);
         });
     }
 
@@ -2254,7 +2306,7 @@ mod tests {
             let queue = make_queue(100);
             submit(&queue, "doc-1", "First document text");
 
-            let (worker, _cache) = make_worker(queue.clone(), &dir, 256);
+            let (worker, _cache, _embedder) = make_worker(queue.clone(), &dir, 256);
             worker.run_cycle(&cx).await.unwrap();
 
             // Submitting the same text again should be deduped.
@@ -2299,7 +2351,7 @@ mod tests {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             let dir = temp_index_dir("multi");
             let queue = make_queue(100);
-            let (worker, _cache) = make_worker(queue.clone(), &dir, 256);
+            let (worker, _cache, embedder) = make_worker(queue.clone(), &dir, 256);
 
             // Cycle 1: 2 docs.
             submit(&queue, "doc-1", "First");
@@ -2308,6 +2360,7 @@ mod tests {
 
             // Cycle 2 refuses before draining or embedding the pending job.
             submit(&queue, "doc-3", "Third");
+            let embed_baseline = embedder.embed_invocations();
             worker
                 .run_cycle(&cx)
                 .await
@@ -2318,6 +2371,8 @@ mod tests {
             assert_eq!(snap.index_rebuilds, 1);
             assert_eq!(snap.rebuild_failures, 0);
             assert_eq!(queue.pending_count(), 1);
+            // r3: the metric inference above is now backed by the direct spy.
+            assert_no_embed_invocations_since(&embedder, embed_baseline);
         });
     }
 
@@ -2348,7 +2403,7 @@ mod tests {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             let dir = temp_index_dir("preserve-existing");
             let queue = make_queue(100);
-            let (worker, cache) = make_worker(queue.clone(), &dir, 256);
+            let (worker, cache, embedder) = make_worker(queue.clone(), &dir, 256);
 
             submit(&queue, "doc-1", "First");
             submit(&queue, "doc-2", "Second");
@@ -2358,6 +2413,7 @@ mod tests {
             let original_bytes = std::fs::read(&fast_path).expect("read active generation");
 
             submit(&queue, "doc-3", "Third");
+            let embed_baseline = embedder.embed_invocations();
             let error = worker
                 .run_cycle(&cx)
                 .await
@@ -2368,6 +2424,7 @@ mod tests {
                     if field == "refresh.fast_index_identity"
                         && value == "identityless-fsvi-v1"
             ));
+            assert_no_embed_invocations_since(&embedder, embed_baseline);
             assert_eq!(queue.pending_count(), 1, "failed job must be requeued");
             assert_eq!(
                 std::fs::read(&fast_path).expect("reread active generation"),
@@ -2426,9 +2483,11 @@ mod tests {
 
             let fast_path = dir.join(VECTOR_INDEX_FAST_FILENAME);
             let original_bytes = std::fs::read(&fast_path).expect("read original fast index");
-            let changed = RefreshWorker::new(config, queue.clone(), changed_embedder, cache);
+            let changed =
+                RefreshWorker::new(config, queue.clone(), changed_embedder.clone(), cache);
 
             submit(&queue, "doc-new", "new generation");
+            let embed_baseline = changed_embedder.embed_invocations();
             let error = changed
                 .run_cycle(&cx)
                 .await
@@ -2440,6 +2499,7 @@ mod tests {
                     if field == "refresh.fast_index_identity"
                         && value == "identityless-fsvi-v1"
             ));
+            assert_no_embed_invocations_since(&changed_embedder, embed_baseline);
             assert_eq!(queue.pending_count(), 1, "failed job must be requeued");
             assert_eq!(
                 std::fs::read(&fast_path).expect("reread fast index"),
@@ -2460,13 +2520,15 @@ mod tests {
             let dir = temp_index_dir("unchanged-tier-ids");
             let queue = make_queue(100);
             let cache = make_cache(&dir, 256);
+            let fast_spy = Arc::new(StubEmbedder::new("stub-fast", 256));
+            let quality_spy = Arc::new(StubEmbedder::new("stub-quality", 384));
             let worker = RefreshWorker::new(
                 RefreshWorkerConfig::new(&dir),
                 queue.clone(),
-                Arc::new(StubEmbedder::new("stub-fast", 256)),
+                fast_spy.clone(),
                 cache.clone(),
             )
-            .with_quality_embedder(Arc::new(StubEmbedder::new("stub-quality", 384)));
+            .with_quality_embedder(quality_spy.clone());
 
             submit(&queue, "doc-old", "old generation");
             worker.run_cycle(&cx).await.expect("initial generation");
@@ -2478,6 +2540,8 @@ mod tests {
                 std::fs::read(&quality_path).expect("read original quality index");
 
             submit(&queue, "doc-new", "new generation");
+            let fast_baseline = fast_spy.embed_invocations();
+            let quality_baseline = quality_spy.embed_invocations();
             let refusal_cycles = queue.config().max_retries + 2;
             for _ in 0..refusal_cycles {
                 let error = worker
@@ -2491,6 +2555,8 @@ mod tests {
                             && value == "identityless-fsvi-v1"
                 ));
             }
+            assert_no_embed_invocations_since(&fast_spy, fast_baseline);
+            assert_no_embed_invocations_since(&quality_spy, quality_baseline);
             assert_eq!(
                 queue.pending_count(),
                 1,
@@ -2549,7 +2615,7 @@ mod tests {
     fn index_dir_accessor() {
         let dir = temp_index_dir("accessor");
         let queue = make_queue(10);
-        let (worker, _cache) = make_worker(queue, &dir, 256);
+        let (worker, _cache, _embedder) = make_worker(queue, &dir, 256);
         assert_eq!(worker.index_dir(), dir.as_path());
     }
 
@@ -2557,7 +2623,7 @@ mod tests {
     fn debug_format() {
         let dir = temp_index_dir("debug");
         let queue = make_queue(10);
-        let (worker, _cache) = make_worker(queue, &dir, 256);
+        let (worker, _cache, _embedder) = make_worker(queue, &dir, 256);
         let debug = format!("{worker:?}");
         assert!(debug.contains("RefreshWorker"));
         assert!(debug.contains("stub-fast"));
@@ -2688,7 +2754,7 @@ mod tests {
     fn worker_metrics_accessor_returns_shared_arc() {
         let dir = temp_index_dir("metrics-arc");
         let queue = make_queue(10);
-        let (worker, _cache) = make_worker(queue, &dir, 256);
+        let (worker, _cache, _embedder) = make_worker(queue, &dir, 256);
         let metrics = worker.metrics();
         metrics.cycles.fetch_add(1, Ordering::Relaxed);
         // Same Arc should reflect the update.
@@ -2718,7 +2784,7 @@ mod tests {
             submit(&queue, "doc-dup", "First version");
             submit(&queue, "doc-dup", "Second version");
 
-            let (worker, cache) = make_worker(queue.clone(), &dir, 256);
+            let (worker, cache, _embedder) = make_worker(queue.clone(), &dir, 256);
             let count = worker.run_cycle(&cx).await.unwrap();
             // Both submitted but doc count should be 1 (deduped).
             assert!(count >= 1);
@@ -2762,7 +2828,7 @@ mod tests {
             let dir = temp_index_dir("empty-after");
             let queue = make_queue(100);
             submit(&queue, "doc-1", "First");
-            let (worker, _cache) = make_worker(queue.clone(), &dir, 256);
+            let (worker, _cache, _embedder) = make_worker(queue.clone(), &dir, 256);
 
             worker.run_cycle(&cx).await.unwrap();
             // Second cycle with empty queue.
@@ -2826,7 +2892,7 @@ mod tests {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             let dir = temp_index_dir("update-doc");
             let queue = make_queue(100);
-            let (worker, cache) = make_worker(queue.clone(), &dir, 256);
+            let (worker, cache, embedder) = make_worker(queue.clone(), &dir, 256);
 
             // Cycle 1: index doc-1 with first text.
             submit(&queue, "doc-1", "First version of the document");
@@ -2843,10 +2909,12 @@ mod tests {
                     submitted_at: Instant::now(),
                 })
                 .unwrap();
+            let embed_baseline = embedder.embed_invocations();
             worker
                 .run_cycle(&cx)
                 .await
                 .expect_err("legacy update must require an identity-bound rebuild");
+            assert_no_embed_invocations_since(&embedder, embed_baseline);
 
             // The active generation remains available, and the update remains
             // queued for a later full identity-bound rebuild.
@@ -2891,10 +2959,12 @@ mod tests {
             }
 
             submit(&queue, "doc-new", "new document");
+            let embed_baseline = fast.embed_invocations();
             worker
                 .run_cycle(&cx)
                 .await
                 .expect_err("legacy WAL-bearing generation must not be republished");
+            assert_no_embed_invocations_since(&fast, embed_baseline);
 
             let preserved =
                 frankensearch_index::VectorIndex::open(&fast_path).expect("reopen fast tier");
@@ -2927,7 +2997,7 @@ mod tests {
             let quality = Arc::new(StubEmbedder::new("stub-quality", 384));
             let worker_with_quality =
                 RefreshWorker::new(config, queue.clone(), fast.clone(), cache.clone())
-                    .with_quality_embedder(quality);
+                    .with_quality_embedder(quality.clone());
 
             submit(&queue, "doc-1", "Test document");
             worker_with_quality.run_cycle(&cx).await.unwrap();
@@ -2936,13 +3006,18 @@ mod tests {
             // Second cycle without quality embedder (fast-only worker).
             let config2 =
                 RefreshWorkerConfig::new(&dir).with_poll_interval(Duration::from_millis(10));
-            let worker_fast_only = RefreshWorker::new(config2, queue.clone(), fast, cache.clone());
+            let worker_fast_only =
+                RefreshWorker::new(config2, queue.clone(), fast.clone(), cache.clone());
 
             submit(&queue, "doc-2", "Another document");
+            let fast_baseline = fast.embed_invocations();
+            let quality_baseline = quality.embed_invocations();
             worker_fast_only
                 .run_cycle(&cx)
                 .await
                 .expect_err("legacy two-tier generation must fail closed");
+            assert_no_embed_invocations_since(&fast, fast_baseline);
+            assert_no_embed_invocations_since(&quality, quality_baseline);
 
             // The prior quality generation remains active and the new work is
             // requeued for a full identity-bound rebuild.
@@ -2960,7 +3035,7 @@ mod tests {
             let queue = make_queue(100);
             submit(&queue, "doc-1", "Timing test");
 
-            let (worker, _cache) = make_worker(queue, &dir, 256);
+            let (worker, _cache, _embedder) = make_worker(queue, &dir, 256);
             worker.run_cycle(&cx).await.unwrap();
 
             let snap = worker.metrics().snapshot();
@@ -2973,7 +3048,7 @@ mod tests {
     fn worker_new_without_quality_debug() {
         let dir = temp_index_dir("no-quality");
         let queue = make_queue(10);
-        let (worker, _cache) = make_worker(queue, &dir, 256);
+        let (worker, _cache, _embedder) = make_worker(queue, &dir, 256);
         // Debug uses `finish_non_exhaustive` and includes fast embedder id.
         let debug = format!("{worker:?}");
         assert!(debug.contains("RefreshWorker"));
@@ -3025,7 +3100,7 @@ mod tests {
             let worker = RefreshWorker::new(
                 RefreshWorkerConfig::new(&dir),
                 queue.clone(),
-                embedder,
+                embedder.clone(),
                 cache,
             );
 
@@ -3043,7 +3118,9 @@ mod tests {
                 "reason must name the dependency"
             );
 
-            // Zero side effects: nothing drained, embedded, written, staged.
+            // Zero embed/drain/write/stage side effects. The spy is the
+            // direct proof; the docs_embedded metric below corroborates.
+            assert_no_embed_invocations_since(&embedder, 0);
             assert_eq!(queue.pending_count(), 1, "refusal must fire before drain");
             let snap = worker.metrics().snapshot();
             assert_eq!(snap.docs_embedded, 0);
@@ -3181,8 +3258,12 @@ mod tests {
 
             let queue = make_queue(100);
             submit(&queue, "doc-new", "new document");
-            let worker =
-                RefreshWorker::new(RefreshWorkerConfig::new(&dir), queue.clone(), beta, cache);
+            let worker = RefreshWorker::new(
+                RefreshWorkerConfig::new(&dir),
+                queue.clone(),
+                beta.clone(),
+                cache,
+            );
 
             // Canonical cycle: typed cross-space refusal, pre-drain.
             let error = worker
@@ -3199,6 +3280,7 @@ mod tests {
                 "reason must carry the attested space fingerprint"
             );
             assert_eq!(queue.pending_count(), 1);
+            assert_no_embed_invocations_since(&beta, 0);
 
             // Staging seam: same typed refusal.
             let jobs = queue.drain_batch();
@@ -3211,6 +3293,7 @@ mod tests {
                 "refresh.fast_space_identity",
                 &beta_space_fingerprint,
             );
+            assert_no_embed_invocations_since(&beta, 0);
             assert_eq!(
                 std::fs::read(&fast_path).expect("reread canonical"),
                 canonical_bytes
@@ -3260,7 +3343,7 @@ mod tests {
             let worker = RefreshWorker::new(
                 RefreshWorkerConfig::new(&dir),
                 queue.clone(),
-                executing,
+                executing.clone(),
                 cache,
             );
 
@@ -3279,6 +3362,7 @@ mod tests {
                     && reason.contains(&sibling.producer.fingerprint()),
                 "truthful telemetry must carry both producer fingerprints: {reason}"
             );
+            assert_no_embed_invocations_since(&executing, 0);
 
             let jobs = queue.drain_batch();
             let error = worker
@@ -3290,6 +3374,7 @@ mod tests {
                 "refresh.fast_producer_conformance",
                 "executing-producer-attestation-unavailable",
             );
+            assert_no_embed_invocations_since(&executing, 0);
             assert_eq!(
                 std::fs::read(&fast_path).expect("reread canonical"),
                 canonical_bytes
@@ -3343,7 +3428,7 @@ mod tests {
             let worker = RefreshWorker::new(
                 RefreshWorkerConfig::new(&dir),
                 queue.clone(),
-                executing,
+                executing.clone(),
                 cache,
             );
 
@@ -3356,6 +3441,7 @@ mod tests {
                 "refresh.fast_producer_conformance",
                 "executing-producer-attestation-unavailable",
             );
+            assert_no_embed_invocations_since(&executing, 0);
 
             let jobs = queue.drain_batch();
             let error = worker
@@ -3367,6 +3453,7 @@ mod tests {
                 "refresh.fast_producer_conformance",
                 "executing-producer-attestation-unavailable",
             );
+            assert_no_embed_invocations_since(&executing, 0);
             assert_eq!(
                 std::fs::read(&fast_path).expect("reread canonical"),
                 canonical_bytes
@@ -3435,7 +3522,7 @@ mod tests {
             let worker = RefreshWorker::new(
                 RefreshWorkerConfig::new(&dir),
                 queue.clone(),
-                embedder,
+                embedder.clone(),
                 cache,
             );
 
@@ -3448,6 +3535,7 @@ mod tests {
             assert!(staged.fast_path.exists());
             assert!(staged.index.fast_identity_is_attested());
 
+            let embed_baseline = embedder.embed_invocations();
             let error = worker
                 .publish_staged_canonical(&staged)
                 .expect_err("split canonical publication must be refused in this slice");
@@ -3457,6 +3545,7 @@ mod tests {
                 "composite-generation-authority-unavailable",
             );
             assert!(invalid_config_reason(&error).contains("bd-xomn"));
+            assert_no_embed_invocations_since(&embedder, embed_baseline);
 
             assert_eq!(
                 std::fs::read(&fast_path).expect("reread canonical seed"),
@@ -3588,8 +3677,12 @@ mod tests {
 
             let queue = make_queue(100);
             submit(&queue, "doc-2", "a second document");
-            let worker =
-                RefreshWorker::new(RefreshWorkerConfig::new(&dir), queue.clone(), fast, cache);
+            let worker = RefreshWorker::new(
+                RefreshWorkerConfig::new(&dir),
+                queue.clone(),
+                fast.clone(),
+                cache,
+            );
 
             let error = worker
                 .run_cycle(&cx)
@@ -3601,6 +3694,7 @@ mod tests {
                 "identity-bound-republication-unavailable",
             );
             assert_eq!(queue.pending_count(), 1, "pre-drain refusal");
+            assert_no_embed_invocations_since(&fast, 0);
         });
     }
 
@@ -3685,7 +3779,7 @@ mod tests {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             let dir = temp_index_dir("r2-stale-wal-invariance");
             let queue = make_queue(100);
-            let (worker, _cache) = make_worker(queue.clone(), &dir, 256);
+            let (worker, _cache, embedder) = make_worker(queue.clone(), &dir, 256);
 
             submit(&queue, "doc-1", "First document");
             worker.run_cycle(&cx).await.expect("bootstrap cycle");
@@ -3698,6 +3792,7 @@ mod tests {
             let manifest_before = dir_manifest(&dir);
 
             submit(&queue, "doc-2", "Second document");
+            let embed_baseline = embedder.embed_invocations();
             let error = worker
                 .run_cycle(&cx)
                 .await
@@ -3707,6 +3802,7 @@ mod tests {
                 "refresh.fast_index_identity",
                 "identityless-fsvi-v1",
             );
+            assert_no_embed_invocations_since(&embedder, embed_baseline);
 
             assert!(
                 wal_path.exists(),
@@ -3739,7 +3835,7 @@ mod tests {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             let dir = temp_index_dir("r2-corrupt-trailer-invariance");
             let queue = make_queue(100);
-            let (worker, _cache) = make_worker(queue.clone(), &dir, 256);
+            let (worker, _cache, embedder) = make_worker(queue.clone(), &dir, 256);
 
             submit(&queue, "doc-1", "First document");
             worker.run_cycle(&cx).await.expect("bootstrap cycle");
@@ -3783,6 +3879,7 @@ mod tests {
             }
 
             submit(&queue, "doc-2", "Second document");
+            let embed_baseline = embedder.embed_invocations();
             let error = worker
                 .run_cycle(&cx)
                 .await
@@ -3792,6 +3889,7 @@ mod tests {
                 "refresh.fast_index_identity",
                 "identityless-fsvi-v1",
             );
+            assert_no_embed_invocations_since(&embedder, embed_baseline);
 
             assert_eq!(
                 std::fs::read(&wal_path).expect("reread wal"),
@@ -3843,7 +3941,7 @@ mod tests {
             let worker = RefreshWorker::new(
                 RefreshWorkerConfig::new(&dir),
                 queue.clone(),
-                embedder,
+                embedder.clone(),
                 cache,
             );
             let error = worker
@@ -3855,6 +3953,7 @@ mod tests {
                 "refresh.quality_index_identity",
                 "identityless-fsvi-v1",
             );
+            assert_no_embed_invocations_since(&embedder, 0);
 
             assert_eq!(
                 std::fs::read(&fast_path).expect("reread v2 fast"),
@@ -3913,7 +4012,7 @@ mod tests {
             let worker = RefreshWorker::new(
                 RefreshWorkerConfig::new(&dir),
                 queue.clone(),
-                embedder,
+                embedder.clone(),
                 cache,
             );
             let error = worker
@@ -3933,6 +4032,7 @@ mod tests {
                 !error.to_string().contains("composite-generation-authority"),
                 "a content-corrupt artifact must never reach the composite-authority refusal"
             );
+            assert_no_embed_invocations_since(&embedder, 0);
             assert_eq!(queue.pending_count(), 1, "refusal fires before drain");
             let drained = queue.drain_batch();
             assert_eq!(drained[0].retry_count, 0, "no retry budget consumed");
@@ -3940,9 +4040,15 @@ mod tests {
     }
 
     /// Required test (i), v2 case: the full pre-drain admission (option A)
-    /// itself has zero side effects on the canonical directory — names,
+    /// performs no writes on the canonical directory — nothing is written,
+    /// truncated, deleted, or opened writable; bytes, directory entries,
     /// sizes, and mtimes are all invariant across the refused cycle, and no
-    /// WAL sidecar or staging directory appears.
+    /// WAL sidecar or staging directory appears. Access metadata is the one
+    /// deliberate non-guarantee (r3 claim precision, #8366/#8367):
+    /// admission prefers the no-atime/no-follow `O_NOATIME | O_NOFOLLOW`
+    /// opener, but its documented ordinary read-only fallback — and the v1
+    /// WAL sidecar read — may update atime and follow symlinks, which is
+    /// why `dir_manifest` deliberately never asserts atime.
     #[test]
     fn pre_drain_full_admission_leaves_canonical_directory_invariant() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
@@ -3961,7 +4067,7 @@ mod tests {
             let worker = RefreshWorker::new(
                 RefreshWorkerConfig::new(&dir),
                 queue.clone(),
-                embedder,
+                embedder.clone(),
                 cache,
             );
             let error = worker
@@ -3973,6 +4079,7 @@ mod tests {
                 "refresh.canonical_publication",
                 "composite-generation-authority-unavailable",
             );
+            assert_no_embed_invocations_since(&embedder, 0);
 
             assert_eq!(
                 std::fs::read(&fast_path).expect("reread canonical"),
@@ -4071,7 +4178,7 @@ mod tests {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             let dir = temp_index_dir("r2-all-tombstoned-fail-closed");
             let queue = make_queue(100);
-            let (worker, _cache) = make_worker(queue.clone(), &dir, 256);
+            let (worker, _cache, embedder) = make_worker(queue.clone(), &dir, 256);
 
             submit(&queue, "doc-1", "First document");
             worker.run_cycle(&cx).await.expect("bootstrap cycle");
@@ -4085,6 +4192,7 @@ mod tests {
             let fast_bytes = std::fs::read(&fast_path).expect("read tombstoned artifact");
 
             submit(&queue, "doc-2", "Second document");
+            let embed_baseline = embedder.embed_invocations();
             let error = worker
                 .run_cycle(&cx)
                 .await
@@ -4094,6 +4202,7 @@ mod tests {
                 "refresh.fast_index_identity",
                 "identityless-fsvi-v1",
             );
+            assert_no_embed_invocations_since(&embedder, embed_baseline);
             assert_eq!(
                 std::fs::read(&fast_path).expect("reread artifact"),
                 fast_bytes,
@@ -4113,7 +4222,7 @@ mod tests {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             let dir = temp_index_dir("r2-bootstrap-stale-wal");
             let queue = make_queue(100);
-            let (worker, cache) = make_worker(queue.clone(), &dir, 256);
+            let (worker, cache, _embedder) = make_worker(queue.clone(), &dir, 256);
 
             // Empty v1 seed (from make_worker) + transplanted stale WAL.
             let fast_path = dir.join(VECTOR_INDEX_FAST_FILENAME);
@@ -4136,6 +4245,114 @@ mod tests {
             assert!(
                 !frankensearch_index::wal::wal_path_for(&fast_path).exists(),
                 "the write path must have cleared the dead sidecar during rebuild"
+            );
+        });
+    }
+
+    // ─── C4-write r3: crash-state fail-closed reopen at the refresh seam ──
+
+    /// r3 fault items (ii)/(iv), refresh-seam half (#8366/#8367): the exact
+    /// on-disk state a pre-r3 crash-after-main-rename left — a fresh
+    /// generation-1 legacy main REPLACED over the canonical name with the
+    /// old generation's generation-2 WAL still adjacent — must fail CLOSED
+    /// at the observation-driven admission seam: a typed refusal before any
+    /// drain or embedding, with the crash state left byte-identical. The
+    /// foreign WAL rows are never merged into a refreshed generation. The
+    /// index-crate side of this pin (observer classification, plain-reopen
+    /// replay, unconstructability through `finish()`) lives in
+    /// `frankensearch-index/src/two_tier.rs`.
+    #[test]
+    fn legacy_crash_state_generation_collision_refuses_pre_drain_without_embedding() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let dir = temp_index_dir("r3-crash-state-refusal");
+            let queue = make_queue(100);
+            let (worker, cache, embedder) = make_worker(queue.clone(), &dir, 256);
+
+            // Old generation: bootstrap a real legacy v1 main, then append a
+            // foreign row out-of-band, which creates the generation-2 WAL.
+            submit(&queue, "doc-old", "old generation document");
+            worker.run_cycle(&cx).await.expect("bootstrap cycle");
+            let fast_path = dir.join(VECTOR_INDEX_FAST_FILENAME);
+            {
+                let mut index = VectorIndex::open(&fast_path).expect("open old generation");
+                let dim = index.dimension();
+                index
+                    .append("foreign-doc", &vec![0.25_f32; dim])
+                    .expect("append the foreign WAL resident");
+            }
+            let wal_path = frankensearch_index::wal::wal_path_for(&fast_path);
+            assert!(wal_path.exists(), "fixture WAL must exist");
+
+            // Simulate the pre-r3 crash point: a fresh generation-1 main is
+            // renamed over the canonical name; the WAL removal never ran.
+            let scratch = dir.join("replacement.scratch");
+            {
+                let mut writer =
+                    VectorIndex::create(&scratch, "stub-fast", 256).expect("create replacement");
+                writer
+                    .write_record("doc-new", &normalized(256, 0.5))
+                    .expect("write replacement row");
+                writer.finish().expect("finish replacement");
+            }
+            std::fs::rename(&scratch, &fast_path).expect("simulate crash after rename");
+
+            // Collision precondition, proven read-only: the leftover WAL
+            // reads as ACTIVE against the fresh generation-1 main.
+            let observation = observe_tier(&fast_path).expect("observe crash state");
+            let FsviTierObservation::V1(observed) = observation else {
+                panic!("crash state must observe as V1, got {observation:?}");
+            };
+            assert_eq!(
+                observed.active_wal_records, 1,
+                "the generation-2 WAL must read as ACTIVE against the fresh \
+                 generation-1 main (the exact collision)"
+            );
+            assert!(observed.wal_sidecar_present);
+            assert!(
+                observed.retains_content(),
+                "the crash state retains content"
+            );
+
+            let fast_bytes = std::fs::read(&fast_path).expect("read crash-state main");
+            let wal_bytes = std::fs::read(&wal_path).expect("read crash-state wal");
+            let manifest_before = dir_manifest(&dir);
+
+            // The refusing cycle: fail closed, pre-drain, zero embedding.
+            submit(&queue, "doc-2", "second document");
+            let embed_baseline = embedder.embed_invocations();
+            let error = worker
+                .run_cycle(&cx)
+                .await
+                .expect_err("the generation-collision crash state must fail closed");
+            assert_invalid_config(
+                &error,
+                "refresh.fast_index_identity",
+                "identityless-fsvi-v1",
+            );
+            assert_no_embed_invocations_since(&embedder, embed_baseline);
+            assert_eq!(queue.pending_count(), 1, "refusal fires before drain");
+
+            // The crash state is left exactly as found: no resurrection into
+            // a refreshed generation, no deletion, no replacement.
+            assert_eq!(
+                std::fs::read(&fast_path).expect("reread main"),
+                fast_bytes,
+                "the crash-state main must be byte-identical after refusal"
+            );
+            assert_eq!(
+                std::fs::read(&wal_path).expect("reread wal"),
+                wal_bytes,
+                "the crash-state WAL must be byte-identical after refusal"
+            );
+            assert_eq!(dir_manifest(&dir), manifest_before);
+
+            // The serving cache still holds the pre-crash generation: the
+            // foreign row was never merged anywhere.
+            let current = cache.current();
+            let ids: Vec<String> = current.iter_doc_ids().filter_map(Result::ok).collect();
+            assert!(
+                !ids.iter().any(|id| id == "foreign-doc"),
+                "no foreign WAL row may reach the served generation: {ids:?}"
             );
         });
     }

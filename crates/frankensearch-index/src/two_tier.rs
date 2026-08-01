@@ -2264,9 +2264,11 @@ fn resolve_fast_path(dir: &Path) -> SearchResult<PathBuf> {
 ///
 /// Every variant is established WITHOUT any mutable open: no WAL sidecar is
 /// ever deleted or truncated, no file is memory-mapped writable, and no byte
-/// of the artifact or its directory changes. This is the classification
-/// carrier for pre-drain refresh admission (the r2 repair of the C4-write
-/// NO-GO's mutable-`VectorIndex::open`-during-classification hazard).
+/// of the artifact or its directory changes. Access metadata is the one
+/// exception — see [`observe_tier`] for the exact atime/symlink caveat of
+/// the ordinary read-only fallback. This is the classification carrier for
+/// pre-drain refresh admission (the r2 repair of the C4-write NO-GO's
+/// mutable-`VectorIndex::open`-during-classification hazard).
 #[derive(Debug)]
 pub enum FsviTierObservation {
     /// Recognized legacy FSVI v1 bytes, header-parsed only.
@@ -2322,15 +2324,27 @@ impl FsviV1Observation {
 /// Prefers the crate's `O_NOATIME | O_NOFOLLOW | O_CLOEXEC` opener (the same
 /// one exact v2 admission uses). Where that is denied or unsupported (non-
 /// owner files, non-Linux targets, symlinked finals) this falls back to an
-/// ordinary read-only [`fs::File::open`], whose only observable effect is a
-/// possible atime update — never weaker than `VectorIndex::inspect`'s
-/// unconditional ordinary open, and never write-capable.
+/// ordinary read-only [`fs::File::open`], whose only observable effects are
+/// a possible atime update and symlink traversal — never weaker than
+/// `VectorIndex::inspect`'s unconditional ordinary open, and never
+/// write-capable.
 fn open_tier_readonly(path: &Path) -> SearchResult<fs::File> {
     crate::open_readonly_noatime_nofollow(path)
         .or_else(|_| fs::File::open(path).map_err(SearchError::Io))
 }
 
-/// Classify one on-disk FSVI tier artifact WITHOUT mutating anything.
+/// Classify one on-disk FSVI tier artifact without writes.
+///
+/// Exact guarantee: nothing is written, truncated, or deleted, and no
+/// writable open or mapping occurs — bytes, directory entries, sizes, and
+/// mtimes are invariant across the call.
+///
+/// The one deliberate non-guarantee is access metadata (r3 claim precision,
+/// audits #8366/#8367): the preferred opener is the no-atime/no-follow fast
+/// path (`O_NOATIME | O_NOFOLLOW | O_CLOEXEC`), but where that open is
+/// denied or unsupported the documented fallback is an ordinary read-only
+/// `File::open` — and the v1 WAL sidecar is read via `wal::read_wal`'s
+/// ordinary open — either of which may update atime and follow symlinks.
 ///
 /// Contrast with the two open paths this deliberately is not:
 /// - [`VectorIndex::open`] (v1) opens WRITE-capable, deletes a stale WAL
