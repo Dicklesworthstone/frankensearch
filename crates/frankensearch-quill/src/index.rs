@@ -67,6 +67,7 @@ use crate::quiver::{
 use crate::schema::{DEFAULT_SCHEMA, FieldKind, SchemaDescriptor};
 use crate::scribe::{
     AccumulatorError, ColumnarAccumulator, DOC_ORDS_PER_LEASE, DeltaFlushInput, DocIdAllocator,
+    DocIdSpan,
     FlushDocumentInput, FlushError, FlushMode, FlushSegmentInput, IndexedFieldValue,
     IndexedNumericValue, ShardRouter, StoredFieldValue, flush_accumulator_with_mode,
     flush_delta_snapshot,
@@ -2544,112 +2545,33 @@ impl QuillWriterState {
             // Only the successful return below (or a successful commit)
             // disarms it.
             self.ingest_retry_required = true;
-            let shard_id = self.shard_router.route_batch();
-            let document_count = u32::try_from(documents.len())
-                .map_err(|_| invalid_state("ingest batch document count does not fit u32"))?;
-            let allocated = self
-                .docid_allocator
-                .alloc_batch(shard_id, document_count)
-                .map_err(|error| invalid_state(error.to_string()))?;
-            self.next_lease_base = self.docid_allocator.watermark();
-            let mut arena_bytes_used_high_water = self
-                .shards
-                .iter()
-                .map(|shard| shard.accumulator.bytes_used())
-                .max()
-                .unwrap_or(0);
-            let mut arena_bytes_reserved_high_water = self
-                .shards
-                .iter()
-                .map(|shard| shard.accumulator.bytes_reserved())
-                .max()
-                .unwrap_or(0);
-            let mut document_index = 0_usize;
-            for (span_index, span) in allocated.spans().iter().copied().enumerate() {
-                let lease_changed = self.shards[shard_id]
-                    .current_lease_base
-                    .is_some_and(|base| base != span.lease_base);
-                if lease_changed {
-                    self.flush_shard(cx, shard_id, LifecycleTrigger::LeaseBoundary)
-                        .await?;
-                }
-                self.shards[shard_id].current_lease_base = Some(span.lease_base);
-                for span_offset in 0..span.len {
-                    let document = &documents[document_index];
-                    document_index += 1;
-                    check_cancel(cx, "index")?;
-                    if document.id.is_empty() {
-                        return Err(invalid_state("document id must be nonempty"));
-                    }
-                    if self.uncommitted_ids.contains(&document.id)
-                        || self
-                            .backend
-                            .snapshot()
-                            .resolve_document_id(&document.id)?
-                            .is_some()
-                            && !replacement_ids.contains(document.id.as_str())
-                    {
-                        return Err(invalid_state(format!(
-                            "duplicate live document id {:?}",
-                            document.id
-                        )));
-                    }
-                    let doc_ord = span
-                        .ord_start
-                        .checked_add(span_offset)
-                        .ok_or_else(|| invalid_state("lease-relative document ordinal overflow"))?;
-                    let global_docid = span
-                        .lease_base
-                        .checked_add(u64::from(doc_ord))
-                        .filter(|docid| *docid < MAX_GLOBAL_DOCID_EXCLUSIVE)
-                        .ok_or_else(|| invalid_state("global Q1 document-id space exhausted"))?;
-
-                    let metadata = canonical_metadata(&document.metadata)?;
-                    let title = document.title.as_deref().unwrap_or("");
-                    let indexed = [
-                        IndexedFieldValue::new(ID_FIELD, &document.id),
-                        IndexedFieldValue::new(CONTENT_FIELD, &document.content),
-                        IndexedFieldValue::new(TITLE_FIELD, title),
-                    ];
-                    let numeric = [IndexedNumericValue::u64(ORD_FIELD, global_docid)];
-                    let stored = [StoredFieldValue::new(METADATA_FIELD, &metadata)];
-                    let accumulated = self.shards[shard_id]
-                        .accumulator
-                        .add_document_with_values(doc_ord, &indexed, &numeric, &stored)?;
-                    arena_bytes_used_high_water =
-                        arena_bytes_used_high_water.max(accumulated.bytes_used);
-                    arena_bytes_reserved_high_water =
-                        arena_bytes_reserved_high_water.max(accumulated.bytes_reserved);
-                    let canonical_content = canonical_document_preimage(document, &metadata)?;
-                    self.shards[shard_id].identities.push(PendingIdentity {
-                        doc_ord,
-                        document_id: document.id.clone(),
-                        canonical_content,
-                    });
-                    self.uncommitted_ids.insert(document.id.clone());
-                    self.unpublished_since.get_or_insert_with(Instant::now);
-
-                    if self.shards[shard_id]
-                        .accumulator
-                        .should_flush(self.config.scribe_shard_budget_bytes)
-                    {
-                        self.flush_shard(cx, shard_id, LifecycleTrigger::ArenaBudget)
-                            .await?;
-                        self.shards[shard_id].current_lease_base = Some(span.lease_base);
-                        if allow_automatic_publication {
-                            self.publish_bulk_cadence_if_due(cx).await?;
-                        }
-                    }
-                }
-                if span_index + 1 < allocated.spans().len() {
-                    self.flush_shard(cx, shard_id, LifecycleTrigger::LeaseBoundary)
-                        .await?;
-                    if allow_automatic_publication {
-                        self.publish_bulk_cadence_if_due(cx).await?;
-                    }
-                }
-            }
-            debug_assert_eq!(document_index, documents.len());
+            // Fan out only when every participating shard gets a segment's
+            // worth of documents: each sealed segment carries its own term
+            // dictionary, so splitting a small batch widely trades real bytes
+            // and search-time segment count for parallelism that is not there.
+            let fanout_shards = self
+                .shard_router
+                .shard_count()
+                .min(documents.len() / FANOUT_MIN_SHARD_DOCUMENTS);
+            let (arena_bytes_used_high_water, arena_bytes_reserved_high_water) =
+                if fanout_shards >= 2 {
+                    self.index_batch_fanout(
+                        cx,
+                        documents,
+                        replacement_ids,
+                        allow_automatic_publication,
+                        fanout_shards,
+                    )
+                    .await?
+                } else {
+                    self.index_batch_serial(
+                        cx,
+                        documents,
+                        replacement_ids,
+                        allow_automatic_publication,
+                    )
+                    .await?
+                };
             let visibility_due = self.unpublished_since.is_some_and(|started| {
                 started.elapsed() >= Duration::from_millis(self.config.max_visibility_lag_ms)
             });
@@ -2674,6 +2596,340 @@ impl QuillWriterState {
         }
         .instrument(instrumented)
         .await
+    }
+
+    /// Route and accumulate one bounded batch into a single shard.
+    ///
+    /// This is the original single-shard path, retained verbatim: it is the
+    /// only path taken when `deterministic_ingest` resolves the router to one
+    /// shard, so single-shard ingest is bit-identical to before the fan-out.
+    ///
+    /// # Errors
+    ///
+    /// Returns typed cancellation, duplicate-id, accumulation, flush, or
+    /// publication failures.
+    async fn index_batch_serial(
+        &mut self,
+        cx: &Cx,
+        documents: &[IndexableDocument],
+        replacement_ids: &BTreeSet<&str>,
+        allow_automatic_publication: bool,
+    ) -> Result<(usize, usize), QuillIndexError> {
+        let shard_id = self.shard_router.route_batch();
+        let document_count = u32::try_from(documents.len())
+            .map_err(|_| invalid_state("ingest batch document count does not fit u32"))?;
+        let allocated = self
+            .docid_allocator
+            .alloc_batch(shard_id, document_count)
+            .map_err(|error| invalid_state(error.to_string()))?;
+        self.next_lease_base = self.docid_allocator.watermark();
+        let mut arena_bytes_used_high_water = self
+            .shards
+            .iter()
+            .map(|shard| shard.accumulator.bytes_used())
+            .max()
+            .unwrap_or(0);
+        let mut arena_bytes_reserved_high_water = self
+            .shards
+            .iter()
+            .map(|shard| shard.accumulator.bytes_reserved())
+            .max()
+            .unwrap_or(0);
+        let mut document_index = 0_usize;
+        for (span_index, span) in allocated.spans().iter().copied().enumerate() {
+            let lease_changed = self.shards[shard_id]
+                .current_lease_base
+                .is_some_and(|base| base != span.lease_base);
+            if lease_changed {
+                self.flush_shard(cx, shard_id, LifecycleTrigger::LeaseBoundary)
+                    .await?;
+            }
+            self.shards[shard_id].current_lease_base = Some(span.lease_base);
+            for span_offset in 0..span.len {
+                let document = &documents[document_index];
+                document_index += 1;
+                check_cancel(cx, "index")?;
+                if document.id.is_empty() {
+                    return Err(invalid_state("document id must be nonempty"));
+                }
+                if self.uncommitted_ids.contains(&document.id)
+                    || self
+                        .backend
+                        .snapshot()
+                        .resolve_document_id(&document.id)?
+                        .is_some()
+                        && !replacement_ids.contains(document.id.as_str())
+                {
+                    return Err(invalid_state(format!(
+                        "duplicate live document id {:?}",
+                        document.id
+                    )));
+                }
+                let doc_ord = span
+                    .ord_start
+                    .checked_add(span_offset)
+                    .ok_or_else(|| invalid_state("lease-relative document ordinal overflow"))?;
+                let global_docid = span
+                    .lease_base
+                    .checked_add(u64::from(doc_ord))
+                    .filter(|docid| *docid < MAX_GLOBAL_DOCID_EXCLUSIVE)
+                    .ok_or_else(|| invalid_state("global Q1 document-id space exhausted"))?;
+
+                let metadata = canonical_metadata(&document.metadata)?;
+                let title = document.title.as_deref().unwrap_or("");
+                let indexed = [
+                    IndexedFieldValue::new(ID_FIELD, &document.id),
+                    IndexedFieldValue::new(CONTENT_FIELD, &document.content),
+                    IndexedFieldValue::new(TITLE_FIELD, title),
+                ];
+                let numeric = [IndexedNumericValue::u64(ORD_FIELD, global_docid)];
+                let stored = [StoredFieldValue::new(METADATA_FIELD, &metadata)];
+                let accumulated = self.shards[shard_id]
+                    .accumulator
+                    .add_document_with_values(doc_ord, &indexed, &numeric, &stored)?;
+                arena_bytes_used_high_water =
+                    arena_bytes_used_high_water.max(accumulated.bytes_used);
+                arena_bytes_reserved_high_water =
+                    arena_bytes_reserved_high_water.max(accumulated.bytes_reserved);
+                let canonical_content = canonical_document_preimage(document, &metadata)?;
+                self.shards[shard_id].identities.push(PendingIdentity {
+                    doc_ord,
+                    document_id: document.id.clone(),
+                    canonical_content,
+                });
+                self.uncommitted_ids.insert(document.id.clone());
+                self.unpublished_since.get_or_insert_with(Instant::now);
+
+                if self.shards[shard_id]
+                    .accumulator
+                    .should_flush(self.config.scribe_shard_budget_bytes)
+                {
+                    self.flush_shard(cx, shard_id, LifecycleTrigger::ArenaBudget)
+                        .await?;
+                    self.shards[shard_id].current_lease_base = Some(span.lease_base);
+                    if allow_automatic_publication {
+                        self.publish_bulk_cadence_if_due(cx).await?;
+                    }
+                }
+            }
+            if span_index + 1 < allocated.spans().len() {
+                self.flush_shard(cx, shard_id, LifecycleTrigger::LeaseBoundary)
+                    .await?;
+                if allow_automatic_publication {
+                    self.publish_bulk_cadence_if_due(cx).await?;
+                }
+            }
+        }
+        debug_assert_eq!(document_index, documents.len());
+        Ok((
+            arena_bytes_used_high_water,
+            arena_bytes_reserved_high_water,
+        ))
+    }
+
+    /// Accumulate one bounded batch across every ingest shard concurrently.
+    ///
+    /// The shards are already shared-nothing — each owns its arena, term
+    /// interner and identity list — but production routed a *whole* batch to
+    /// one shard, so they never ran at the same time. This partitions the
+    /// batch instead, so `shard_count` accumulators fill in parallel.
+    ///
+    /// Three things must stay serial and do:
+    ///
+    /// - **Admission.** The duplicate-id probe reads the published snapshot and
+    ///   the uncommitted-id set and mutates the latter, so it runs first, in
+    ///   input order. That reports the same first offending document, with the
+    ///   same message, as [`Self::index_batch_serial`].
+    /// - **Docid allocation.** Leases are per shard but the allocator is
+    ///   shared, so every span is allocated before the parallel region opens.
+    /// - **Sealing.** A flush is `async` and mutates shared publication state,
+    ///   so budget and lease-boundary seals happen between waves.
+    ///
+    /// Work is issued in waves of at most [`FANOUT_WAVE_SHARD_DOCUMENTS`] per
+    /// shard so a shard's arena cannot overshoot its byte budget by more than
+    /// one wave before the seal check runs.
+    ///
+    /// # Errors
+    ///
+    /// Returns typed cancellation, duplicate-id, accumulation, flush, or
+    /// publication failures.
+    async fn index_batch_fanout(
+        &mut self,
+        cx: &Cx,
+        documents: &[IndexableDocument],
+        replacement_ids: &BTreeSet<&str>,
+        allow_automatic_publication: bool,
+        shard_count: usize,
+    ) -> Result<(usize, usize), QuillIndexError> {
+        use rayon::prelude::*;
+
+        // Admission, in input order, before anything is accumulated.
+        for document in documents {
+            check_cancel(cx, "index")?;
+            if document.id.is_empty() {
+                return Err(invalid_state("document id must be nonempty"));
+            }
+            if self.uncommitted_ids.contains(&document.id)
+                || self
+                    .backend
+                    .snapshot()
+                    .resolve_document_id(&document.id)?
+                    .is_some()
+                    && !replacement_ids.contains(document.id.as_str())
+            {
+                return Err(invalid_state(format!(
+                    "duplicate live document id {:?}",
+                    document.id
+                )));
+            }
+            self.uncommitted_ids.insert(document.id.clone());
+        }
+        if !documents.is_empty() {
+            self.unpublished_since.get_or_insert_with(Instant::now);
+        }
+
+        let mut arena_bytes_used_high_water = self
+            .shards
+            .iter()
+            .map(|shard| shard.accumulator.bytes_used())
+            .max()
+            .unwrap_or(0);
+        let mut arena_bytes_reserved_high_water = self
+            .shards
+            .iter()
+            .map(|shard| shard.accumulator.bytes_reserved())
+            .max()
+            .unwrap_or(0);
+
+        let mut wave_start = 0_usize;
+        while wave_start < documents.len() {
+            check_cancel(cx, "index")?;
+            let wave_len = (documents.len() - wave_start)
+                .min(FANOUT_WAVE_SHARD_DOCUMENTS.saturating_mul(shard_count));
+            let wave = &documents[wave_start..wave_start + wave_len];
+            wave_start += wave_len;
+
+            // Contiguous partition in ascending shard order: every shard sees
+            // strictly increasing document ordinals, which the accumulator
+            // requires, and the assignment is a pure function of the batch.
+            let per_shard = wave.len() / shard_count;
+            let remainder = wave.len() % shard_count;
+            let mut allocations: Vec<(usize, usize, Vec<DocIdSpan>)> =
+                Vec::with_capacity(shard_count);
+            let mut cursor = 0_usize;
+            for shard in 0..shard_count {
+                let len = per_shard + usize::from(shard < remainder);
+                if len == 0 {
+                    continue;
+                }
+                let count = u32::try_from(len)
+                    .map_err(|_| invalid_state("fan-out shard document count does not fit u32"))?;
+                let allocated = self
+                    .docid_allocator
+                    .alloc_batch(shard, count)
+                    .map_err(|error| invalid_state(error.to_string()))?;
+                allocations.push((shard, cursor, allocated.spans().to_vec()));
+                cursor += len;
+            }
+            debug_assert_eq!(cursor, wave.len());
+            self.next_lease_base = self.docid_allocator.watermark();
+
+            // A shard whose allocation crossed a lease boundary needs an R1 cut
+            // between its spans, so spans are consumed in rounds; all but the
+            // last round is rare (a lease is 65,536 ordinals wide).
+            let rounds = allocations
+                .iter()
+                .map(|(_, _, spans)| spans.len())
+                .max()
+                .unwrap_or(0);
+            let mut consumed = vec![0_usize; allocations.len()];
+
+            for round in 0..rounds {
+                // Seal any shard whose lease rolled before its ordinals are used.
+                for (shard, _, spans) in &allocations {
+                    let Some(span) = spans.get(round) else {
+                        continue;
+                    };
+                    let lease_changed = self.shards[*shard]
+                        .current_lease_base
+                        .is_some_and(|base| base != span.lease_base);
+                    if lease_changed {
+                        self.flush_shard(cx, *shard, LifecycleTrigger::LeaseBoundary)
+                            .await?;
+                    }
+                    self.shards[*shard].current_lease_base = Some(span.lease_base);
+                }
+
+                // Shared-nothing parallel accumulate. Disjoint `&mut` shard
+                // borrows are carved out in ascending shard order, scoped so
+                // the shard-vector borrow ends before the seal pass below.
+                let outcomes = {
+                    let mut work: Vec<(&mut ScribeShardState, &[IndexableDocument], DocIdSpan)> =
+                        Vec::with_capacity(allocations.len());
+                    let mut rest: &mut [ScribeShardState] = &mut self.shards;
+                    let mut taken = 0_usize;
+                    for (index, (shard, start, spans)) in allocations.iter().enumerate() {
+                        let Some(span) = spans.get(round) else {
+                            continue;
+                        };
+                        let (_, tail) = std::mem::take(&mut rest).split_at_mut(*shard - taken);
+                        let (head, tail) = tail.split_at_mut(1);
+                        rest = tail;
+                        taken = *shard + 1;
+                        let begin = *start + consumed[index];
+                        let end = begin + span.len as usize;
+                        work.push((&mut head[0], &wave[begin..end], *span));
+                    }
+                    work.into_par_iter()
+                        .map(|(state, assigned, span)| accumulate_shard_run(state, assigned, span))
+                        .collect::<Vec<_>>()
+                };
+                for outcome in outcomes {
+                    let (bytes_used, bytes_reserved) = outcome?;
+                    arena_bytes_used_high_water = arena_bytes_used_high_water.max(bytes_used);
+                    arena_bytes_reserved_high_water =
+                        arena_bytes_reserved_high_water.max(bytes_reserved);
+                }
+
+                for (index, (_, _, spans)) in allocations.iter().enumerate() {
+                    if let Some(span) = spans.get(round) {
+                        consumed[index] += span.len as usize;
+                    }
+                }
+
+                // Seal shards that filled their budget, or that still have a
+                // span waiting behind a lease boundary.
+                for (shard, _, spans) in &allocations {
+                    let Some(span) = spans.get(round) else {
+                        continue;
+                    };
+                    let boundary_pending = spans.len() > round + 1;
+                    let budget_reached = self.shards[*shard]
+                        .accumulator
+                        .should_flush(self.config.scribe_shard_budget_bytes);
+                    if !boundary_pending && !budget_reached {
+                        continue;
+                    }
+                    let trigger = if boundary_pending {
+                        LifecycleTrigger::LeaseBoundary
+                    } else {
+                        LifecycleTrigger::ArenaBudget
+                    };
+                    self.flush_shard(cx, *shard, trigger).await?;
+                    if !boundary_pending {
+                        self.shards[*shard].current_lease_base = Some(span.lease_base);
+                    }
+                    if allow_automatic_publication {
+                        self.publish_bulk_cadence_if_due(cx).await?;
+                    }
+                }
+            }
+        }
+
+        Ok((
+            arena_bytes_used_high_water,
+            arena_bytes_reserved_high_water,
+        ))
     }
 
     /// Seal the scalar accumulator and atomically publish the next MANIFEST.
@@ -5850,6 +6106,66 @@ fn next_lease_boundary(watermark: u64) -> Result<u64, QuillIndexError> {
         .checked_add(lease_size - remainder)
         .filter(|boundary| *boundary <= MAX_GLOBAL_DOCID_EXCLUSIVE)
         .ok_or_else(|| invalid_state("manifest document-id watermark cannot reach another lease"))
+}
+
+/// Minimum documents a shard must receive to be worth enrolling in a fan-out.
+///
+/// Each participating shard seals its own segment, and every segment carries a
+/// full term dictionary, so a wide split of a small batch buys parallelism at
+/// the cost of index bytes and search-time segment count. Batches smaller than
+/// twice this stay on the single-shard path.
+const FANOUT_MIN_SHARD_DOCUMENTS: usize = 256;
+
+/// Documents handed to one shard per parallel wave. A seal cannot be awaited
+/// from inside the parallel region, so this bounds how far a shard's arena can
+/// exceed `scribe_shard_budget_bytes` before the between-wave seal check runs.
+const FANOUT_WAVE_SHARD_DOCUMENTS: usize = 256;
+
+/// Accumulate one contiguous run of documents into one shard.
+///
+/// Shared-nothing: touches only `state`, so shards run concurrently. Admission
+/// and docid allocation have already happened on the serial path.
+fn accumulate_shard_run(
+    state: &mut ScribeShardState,
+    documents: &[IndexableDocument],
+    span: DocIdSpan,
+) -> Result<(usize, usize), QuillIndexError> {
+    let mut bytes_used_high_water = 0_usize;
+    let mut bytes_reserved_high_water = 0_usize;
+    for (offset, document) in documents.iter().enumerate() {
+        let span_offset = u32::try_from(offset)
+            .map_err(|_| invalid_state("fan-out document offset does not fit u32"))?;
+        let doc_ord = span
+            .ord_start
+            .checked_add(span_offset)
+            .ok_or_else(|| invalid_state("lease-relative document ordinal overflow"))?;
+        let global_docid = span
+            .lease_base
+            .checked_add(u64::from(doc_ord))
+            .filter(|docid| *docid < MAX_GLOBAL_DOCID_EXCLUSIVE)
+            .ok_or_else(|| invalid_state("global Q1 document-id space exhausted"))?;
+        let metadata = canonical_metadata(&document.metadata)?;
+        let title = document.title.as_deref().unwrap_or("");
+        let indexed = [
+            IndexedFieldValue::new(ID_FIELD, &document.id),
+            IndexedFieldValue::new(CONTENT_FIELD, &document.content),
+            IndexedFieldValue::new(TITLE_FIELD, title),
+        ];
+        let numeric = [IndexedNumericValue::u64(ORD_FIELD, global_docid)];
+        let stored = [StoredFieldValue::new(METADATA_FIELD, &metadata)];
+        let accumulated = state
+            .accumulator
+            .add_document_with_values(doc_ord, &indexed, &numeric, &stored)?;
+        bytes_used_high_water = bytes_used_high_water.max(accumulated.bytes_used);
+        bytes_reserved_high_water = bytes_reserved_high_water.max(accumulated.bytes_reserved);
+        let canonical_content = canonical_document_preimage(document, &metadata)?;
+        state.identities.push(PendingIdentity {
+            doc_ord,
+            document_id: document.id.clone(),
+            canonical_content,
+        });
+    }
+    Ok((bytes_used_high_water, bytes_reserved_high_water))
 }
 
 fn canonical_metadata(
@@ -14935,6 +15251,119 @@ mod tests {
                     "a resolved multi-shard writer must consume independent Q1 leases",
                 );
             }
+        });
+    }
+
+    /// Build a batch large enough that every shard clears the per-shard floor
+    /// and the writer takes the fan-out path.
+    fn fanout_corpus(prefix: &str, count: usize) -> Vec<IndexableDocument> {
+        (0..count)
+            .map(|ordinal| {
+                IndexableDocument::new(
+                    format!("{prefix}-{ordinal}"),
+                    format!("shared corpus term ordinal {ordinal}"),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn within_batch_fanout_agrees_with_the_retained_single_shard_path() {
+        run_with_cx(|cx| async move {
+            const DOCUMENTS: usize = 2_048;
+            let documents = fanout_corpus("fanout", DOCUMENTS);
+
+            // Fan-out arm: one batch partitioned across several shards.
+            let fanout_config = QuillConfig {
+                max_ingest_shards: 4,
+                ..QuillConfig::default()
+            };
+            let detected = std::thread::available_parallelism().map_or(1, usize::from);
+            let fanout_shards = fanout_config.resolved_ingest_shards(detected);
+            let mut fanout = QuillIndex::in_memory(fanout_config).expect("fan-out memory index");
+            fanout
+                .index_documents(&cx, &documents)
+                .await
+                .expect("fan out one batch");
+            fanout.commit(&cx).await.expect("publish fanned-out batch");
+
+            // Control arm: the byte-identical single-shard path, same corpus.
+            let serial_config = QuillConfig {
+                deterministic_ingest: true,
+                ..QuillConfig::default()
+            };
+            let mut serial = QuillIndex::in_memory(serial_config).expect("serial memory index");
+            serial
+                .index_documents(&cx, &documents)
+                .await
+                .expect("index one serial batch");
+            serial.commit(&cx).await.expect("publish serial batch");
+
+            // Every document survives the partition exactly once, and the two
+            // arms agree as sets.
+            let fanned = fanout
+                .search_paginated(&cx, "corpus", DOCUMENTS, 0, true)
+                .expect("fan-out query");
+            let control = serial
+                .search_paginated(&cx, "corpus", DOCUMENTS, 0, true)
+                .expect("control query");
+            assert_eq!(
+                fanned.hits.len(),
+                DOCUMENTS,
+                "fan-out must not drop or duplicate a document",
+            );
+            assert_eq!(control.hits.len(), DOCUMENTS);
+            assert_eq!(fanned.total_count, control.total_count);
+
+            let mut fanned_ids = fanned
+                .hits
+                .iter()
+                .map(|hit| hit.document_id.clone())
+                .collect::<Vec<_>>();
+            let mut control_ids = control
+                .hits
+                .iter()
+                .map(|hit| hit.document_id.clone())
+                .collect::<Vec<_>>();
+            fanned_ids.sort();
+            control_ids.sort();
+            assert_eq!(fanned_ids, control_ids, "fan-out changed the result set");
+
+            assert_pairwise_disjoint_manifest(
+                fanout.snapshot().loaded_manifest().manifest.segments.as_slice(),
+            );
+            if fanout_shards > 1 {
+                assert!(
+                    fanout.snapshot().segments().len() > 1,
+                    "a fanned-out batch must seal a segment per participating shard",
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn within_batch_fanout_rejects_a_duplicate_id_inside_one_batch() {
+        run_with_cx(|cx| async move {
+            const DOCUMENTS: usize = 2_048;
+            let mut documents = fanout_corpus("fanout-dup", DOCUMENTS);
+            // Collide the last document with the first, so the collision spans
+            // two different shards of the same batch.
+            documents[DOCUMENTS - 1] =
+                IndexableDocument::new("fanout-dup-0", "shared corpus term ordinal 0");
+
+            let config = QuillConfig {
+                max_ingest_shards: 4,
+                ..QuillConfig::default()
+            };
+            let mut index = QuillIndex::in_memory(config).expect("fan-out memory index");
+            let error = index
+                .index_documents(&cx, &documents)
+                .await
+                .expect_err("a duplicate id inside one fanned-out batch must be rejected");
+            assert!(
+                error.to_string().contains("duplicate live document id"),
+                "unexpected error: {error}",
+            );
         });
     }
 
