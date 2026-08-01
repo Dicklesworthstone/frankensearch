@@ -89,7 +89,22 @@ scripts/check_feature_matrix_overlay.sh \
 
 Use a new, empty artifact directory for every run. A full gate uses the same
 arguments with `--mode gate`. A single lane can be explored with `--lane`, but
-only an all-lane gate can set `claim.release_admissible` to `true`.
+only an all-lane gate can set `claim.source_receipt_admissible` to `true`.
+That field means only that the frozen prospective source tree satisfied the
+reviewed QG-10 source-workspace contract. It never authorizes the facade flip:
+every v2 receipt fixes `flip_authorized` to `false`, identifies `bd-3beo` as
+the authorization owner, makes no performance or publication claim, and
+records semantic foundation F as outside this pre-Batch4 scope.
+
+Receipt verification derives that claim from the enclosing mode, selected
+lane, outcome, and clean-state booleans instead of trusting claim fields. For
+a source-admissible receipt it also replays the bound canonical patch against
+the bound base commit, requires the resulting Git tree and synthetic commit to
+match, binds the executing validator and reviewed contract bytes, checks the
+exact 16-lane receipt census and six execution logs per lane, and requires the
+exact global, lane-receipt, and public-API artifact set. Empty, partial,
+duplicated, unreviewed, or identity-mismatched evidence therefore fails
+closed in both gate and later `--mode verify` invocations.
 
 The overlay matrix is exhaustive and ordered:
 
