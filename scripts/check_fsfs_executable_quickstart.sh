@@ -101,6 +101,17 @@ fi
 BIN_SHA256="$(sha256sum "${FSFS_BIN}" | cut -d' ' -f1)"
 GIT_REV="$(git -C "${ROOT_DIR}" rev-parse HEAD 2>/dev/null || echo unknown)"
 
+# ── 1b. Forbidden-runtime graph proof (AGENTS.md: asupersync only, no tokio) ──
+echo "[gate] dependency-graph check: Tokio-family crates must be absent"
+cargo tree -p frankensearch-fsfs --features embedded-models --edges normal \
+  >"${WORK_DIR}/fsfs-dep-tree.txt" 2>"${WORK_DIR}/fsfs-dep-tree.err" \
+  || fail "SETUP" "cargo tree failed for the shipped feature graph"
+if grep -nE '(^|[^a-z-])(tokio|hyper|reqwest|axum|tower|async-std|smol) v[0-9]' \
+    "${WORK_DIR}/fsfs-dep-tree.txt" >"${WORK_DIR}/forbidden-crates.txt"; then
+  fail "FORBIDDEN-RUNTIME" \
+    "Tokio-family crate(s) entered the shipped fsfs graph: $(head -3 "${WORK_DIR}/forbidden-crates.txt" | tr '\n' ' ')"
+fi
+
 # ── 2. Deterministic fixture corpus with one unambiguous best answer ──
 CORPUS_DIR="${WORK_DIR}/corpus"
 INDEX_DIR="${WORK_DIR}/index"
