@@ -8297,3 +8297,170 @@ on CV.
   were added during hostile review. Full narrative and consolidated raw rows:
   `docs/evidence/e8h/p8-retry-local-qg2-span-inline-20260730.md` and
   `docs/evidence/e8h/p8-retry-local-qg2-span-inline-raw-20260730.json`.
+
+## 2026-08-01 — KEEP: Quill phrase position runs decode once — 21.85x self-speedup at 100k (`bd-qg6-phrase-position-decode-once-zcxk3`, YellowSparrow)
+
+- **Comparison class: SELF-SPEEDUP.** The keep decision compares Quill before
+  and after one narrow phrase-position decode lever. This is maintenance
+  evidence only. It does **not** activate QG-6, change a ratchet, authorize the
+  default-engine flip, or establish Quill/Tantivy parity.
+- **Exact source identities:** control
+  `0ed5be9d67afcb8ead092801cf7fb564062e3a8c`; production candidate
+  `11c42096aee1dc4d1c3ec77f22d8270e297942e0`; test-only landing head
+  `bd800c41c1146775e9cfee87a432b9b92e3e4b5d`. The second commit changes only
+  how the independent-block-seam regression constructs its fixture, so the
+  executing production candidate is exactly `11c42096`.
+- **Lever:** the old owned phrase materializer called `positions_for_ordinal`
+  for every posting. Each call restarted a POSITIONS reader at that ordinal's
+  block boundary, consumed every preceding run in the block, then decoded the
+  target run into a new row, producing triangular rescans across ordinals. The
+  candidate instead traverses paired postings/positions once; its transactional
+  owned decode advances the reader after success, and a consumed marker prevents
+  `next`/forward `advance` from consuming that just-decoded run again. Immutable
+  replay, unpositioned callers, typed corruption, fuel checkpoints, and public
+  cursor contracts are unchanged.
+- **Machine and execution:** strict-remote RCH job
+  `j-29956918973825140` on `vmi1152480`, reported CPU `AMD EPYC Processor
+  (with IBPB)`, `x86_64-linux`, 10 available CPUs, and
+  `RAYON_NUM_THREADS=1`. This VPS is a diagnostic machine class, not the Apple
+  Silicon or high-core-count AMD reference hardware required for campaign
+  promotion.
+- **First executing ELF:** SHA-256
+  `115546e8aa9ef52c8dbf0b923b26d22e6856b66847c67ba3e0a9ada91776e35b`,
+  built with `release-perf` (`opt-level=3`, thin LTO, one codegen unit). One
+  process linked both exact Quill revisions under distinct crate names plus a
+  runtime-asserted linked incumbent Tantivy v0.26.1; its linked-version receipt
+  reported `index_format v7`.
+- **Workload and schedule:** pinned `SyntheticCorpus` seed
+  `0x5155494c4c504552`, 100,000 documents, vocabulary 8,192, Zipf S1.1,
+  maximum document size 4,096 bytes, four quoted two-term phrase queries,
+  top-10, and 15 rounds per query. Every invocation received a unique
+  whitespace suffix. Each round rotated the interleaved order of control A,
+  candidate, control B, and Tantivy. Control B/control A is the same-invocation
+  A/A null. Point estimates are empirical medians of per-round paired ratios;
+  95% CIs are ordinary deterministic 10,000-resample percentile-bootstrap
+  intervals over those ratios. The pooled CI is non-hierarchical across all 60
+  individual samples. Build times (not part of the query verdict) were
+  4,672.642 ms control, 5,057.470 ms candidate, and 3,332.090 ms Tantivy.
+- **Absolute p50 latency (ms):**
+
+  | phrase | control A | candidate | control B | Tantivy |
+  |---|---:|---:|---:|---:|
+  | `term00001 term00002` | 1,145.747 | 67.126 | 1,181.914 | 19.445 |
+  | `term00002 term00003` | 1,172.588 | 54.246 | 1,206.178 | 13.166 |
+  | `term00003 term00004` | 1,171.324 | 42.822 | 1,143.068 | 9.947 |
+  | `term00005 term00006` | 891.350 | 32.655 | 879.318 | 6.998 |
+
+- **Per-query candidate/control ratios:** 0.057525
+  [0.055690, 0.062253], 0.047089 [0.045087, 0.050173], 0.035988
+  [0.034311, 0.039159], and 0.038863 [0.034104, 0.053112]. The executing
+  harness emitted `null_contains_one=true` and
+  `effect_ci_below_null_ci=true` for all four query groups.
+- **Pooled result (60 paired samples per arm):** candidate/control latency
+  median **0.045774 [0.040337, 0.050173]**, p5-p95
+  [0.032413, 0.079339], or **21.85x faster** at the median. The pooled
+  control-B/control-A null is **1.006872 [0.993514, 1.022058]**. The effect
+  and null intervals are disjoint by an order of magnitude.
+- **Cache and parity receipts:** all 188 expected Quill lookups were observed
+  as misses; hits, disabled lookups, and not-checked lookups were all zero.
+  Candidate and control returned identical ordered top-10 document IDs on
+  every warmup and timed query. Tantivy returned the same ordered IDs for all
+  four groups and every timed round.
+- **Incumbent disclosure:** candidate/Tantivy latency remains **4.233582
+  [3.872581, 4.584200]** pooled, so the optimized Quill phrase path is still
+  about 4.23x slower than genuine linked Tantivy on this slice. That honest
+  remaining gap is why this is a self-speedup keep, not a QG-6 result.
+- **Immediate same-worker reproduction:** strict-remote job
+  `j-29956918973825151` repeated the exact source identities, harness command,
+  100,000-document corpus, four queries, 15-round rotation, cache busting,
+  `RAYON_NUM_THREADS=1`, and linked-incumbent contract on the same
+  `vmi1152480` worker/machine/10-CPU environment. Its freshly rebuilt ELF was
+  `6cd356a50fc1c13f53cbf6c280ee4463879b5f45dd147e6fe17c9e81004249bc`;
+  the linked-version receipt again reported `tantivy v0.26.1, index_format
+  v7`. The exact Cargo harness command was `cargo run --profile release-perf
+  --manifest-path .scratch/qg6-phrase-paired-20260801/Cargo.toml -- --count
+  100000 --rounds 15`. The first invocation's individual sample rows were not
+  persisted; its preserved summaries are recorded above. The reproduction's
+  complete printed meta, build, arm-summary, ratio, decision, and cache
+  receipts are preserved field-for-field below, with tabs normalized to spaces
+  for Markdown (individual timed sample rows are not repeated):
+
+  ```text
+  meta control_sha 0ed5be9d67afcb8ead092801cf7fb564062e3a8c
+  meta candidate_production_sha 11c42096aee1dc4d1c3ec77f22d8270e297942e0
+  meta executable_sha256 6cd356a50fc1c13f53cbf6c280ee4463879b5f45dd147e6fe17c9e81004249bc
+  meta linked_tantivy tantivy v0.26.1, index_format v7
+  meta target x86_64-linux
+  meta cpu_model AMD EPYC Processor (with IBPB)
+  meta available_parallelism 10
+  meta document_count 100000
+  meta rounds 15
+  meta rayon_num_threads 1
+  build control_ms 4337.662
+  build candidate_ms 5079.036
+  build tantivy_ms 3456.113
+  summary arm=control_a group=0 p50_ns=1258495149 p95_ns=1419278695 p99_ns=1464172399 min_ns=1134408700 max_ns=1464172399
+  summary arm=control_a group=1 p50_ns=1254801018 p95_ns=1394705389 p99_ns=1420186890 min_ns=1164052133 max_ns=1420186890
+  summary arm=control_a group=2 p50_ns=1242328560 p95_ns=1389834932 p99_ns=1550805198 min_ns=1143976012 max_ns=1550805198
+  summary arm=control_a group=3 p50_ns=988994721 p95_ns=1151737175 p99_ns=1238715184 min_ns=878825556 max_ns=1238715184
+  summary arm=candidate group=0 p50_ns=71128938 p95_ns=93324621 p99_ns=122224773 min_ns=61117971 max_ns=122224773
+  summary arm=candidate group=1 p50_ns=53347017 p95_ns=84031005 p99_ns=110009415 min_ns=40729283 max_ns=110009415
+  summary arm=candidate group=2 p50_ns=46398525 p95_ns=70822270 p99_ns=149666063 min_ns=34790480 max_ns=149666063
+  summary arm=candidate group=3 p50_ns=31883135 p95_ns=55573515 p99_ns=58119880 min_ns=25699855 max_ns=58119880
+  summary arm=control_b group=0 p50_ns=1203624574 p95_ns=1306503174 p99_ns=1415108931 min_ns=1102336308 max_ns=1415108931
+  summary arm=control_b group=1 p50_ns=1273286638 p95_ns=1372801162 p99_ns=1392402493 min_ns=1167128022 max_ns=1392402493
+  summary arm=control_b group=2 p50_ns=1225399086 p95_ns=1323728609 p99_ns=1366154381 min_ns=1094601672 max_ns=1366154381
+  summary arm=control_b group=3 p50_ns=1004213114 p95_ns=1150162066 p99_ns=1450400639 min_ns=896221978 max_ns=1450400639
+  summary arm=tantivy group=0 p50_ns=18715433 p95_ns=34365346 p99_ns=38733798 min_ns=16267414 max_ns=38733798
+  summary arm=tantivy group=1 p50_ns=13345076 p95_ns=32697359 p99_ns=68694620 min_ns=11588718 max_ns=68694620
+  summary arm=tantivy group=2 p50_ns=10958488 p95_ns=15548221 p99_ns=16288504 min_ns=8737787 max_ns=16288504
+  summary arm=tantivy group=3 p50_ns=7045374 p95_ns=15258209 p99_ns=56699526 min_ns=6306743 max_ns=56699526
+  ratio group=0 control_a_over_control_b=1.045588 control_over_candidate=17.307440 candidate_over_tantivy=3.800550 tantivy_order_matches=true
+  paired metric=candidate_over_control group=0 median=0.055443 ci95_low=0.051695 ci95_high=0.060854 p5=0.048564 p95=0.077584
+  paired metric=control_b_over_control_a_null group=0 median=0.940039 ci95_low=0.910137 ci95_high=1.000911 p5=0.852693 p95=1.014395
+  paired metric=candidate_over_tantivy group=0 median=3.489711 ci95_low=3.024344 ci95_high=4.332849 p5=1.843907 p95=5.736906
+  decision group=0 null_contains_one=true effect_ci_below_null_ci=true
+  ratio group=1 control_a_over_control_b=0.985482 control_over_candidate=23.694742 candidate_over_tantivy=3.997506 tantivy_order_matches=true
+  paired metric=candidate_over_control group=1 median=0.043965 ci95_low=0.041013 ci95_high=0.047925 p5=0.039172 p95=0.059169
+  paired metric=control_b_over_control_a_null group=1 median=1.018600 ci95_low=0.985977 ci95_high=1.047439 p5=0.927661 p95=1.100103
+  paired metric=candidate_over_tantivy group=1 median=4.008068 ci95_low=3.625796 ci95_high=4.584589 p5=3.052008 p95=5.123871
+  decision group=1 null_contains_one=true effect_ci_below_null_ci=true
+  ratio group=2 control_a_over_control_b=1.013815 control_over_candidate=26.592738 candidate_over_tantivy=4.234026 tantivy_order_matches=true
+  paired metric=candidate_over_control group=2 median=0.036190 ci95_low=0.033721 ci95_high=0.043726 p5=0.028918 p95=0.061909
+  paired metric=control_b_over_control_a_null group=2 median=0.958571 ci95_low=0.917245 ci95_high=1.048972 p5=0.853575 p95=1.097350
+  paired metric=candidate_over_tantivy group=2 median=4.326269 ci95_low=3.472104 ci95_high=5.150850 p5=2.964191 p95=5.667976
+  decision group=2 null_contains_one=true effect_ci_below_null_ci=true
+  ratio group=3 control_a_over_control_b=0.984845 control_over_candidate=31.258028 candidate_over_tantivy=4.525400 tantivy_order_matches=true
+  paired metric=candidate_over_control group=3 median=0.032978 ci95_low=0.030363 ci95_high=0.033793 p5=0.028258 p95=0.050934
+  paired metric=control_b_over_control_a_null group=3 median=0.998632 ci95_low=0.971421 ci95_high=1.085658 p5=0.894977 p95=1.173358
+  paired metric=candidate_over_tantivy group=3 median=4.097719 ci95_low=2.785226 ci95_high=4.879725 p5=2.089573 p95=7.312987
+  decision group=3 null_contains_one=true effect_ci_below_null_ci=true
+  paired metric=candidate_over_control group=pooled median=0.043616 ci95_low=0.038855 ci95_high=0.047925 p5=0.028435 p95=0.077584
+  paired metric=control_b_over_control_a_null group=pooled median=0.995678 ci95_low=0.957449 ci95_high=1.009403 p5=0.852693 p95=1.176434
+  paired metric=candidate_over_tantivy group=pooled median=4.022228 ci95_low=3.625796 ci95_high=4.326269 p5=1.843907 p95=6.707800
+  decision group=pooled null_contains_one=true effect_ci_below_null_ci=true
+  cache_receipt expected_misses=188 observed_misses=188 hits=0 disabled=0 not_checked=0
+  ```
+
+  This independent invocation reproduces the first run without pooling:
+  candidate/control is **0.043616 [0.038855, 0.047925]**, or **22.93x
+  faster**; the A/A null is **0.995678 [0.957449, 1.009403]**; and
+  candidate/Tantivy is **4.022228 [3.625796, 4.326269]**. Every per-query
+  and pooled decision receipt is true, all 188 Quill lookups are attested
+  misses, all other cache states are zero, and ordered candidate/control and
+  Tantivy document-ID parity holds. This confirms the self-speedup direction
+  and magnitude while independently confirming the roughly 4x incumbent gap;
+  it does not upgrade the comparison class, activate QG-6, change a ratchet,
+  or authorize the engine flip.
+- **Correctness and landing gates:** hostile peer review passed. Strict-remote
+  exact-head validation passed 512 runnable Quill unit tests (one scale test
+  ignored), 3 cancellation integration tests, and 2 doctests; workspace
+  `cargo check --workspace --all-targets` and workspace Clippy with
+  `-D warnings` passed. `cargo fmt --all -- --check` and `git diff --check`
+  passed. UBS scanned both changed Rust files with exit 0 and zero critical
+  findings; its warning/info census is inherited whole-file heuristic output,
+  not newly introduced findings.
+- **Decision: KEEP.** The production seam is unchanged after measurement.
+  QG-6 still requires its complete normative query-class matrix, reference
+  hardware, all gate receipts, and an independently admissible campaign
+  artifact; none is claimed here.
