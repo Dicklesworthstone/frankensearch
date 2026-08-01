@@ -3256,7 +3256,9 @@ impl QuillWriterState {
             let stored = [StoredFieldValue::new(METADATA_FIELD, &metadata)];
             state
                 .accumulator
-                .add_document_with_values(doc_ord, &indexed, &numeric, &stored)?;
+                .add_document_with_values_deferred_telemetry(
+                    doc_ord, &indexed, &numeric, &stored,
+                )?;
             let content_hash = canonical_document_content_hash(document, &metadata)?;
             state.identities.push(PendingIdentity {
                 doc_ord,
@@ -3391,6 +3393,10 @@ impl QuillWriterState {
                     .current_lease_base
                     .is_some_and(|base| base != span.lease_base);
                 if lease_changed {
+                    arena_bytes_used_high_water = arena_bytes_used_high_water
+                        .max(self.shards[shard_id].accumulator.bytes_used());
+                    arena_bytes_reserved_high_water = arena_bytes_reserved_high_water
+                        .max(self.shards[shard_id].accumulator.bytes_reserved());
                     self.flush_shard(cx, shard_id, LifecycleTrigger::LeaseBoundary)
                         .await?;
                 }
@@ -3434,13 +3440,11 @@ impl QuillWriterState {
                     ];
                     let numeric = [IndexedNumericValue::u64(ORD_FIELD, global_docid)];
                     let stored = [StoredFieldValue::new(METADATA_FIELD, &metadata)];
-                    let accumulated = self.shards[shard_id]
+                    self.shards[shard_id]
                         .accumulator
-                        .add_document_with_values(doc_ord, &indexed, &numeric, &stored)?;
-                    arena_bytes_used_high_water =
-                        arena_bytes_used_high_water.max(accumulated.bytes_used);
-                    arena_bytes_reserved_high_water =
-                        arena_bytes_reserved_high_water.max(accumulated.bytes_reserved);
+                        .add_document_with_values_deferred_telemetry(
+                            doc_ord, &indexed, &numeric, &stored,
+                        )?;
                     let content_hash = canonical_document_content_hash(document, &metadata)?;
                     self.shards[shard_id].identities.push(PendingIdentity {
                         doc_ord,
@@ -3454,6 +3458,10 @@ impl QuillWriterState {
                         .accumulator
                         .should_flush(self.config.scribe_shard_budget_bytes)
                     {
+                        arena_bytes_used_high_water = arena_bytes_used_high_water
+                            .max(self.shards[shard_id].accumulator.bytes_used());
+                        arena_bytes_reserved_high_water = arena_bytes_reserved_high_water
+                            .max(self.shards[shard_id].accumulator.bytes_reserved());
                         self.flush_shard(cx, shard_id, LifecycleTrigger::ArenaBudget)
                             .await?;
                         self.shards[shard_id].current_lease_base = Some(span.lease_base);
@@ -3463,6 +3471,10 @@ impl QuillWriterState {
                     }
                 }
                 if span_index + 1 < allocated.spans().len() {
+                    arena_bytes_used_high_water = arena_bytes_used_high_water
+                        .max(self.shards[shard_id].accumulator.bytes_used());
+                    arena_bytes_reserved_high_water = arena_bytes_reserved_high_water
+                        .max(self.shards[shard_id].accumulator.bytes_reserved());
                     self.flush_shard(cx, shard_id, LifecycleTrigger::LeaseBoundary)
                         .await?;
                     if allow_automatic_publication {
@@ -3470,6 +3482,10 @@ impl QuillWriterState {
                     }
                 }
             }
+            arena_bytes_used_high_water =
+                arena_bytes_used_high_water.max(self.shards[shard_id].accumulator.bytes_used());
+            arena_bytes_reserved_high_water = arena_bytes_reserved_high_water
+                .max(self.shards[shard_id].accumulator.bytes_reserved());
             debug_assert_eq!(document_index, documents.len());
             let visibility_due = self.unpublished_since.is_some_and(|started| {
                 started.elapsed() >= Duration::from_millis(self.config.max_visibility_lag_ms)
