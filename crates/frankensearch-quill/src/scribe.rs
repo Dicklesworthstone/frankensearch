@@ -1234,6 +1234,11 @@ impl TermInterner<ahash::RandomState> {
     pub fn new() -> Self {
         Self::with_hasher(ahash::RandomState::new())
     }
+
+    #[must_use]
+    pub(crate) fn with_arena_chunk_size(arena_chunk_size: usize) -> Self {
+        Self::with_hasher_and_arena_chunk_size(ahash::RandomState::new(), arena_chunk_size)
+    }
 }
 
 impl Default for TermInterner<ahash::RandomState> {
@@ -1245,8 +1250,12 @@ impl Default for TermInterner<ahash::RandomState> {
 impl<S: BuildHasher> TermInterner<S> {
     #[must_use]
     pub fn with_hasher(hasher: S) -> Self {
+        Self::with_hasher_and_arena_chunk_size(hasher, DEFAULT_ARENA_CHUNK_BYTES)
+    }
+
+    fn with_hasher_and_arena_chunk_size(hasher: S, arena_chunk_size: usize) -> Self {
         Self {
-            arena: ByteArena::default(),
+            arena: ByteArena::with_chunk_size(arena_chunk_size),
             spans: Vec::new(),
             buckets: HashMap::default(),
             hasher,
@@ -2037,6 +2046,24 @@ impl ColumnarAccumulator<FrankensearchTokenizer> {
     pub fn new(schema: SchemaDescriptor) -> Result<Self, QuillError> {
         Self::with_analyzer(schema, FrankensearchTokenizer::default())
     }
+
+    /// Create an empty accumulator whose term arena is sized for one bounded
+    /// shared-nothing worker rather than the scalar one-mebibyte default.
+    ///
+    /// Logical accounting and flush boundaries are independent of arena
+    /// capacity. This constructor lets the caller share scalar arena slack
+    /// across a wide parallel generation, subject to `ByteArena`'s 4 KiB
+    /// per-arena floor.
+    pub(crate) fn with_arena_chunk_size(
+        schema: SchemaDescriptor,
+        arena_chunk_size: usize,
+    ) -> Result<Self, QuillError> {
+        Self::with_analyzer_and_arena_chunk_size(
+            schema,
+            FrankensearchTokenizer::default(),
+            arena_chunk_size,
+        )
+    }
 }
 
 impl<A: TokenAnalyzer> ColumnarAccumulator<A> {
@@ -2053,6 +2080,14 @@ impl<A: TokenAnalyzer> ColumnarAccumulator<A> {
     /// dense-ID and field-shape invariants, or [`QuillError::Resource`] when
     /// the injected family does not implement every requested analyzer.
     pub fn with_analyzer(schema: SchemaDescriptor, analyzer: A) -> Result<Self, QuillError> {
+        Self::with_analyzer_and_arena_chunk_size(schema, analyzer, DEFAULT_ARENA_CHUNK_BYTES)
+    }
+
+    fn with_analyzer_and_arena_chunk_size(
+        schema: SchemaDescriptor,
+        analyzer: A,
+        arena_chunk_size: usize,
+    ) -> Result<Self, QuillError> {
         schema.validate()?;
         if let Some((field, requested)) = schema.fields.iter().find_map(|field| {
             let FieldKind::Text {
@@ -2099,7 +2134,7 @@ impl<A: TokenAnalyzer> ColumnarAccumulator<A> {
             .collect();
         Ok(Self {
             schema,
-            terms: TermInterner::new(),
+            terms: TermInterner::with_arena_chunk_size(arena_chunk_size),
             fields,
             numeric_fields,
             stored_fields,
