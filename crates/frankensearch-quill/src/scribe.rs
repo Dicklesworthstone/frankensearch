@@ -2191,39 +2191,6 @@ impl<A: TokenAnalyzer> ColumnarAccumulator<A> {
         numeric_values: &[IndexedNumericValue],
         stored_values: &[StoredFieldValue<'_>],
     ) -> Result<DocumentAccumulation, AccumulatorError> {
-        self.add_document_with_values_inner::<true>(doc_ord, values, numeric_values, stored_values)
-    }
-
-    /// Production ingest path that defers retained-capacity telemetry to the
-    /// surrounding batch or flush boundary.
-    ///
-    /// Reserved capacity is monotone between accumulator resets. Computing it
-    /// once immediately before every reset and once after the batch therefore
-    /// preserves the exact high-water mark without walking every retained
-    /// column and arena chunk after every document.
-    ///
-    /// # Errors
-    ///
-    /// Returns the same validation and capacity errors as
-    /// [`Self::add_document_with_values`].
-    pub(crate) fn add_document_with_values_deferred_reserved(
-        &mut self,
-        doc_ord: u32,
-        values: &[IndexedFieldValue<'_>],
-        numeric_values: &[IndexedNumericValue],
-        stored_values: &[StoredFieldValue<'_>],
-    ) -> Result<usize, AccumulatorError> {
-        self.add_document_with_values_inner::<false>(doc_ord, values, numeric_values, stored_values)
-            .map(|accumulated| accumulated.bytes_used)
-    }
-
-    fn add_document_with_values_inner<const MEASURE_RESERVED: bool>(
-        &mut self,
-        doc_ord: u32,
-        values: &[IndexedFieldValue<'_>],
-        numeric_values: &[IndexedNumericValue],
-        stored_values: &[StoredFieldValue<'_>],
-    ) -> Result<DocumentAccumulation, AccumulatorError> {
         let accumulate_span = tracing::info_span!(
             target: crate::tracing_conventions::TARGET,
             crate::tracing_conventions::SCRIBE_ACCUMULATE,
@@ -2567,7 +2534,7 @@ impl<A: TokenAnalyzer> ColumnarAccumulator<A> {
         self.document_ords.push(doc_ord);
         self.last_doc_ord = Some(doc_ord);
         let arena_bytes_used = self.bytes_used();
-        let arena_bytes_reserved = MEASURE_RESERVED.then(|| self.bytes_reserved());
+        let arena_bytes_reserved = self.bytes_reserved();
         accumulate_span.record(
             "doc_count",
             u64::try_from(self.document_ords.len()).unwrap_or(u64::MAX),
@@ -2583,36 +2550,24 @@ impl<A: TokenAnalyzer> ColumnarAccumulator<A> {
             "arena_bytes_used_high_water",
             u64::try_from(arena_bytes_used).unwrap_or(u64::MAX),
         );
-        if let Some(arena_bytes_reserved) = arena_bytes_reserved {
-            accumulate_span.record(
-                "arena_bytes_reserved_high_water",
-                u64::try_from(arena_bytes_reserved).unwrap_or(u64::MAX),
-            );
-            tracing::info!(
-                target: crate::tracing_conventions::TARGET,
-                phase = "accumulate.complete",
-                doc_count = self.document_ords.len(),
-                admitted_tokens,
-                oversized_tokens,
-                arena_bytes_used,
-                arena_bytes_reserved,
-                "scalar document accumulated"
-            );
-        } else {
-            tracing::info!(
-                target: crate::tracing_conventions::TARGET,
-                phase = "accumulate.complete",
-                doc_count = self.document_ords.len(),
-                admitted_tokens,
-                oversized_tokens,
-                arena_bytes_used,
-                "scalar document accumulated with reserved telemetry deferred"
-            );
-        }
+        accumulate_span.record(
+            "arena_bytes_reserved_high_water",
+            u64::try_from(arena_bytes_reserved).unwrap_or(u64::MAX),
+        );
+        tracing::info!(
+            target: crate::tracing_conventions::TARGET,
+            phase = "accumulate.complete",
+            doc_count = self.document_ords.len(),
+            admitted_tokens,
+            oversized_tokens,
+            arena_bytes_used,
+            arena_bytes_reserved,
+            "scalar document accumulated"
+        );
         Ok(DocumentAccumulation {
             admitted_tokens,
             oversized_tokens,
-            bytes_reserved: arena_bytes_reserved.unwrap_or_default(),
+            bytes_reserved: arena_bytes_reserved,
             bytes_used: arena_bytes_used,
         })
     }
