@@ -18,8 +18,8 @@ use frankensearch_core::LexicalSearch;
 
 use crate::GauntletError;
 use crate::artifact::{
-    ArtifactLexicalContractEvidence, ArtifactObject, ArtifactStore, CampaignArtifactContext,
-    GauntletProducerBuildIdentity,
+    ArtifactDivergenceBinding, ArtifactLexicalContractEvidence, ArtifactObject, ArtifactStore,
+    CampaignArtifactContext, GauntletProducerBuildIdentity, OBJECT_HASH_SCHEME_V7_SHA256,
 };
 use crate::comparator::{
     ComparatorConfig, ComparisonReport, ComparisonStatus, Divergence, DivergenceClass,
@@ -47,9 +47,14 @@ use crate::version_contract::oracle_version_contract;
 /// Schema version for deterministic campaign reports.
 pub const CAMPAIGN_REPORT_SCHEMA_VERSION: u32 = 6;
 /// Schema version for the append-only machine-readable Divergence Register.
-pub const DIVERGENCE_REGISTER_LEDGER_SCHEMA_VERSION: u32 = 1;
+pub const DIVERGENCE_REGISTER_LEDGER_SCHEMA_VERSION: u32 = 2;
+const LEGACY_DIVERGENCE_REGISTER_LEDGER_SCHEMA_VERSION_V1: u32 = 1;
 /// Redaction policy required by committed Divergence Register evidence.
 pub const DIVERGENCE_REGISTER_REDACTION_POLICY_VERSION: &str = "quill-divergence-redaction-v1";
+/// Frozen seeded-class policy reserved for the future verified terminal gate.
+pub const DIVERGENCE_PREDICTION_POLICY_VERSION: &str = "quill-divergence-predictions-v1";
+/// Canonical ordered prediction-policy receipt for future verified evidence.
+pub const DIVERGENCE_PREDICTION_POLICY_PREIMAGE: &str = "quill-divergence-predictions-v1;required=score_epsilon,tie_order,snippet_window,glob_expansion_limit,stats_semantics,oversized_query_token";
 /// Canonical preimage for the default shipping lexical analyzer protocol.
 pub const DEFAULT_ANALYZER_CONTRACT_PREIMAGE: &str =
     "v1;tokenizer=frankensearch_default;split=unicode_alphanumeric;lowercase=unicode_to_lowercase";
@@ -75,13 +80,16 @@ const LEXICAL_INDEX_IDENTITY_DOMAIN: &[u8] = b"frankensearch/quill/lexical-index
 const CAMPAIGN_REPORT_HASH_DOMAIN: &[u8] = b"frankensearch/quill/campaign-report/v6\0";
 const DIVERGENCE_REGISTRY_HASH_DOMAIN: &[u8] = b"frankensearch/quill/divergence-registry/v1\0";
 const DIVERGENCE_REGISTER_LEDGER_HASH_DOMAIN: &[u8] =
-    b"frankensearch/quill/divergence-register-ledger/v1\0";
+    b"frankensearch/quill/divergence-register-ledger/v2\0";
+const DIVERGENCE_PREDICTION_POLICY_HASH_DOMAIN: &[u8] =
+    b"frankensearch/quill/divergence-prediction-policy/v1\0";
 const MAX_DIVERGENCE_REGISTRY_ENTRIES: usize = 1_024;
 const MAX_DIVERGENCE_REGISTER_EVENTS: usize = 4_096;
 const MAX_DIVERGENCE_REGISTER_PROSE_BYTES: usize = 64 * 1024;
 const MAX_DIVERGENCE_REVIEWER_BYTES: usize = 1_024;
 const MAX_DIVERGENCE_REGISTRY_TEXT_BYTES: usize = 16 * 1024 * 1024;
 const MAX_DIVERGENCE_REGISTER_MARKER_BYTES: usize = 256;
+const DIVERGENCE_ARTIFACT_OBJECT_SCHEMA_VERSION_V7: u32 = 7;
 const MAX_CAMPAIGN_REASON_BYTES: usize = 4 * 1024;
 const MAX_CAMPAIGN_POINTER_BYTES: usize = 1024 * 1024;
 const MAX_MISMATCH_GROUPS: usize = MAX_QUERY_CASES;
@@ -535,6 +543,10 @@ fn is_bounded_register_text(value: &str, max_bytes: usize) -> bool {
         && !value.chars().any(char::is_control)
 }
 
+fn is_bounded_register_ascii_text(value: &str, max_bytes: usize) -> bool {
+    is_bounded_register_text(value, max_bytes) && value.is_ascii()
+}
+
 fn validate_registry_bounds(entries: &[DivergenceRegisterEntry]) -> Result<(), GauntletError> {
     let aggregate_bytes = entries
         .iter()
@@ -600,15 +612,26 @@ pub struct DivergenceRegisterEventHeader {
     pub recorded_at: String,
 }
 
-/// Exact revisions needed to reproduce one observed divergence.
+/// Version-routed producer and oracle identity for one observation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct DivergenceRevisionSet {
-    pub subject_git_revision: String,
-    pub oracle_git_revision: String,
-    pub corpus_manifest_sha256: String,
-    pub query_manifest_sha256: String,
-    pub generator_revision: String,
+#[serde(untagged, deny_unknown_fields)]
+pub enum DivergenceRevisionSet {
+    CurrentV2 {
+        producer_build_identity_sha256: String,
+        oracle_dependency_contract_sha256: String,
+        oracle_lexical_contract_audit_revision: String,
+        corpus_manifest_sha256: String,
+        query_manifest_sha256: String,
+        query_suite_source: QuerySuiteSource,
+        query_source_identity_sha256: String,
+    },
+    LegacyV1 {
+        subject_git_revision: String,
+        oracle_git_revision: String,
+        corpus_manifest_sha256: String,
+        query_manifest_sha256: String,
+        generator_revision: String,
+    },
 }
 
 /// Minimized, replayable fixture evidence retained with an observation.
@@ -629,15 +652,37 @@ pub struct RedactedDivergenceDiagnostic {
     pub marker: String,
 }
 
-/// One observed mismatch, including immutable first-seen evidence.
+/// Exact domain-separated hash scheme admitted by Divergence Register v2.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DivergenceArtifactObjectHashScheme {
+    #[serde(rename = "frankensearch-quill-gauntlet/artifact-object/v7/sha256")]
+    ArtifactObjectV7Sha256,
+}
+
+/// Typed content address of the exact first-recorded gauntlet witness object.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DivergenceArtifactObjectHash {
+    pub scheme: DivergenceArtifactObjectHashScheme,
+    pub object_schema_version: u32,
+    pub digest: String,
+}
+
+/// One observed mismatch, including its first-recorded witness evidence.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct DivergenceObservationEvent {
     pub header: DivergenceRegisterEventHeader,
     pub divergence_id: String,
     pub class: DivergenceClass,
-    pub first_seen_artifact_object_hash: String,
-    pub first_seen_artifact_sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_recorded_witness_case_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_recorded_witness_artifact_object: Option<DivergenceArtifactObjectHash>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_seen_artifact_object_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_seen_artifact_sha256: Option<String>,
     pub revisions: DivergenceRevisionSet,
     pub fixture: DivergenceFixtureEvidence,
     pub mismatch_signatures: Vec<String>,
@@ -713,32 +758,72 @@ pub struct DivergencePredictionEvent {
     pub state: PredictedDivergenceState,
 }
 
-/// Per-class terminal-census counts derived from the authoritative ledger.
+/// Test-only per-class structural counts derived from the ledger shape.
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct DivergenceClassCensus {
-    pub class: DivergenceClass,
-    pub active_entries: u64,
-    pub observed_mismatches: u64,
-    pub accepted_entries: u64,
-    pub fixed_entries: u64,
-    pub blocking_entries: u64,
+pub(crate) struct DivergenceClassCensus {
+    pub(crate) class: DivergenceClass,
+    pub(crate) active_entries: u64,
+    pub(crate) observed_mismatches: u64,
+    pub(crate) accepted_entries: u64,
+    pub(crate) fixed_entries: u64,
+    pub(crate) blocking_entries: u64,
 }
 
-/// Deterministic join of campaign mismatch signatures against the register.
+/// Test-only, nonadmissible join of caller-supplied signatures against the register.
+#[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct DivergenceCensus {
-    pub schema_version: u32,
-    pub register_hash: String,
-    pub mismatch_count: u64,
-    pub registered_mismatch_count: u64,
-    pub class_census: Vec<DivergenceClassCensus>,
-    pub unclassified_signatures: Vec<String>,
-    pub fixed_regression_divergence_ids: Vec<String>,
-    pub blocking_divergence_ids: Vec<String>,
-    pub unresolved_prediction_ids: Vec<String>,
-    pub flip_ready: bool,
+pub(crate) struct DivergenceCensus {
+    pub(crate) schema_version: u32,
+    pub(crate) prediction_policy_version: String,
+    pub(crate) prediction_policy_sha256: String,
+    pub(crate) required_prediction_classes: Vec<DivergenceClass>,
+    pub(crate) register_hash: String,
+    pub(crate) mismatch_count: u64,
+    pub(crate) registered_mismatch_count: u64,
+    pub(crate) class_census: Vec<DivergenceClassCensus>,
+    pub(crate) unclassified_signatures: Vec<String>,
+    pub(crate) fixed_regression_divergence_ids: Vec<String>,
+    pub(crate) blocking_divergence_ids: Vec<String>,
+    pub(crate) unresolved_prediction_ids: Vec<String>,
+    pub(crate) missing_prediction_classes: Vec<DivergenceClass>,
+    pub(crate) unresolved_lexical_mismatch_signatures: Vec<String>,
+    pub(crate) flip_ready: bool,
+}
+
+/// Hash-bound content for one minimized fixture.
+///
+/// This proves byte availability and digest equality only. It is not a replay
+/// receipt and cannot make a terminal census admissible.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DivergenceFixtureContentWitness {
+    fixture_id: String,
+    fixture_sha256: String,
+}
+
+impl DivergenceFixtureContentWitness {
+    /// Seal caller-supplied fixture bytes under their canonical fixture ID.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the fixture ID violates the v2 identifier bound.
+    pub fn from_bytes(
+        fixture_id: impl Into<String>,
+        fixture_bytes: &[u8],
+    ) -> Result<Self, GauntletError> {
+        let fixture_id = fixture_id.into();
+        if !is_bounded_register_ascii_text(&fixture_id, MAX_QUERY_ID_BYTES) {
+            return Err(campaign_error(
+                "divergence fixture witness has a noncanonical fixture ID",
+            ));
+        }
+        Ok(Self {
+            fixture_id,
+            fixture_sha256: sha256_bytes(fixture_bytes),
+        })
+    }
 }
 
 struct DivergenceRegisterProjection<'a> {
@@ -775,13 +860,46 @@ impl DivergenceRegisterEventHeader {
 }
 
 impl DivergenceRevisionSet {
-    fn validate(&self) -> Result<(), GauntletError> {
-        if !is_git_revision(&self.subject_git_revision)
-            || !is_git_revision(&self.oracle_git_revision)
-            || !is_lower_sha256(&self.corpus_manifest_sha256)
-            || !is_lower_sha256(&self.query_manifest_sha256)
-            || !is_bounded_register_text(&self.generator_revision, MAX_QUERY_ID_BYTES)
-        {
+    fn validate(&self, schema_version: u32) -> Result<(), GauntletError> {
+        let is_valid = match (schema_version, self) {
+            (
+                DIVERGENCE_REGISTER_LEDGER_SCHEMA_VERSION,
+                Self::CurrentV2 {
+                    producer_build_identity_sha256,
+                    oracle_dependency_contract_sha256,
+                    oracle_lexical_contract_audit_revision,
+                    corpus_manifest_sha256,
+                    query_manifest_sha256,
+                    query_suite_source: _,
+                    query_source_identity_sha256,
+                },
+            ) => {
+                is_lower_sha256(producer_build_identity_sha256)
+                    && is_lower_sha256(oracle_dependency_contract_sha256)
+                    && is_git_revision_40(oracle_lexical_contract_audit_revision)
+                    && is_lower_sha256(corpus_manifest_sha256)
+                    && is_lower_sha256(query_manifest_sha256)
+                    && is_lower_sha256(query_source_identity_sha256)
+            }
+            (
+                LEGACY_DIVERGENCE_REGISTER_LEDGER_SCHEMA_VERSION_V1,
+                Self::LegacyV1 {
+                    subject_git_revision,
+                    oracle_git_revision,
+                    corpus_manifest_sha256,
+                    query_manifest_sha256,
+                    generator_revision,
+                },
+            ) => {
+                is_git_revision(subject_git_revision)
+                    && is_git_revision(oracle_git_revision)
+                    && is_lower_sha256(corpus_manifest_sha256)
+                    && is_lower_sha256(query_manifest_sha256)
+                    && is_bounded_register_text(generator_revision, MAX_QUERY_ID_BYTES)
+            }
+            _ => false,
+        };
+        if !is_valid {
             return Err(campaign_error(
                 "divergence observation revisions are incomplete or noncanonical",
             ));
@@ -791,8 +909,17 @@ impl DivergenceRevisionSet {
 }
 
 impl DivergenceFixtureEvidence {
-    fn validate(&self) -> Result<(), GauntletError> {
-        if !is_bounded_register_text(&self.fixture_id, MAX_QUERY_ID_BYTES)
+    fn validate(&self, schema_version: u32) -> Result<(), GauntletError> {
+        let fixture_id_is_valid = match schema_version {
+            DIVERGENCE_REGISTER_LEDGER_SCHEMA_VERSION => {
+                is_bounded_register_ascii_text(&self.fixture_id, MAX_QUERY_ID_BYTES)
+            }
+            LEGACY_DIVERGENCE_REGISTER_LEDGER_SCHEMA_VERSION_V1 => {
+                is_bounded_register_text(&self.fixture_id, MAX_QUERY_ID_BYTES)
+            }
+            _ => false,
+        };
+        if !fixture_id_is_valid
             || !is_lower_sha256(&self.fixture_sha256)
             || !is_bounded_register_text(&self.regression_test, MAX_DIVERGENCE_REGISTER_PROSE_BYTES)
             || !self.minimized
@@ -831,11 +958,84 @@ impl RedactedDivergenceDiagnostic {
     }
 }
 
-impl DivergenceObservationEvent {
+impl DivergenceArtifactObjectHashScheme {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::ArtifactObjectV7Sha256 => OBJECT_HASH_SCHEME_V7_SHA256,
+        }
+    }
+}
+
+impl DivergenceArtifactObjectHash {
+    /// Construct a v7 artifact identity from a lowercase SHA-256 digest.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `digest` is not exactly 64 lowercase hexadecimal
+    /// characters.
+    pub fn v7_sha256(digest: impl Into<String>) -> Result<Self, GauntletError> {
+        let identity = Self {
+            scheme: DivergenceArtifactObjectHashScheme::ArtifactObjectV7Sha256,
+            object_schema_version: DIVERGENCE_ARTIFACT_OBJECT_SCHEMA_VERSION_V7,
+            digest: digest.into(),
+        };
+        identity.validate()?;
+        Ok(identity)
+    }
+
     fn validate(&self) -> Result<(), GauntletError> {
-        self.revisions.validate()?;
-        self.fixture.validate()?;
+        if self.scheme.as_str() != OBJECT_HASH_SCHEME_V7_SHA256
+            || self.object_schema_version != DIVERGENCE_ARTIFACT_OBJECT_SCHEMA_VERSION_V7
+            || !is_lower_sha256(&self.digest)
+        {
+            return Err(campaign_error(
+                "divergence artifact identity must be an exact v7 object-domain SHA-256 address",
+            ));
+        }
+        Ok(())
+    }
+
+    fn matches_binding(&self, binding: &ArtifactDivergenceBinding) -> bool {
+        self.object_schema_version == binding.object_schema_version
+            && self.scheme.as_str() == binding.object_hash_scheme
+            && self.digest == binding.object_hash
+    }
+}
+
+impl DivergenceObservationEvent {
+    fn validate(&self, schema_version: u32) -> Result<(), GauntletError> {
+        self.revisions.validate(schema_version)?;
+        self.fixture.validate(schema_version)?;
         self.diagnostic.validate()?;
+        let witness_identity_is_valid = match (
+            schema_version,
+            &self.first_recorded_witness_case_id,
+            &self.first_recorded_witness_artifact_object,
+            self.first_seen_artifact_object_hash.as_deref(),
+            self.first_seen_artifact_sha256.as_deref(),
+        ) {
+            (
+                DIVERGENCE_REGISTER_LEDGER_SCHEMA_VERSION,
+                Some(case_id),
+                Some(artifact_object),
+                None,
+                None,
+            ) => {
+                is_bounded_register_ascii_text(case_id, MAX_QUERY_ID_BYTES)
+                    && artifact_object.validate().is_ok()
+            }
+            (
+                LEGACY_DIVERGENCE_REGISTER_LEDGER_SCHEMA_VERSION_V1,
+                None,
+                None,
+                Some(first_seen_artifact_object_hash),
+                Some(first_seen_artifact_sha256),
+            ) => {
+                is_lower_xxh3(first_seen_artifact_object_hash)
+                    && is_lower_sha256(first_seen_artifact_sha256)
+            }
+            _ => false,
+        };
         let invalid_signatures = self.mismatch_signatures.is_empty()
             || self.mismatch_signatures.len() > 64
             || self
@@ -847,8 +1047,7 @@ impl DivergenceObservationEvent {
                 .windows(2)
                 .any(|pair| pair[0] >= pair[1]);
         if !is_register_id(&self.divergence_id)
-            || !is_lower_xxh3(&self.first_seen_artifact_object_hash)
-            || !is_lower_sha256(&self.first_seen_artifact_sha256)
+            || !witness_identity_is_valid
             || invalid_signatures
             || !is_bounded_register_text(
                 &self.observed_behavior,
@@ -863,6 +1062,61 @@ impl DivergenceObservationEvent {
         {
             return Err(campaign_error(
                 "divergence observation is missing bounded classified evidence",
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_against_artifact_binding(
+        &self,
+        binding: &ArtifactDivergenceBinding,
+    ) -> Result<(), GauntletError> {
+        let address = self
+            .first_recorded_witness_artifact_object
+            .as_ref()
+            .ok_or_else(|| {
+                campaign_error(
+                    "admissible divergence evidence requires a recorded artifact-object witness",
+                )
+            })?;
+        let DivergenceRevisionSet::CurrentV2 {
+            producer_build_identity_sha256,
+            oracle_dependency_contract_sha256,
+            oracle_lexical_contract_audit_revision,
+            corpus_manifest_sha256,
+            query_manifest_sha256,
+            query_suite_source,
+            query_source_identity_sha256,
+            ..
+        } = &self.revisions
+        else {
+            return Err(campaign_error(
+                "admissible divergence evidence requires current producer and oracle identities",
+            ));
+        };
+        let mut artifact_signatures = binding
+            .divergences
+            .iter()
+            .filter(|divergence| !is_auto_class(divergence.class) && divergence.class == self.class)
+            .map(|divergence| mismatch_signature(binding.rank_class, divergence))
+            .collect::<Vec<_>>();
+        artifact_signatures.sort();
+        let artifact_divergence_is_exact =
+            !artifact_signatures.is_empty() && artifact_signatures == self.mismatch_signatures;
+        if !address.matches_binding(binding)
+            || producer_build_identity_sha256 != &binding.producer_identity_sha256
+            || oracle_dependency_contract_sha256 != &binding.oracle_dependency_identity_sha256
+            || oracle_lexical_contract_audit_revision
+                != &binding.oracle_lexical_contract_audit_revision
+            || corpus_manifest_sha256 != &binding.corpus_manifest_sha256
+            || query_manifest_sha256 != &binding.query_manifest_sha256
+            || query_suite_source != &binding.query_suite_source
+            || query_source_identity_sha256 != &binding.query_source_identity_sha256
+            || self.first_recorded_witness_case_id.as_deref() != Some(binding.fixture_id.as_str())
+            || !artifact_divergence_is_exact
+        {
+            return Err(campaign_error(
+                "divergence observation does not match its verified ArtifactObject evidence",
             ));
         }
         Ok(())
@@ -1024,7 +1278,7 @@ impl DivergenceRegisterLedger {
     /// # Errors
     ///
     /// Returns an error when any event, revision link, evidence field, or
-    /// active projection violates the v1 contract.
+    /// active projection violates the current v2 contract.
     pub fn new(
         register_id: impl Into<String>,
         events: Vec<DivergenceRegisterEvent>,
@@ -1039,14 +1293,185 @@ impl DivergenceRegisterLedger {
         Ok(ledger)
     }
 
-    /// Validate schema, ordering, supersession, evidence, and active state.
+    /// Decode and structurally validate a current v2 or archived v1 ledger.
+    ///
+    /// Archived v1 ledgers remain readable for historical inspection, but
+    /// every evidence-producing method calls [`Self::validate`] and therefore
+    /// rejects them as nonadmissible.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for malformed JSON, an unsupported schema version, or
+    /// a document whose artifact address does not match its schema version.
+    pub fn decode_json(bytes: &[u8]) -> Result<Self, GauntletError> {
+        let ledger = serde_json::from_slice::<Self>(bytes).map_err(|error| {
+            campaign_error(format!("failed to decode divergence register: {error}"))
+        })?;
+        match ledger.schema_version {
+            LEGACY_DIVERGENCE_REGISTER_LEDGER_SCHEMA_VERSION_V1 => {
+                ledger.validate_for_schema(LEGACY_DIVERGENCE_REGISTER_LEDGER_SCHEMA_VERSION_V1)?
+            }
+            DIVERGENCE_REGISTER_LEDGER_SCHEMA_VERSION => {
+                ledger.validate_for_schema(DIVERGENCE_REGISTER_LEDGER_SCHEMA_VERSION)?;
+            }
+            _ => {
+                return Err(campaign_error(
+                    "divergence register schema version is unsupported",
+                ));
+            }
+        }
+        Ok(ledger)
+    }
+
+    /// Validate self-contained schema, ordering, supersession, and active state.
+    ///
+    /// This proves the ledger's canonical shape, but cannot prove that an
+    /// externally named artifact exists or that its co-located producer and
+    /// oracle identities are authentic. Evidence admission must additionally
+    /// call [`Self::validate_against_artifact_objects`].
     ///
     /// # Errors
     ///
     /// Returns an error for malformed evidence, history rewrites, orphan
     /// dispositions, duplicate active signatures, or incomplete reviews.
     pub fn validate(&self) -> Result<(), GauntletError> {
-        if self.schema_version != DIVERGENCE_REGISTER_LEDGER_SCHEMA_VERSION
+        if self.schema_version != DIVERGENCE_REGISTER_LEDGER_SCHEMA_VERSION {
+            return Err(campaign_error(
+                "only divergence register schema v2 is admissible evidence",
+            ));
+        }
+        self.validate_for_schema(DIVERGENCE_REGISTER_LEDGER_SCHEMA_VERSION)
+    }
+
+    /// Bind every observation to a verified, admissible gauntlet artifact.
+    ///
+    /// Each supplied [`ArtifactObject`] is validated by its owning artifact
+    /// contract before this method compares the exact object schema/hash
+    /// domain, digest, producer-build identity, oracle dependency identity,
+    /// and lexical-contract audit revision. Every observation event,
+    /// including superseded history, must have a matching artifact witness.
+    /// Call [`Self::validate`] alone only for structural inspection.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a structurally invalid ledger, an inadmissible or
+    /// duplicate artifact, a missing first-recorded artifact, or any well-formed
+    /// but substituted artifact/producer/oracle identity.
+    pub fn validate_against_artifact_objects(
+        &self,
+        artifacts: &[ArtifactObject],
+    ) -> Result<(), GauntletError> {
+        self.validate()?;
+        let mut bindings = BTreeMap::<String, ArtifactDivergenceBinding>::new();
+        for artifact in artifacts {
+            let binding = artifact.divergence_binding()?;
+            if bindings
+                .insert(binding.object_hash.clone(), binding)
+                .is_some()
+            {
+                return Err(campaign_error(
+                    "divergence artifact witness set contains a duplicate object hash",
+                ));
+            }
+        }
+
+        for event in &self.events {
+            let DivergenceRegisterEvent::Observation(observation) = event else {
+                continue;
+            };
+            let object_hash = observation
+                .first_recorded_witness_artifact_object
+                .as_ref()
+                .map(|address| address.digest.as_str())
+                .ok_or_else(|| {
+                    campaign_error(
+                        "admissible divergence evidence requires a recorded artifact-object witness",
+                    )
+                })?;
+            let binding = bindings.get(object_hash).ok_or_else(|| {
+                campaign_error(format!(
+                    "divergence observation {} has no verified ArtifactObject witness",
+                    observation.divergence_id
+                ))
+            })?;
+            observation.validate_against_artifact_binding(binding)?;
+        }
+        let claimed_by_object = self.artifact_claims_from_all_observations()?;
+        let mut expected_by_object = BTreeMap::<String, Vec<(String, String)>>::new();
+        for (object_hash, binding) in &bindings {
+            let mut expected = binding
+                .divergences
+                .iter()
+                .filter(|divergence| !is_auto_class(divergence.class))
+                .map(|divergence| {
+                    (
+                        divergence_class_name(divergence.class).to_owned(),
+                        mismatch_signature(binding.rank_class, divergence),
+                    )
+                })
+                .collect::<Vec<_>>();
+            expected.sort();
+            expected_by_object.insert(object_hash.clone(), expected);
+        }
+        validate_exact_artifact_claim_coverage(&claimed_by_object, &expected_by_object)
+    }
+
+    /// Verify the exact minimized-fixture bytes named by every observation.
+    ///
+    /// This is content-integrity validation only. It does not prove that the
+    /// regression test exists or passed, and therefore is not a terminal
+    /// release admission API.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid ledger or a missing, extra, duplicate,
+    /// or hash-mismatched fixture-content witness.
+    pub fn validate_fixture_content_witnesses(
+        &self,
+        witnesses: &[DivergenceFixtureContentWitness],
+    ) -> Result<(), GauntletError> {
+        self.validate()?;
+        let mut fixtures = BTreeMap::<String, String>::new();
+        for witness in witnesses {
+            if fixtures
+                .insert(witness.fixture_id.clone(), witness.fixture_sha256.clone())
+                .is_some()
+            {
+                return Err(campaign_error(
+                    "divergence fixture witnesses contain a duplicate fixture ID",
+                ));
+            }
+        }
+        let mut required_fixtures = BTreeMap::<String, String>::new();
+        for event in &self.events {
+            let DivergenceRegisterEvent::Observation(observation) = event else {
+                continue;
+            };
+            if let Some(previous_hash) = required_fixtures.insert(
+                observation.fixture.fixture_id.clone(),
+                observation.fixture.fixture_sha256.clone(),
+            ) && previous_hash != observation.fixture.fixture_sha256
+            {
+                return Err(campaign_error(
+                    "one divergence fixture ID cannot name multiple content hashes",
+                ));
+            }
+        }
+        if fixtures != required_fixtures {
+            return Err(campaign_error(
+                "divergence fixture content witnesses do not exactly cover ledger evidence",
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_for_schema(&self, schema_version: u32) -> Result<(), GauntletError> {
+        if self.schema_version != schema_version
+            || !matches!(
+                schema_version,
+                LEGACY_DIVERGENCE_REGISTER_LEDGER_SCHEMA_VERSION_V1
+                    | DIVERGENCE_REGISTER_LEDGER_SCHEMA_VERSION
+            )
             || !is_register_name(&self.register_id)
             || self.redaction_policy_version != DIVERGENCE_REGISTER_REDACTION_POLICY_VERSION
             || self.events.len() > MAX_DIVERGENCE_REGISTER_EVENTS
@@ -1075,7 +1500,7 @@ impl DivergenceRegisterLedger {
             event.header().validate(expected_sequence)?;
             match event {
                 DivergenceRegisterEvent::Observation(observation) => {
-                    observation.validate()?;
+                    observation.validate(schema_version)?;
                     if observations
                         .get(&observation.divergence_id)
                         .is_some_and(|previous| previous.class != observation.class)
@@ -1167,7 +1592,12 @@ impl DivergenceRegisterLedger {
         Ok(())
     }
 
-    /// Domain-separated identity of the complete immutable event stream.
+    /// Domain-separated structural identity of the immutable event stream.
+    ///
+    /// This hash commits to the ledger bytes; it is not proof that referenced
+    /// artifact objects were supplied. Call
+    /// [`Self::validate_against_artifact_objects`] before citing the hash as
+    /// evidence.
     ///
     /// # Errors
     ///
@@ -1232,28 +1662,27 @@ impl DivergenceRegisterLedger {
         Ok(())
     }
 
-    /// Join a sorted set of emitted mismatch signatures to active entries.
-    ///
-    /// A returned census is evidence even when `flip_ready` is false. Call
-    /// [`Self::require_terminal_census`] when a release gate must fail closed.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error for an invalid ledger or malformed/duplicate input.
-    pub fn census(
+    // Deliberately test-only and nonadmissible. A public terminal census must
+    // derive both signature sets from a frozen, store-verified complete
+    // campaign matrix; raw caller slices permit omission and cherry-picking.
+    #[cfg(test)]
+    fn nonadmissible_structural_census(
         &self,
         mismatch_signatures: &[String],
+        lexical_mismatch_signatures: &[String],
     ) -> Result<DivergenceCensus, GauntletError> {
         self.validate()?;
-        if mismatch_signatures
-            .iter()
-            .any(|signature| !is_lower_sha256(signature))
-            || mismatch_signatures
-                .windows(2)
-                .any(|pair| pair[0] >= pair[1])
+        let invalid_signatures = |signatures: &[String]| {
+            signatures
+                .iter()
+                .any(|signature| !is_lower_sha256(signature))
+                || signatures.windows(2).any(|pair| pair[0] >= pair[1])
+        };
+        if invalid_signatures(mismatch_signatures)
+            || invalid_signatures(lexical_mismatch_signatures)
         {
             return Err(campaign_error(
-                "terminal census mismatch signatures must be unique sorted SHA-256 values",
+                "structural census signatures must be unique sorted SHA-256 values",
             ));
         }
         let projection = self.projection();
@@ -1295,8 +1724,24 @@ impl DivergenceRegisterLedger {
         let unresolved_prediction_ids = projection
             .predictions
             .iter()
-            .filter(|(_, event)| matches!(&event.state, PredictedDivergenceState::Declared { .. }))
+            .filter(|(_, event)| {
+                matches!(
+                    &event.state,
+                    PredictedDivergenceState::Declared { .. }
+                        | PredictedDivergenceState::Retired { .. }
+                )
+            })
             .map(|(prediction_id, _)| prediction_id.clone())
+            .collect::<Vec<_>>();
+        let missing_prediction_classes = REQUIRED_DIVERGENCE_PREDICTION_CLASSES
+            .iter()
+            .copied()
+            .filter(|required_class| {
+                !projection
+                    .predictions
+                    .values()
+                    .any(|prediction| prediction.class == *required_class)
+            })
             .collect::<Vec<_>>();
 
         let mut class_census = Vec::with_capacity(DIVERGENCE_CLASSES.len());
@@ -1370,12 +1815,17 @@ impl DivergenceRegisterLedger {
         let flip_ready = unclassified_signatures.is_empty()
             && fixed_regression_divergence_ids.is_empty()
             && blocking_divergence_ids.is_empty()
-            && unresolved_prediction_ids.is_empty();
+            && unresolved_prediction_ids.is_empty()
+            && missing_prediction_classes.is_empty()
+            && lexical_mismatch_signatures.is_empty();
         let mismatch_count = count_to_u64(mismatch_signatures.len())?;
         let registered_mismatch_count =
             mismatch_count.saturating_sub(count_to_u64(unclassified_signatures.len())?);
         Ok(DivergenceCensus {
             schema_version: DIVERGENCE_REGISTER_LEDGER_SCHEMA_VERSION,
+            prediction_policy_version: DIVERGENCE_PREDICTION_POLICY_VERSION.to_owned(),
+            prediction_policy_sha256: divergence_prediction_policy_sha256(),
+            required_prediction_classes: REQUIRED_DIVERGENCE_PREDICTION_CLASSES.to_vec(),
             register_hash: self.ledger_hash()?,
             mismatch_count,
             registered_mismatch_count,
@@ -1384,31 +1834,10 @@ impl DivergenceRegisterLedger {
             fixed_regression_divergence_ids,
             blocking_divergence_ids,
             unresolved_prediction_ids,
+            missing_prediction_classes,
+            unresolved_lexical_mismatch_signatures: lexical_mismatch_signatures.to_vec(),
             flip_ready,
         })
-    }
-
-    /// Require a one-to-one, nonblocking, no-regression terminal census.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when unclassified mismatches, fixed regressions,
-    /// explicit blockers, or unresolved predictions remain.
-    pub fn require_terminal_census(
-        &self,
-        mismatch_signatures: &[String],
-    ) -> Result<DivergenceCensus, GauntletError> {
-        let census = self.census(mismatch_signatures)?;
-        if !census.flip_ready {
-            return Err(campaign_error(format!(
-                "divergence terminal census is not flip-ready: {} unclassified, {} fixed regressions, {} blockers, {} unresolved predictions",
-                census.unclassified_signatures.len(),
-                census.fixed_regression_divergence_ids.len(),
-                census.blocking_divergence_ids.len(),
-                census.unresolved_prediction_ids.len(),
-            )));
-        }
-        Ok(census)
     }
 
     /// Render a deterministic, redacted active-entry review table.
@@ -1470,8 +1899,70 @@ impl DivergenceRegisterLedger {
         }
         projection
     }
+
+    fn artifact_claims_from_all_observations(
+        &self,
+    ) -> Result<DivergenceArtifactClaims, GauntletError> {
+        let mut claims_by_object = DivergenceArtifactClaims::new();
+        for event in &self.events {
+            let DivergenceRegisterEvent::Observation(observation) = event else {
+                continue;
+            };
+            let object_hash = observation
+                .first_recorded_witness_artifact_object
+                .as_ref()
+                .map(|address| address.digest.clone())
+                .ok_or_else(|| {
+                    campaign_error(
+                        "admissible divergence evidence requires a recorded artifact-object witness",
+                    )
+                })?;
+            let object_claims = claims_by_object.entry(object_hash).or_default();
+            for signature in &observation.mismatch_signatures {
+                let claim = (
+                    divergence_class_name(observation.class).to_owned(),
+                    signature.clone(),
+                );
+                if let Some(existing_divergence_id) =
+                    object_claims.insert(claim, observation.divergence_id.clone())
+                    && existing_divergence_id != observation.divergence_id
+                {
+                    return Err(campaign_error(
+                        "different divergence IDs cannot claim one artifact mismatch",
+                    ));
+                }
+            }
+        }
+        Ok(claims_by_object)
+    }
 }
 
+type DivergenceArtifactClaims = BTreeMap<String, BTreeMap<(String, String), String>>;
+
+fn validate_exact_artifact_claim_coverage(
+    claimed_by_object: &DivergenceArtifactClaims,
+    expected_by_object: &BTreeMap<String, Vec<(String, String)>>,
+) -> Result<(), GauntletError> {
+    if claimed_by_object.len() != expected_by_object.len() {
+        return Err(campaign_error(
+            "divergence artifact witness set contains a missing or unreferenced object",
+        ));
+    }
+    for (object_hash, expected) in expected_by_object {
+        let claimed = claimed_by_object
+            .get(object_hash)
+            .map(|claims| claims.keys().cloned().collect::<Vec<_>>())
+            .unwrap_or_default();
+        if &claimed != expected {
+            return Err(campaign_error(
+                "divergence observations do not exactly cover their artifact mismatches",
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
 const DIVERGENCE_CLASSES: [DivergenceClass; 14] = [
     DivergenceClass::TieOrder,
     DivergenceClass::ScoreEpsilon,
@@ -1488,6 +1979,29 @@ const DIVERGENCE_CLASSES: [DivergenceClass; 14] = [
     DivergenceClass::UnicodeEdge,
     DivergenceClass::OversizedQueryToken,
 ];
+
+// This frozen set includes every still-predicted class, including pending
+// StatsSemantics, plus the oversized-token prediction already advanced to
+// observed. Removing a seeded class would otherwise let an empty ledger
+// manufacture a structurally clean projection.
+#[cfg(test)]
+const REQUIRED_DIVERGENCE_PREDICTION_CLASSES: [DivergenceClass; 6] = [
+    DivergenceClass::ScoreEpsilon,
+    DivergenceClass::TieOrder,
+    DivergenceClass::SnippetWindow,
+    DivergenceClass::GlobExpansionLimit,
+    DivergenceClass::StatsSemantics,
+    DivergenceClass::OversizedQueryToken,
+];
+
+/// Domain-separated identity of the frozen ordered prediction policy.
+#[must_use]
+pub fn divergence_prediction_policy_sha256() -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(DIVERGENCE_PREDICTION_POLICY_HASH_DOMAIN);
+    hasher.update(DIVERGENCE_PREDICTION_POLICY_PREIMAGE.as_bytes());
+    lower_hex(&hasher.finalize())
+}
 
 fn validate_revision_link(
     header: &DivergenceRegisterEventHeader,
@@ -2144,7 +2658,7 @@ fn collect_oracle_git_state() -> Result<(String, bool), GauntletError> {
         (Ok(revision), Ok(dirty)) => Ok((revision, parse_dirty_state(&dirty, DIRTY_ENV)?)),
         (Err(std::env::VarError::NotPresent), Err(std::env::VarError::NotPresent)) => {
             let contract = oracle_version_contract()?;
-            Ok((contract.lexical_git_revision, false))
+            Ok((contract.lexical_contract_audit_revision, false))
         }
         _ => Err(campaign_error(format!(
             "provenance overrides {REVISION_ENV} and {DIRTY_ENV} must be supplied together as valid UTF-8"
@@ -4786,6 +5300,7 @@ fn is_register_name(value: &str) -> bool {
 
 fn is_bead_id(value: &str) -> bool {
     value.starts_with("bd-")
+        && value.len() > 3
         && value.len() <= 160
         && value
             .bytes()
@@ -4855,6 +5370,13 @@ fn is_git_revision(value: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
+fn is_git_revision_40(value: &str) -> bool {
+    value.len() == 40
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
 fn is_lower_xxh3(value: &str) -> bool {
     value.len() == 16
         && value
@@ -4879,7 +5401,11 @@ fn lower_hex(bytes: &[u8]) -> String {
 }
 
 fn sha256_text(value: &str) -> String {
-    lower_hex(&Sha256::digest(value.as_bytes()))
+    sha256_bytes(value.as_bytes())
+}
+
+fn sha256_bytes(value: &[u8]) -> String {
+    lower_hex(&Sha256::digest(value))
 }
 
 /// One-sided lower quantile of a Beta(successes+1, failures+1) posterior.
@@ -6292,13 +6818,17 @@ mod tests {
     #[cfg(feature = "tantivy-oracle")]
     const E410_RANK_GOLDEN_JSON: &str = include_str!("../fixtures/argus-e410-ranks-v1.json");
     const DIVERGENCE_REGISTER_FIXTURE_JSON: &str =
-        include_str!("../fixtures/divergence-register-v1.json");
+        include_str!("../fixtures/divergence-register-v2.json");
     const DIVERGENCE_REGISTER_SCHEMA_JSON: &str =
+        include_str!("../../../schemas/quill-divergence-register-v2.schema.json");
+    const LEGACY_DIVERGENCE_REGISTER_FIXTURE_V1_JSON: &str =
+        include_str!("../fixtures/divergence-register-v1.json");
+    const LEGACY_DIVERGENCE_REGISTER_SCHEMA_V1_JSON: &str =
         include_str!("../../../schemas/quill-divergence-register-v1.schema.json");
 
     fn divergence_ledger_fixture() -> DivergenceRegisterLedger {
-        serde_json::from_str(DIVERGENCE_REGISTER_FIXTURE_JSON)
-            .expect("decode Divergence Register contract fixture")
+        DivergenceRegisterLedger::decode_json(DIVERGENCE_REGISTER_FIXTURE_JSON.as_bytes())
+            .expect("decode Divergence Register v2 contract fixture")
     }
 
     #[cfg(feature = "tantivy-oracle")]
@@ -6922,7 +7452,7 @@ mod tests {
             family: EngineFamily::Tantivy,
             implementation: "frankensearch-lexical/tantivy-index".to_owned(),
             crate_version: version.lexical_package_version,
-            source_revision: version.lexical_git_revision,
+            source_revision: version.lexical_contract_audit_revision,
             source_dirty: false,
             config_hash: TANTIVY_ORACLE_CONFIG_HASH.to_owned(),
         }
@@ -7316,6 +7846,22 @@ mod tests {
         ledger
             .validate()
             .expect("fixture satisfies semantic contract");
+        let DivergenceRegisterEvent::Observation(observation) = &ledger.events[0] else {
+            panic!("first fixture event is the observation");
+        };
+        let address = observation
+            .first_recorded_witness_artifact_object
+            .as_ref()
+            .expect("v2 fixture uses a recorded v7 artifact-object witness");
+        assert_eq!(
+            address.digest,
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        );
+        assert_eq!(address.scheme.as_str(), OBJECT_HASH_SCHEME_V7_SHA256);
+        assert_eq!(
+            address.object_schema_version,
+            DIVERGENCE_ARTIFACT_OBJECT_SCHEMA_VERSION_V7
+        );
         let round_trip =
             serde_json::to_value(&ledger).expect("serialize typed Divergence Register fixture");
         assert_eq!(round_trip, fixture);
@@ -7325,11 +7871,36 @@ mod tests {
 
         let signature = "e".repeat(64);
         let census = ledger
-            .require_terminal_census(&[signature])
-            .expect("reviewed observed fixture is terminal");
-        assert!(census.flip_ready);
+            .nonadmissible_structural_census(std::slice::from_ref(&signature), &[])
+            .expect("synthetic fixture has a structural projection");
+        assert!(!census.flip_ready);
         assert_eq!(census.mismatch_count, 1);
         assert_eq!(census.registered_mismatch_count, 1);
+        assert_eq!(census.missing_prediction_classes.len(), 5);
+        assert_eq!(
+            census.prediction_policy_sha256,
+            divergence_prediction_policy_sha256()
+        );
+        assert_eq!(
+            census.prediction_policy_sha256,
+            "ac71c1ed97fcd39fbe8f16ea8fb361c6a702b7f51bacb38dbf0bc5ecf0ba82e8",
+            "the ordered required-class policy is a frozen evidence identity"
+        );
+        assert_eq!(
+            census.required_prediction_classes,
+            REQUIRED_DIVERGENCE_PREDICTION_CLASSES
+        );
+
+        let empty = DivergenceRegisterLedger::new("empty-terminal-policy", Vec::new())
+            .expect("an in-progress empty ledger remains structurally valid");
+        let empty_census = empty
+            .nonadmissible_structural_census(&[], &[])
+            .expect("private structural projection reports an incomplete policy state");
+        assert!(!empty_census.flip_ready);
+        assert_eq!(
+            empty_census.missing_prediction_classes,
+            REQUIRED_DIVERGENCE_PREDICTION_CLASSES
+        );
         let table = ledger.review_table().expect("render review table");
         assert!(table.contains(
             "| DIV-900 | oversized_query_token | divergence-register-contract-fixture | accepted | contract-fixture-reviewer |"
@@ -7344,6 +7915,313 @@ mod tests {
         assert!(
             serde_json::from_value::<DivergenceRegisterLedger>(unknown_field).is_err(),
             "typed decoder must also reject unknown fields"
+        );
+    }
+
+    #[test]
+    fn divergence_ledger_v1_is_decode_only_and_cannot_be_admitted() {
+        let schema: serde_json::Value =
+            serde_json::from_str(LEGACY_DIVERGENCE_REGISTER_SCHEMA_V1_JSON)
+                .expect("parse legacy register schema");
+        let fixture: serde_json::Value =
+            serde_json::from_str(LEGACY_DIVERGENCE_REGISTER_FIXTURE_V1_JSON)
+                .expect("parse legacy register fixture");
+        let validator =
+            jsonschema::draft202012::new(&schema).expect("compile legacy register schema");
+        validator
+            .validate(&fixture)
+            .expect("legacy fixture satisfies its historical schema");
+
+        let ledger = DivergenceRegisterLedger::decode_json(
+            LEGACY_DIVERGENCE_REGISTER_FIXTURE_V1_JSON.as_bytes(),
+        )
+        .expect("decode and structurally validate legacy register");
+        assert_eq!(
+            ledger.schema_version,
+            LEGACY_DIVERGENCE_REGISTER_LEDGER_SCHEMA_VERSION_V1
+        );
+        assert_eq!(
+            serde_json::to_value(&ledger).expect("serialize decoded legacy register"),
+            fixture,
+            "archival decoding must not rewrite the historical v1 shape"
+        );
+        assert!(ledger.validate().is_err());
+        assert!(ledger.ledger_hash().is_err());
+        assert!(ledger.nonadmissible_structural_census(&[], &[]).is_err());
+
+        let mut historical_multibyte = fixture.clone();
+        let historical_text = "é".repeat(200);
+        historical_multibyte["events"][0]["event"]["revisions"]["generator_revision"] =
+            serde_json::Value::String(historical_text.clone());
+        historical_multibyte["events"][0]["event"]["fixture"]["fixture_id"] =
+            serde_json::Value::String(historical_text);
+        validator
+            .validate(&historical_multibyte)
+            .expect("historical v1 schema admitted 256-character Unicode identifiers");
+        let decoded_multibyte = DivergenceRegisterLedger::decode_json(
+            &serde_json::to_vec(&historical_multibyte).expect("serialize legacy Unicode fixture"),
+        )
+        .expect("v1 decode preserves its historical 1024-byte Rust bound");
+        assert_eq!(
+            serde_json::to_value(decoded_multibyte).expect("serialize legacy Unicode ledger"),
+            historical_multibyte
+        );
+
+        let mut malformed_legacy = fixture.clone();
+        malformed_legacy["events"][0]["event"]["first_seen_artifact_object_hash"] =
+            serde_json::Value::String("0".repeat(15));
+        assert!(!validator.is_valid(&malformed_legacy));
+        assert!(
+            DivergenceRegisterLedger::decode_json(
+                &serde_json::to_vec(&malformed_legacy).expect("serialize mutation")
+            )
+            .is_err(),
+            "archival decoding still validates the historical v1 address"
+        );
+
+        let mut legacy_identity_under_v2 = fixture.clone();
+        legacy_identity_under_v2["schema_version"] = serde_json::json!(2);
+        assert!(
+            DivergenceRegisterLedger::decode_json(
+                &serde_json::to_vec(&legacy_identity_under_v2).expect("serialize mutation")
+            )
+            .is_err(),
+            "v2 must never admit the legacy XXH3-64 address shape"
+        );
+
+        let mut current_identity_under_v1: serde_json::Value =
+            serde_json::from_str(DIVERGENCE_REGISTER_FIXTURE_JSON).expect("current fixture");
+        current_identity_under_v1["schema_version"] = serde_json::json!(1);
+        assert!(
+            DivergenceRegisterLedger::decode_json(
+                &serde_json::to_vec(&current_identity_under_v1).expect("serialize mutation")
+            )
+            .is_err(),
+            "v1 archival decoding must require the historical identity shape"
+        );
+    }
+
+    #[test]
+    fn divergence_ledger_v2_rejects_wrong_object_domain_version_and_digest() {
+        let schema: serde_json::Value =
+            serde_json::from_str(DIVERGENCE_REGISTER_SCHEMA_JSON).expect("parse register schema");
+        let validator =
+            jsonschema::draft202012::new(&schema).expect("compile Divergence Register schema");
+        let fixture: serde_json::Value =
+            serde_json::from_str(DIVERGENCE_REGISTER_FIXTURE_JSON).expect("parse register fixture");
+
+        for (field, value) in [
+            ("scheme", serde_json::json!("sha256")),
+            ("object_schema_version", serde_json::json!(6)),
+        ] {
+            let mut wrong_domain = fixture.clone();
+            wrong_domain["events"][0]["event"]["first_recorded_witness_artifact_object"][field] =
+                value;
+            assert!(!validator.is_valid(&wrong_domain));
+            assert!(
+                DivergenceRegisterLedger::decode_json(
+                    &serde_json::to_vec(&wrong_domain).expect("serialize mutation")
+                )
+                .is_err(),
+                "v2 must reject a wrong artifact-object {field}"
+            );
+        }
+
+        for invalid_digest in ["a".repeat(63), format!("{}g", "a".repeat(63))] {
+            let mut invalid = fixture.clone();
+            invalid["events"][0]["event"]["first_recorded_witness_artifact_object"]["digest"] =
+                serde_json::Value::String(invalid_digest);
+            assert!(!validator.is_valid(&invalid));
+            assert!(
+                DivergenceRegisterLedger::decode_json(
+                    &serde_json::to_vec(&invalid).expect("serialize mutation")
+                )
+                .is_err()
+            );
+        }
+
+        for (field, invalid_value) in [
+            ("producer_build_identity_sha256", "1".repeat(63)),
+            (
+                "oracle_dependency_contract_sha256",
+                format!("{}g", "2".repeat(63)),
+            ),
+            ("oracle_lexical_contract_audit_revision", "3".repeat(39)),
+        ] {
+            let mut invalid = fixture.clone();
+            invalid["events"][0]["event"]["revisions"][field] =
+                serde_json::Value::String(invalid_value);
+            assert!(!validator.is_valid(&invalid));
+            assert!(
+                DivergenceRegisterLedger::decode_json(
+                    &serde_json::to_vec(&invalid).expect("serialize mutation")
+                )
+                .is_err()
+            );
+        }
+
+        for (field, invalid_value) in [
+            ("query_suite_source", serde_json::json!("caller_supplied")),
+            (
+                "query_source_identity_sha256",
+                serde_json::json!("4".repeat(63)),
+            ),
+        ] {
+            let mut invalid = fixture.clone();
+            invalid["events"][0]["event"]["revisions"][field] = invalid_value;
+            assert!(!validator.is_valid(&invalid));
+            assert!(
+                DivergenceRegisterLedger::decode_json(
+                    &serde_json::to_vec(&invalid).expect("serialize source mutation")
+                )
+                .is_err(),
+                "v2 must reject an invalid query-source field: {field}"
+            );
+        }
+
+        let mut obsolete_generator_revision = fixture.clone();
+        obsolete_generator_revision["events"][0]["event"]["revisions"]["generator_revision"] =
+            serde_json::json!("legacy-generator");
+        assert!(!validator.is_valid(&obsolete_generator_revision));
+        assert!(
+            DivergenceRegisterLedger::decode_json(
+                &serde_json::to_vec(&obsolete_generator_revision)
+                    .expect("serialize obsolete generator field")
+            )
+            .is_err(),
+            "v2 must reject the obsolete unsealed generator revision"
+        );
+
+        let mut obsolete_revision_pair = fixture;
+        let revisions = obsolete_revision_pair["events"][0]["event"]["revisions"]
+            .as_object_mut()
+            .expect("revision object");
+        revisions.remove("producer_build_identity_sha256");
+        revisions.remove("oracle_dependency_contract_sha256");
+        revisions.remove("oracle_lexical_contract_audit_revision");
+        revisions.insert(
+            "subject_git_revision".to_owned(),
+            serde_json::Value::String("1".repeat(40)),
+        );
+        revisions.insert(
+            "oracle_git_revision".to_owned(),
+            serde_json::Value::String("2".repeat(40)),
+        );
+        assert!(!validator.is_valid(&obsolete_revision_pair));
+        assert!(
+            DivergenceRegisterLedger::decode_json(
+                &serde_json::to_vec(&obsolete_revision_pair).expect("serialize mutation")
+            )
+            .is_err(),
+            "v2 must reject v1's unauthenticated subject/oracle revision pair"
+        );
+    }
+
+    #[test]
+    fn divergence_ledger_v2_schema_and_rust_agree_on_identifier_byte_bounds() {
+        let schema: serde_json::Value =
+            serde_json::from_str(DIVERGENCE_REGISTER_SCHEMA_JSON).expect("parse register schema");
+        let validator =
+            jsonschema::draft202012::new(&schema).expect("compile Divergence Register schema");
+        let fixture: serde_json::Value =
+            serde_json::from_str(DIVERGENCE_REGISTER_FIXTURE_JSON).expect("parse register fixture");
+        let assert_contract = |candidate: &serde_json::Value, expected: bool, label: &str| {
+            assert_eq!(
+                validator.is_valid(candidate),
+                expected,
+                "JSON Schema disagrees for {label}"
+            );
+            let encoded = serde_json::to_vec(candidate).expect("serialize boundary mutation");
+            assert_eq!(
+                DivergenceRegisterLedger::decode_json(&encoded).is_ok(),
+                expected,
+                "typed validation disagrees for {label}"
+            );
+        };
+
+        for (length, expected) in [(MAX_QUERY_ID_BYTES, true), (MAX_QUERY_ID_BYTES + 1, false)] {
+            for field in ["fixture_id", "first_recorded_witness_case_id"] {
+                let mut candidate = fixture.clone();
+                if field == "fixture_id" {
+                    candidate["events"][0]["event"]["fixture"][field] =
+                        serde_json::Value::String("f".repeat(length));
+                } else {
+                    candidate["events"][0]["event"][field] =
+                        serde_json::Value::String("f".repeat(length));
+                }
+                assert_contract(&candidate, expected, &format!("{field} length {length}"));
+            }
+        }
+
+        for field in ["fixture_id", "first_recorded_witness_case_id"] {
+            let mut candidate = fixture.clone();
+            let target = if field == "fixture_id" {
+                &mut candidate["events"][0]["event"]["fixture"][field]
+            } else {
+                &mut candidate["events"][0]["event"][field]
+            };
+            *target = serde_json::Value::String("é".repeat(128));
+            assert_contract(&candidate, false, &format!("non-ASCII multibyte {field}"));
+        }
+
+        let mut empty_bead_suffix = fixture;
+        empty_bead_suffix["events"][2]["event"]["state"]["bead_id"] = serde_json::json!("bd-");
+        assert_contract(&empty_bead_suffix, false, "empty bead ID suffix");
+    }
+
+    #[test]
+    fn divergence_fixture_content_witnesses_are_exact_but_nonadmissible() {
+        let fixture_bytes = b"minimized divergence fixture bytes";
+        let mut ledger = divergence_ledger_fixture();
+        let fixture_id = {
+            let DivergenceRegisterEvent::Observation(observation) = &mut ledger.events[0] else {
+                panic!("first fixture event is the observation");
+            };
+            assert_ne!(
+                observation
+                    .first_recorded_witness_case_id
+                    .as_deref()
+                    .expect("v2 case identity"),
+                observation.fixture.fixture_id,
+                "a minimized fixture need not retain the first campaign case ID"
+            );
+            observation.fixture.fixture_sha256 = sha256_bytes(fixture_bytes);
+            observation.fixture.fixture_id.clone()
+        };
+        ledger
+            .validate()
+            .expect("updated fixture hash remains valid");
+
+        let witness =
+            DivergenceFixtureContentWitness::from_bytes(fixture_id.clone(), fixture_bytes)
+                .expect("seal exact fixture bytes");
+        ledger
+            .validate_fixture_content_witnesses(std::slice::from_ref(&witness))
+            .expect("exact fixture content is present");
+        assert!(ledger.validate_fixture_content_witnesses(&[]).is_err());
+        assert!(
+            ledger
+                .validate_fixture_content_witnesses(&[witness.clone(), witness.clone()])
+                .is_err(),
+            "duplicate fixture witnesses fail closed"
+        );
+
+        let wrong_bytes =
+            DivergenceFixtureContentWitness::from_bytes(fixture_id, b"different bytes")
+                .expect("seal wrong bytes for negative test");
+        assert!(
+            ledger
+                .validate_fixture_content_witnesses(&[wrong_bytes])
+                .is_err(),
+            "a matching fixture ID cannot substitute different content"
+        );
+        let extra = DivergenceFixtureContentWitness::from_bytes("extra-fixture", b"extra")
+            .expect("seal extra fixture");
+        assert!(
+            ledger
+                .validate_fixture_content_witnesses(&[witness, extra])
+                .is_err(),
+            "unreferenced fixture content is rejected"
         );
     }
 
@@ -7421,6 +8299,72 @@ mod tests {
     }
 
     #[test]
+    fn divergence_artifact_coverage_retains_superseded_object_claims() {
+        let ledger = divergence_ledger_fixture();
+        let mut successor = ledger.clone();
+        let DivergenceRegisterEvent::Observation(observation) = ledger.events[0].clone() else {
+            panic!("first fixture event is the observation");
+        };
+        let mut corrected_observation = *observation;
+        corrected_observation.header.sequence = 5;
+        corrected_observation.header.supersedes = Some(1);
+        corrected_observation.header.recorded_at = "2026-07-27T00:04:00Z".to_owned();
+        corrected_observation.first_recorded_witness_case_id =
+            Some("divergence-register-corrected-case".to_owned());
+        corrected_observation
+            .first_recorded_witness_artifact_object
+            .as_mut()
+            .expect("v2 artifact identity")
+            .digest = "9".repeat(64);
+        corrected_observation.mismatch_signatures = vec!["8".repeat(64)];
+        successor
+            .events
+            .push(DivergenceRegisterEvent::Observation(Box::new(
+                corrected_observation,
+            )));
+
+        let DivergenceRegisterEvent::Disposition(mut corrected_disposition) =
+            ledger.events[1].clone()
+        else {
+            panic!("second fixture event is the disposition");
+        };
+        corrected_disposition.header.sequence = 6;
+        corrected_disposition.header.supersedes = Some(2);
+        corrected_disposition.header.recorded_at = "2026-07-27T00:05:00Z".to_owned();
+        successor
+            .events
+            .push(DivergenceRegisterEvent::Disposition(corrected_disposition));
+        successor
+            .validate()
+            .expect("append-only correction is valid");
+
+        let claims = successor
+            .artifact_claims_from_all_observations()
+            .expect("collect historical and active claims");
+        let expected = BTreeMap::from([
+            (
+                "a".repeat(64),
+                vec![("oversized_query_token".to_owned(), "e".repeat(64))],
+            ),
+            (
+                "9".repeat(64),
+                vec![("oversized_query_token".to_owned(), "8".repeat(64))],
+            ),
+        ]);
+        validate_exact_artifact_claim_coverage(&claims, &expected)
+            .expect("each historical object is covered by its own observation");
+
+        let active_only = BTreeMap::from([(
+            "9".repeat(64),
+            vec![("oversized_query_token".to_owned(), "8".repeat(64))],
+        )]);
+        assert!(
+            validate_exact_artifact_claim_coverage(&claims, &active_only).is_err(),
+            "dropping the superseded object's expected claim must fail"
+        );
+    }
+
+    #[test]
     fn divergence_ledger_rejects_orphans_duplicate_signatures_and_unsafe_accepts() {
         let ledger = divergence_ledger_fixture();
         let mut duplicate = ledger.clone();
@@ -7481,15 +8425,24 @@ mod tests {
         let signature = "e".repeat(64);
         let unknown = "0".repeat(64);
         let unclassified = ledger
-            .census(std::slice::from_ref(&unknown))
+            .nonadmissible_structural_census(std::slice::from_ref(&unknown), &[])
             .expect("census");
         assert!(!unclassified.flip_ready);
         assert_eq!(unclassified.unclassified_signatures, vec![unknown.clone()]);
-        assert!(
-            ledger
-                .require_terminal_census(std::slice::from_ref(&unknown))
-                .is_err()
+        assert!(!unclassified.flip_ready);
+
+        let lexical_signature = "9".repeat(64);
+        let lexical_failure = ledger
+            .nonadmissible_structural_census(
+                std::slice::from_ref(&signature),
+                std::slice::from_ref(&lexical_signature),
+            )
+            .expect("lexical fix-only projection");
+        assert_eq!(
+            lexical_failure.unresolved_lexical_mismatch_signatures,
+            vec![lexical_signature]
         );
+        assert!(!lexical_failure.flip_ready);
 
         let mut fixed = ledger.clone();
         let DivergenceRegisterEvent::Disposition(disposition) = &mut fixed.events[1] else {
@@ -7502,7 +8455,7 @@ mod tests {
             reviewed_at: "2026-07-27T00:00:30Z".to_owned(),
         };
         let fixed_census = fixed
-            .census(std::slice::from_ref(&signature))
+            .nonadmissible_structural_census(std::slice::from_ref(&signature), &[])
             .expect("fixed census");
         assert_eq!(
             fixed_census.fixed_regression_divergence_ids,
@@ -7520,7 +8473,9 @@ mod tests {
             reviewer: "contract-fixture-reviewer".to_owned(),
             reviewed_at: "2026-07-27T00:00:30Z".to_owned(),
         };
-        let blocking_census = blocking.census(&[]).expect("blocking census");
+        let blocking_census = blocking
+            .nonadmissible_structural_census(&[], &[])
+            .expect("blocking census");
         assert_eq!(blocking_census.blocking_divergence_ids, vec!["DIV-900"]);
         assert!(!blocking_census.flip_ready);
 
@@ -7530,13 +8485,36 @@ mod tests {
             .validate()
             .expect("declared prediction is valid during an active campaign");
         let prediction_census = unresolved_prediction
-            .census(std::slice::from_ref(&signature))
+            .nonadmissible_structural_census(std::slice::from_ref(&signature), &[])
             .expect("prediction census");
         assert_eq!(
             prediction_census.unresolved_prediction_ids,
             vec!["PRED-900"]
         );
         assert!(!prediction_census.flip_ready);
+
+        let mut unverified_retirement = divergence_ledger_fixture();
+        let DivergenceRegisterEvent::Prediction(prediction) = &mut unverified_retirement.events[3]
+        else {
+            panic!("fourth fixture event is a prediction revision");
+        };
+        prediction.state = PredictedDivergenceState::Retired {
+            proof_sha256: "0".repeat(64),
+            rationale: "A shape-valid hash is not a verified retirement receipt.".to_owned(),
+            reviewer: "contract-fixture-reviewer".to_owned(),
+            reviewed_at: "2026-07-27T00:02:30Z".to_owned(),
+        };
+        unverified_retirement
+            .validate()
+            .expect("retirement remains archival shape-valid state");
+        let retirement_census = unverified_retirement
+            .nonadmissible_structural_census(std::slice::from_ref(&signature), &[])
+            .expect("retirement projection");
+        assert_eq!(
+            retirement_census.unresolved_prediction_ids,
+            vec!["PRED-900"]
+        );
+        assert!(!retirement_census.flip_ready);
     }
 
     #[test]
@@ -7600,7 +8578,7 @@ mod tests {
         // Git provenance.
         let lexical_revision = oracle_version_contract()
             .expect("oracle version contract")
-            .lexical_git_revision;
+            .lexical_contract_audit_revision;
         let config = frankensearch_quill::QuillConfig {
             deterministic_ingest: true,
             ..frankensearch_quill::QuillConfig::default()
@@ -9454,7 +10432,7 @@ mod tests {
             tantivy_checksum_sha256: contract.tantivy_checksum_sha256,
             lexical_package: contract.lexical_package,
             lexical_package_version: contract.lexical_package_version,
-            pinned_lexical_contract_revision: contract.lexical_git_revision,
+            pinned_lexical_contract_revision: contract.lexical_contract_audit_revision,
         }
     }
 
@@ -13682,7 +14660,7 @@ mod tests {
         let fixture = make_fixture();
         let lexical_revision = oracle_version_contract()
             .expect("oracle version contract")
-            .lexical_git_revision;
+            .lexical_contract_audit_revision;
         let contract = SemanticContract::shipping_default();
         let query = fixture
             .query_suite
@@ -13792,7 +14770,7 @@ mod tests {
         let fixture = make_fixture();
         let lexical_revision = oracle_version_contract()
             .expect("oracle version contract")
-            .lexical_git_revision;
+            .lexical_contract_audit_revision;
         let contract = SemanticContract::shipping_default();
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             let mut oracle =
@@ -15542,7 +16520,7 @@ mod tests {
         let fixture = make_scalar_g1a_regression_fixture();
         let lexical_revision = oracle_version_contract()
             .expect("oracle version contract")
-            .lexical_git_revision;
+            .lexical_contract_audit_revision;
         let config = frankensearch_quill::QuillConfig {
             deterministic_ingest: true,
             ..frankensearch_quill::QuillConfig::default()
