@@ -3486,6 +3486,15 @@ impl CampaignReport {
         hasher.update(self.canonical_bytes()?);
         Ok(lower_hex(&hasher.finalize()))
     }
+
+    /// Hash test-owned hostile bytes without granting them report validity.
+    #[cfg(test)]
+    pub(crate) fn report_hash_unchecked_fixture(&self) -> Result<String, GauntletError> {
+        let mut hasher = Sha256::new();
+        hasher.update(CAMPAIGN_REPORT_V7_HASH_DOMAIN);
+        hasher.update(self.canonical_bytes_unchecked()?);
+        Ok(lower_hex(&hasher.finalize()))
+    }
 }
 
 /// Streaming cross-artifact validator for one structurally valid campaign report.
@@ -13066,15 +13075,23 @@ mod tests {
             let loaded = store
                 .load_integrity_checked_campaign("built-in-all-infrastructure")
                 .expect("untouched no-object report reloads");
-            assert_eq!(loaded.report(), &report);
+            assert!(
+                report.cases.iter().any(|case| case.diagnostic.is_some()),
+                "the in-memory fixture must exercise noncanonical backend diagnostics",
+            );
+            let mut expected_durable_report = report.clone();
+            for case in &mut expected_durable_report.cases {
+                case.diagnostic = None;
+            }
+            assert_eq!(loaded.report(), &expected_durable_report);
             assert_eq!(
                 loaded
                     .report()
                     .canonical_bytes_unchecked()
                     .expect("loaded canonical report"),
-                report
+                expected_durable_report
                     .canonical_bytes_unchecked()
-                    .expect("original canonical report"),
+                    .expect("expected durable canonical report"),
             );
             assert!(
                 loaded
@@ -13281,8 +13298,25 @@ mod tests {
     fn production_default_rank_envelope_is_rejected_before_ingest_with_valid_provenance() {
         let fixture = make_fixture();
         let semantic_contract = semantic_contract();
-        let subject_descriptor = bind_descriptor_to_compiled_producer(subject_descriptor());
-        let oracle_descriptor = bind_descriptor_to_compiled_producer(oracle_descriptor());
+        let quill_config = frankensearch_quill::QuillConfig::default();
+        let producer = GauntletProducerBuildIdentity::compiled().expect("compiled producer");
+        let oracle_version = oracle_version_contract().expect("oracle dependency contract");
+        let subject_descriptor = EngineDescriptor {
+            family: EngineFamily::Quill,
+            implementation: "frankensearch-quill/scalar-index".to_owned(),
+            crate_version: frankensearch_quill::FRANKENSEARCH_QUILL_CRATE_VERSION.to_owned(),
+            source_revision: producer.source_git_revision.clone(),
+            source_dirty: producer.source_git_dirty,
+            config_hash: crate::engine::quill_config_hash(&quill_config),
+        };
+        let oracle_descriptor = EngineDescriptor {
+            family: EngineFamily::Tantivy,
+            implementation: "frankensearch-lexical/tantivy-index".to_owned(),
+            crate_version: oracle_version.lexical_package_version,
+            source_revision: producer.source_git_revision,
+            source_dirty: producer.source_git_dirty,
+            config_hash: crate::engine::TANTIVY_ORACLE_CONFIG_HASH.to_owned(),
+        };
         let config = CampaignConfig {
             selection: CampaignSelection::DefaultSyntax,
             contract_mode: CampaignContractMode::RankEnvelopeOnly,
@@ -13341,7 +13375,7 @@ mod tests {
                     &fixture.query_suite,
                     CampaignAdmission::BuiltInEvidence(BuiltInEngineProfileReceipt::new(
                         BuiltInEngineProfile::ScalarShipping,
-                        &frankensearch_quill::QuillConfig::default(),
+                        &quill_config,
                     )),
                 )
                 .await
@@ -17210,6 +17244,35 @@ mod tests {
                 u64::try_from(index + 1).expect("persisted hit ordinal must fit in u64");
         }
 
+        fn install_matching_completion_receipt(
+            campaign: &std::path::Path,
+            current_name: &std::ffi::OsStr,
+            report: &CampaignReport,
+        ) -> std::ffi::OsString {
+            let (next_name, next_bytes) =
+                crate::artifact::campaign_completion_receipt_fixture(report)
+                    .expect("construct exact test completion receipt");
+            let current_path = campaign.join(current_name);
+            let next_path = campaign.join(&next_name);
+            if current_name != next_name.as_os_str() {
+                std::fs::rename(&current_path, &next_path)
+                    .expect("move sole test completion receipt to its new content address");
+            }
+            std::fs::write(&next_path, next_bytes)
+                .expect("write exact test completion receipt bytes");
+            next_name
+        }
+
+        fn assert_reached_past_completion(label: &str, error: &GauntletError) {
+            let error_text = error.to_string();
+            assert!(
+                !matches!(error, GauntletError::Io(_))
+                    && !error_text.contains("completion receipt")
+                    && !error_text.contains("completed campaign directory"),
+                "{label} failed at campaign completion closure instead of the intended deeper validation: {error}",
+            );
+        }
+
         let scratch = tempfile::tempdir().expect("isolated mutation store");
         let scratch_root = scratch.path();
         let source_campaign = source_root.join("campaigns").join(&report.run_id);
@@ -17222,6 +17285,25 @@ mod tests {
             std::fs::copy(source_campaign.join(name), scratch_campaign.join(name))
                 .expect("copy campaign control file");
         }
+        let completion_files = std::fs::read_dir(&source_campaign)
+            .expect("read completed source campaign")
+            .map(|entry| entry.expect("source campaign entry").file_name())
+            .filter(|name| name.to_string_lossy().starts_with("completion-"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            completion_files.len(),
+            1,
+            "source campaign must have exactly one write-last completion receipt"
+        );
+        let original_completion_name = completion_files
+            .into_iter()
+            .next()
+            .expect("source completion receipt");
+        std::fs::copy(
+            source_campaign.join(&original_completion_name),
+            scratch_campaign.join(&original_completion_name),
+        )
+        .expect("copy write-last completion receipt");
         for (ordinal, result) in report.cases.iter().enumerate() {
             let Some(hash) = result.artifact_hash.as_deref() else {
                 continue;
@@ -17759,13 +17841,25 @@ mod tests {
                     .expect("encode coherently referenced campaign report"),
             )
             .expect("write coherently referenced campaign report");
+            let mutated_completion_name = install_matching_completion_receipt(
+                &scratch_campaign,
+                &original_completion_name,
+                &mutated_report,
+            );
 
             let error = store
                 .load_integrity_checked_campaign(&report.run_id)
                 .expect_err("semantic replay must reject canonical typed mutation");
+            assert_reached_past_completion(label, &error);
             std::fs::write(&target_case_path, &original_case_bytes)
                 .expect("restore target run manifest");
             std::fs::write(&report_path, &original_report_bytes).expect("restore campaign report");
+            let restored_completion_name = install_matching_completion_receipt(
+                &scratch_campaign,
+                &mutated_completion_name,
+                report,
+            );
+            assert_eq!(restored_completion_name, original_completion_name);
             store
                 .load_integrity_checked_campaign(&report.run_id)
                 .unwrap_or_else(|error| panic!("restored campaign failed after {label}: {error}"));
@@ -17870,14 +17964,26 @@ mod tests {
                     .expect("encode coherently mutated campaign report"),
             )
             .expect("write coherently mutated campaign report");
+            let mutated_completion_name = install_matching_completion_receipt(
+                &scratch_campaign,
+                &original_completion_name,
+                &mutated_report,
+            );
 
             let error = store
                 .load_integrity_checked_campaign(&report.run_id)
                 .expect_err("integrity-checked campaign reload must reject mutated provenance");
+            assert_reached_past_completion(field, &error);
             std::fs::write(&reservation_path, &original_reservation_bytes)
                 .expect("restore campaign reservation");
             std::fs::write(&report_path, &original_report_bytes)
                 .expect("restore campaign report after provenance mutation");
+            let restored_completion_name = install_matching_completion_receipt(
+                &scratch_campaign,
+                &mutated_completion_name,
+                report,
+            );
+            assert_eq!(restored_completion_name, original_completion_name);
             store
                 .load_integrity_checked_campaign(&report.run_id)
                 .unwrap_or_else(|error| {
@@ -17917,15 +18023,27 @@ mod tests {
                 .expect("encode ordinal-swapped campaign report"),
         )
         .expect("write ordinal-swapped campaign report");
+        let swapped_completion_name = install_matching_completion_receipt(
+            &scratch_campaign,
+            &original_completion_name,
+            &swapped_report,
+        );
         let error = store
             .load_integrity_checked_campaign(&report.run_id)
             .expect_err(
                 "campaign evidence validator must reject a valid object at the wrong ordinal",
             );
+        assert_reached_past_completion("ordinal swap", &error);
         std::fs::write(&target_case_path, &original_case_bytes)
             .expect("restore target run manifest after ordinal swap");
         std::fs::write(&report_path, &original_report_bytes)
             .expect("restore campaign report after ordinal swap");
+        let restored_completion_name = install_matching_completion_receipt(
+            &scratch_campaign,
+            &swapped_completion_name,
+            report,
+        );
+        assert_eq!(restored_completion_name, original_completion_name);
         store
             .load_integrity_checked_campaign(&report.run_id)
             .unwrap_or_else(|error| panic!("restored campaign failed after ordinal swap: {error}"));

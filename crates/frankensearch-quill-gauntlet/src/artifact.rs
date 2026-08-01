@@ -1356,6 +1356,20 @@ impl CampaignCompletionReceipt {
     }
 }
 
+/// Build the exact durable completion marker for a test-owned campaign report.
+///
+/// This exposes receipt construction only to in-crate tests that need to prove
+/// deeper replay validation after a coherent hostile rewrite. It grants no
+/// authority and is absent from non-test builds.
+#[cfg(test)]
+pub(crate) fn campaign_completion_receipt_fixture(
+    report: &CampaignReport,
+) -> Result<(OsString, Vec<u8>), GauntletError> {
+    let receipt =
+        CampaignCompletionReceipt::new(&report.run_id, report.report_hash_unchecked_fixture()?)?;
+    Ok((receipt.file_name()?, receipt.canonical_bytes()?))
+}
+
 /// Self-described execution role preserved by durable integrity checks.
 ///
 /// This value is not an admission capability. It records whether the producer
