@@ -28,9 +28,12 @@ use std::path::PathBuf;
 use thiserror::Error;
 
 pub use artifact::{
-    ArtifactLexicalContractEvidence, ArtifactObject, ArtifactStore, CANONICALIZATION_VERSION,
-    CampaignArtifactContext, OBJECT_SCHEMA_VERSION, PreparedArtifact, RUN_MANIFEST_SCHEMA_VERSION,
-    RunManifest,
+    ArtifactExecutionRole, ArtifactLexicalContractEvidence, ArtifactObject,
+    ArtifactOracleDependency, ArtifactStore, ArtifactTrustCeiling, CANONICALIZATION_VERSION,
+    CampaignArtifactContext, GauntletProducerBuildIdentity, GauntletProducerSourceVerification,
+    IntegrityCheckedCampaign, OBJECT_SCHEMA_VERSION, PreparedArtifact, RUN_MANIFEST_SCHEMA_VERSION,
+    RunManifest, SerializedSchemaDisposition, classify_artifact_object_schema,
+    classify_campaign_report_schema,
 };
 #[cfg(feature = "tantivy-oracle")]
 pub use comparator::observe_tantivy_cass_profile;
@@ -164,21 +167,24 @@ pub use qg6_prepared::{
 };
 pub use runner::{
     CAMPAIGN_REPORT_SCHEMA_VERSION, CASS_ANALYZER_CONTRACT_PREIMAGE, CASS_SCHEMA_CONTRACT_PREIMAGE,
-    CampaignCaseResult, CampaignConfig, CampaignContractMode, CampaignDisposition, CampaignFuture,
-    CampaignLexicalCaseSummary, CampaignLexicalCoverageSummary, CampaignProvenance, CampaignReport,
-    CampaignSelection, DEFAULT_ANALYZER_CONTRACT_HASH, DEFAULT_ANALYZER_CONTRACT_PREIMAGE,
+    CampaignCaseReason, CampaignCaseResult, CampaignConfig, CampaignContractMode,
+    CampaignDisposition, CampaignFuture, CampaignLexicalCaseSummary,
+    CampaignLexicalCoverageSummary, CampaignProvenance, CampaignReport, CampaignSelection,
+    DEFAULT_ANALYZER_CONTRACT_HASH, DEFAULT_ANALYZER_CONTRACT_PREIMAGE,
     DEFAULT_SCHEMA_CONTRACT_HASH, DEFAULT_SCHEMA_CONTRACT_PREIMAGE, DEFAULT_SHRINK_FUEL,
+    DIVERGENCE_PREDICTION_POLICY_PREIMAGE, DIVERGENCE_PREDICTION_POLICY_VERSION,
     DIVERGENCE_REGISTER_LEDGER_SCHEMA_VERSION, DIVERGENCE_REGISTER_REDACTION_POLICY_VERSION,
-    DifferentialCampaignEngine, DifferentialCampaignRunner, DivergenceCensus,
-    DivergenceClassCensus, DivergenceDisposition, DivergenceDispositionEvent,
-    DivergenceFixtureEvidence, DivergenceObservationEvent, DivergencePredictionEvent,
-    DivergenceRegisterDecision, DivergenceRegisterEntry, DivergenceRegisterEvent,
-    DivergenceRegisterEventHeader, DivergenceRegisterLedger, DivergenceRegistry,
-    DivergenceRevisionSet, EngineIndexReceipt, GeneratedCorpusReplay, LexicalMismatchGroup,
-    LexicalSideCoverageCounts, MismatchGroup, PredictedDivergenceState, ProbeCoverageCounts,
-    QueryClassSummary, RedactedDivergenceDiagnostic, SCALAR_G1A_SCHEMA_CONTRACT_PREIMAGE,
-    SemanticContract, ShadowDivergenceRecord, ShrinkDriver, ShrinkEngineFactory, ShrinkError,
-    ShrinkRequest, ShrunkReproduction, SuspectedLayer, TriageConfidence, TriageVerdict,
+    DifferentialCampaignEngine, DifferentialCampaignRunner, DivergenceArtifactObjectHash,
+    DivergenceArtifactObjectHashScheme, DivergenceDisposition, DivergenceDispositionEvent,
+    DivergenceFixtureContentWitness, DivergenceFixtureEvidence, DivergenceObservationEvent,
+    DivergencePredictionEvent, DivergenceRegisterDecision, DivergenceRegisterEntry,
+    DivergenceRegisterEvent, DivergenceRegisterEventHeader, DivergenceRegisterLedger,
+    DivergenceRegistry, DivergenceRevisionSet, EngineIndexReceipt, GeneratedCorpusReplay,
+    LexicalMismatchGroup, LexicalSideCoverageCounts, MismatchGroup, PredictedDivergenceState,
+    ProbeCoverageCounts, QueryClassSummary, RedactedDivergenceDiagnostic,
+    SCALAR_G1A_SCHEMA_CONTRACT_PREIMAGE, SemanticContract, ShadowDivergenceRecord, ShrinkDriver,
+    ShrinkEngineFactory, ShrinkError, ShrinkRequest, ShrunkReproduction, SuspectedLayer,
+    TriageConfidence, TriageVerdict, divergence_prediction_policy_sha256,
     persist_shrunk_reproduction,
 };
 pub use version_contract::{

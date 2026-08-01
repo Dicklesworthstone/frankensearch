@@ -4,6 +4,9 @@
 //! including schema creation, document indexing, BM25 query parsing,
 //! and search result ranking.
 //!
+//! The crate version constant is part of gauntlet dependency provenance: it
+//! identifies the concrete lexical wrapper compiled around Tantivy.
+//!
 //! # Schema
 //!
 //! | Field | Tantivy Options | Source |
@@ -15,6 +18,9 @@
 //!
 //! The `content` and `title` fields are searched with BM25 scoring.
 //! Title matches receive a 2× boost via `QueryParser::set_field_boost`.
+
+/// Exact `frankensearch-lexical` crate version compiled into this adapter.
+pub const FRANKENSEARCH_LEXICAL_CRATE_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 pub mod cass_compat;
 pub mod quill_contract;
@@ -689,6 +695,23 @@ pub struct BenchmarkWriterJoinReceipt {
     pub writer_rearmed: bool,
 }
 
+/// Ordered searchable-segment geometry from the pinned Tantivy oracle.
+///
+/// This conformance-only receipt preserves Tantivy's native `segment_ord`
+/// assignment as well as physical and live document counts. It is absent from
+/// normal shipping builds.
+#[cfg(feature = "tantivy-oracle")]
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OracleSegmentLayout {
+    /// Native Tantivy segment ordinal used in `DocAddress` tie-breaking.
+    pub segment_ord: u32,
+    /// Physical document cardinality, including deleted rows.
+    pub max_doc: u32,
+    /// Live document cardinality.
+    pub num_docs: u32,
+}
+
 /// A Tantivy-backed full-text search index implementing [`LexicalSearch`].
 ///
 /// Thread-safe for concurrent reads. Writes are serialized internally via
@@ -853,6 +876,57 @@ impl TantivyIndex {
             WRITER_HEAP_BYTES,
             Some(1),
         )
+    }
+
+    /// Disable automatic merging for an exact oracle segment-topology proof.
+    ///
+    /// This method is intentionally separate from the benchmark-only helper:
+    /// conformance fixtures use Tantivy's shipping indexing path but must keep
+    /// explicit commit boundaries observable for native `DocAddress` ties.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed cancellation or writer-lock error.
+    #[cfg(feature = "tantivy-oracle")]
+    #[doc(hidden)]
+    pub async fn oracle_disable_auto_merge(&self, cx: &Cx) -> SearchResult<()> {
+        let writer = self
+            .writer
+            .lock(cx)
+            .await
+            .map_err(|error| Self::map_writer_lock_error("tantivy.oracle_no_merge", error))?;
+        writer.set_merge_policy(Box::new(tantivy::merge_policy::NoMergePolicy));
+        Ok(())
+    }
+
+    /// Return searchable oracle segments in native `segment_ord` order.
+    ///
+    /// # Errors
+    ///
+    /// Returns an invalid-config error if a segment ordinal cannot fit
+    /// Tantivy's public address type.
+    #[cfg(feature = "tantivy-oracle")]
+    #[doc(hidden)]
+    pub fn oracle_segment_layout(&self) -> SearchResult<Vec<OracleSegmentLayout>> {
+        self.reader
+            .searcher()
+            .segment_readers()
+            .iter()
+            .enumerate()
+            .map(|(segment_ord, segment)| {
+                let segment_ord =
+                    u32::try_from(segment_ord).map_err(|_| SearchError::InvalidConfig {
+                        field: "tantivy.segment_ord".to_owned(),
+                        value: segment_ord.to_string(),
+                        reason: "segment ordinal must fit in u32".to_owned(),
+                    })?;
+                Ok(OracleSegmentLayout {
+                    segment_ord,
+                    max_doc: segment.max_doc(),
+                    num_docs: segment.num_docs(),
+                })
+            })
+            .collect()
     }
 
     /// Create an in-memory index with an explicit writer heap budget.

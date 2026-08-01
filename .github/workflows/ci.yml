@@ -226,10 +226,159 @@ jobs:
         env:
           GAUNTLET_SUBJECT_REVISION: ${{ github.sha }}
           GAUNTLET_SUBJECT_DIRTY: "false"
-          GAUNTLET_ORACLE_REVISION: 062a5e5b2d41653b1c8b07888eda1a765e421f49
-          GAUNTLET_ORACLE_DIRTY: "false"
           GAUNTLET_ARTIFACT_ROOT: target/coverage/quill-gauntlet-pr
         run: cargo test -p frankensearch-quill-gauntlet --features tantivy-oracle runner::tests::live_ -- --nocapture
+
+      - name: Bind job-scoped Salej artifact lane
+        id: salej_lane
+        if: always() && matrix.os == 'ubuntu-latest'
+        shell: bash
+        env:
+          EXPECTED_SALEJ_LANE_KEY: ${{ github.job }}-${{ runner.arch }}-${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          if [[ ! "${EXPECTED_SALEJ_LANE_KEY}" =~ ^[A-Za-z0-9._-]+$ ]]; then
+            echo "Unsafe Salej artifact lane key: ${EXPECTED_SALEJ_LANE_KEY}" >&2
+            exit 1
+          fi
+          printf 'key=%s\n' "${EXPECTED_SALEJ_LANE_KEY}" >> "${GITHUB_OUTPUT}"
+
+      - name: Assert Salej artifact lane identity contract
+        if: matrix.os == 'ubuntu-latest'
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import pathlib
+          import re
+
+          source = pathlib.Path(".github/workflows/ci.yml").read_text(encoding="utf-8")
+          dollar = "$"
+          lane_expression = (
+              dollar + "{{ github.job }}-"
+              + dollar + "{{ runner.arch }}-"
+              + dollar + "{{ github.run_id }}-"
+              + dollar + "{{ github.run_attempt }}"
+          )
+          lane_output = "steps" + ".salej_lane.outputs.key"
+          lane_reference = dollar + "{{ " + lane_output + " }}"
+
+          def job_block(job: str) -> str:
+              match = re.search(
+                  rf"(?ms)^  {re.escape(job)}:\n(?P<body>.*?)(?=^  [A-Za-z0-9_-]+:\n|\Z)",
+                  source,
+              )
+              if match is None:
+                  raise SystemExit(f"salej.identity.missing_job: {job}")
+              return match.group(0)
+
+          for job in ("quality", "salej-conformance"):
+              block = job_block(job)
+              declaration = f"EXPECTED_SALEJ_LANE_KEY: {lane_expression}"
+              if block.count(declaration) != 1:
+                  raise SystemExit(
+                      f"salej.identity.lane_declaration: {job} expected exactly one {declaration!r}"
+                  )
+              binding_id = "id" + ": salej_lane"
+              if block.count(binding_id) != 1:
+                  raise SystemExit(
+                      f"salej.identity.lane_binding_step: {job} expected exactly one salej_lane id"
+                  )
+              binding_match = re.search(
+                  r"(?m)^\s+- name: Bind job-scoped Salej artifact lane\n"
+                  + rf"\s+{re.escape(binding_id)}\n"
+                  r"\s+if: always\(\) && matrix\.os == 'ubuntu-latest'$",
+                  block,
+              )
+              if binding_match is None:
+                  raise SystemExit(
+                      f"salej.identity.lane_binding_guard: {job} must bind under always() "
+                      "on the Ubuntu publication lane"
+                  )
+              failure_upload_guard = (
+                  "if" + ": always() && failure() && matrix.os == 'ubuntu-latest' "
+                  f"&& {lane_output} != ''"
+              )
+              if block.count(failure_upload_guard) != 1:
+                  raise SystemExit(
+                      f"salej.identity.failure_upload_guard: {job} expected exactly one "
+                      f"{failure_upload_guard!r}"
+                  )
+              required = (
+                  f"GAUNTLET_UNION_HORIZON_ARTIFACT_ROOT: target/coverage/quill-gauntlet-salej/{lane_reference}",
+                  f"GAUNTLET_UNION_HORIZON_RUN_ID: {lane_reference}",
+                  f"name: quill-gauntlet-salej-diagnostic-{lane_reference}",
+                  f"path: target/coverage/quill-gauntlet-salej/{lane_reference}/*.json",
+                  f"name: quill-gauntlet-salej-attempt-{lane_reference}",
+                  f"path: target/coverage/quill-gauntlet-salej/{lane_reference}/**",
+              )
+              for fragment in required:
+                  if block.count(fragment) != 1:
+                      raise SystemExit(
+                          f"salej.identity.contract_fragment: {job} expected exactly one {fragment!r}"
+                      )
+              if block.count(lane_reference) != len(required):
+                  raise SystemExit(
+                      f"salej.identity.unreviewed_lane_reference: {job} found "
+                      f"{block.count(lane_reference)}, expected {len(required)}"
+                  )
+              expected_output_references = len(required) + 1
+              if block.count(lane_output) != expected_output_references:
+                  raise SystemExit(
+                      f"salej.identity.unreviewed_output_reference: {job} found "
+                      f"{block.count(lane_output)}, expected {expected_output_references}"
+                  )
+              first_reference = block.find(lane_reference)
+              if first_reference <= binding_match.start():
+                  raise SystemExit(
+                      f"salej.identity.reference_before_binding: {job} consumes the lane key "
+                      "before its always()-guarded producer"
+                  )
+
+          quality_key = f"quality-X64-{dollar}{{{{ github.run_id }}}}-{dollar}{{{{ github.run_attempt }}}}"
+          conformance_key = f"salej-conformance-X64-{dollar}{{{{ github.run_id }}}}-{dollar}{{{{ github.run_attempt }}}}"
+          if quality_key == conformance_key:
+              raise SystemExit("salej.identity.collision: distinct github.job values collapsed")
+          print("salej.identity.job_scoped_artifacts: PASS")
+          PY
+
+      - name: Salej partial pruning-receipt cancellation PR gate
+        if: matrix.os == 'ubuntu-latest'
+        timeout-minutes: 15
+        run: cargo test -p frankensearch-quill --features pruning-conformance --test cancellation_contract pruning_conformance_traced_public_search_discards_partial_receipt_and_replays_exactly -- --exact --nocapture
+
+      - name: Salej pruning-trace lifecycle unit PR gate
+        if: matrix.os == 'ubuntu-latest'
+        timeout-minutes: 15
+        run: cargo test -p frankensearch-quill --lib --features pruning-conformance pruning_conformance_ -- --nocapture --test-threads=1
+
+      - name: Salej direct-term MaxScore UNION_HORIZON diagnostic PR gate
+        if: matrix.os == 'ubuntu-latest'
+        timeout-minutes: 30
+        env:
+          GAUNTLET_SUBJECT_REVISION: ${{ github.sha }}
+          GAUNTLET_SUBJECT_DIRTY: "false"
+          GAUNTLET_UNION_HORIZON_ARTIFACT_ROOT: target/coverage/quill-gauntlet-salej/${{ steps.salej_lane.outputs.key }}
+          GAUNTLET_UNION_HORIZON_RUN_ID: ${{ steps.salej_lane.outputs.key }}
+        run: cargo test -p frankensearch-quill-gauntlet --features tantivy-oracle,pruning-conformance runner::tests::salej_complete_union_horizon_diagnostic_bundle -- --ignored --exact --nocapture --test-threads=1
+
+      - name: Upload Salej UNION_HORIZON diagnostic bundle
+        if: success() && matrix.os == 'ubuntu-latest'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: quill-gauntlet-salej-diagnostic-${{ steps.salej_lane.outputs.key }}
+          path: target/coverage/quill-gauntlet-salej/${{ steps.salej_lane.outputs.key }}/*.json
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload non-admissible Salej failure attempt
+        if: always() && failure() && matrix.os == 'ubuntu-latest' && steps.salej_lane.outputs.key != ''
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: quill-gauntlet-salej-attempt-${{ steps.salej_lane.outputs.key }}
+          path: target/coverage/quill-gauntlet-salej/${{ steps.salej_lane.outputs.key }}/**
+          if-no-files-found: warn
+          retention-days: 14
 
       - name: Upload Quill oracle PR campaign artifacts
         if: always() && matrix.os == 'ubuntu-latest'
@@ -560,6 +709,162 @@ jobs:
             echo "- Perf gate artifacts: \`perf_regression_gate_policy.json\`, \`perf_regression_gate_result.json\`."
           } >> "${GITHUB_STEP_SUMMARY}"
 
+  salej-conformance:
+    name: Salej conformance (${{ matrix.os }}, ${{ matrix.architecture }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            architecture: x86_64
+          - os: macos-15
+            architecture: arm64
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Bind job-scoped Salej artifact lane
+        id: salej_lane
+        if: always() && matrix.os == 'ubuntu-latest'
+        shell: bash
+        env:
+          EXPECTED_SALEJ_LANE_KEY: ${{ github.job }}-${{ runner.arch }}-${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          if [[ ! "${EXPECTED_SALEJ_LANE_KEY}" =~ ^[A-Za-z0-9._-]+$ ]]; then
+            echo "Unsafe Salej artifact lane key: ${EXPECTED_SALEJ_LANE_KEY}" >&2
+            exit 1
+          fi
+          printf 'key=%s\n' "${EXPECTED_SALEJ_LANE_KEY}" >> "${GITHUB_OUTPUT}"
+
+      - name: Assert exact runner architecture
+        shell: bash
+        run: |
+          set -euo pipefail
+          observed="$(uname -m)"
+          if [[ "${observed}" != "${{ matrix.architecture }}" ]]; then
+            echo "Expected ${{ matrix.architecture }} but GitHub assigned ${observed}" >&2
+            exit 1
+          fi
+          {
+            echo "### Salej runner identity"
+            echo "- image: ${{ matrix.os }}"
+            echo "- architecture: ${observed}"
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Install nightly toolchain
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
+        with:
+          toolchain: nightly-2026-07-20
+          components: rustfmt, clippy
+
+      - name: Prepare path dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          deps_dir="$(cd "$GITHUB_WORKSPACE/.." && pwd)"
+          asupersync_ref="15e6b6920fa0ad3e6d843ea55186eed754389ad2"
+          frankensqlite_ref="5c99eeb93d789c1309d5c46a540289369ff39535"
+          fast_cmaes_ref="17f633e2c24bdd0c358310949066e5922b9e17b5"
+
+          clone_or_update() {
+            local repo_url="$1"
+            local dest_path="$2"
+            local ref="$3"
+            if [[ -d "${dest_path}/.git" ]]; then
+              git -C "${dest_path}" fetch --depth 1 origin "${ref}"
+            else
+              git clone --no-checkout "${repo_url}" "${dest_path}"
+              git -C "${dest_path}" fetch --depth 1 origin "${ref}"
+            fi
+            git -C "${dest_path}" checkout --detach FETCH_HEAD
+          }
+
+          clone_or_update "https://github.com/Dicklesworthstone/asupersync.git" "${deps_dir}/asupersync" "${asupersync_ref}"
+          clone_or_update "https://github.com/Dicklesworthstone/frankensqlite.git" "${deps_dir}/frankensqlite" "${frankensqlite_ref}"
+          clone_or_update "https://github.com/Dicklesworthstone/fast_cmaes.git" "${deps_dir}/fast_cmaes" "${fast_cmaes_ref}"
+
+          while IFS= read -r -d '' manifest; do
+            if [[ "$RUNNER_OS" == "macOS" ]]; then
+              sed -i '' -e "s|/data/projects/|${deps_dir}/|g" "$manifest"
+            else
+              sed -i -e "s|/data/projects/|${deps_dir}/|g" "$manifest"
+            fi
+          done < <(find "$GITHUB_WORKSPACE" -name Cargo.toml -print0)
+
+      - name: Cache Salej Cargo registry and target
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: salej-${{ matrix.os }}-nightly
+          cache-targets: true
+
+      - name: Clippy Quill pruning-conformance surface
+        run: cargo clippy -p frankensearch-quill --all-targets --features pruning-conformance -- -D warnings
+
+      - name: Clippy Salej gauntlet feature surface
+        run: cargo clippy -p frankensearch-quill-gauntlet --all-targets --features tantivy-oracle,pruning-conformance -- -D warnings
+
+      - name: Salej partial pruning-receipt cancellation contract
+        timeout-minutes: 15
+        run: cargo test -p frankensearch-quill --features pruning-conformance --test cancellation_contract pruning_conformance_traced_public_search_discards_partial_receipt_and_replays_exactly -- --exact --nocapture
+
+      - name: Salej pruning-trace lifecycle units
+        timeout-minutes: 15
+        run: cargo test -p frankensearch-quill --lib --features pruning-conformance pruning_conformance_ -- --nocapture --test-threads=1
+
+      - name: Salej full nonignored Apple-Silicon matrix
+        if: matrix.os == 'macos-15'
+        timeout-minutes: 75
+        env:
+          GAUNTLET_SUBJECT_REVISION: ${{ github.sha }}
+          GAUNTLET_SUBJECT_DIRTY: "false"
+        run: cargo test -p frankensearch-quill-gauntlet --features tantivy-oracle,pruning-conformance runner::tests::salej_ -- --nocapture --test-threads=1
+
+      - name: Salej Ubuntu provenance and interruption gaps
+        if: matrix.os == 'ubuntu-latest'
+        timeout-minutes: 30
+        env:
+          GAUNTLET_SUBJECT_REVISION: ${{ github.sha }}
+          GAUNTLET_SUBJECT_DIRTY: "false"
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p frankensearch-quill-gauntlet --features tantivy-oracle,pruning-conformance runner::tests::salej_runtime_identity_rejects_revision_or_dirty_state_rewrites -- --exact --nocapture --test-threads=1
+          cargo test -p frankensearch-quill-gauntlet --features tantivy-oracle,pruning-conformance runner::tests::salej_diagnostic_source_identity_accepts_degraded_provenance_without_upgrading_it -- --exact --nocapture --test-threads=1
+          cargo test -p frankensearch-quill-gauntlet --features tantivy-oracle,pruning-conformance runner::tests::salej_union_horizon_offset_page_matches_control_with_real_tombstones -- --exact --nocapture --test-threads=1
+          cargo test -p frankensearch-quill-gauntlet --features tantivy-oracle,pruning-conformance runner::tests::salej_union_horizon_cancellation_at_final_collection_checkpoint_is_atomic -- --exact --nocapture --test-threads=1
+          cargo test -p frankensearch-quill-gauntlet --features tantivy-oracle,pruning-conformance runner::tests::salej_union_horizon_minimum_fuel_boundary_is_atomic_and_deterministic -- --exact --nocapture --test-threads=1
+
+      - name: Salej sealed UNION_HORIZON diagnostic bundle
+        if: matrix.os == 'ubuntu-latest'
+        timeout-minutes: 60
+        env:
+          GAUNTLET_SUBJECT_REVISION: ${{ github.sha }}
+          GAUNTLET_SUBJECT_DIRTY: "false"
+          GAUNTLET_UNION_HORIZON_ARTIFACT_ROOT: target/coverage/quill-gauntlet-salej/${{ steps.salej_lane.outputs.key }}
+          GAUNTLET_UNION_HORIZON_RUN_ID: ${{ steps.salej_lane.outputs.key }}
+        run: cargo test -p frankensearch-quill-gauntlet --features tantivy-oracle,pruning-conformance runner::tests::salej_complete_union_horizon_diagnostic_bundle -- --ignored --exact --nocapture --test-threads=1
+
+      - name: Upload Salej UNION_HORIZON diagnostic bundle
+        if: success() && matrix.os == 'ubuntu-latest'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: quill-gauntlet-salej-diagnostic-${{ steps.salej_lane.outputs.key }}
+          path: target/coverage/quill-gauntlet-salej/${{ steps.salej_lane.outputs.key }}/*.json
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload non-admissible Salej failure attempt
+        if: always() && failure() && matrix.os == 'ubuntu-latest' && steps.salej_lane.outputs.key != ''
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: quill-gauntlet-salej-attempt-${{ steps.salej_lane.outputs.key }}
+          path: target/coverage/quill-gauntlet-salej/${{ steps.salej_lane.outputs.key }}/**
+          if-no-files-found: warn
+          retention-days: 14
+
   fsfs-executable-quickstart:
     # bd-fsfs-executable-quickstart-ci-ve3ul: run the README's documented
     # source-install quick start against the REAL binary and a deterministic
@@ -723,8 +1028,6 @@ jobs:
           RCH_TEST_TIMEOUT_SEC: "4200"
           GAUNTLET_SUBJECT_REVISION: ${{ github.sha }}
           GAUNTLET_SUBJECT_DIRTY: "false"
-          GAUNTLET_ORACLE_REVISION: 062a5e5b2d41653b1c8b07888eda1a765e421f49
-          GAUNTLET_ORACLE_DIRTY: "false"
           GAUNTLET_ARTIFACT_ROOT: target/coverage/quill-gauntlet-nightly
         run: RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- cargo test --profile release -p frankensearch-quill-gauntlet --features tantivy-oracle runner::tests::live_both_profiles_campaign_nightly_full_lane -- --ignored --exact --nocapture
 
