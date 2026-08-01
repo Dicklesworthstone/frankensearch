@@ -15505,10 +15505,12 @@ mod tests {
                         .with_title(title),
                 );
             }
-            mixed
-                .index_documents(&cx, &sealed_documents)
-                .await
-                .expect("accumulate large sealed fixture");
+            for batch in sealed_documents.chunks(PARALLEL_INGEST_MIN_DOCS_PER_SHARD - 1) {
+                mixed
+                    .index_documents(&cx, batch)
+                    .await
+                    .expect("accumulate monolithic sealed fixture");
+            }
             mixed.commit(&cx).await.expect("seal large fixture");
             let keeper = mixed.snapshot();
             let sealed_snapshot = QuillSearchSnapshot::compose(0, Arc::clone(&keeper), Vec::new())
@@ -17904,6 +17906,65 @@ mod tests {
     }
 
     #[test]
+    fn deterministic_large_batch_builds_four_contiguous_segments() {
+        run_with_cx(|cx| async move {
+            let mut index =
+                QuillIndex::in_memory(deterministic_config()).expect("deterministic memory index");
+            let document_count = INTERNAL_PARALLEL_INGEST_SHARDS
+                .checked_mul(PARALLEL_INGEST_MIN_DOCS_PER_SHARD)
+                .expect("bounded deterministic parallel fixture");
+            let documents = (0..document_count)
+                .map(|ordinal| {
+                    IndexableDocument::new(
+                        format!("internal-parallel-{ordinal:05}"),
+                        "deterministic internal parallel indexing fixture",
+                    )
+                })
+                .collect::<Vec<_>>();
+            index
+                .index_documents(&cx, &documents)
+                .await
+                .expect("build deterministic internal segments");
+
+            assert_eq!(
+                index.writer_mut().pending_segments.len(),
+                INTERNAL_PARALLEL_INGEST_SHARDS,
+            );
+            assert!(index.writer_mut().shards.iter().all(|shard| {
+                shard.accumulator.document_count() == 0 && shard.identities.is_empty()
+            }));
+            index
+                .commit(&cx)
+                .await
+                .expect("publish deterministic internal segments");
+
+            let snapshot = index.snapshot();
+            let manifest = &snapshot.loaded_manifest().manifest;
+            assert_eq!(manifest.segments.len(), INTERNAL_PARALLEL_INGEST_SHARDS);
+            assert_eq!(
+                index.snapshot().doc_count(),
+                u64::try_from(document_count).expect("fixture document count fits u64"),
+            );
+            assert_eq!(
+                manifest.segments.first().map(|segment| segment.docid_lo),
+                Some(0)
+            );
+            assert_eq!(
+                manifest.segments.last().map(|segment| segment.docid_hi),
+                Some(u64::try_from(document_count).expect("fixture document count fits u64")),
+            );
+            assert!(
+                manifest
+                    .segments
+                    .windows(2)
+                    .all(|pair| pair[0].docid_hi == pair[1].docid_lo),
+                "internal segment ranges must be contiguous and gap-free",
+            );
+            assert_pairwise_disjoint_manifest(&manifest.segments);
+        });
+    }
+
+    #[test]
     fn adaptive_parallel_planner_v1_covers_frozen_matrix() {
         const DOCUMENT_COUNTS: [usize; 10] = [0, 1, 63, 64, 127, 128, 249, 250, 5_000, 8_192];
         const WIDTHS: [usize; 6] = [1, 2, 4, 64, 96, 128];
@@ -18212,7 +18273,7 @@ mod tests {
     }
 
     #[test]
-    fn deterministic_batch_keeps_adaptive_parallel_route_disabled() {
+    fn deterministic_batch_uses_fixed_internal_parallel_plan() {
         run_with_cx(|cx| async move {
             let config = QuillConfig {
                 max_ingest_shards: 4,
@@ -18236,7 +18297,9 @@ mod tests {
                 .commit(&cx)
                 .await
                 .expect("publish deterministic batch");
-            assert_eq!(index.snapshot().segments().len(), 1);
+            let expected_segments = INTERNAL_PARALLEL_INGEST_SHARDS
+                .min(documents.len() / PARALLEL_INGEST_MIN_DOCS_PER_SHARD);
+            assert_eq!(index.snapshot().segments().len(), expected_segments);
             assert_eq!(index.snapshot().doc_count(), 250);
         });
     }
