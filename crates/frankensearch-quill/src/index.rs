@@ -82,6 +82,7 @@ const METADATA_FIELD: u16 = 3;
 const ORD_FIELD: u16 = 4;
 const MAX_GLOBAL_DOCID_EXCLUSIVE: u64 = 1_u64 << 32;
 const PARALLEL_INGEST_MIN_DOCS_PER_SHARD: usize = 64;
+const PARALLEL_INGEST_PLANNER_VERSION: u8 = 1;
 const CONTENT_HASH_DOMAIN: &[u8] = b"frankensearch.quill.idmap-content.v2\0";
 
 /// Typed failure from the scalar shipping facade.
@@ -1500,20 +1501,97 @@ struct ParallelShardAssignment {
 
 #[derive(Debug, Clone, Copy)]
 struct ParallelIngestReceipt {
+    planner_version: u8,
+    route: ParallelIngestRoute,
+    configured_width: usize,
+    verified_pool_capacity: usize,
+    eligible_shards: usize,
     active_shards: usize,
-    worker_count: usize,
     arena_bytes_used_high_water: usize,
     arena_bytes_reserved_high_water: usize,
 }
 
-fn parallel_ingest_active_shards(
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ParallelIngestRoute {
+    Serial,
+    SharedNothing,
+}
+
+impl ParallelIngestRoute {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Serial => "serial",
+            Self::SharedNothing => "shared_nothing",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ParallelDocumentRange {
+    start: usize,
+    end: usize,
+}
+
+impl ParallelDocumentRange {
+    const fn len(self) -> usize {
+        self.end - self.start
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ParallelIngestPlan {
+    planner_version: u8,
+    route: ParallelIngestRoute,
+    configured_width: usize,
+    verified_pool_capacity: usize,
+    eligible_shards: usize,
+    active_shards: usize,
+    ranges: Vec<ParallelDocumentRange>,
+}
+
+fn plan_parallel_ingest(
     document_count: usize,
-    configured_shards: usize,
-    worker_count: usize,
-) -> usize {
-    configured_shards
-        .min(worker_count)
-        .min(document_count / PARALLEL_INGEST_MIN_DOCS_PER_SHARD)
+    configured_width: usize,
+    verified_pool_capacity: usize,
+) -> Result<ParallelIngestPlan, QuillIndexError> {
+    let eligible_shards = configured_width.min(verified_pool_capacity);
+    let active_shards = eligible_shards.min(document_count / PARALLEL_INGEST_MIN_DOCS_PER_SHARD);
+    let route = if active_shards < 2 {
+        ParallelIngestRoute::Serial
+    } else {
+        ParallelIngestRoute::SharedNothing
+    };
+    let mut ranges = Vec::new();
+    if route == ParallelIngestRoute::SharedNothing {
+        ranges
+            .try_reserve_exact(active_shards)
+            .map_err(|_| invalid_state("could not reserve parallel ingest plan ranges"))?;
+        let documents_per_shard = document_count / active_shards;
+        let remainder = document_count % active_shards;
+        let mut start = 0_usize;
+        for position in 0..active_shards {
+            let count = documents_per_shard + usize::from(position < remainder);
+            let end = start
+                .checked_add(count)
+                .ok_or_else(|| invalid_state("parallel ingest plan range overflow"))?;
+            ranges.push(ParallelDocumentRange { start, end });
+            start = end;
+        }
+        if start != document_count {
+            return Err(invalid_state(
+                "parallel ingest plan did not cover the complete document batch",
+            ));
+        }
+    }
+    Ok(ParallelIngestPlan {
+        planner_version: PARALLEL_INGEST_PLANNER_VERSION,
+        route,
+        configured_width,
+        verified_pool_capacity,
+        eligible_shards,
+        active_shards,
+        ranges,
+    })
 }
 
 #[derive(Default)]
@@ -2892,16 +2970,16 @@ impl QuillWriterState {
         allow_automatic_publication: bool,
     ) -> Result<Option<ParallelIngestReceipt>, QuillIndexError> {
         let shard_count = self.shards.len();
-        let worker_count = rayon::current_num_threads();
-        let active_shard_count =
-            parallel_ingest_active_shards(documents.len(), shard_count, worker_count);
+        let verified_pool_capacity = rayon::current_num_threads();
+        let plan = plan_parallel_ingest(documents.len(), shard_count, verified_pool_capacity)?;
         if !replacement_ids.is_empty()
             || self.shard_router.is_deterministic()
-            || active_shard_count < 2
+            || plan.route == ParallelIngestRoute::Serial
         {
             return Ok(None);
         }
 
+        let active_shard_count = plan.active_shards;
         let maximum_shard_documents = documents.len().div_ceil(active_shard_count);
         let maximum_shard_documents = u32::try_from(maximum_shard_documents)
             .map_err(|_| invalid_state("parallel shard document count does not fit u32"))?;
@@ -2943,12 +3021,9 @@ impl QuillWriterState {
         }
 
         let mut assignments = vec![None; shard_count];
-        let documents_per_shard = documents.len() / active_shard_count;
-        let remainder = documents.len() % active_shard_count;
-        let mut document_start = 0_usize;
-        for position in 0..active_shard_count {
+        for range in &plan.ranges {
             let shard = self.shard_router.route_batch();
-            let count = documents_per_shard + usize::from(position < remainder);
+            let count = range.len();
             let count_u32 = u32::try_from(count)
                 .map_err(|_| invalid_state("parallel shard document count does not fit u32"))?;
             let allocated = self
@@ -2960,18 +3035,13 @@ impl QuillWriterState {
                     "parallel shard allocation unexpectedly crossed a Q1 lease",
                 ));
             };
-            let document_end = document_start
-                .checked_add(count)
-                .ok_or_else(|| invalid_state("parallel document range overflow"))?;
             assignments[shard] = Some(ParallelShardAssignment {
-                document_start,
-                document_end,
+                document_start: range.start,
+                document_end: range.end,
                 span: *span,
             });
             self.shards[shard].current_lease_base = Some(span.lease_base);
-            document_start = document_end;
         }
-        debug_assert_eq!(document_start, documents.len());
         self.next_lease_base = self.docid_allocator.watermark();
 
         self.shards
@@ -3016,8 +3086,12 @@ impl QuillWriterState {
                 .await?;
         }
         Ok(Some(ParallelIngestReceipt {
+            planner_version: plan.planner_version,
+            route: plan.route,
+            configured_width: plan.configured_width,
+            verified_pool_capacity: plan.verified_pool_capacity,
+            eligible_shards: plan.eligible_shards,
             active_shards: active_shard_count,
-            worker_count,
             arena_bytes_used_high_water,
             arena_bytes_reserved_high_water,
         }))
@@ -3092,8 +3166,12 @@ impl QuillWriterState {
             phase = "ingest",
             doc_count = documents.len(),
             result_count = tracing::field::Empty,
+            parallel_planner_version = tracing::field::Empty,
+            parallel_route = tracing::field::Empty,
+            parallel_configured_width = tracing::field::Empty,
+            parallel_verified_pool_capacity = tracing::field::Empty,
+            parallel_eligible_shards = tracing::field::Empty,
             parallel_active_shards = tracing::field::Empty,
-            parallel_worker_count = tracing::field::Empty,
             arena_bytes_used_high_water = tracing::field::Empty,
             arena_bytes_reserved_high_water = tracing::field::Empty,
             duration_us = tracing::field::Empty,
@@ -3142,12 +3220,25 @@ impl QuillWriterState {
                     u64::try_from(documents.len()).unwrap_or(u64::MAX),
                 );
                 ingest_span.record(
-                    "parallel_active_shards",
-                    u64::try_from(receipt.active_shards).unwrap_or(u64::MAX),
+                    "parallel_planner_version",
+                    u64::from(receipt.planner_version),
+                );
+                ingest_span.record("parallel_route", receipt.route.as_str());
+                ingest_span.record(
+                    "parallel_configured_width",
+                    u64::try_from(receipt.configured_width).unwrap_or(u64::MAX),
                 );
                 ingest_span.record(
-                    "parallel_worker_count",
-                    u64::try_from(receipt.worker_count).unwrap_or(u64::MAX),
+                    "parallel_verified_pool_capacity",
+                    u64::try_from(receipt.verified_pool_capacity).unwrap_or(u64::MAX),
+                );
+                ingest_span.record(
+                    "parallel_eligible_shards",
+                    u64::try_from(receipt.eligible_shards).unwrap_or(u64::MAX),
+                );
+                ingest_span.record(
+                    "parallel_active_shards",
+                    u64::try_from(receipt.active_shards).unwrap_or(u64::MAX),
                 );
                 ingest_span.record(
                     "arena_bytes_used_high_water",
@@ -15988,11 +16079,10 @@ mod tests {
                 .await
                 .expect("accumulate one large batch");
 
-            let active_shards = parallel_ingest_active_shards(
-                documents.len(),
-                shard_count,
-                rayon::current_num_threads(),
-            );
+            let active_shards =
+                plan_parallel_ingest(documents.len(), shard_count, rayon::current_num_threads())
+                    .expect("plan large parallel fixture")
+                    .active_shards;
             let expected_segments = active_shards.max(1);
             index.commit(&cx).await.expect("publish parallel batch");
             assert_eq!(index.snapshot().segments().len(), expected_segments);
@@ -16012,12 +16102,93 @@ mod tests {
     }
 
     #[test]
-    fn adaptive_parallel_batch_activates_only_amortized_shards() {
-        assert_eq!(parallel_ingest_active_shards(127, 4, 4), 1);
-        assert_eq!(parallel_ingest_active_shards(250, 4, 4), 3);
-        assert_eq!(parallel_ingest_active_shards(256, 4, 2), 2);
-        assert_eq!(parallel_ingest_active_shards(5_000, 128, 128), 78);
+    fn adaptive_parallel_planner_v1_covers_frozen_matrix() {
+        const DOCUMENT_COUNTS: [usize; 10] = [0, 1, 63, 64, 127, 128, 249, 250, 5_000, 8_192];
+        const WIDTHS: [usize; 6] = [1, 2, 4, 64, 96, 128];
 
+        let goldens = [
+            (250, 4, 4, 3),
+            (5_000, 96, 96, 78),
+            (5_000, 128, 128, 78),
+            (8_192, 128, 128, 128),
+        ];
+        for (document_count, configured_width, pool_capacity, expected_active) in goldens {
+            let plan = plan_parallel_ingest(document_count, configured_width, pool_capacity)
+                .expect("plan frozen adaptive-ingest golden");
+            assert_eq!(plan.active_shards, expected_active);
+        }
+
+        for document_count in DOCUMENT_COUNTS {
+            for width in WIDTHS {
+                let plan = plan_parallel_ingest(document_count, width, width)
+                    .expect("plan frozen adaptive-ingest matrix cell");
+                let repeated = plan_parallel_ingest(document_count, width, width)
+                    .expect("repeat frozen adaptive-ingest matrix cell");
+                assert_eq!(plan, repeated, "planner must be deterministic");
+                assert_eq!(plan.planner_version, PARALLEL_INGEST_PLANNER_VERSION);
+                assert_eq!(plan.configured_width, width);
+                assert_eq!(plan.verified_pool_capacity, width);
+                assert_eq!(plan.eligible_shards, width);
+                assert_eq!(
+                    plan.active_shards,
+                    width.min(document_count / PARALLEL_INGEST_MIN_DOCS_PER_SHARD),
+                );
+
+                if plan.active_shards < 2 {
+                    assert_eq!(plan.route, ParallelIngestRoute::Serial);
+                    assert!(plan.ranges.is_empty());
+                    continue;
+                }
+
+                assert_eq!(plan.route, ParallelIngestRoute::SharedNothing);
+                assert_eq!(plan.ranges.len(), plan.active_shards);
+                assert_eq!(plan.ranges.first().map(|range| range.start), Some(0));
+                assert_eq!(
+                    plan.ranges.last().map(|range| range.end),
+                    Some(document_count),
+                );
+                assert!(
+                    plan.ranges.windows(2).all(|pair| pair
+                        .first()
+                        .zip(pair.get(1))
+                        .is_some_and(|(first, second)| first.end == second.start)),
+                    "ranges must be contiguous and nonoverlapping",
+                );
+                assert!(
+                    plan.ranges.iter().all(|range| {
+                        range.len() >= PARALLEL_INGEST_MIN_DOCS_PER_SHARD
+                            && range.end <= document_count
+                    }),
+                    "tail documents must be folded into nonempty amortized ranges",
+                );
+                let shortest = plan
+                    .ranges
+                    .iter()
+                    .map(|range| range.len())
+                    .min()
+                    .expect("parallel plan has ranges");
+                let longest = plan
+                    .ranges
+                    .iter()
+                    .map(|range| range.len())
+                    .max()
+                    .expect("parallel plan has ranges");
+                assert!(longest - shortest <= 1, "ranges must remain balanced");
+                assert_eq!(
+                    plan.ranges.iter().map(|range| range.len()).sum::<usize>(),
+                    document_count,
+                );
+            }
+        }
+
+        let capacity_limited =
+            plan_parallel_ingest(8_192, 128, 96).expect("plan capacity-limited adaptive ingest");
+        assert_eq!(capacity_limited.eligible_shards, 96);
+        assert_eq!(capacity_limited.active_shards, 96);
+    }
+
+    #[test]
+    fn adaptive_parallel_batch_activates_only_amortized_shards() {
         run_with_cx(|cx| async move {
             let config = QuillConfig {
                 max_ingest_shards: 4,
@@ -16038,11 +16209,10 @@ mod tests {
                 .await
                 .expect("accumulate one adaptive batch");
 
-            let active_shards = parallel_ingest_active_shards(
-                documents.len(),
-                shard_count,
-                rayon::current_num_threads(),
-            );
+            let active_shards =
+                plan_parallel_ingest(documents.len(), shard_count, rayon::current_num_threads())
+                    .expect("plan adaptive parallel fixture")
+                    .active_shards;
             index.commit(&cx).await.expect("publish adaptive batch");
             assert_eq!(index.snapshot().segments().len(), active_shards.max(1));
             assert_eq!(index.snapshot().doc_count(), 250);
