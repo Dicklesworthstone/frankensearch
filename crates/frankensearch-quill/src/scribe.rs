@@ -4668,9 +4668,33 @@ pub struct DocIdAllocator {
     leases: Vec<Option<ShardLease>>,
     grants: Vec<LeaseGrant>,
     open: bool,
+    trace_grants: bool,
 }
 
 impl DocIdAllocator {
+    pub(crate) fn speculative_clone(&self) -> Self {
+        Self {
+            shard_count: self.shard_count,
+            next_block_base: self.next_block_base,
+            open_gap_burned: self.open_gap_burned,
+            grant_seq: self.grant_seq,
+            leases: self.leases.clone(),
+            grants: self.grants.clone(),
+            open: self.open,
+            trace_grants: false,
+        }
+    }
+
+    pub(crate) fn commit_speculative_grants(&mut self, prior_grant_count: usize) {
+        debug_assert!(prior_grant_count <= self.grants.len());
+        self.trace_grants = true;
+        if let Some(committed) = self.grants.get(prior_grant_count..) {
+            for grant in committed {
+                Self::trace_grant(*grant);
+            }
+        }
+    }
+
     /// Open a session allocator at the manifest's persisted watermark.
     ///
     /// A watermark that is not lease-block-aligned is aligned *up* to the next
@@ -4694,6 +4718,7 @@ impl DocIdAllocator {
             leases: vec![None; shard_count],
             grants: Vec::new(),
             open: true,
+            trace_grants: true,
         })
     }
 
@@ -4847,6 +4872,13 @@ impl DocIdAllocator {
             next_ord: 0,
         });
         self.grants.push(grant);
+        if self.trace_grants {
+            Self::trace_grant(grant);
+        }
+        Ok(())
+    }
+
+    fn trace_grant(grant: LeaseGrant) {
         tracing::trace!(
             target: crate::tracing_conventions::TARGET,
             phase = "scribe.docid_lease_grant",
@@ -4855,7 +4887,6 @@ impl DocIdAllocator {
             lease_base = grant.base_docid,
             "docid lease granted"
         );
-        Ok(())
     }
 }
 

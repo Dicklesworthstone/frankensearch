@@ -1492,6 +1492,12 @@ struct ScribeShardState {
     current_lease_base: Option<u64>,
 }
 
+struct ParallelShardWork {
+    shard: usize,
+    assignment: ParallelShardAssignment,
+    state: ScribeShardState,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct ParallelShardAssignment {
     document_start: usize,
@@ -1517,6 +1523,37 @@ enum ParallelIngestRoute {
     SharedNothing,
 }
 
+#[derive(Clone)]
+struct ParallelIngestCheckpoint {
+    #[cfg(feature = "conformance-internals")]
+    controller: Arc<ConformanceCancellationController>,
+}
+
+impl ParallelIngestCheckpoint {
+    #[cfg(not(feature = "conformance-internals"))]
+    const fn new(_: &QuillReader) -> Self {
+        Self {}
+    }
+
+    #[cfg(feature = "conformance-internals")]
+    fn new(reader: &QuillReader) -> Self {
+        Self {
+            controller: Arc::clone(&reader.conformance_controller),
+        }
+    }
+
+    #[allow(
+        clippy::unused_self,
+        reason = "keeps worker checkpoint call sites cfg-symmetric with the controller-backed variant"
+    )]
+    fn check(&self, cx: &Cx) -> Result<(), QuillIndexError> {
+        #[cfg(feature = "conformance-internals")]
+        self.controller
+            .checkpoint(ConformanceCancellationStage::ParallelIngest, cx);
+        check_cancel(cx, "parallel index worker")
+    }
+}
+
 impl ParallelIngestRoute {
     const fn as_str(self) -> &'static str {
         match self {
@@ -1524,6 +1561,17 @@ impl ParallelIngestRoute {
             Self::SharedNothing => "shared_nothing",
         }
     }
+}
+
+fn catch_parallel_ingest_worker<T>(
+    shard: usize,
+    operation: impl FnOnce() -> Result<T, QuillIndexError>,
+) -> Result<T, QuillIndexError> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(operation)).unwrap_or_else(|_| {
+        Err(invalid_state(format!(
+            "parallel ingest worker {shard} panicked before transactional commit"
+        )))
+    })
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1621,6 +1669,8 @@ pub enum ConformanceCancellationStage {
     FusionHydration = 2,
     /// The retained commit transaction immediately before publication.
     CommitPublication = 3,
+    /// One document boundary inside a shared-nothing ingest worker.
+    ParallelIngest = 4,
 }
 
 /// Fixed-size conformance receipt for the complete retained scalar writer
@@ -1743,6 +1793,7 @@ impl ConformanceCancellationStage {
             Self::QueryCollection => 1,
             Self::FusionHydration => 2,
             Self::CommitPublication => 3,
+            Self::ParallelIngest => 4,
         }
     }
 }
@@ -2979,26 +3030,6 @@ impl QuillWriterState {
             return Ok(None);
         }
 
-        let active_shard_count = plan.active_shards;
-        let maximum_shard_documents = documents.len().div_ceil(active_shard_count);
-        let maximum_shard_documents = u32::try_from(maximum_shard_documents)
-            .map_err(|_| invalid_state("parallel shard document count does not fit u32"))?;
-        for shard in 0..shard_count {
-            let live_lease = self.docid_allocator.live_lease(shard);
-            let remaining = live_lease.map_or(DOC_ORDS_PER_LEASE, |(_, next_ord)| {
-                DOC_ORDS_PER_LEASE - next_ord
-            });
-            if maximum_shard_documents > remaining {
-                return Ok(None);
-            }
-            if let (Some(current), Some((live, _))) =
-                (self.shards[shard].current_lease_base, live_lease)
-                && current != live
-            {
-                return Ok(None);
-            }
-        }
-
         let mut batch_ids = BTreeSet::new();
         for document in documents {
             check_cancel(cx, "parallel index validation")?;
@@ -3020,14 +3051,47 @@ impl QuillWriterState {
             }
         }
 
-        let mut assignments = vec![None; shard_count];
+        let active_shard_count = plan.active_shards;
+        let mut planned_router = self.shard_router.clone();
+        let prior_grant_count = self.docid_allocator.lease_grants().len();
+        let mut planned_allocator = self.docid_allocator.speculative_clone();
+        let mut selected_shards = vec![false; shard_count];
+        let mut work = Vec::new();
+        work.try_reserve_exact(active_shard_count)
+            .map_err(|_| invalid_state("could not reserve parallel ingest worker plans"))?;
         for range in &plan.ranges {
-            let shard = self.shard_router.route_batch();
+            let shard = planned_router.route_batch();
+            let selected = selected_shards.get_mut(shard).ok_or_else(|| {
+                invalid_state("parallel ingest planner selected an unknown shard")
+            })?;
+            if std::mem::replace(selected, true) {
+                return Err(invalid_state(
+                    "parallel ingest planner selected one shard more than once",
+                ));
+            }
+            let state = self
+                .shards
+                .get(shard)
+                .ok_or_else(|| invalid_state("parallel ingest shard state is missing"))?;
+            if state.accumulator.document_count() != 0 || !state.identities.is_empty() {
+                return Ok(None);
+            }
+            let live_lease = planned_allocator.live_lease(shard);
+            if let (Some(current), Some((live, _))) = (state.current_lease_base, live_lease)
+                && current != live
+            {
+                return Ok(None);
+            }
             let count = range.len();
             let count_u32 = u32::try_from(count)
                 .map_err(|_| invalid_state("parallel shard document count does not fit u32"))?;
-            let allocated = self
-                .docid_allocator
+            let remaining = live_lease.map_or(DOC_ORDS_PER_LEASE, |(_, next_ord)| {
+                DOC_ORDS_PER_LEASE - next_ord
+            });
+            if count_u32 > remaining {
+                return Ok(None);
+            }
+            let allocated = planned_allocator
                 .alloc_batch(shard, count_u32)
                 .map_err(|error| invalid_state(error.to_string()))?;
             let [span] = allocated.spans() else {
@@ -3035,23 +3099,69 @@ impl QuillWriterState {
                     "parallel shard allocation unexpectedly crossed a Q1 lease",
                 ));
             };
-            assignments[shard] = Some(ParallelShardAssignment {
-                document_start: range.start,
-                document_end: range.end,
-                span: *span,
+            work.push(ParallelShardWork {
+                shard,
+                assignment: ParallelShardAssignment {
+                    document_start: range.start,
+                    document_end: range.end,
+                    span: *span,
+                },
+                state: ScribeShardState {
+                    accumulator: ColumnarAccumulator::new(self.schema)?,
+                    identities: Vec::new(),
+                    current_lease_base: Some(span.lease_base),
+                },
             });
-            self.shards[shard].current_lease_base = Some(span.lease_base);
         }
-        self.next_lease_base = self.docid_allocator.watermark();
 
-        self.shards
-            .par_iter_mut()
-            .enumerate()
-            .try_for_each(|(shard, state)| {
-                assignments[shard].map_or(Ok(()), |assignment| {
-                    Self::accumulate_parallel_shard(state, documents, assignment)
-                })
-            })?;
+        let checkpoint = ParallelIngestCheckpoint::new(&self.reader);
+        let completed = work
+            .into_par_iter()
+            .map(|mut work| {
+                catch_parallel_ingest_worker(work.shard, || {
+                    Self::accumulate_parallel_shard(
+                        &mut work.state,
+                        documents,
+                        work.assignment,
+                        cx,
+                        &checkpoint,
+                    )
+                })?;
+                Ok(work)
+            })
+            .collect::<Result<Vec<_>, QuillIndexError>>()?;
+        checkpoint.check(cx)?;
+
+        let mut replacements = Vec::new();
+        replacements
+            .try_reserve_exact(shard_count)
+            .map_err(|_| invalid_state("could not reserve parallel ingest commit table"))?;
+        replacements.resize_with(shard_count, || None);
+        for completed_shard in completed {
+            let slot = replacements
+                .get_mut(completed_shard.shard)
+                .ok_or_else(|| invalid_state("parallel ingest completed an unknown shard"))?;
+            if slot.replace(completed_shard.state).is_some() {
+                return Err(invalid_state(
+                    "parallel ingest completed one shard more than once",
+                ));
+            }
+        }
+
+        // This is the first mutation of writer-owned state. Every fallible
+        // validation, allocation, worker, cancellation, and panic boundary
+        // above operates only on local plans, so a failure remains exactly
+        // retryable without committing allocator, router, or shard progress.
+        planned_allocator.commit_speculative_grants(prior_grant_count);
+        self.ingest_retry_required = true;
+        for (state, replacement) in self.shards.iter_mut().zip(replacements) {
+            if let Some(replacement) = replacement {
+                *state = replacement;
+            }
+        }
+        self.shard_router = planned_router;
+        self.docid_allocator = planned_allocator;
+        self.next_lease_base = self.docid_allocator.watermark();
 
         let arena_bytes_used_high_water = self.shards.iter().fold(0_usize, |total, shard| {
             total.saturating_add(shard.accumulator.bytes_used())
@@ -3101,7 +3211,10 @@ impl QuillWriterState {
         state: &mut ScribeShardState,
         documents: &[IndexableDocument],
         assignment: ParallelShardAssignment,
+        cx: &Cx,
+        checkpoint: &ParallelIngestCheckpoint,
     ) -> Result<(), QuillIndexError> {
+        checkpoint.check(cx)?;
         let shard_documents = documents
             .get(assignment.document_start..assignment.document_end)
             .ok_or_else(|| invalid_state("parallel shard document range is outside the batch"))?;
@@ -3118,6 +3231,7 @@ impl QuillWriterState {
             .try_reserve(shard_documents.len())
             .map_err(|_| invalid_state("could not reserve parallel shard identities"))?;
         for (offset, document) in shard_documents.iter().enumerate() {
+            checkpoint.check(cx)?;
             let offset = u32::try_from(offset)
                 .map_err(|_| invalid_state("parallel shard offset does not fit u32"))?;
             let doc_ord = assignment
@@ -3202,10 +3316,6 @@ impl QuillWriterState {
             if documents.is_empty() {
                 return Ok(());
             }
-            // Arm the fail-closed retry guard before allocation or mutation.
-            // Only the successful return below (or a successful commit)
-            // disarms it.
-            self.ingest_retry_required = true;
             if let Some(receipt) = self
                 .try_index_documents_parallel(
                     cx,
@@ -3251,6 +3361,10 @@ impl QuillWriterState {
                 self.ingest_retry_required = false;
                 return Ok(());
             }
+            // The parallel route arms this guard only at its transactional
+            // commit boundary. The serial route still mutates the live router
+            // and allocator directly, so arm it immediately before doing so.
+            self.ingest_retry_required = true;
             let shard_id = self.shard_router.route_batch();
             let document_count = u32::try_from(documents.len())
                 .map_err(|_| invalid_state("ingest batch document count does not fit u32"))?;
@@ -16225,6 +16339,120 @@ mod tests {
                     .as_slice(),
             );
         });
+    }
+
+    #[cfg(feature = "conformance-internals")]
+    #[test]
+    fn cancelled_parallel_batch_preserves_exact_state_and_retries_identically() {
+        run_with_cx(|cx| async move {
+            let config = QuillConfig {
+                max_ingest_shards: 4,
+                max_visibility_lag_ms: 60_000,
+                ..QuillConfig::default()
+            };
+            let mut index = QuillIndex::in_memory(config.clone()).expect("parallel memory index");
+            let shard_count = index.writer_mut().shard_router.shard_count();
+            let plan = plan_parallel_ingest(256, shard_count, rayon::current_num_threads())
+                .expect("plan cancellation fixture");
+            assert_eq!(
+                plan.route,
+                ParallelIngestRoute::SharedNothing,
+                "transaction test requires at least two verified worker shards",
+            );
+            let documents = (0..256)
+                .map(|ordinal| {
+                    IndexableDocument::new(
+                        format!("parallel-transaction-{ordinal:05}"),
+                        "shared nothing cancellation transaction fixture",
+                    )
+                })
+                .collect::<Vec<_>>();
+            let state_before = index
+                .conformance_pending_writer_state()
+                .expect("capture pristine writer state");
+            let controller = index.conformance_cancellation_controller();
+            controller
+                .arm(ConformanceCancellationStage::ParallelIngest, 3)
+                .expect("arm mid-worker cancellation");
+
+            let cancelled = index
+                .index_documents(&cx, &documents)
+                .await
+                .expect_err("parallel worker must observe injected cancellation");
+            assert!(
+                matches!(
+                    &cancelled,
+                    QuillIndexError::Cancelled {
+                        phase: "parallel index worker"
+                    }
+                ),
+                "unexpected cancellation result: {cancelled:?}",
+            );
+            assert!(controller.fired());
+            assert!(controller.observed_checkpoints() >= 3);
+            assert!(cx.is_cancel_requested());
+            assert!(!index.has_uncommitted_changes());
+            assert_eq!(
+                index
+                    .conformance_pending_writer_state()
+                    .expect("capture cancelled writer state"),
+                state_before,
+                "a joined worker cancellation must not commit allocator, router, shard, or retry-guard state",
+            );
+
+            controller.disarm();
+            cx.set_cancel_requested(false);
+            index
+                .index_documents(&cx, &documents)
+                .await
+                .expect("retry cancelled parallel batch");
+            let retry_state = index
+                .conformance_pending_writer_state()
+                .expect("capture retried writer state");
+
+            let control = QuillIndex::in_memory(config).expect("fresh parallel control index");
+            control
+                .index_documents(&cx, &documents)
+                .await
+                .expect("accumulate fresh parallel control batch");
+            assert_eq!(
+                retry_state,
+                control
+                    .conformance_pending_writer_state()
+                    .expect("capture control writer state"),
+                "retry must reproduce the exact fresh allocator, router, shard, and identity state",
+            );
+
+            index.commit(&cx).await.expect("publish retried batch");
+            control.commit(&cx).await.expect("publish control batch");
+            assert_eq!(index.snapshot().doc_count(), 256);
+            assert_eq!(control.snapshot().doc_count(), 256);
+            for document in &documents {
+                assert_eq!(
+                    index
+                        .document_witness(&document.id)
+                        .expect("resolve retried witness"),
+                    control
+                        .document_witness(&document.id)
+                        .expect("resolve control witness"),
+                    "retry witness differs for {}",
+                    document.id,
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn parallel_worker_panic_is_a_typed_precommit_failure() {
+        let error = catch_parallel_ingest_worker(7, || -> Result<(), QuillIndexError> {
+            panic!("injected parallel worker panic");
+        })
+        .expect_err("worker panic must be caught");
+        assert!(matches!(
+            error,
+            QuillIndexError::InvalidState { detail }
+                if detail == "parallel ingest worker 7 panicked before transactional commit"
+        ));
     }
 
     #[test]
