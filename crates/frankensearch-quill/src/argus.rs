@@ -9199,6 +9199,209 @@ mod tests {
     }
 
     #[test]
+    fn block_max_wand_empty_competitive_window_refills_again_for_late_winner()
+    -> Result<(), Box<dyn std::error::Error>> {
+        const NUM_DOCS: u32 = 9_001;
+        const TARGET_DOC: u32 = 9_000;
+        const FIELD_LENGTH: u32 = 64;
+        assert_eq!(BMW_MIN_CLAUSES, 9, "fixture requires nine direct terms");
+
+        let lengths = vec![Some(FIELD_LENGTH); usize::try_from(NUM_DOCS)?];
+        let encoded_doclens = EncodedDocLenSection::encode(
+            0,
+            u64::from(NUM_DOCS),
+            &[1],
+            &[DocLenFieldInput::new(1, &lengths)],
+        )?;
+        let doclens = encoded_doclens.section(&[1])?;
+        let field = doclens.field(1).ok_or(ArgusError::CursorInvariant(
+            "BMW UNION_HORIZON fixture has no field 1",
+        ))?;
+        let snapshot = snapshot(
+            1,
+            u64::from(NUM_DOCS) * u64::from(FIELD_LENGTH),
+            u64::from(NUM_DOCS),
+        )?;
+
+        // Every term is dense so all nine cursors remain active across the
+        // first two 4,096-document horizons and their aggregate cost forces
+        // BMW rather than MaxScore. Fixed field lengths isolate frequency as
+        // the only score lever: doc 0 establishes the first cutoff, the low-TF
+        // middle horizon is entirely skippable, and doc 9,000 is strictly
+        // stronger than the incumbent in the terminal horizon.
+        let dense_rows = (0..NUM_DOCS)
+            .map(|doc| {
+                Posting::new(
+                    doc,
+                    if doc == 0 {
+                        4
+                    } else if doc == TARGET_DOC {
+                        8
+                    } else {
+                        1
+                    },
+                )
+            })
+            .collect::<Vec<_>>();
+        let rows_by_term = (0..BMW_MIN_CLAUSES)
+            .map(|_| dense_rows.clone())
+            .collect::<Vec<_>>();
+        let boosts = vec![1.0; BMW_MIN_CLAUSES];
+        let encoded_terms = rows_by_term
+            .iter()
+            .map(|rows| {
+                EncodedPostingList::encode_with_block_max(rows, |doc| {
+                    field.fieldnorm_id(u64::from(doc))
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let posting_lists = encoded_terms
+            .iter()
+            .map(|(postings, _)| postings.posting_list())
+            .collect::<Result<Vec<_>, _>>()?;
+        let block_max = validated_block_max_entries(&encoded_terms, &posting_lists, field)?;
+
+        let mut broken = sealed_union(
+            &posting_lists,
+            Some(&block_max),
+            field,
+            &snapshot,
+            &rows_by_term,
+            &boosts,
+            NUM_DOCS,
+        )?;
+        let mut broken_collector = TopDocsCollector::new(1, 0)?;
+        let ScorerNode::Union(broken_union) = &mut broken.node else {
+            return Err(Box::new(ArgusError::CursorInvariant(
+                "UNION_HORIZON fixture must lower to a buffered union",
+            )));
+        };
+        collect_until_first_empty_competitive_refill_for_negative_control(
+            broken_union,
+            &mut broken_collector,
+        )?;
+        assert_eq!(broken_union.pruning_stats.max_score_windows, 0);
+        assert_eq!(broken_union.pruning_stats.block_max_wand_windows, 1);
+        assert_eq!(broken_union.pruning_stats.candidate_docs, 0);
+        assert!(broken_union.pruning_stats.blocks_skipped > 0);
+        assert_eq!(broken_union.conformance_refills.len(), 2);
+        assert_eq!(
+            broken_union.conformance_refills[1].strategy,
+            ConformanceUnionRefillStrategy::BlockMaxWand,
+        );
+        assert!(broken_union.conformance_refills[1].buffer_empty);
+        assert!(broken_union.conformance_refills[1].live_work_remains);
+        let broken_hits = broken_collector.finish()?.hits;
+        assert_eq!(broken_hits[0].global_docid, 0);
+        assert_ne!(broken_hits[0].global_docid, TARGET_DOC);
+
+        let mut oracle = sealed_union(
+            &posting_lists,
+            None,
+            field,
+            &snapshot,
+            &rows_by_term,
+            &boosts,
+            NUM_DOCS,
+        )?;
+        let mut oracle_collector = TopDocsCollector::new(1, 0)?;
+        oracle_collector.collect(&mut oracle, &AllLiveDocs)?;
+        let oracle_hits = oracle_collector.finish()?.hits;
+
+        let mut candidate = sealed_union(
+            &posting_lists,
+            Some(&block_max),
+            field,
+            &snapshot,
+            &rows_by_term,
+            &boosts,
+            NUM_DOCS,
+        )?;
+        let mut candidate_collector = TopDocsCollector::new(1, 0)?;
+        candidate_collector.collect(&mut candidate, &AllLiveDocs)?;
+        let ScorerNode::Union(candidate_union) = &candidate.node else {
+            return Err(Box::new(ArgusError::CursorInvariant(
+                "UNION_HORIZON fixture must lower to a buffered union",
+            )));
+        };
+        let stats = candidate_union.pruning_stats;
+        let trace = candidate_union.conformance_refills.clone();
+        let candidate_hits = candidate_collector.finish()?.hits;
+
+        assert_hits_bit_exact(&candidate_hits, &oracle_hits);
+        assert_eq!(candidate_hits[0].global_docid, TARGET_DOC);
+        assert_eq!(stats.max_score_windows, 0);
+        assert_eq!(stats.block_max_wand_windows, 2);
+        assert!(stats.blocks_skipped > 0);
+
+        assert_eq!(
+            trace.len(),
+            3,
+            "expected one exhaustive and two BMW refills"
+        );
+        assert_eq!(
+            (
+                trace[0].ordinal,
+                trace[0].window_start,
+                trace[0].horizon_end,
+                trace[0].strategy,
+            ),
+            (1, 0, 4_096, ConformanceUnionRefillStrategy::Exhaustive),
+        );
+        assert!(trace[0].cutoff_bits.is_none());
+        assert!(trace[0].candidate_docs > 0);
+        assert!(!trace[0].buffer_empty);
+        assert!(trace[0].live_work_remains);
+
+        assert_eq!(
+            (
+                trace[1].ordinal,
+                trace[1].window_start,
+                trace[1].horizon_end,
+                trace[1].strategy,
+            ),
+            (
+                2,
+                4_096,
+                8_192,
+                ConformanceUnionRefillStrategy::BlockMaxWand,
+            ),
+        );
+        assert!(
+            trace[1]
+                .cutoff_bits
+                .is_some_and(|bits| f32::from_bits(bits).is_finite())
+        );
+        assert_eq!(trace[1].candidate_docs, 0);
+        assert!(trace[1].buffer_empty);
+        assert!(trace[1].live_work_remains);
+
+        assert_eq!(
+            (
+                trace[2].ordinal,
+                trace[2].window_start,
+                trace[2].horizon_end,
+                trace[2].strategy,
+            ),
+            (
+                3,
+                8_192,
+                12_288,
+                ConformanceUnionRefillStrategy::BlockMaxWand,
+            ),
+        );
+        assert!(
+            trace[2]
+                .cutoff_bits
+                .is_some_and(|bits| f32::from_bits(bits).is_finite())
+        );
+        assert!(trace[2].candidate_docs > 0);
+        assert!(!trace[2].buffer_empty);
+        assert!(!trace[2].live_work_remains);
+        Ok(())
+    }
+
+    #[test]
     fn older_monotone_cutoff_is_exact_but_admits_more_candidates()
     -> Result<(), Box<dyn std::error::Error>> {
         const NUM_DOCS: u32 = 10_001;
