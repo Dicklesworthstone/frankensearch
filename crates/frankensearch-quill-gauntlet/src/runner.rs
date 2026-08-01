@@ -29,12 +29,14 @@ use crate::comparator::{
     LexicalProbeCoverage, LexicalSideCoverage, RankClass, compare_lexical_contracts,
     compare_observations, observe_live_lexical_contract,
 };
+#[cfg(any(test, feature = "tantivy-oracle"))]
+use crate::engine::BuiltInEngineProfile;
 #[cfg(feature = "tantivy-oracle")]
 use crate::engine::GauntletEngine;
 use crate::engine::{
-    BuiltInEngineProfile, BuiltInEngineProfileReceipt, ComparisonMode, DifferentialCase,
-    DifferentialCaseMetadata, EngineDescriptor, EnginePairIdentity, HARNESS_RUN_SCHEMA_VERSION,
-    HarnessRun, MAX_SNIPPET_CHARS,
+    BuiltInEngineProfileReceipt, ComparisonMode, DifferentialCase, DifferentialCaseMetadata,
+    EngineDescriptor, EnginePairIdentity, HARNESS_RUN_SCHEMA_VERSION, HarnessRun,
+    MAX_SNIPPET_CHARS,
 };
 #[cfg(feature = "tantivy-oracle")]
 use crate::generator::GeneratedSourceFilter;
@@ -3488,7 +3490,7 @@ impl CampaignReport {
     }
 
     /// Hash test-owned hostile bytes without granting them report validity.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "tantivy-oracle"))]
     pub(crate) fn report_hash_unchecked_fixture(&self) -> Result<String, GauntletError> {
         let mut hasher = Sha256::new();
         hasher.update(CAMPAIGN_REPORT_V7_HASH_DOMAIN);
@@ -3987,6 +3989,13 @@ pub struct DifferentialCampaignRunner {
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum CampaignAdmission {
     Diagnostic,
+    #[cfg_attr(
+        not(any(test, feature = "tantivy-oracle")),
+        expect(
+            dead_code,
+            reason = "typed built-in admission is entered only by oracle-backed or test lanes"
+        )
+    )]
     BuiltInEvidence(BuiltInEngineProfileReceipt),
 }
 

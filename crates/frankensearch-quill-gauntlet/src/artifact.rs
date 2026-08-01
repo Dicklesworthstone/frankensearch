@@ -1361,8 +1361,8 @@ impl CampaignCompletionReceipt {
 /// This exposes receipt construction only to in-crate tests that need to prove
 /// deeper replay validation after a coherent hostile rewrite. It grants no
 /// authority and is absent from non-test builds.
-#[cfg(test)]
-pub(crate) fn campaign_completion_receipt_fixture(
+#[cfg(all(test, feature = "tantivy-oracle"))]
+pub(super) fn campaign_completion_receipt_fixture(
     report: &CampaignReport,
 ) -> Result<(OsString, Vec<u8>), GauntletError> {
     let receipt =

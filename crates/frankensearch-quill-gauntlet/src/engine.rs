@@ -18,6 +18,7 @@ use frankensearch_quill::{
 use frankensearch_quill::{QuillConfig, QuillIndex, QuillSearchResult};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+#[cfg(any(test, feature = "tantivy-oracle"))]
 use xxhash_rust::xxh3::xxh3_64;
 
 use crate::GauntletError;
@@ -371,8 +372,22 @@ pub struct BuiltInEngineProfileReceipt {
 
 impl BuiltInEngineProfileReceipt {
     const V1_SCHEMA_VERSION: u32 = 1;
+    #[cfg_attr(
+        not(any(test, feature = "tantivy-oracle")),
+        expect(
+            dead_code,
+            reason = "typed built-in receipts are constructed only by oracle-backed or test lanes"
+        )
+    )]
     const CURRENT_SCHEMA_VERSION: u32 = Self::V1_SCHEMA_VERSION;
 
+    #[cfg_attr(
+        not(any(test, feature = "tantivy-oracle")),
+        expect(
+            dead_code,
+            reason = "typed built-in receipts are constructed only by oracle-backed or test lanes"
+        )
+    )]
     pub(crate) fn new(profile: BuiltInEngineProfile, subject_config: &QuillConfig) -> Self {
         Self {
             schema_version: Self::CURRENT_SCHEMA_VERSION,
