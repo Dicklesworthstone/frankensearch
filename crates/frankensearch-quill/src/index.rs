@@ -81,7 +81,7 @@ const TITLE_FIELD: u16 = 2;
 const METADATA_FIELD: u16 = 3;
 const ORD_FIELD: u16 = 4;
 const MAX_GLOBAL_DOCID_EXCLUSIVE: u64 = 1_u64 << 32;
-const PARALLEL_INGEST_MIN_DOCS_PER_SHARD: usize = 64;
+const PARALLEL_INGEST_MIN_DOCS_PER_SHARD: usize = 128;
 const CONTENT_HASH_DOMAIN: &[u8] = b"frankensearch.quill.idmap-content.v2\0";
 
 /// Typed failure from the scalar shipping facade.
@@ -15546,10 +15546,10 @@ mod tests {
 
     #[test]
     fn adaptive_parallel_batch_activates_only_amortized_shards() {
-        assert_eq!(parallel_ingest_active_shards(127, 4, 4), 1);
-        assert_eq!(parallel_ingest_active_shards(250, 4, 4), 3);
+        assert_eq!(parallel_ingest_active_shards(127, 4, 4), 0);
+        assert_eq!(parallel_ingest_active_shards(250, 4, 4), 1);
         assert_eq!(parallel_ingest_active_shards(256, 4, 2), 2);
-        assert_eq!(parallel_ingest_active_shards(5_000, 128, 128), 78);
+        assert_eq!(parallel_ingest_active_shards(5_000, 128, 128), 39);
 
         run_with_cx(|cx| async move {
             let config = QuillConfig {
@@ -15558,7 +15558,7 @@ mod tests {
             };
             let mut index = QuillIndex::in_memory(config).expect("multi-shard memory index");
             let shard_count = index.writer_mut().shard_router.shard_count();
-            let documents = (0..250)
+            let documents = (0..500)
                 .map(|ordinal| {
                     IndexableDocument::new(
                         format!("adaptive-shard-{ordinal:05}"),
@@ -15578,7 +15578,7 @@ mod tests {
             );
             index.commit(&cx).await.expect("publish adaptive batch");
             assert_eq!(index.snapshot().segments().len(), active_shards.max(1));
-            assert_eq!(index.snapshot().doc_count(), 250);
+            assert_eq!(index.snapshot().doc_count(), 500);
             assert_pairwise_disjoint_manifest(
                 index
                     .snapshot()
