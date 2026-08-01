@@ -536,8 +536,11 @@ impl SyncTwoTierSearcher {
         }
 
         if self.config.fast_only || !self.index.has_quality_index() {
+            // Same vocabulary as the async searcher (searcher.rs) — the two
+            // sides share one skip_reason contract; "fast_only" is the string
+            // the fsfs surfaces document (bd-k3089 parity suite pins this).
             metrics.skip_reason = Some(if self.config.fast_only {
-                "fast_only_enabled".to_owned()
+                "fast_only".to_owned()
             } else {
                 "quality_index_unavailable".to_owned()
             });

@@ -190,7 +190,7 @@ fn fast_only_mode_skips_phase_two() {
     let (_, metrics) = searcher
         .search_collect(&normalize(vec![1.0, 0.0]), 3)
         .expect("search collect");
-    assert_eq!(metrics.skip_reason.as_deref(), Some("fast_only_enabled"));
+    assert_eq!(metrics.skip_reason.as_deref(), Some("fast_only"));
 }
 
 #[test]
