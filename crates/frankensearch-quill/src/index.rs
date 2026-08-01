@@ -5130,6 +5130,8 @@ impl QuillReader {
         let _query_entered = query_span.enter();
         check_cancel(cx, "search")?;
         let cache_enabled = self.ranked_query_cache_enabled();
+        #[cfg(feature = "pruning-conformance")]
+        let cache_enabled = cache_enabled && pruning_trace.is_none();
         if cache_enabled
             && let Some(result) = self.published_snapshot.ranked_query_cache.get_raw(
                 snapshot.snapshot_epoch(),
@@ -11555,6 +11557,112 @@ mod tests {
             SEGMENT_FANOUT_THRESHOLD - 1,
         ));
         assert!(sealed_segment_fanout(16, u64::MAX));
+    }
+
+    #[cfg(feature = "pruning-conformance")]
+    #[test]
+    fn pruning_conformance_traced_search_bypasses_warm_cache_without_mutation() {
+        run_with_cx(|cx| async move {
+            const QUERY: &str = "shared OR alpha";
+            const LIMIT: usize = 20;
+            const OFFSET: usize = 0;
+            const EXACT_COUNT: bool = false;
+            let fixtures = [
+                (
+                    1,
+                    0x5e21_a11c_0000_0001,
+                    ConformancePruningExecutionMode::Serial,
+                ),
+                (
+                    SEGMENT_COUNT_FANOUT_THRESHOLD,
+                    0x5e21_a11c_0000_0002,
+                    ConformancePruningExecutionMode::Rayon,
+                ),
+            ];
+
+            for (segment_count, seed, expected_mode) in fixtures {
+                let index = segment_fanout_fixture_index(&cx, segment_count, 64, seed).await;
+                let snapshot = index.search_snapshot();
+                let snapshot_epoch = snapshot.snapshot_epoch();
+                let expected_doc_counts = index
+                    .snapshot()
+                    .segments()
+                    .iter()
+                    .map(|segment| u64::from(segment.doc_count()))
+                    .collect::<Vec<_>>();
+                let cache = &index.reader.published_snapshot.ranked_query_cache;
+
+                assert!(
+                    cache
+                        .get_raw(snapshot_epoch, QUERY, LIMIT, OFFSET, EXACT_COUNT)
+                        .is_none(),
+                    "fixture must begin cold for {expected_mode:?}",
+                );
+                let warm = index
+                    .search_paginated(&cx, QUERY, LIMIT, OFFSET, EXACT_COUNT)
+                    .expect("ordinary search warms the ranked query cache");
+                assert_eq!(
+                    cache.get_raw(snapshot_epoch, QUERY, LIMIT, OFFSET, EXACT_COUNT),
+                    Some(warm.clone()),
+                    "ordinary search must populate the exact raw-query cache key for {expected_mode:?}",
+                );
+                let slots_before = cache
+                    .slots
+                    .iter()
+                    .map(ArcSwapOption::load_full)
+                    .collect::<Vec<_>>();
+
+                let (traced, receipt) = index
+                    .search_paginated_with_conformance_pruning_trace(
+                        &cx,
+                        QUERY,
+                        LIMIT,
+                        OFFSET,
+                        EXACT_COUNT,
+                    )
+                    .expect("traced search must execute instead of returning from the warm cache");
+                assert_eq!(traced, warm);
+                assert_eq!(receipt.execution_mode(), expected_mode);
+                assert_eq!(receipt.segments().len(), expected_doc_counts.len());
+                assert_eq!(
+                    receipt
+                        .segments()
+                        .iter()
+                        .map(ConformanceSegmentPruningReceipt::segment_ordinal)
+                        .collect::<Vec<_>>(),
+                    (0..u64::try_from(expected_doc_counts.len())
+                        .expect("fixture segment count fits u64"))
+                        .collect::<Vec<_>>(),
+                );
+                assert_eq!(
+                    receipt
+                        .segments()
+                        .iter()
+                        .map(ConformanceSegmentPruningReceipt::segment_doc_count)
+                        .collect::<Vec<_>>(),
+                    expected_doc_counts,
+                );
+
+                let slots_after = cache
+                    .slots
+                    .iter()
+                    .map(ArcSwapOption::load_full)
+                    .collect::<Vec<_>>();
+                assert_eq!(slots_after.len(), slots_before.len());
+                for (slot, (before, after)) in slots_before.iter().zip(&slots_after).enumerate() {
+                    match (before, after) {
+                        (Some(before), Some(after)) => assert!(
+                            Arc::ptr_eq(before, after),
+                            "traced search replaced cache slot {slot} for {expected_mode:?}",
+                        ),
+                        (None, None) => {}
+                        _ => panic!(
+                            "traced search changed cache slot occupancy at {slot} for {expected_mode:?}",
+                        ),
+                    }
+                }
+            }
+        });
     }
 
     #[cfg(feature = "pruning-conformance")]
