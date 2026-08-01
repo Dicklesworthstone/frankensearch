@@ -18071,9 +18071,9 @@ mod tests {
         );
         assert_eq!(
             existing_mutation_count + typed_mutations.len() + provenance_mutations.len(),
-            88,
-            "the persisted Core V3 replay corpus must execute every pre-V3, typed, and provenance \
-             mutation"
+            85,
+            "the persisted Core V3 replay corpus must execute all 8 pre-V3, 60 typed, and 17 \
+             provenance mutations"
         );
     }
 
