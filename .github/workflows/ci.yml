@@ -738,6 +738,78 @@ jobs:
           if-no-files-found: warn
           retention-days: 14
 
+  fsfs-executable-quickstart:
+    # bd-fsfs-executable-quickstart-ci-ve3ul: run the README's documented
+    # source-install quick start against the REAL binary and a deterministic
+    # corpus. Fails closed on index nontermination (bd-fsfs-index-command-
+    # quiescence-v53qo), model-unavailable inert builds (bd-fsfs-default-build-
+    # usable-6mtid), missing durability artifacts, empty or wrongly ranked
+    # search results, hash-only degradation, and leaked processes.
+    name: fsfs executable quick start
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install nightly toolchain
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
+        with:
+          toolchain: nightly-2026-07-20
+
+      - name: Prepare path dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          deps_dir="$(cd "$GITHUB_WORKSPACE/.." && pwd)"
+          asupersync_ref="15e6b6920fa0ad3e6d843ea55186eed754389ad2"
+          frankensqlite_ref="5c99eeb93d789c1309d5c46a540289369ff39535"
+          fast_cmaes_ref="17f633e2c24bdd0c358310949066e5922b9e17b5"
+
+          clone_or_update() {
+            local repo_url="$1"
+            local dest_path="$2"
+            local ref="$3"
+            if [[ -d "${dest_path}/.git" ]]; then
+              git -C "${dest_path}" fetch --depth 1 origin "${ref}"
+            else
+              git clone --no-checkout "${repo_url}" "${dest_path}"
+              git -C "${dest_path}" fetch --depth 1 origin "${ref}"
+            fi
+            git -C "${dest_path}" checkout --detach FETCH_HEAD
+          }
+
+          clone_or_update "https://github.com/Dicklesworthstone/asupersync.git" "${deps_dir}/asupersync" "${asupersync_ref}"
+          clone_or_update "https://github.com/Dicklesworthstone/frankensqlite.git" "${deps_dir}/frankensqlite" "${frankensqlite_ref}"
+          clone_or_update "https://github.com/Dicklesworthstone/fast_cmaes.git" "${deps_dir}/fast_cmaes" "${fast_cmaes_ref}"
+
+          while IFS= read -r -d '' manifest; do
+            sed -i -e "s|/data/projects/|${deps_dir}/|g" "$manifest"
+          done < <(find "$GITHUB_WORKSPACE" -name Cargo.toml -print0)
+
+      - name: Cache cargo registry + target
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: workspace-ubuntu-latest-nightly
+          cache-targets: true
+
+      - name: Cache verified bundled model inputs
+        uses: actions/cache@v4
+        with:
+          path: ~/.local/share/frankensearch/models
+          key: bundled-model-inputs-${{ runner.os }}-v1-a28f4eeb-c9745ed1
+
+      - name: Provision verified bundled model inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          scripts/rch-ensure-deps.sh --models-only
+          scripts/rch-ensure-deps.sh --models-only --check
+
+      - name: Run executable quick-start gate
+        shell: bash
+        run: scripts/check_fsfs_executable_quickstart.sh --keep-artifacts
+
   ann-path-identity:
     name: ANN path identity (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
@@ -1419,7 +1491,8 @@ jobs:
     if: >-
       startsWith(github.ref, 'refs/tags/v') && !cancelled()
       && (needs.release-build.result == 'success' || needs.release-build-lite.result == 'success')
-    needs: [release-build, release-build-lite]
+      && needs.fsfs-executable-quickstart.result == 'success'
+    needs: [release-build, release-build-lite, fsfs-executable-quickstart]
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:

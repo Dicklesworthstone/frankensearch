@@ -1,14 +1,23 @@
 use std::io;
 
 use frankensearch_core::{SearchError, SearchResult};
-use fsqlite::{Connection, Row};
+use fsqlite::{Connection, FrankenError, Row};
 use fsqlite_types::value::SqliteValue;
+
+use crate::connection::map_storage_error_at;
 
 pub const SCHEMA_VERSION: i64 = 6;
 
 struct Migration {
     version: i64,
     statements: &'static [&'static str],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SchemaVersionState {
+    MissingTable,
+    Empty,
+    Present(i64),
 }
 
 /// Canonical latest schema for brand-new databases.
@@ -315,23 +324,41 @@ const MIGRATIONS: &[Migration] = &[
 ];
 
 pub fn bootstrap(conn: &Connection) -> SearchResult<()> {
-    conn.execute("BEGIN IMMEDIATE;").map_err(storage_error)?;
+    match schema_version_state(conn, "schema preflight")? {
+        SchemaVersionState::Present(version) => {
+            reject_future_version(version, "schema preflight")?;
+            if version == SCHEMA_VERSION {
+                tracing::trace!(
+                    target: "frankensearch.storage",
+                    schema_version = version,
+                    "storage schema is current; skipping write transaction"
+                );
+                return Ok(());
+            }
+        }
+        SchemaVersionState::MissingTable | SchemaVersionState::Empty => {}
+    }
+
+    conn.execute("BEGIN IMMEDIATE;")
+        .map_err(|error| map_storage_error_at("schema transaction begin", error))?;
     let result = bootstrap_inner(conn);
     match result {
         Ok(()) => conn.execute("COMMIT;").map(|_| ()).map_err(|commit_err| {
             if let Err(rollback_err) = conn.execute("ROLLBACK;") {
                 tracing::warn!(
                     target: "frankensearch.storage",
+                    stage = "schema transaction rollback after commit",
                     error = %rollback_err,
                     "rollback failed after schema bootstrap commit error"
                 );
             }
-            storage_error(commit_err)
+            map_storage_error_at("schema transaction commit", commit_err)
         }),
         Err(error) => {
             if let Err(rollback_err) = conn.execute("ROLLBACK;") {
                 tracing::warn!(
                     target: "frankensearch.storage",
+                    stage = "schema transaction rollback after bootstrap",
                     error = %rollback_err,
                     "rollback failed after schema bootstrap error"
                 );
@@ -343,9 +370,11 @@ pub fn bootstrap(conn: &Connection) -> SearchResult<()> {
 
 fn bootstrap_inner(conn: &Connection) -> SearchResult<()> {
     conn.execute("CREATE TABLE IF NOT EXISTS schema_version (version INTEGER PRIMARY KEY);")
-        .map_err(storage_error)?;
+        .map_err(|error| map_storage_error_at("schema transaction marker table", error))?;
 
-    let mut version = current_version_optional(conn)?.unwrap_or(0);
+    let mut version = current_version_optional_at(conn, "schema transaction recheck")?.unwrap_or(0);
+    reject_future_version(version, "schema transaction recheck")?;
+
     if version == 0 {
         tracing::debug!(
             target: "frankensearch.storage",
@@ -354,27 +383,17 @@ fn bootstrap_inner(conn: &Connection) -> SearchResult<()> {
         );
 
         for statement in LATEST_SCHEMA {
-            conn.execute(statement).map_err(storage_error)?;
+            conn.execute(statement)
+                .map_err(|error| map_storage_error_at("fresh schema application", error))?;
         }
 
-        // Multiple processes/threads may bootstrap the same on-disk database at once.
-        // Use OR REPLACE so every bootstrap transaction leaves a visible marker row.
         let params = [SqliteValue::Integer(SCHEMA_VERSION)];
         conn.execute_with_params(
             "INSERT OR REPLACE INTO schema_version(version) VALUES (?1);",
             &params,
         )
-        .map_err(storage_error)?;
-        version = current_version(conn)?;
-    }
-
-    if version > SCHEMA_VERSION {
-        return Err(SearchError::SubsystemError {
-            subsystem: "storage",
-            source: Box::new(io::Error::other(format!(
-                "schema version {version} is newer than supported {SCHEMA_VERSION}"
-            ))),
-        });
+        .map_err(|error| map_storage_error_at("fresh schema marker write", error))?;
+        version = SCHEMA_VERSION;
     }
 
     while version < SCHEMA_VERSION {
@@ -383,12 +402,10 @@ fn bootstrap_inner(conn: &Connection) -> SearchResult<()> {
             .iter()
             .find(|migration| migration.version == next_version)
         else {
-            return Err(SearchError::SubsystemError {
-                subsystem: "storage",
-                source: Box::new(io::Error::other(format!(
-                    "missing migration path from schema version {version} to {next_version}"
-                ))),
-            });
+            return Err(schema_contract_error(
+                "schema migration selection",
+                format!("missing migration path from schema version {version} to {next_version}"),
+            ));
         };
 
         tracing::debug!(
@@ -399,7 +416,8 @@ fn bootstrap_inner(conn: &Connection) -> SearchResult<()> {
         );
 
         for statement in migration.statements {
-            conn.execute(statement).map_err(storage_error)?;
+            conn.execute(statement)
+                .map_err(|error| map_storage_error_at("schema migration application", error))?;
         }
 
         let params = [SqliteValue::Integer(migration.version)];
@@ -407,17 +425,9 @@ fn bootstrap_inner(conn: &Connection) -> SearchResult<()> {
             "INSERT OR REPLACE INTO schema_version(version) VALUES (?1);",
             &params,
         )
-        .map_err(storage_error)?;
+        .map_err(|error| map_storage_error_at("schema migration marker write", error))?;
         version = migration.version;
     }
-
-    let params = [SqliteValue::Integer(SCHEMA_VERSION)];
-    conn.execute_with_params(
-        "INSERT OR REPLACE INTO schema_version(version) VALUES (?1);",
-        &params,
-    )
-    .map_err(storage_error)?;
-    version = current_version(conn)?;
 
     tracing::debug!(
         target: "frankensearch.storage",
@@ -429,47 +439,98 @@ fn bootstrap_inner(conn: &Connection) -> SearchResult<()> {
 }
 
 pub fn current_version(conn: &Connection) -> SearchResult<i64> {
-    current_version_optional(conn)?.ok_or_else(|| SearchError::SubsystemError {
-        subsystem: "storage",
-        source: Box::new(io::Error::other("schema_version table has no rows")),
-    })
+    current_version_at(conn, "schema version read")
 }
 
+pub(crate) fn current_version_at(conn: &Connection, stage: &'static str) -> SearchResult<i64> {
+    current_version_optional_at(conn, stage)?
+        .ok_or_else(|| schema_contract_error(stage, "schema_version table has no rows"))
+}
+
+#[cfg(test)]
 fn current_version_optional(conn: &Connection) -> SearchResult<Option<i64>> {
-    let rows = conn
-        .query("SELECT version FROM schema_version ORDER BY version DESC LIMIT 1;")
-        .map_err(storage_error)?;
-    let Some(row) = rows.first() else {
-        return Ok(None);
-    };
-    row_i64(row, 0, "schema_version.version").map(Some)
+    current_version_optional_at(conn, "schema version read")
 }
 
-pub(crate) fn row_i64(row: &Row, index: usize, field: &str) -> SearchResult<i64> {
-    match row.get(index) {
-        Some(SqliteValue::Integer(value)) => Ok(*value),
-        Some(other) => Err(SearchError::SubsystemError {
-            subsystem: "storage",
-            source: Box::new(io::Error::other(format!(
-                "unexpected type for {field}: {:?}",
-                other
-            ))),
-        }),
-        None => Err(SearchError::SubsystemError {
-            subsystem: "storage",
-            source: Box::new(io::Error::other(format!("missing column for {field}"))),
-        }),
+fn current_version_optional_at(
+    conn: &Connection,
+    stage: &'static str,
+) -> SearchResult<Option<i64>> {
+    match schema_version_state(conn, stage)? {
+        SchemaVersionState::MissingTable => Err(map_storage_error_at(
+            stage,
+            FrankenError::NoSuchTable {
+                name: "schema_version".to_owned(),
+            },
+        )),
+        SchemaVersionState::Empty => Ok(None),
+        SchemaVersionState::Present(version) => Ok(Some(version)),
     }
 }
 
+fn schema_version_state(
+    conn: &Connection,
+    stage: &'static str,
+) -> SearchResult<SchemaVersionState> {
+    let table_columns = conn
+        .query("PRAGMA table_info(schema_version);")
+        .map_err(|error| map_storage_error_at(stage, error))?;
+    if table_columns.is_empty() {
+        return Ok(SchemaVersionState::MissingTable);
+    }
+
+    let rows = match conn.query("SELECT version FROM schema_version ORDER BY version DESC LIMIT 1;")
+    {
+        Ok(rows) => rows,
+        Err(FrankenError::NoSuchTable { name }) if name == "schema_version" => {
+            return Ok(SchemaVersionState::MissingTable);
+        }
+        Err(error) => return Err(map_storage_error_at(stage, error)),
+    };
+    let Some(row) = rows.first() else {
+        return Ok(SchemaVersionState::Empty);
+    };
+    row_i64_at(row, 0, "schema_version.version", stage).map(SchemaVersionState::Present)
+}
+
+fn reject_future_version(version: i64, stage: &'static str) -> SearchResult<()> {
+    if version > SCHEMA_VERSION {
+        return Err(schema_contract_error(
+            stage,
+            format!("schema version {version} is newer than supported {SCHEMA_VERSION}"),
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn row_i64(row: &Row, index: usize, field: &str) -> SearchResult<i64> {
+    row_i64_at(row, index, field, "schema row decode")
+}
+
+fn row_i64_at(row: &Row, index: usize, field: &str, stage: &'static str) -> SearchResult<i64> {
+    match row.get(index) {
+        Some(SqliteValue::Integer(value)) => Ok(*value),
+        Some(other) => Err(schema_contract_error(
+            stage,
+            format!("unexpected type for {field}: {:?}", other),
+        )),
+        None => Err(schema_contract_error(
+            stage,
+            format!("missing column for {field}"),
+        )),
+    }
+}
+
+fn schema_contract_error(stage: &'static str, message: impl Into<String>) -> SearchError {
+    map_storage_error_at(stage, io::Error::other(message.into()))
+}
+
+#[cfg(test)]
 fn storage_error<E>(source: E) -> SearchError
 where
     E: std::error::Error + Send + Sync + 'static,
 {
-    SearchError::SubsystemError {
-        subsystem: "storage",
-        source: Box::new(source),
-    }
+    map_storage_error_at("storage operation", source)
 }
 
 #[cfg(test)]
@@ -505,6 +566,28 @@ mod tests {
         .is_ok()
     }
 
+    fn seed_historical_schema(conn: &Connection, version: i64) {
+        conn.execute("CREATE TABLE schema_version (version INTEGER PRIMARY KEY);")
+            .expect("schema_version table should be creatable");
+
+        for migration in super::MIGRATIONS
+            .iter()
+            .filter(|migration| migration.version <= version)
+        {
+            for statement in migration.statements {
+                conn.execute(statement).unwrap_or_else(|error| {
+                    panic!("seed migration {}: {error}", migration.version)
+                });
+            }
+            let params = [SqliteValue::Integer(migration.version)];
+            conn.execute_with_params(
+                "INSERT OR REPLACE INTO schema_version(version) VALUES (?1);",
+                &params,
+            )
+            .unwrap_or_else(|error| panic!("seed migration {} marker: {error}", migration.version));
+        }
+    }
+
     #[test]
     fn bootstrap_sets_latest_version_for_fresh_database() {
         let conn = Connection::open(":memory:".to_owned()).expect("in-memory connection");
@@ -525,6 +608,46 @@ mod tests {
         assert!(
             index_exists(&conn, "embedding_jobs", "idx_jobs_processing"),
             "latest schema should include queue processing index"
+        );
+    }
+
+    #[test]
+    fn bootstrap_accepts_read_only_confirmation_that_marker_table_is_absent() {
+        let conn = Connection::open(":memory:".to_owned()).expect("in-memory connection");
+        assert_eq!(
+            super::schema_version_state(&conn, "test absence probe")
+                .expect("absence probe should be readable"),
+            super::SchemaVersionState::MissingTable
+        );
+
+        bootstrap(&conn).expect("confirmed absent marker table should bootstrap");
+        assert_eq!(
+            current_version(&conn).expect("bootstrapped marker should be readable"),
+            SCHEMA_VERSION
+        );
+    }
+
+    #[test]
+    fn bootstrap_does_not_swallow_malformed_marker_state_as_absence() {
+        let conn = Connection::open(":memory:".to_owned()).expect("in-memory connection");
+        conn.execute("CREATE TABLE schema_version (version TEXT PRIMARY KEY);")
+            .expect("malformed marker table should be creatable");
+        conn.execute("INSERT INTO schema_version(version) VALUES ('not-an-integer');")
+            .expect("malformed marker should insert");
+
+        let error = bootstrap(&conn).expect_err("malformed marker state must fail closed");
+        let message = error.to_string();
+        assert!(
+            message.contains("schema preflight"),
+            "error should retain the preflight stage: {message}"
+        );
+        assert!(
+            message.contains("unexpected type"),
+            "malformed marker must not be reclassified as absence: {message}"
+        );
+        assert!(
+            !conn.in_transaction(),
+            "read-only preflight rejection must not leave a transaction active"
         );
     }
 
@@ -551,6 +674,28 @@ mod tests {
             index_exists(&conn, "search_history", "idx_history_query"),
             "migration should create search history index"
         );
+    }
+
+    #[test]
+    fn bootstrap_migrates_every_historical_schema_edge() {
+        for starting_version in 1..SCHEMA_VERSION {
+            let conn = Connection::open(":memory:".to_owned()).expect("in-memory connection");
+            seed_historical_schema(&conn, starting_version);
+
+            assert_eq!(
+                current_version(&conn).expect("seed marker should be readable"),
+                starting_version,
+                "fixture should represent schema v{starting_version}"
+            );
+            bootstrap(&conn).unwrap_or_else(|error| {
+                panic!("schema v{starting_version} should migrate to latest: {error}")
+            });
+            assert_eq!(
+                current_version(&conn).expect("migrated marker should be readable"),
+                SCHEMA_VERSION,
+                "schema v{starting_version} should reach latest"
+            );
+        }
     }
 
     #[test]
@@ -875,6 +1020,29 @@ mod tests {
         assert!(
             msg.contains("no rows"),
             "error should mention no rows: {msg}"
+        );
+    }
+
+    #[test]
+    fn current_version_missing_table_preserves_typed_cause_and_stage() {
+        let conn = Connection::open(":memory:".to_owned()).expect("in-memory connection");
+        let error = current_version(&conn).expect_err("missing marker table should fail");
+        assert!(
+            error.to_string().contains("schema version read"),
+            "error should identify the failed stage: {error}"
+        );
+
+        let frankensearch_core::SearchError::SubsystemError { source, .. } = &error else {
+            panic!("expected storage subsystem error, got {error:?}");
+        };
+        let typed_cause = std::error::Error::source(source.as_ref())
+            .and_then(|cause| cause.downcast_ref::<fsqlite::FrankenError>());
+        assert!(
+            matches!(
+                typed_cause,
+                Some(fsqlite::FrankenError::NoSuchTable { name }) if name == "schema_version"
+            ),
+            "error chain should retain exact NoSuchTable(schema_version), got {typed_cause:?}"
         );
     }
 

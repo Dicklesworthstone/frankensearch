@@ -6,7 +6,14 @@
 
 use frankensearch_core::{SearchError, SearchResult};
 
-/// Default per-shard Scribe arena budget (64 MiB).
+/// Default Scribe logical accumulation budget (64 MiB).
+///
+/// Scalar ingest applies this at each completed-document boundary in its
+/// active shard. Shared-nothing ingest treats the same value as one
+/// width-independent aggregate admission ceiling for the complete generation;
+/// a batch that cannot prove it will remain below the ceiling uses the scalar
+/// route. Retained container capacity is observed separately and is not this
+/// logical byte counter.
 pub const DEFAULT_SCRIBE_SHARD_BUDGET_BYTES: usize = 64 * 1024 * 1024;
 /// Default searchable delta budget per shard (8 MiB).
 pub const DEFAULT_DELTA_BUDGET_BYTES: usize = 8 * 1024 * 1024;
@@ -43,7 +50,12 @@ pub const DEFAULT_MAX_VISIBILITY_LAG_MS: u64 = 1_000;
 /// Defaults are deterministic constants, not environment-dependent values.
 #[derive(Debug, Clone, PartialEq)]
 pub struct QuillConfig {
-    /// Maximum bytes in one Scribe shard's accumulation arenas before flush.
+    /// Logical Scribe accumulation budget.
+    ///
+    /// Scalar ingest checks the active shard after every complete document.
+    /// Shared-nothing ingest uses this as a single aggregate pre-worker bound,
+    /// never as `active_shards * budget`. `bytes_reserved`/RSS diagnostics may
+    /// exceed it because one document and allocator capacity are indivisible.
     pub scribe_shard_budget_bytes: usize,
     /// Maximum bytes in one shard's searchable delta before seal.
     pub delta_budget_bytes: usize,

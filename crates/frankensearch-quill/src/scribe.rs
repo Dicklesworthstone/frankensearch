@@ -100,6 +100,37 @@ pub struct AnalyzedToken {
     pub position_length: usize,
 }
 
+/// Borrowed normalized token emitted directly into an ingest consumer.
+///
+/// The default tokenizer uses the original input slice when an ASCII token is
+/// already lowercase, and its retained scratch only when normalization changes
+/// bytes. The view is valid only for the duration of the sink call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AnalyzedTokenRef<'a> {
+    /// Normalized token text.
+    pub text: &'a str,
+    /// Logical token position, starting at zero.
+    pub position: u32,
+    /// Source byte offset of the first token byte.
+    pub offset_from: usize,
+    /// Source byte offset immediately after the token.
+    pub offset_to: usize,
+    /// Position span. The default analyzer always emits one.
+    pub position_length: usize,
+}
+
+impl<'a> From<&'a AnalyzedToken> for AnalyzedTokenRef<'a> {
+    fn from(token: &'a AnalyzedToken) -> Self {
+        Self {
+            text: token.text.as_str(),
+            position: token.position,
+            offset_from: token.offset_from,
+            offset_to: token.offset_to,
+            position_length: token.position_length,
+        }
+    }
+}
+
 /// Allocation-free callback surface shared by scalar and future SIMD/CASS
 /// analyzer families.
 ///
@@ -120,6 +151,20 @@ pub trait TokenAnalyzer: sealed::Sealed {
     ///
     /// Callers invoke this only for kinds accepted by [`Self::supports`].
     fn analyze(&mut self, analyzer: AnalyzerKind, text: &str, sink: &mut dyn FnMut(&AnalyzedToken));
+
+    /// Analyze directly into a consumer that does not require owned token text.
+    ///
+    /// The default bridge preserves custom analyzer behavior. Analyzer
+    /// families with a borrowed fast path override this method so unchanged
+    /// input bytes can flow straight into the term interner.
+    fn analyze_borrowed(
+        &mut self,
+        analyzer: AnalyzerKind,
+        text: &str,
+        sink: &mut dyn for<'token> FnMut(AnalyzedTokenRef<'token>),
+    ) {
+        self.analyze(analyzer, text, &mut |token| sink(token.into()));
+    }
 
     /// Retained analyzer scratch included in RSS/reuse diagnostics.
     fn bytes_reserved(&self) -> usize {
@@ -179,6 +224,41 @@ pub fn analyze_admitted<A: TokenAnalyzer + ?Sized>(
     }
     let mut report = AnalysisReport::default();
     analyzer.analyze(analyzer_kind, text, &mut |token| {
+        report.raw_tokens += 1;
+        if token.text.len() > MAX_TERM_BYTES {
+            report.oversized_tokens += 1;
+            tracing::warn!(
+                token_bytes = token.text.len(),
+                max_token_bytes = MAX_TERM_BYTES,
+                position = token.position,
+                "Quill dropped an oversized analyzed token"
+            );
+            return;
+        }
+        report.admitted_tokens += 1;
+        sink(token);
+    });
+    Ok(report)
+}
+
+/// Analyze directly into a borrowed consumer and apply the global term limit.
+///
+/// This is the ingest form of [`analyze_admitted`]. It preserves the same
+/// report and position-gap semantics while allowing unchanged normalized text
+/// to bypass analyzer-owned string construction.
+fn analyze_admitted_borrowed<A: TokenAnalyzer + ?Sized>(
+    analyzer: &mut A,
+    analyzer_kind: AnalyzerKind,
+    text: &str,
+    sink: &mut dyn for<'token> FnMut(AnalyzedTokenRef<'token>),
+) -> Result<AnalysisReport, UnsupportedAnalysis> {
+    if !analyzer.supports(analyzer_kind) {
+        return Err(UnsupportedAnalysis {
+            analyzer: analyzer_kind,
+        });
+    }
+    let mut report = AnalysisReport::default();
+    analyzer.analyze_borrowed(analyzer_kind, text, &mut |token| {
         report.raw_tokens += 1;
         if token.text.len() > MAX_TERM_BYTES {
             report.oversized_tokens += 1;
@@ -465,6 +545,45 @@ impl TokenAnalyzer for BoundaryMaskTokenizer {
     }
 }
 
+#[inline]
+fn emit_normalized_token(
+    scratch: &mut String,
+    source: &str,
+    all_ascii: bool,
+    position: u32,
+    offset_from: usize,
+    offset_to: usize,
+    sink: &mut dyn for<'token> FnMut(AnalyzedTokenRef<'token>),
+) {
+    if all_ascii && !source.as_bytes().iter().any(u8::is_ascii_uppercase) {
+        sink(AnalyzedTokenRef {
+            text: source,
+            position,
+            offset_from,
+            offset_to,
+            position_length: 1,
+        });
+        return;
+    }
+
+    scratch.clear();
+    if all_ascii {
+        scratch.push_str(source);
+        scratch.make_ascii_lowercase();
+    } else {
+        for source_char in source.chars() {
+            scratch.extend(source_char.to_lowercase());
+        }
+    }
+    sink(AnalyzedTokenRef {
+        text: scratch.as_str(),
+        position,
+        offset_from,
+        offset_to,
+        position_length: 1,
+    });
+}
+
 impl TokenAnalyzer for FrankensearchTokenizer {
     fn supports(&self, analyzer: AnalyzerKind) -> bool {
         analyzer == AnalyzerKind::FrankensearchDefault
@@ -475,6 +594,24 @@ impl TokenAnalyzer for FrankensearchTokenizer {
         analyzer: AnalyzerKind,
         text: &str,
         sink: &mut dyn FnMut(&AnalyzedToken),
+    ) {
+        let mut token = AnalyzedToken::default();
+        self.analyze_borrowed(analyzer, text, &mut |borrowed| {
+            token.text.clear();
+            token.text.push_str(borrowed.text);
+            token.position = borrowed.position;
+            token.offset_from = borrowed.offset_from;
+            token.offset_to = borrowed.offset_to;
+            token.position_length = borrowed.position_length;
+            sink(&token);
+        });
+    }
+
+    fn analyze_borrowed(
+        &mut self,
+        analyzer: AnalyzerKind,
+        text: &str,
+        sink: &mut dyn for<'token> FnMut(AnalyzedTokenRef<'token>),
     ) {
         debug_assert_eq!(analyzer, AnalyzerKind::FrankensearchDefault);
         const NO_TOKEN: usize = usize::MAX;
@@ -515,21 +652,16 @@ impl TokenAnalyzer for FrankensearchTokenizer {
                             all_ascii = true;
                         } else {
                             debug_assert_ne!(offset_from, NO_TOKEN);
-                            self.token.text.clear();
                             let source = &text[offset_from..at];
-                            if all_ascii {
-                                self.token.text.push_str(source);
-                                self.token.text.make_ascii_lowercase();
-                            } else {
-                                for source_char in source.chars() {
-                                    self.token.text.extend(source_char.to_lowercase());
-                                }
-                            }
-                            self.token.position = position;
-                            self.token.offset_from = offset_from;
-                            self.token.offset_to = at;
-                            self.token.position_length = 1;
-                            sink(&self.token);
+                            emit_normalized_token(
+                                &mut self.token.text,
+                                source,
+                                all_ascii,
+                                position,
+                                offset_from,
+                                at,
+                                sink,
+                            );
 
                             position = next_token_position(position);
                             offset_from = NO_TOKEN;
@@ -553,21 +685,16 @@ impl TokenAnalyzer for FrankensearchTokenizer {
                     all_ascii &= ch.is_ascii();
                 }
             } else if offset_from != NO_TOKEN {
-                self.token.text.clear();
                 let source = &text[offset_from..cursor];
-                if all_ascii {
-                    self.token.text.push_str(source);
-                    self.token.text.make_ascii_lowercase();
-                } else {
-                    for source_char in source.chars() {
-                        self.token.text.extend(source_char.to_lowercase());
-                    }
-                }
-                self.token.position = position;
-                self.token.offset_from = offset_from;
-                self.token.offset_to = cursor;
-                self.token.position_length = 1;
-                sink(&self.token);
+                emit_normalized_token(
+                    &mut self.token.text,
+                    source,
+                    all_ascii,
+                    position,
+                    offset_from,
+                    cursor,
+                    sink,
+                );
 
                 position = next_token_position(position);
                 offset_from = NO_TOKEN;
@@ -576,21 +703,16 @@ impl TokenAnalyzer for FrankensearchTokenizer {
         }
 
         if offset_from != NO_TOKEN {
-            self.token.text.clear();
             let source = &text[offset_from..len];
-            if all_ascii {
-                self.token.text.push_str(source);
-                self.token.text.make_ascii_lowercase();
-            } else {
-                for source_char in source.chars() {
-                    self.token.text.extend(source_char.to_lowercase());
-                }
-            }
-            self.token.position = position;
-            self.token.offset_from = offset_from;
-            self.token.offset_to = len;
-            self.token.position_length = 1;
-            sink(&self.token);
+            emit_normalized_token(
+                &mut self.token.text,
+                source,
+                all_ascii,
+                position,
+                offset_from,
+                len,
+                sink,
+            );
         }
     }
 
@@ -975,7 +1097,7 @@ impl ByteArena {
     pub fn with_chunk_size(chunk_size: usize) -> Self {
         let chunk_size = chunk_size.max(4096);
         Self {
-            chunks: vec![Vec::with_capacity(chunk_size)],
+            chunks: Vec::new(),
             chunk_size,
             active: 0,
         }
@@ -1001,6 +1123,10 @@ impl ByteArena {
                 offset: 0,
                 len: u32::try_from(bytes.len()).expect("arena span exceeds u32"),
             };
+        }
+        if self.chunks.is_empty() {
+            self.chunks.push(Vec::with_capacity(self.chunk_size));
+            self.active = 0;
         }
         let needs_new = {
             let chunk = &self.chunks[self.active];
@@ -1065,9 +1191,6 @@ impl ByteArena {
     /// retaining them would ratchet RSS on pathological inputs).
     pub fn reset(&mut self) {
         self.chunks.retain(|c| c.capacity() == self.chunk_size);
-        if self.chunks.is_empty() {
-            self.chunks.push(Vec::with_capacity(self.chunk_size));
-        }
         for chunk in &mut self.chunks {
             chunk.clear();
         }
@@ -1233,6 +1356,11 @@ impl TermInterner<ahash::RandomState> {
     pub fn new() -> Self {
         Self::with_hasher(ahash::RandomState::new())
     }
+
+    #[must_use]
+    pub(crate) fn with_arena_chunk_size(arena_chunk_size: usize) -> Self {
+        Self::with_hasher_and_arena_chunk_size(ahash::RandomState::new(), arena_chunk_size)
+    }
 }
 
 impl Default for TermInterner<ahash::RandomState> {
@@ -1244,8 +1372,12 @@ impl Default for TermInterner<ahash::RandomState> {
 impl<S: BuildHasher> TermInterner<S> {
     #[must_use]
     pub fn with_hasher(hasher: S) -> Self {
+        Self::with_hasher_and_arena_chunk_size(hasher, DEFAULT_ARENA_CHUNK_BYTES)
+    }
+
+    fn with_hasher_and_arena_chunk_size(hasher: S, arena_chunk_size: usize) -> Self {
         Self {
-            arena: ByteArena::default(),
+            arena: ByteArena::with_chunk_size(arena_chunk_size),
             spans: Vec::new(),
             buckets: HashMap::default(),
             hasher,
@@ -1403,7 +1535,10 @@ impl<S: BuildHasher> TermInterner<S> {
 
     /// Ids sorted by composite key bytes — exactly the on-disk TERMDICT order
     /// (FSLX §5.1: the BE field prefix makes byte order equal (field, term)
-    /// order). Called once per flush; cost is the sort, not paid per token.
+    /// order). Called once per flush. Large buckets use an in-place MSD radix
+    /// partition so shared prefixes are inspected once per byte instead of by
+    /// every comparison; small buckets finish with the comparison sorter to
+    /// avoid clearing a 257-way histogram for a handful of ids.
     ///
     /// # Panics
     /// Panics if the id space exceeds `u32` (unreachable; see [`Self::intern`]).
@@ -1411,8 +1546,81 @@ impl<S: BuildHasher> TermInterner<S> {
     pub fn sorted_ids(&self) -> Vec<u32> {
         let mut ids: Vec<u32> =
             (0..u32::try_from(self.spans.len()).expect("term id space exceeds u32")).collect();
-        ids.sort_unstable_by(|a, b| self.composite_key(*a).cmp(self.composite_key(*b)));
+        self.sort_ids_msd(&mut ids);
         ids
+    }
+
+    fn sort_ids_msd(&self, ids: &mut [u32]) {
+        const RADIX: usize = 257;
+        const SMALL_BUCKET: usize = 24;
+
+        if ids.len() < 2 {
+            return;
+        }
+
+        let mut pending = Vec::with_capacity(64);
+        pending.push((0_usize, ids.len(), 0_usize));
+        let mut counts = [0_usize; RADIX];
+        let mut starts = [0_usize; RADIX];
+        let mut next = [0_usize; RADIX];
+
+        while let Some((lo, hi, depth)) = pending.pop() {
+            if hi - lo <= SMALL_BUCKET {
+                ids[lo..hi]
+                    .sort_unstable_by(|a, b| self.composite_key(*a).cmp(self.composite_key(*b)));
+                continue;
+            }
+
+            counts.fill(0);
+            for &id in &ids[lo..hi] {
+                let digit = self
+                    .composite_key(id)
+                    .get(depth)
+                    .map_or(0, |byte| usize::from(*byte) + 1);
+                counts[digit] += 1;
+            }
+
+            let mut cursor = lo;
+            for bucket in 0..RADIX {
+                starts[bucket] = cursor;
+                next[bucket] = cursor;
+                cursor += counts[bucket];
+            }
+            debug_assert_eq!(cursor, hi);
+
+            // American-flag partitioning: every swap fills one destination
+            // slot, so the pass is linear and needs no second id array.
+            for bucket in 0..RADIX {
+                let end = starts[bucket] + counts[bucket];
+                while next[bucket] < end {
+                    let source = next[bucket];
+                    let id = ids[source];
+                    let destination_bucket = self
+                        .composite_key(id)
+                        .get(depth)
+                        .map_or(0, |byte| usize::from(*byte) + 1);
+                    if destination_bucket == bucket {
+                        next[bucket] += 1;
+                    } else {
+                        let destination = next[destination_bucket];
+                        debug_assert!(
+                            destination < starts[destination_bucket] + counts[destination_bucket]
+                        );
+                        ids.swap(source, destination);
+                        next[destination_bucket] += 1;
+                    }
+                }
+            }
+
+            // Bucket zero is the end-of-key sentinel and is already final.
+            // Push in reverse so low-byte buckets are processed first, keeping
+            // the traversal deterministic even though the partition is not.
+            for bucket in (1..RADIX).rev() {
+                if counts[bucket] > 1 {
+                    pending.push((starts[bucket], starts[bucket] + counts[bucket], depth + 1));
+                }
+            }
+        }
     }
 
     /// Approximate live bytes held, for the shard flush trigger.
@@ -2036,6 +2244,24 @@ impl ColumnarAccumulator<FrankensearchTokenizer> {
     pub fn new(schema: SchemaDescriptor) -> Result<Self, QuillError> {
         Self::with_analyzer(schema, FrankensearchTokenizer::default())
     }
+
+    /// Create an empty accumulator whose term arena is sized for one bounded
+    /// shared-nothing worker rather than the scalar one-mebibyte default.
+    ///
+    /// Logical accounting and flush boundaries are independent of arena
+    /// capacity. This constructor lets the caller share scalar arena slack
+    /// across a wide parallel generation, subject to `ByteArena`'s 4 KiB
+    /// per-arena floor.
+    pub(crate) fn with_arena_chunk_size(
+        schema: SchemaDescriptor,
+        arena_chunk_size: usize,
+    ) -> Result<Self, QuillError> {
+        Self::with_analyzer_and_arena_chunk_size(
+            schema,
+            FrankensearchTokenizer::default(),
+            arena_chunk_size,
+        )
+    }
 }
 
 impl<A: TokenAnalyzer> ColumnarAccumulator<A> {
@@ -2052,6 +2278,14 @@ impl<A: TokenAnalyzer> ColumnarAccumulator<A> {
     /// dense-ID and field-shape invariants, or [`QuillError::Resource`] when
     /// the injected family does not implement every requested analyzer.
     pub fn with_analyzer(schema: SchemaDescriptor, analyzer: A) -> Result<Self, QuillError> {
+        Self::with_analyzer_and_arena_chunk_size(schema, analyzer, DEFAULT_ARENA_CHUNK_BYTES)
+    }
+
+    fn with_analyzer_and_arena_chunk_size(
+        schema: SchemaDescriptor,
+        analyzer: A,
+        arena_chunk_size: usize,
+    ) -> Result<Self, QuillError> {
         schema.validate()?;
         if let Some((field, requested)) = schema.fields.iter().find_map(|field| {
             let FieldKind::Text {
@@ -2098,7 +2332,7 @@ impl<A: TokenAnalyzer> ColumnarAccumulator<A> {
             .collect();
         Ok(Self {
             schema,
-            terms: TermInterner::new(),
+            terms: TermInterner::with_arena_chunk_size(arena_chunk_size),
             fields,
             numeric_fields,
             stored_fields,
@@ -2464,7 +2698,7 @@ impl<A: TokenAnalyzer> ColumnarAccumulator<A> {
                         let _tokenize_timer =
                             crate::tracing_conventions::StageTimer::new(&tokenize_span);
                         let _tokenize_entered = tokenize_span.enter();
-                        let report = analyze_admitted(
+                        let report = analyze_admitted_borrowed(
                             &mut self.analyzer,
                             analyzer,
                             value.text,
@@ -4667,9 +4901,33 @@ pub struct DocIdAllocator {
     leases: Vec<Option<ShardLease>>,
     grants: Vec<LeaseGrant>,
     open: bool,
+    trace_grants: bool,
 }
 
 impl DocIdAllocator {
+    pub(crate) fn speculative_clone(&self) -> Self {
+        Self {
+            shard_count: self.shard_count,
+            next_block_base: self.next_block_base,
+            open_gap_burned: self.open_gap_burned,
+            grant_seq: self.grant_seq,
+            leases: self.leases.clone(),
+            grants: self.grants.clone(),
+            open: self.open,
+            trace_grants: false,
+        }
+    }
+
+    pub(crate) fn commit_speculative_grants(&mut self, prior_grant_count: usize) {
+        debug_assert!(prior_grant_count <= self.grants.len());
+        self.trace_grants = true;
+        if let Some(committed) = self.grants.get(prior_grant_count..) {
+            for grant in committed {
+                Self::trace_grant(*grant);
+            }
+        }
+    }
+
     /// Open a session allocator at the manifest's persisted watermark.
     ///
     /// A watermark that is not lease-block-aligned is aligned *up* to the next
@@ -4693,6 +4951,7 @@ impl DocIdAllocator {
             leases: vec![None; shard_count],
             grants: Vec::new(),
             open: true,
+            trace_grants: true,
         })
     }
 
@@ -4846,6 +5105,13 @@ impl DocIdAllocator {
             next_ord: 0,
         });
         self.grants.push(grant);
+        if self.trace_grants {
+            Self::trace_grant(grant);
+        }
+        Ok(())
+    }
+
+    fn trace_grant(grant: LeaseGrant) {
         tracing::trace!(
             target: crate::tracing_conventions::TARGET,
             phase = "scribe.docid_lease_grant",
@@ -4854,7 +5120,6 @@ impl DocIdAllocator {
             lease_base = grant.base_docid,
             "docid lease granted"
         );
-        Ok(())
     }
 }
 
@@ -5250,6 +5515,33 @@ mod tests {
             tokens.push(token.clone());
         });
         tokens
+    }
+
+    #[test]
+    fn borrowed_default_reuses_normalized_input_and_scratches_changed_tokens() {
+        let text = "lowercase123 MIXED ÜBER";
+        let input_start = text.as_ptr() as usize;
+        let input_end = input_start + text.len();
+        let mut analyzer = FrankensearchTokenizer::default();
+        let mut observed = Vec::new();
+        analyzer.analyze_borrowed(AnalyzerKind::FrankensearchDefault, text, &mut |token| {
+            let token_start = token.text.as_ptr() as usize;
+            observed.push((
+                token.text.to_owned(),
+                token.offset_from,
+                token.offset_to,
+                (input_start..input_end).contains(&token_start),
+            ));
+        });
+
+        assert_eq!(
+            observed,
+            vec![
+                ("lowercase123".to_owned(), 0, 12, true),
+                ("mixed".to_owned(), 13, 18, false),
+                ("über".to_owned(), 19, 24, false),
+            ]
+        );
     }
 
     fn boundary_mask_tokens(text: &str) -> Vec<AnalyzedToken> {
@@ -6771,6 +7063,30 @@ mod tests {
     }
 
     #[test]
+    fn msd_sorted_ids_match_comparison_oracle_on_shared_prefixes() {
+        let mut interner = TermInterner::new();
+        let mut rng = DeterministicRng(0x6d73_642d_7465_726d);
+        for ordinal in (0_u32..4_096).rev() {
+            let field_ord = u16::try_from(rng.choose(513)).expect("bounded field ordinal");
+            let mut term = vec![b'a'; rng.choose(96)];
+            term.extend_from_slice(&rng.next().to_be_bytes());
+            term.extend_from_slice(&ordinal.to_be_bytes());
+            interner.intern(field_ord, &term);
+        }
+        interner.intern(0, b"");
+        interner.intern(0, b"a");
+        interner.intern(0, b"a\0");
+        interner.intern(u16::MAX, b"\xff");
+
+        let actual = interner.sorted_ids();
+        let mut expected =
+            (0..u32::try_from(interner.len()).expect("bounded term count")).collect::<Vec<_>>();
+        expected
+            .sort_unstable_by(|a, b| interner.composite_key(*a).cmp(interner.composite_key(*b)));
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
     fn collision_path_verifies_bytes() {
         // Every key collides: correctness must come from byte verification.
         let mut interner: TermInterner<ConstBuild> =
@@ -6965,6 +7281,23 @@ mod tests {
             prev <= term_bytes_total.max(DEFAULT_ARENA_CHUNK_BYTES) * 10,
             "accounting should not wildly overestimate: {prev} vs {term_bytes_total}"
         );
+    }
+
+    #[test]
+    fn empty_arena_reserves_nothing_until_first_write() {
+        let mut arena = ByteArena::with_chunk_size(DEFAULT_ARENA_CHUNK_BYTES);
+        assert_eq!(arena.bytes_used(), 0);
+        assert_eq!(arena.bytes_reserved(), 0);
+        assert_eq!(arena.chunk_count(), 0);
+
+        arena.reset();
+        assert_eq!(arena.bytes_reserved(), 0);
+        assert_eq!(arena.chunk_count(), 0);
+
+        let span = arena.push(b"first-term");
+        assert_eq!(arena.resolve(span), b"first-term");
+        assert_eq!(arena.bytes_reserved(), DEFAULT_ARENA_CHUNK_BYTES);
+        assert_eq!(arena.chunk_count(), 1);
     }
 
     #[test]

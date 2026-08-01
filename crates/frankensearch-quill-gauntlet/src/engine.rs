@@ -134,8 +134,8 @@ fn validate_recorded_producer_source(
     observed_revision: &str,
     source_dirty: bool,
 ) -> Result<(), GauntletError> {
-    if !is_canonical_git_revision(observed_revision)
-        && !(observed_revision == "unavailable" && source_dirty)
+    if !(is_canonical_git_revision(observed_revision)
+        || observed_revision == "unavailable" && source_dirty)
     {
         return Err(GauntletError::InvalidContract {
             reason: "recorded producer revision must be a canonical lowercase 40-hex Git identity or the conservative dirty unavailable sentinel"
@@ -150,10 +150,9 @@ fn canonical_f64_bits(value: f64) -> u64 {
 }
 
 fn usize_to_receipt_u64(value: usize, field: &str) -> u64 {
-    match u64::try_from(value) {
-        Ok(value) => value,
-        Err(_) => panic!("Quill config field {field} exceeds the portable u64 receipt domain"),
-    }
+    u64::try_from(value).unwrap_or_else(|error| {
+        panic!("Quill config field {field} exceeds the portable u64 receipt domain: {error}")
+    })
 }
 
 fn receipt_u64_to_usize(value: u64, field: &str) -> Result<usize, GauntletError> {
@@ -182,7 +181,7 @@ fn sha256_lower_hex(bytes: &[u8]) -> String {
 /// Canonical, replayable preimage of every public Quill runtime knob.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct QuillConfigReceipt {
+pub struct QuillConfigReceipt {
     schema_version: u32,
     scribe_shard_budget_bytes: u64,
     delta_budget_bytes: u64,
@@ -355,7 +354,7 @@ impl QuillConfigReceipt {
 /// authority.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub(crate) enum BuiltInEngineProfile {
+pub enum BuiltInEngineProfile {
     ScalarShipping,
     ScalarG1a,
     Cass,
@@ -364,7 +363,7 @@ pub(crate) enum BuiltInEngineProfile {
 /// Stored profile receipt binding the adapter role to the full Quill config.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct BuiltInEngineProfileReceipt {
+pub struct BuiltInEngineProfileReceipt {
     schema_version: u32,
     profile: BuiltInEngineProfile,
     subject_config: QuillConfigReceipt,

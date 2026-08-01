@@ -29,7 +29,7 @@ const ARTIFACT_OBJECT_V7_SCHEMA_VERSION: u32 = 7;
 pub const OBJECT_SCHEMA_VERSION: u32 = ARTIFACT_OBJECT_V7_SCHEMA_VERSION;
 const ARTIFACT_OBJECT_V7_CANONICALIZATION_VERSION: u32 = 1;
 pub const CANONICALIZATION_VERSION: u32 = ARTIFACT_OBJECT_V7_CANONICALIZATION_VERSION;
-pub(crate) const OBJECT_HASH_SCHEME_V7_SHA256: &str =
+pub const OBJECT_HASH_SCHEME_V7_SHA256: &str =
     "frankensearch-quill-gauntlet/artifact-object/v7/sha256";
 /// Current mutable run-manifest schema.
 ///
@@ -396,7 +396,7 @@ fn capture_current_executable_identity()
     }
     let mut hasher = Sha256::new();
     let mut byte_len = 0_u64;
-    let mut buffer = [0_u8; 64 * 1024];
+    let mut buffer = vec![0_u8; 64 * 1024];
     loop {
         let read = file
             .read(&mut buffer)
@@ -524,15 +524,18 @@ fn is_lower_hex_text(value: &str) -> bool {
 }
 
 fn decode_lower_hex(value: &str) -> Option<Vec<u8>> {
-    if !value.len().is_multiple_of(2) || !is_lower_hex_text(value) {
+    if !is_lower_hex_text(value) {
         return None;
     }
-    value
-        .as_bytes()
-        .chunks_exact(2)
-        .map(|pair| {
-            let high = lower_hex_nibble(pair[0])?;
-            let low = lower_hex_nibble(pair[1])?;
+    let (pairs, remainder) = value.as_bytes().as_chunks::<2>();
+    if !remainder.is_empty() {
+        return None;
+    }
+    pairs
+        .iter()
+        .map(|&[high, low]| {
+            let high = lower_hex_nibble(high)?;
+            let low = lower_hex_nibble(low)?;
             Some((high << 4) | low)
         })
         .collect()
@@ -703,7 +706,7 @@ pub struct ArtifactObject {
 /// Closed, validated identity surface used when a current artifact first
 /// observes a divergence.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ArtifactDivergenceBinding {
+pub struct ArtifactDivergenceBinding {
     pub object_schema_version: u32,
     pub object_hash_scheme: &'static str,
     pub object_hash: String,
@@ -729,9 +732,14 @@ impl ArtifactObject {
     /// This does not validate the DTO, verify its address, or establish that
     /// relational replay occurred. Callers must never use this ceiling as an
     /// achieved trust classification.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the schema version is reserved or has no registered
+    /// trust classification.
     pub fn schema_trust_ceiling(&self) -> Result<ArtifactTrustCeiling, GauntletError> {
         match self.object_schema_version {
-            1 | 2 | 3 | 5 => Ok(ArtifactTrustCeiling::UnauthenticatedLegacy),
+            1..=3 | 5 => Ok(ArtifactTrustCeiling::UnauthenticatedLegacy),
             4 => Err(GauntletError::InvalidContract {
                 reason: "reserved pre-policy artifact v4 has no trust classification".to_owned(),
             }),
@@ -1436,6 +1444,10 @@ impl ArtifactStore {
         &self.root
     }
 
+    #[allow(
+        clippy::unused_self,
+        reason = "the receiver carries test-only bypass state that must not exist in production"
+    )]
     pub(crate) fn validate_live_source_checkout_for_creation(
         &self,
         producer: &GauntletProducerBuildIdentity,
@@ -1781,7 +1793,7 @@ impl ArtifactStore {
                     .to_owned(),
             });
         }
-        self.validate_completed_campaign_entries(&campaign, &report, &completion_name)?;
+        Self::validate_completed_campaign_entries(&campaign, &report, &completion_name)?;
         self.verify_campaign_evidence(
             &root,
             &campaign,
@@ -1826,11 +1838,10 @@ impl ArtifactStore {
             ExistingFileKind::Run,
             MAX_CAMPAIGN_COMPLETION_RECEIPT_BYTES,
         )?;
-        self.validate_completed_campaign_entries(&campaign, report, &completion_name)
+        Self::validate_completed_campaign_entries(&campaign, report, &completion_name)
     }
 
     fn validate_completed_campaign_entries(
-        &self,
         campaign: &PinnedDirectory,
         report: &CampaignReport,
         completion_name: &OsStr,
@@ -1991,9 +2002,13 @@ impl ArtifactStore {
                     CampaignEvidenceValidation::Creation,
                     ArtifactOracleDependency::BuiltInTantivy { .. },
                 ) => object.validate_current_builtin_integrity()?,
-                (ArtifactExecutionRole::LegacyMissing, _, _)
-                | (ArtifactExecutionRole::Diagnostic, _, _)
-                | (ArtifactExecutionRole::BuiltInExecution, _, _) => {
+                (
+                    ArtifactExecutionRole::LegacyMissing
+                    | ArtifactExecutionRole::Diagnostic
+                    | ArtifactExecutionRole::BuiltInExecution,
+                    _,
+                    _,
+                ) => {
                     return Err(GauntletError::InvalidPreparedArtifact {
                         reason:
                             "campaign report role does not match its case artifact dependency role"
@@ -2160,7 +2175,7 @@ fn hash_object_bytes(bytes: &[u8], schema_version: u32) -> Result<String, Gauntl
 fn validate_stored_object_schema(schema_version: u32) -> Result<(), String> {
     match schema_version {
         ARTIFACT_OBJECT_V7_SCHEMA_VERSION => Ok(()),
-        1 | 2 | 3 => Err(format!(
+        1..=3 => Err(format!(
             "legacy artifact v{schema_version} lacks the current total lexical contract and is non-admissible; rerun the campaign"
         )),
         4 => Err(
@@ -3201,7 +3216,7 @@ mod tests {
                 panic!("historical object v{version} returned the wrong error class");
             };
             match version {
-                1 | 2 | 3 => assert!(reason.contains("legacy artifact")),
+                1..=3 => assert!(reason.contains("legacy artifact")),
                 4 => assert!(reason.contains("reserved pre-policy")),
                 5 => assert!(reason.contains("unauthenticated legacy")),
                 6 => assert!(reason.contains("integrity only")),
@@ -3238,8 +3253,8 @@ mod tests {
 
         let invalid_reports: [&[u8]; 11] = [
             b"",
-            br#"{"#,
-            br#"{}"#,
+            br"{",
+            br"{}",
             br#"{"schema_version":null}"#,
             br#"{"schema_version":"7"}"#,
             br#"{"schema_version":7.0}"#,
@@ -3259,8 +3274,8 @@ mod tests {
 
         let invalid_objects: [&[u8]; 11] = [
             b"",
-            br#"{"#,
-            br#"{}"#,
+            br"{",
+            br"{}",
             br#"{"object_schema_version":null}"#,
             br#"{"object_schema_version":"7"}"#,
             br#"{"object_schema_version":7.0}"#,

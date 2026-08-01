@@ -49,7 +49,7 @@ workspace and crates.io builds need no model artifacts:
 ```bash
 cargo +nightly install --path crates/frankensearch-fsfs
 fsfs version
-fsfs status --no-watch-mode --format json
+fsfs status --format json
 ```
 
 That model-free binary can acquire and verify model files, but it does not

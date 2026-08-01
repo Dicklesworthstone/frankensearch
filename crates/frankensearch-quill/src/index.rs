@@ -48,8 +48,8 @@ use crate::config::QuillConfig;
 use crate::delta::DeltaSnapshot;
 use crate::error::QuillError;
 use crate::grimoire::{
-    ByteSpan, TermDictionary, TermDictionaryError, star_glob_matches, trailing_star_prefix,
-    validate_bound_term, validate_query_term,
+    ByteSpan, MAX_TERM_BYTES, TermDictionary, TermDictionaryError, star_glob_matches,
+    trailing_star_prefix, validate_bound_term, validate_query_term,
 };
 #[cfg(feature = "durability")]
 use crate::keeper::UnrepairableSegmentPolicy;
@@ -70,12 +70,13 @@ use crate::quiver::{
     PositionCodecError, PositionList, Posting, PostingCodecError, PostingList, SnapshotFieldStats,
     StoredMetaCodecError, StoredMetaSection,
 };
-use crate::schema::{DEFAULT_SCHEMA, FieldKind, SchemaDescriptor};
+use crate::schema::{Analyzer, DEFAULT_SCHEMA, FieldKind, SchemaDescriptor};
 use crate::scribe::{
-    AccumulatorError, ColumnarAccumulator, DOC_ORDS_PER_LEASE, DeltaFlushInput, DocIdAllocator,
-    DocIdSpan, FlushDocumentInput, FlushError, FlushMode, FlushSegmentInput, IndexedFieldValue,
-    IndexedNumericValue, ShardRouter, StoredFieldValue, flush_accumulator_with_mode,
-    flush_delta_snapshot,
+    AccumulatorError, ArenaSpan, ColumnarAccumulator, DEFAULT_ARENA_CHUNK_BYTES,
+    DOC_ORDS_PER_LEASE, DeltaFlushInput, DocIdAllocator, DocIdSpan, FIELD_PREFIX_BYTES,
+    FlushDocumentInput, FlushError, FlushMode, FlushSegmentInput, FrankensearchTokenizer,
+    IndexedFieldValue, IndexedNumericValue, ShardRouter, StoredFieldValue,
+    TERM_BUCKET_BYTES_ESTIMATE, TokenAnalyzer, flush_accumulator_with_mode, flush_delta_snapshot,
 };
 use crate::segment::{EncodedSegment, SectionKind};
 use crate::snippet::{SnippetConfig, SnippetGenerator, SnippetTerm};
@@ -88,6 +89,10 @@ const METADATA_FIELD: u16 = 3;
 const ORD_FIELD: u16 = 4;
 const MAX_GLOBAL_DOCID_EXCLUSIVE: u64 = 1_u64 << 32;
 const PARALLEL_INGEST_MIN_DOCS_PER_SHARD: usize = 64;
+const PARALLEL_INGEST_PLANNER_VERSION: u8 = 1;
+const PARALLEL_ARENA_BUDGET_DIVISOR: usize = 2;
+const MIN_ARENA_CHUNK_BYTES: usize = 4096;
+const INTERNAL_PARALLEL_INGEST_SHARDS: usize = 4;
 const CONTENT_HASH_DOMAIN: &[u8] = b"frankensearch.quill.idmap-content.v2\0";
 
 /// Typed failure from the scalar shipping facade.
@@ -256,6 +261,7 @@ const RANKED_QUERY_CACHE_SLOTS: usize = RANKED_QUERY_CACHE_SETS * RANKED_QUERY_C
 
 enum RankedQueryCacheKey {
     Raw(Arc<str>),
+    #[cfg(any(test, feature = "bench-internals"))]
     Preparsed(Arc<Query>),
 }
 
@@ -306,6 +312,7 @@ impl RankedQueryCache {
         })
     }
 
+    #[cfg(any(test, feature = "bench-internals"))]
     fn get_preparsed(
         &self,
         snapshot_epoch: u64,
@@ -367,6 +374,7 @@ impl RankedQueryCache {
         }));
     }
 
+    #[cfg(any(test, feature = "bench-internals"))]
     fn insert_preparsed(
         &self,
         snapshot_epoch: u64,
@@ -428,6 +436,7 @@ fn raw_query_cache_fingerprint(
     hasher.digest()
 }
 
+#[cfg(any(test, feature = "bench-internals"))]
 fn preparsed_query_cache_fingerprint(
     snapshot_epoch: u64,
     query: &Query,
@@ -461,10 +470,12 @@ fn hash_query_cache_bytes(hasher: &mut Xxh3, bytes: &[u8]) {
     hasher.update(bytes);
 }
 
+#[cfg(any(test, feature = "bench-internals"))]
 fn hash_query_cache_len(hasher: &mut Xxh3, len: usize) {
     hasher.update(&u64::try_from(len).unwrap_or(u64::MAX).to_le_bytes());
 }
 
+#[cfg(any(test, feature = "bench-internals"))]
 fn hash_query_cache_value(hasher: &mut Xxh3, value: &QueryValue) {
     match value {
         QueryValue::I64(value) => {
@@ -482,6 +493,7 @@ fn hash_query_cache_value(hasher: &mut Xxh3, value: &QueryValue) {
     }
 }
 
+#[cfg(any(test, feature = "bench-internals"))]
 fn hash_query_cache_bound(hasher: &mut Xxh3, bound: &Bound<QueryValue>) {
     match bound {
         Bound::Included(value) => {
@@ -496,6 +508,7 @@ fn hash_query_cache_bound(hasher: &mut Xxh3, bound: &Bound<QueryValue>) {
     }
 }
 
+#[cfg(any(test, feature = "bench-internals"))]
 fn hash_exact_query(hasher: &mut Xxh3, query: &Query) {
     match query {
         Query::Empty => hasher.update(&[0]),
@@ -1489,6 +1502,12 @@ struct ScribeShardState {
     current_lease_base: Option<u64>,
 }
 
+struct ParallelShardWork {
+    shard: usize,
+    assignment: ParallelShardAssignment,
+    state: ScribeShardState,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct ParallelShardAssignment {
     document_start: usize,
@@ -1498,20 +1517,372 @@ struct ParallelShardAssignment {
 
 #[derive(Debug, Clone, Copy)]
 struct ParallelIngestReceipt {
+    planner_version: u8,
+    route: ParallelIngestRoute,
+    configured_width: usize,
+    verified_pool_capacity: usize,
+    eligible_shards: usize,
     active_shards: usize,
-    worker_count: usize,
+    logical_budget_bytes: usize,
+    initial_logical_bytes: usize,
+    batch_logical_upper_bound: usize,
+    projected_logical_upper_bound: usize,
+    arena_chunk_bytes: usize,
     arena_bytes_used_high_water: usize,
     arena_bytes_reserved_high_water: usize,
 }
 
-fn parallel_ingest_active_shards(
+#[derive(Debug, Clone, Copy)]
+struct ParallelBudgetAdmission {
+    logical_budget_bytes: usize,
+    initial_logical_bytes: usize,
+    initial_reserved_bytes: usize,
+    batch_logical_upper_bound: usize,
+    projected_logical_upper_bound: usize,
+    arena_chunk_bytes: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ParallelDocumentBudgetBound {
+    Within(usize),
+    ReachesCeiling,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ParallelIngestRoute {
+    Serial,
+    SharedNothing,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IngestParallelismPolicy {
+    Adaptive,
+    #[cfg(feature = "pruning-conformance")]
+    ScalarTopologyConformance,
+}
+
+#[derive(Clone)]
+struct ParallelIngestCheckpoint {
+    #[cfg(feature = "conformance-internals")]
+    controller: Arc<ConformanceCancellationController>,
+}
+
+impl ParallelIngestCheckpoint {
+    #[cfg(not(feature = "conformance-internals"))]
+    const fn new(_: &QuillReader) -> Self {
+        Self {}
+    }
+
+    #[cfg(feature = "conformance-internals")]
+    fn new(reader: &QuillReader) -> Self {
+        Self {
+            controller: Arc::clone(&reader.conformance_controller),
+        }
+    }
+
+    #[allow(
+        clippy::unused_self,
+        reason = "keeps worker checkpoint call sites cfg-symmetric with the controller-backed variant"
+    )]
+    fn check(&self, cx: &Cx) -> Result<(), QuillIndexError> {
+        #[cfg(feature = "conformance-internals")]
+        self.controller
+            .checkpoint(ConformanceCancellationStage::ParallelIngest, cx);
+        check_cancel(cx, "parallel index worker")
+    }
+}
+
+impl ParallelIngestRoute {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Serial => "serial",
+            Self::SharedNothing => "shared_nothing",
+        }
+    }
+}
+
+fn catch_parallel_ingest_worker<T>(
+    shard: usize,
+    operation: impl FnOnce() -> Result<T, QuillIndexError>,
+) -> Result<T, QuillIndexError> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(operation)).unwrap_or_else(|_| {
+        Err(invalid_state(format!(
+            "parallel ingest worker {shard} panicked before transactional commit"
+        )))
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ParallelDocumentRange {
+    start: usize,
+    end: usize,
+}
+
+impl ParallelDocumentRange {
+    const fn len(self) -> usize {
+        self.end - self.start
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ParallelIngestPlan {
+    planner_version: u8,
+    route: ParallelIngestRoute,
+    configured_width: usize,
+    verified_pool_capacity: usize,
+    eligible_shards: usize,
+    active_shards: usize,
+    ranges: Vec<ParallelDocumentRange>,
+}
+
+fn plan_parallel_ingest(
     document_count: usize,
-    configured_shards: usize,
-    worker_count: usize,
-) -> usize {
-    configured_shards
-        .min(worker_count)
-        .min(document_count / PARALLEL_INGEST_MIN_DOCS_PER_SHARD)
+    configured_width: usize,
+    verified_pool_capacity: usize,
+) -> Result<ParallelIngestPlan, QuillIndexError> {
+    let eligible_shards = configured_width.min(verified_pool_capacity);
+    let active_shards = eligible_shards.min(document_count / PARALLEL_INGEST_MIN_DOCS_PER_SHARD);
+    let route = if active_shards < 2 {
+        ParallelIngestRoute::Serial
+    } else {
+        ParallelIngestRoute::SharedNothing
+    };
+    let mut ranges = Vec::new();
+    if route == ParallelIngestRoute::SharedNothing {
+        ranges
+            .try_reserve_exact(active_shards)
+            .map_err(|_| invalid_state("could not reserve parallel ingest plan ranges"))?;
+        let documents_per_shard = document_count / active_shards;
+        let remainder = document_count % active_shards;
+        let mut start = 0_usize;
+        for position in 0..active_shards {
+            let count = documents_per_shard + usize::from(position < remainder);
+            let end = start
+                .checked_add(count)
+                .ok_or_else(|| invalid_state("parallel ingest plan range overflow"))?;
+            ranges.push(ParallelDocumentRange { start, end });
+            start = end;
+        }
+        if start != document_count {
+            return Err(invalid_state(
+                "parallel ingest plan did not cover the complete document batch",
+            ));
+        }
+    }
+    Ok(ParallelIngestPlan {
+        planner_version: PARALLEL_INGEST_PLANNER_VERSION,
+        route,
+        configured_width,
+        verified_pool_capacity,
+        eligible_shards,
+        active_shards,
+        ranges,
+    })
+}
+
+fn checked_budget_charge(total: &mut usize, additional: usize) -> bool {
+    let Some(charged) = total.checked_add(additional) else {
+        return false;
+    };
+    *total = charged;
+    true
+}
+
+fn charge_parallel_budget_token(total: &mut usize, term_bytes: usize, row_bytes: usize) -> bool {
+    let Some(additional) = term_bytes
+        .checked_add(FIELD_PREFIX_BYTES)
+        .and_then(|value| value.checked_add(std::mem::size_of::<ArenaSpan>()))
+        .and_then(|value| value.checked_add(TERM_BUCKET_BYTES_ESTIMATE))
+        .and_then(|value| value.checked_add(row_bytes))
+    else {
+        return false;
+    };
+    checked_budget_charge(total, additional)
+}
+
+fn validate_parallel_source_len(field_ord: u16, bytes: usize) -> Result<(), QuillIndexError> {
+    if u32::try_from(bytes).is_err() {
+        return Err(AccumulatorError::SourceTooLarge { field_ord, bytes }.into());
+    }
+    Ok(())
+}
+
+/// Return a conservative increment to `ColumnarAccumulator::bytes_used` for
+/// one shipping-shaped document.
+///
+/// Every admitted token occurrence is charged as though it were a distinct
+/// term. That deliberately overstates interner use for repeated terms while
+/// retaining the exact configured analyzer, normalized term bytes, positions
+/// width, stored bytes, and per-document column rows. `None` means the schema
+/// is not the five-field shipping shape or an arithmetic bound overflowed, so
+/// the caller must retain the scalar route.
+fn parallel_document_logical_upper_bound(
+    schema: SchemaDescriptor,
+    analyzer: &mut FrankensearchTokenizer,
+    document: &IndexableDocument,
+    exclusive_ceiling: usize,
+) -> Result<Option<ParallelDocumentBudgetBound>, QuillIndexError> {
+    let [
+        id_field,
+        content_field,
+        title_field,
+        metadata_field,
+        ord_field,
+    ] = schema.fields
+    else {
+        return Ok(None);
+    };
+    if !matches!(id_field.kind, FieldKind::Keyword)
+        || !id_field.stored
+        || !matches!(
+            content_field.kind,
+            FieldKind::Text {
+                analyzer: Analyzer::FrankensearchDefault,
+                ..
+            }
+        )
+        || !content_field.stored
+        || !matches!(
+            title_field.kind,
+            FieldKind::Text {
+                analyzer: Analyzer::FrankensearchDefault,
+                ..
+            }
+        )
+        || !title_field.stored
+        || !matches!(metadata_field.kind, FieldKind::StoredOnly)
+        || !metadata_field.stored
+        || !matches!(ord_field.kind, FieldKind::U64 { fast: true, .. })
+        || !ord_field.stored
+    {
+        return Ok(None);
+    }
+
+    validate_parallel_source_len(ID_FIELD, document.id.len())?;
+    validate_parallel_source_len(CONTENT_FIELD, document.content.len())?;
+    validate_parallel_source_len(TITLE_FIELD, document.title.as_deref().unwrap_or("").len())?;
+
+    let mut upper_bound = std::mem::size_of::<u32>();
+    for field in schema.fields {
+        if matches!(field.kind, FieldKind::Keyword | FieldKind::Text { .. })
+            && !checked_budget_charge(
+                &mut upper_bound,
+                std::mem::size_of::<u32>() + std::mem::size_of::<u8>(),
+            )
+        {
+            return Ok(None);
+        }
+        if field.kind.has_numeric_column()
+            && !checked_budget_charge(
+                &mut upper_bound,
+                std::mem::size_of::<Option<NumericValue>>(),
+            )
+        {
+            return Ok(None);
+        }
+        if field.stored
+            && !checked_budget_charge(
+                &mut upper_bound,
+                std::mem::size_of::<u32>() + std::mem::size_of::<u8>(),
+            )
+        {
+            return Ok(None);
+        }
+    }
+
+    let metadata = canonical_metadata(&document.metadata)?;
+    if u32::try_from(metadata.len()).is_err() {
+        return Err(AccumulatorError::StoredValueTooLarge {
+            field_ord: METADATA_FIELD,
+            bytes: metadata.len(),
+        }
+        .into());
+    }
+    for stored_bytes in [
+        document.id.len(),
+        document.content.len(),
+        document.title.as_deref().unwrap_or("").len(),
+        metadata.len(),
+        std::mem::size_of::<u64>(),
+    ] {
+        if !checked_budget_charge(&mut upper_bound, stored_bytes) {
+            return Ok(None);
+        }
+    }
+
+    // Stored bytes and fixed rows are a cheap lower bound. Once they alone
+    // reach the caller's remaining admission budget, do not scan either text
+    // field merely to prove a rejection already established without
+    // tokenization. This also bounds the count-only double scan to source
+    // sizes below the configured logical ceiling.
+    if upper_bound >= exclusive_ceiling {
+        return Ok(Some(ParallelDocumentBudgetBound::ReachesCeiling));
+    }
+
+    if document.id.len() <= MAX_TERM_BYTES
+        && !charge_parallel_budget_token(
+            &mut upper_bound,
+            document.id.len(),
+            2 * std::mem::size_of::<u32>(),
+        )
+    {
+        return Ok(None);
+    }
+    if upper_bound >= exclusive_ceiling {
+        return Ok(Some(ParallelDocumentBudgetBound::ReachesCeiling));
+    }
+
+    for (field, text) in [
+        (content_field, document.content.as_str()),
+        (title_field, document.title.as_deref().unwrap_or("")),
+    ] {
+        let FieldKind::Text {
+            analyzer: analyzer_kind,
+            positions,
+        } = field.kind
+        else {
+            unreachable!("shipping-shape validation accepted a non-text field");
+        };
+        let row_bytes =
+            2 * std::mem::size_of::<u32>() + usize::from(positions) * std::mem::size_of::<u32>();
+        let mut overflowed = false;
+        let mut reached_ceiling = false;
+        analyzer.analyze(analyzer_kind, text, &mut |token| {
+            if token.text.len() <= MAX_TERM_BYTES
+                && !overflowed
+                && !reached_ceiling
+                && !charge_parallel_budget_token(&mut upper_bound, token.text.len(), row_bytes)
+            {
+                overflowed = true;
+            }
+            reached_ceiling = upper_bound >= exclusive_ceiling;
+        });
+        if overflowed {
+            return Ok(None);
+        }
+        if reached_ceiling {
+            return Ok(Some(ParallelDocumentBudgetBound::ReachesCeiling));
+        }
+    }
+
+    debug_assert!(upper_bound < exclusive_ceiling);
+    Ok(Some(ParallelDocumentBudgetBound::Within(upper_bound)))
+}
+
+fn parallel_arena_chunk_bytes(batch_logical_upper_bound: usize, active_shards: usize) -> usize {
+    // Size speculative term arenas from the admitted work, not from the
+    // configuration ceiling. With the 64 MiB default, deriving this from the
+    // ceiling would clamp every supported width back to the scalar 1 MiB
+    // chunk and multiply idle reservation by the worker count. The second cap
+    // shares one scalar chunk of aggregate slack across workers; above 256
+    // workers, ByteArena's 4 KiB hard floor is the irreducible bound.
+    let active_shards = active_shards.max(1);
+    let per_shard_share = batch_logical_upper_bound / active_shards;
+    let per_shard_slack_cap =
+        (DEFAULT_ARENA_CHUNK_BYTES / active_shards).max(MIN_ARENA_CHUNK_BYTES);
+    per_shard_share
+        .saturating_div(PARALLEL_ARENA_BUDGET_DIVISOR)
+        .clamp(MIN_ARENA_CHUNK_BYTES, per_shard_slack_cap)
 }
 
 #[derive(Default)]
@@ -1530,7 +1901,7 @@ struct QueryFuelState {
 pub enum ConformancePruningStrategy {
     /// Full window scoring without a competitive cutoff.
     Exhaustive,
-    /// Direct-term MaxScore candidate selection.
+    /// Direct-term `MaxScore` candidate selection.
     MaxScore,
     /// Block-Max WAND candidate selection.
     BlockMaxWand,
@@ -1742,7 +2113,7 @@ impl ConformancePruningTraceSession {
             .state
             .lock()
             .map_err(|_| invalid_state("pruning-conformance receipt lock is poisoned"))?;
-        match &mut *state {
+        let result = match &mut *state {
             ConformancePruningTraceState::Collecting {
                 execution_mode: slot,
                 ..
@@ -1762,7 +2133,9 @@ impl ConformancePruningTraceSession {
             ConformancePruningTraceState::Failed => Err(invalid_state(
                 "pruning-conformance trace session has failed",
             )),
-        }
+        };
+        drop(state);
+        result
     }
 
     #[cfg(test)]
@@ -1872,14 +2245,11 @@ impl ConformancePruningTraceSession {
             segment_doc_count,
             refills,
         });
-        let recorded_receipts = match u64::try_from(receipts.len()) {
-            Ok(recorded_receipts) => recorded_receipts,
-            Err(_) => {
-                *state = ConformancePruningTraceState::Failed;
-                return Err(invalid_state(
-                    "pruning-conformance recorded receipt count does not fit u64",
-                ));
-            }
+        let Ok(recorded_receipts) = u64::try_from(receipts.len()) else {
+            *state = ConformancePruningTraceState::Failed;
+            return Err(invalid_state(
+                "pruning-conformance recorded receipt count does not fit u64",
+            ));
         };
         if let Some((controller, cx)) = checkpoint
             && let Err(error) = controller.checkpoint_pruning_trace_segment_recorded(
@@ -1892,6 +2262,7 @@ impl ConformancePruningTraceSession {
             *state = ConformancePruningTraceState::Failed;
             return Err(error);
         }
+        drop(state);
         Ok(recorded_receipts)
     }
 
@@ -1934,6 +2305,7 @@ impl ConformancePruningTraceSession {
             )));
         }
         *state = ConformancePruningTraceState::Completed;
+        drop(state);
         Ok(ConformancePruningTraceReceipt {
             execution_mode,
             segments: receipts,
@@ -2011,8 +2383,12 @@ pub enum ConformanceCancellationStage {
     FusionHydration = 2,
     /// The retained commit transaction immediately before publication.
     CommitPublication = 3,
+    /// One document boundary inside a shared-nothing ingest worker.
+    ParallelIngest = 4,
+    /// One document boundary in the read-only parallel budget preflight.
+    ParallelBudgetAdmission = 5,
     /// One sealed-segment pruning receipt has been recorded successfully.
-    PruningTraceSegmentRecorded = 4,
+    PruningTraceSegmentRecorded = 6,
 }
 
 /// Fixed-size conformance receipt for the complete retained scalar writer
@@ -2135,7 +2511,9 @@ impl ConformanceCancellationStage {
             Self::QueryCollection => 1,
             Self::FusionHydration => 2,
             Self::CommitPublication => 3,
-            Self::PruningTraceSegmentRecorded => 4,
+            Self::ParallelIngest => 4,
+            Self::ParallelBudgetAdmission => 5,
+            Self::PruningTraceSegmentRecorded => 6,
         }
     }
 }
@@ -3465,6 +3843,97 @@ impl QuillWriterState {
         !self.published_snapshot.load().delta_snapshots().is_empty()
     }
 
+    fn parallel_budget_admission(
+        &self,
+        cx: &Cx,
+        documents: &[IndexableDocument],
+        active_shards: usize,
+    ) -> Result<Option<ParallelBudgetAdmission>, QuillIndexError> {
+        // The first budget-safe activation accepts only a pristine Scribe
+        // generation. Retained leases or logical rows from an earlier routed
+        // batch would make the scalar counterfactual depend on prior shard
+        // selection, so those cases deliberately keep the scalar path.
+        if self.shards.iter().any(|shard| {
+            shard.accumulator.document_count() != 0
+                || !shard.identities.is_empty()
+                || shard.current_lease_base.is_some()
+        }) {
+            return Ok(None);
+        }
+
+        let Some(initial_logical_bytes) = self.shards.iter().try_fold(0_usize, |total, shard| {
+            total.checked_add(shard.accumulator.bytes_used())
+        }) else {
+            return Ok(None);
+        };
+        let Some(initial_reserved_bytes) = self.shards.iter().try_fold(0_usize, |total, shard| {
+            total.checked_add(shard.accumulator.bytes_reserved())
+        }) else {
+            return Ok(None);
+        };
+
+        let logical_budget_bytes = self.config.scribe_shard_budget_bytes;
+        if initial_logical_bytes >= logical_budget_bytes {
+            return Ok(None);
+        }
+
+        let mut analyzer = FrankensearchTokenizer::default();
+        let mut batch_logical_upper_bound = 0_usize;
+        for document in documents {
+            #[cfg(feature = "conformance-internals")]
+            self.reader
+                .conformance_controller
+                .checkpoint(ConformanceCancellationStage::ParallelBudgetAdmission, cx);
+            check_cancel(cx, "parallel budget admission")?;
+            let Some(consumed_before_document) =
+                initial_logical_bytes.checked_add(batch_logical_upper_bound)
+            else {
+                return Ok(None);
+            };
+            let Some(remaining_budget) = logical_budget_bytes.checked_sub(consumed_before_document)
+            else {
+                return Ok(None);
+            };
+            let Some(document_bound) = parallel_document_logical_upper_bound(
+                self.schema,
+                &mut analyzer,
+                document,
+                remaining_budget,
+            )?
+            else {
+                return Ok(None);
+            };
+            let ParallelDocumentBudgetBound::Within(document_upper_bound) = document_bound else {
+                return Ok(None);
+            };
+            let Some(charged) = batch_logical_upper_bound.checked_add(document_upper_bound) else {
+                return Ok(None);
+            };
+            batch_logical_upper_bound = charged;
+            if initial_logical_bytes
+                .checked_add(batch_logical_upper_bound)
+                .is_none_or(|projected| projected >= logical_budget_bytes)
+            {
+                return Ok(None);
+            }
+        }
+        let Some(projected_logical_upper_bound) =
+            initial_logical_bytes.checked_add(batch_logical_upper_bound)
+        else {
+            return Ok(None);
+        };
+        debug_assert!(projected_logical_upper_bound < logical_budget_bytes);
+
+        Ok(Some(ParallelBudgetAdmission {
+            logical_budget_bytes,
+            initial_logical_bytes,
+            initial_reserved_bytes,
+            batch_logical_upper_bound,
+            projected_logical_upper_bound,
+            arena_chunk_bytes: parallel_arena_chunk_bytes(batch_logical_upper_bound, active_shards),
+        }))
+    }
+
     /// Route and accumulate one bounded batch into the production Scribe shard set.
     ///
     /// A budget or lease boundary seals an immutable segment, but no newly
@@ -3482,8 +3951,310 @@ impl QuillWriterState {
         documents: &[IndexableDocument],
     ) -> Result<(), QuillIndexError> {
         let replacement_ids = BTreeSet::new();
-        self.index_documents_with_replacements(cx, documents, &replacement_ids, true)
-            .await
+        self.index_documents_with_replacements(
+            cx,
+            documents,
+            &replacement_ids,
+            true,
+            IngestParallelismPolicy::Adaptive,
+        )
+        .await
+    }
+
+    /// Index through the production scalar accumulator without parallel-planner
+    /// fanout so pruning conformance can request a specific leaf geometry.
+    ///
+    /// Shipping ingest keeps its adaptive shared-nothing and fixed-width
+    /// internal fanout. This feature-gated seam exists only because Salej
+    /// treats the number and size of sealed leaves as evidence. Scalar lease,
+    /// arena-budget, visibility-publication, and tier-merge rules remain live,
+    /// so proof callers must validate the realized topology before using it as
+    /// evidence.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same typed cancellation, duplicate-ID, accumulation,
+    /// flush, or publication failures as [`Self::index_documents`].
+    #[cfg(feature = "pruning-conformance")]
+    async fn index_documents_with_scalar_topology_conformance(
+        &mut self,
+        cx: &Cx,
+        documents: &[IndexableDocument],
+    ) -> Result<(), QuillIndexError> {
+        let replacement_ids = BTreeSet::new();
+        self.index_documents_with_replacements(
+            cx,
+            documents,
+            &replacement_ids,
+            true,
+            IngestParallelismPolicy::ScalarTopologyConformance,
+        )
+        .await
+    }
+
+    async fn try_index_documents_internal_parallel(
+        &mut self,
+        cx: &Cx,
+        documents: &[IndexableDocument],
+        replacement_ids: &BTreeSet<&str>,
+        allow_automatic_publication: bool,
+    ) -> Result<Option<ParallelIngestReceipt>, QuillIndexError> {
+        if !replacement_ids.is_empty()
+            || !self.shard_router.is_deterministic()
+            || !matches!(&self.backend, IndexBackend::Memory(_))
+            || self.shards.iter().any(|state| {
+                state.accumulator.document_count() != 0 || !state.identities.is_empty()
+            })
+        {
+            return Ok(None);
+        }
+
+        // Use a fixed logical width so deterministic-ingest output does not
+        // change with the host's available parallelism. Rayon executes the
+        // same independent jobs serially when installed on a one-thread pool.
+        let plan = plan_parallel_ingest(
+            documents.len(),
+            INTERNAL_PARALLEL_INGEST_SHARDS,
+            INTERNAL_PARALLEL_INGEST_SHARDS,
+        )?;
+        if plan.route == ParallelIngestRoute::Serial {
+            return Ok(None);
+        }
+        let Some(initial_logical_bytes) = self.shards.iter().try_fold(0_usize, |total, shard| {
+            total.checked_add(shard.accumulator.bytes_used())
+        }) else {
+            return Ok(None);
+        };
+        let Some(initial_reserved_bytes) = self.shards.iter().try_fold(0_usize, |total, shard| {
+            total.checked_add(shard.accumulator.bytes_reserved())
+        }) else {
+            return Ok(None);
+        };
+        let logical_budget_bytes = self.config.scribe_shard_budget_bytes;
+        let Some(available_logical_bytes) = logical_budget_bytes.checked_sub(initial_logical_bytes)
+        else {
+            return Ok(None);
+        };
+        if available_logical_bytes == 0 {
+            return Ok(None);
+        }
+        let arena_chunk_bytes = available_logical_bytes
+            .saturating_div(plan.active_shards.max(1))
+            .saturating_div(PARALLEL_ARENA_BUDGET_DIVISOR)
+            .clamp(MIN_ARENA_CHUNK_BYTES, DEFAULT_ARENA_CHUNK_BYTES);
+
+        let mut batch_ids = BTreeSet::new();
+        for document in documents {
+            check_cancel(cx, "internal parallel index validation")?;
+            if document.id.is_empty() {
+                return Err(invalid_state("document id must be nonempty"));
+            }
+            if !batch_ids.insert(document.id.as_str())
+                || self.uncommitted_ids.contains(&document.id)
+                || self
+                    .backend
+                    .snapshot()
+                    .resolve_document_id(&document.id)?
+                    .is_some()
+            {
+                return Err(invalid_state(format!(
+                    "duplicate live document id {:?}",
+                    document.id
+                )));
+            }
+        }
+
+        let document_count = u32::try_from(documents.len())
+            .map_err(|_| invalid_state("ingest batch document count does not fit u32"))?;
+        let prior_grant_count = self.docid_allocator.lease_grants().len();
+        let mut planned_allocator = self.docid_allocator.speculative_clone();
+        let allocated = planned_allocator
+            .alloc_batch(0, document_count)
+            .map_err(|error| invalid_state(error.to_string()))?;
+        let [batch_span] = allocated.spans() else {
+            // The scalar path already owns exact lease-boundary cuts. Keep it
+            // as the fallback for the infrequent batch that crosses one.
+            return Ok(None);
+        };
+
+        let mut work = Vec::new();
+        work.try_reserve_exact(plan.active_shards)
+            .map_err(|_| invalid_state("could not reserve internal parallel ingest work"))?;
+        for (shard, range) in plan.ranges.iter().copied().enumerate() {
+            let range_start = u32::try_from(range.start)
+                .map_err(|_| invalid_state("parallel range start does not fit u32"))?;
+            let range_len = u32::try_from(range.len())
+                .map_err(|_| invalid_state("parallel range length does not fit u32"))?;
+            let ord_start = batch_span
+                .ord_start
+                .checked_add(range_start)
+                .ok_or_else(|| invalid_state("parallel range document ordinal overflow"))?;
+            work.push(ParallelShardWork {
+                shard,
+                assignment: ParallelShardAssignment {
+                    document_start: range.start,
+                    document_end: range.end,
+                    span: DocIdSpan {
+                        lease_base: batch_span.lease_base,
+                        ord_start,
+                        len: range_len,
+                    },
+                },
+                state: ScribeShardState {
+                    accumulator: ColumnarAccumulator::with_arena_chunk_size(
+                        self.schema,
+                        arena_chunk_bytes,
+                    )?,
+                    identities: Vec::new(),
+                    current_lease_base: Some(batch_span.lease_base),
+                },
+            });
+        }
+
+        let checkpoint = ParallelIngestCheckpoint::new(&self.reader);
+        let completed = work
+            .into_par_iter()
+            .map(|mut work| {
+                catch_parallel_ingest_worker(work.shard, || {
+                    Self::accumulate_parallel_shard(
+                        &mut work.state,
+                        documents,
+                        work.assignment,
+                        cx,
+                        &checkpoint,
+                    )
+                })?;
+                Ok(work)
+            })
+            .collect::<Result<Vec<_>, QuillIndexError>>()?;
+        checkpoint.check(cx)?;
+
+        let created_unix_s = self.created_unix_s()?;
+        let mut reserved_segment_ids = BTreeSet::new();
+        let mut flush_plans = Vec::new();
+        flush_plans
+            .try_reserve_exact(completed.len())
+            .map_err(|_| invalid_state("could not reserve internal parallel flush plans"))?;
+        for (offset, completed_shard) in completed.iter().enumerate() {
+            let segment_id = self.derive_segment_id_for_state_avoiding(
+                &completed_shard.state,
+                batch_span.lease_base,
+                created_unix_s,
+                &reserved_segment_ids,
+            )?;
+            reserved_segment_ids.insert(segment_id);
+            let offset = u64::try_from(offset)
+                .map_err(|_| invalid_state("parallel shard count does not fit u64"))?;
+            let seal_seq = self
+                .next_seal_seq
+                .checked_add(offset)
+                .ok_or_else(|| invalid_state("seal sequence exhausted"))?;
+            flush_plans.push(ShardFlushPlan {
+                shard: completed_shard.shard,
+                state: &completed_shard.state,
+                segment_id,
+                lease_docid_base: batch_span.lease_base,
+                created_unix_s,
+                seal_seq,
+            });
+        }
+        let built = flush_plans
+            .par_iter()
+            .map(Self::build_planned_shard_flush)
+            .collect::<Result<Vec<_>, _>>()?;
+        checkpoint.check(cx)?;
+
+        let mut pending_field_stats = self.pending_field_stats.clone();
+        for completed_shard in &completed {
+            let shard_document_count =
+                u32::try_from(completed_shard.state.accumulator.document_count())
+                    .map_err(|_| invalid_state("segment document count does not fit u32"))?;
+            for field in completed_shard.state.accumulator.fields() {
+                let entry = pending_field_stats
+                    .entry(field.field_ord())
+                    .or_insert((0, 0));
+                entry.0 = entry
+                    .0
+                    .checked_add(field.total_tokens())
+                    .ok_or_else(|| invalid_state("pending field token count overflow"))?;
+                entry.1 = entry
+                    .1
+                    .checked_add(shard_document_count)
+                    .ok_or_else(|| invalid_state("pending field document count overflow"))?;
+            }
+        }
+        let batch_logical_bytes = completed.iter().fold(0_usize, |total, shard| {
+            total.saturating_add(shard.state.accumulator.bytes_used())
+        });
+        let Some(projected_logical_bytes) = initial_logical_bytes.checked_add(batch_logical_bytes)
+        else {
+            return Ok(None);
+        };
+        if projected_logical_bytes >= logical_budget_bytes {
+            // The workers mutated only local accumulators. Discarding them and
+            // taking the scalar path preserves the exclusive logical ceiling
+            // without tokenizing every document twice on the admitted path.
+            return Ok(None);
+        }
+        let arena_bytes_used_high_water = projected_logical_bytes;
+        let arena_bytes_reserved_high_water = completed
+            .iter()
+            .fold(initial_reserved_bytes, |total, shard| {
+                total.saturating_add(shard.state.accumulator.bytes_reserved())
+            });
+        let next_seal_seq = built
+            .last()
+            .map_or(self.next_seal_seq, |flush| flush.next_seal_seq);
+        self.pending_segments
+            .try_reserve(built.len())
+            .map_err(|_| invalid_state("could not reserve pending segment bookkeeping"))?;
+        self.pending_owned_segments
+            .try_reserve(built.len())
+            .map_err(|_| invalid_state("could not reserve owned segment bookkeeping"))?;
+
+        // All fallible accumulation, encoding, accounting, and reservations
+        // finished against local state. Install the generation as one writer
+        // mutation so a failed worker leaves the original batch retryable.
+        planned_allocator.commit_speculative_grants(prior_grant_count);
+        self.ingest_retry_required = true;
+        self.docid_allocator = planned_allocator;
+        self.next_lease_base = self.docid_allocator.watermark();
+        for flush in built {
+            self.pending_segments.push(flush.manifest_segment);
+            self.pending_owned_segments.push(flush.encoded);
+        }
+        self.pending_field_stats = pending_field_stats;
+        self.next_seal_seq = next_seal_seq;
+        self.uncommitted_ids
+            .extend(documents.iter().map(|document| document.id.clone()));
+        self.unpublished_since.get_or_insert_with(Instant::now);
+
+        if allow_automatic_publication {
+            self.publish_bulk_cadence_if_due(cx).await?;
+        }
+        let visibility_due = self.unpublished_since.is_some_and(|started| {
+            started.elapsed() >= Duration::from_millis(self.config.max_visibility_lag_ms)
+        });
+        if allow_automatic_publication && visibility_due {
+            self.commit_with_trigger(cx, LifecycleTrigger::VisibilityLag)
+                .await?;
+        }
+
+        Ok(Some(ParallelIngestReceipt {
+            planner_version: plan.planner_version,
+            route: plan.route,
+            configured_width: plan.configured_width,
+            verified_pool_capacity: rayon::current_num_threads(),
+            eligible_shards: plan.eligible_shards,
+            active_shards: plan.active_shards,
+            logical_budget_bytes,
+            initial_logical_bytes,
+            batch_logical_upper_bound: batch_logical_bytes,
+            projected_logical_upper_bound: projected_logical_bytes,
+            arena_chunk_bytes,
+            arena_bytes_used_high_water,
+            arena_bytes_reserved_high_water,
+        }))
     }
 
     async fn try_index_documents_parallel(
@@ -3494,33 +4265,13 @@ impl QuillWriterState {
         allow_automatic_publication: bool,
     ) -> Result<Option<ParallelIngestReceipt>, QuillIndexError> {
         let shard_count = self.shards.len();
-        let worker_count = rayon::current_num_threads();
-        let active_shard_count =
-            parallel_ingest_active_shards(documents.len(), shard_count, worker_count);
+        let verified_pool_capacity = rayon::current_num_threads();
+        let plan = plan_parallel_ingest(documents.len(), shard_count, verified_pool_capacity)?;
         if !replacement_ids.is_empty()
             || self.shard_router.is_deterministic()
-            || active_shard_count < 2
+            || plan.route == ParallelIngestRoute::Serial
         {
             return Ok(None);
-        }
-
-        let maximum_shard_documents = documents.len().div_ceil(active_shard_count);
-        let maximum_shard_documents = u32::try_from(maximum_shard_documents)
-            .map_err(|_| invalid_state("parallel shard document count does not fit u32"))?;
-        for shard in 0..shard_count {
-            let live_lease = self.docid_allocator.live_lease(shard);
-            let remaining = live_lease.map_or(DOC_ORDS_PER_LEASE, |(_, next_ord)| {
-                DOC_ORDS_PER_LEASE - next_ord
-            });
-            if maximum_shard_documents > remaining {
-                return Ok(None);
-            }
-            if let (Some(current), Some((live, _))) =
-                (self.shards[shard].current_lease_base, live_lease)
-                && current != live
-            {
-                return Ok(None);
-            }
         }
 
         let mut batch_ids = BTreeSet::new();
@@ -3544,17 +4295,52 @@ impl QuillWriterState {
             }
         }
 
-        let mut assignments = vec![None; shard_count];
-        let documents_per_shard = documents.len() / active_shard_count;
-        let remainder = documents.len() % active_shard_count;
-        let mut document_start = 0_usize;
-        for position in 0..active_shard_count {
-            let shard = self.shard_router.route_batch();
-            let count = documents_per_shard + usize::from(position < remainder);
+        let active_shard_count = plan.active_shards;
+        let Some(budget_admission) =
+            self.parallel_budget_admission(cx, documents, active_shard_count)?
+        else {
+            return Ok(None);
+        };
+        let mut planned_router = self.shard_router.clone();
+        let prior_grant_count = self.docid_allocator.lease_grants().len();
+        let mut planned_allocator = self.docid_allocator.speculative_clone();
+        let mut selected_shards = vec![false; shard_count];
+        let mut work = Vec::new();
+        work.try_reserve_exact(active_shard_count)
+            .map_err(|_| invalid_state("could not reserve parallel ingest worker plans"))?;
+        for range in &plan.ranges {
+            let shard = planned_router.route_batch();
+            let selected = selected_shards.get_mut(shard).ok_or_else(|| {
+                invalid_state("parallel ingest planner selected an unknown shard")
+            })?;
+            if std::mem::replace(selected, true) {
+                return Err(invalid_state(
+                    "parallel ingest planner selected one shard more than once",
+                ));
+            }
+            let state = self
+                .shards
+                .get(shard)
+                .ok_or_else(|| invalid_state("parallel ingest shard state is missing"))?;
+            if state.accumulator.document_count() != 0 || !state.identities.is_empty() {
+                return Ok(None);
+            }
+            let live_lease = planned_allocator.live_lease(shard);
+            if let (Some(current), Some((live, _))) = (state.current_lease_base, live_lease)
+                && current != live
+            {
+                return Ok(None);
+            }
+            let count = range.len();
             let count_u32 = u32::try_from(count)
                 .map_err(|_| invalid_state("parallel shard document count does not fit u32"))?;
-            let allocated = self
-                .docid_allocator
+            let remaining = live_lease.map_or(DOC_ORDS_PER_LEASE, |(_, next_ord)| {
+                DOC_ORDS_PER_LEASE - next_ord
+            });
+            if count_u32 > remaining {
+                return Ok(None);
+            }
+            let allocated = planned_allocator
                 .alloc_batch(shard, count_u32)
                 .map_err(|error| invalid_state(error.to_string()))?;
             let [span] = allocated.spans() else {
@@ -3562,54 +4348,116 @@ impl QuillWriterState {
                     "parallel shard allocation unexpectedly crossed a Q1 lease",
                 ));
             };
-            let document_end = document_start
-                .checked_add(count)
-                .ok_or_else(|| invalid_state("parallel document range overflow"))?;
-            assignments[shard] = Some(ParallelShardAssignment {
-                document_start,
-                document_end,
-                span: *span,
+            work.push(ParallelShardWork {
+                shard,
+                assignment: ParallelShardAssignment {
+                    document_start: range.start,
+                    document_end: range.end,
+                    span: *span,
+                },
+                state: ScribeShardState {
+                    accumulator: ColumnarAccumulator::with_arena_chunk_size(
+                        self.schema,
+                        budget_admission.arena_chunk_bytes,
+                    )?,
+                    identities: Vec::new(),
+                    current_lease_base: Some(span.lease_base),
+                },
             });
-            self.shards[shard].current_lease_base = Some(span.lease_base);
-            document_start = document_end;
         }
-        debug_assert_eq!(document_start, documents.len());
-        self.next_lease_base = self.docid_allocator.watermark();
 
-        self.shards
-            .par_iter_mut()
-            .enumerate()
-            .try_for_each(|(shard, state)| {
-                assignments[shard].map_or(Ok(()), |assignment| {
-                    Self::accumulate_parallel_shard(state, documents, assignment)
+        let checkpoint = ParallelIngestCheckpoint::new(&self.reader);
+        let completed = work
+            .into_par_iter()
+            .map(|mut work| {
+                catch_parallel_ingest_worker(work.shard, || {
+                    Self::accumulate_parallel_shard(
+                        &mut work.state,
+                        documents,
+                        work.assignment,
+                        cx,
+                        &checkpoint,
+                    )
+                })?;
+                Ok(work)
+            })
+            .collect::<Result<Vec<_>, QuillIndexError>>()?;
+        checkpoint.check(cx)?;
+
+        let mut replacements = Vec::new();
+        replacements
+            .try_reserve_exact(shard_count)
+            .map_err(|_| invalid_state("could not reserve parallel ingest commit table"))?;
+        replacements.resize_with(shard_count, || None);
+        for completed_shard in completed {
+            let slot = replacements
+                .get_mut(completed_shard.shard)
+                .ok_or_else(|| invalid_state("parallel ingest completed an unknown shard"))?;
+            if slot.replace(completed_shard.state).is_some() {
+                return Err(invalid_state(
+                    "parallel ingest completed one shard more than once",
+                ));
+            }
+        }
+
+        let Some(arena_bytes_used_high_water) = self.shards.iter().zip(&replacements).try_fold(
+            0_usize,
+            |total, (current, replacement)| {
+                total.checked_add(replacement.as_ref().map_or_else(
+                    || current.accumulator.bytes_used(),
+                    |state| state.accumulator.bytes_used(),
+                ))
+            },
+        ) else {
+            return Err(invalid_state(
+                "parallel ingest aggregate logical accounting overflowed",
+            ));
+        };
+        if arena_bytes_used_high_water > budget_admission.projected_logical_upper_bound
+            || arena_bytes_used_high_water >= budget_admission.logical_budget_bytes
+        {
+            return Err(invalid_state(
+                "parallel ingest exceeded its pre-worker logical budget proof",
+            ));
+        }
+        let Some(speculative_reserved_bytes) =
+            replacements.iter().try_fold(0_usize, |total, replacement| {
+                replacement.as_ref().map_or(Some(total), |state| {
+                    total.checked_add(state.accumulator.bytes_reserved())
                 })
-            })?;
+            })
+        else {
+            return Err(invalid_state(
+                "parallel ingest speculative reserve accounting overflowed",
+            ));
+        };
+        let Some(arena_bytes_reserved_high_water) = budget_admission
+            .initial_reserved_bytes
+            .checked_add(speculative_reserved_bytes)
+        else {
+            return Err(invalid_state(
+                "parallel ingest aggregate reserve accounting overflowed",
+            ));
+        };
 
-        let arena_bytes_used_high_water = self.shards.iter().fold(0_usize, |total, shard| {
-            total.saturating_add(shard.accumulator.bytes_used())
-        });
-        let arena_bytes_reserved_high_water = self.shards.iter().fold(0_usize, |total, shard| {
-            total.saturating_add(shard.accumulator.bytes_reserved())
-        });
+        // This is the first mutation of writer-owned state. Every fallible
+        // validation, allocation, worker, cancellation, and panic boundary
+        // above operates only on local plans, so a failure remains exactly
+        // retryable without committing allocator, router, or shard progress.
+        planned_allocator.commit_speculative_grants(prior_grant_count);
+        self.ingest_retry_required = true;
+        for (state, replacement) in self.shards.iter_mut().zip(replacements) {
+            if let Some(replacement) = replacement {
+                *state = replacement;
+            }
+        }
+        self.shard_router = planned_router;
+        self.docid_allocator = planned_allocator;
+        self.next_lease_base = self.docid_allocator.watermark();
 
         self.uncommitted_ids
             .extend(documents.iter().map(|document| document.id.clone()));
         self.unpublished_since.get_or_insert_with(Instant::now);
-
-        if self.shards.iter().any(|shard| {
-            shard
-                .accumulator
-                .should_flush(self.config.scribe_shard_budget_bytes)
-        }) {
-            // All shards reached this point through independent accumulators. Seal
-            // their segments as one parallel generation instead of serializing the
-            // hot path on the first shard that crosses its arena budget.
-            self.flush_all_shards(cx, LifecycleTrigger::ArenaBudget)
-                .await?;
-            if allow_automatic_publication {
-                self.publish_bulk_cadence_if_due(cx).await?;
-            }
-        }
         let visibility_due = self.unpublished_since.is_some_and(|started| {
             started.elapsed() >= Duration::from_millis(self.config.max_visibility_lag_ms)
         });
@@ -3618,8 +4466,17 @@ impl QuillWriterState {
                 .await?;
         }
         Ok(Some(ParallelIngestReceipt {
+            planner_version: plan.planner_version,
+            route: plan.route,
+            configured_width: plan.configured_width,
+            verified_pool_capacity: plan.verified_pool_capacity,
+            eligible_shards: plan.eligible_shards,
             active_shards: active_shard_count,
-            worker_count,
+            logical_budget_bytes: budget_admission.logical_budget_bytes,
+            initial_logical_bytes: budget_admission.initial_logical_bytes,
+            batch_logical_upper_bound: budget_admission.batch_logical_upper_bound,
+            projected_logical_upper_bound: budget_admission.projected_logical_upper_bound,
+            arena_chunk_bytes: budget_admission.arena_chunk_bytes,
             arena_bytes_used_high_water,
             arena_bytes_reserved_high_water,
         }))
@@ -3629,7 +4486,10 @@ impl QuillWriterState {
         state: &mut ScribeShardState,
         documents: &[IndexableDocument],
         assignment: ParallelShardAssignment,
+        cx: &Cx,
+        checkpoint: &ParallelIngestCheckpoint,
     ) -> Result<(), QuillIndexError> {
+        checkpoint.check(cx)?;
         let shard_documents = documents
             .get(assignment.document_start..assignment.document_end)
             .ok_or_else(|| invalid_state("parallel shard document range is outside the batch"))?;
@@ -3646,6 +4506,7 @@ impl QuillWriterState {
             .try_reserve(shard_documents.len())
             .map_err(|_| invalid_state("could not reserve parallel shard identities"))?;
         for (offset, document) in shard_documents.iter().enumerate() {
+            checkpoint.check(cx)?;
             let offset = u32::try_from(offset)
                 .map_err(|_| invalid_state("parallel shard offset does not fit u32"))?;
             let doc_ord = assignment
@@ -3687,6 +4548,7 @@ impl QuillWriterState {
         documents: &[IndexableDocument],
         replacement_ids: &BTreeSet<&str>,
         allow_automatic_publication: bool,
+        parallelism_policy: IngestParallelismPolicy,
     ) -> Result<(), QuillIndexError> {
         let ingest_span = tracing::info_span!(
             target: crate::tracing_conventions::TARGET,
@@ -3694,8 +4556,17 @@ impl QuillWriterState {
             phase = "ingest",
             doc_count = documents.len(),
             result_count = tracing::field::Empty,
+            parallel_planner_version = tracing::field::Empty,
+            parallel_route = tracing::field::Empty,
+            parallel_configured_width = tracing::field::Empty,
+            parallel_verified_pool_capacity = tracing::field::Empty,
+            parallel_eligible_shards = tracing::field::Empty,
             parallel_active_shards = tracing::field::Empty,
-            parallel_worker_count = tracing::field::Empty,
+            parallel_logical_budget_bytes = tracing::field::Empty,
+            parallel_initial_logical_bytes = tracing::field::Empty,
+            parallel_batch_logical_upper_bound = tracing::field::Empty,
+            parallel_projected_logical_upper_bound = tracing::field::Empty,
+            parallel_arena_chunk_bytes = tracing::field::Empty,
             arena_bytes_used_high_water = tracing::field::Empty,
             arena_bytes_reserved_high_water = tracing::field::Empty,
             duration_us = tracing::field::Empty,
@@ -3726,30 +4597,79 @@ impl QuillWriterState {
             if documents.is_empty() {
                 return Ok(());
             }
-            // Arm the fail-closed retry guard before allocation or mutation.
-            // Only the successful return below (or a successful commit)
-            // disarms it.
-            self.ingest_retry_required = true;
-            if let Some(receipt) = self
-                .try_index_documents_parallel(
-                    cx,
-                    documents,
-                    replacement_ids,
-                    allow_automatic_publication,
-                )
-                .await?
-            {
+            let parallel_receipt = match parallelism_policy {
+                IngestParallelismPolicy::Adaptive => {
+                    if let Some(receipt) = self
+                        .try_index_documents_internal_parallel(
+                            cx,
+                            documents,
+                            replacement_ids,
+                            allow_automatic_publication,
+                        )
+                        .await?
+                    {
+                        Some(receipt)
+                    } else {
+                        self.try_index_documents_parallel(
+                            cx,
+                            documents,
+                            replacement_ids,
+                            allow_automatic_publication,
+                        )
+                        .await?
+                    }
+                }
+                #[cfg(feature = "pruning-conformance")]
+                IngestParallelismPolicy::ScalarTopologyConformance => {
+                    ingest_span.record("parallel_route", "scalar_topology_conformance");
+                    None
+                }
+            };
+            if let Some(receipt) = parallel_receipt {
                 ingest_span.record(
                     "result_count",
                     u64::try_from(documents.len()).unwrap_or(u64::MAX),
+                );
+                ingest_span.record(
+                    "parallel_planner_version",
+                    u64::from(receipt.planner_version),
+                );
+                ingest_span.record("parallel_route", receipt.route.as_str());
+                ingest_span.record(
+                    "parallel_configured_width",
+                    u64::try_from(receipt.configured_width).unwrap_or(u64::MAX),
+                );
+                ingest_span.record(
+                    "parallel_verified_pool_capacity",
+                    u64::try_from(receipt.verified_pool_capacity).unwrap_or(u64::MAX),
+                );
+                ingest_span.record(
+                    "parallel_eligible_shards",
+                    u64::try_from(receipt.eligible_shards).unwrap_or(u64::MAX),
                 );
                 ingest_span.record(
                     "parallel_active_shards",
                     u64::try_from(receipt.active_shards).unwrap_or(u64::MAX),
                 );
                 ingest_span.record(
-                    "parallel_worker_count",
-                    u64::try_from(receipt.worker_count).unwrap_or(u64::MAX),
+                    "parallel_logical_budget_bytes",
+                    u64::try_from(receipt.logical_budget_bytes).unwrap_or(u64::MAX),
+                );
+                ingest_span.record(
+                    "parallel_initial_logical_bytes",
+                    u64::try_from(receipt.initial_logical_bytes).unwrap_or(u64::MAX),
+                );
+                ingest_span.record(
+                    "parallel_batch_logical_upper_bound",
+                    u64::try_from(receipt.batch_logical_upper_bound).unwrap_or(u64::MAX),
+                );
+                ingest_span.record(
+                    "parallel_projected_logical_upper_bound",
+                    u64::try_from(receipt.projected_logical_upper_bound).unwrap_or(u64::MAX),
+                );
+                ingest_span.record(
+                    "parallel_arena_chunk_bytes",
+                    u64::try_from(receipt.arena_chunk_bytes).unwrap_or(u64::MAX),
                 );
                 ingest_span.record(
                     "arena_bytes_used_high_water",
@@ -3762,6 +4682,10 @@ impl QuillWriterState {
                 self.ingest_retry_required = false;
                 return Ok(());
             }
+            // The parallel route arms this guard only at its transactional
+            // commit boundary. The serial route still mutates the live router
+            // and allocator directly, so arm it immediately before doing so.
+            self.ingest_retry_required = true;
             let shard_id = self.shard_router.route_batch();
             let document_count = u32::try_from(documents.len())
                 .map_err(|_| invalid_state("ingest batch document count does not fit u32"))?;
@@ -4353,8 +5277,14 @@ impl QuillWriterState {
         }
 
         self.pending_replacement_manifest = Some(manifest);
-        self.index_documents_with_replacements(cx, documents, &replacement_ids, false)
-            .await?;
+        self.index_documents_with_replacements(
+            cx,
+            documents,
+            &replacement_ids,
+            false,
+            IngestParallelismPolicy::Adaptive,
+        )
+        .await?;
         self.flush_all_shards(cx, LifecycleTrigger::ExplicitFlush)
             .await?;
         self.prepare_pending_manifest()?;
@@ -4876,6 +5806,21 @@ impl QuillWriterState {
         created_unix_s: i64,
         reserved_segment_ids: &BTreeSet<u64>,
     ) -> Result<u64, QuillIndexError> {
+        self.derive_segment_id_for_state_avoiding(
+            &self.shards[shard],
+            lease_base,
+            created_unix_s,
+            reserved_segment_ids,
+        )
+    }
+
+    fn derive_segment_id_for_state_avoiding(
+        &self,
+        state: &ScribeShardState,
+        lease_base: u64,
+        created_unix_s: i64,
+        reserved_segment_ids: &BTreeSet<u64>,
+    ) -> Result<u64, QuillIndexError> {
         let generation = self
             .backend
             .snapshot()
@@ -4886,7 +5831,7 @@ impl QuillWriterState {
             .ok_or_else(|| invalid_state("manifest generation exhausted"))?;
         let schema_id = self.schema.schema_id()?;
         let mut batch_hasher = Xxh3::new();
-        for identity in &self.shards[shard].identities {
+        for identity in &state.identities {
             batch_hasher.update(&identity.content_hash.to_le_bytes());
         }
         let batch_digest = batch_hasher.digest();
@@ -4973,16 +5918,20 @@ impl QuillWriterState {
 }
 
 impl QuillReader {
+    #[cfg(not(feature = "conformance-internals"))]
+    #[inline]
+    #[allow(
+        clippy::unused_self,
+        reason = "keeps cache call sites cfg-symmetric with the controller-backed variant"
+    )]
+    fn ranked_query_cache_enabled(&self) -> bool {
+        true
+    }
+
+    #[cfg(feature = "conformance-internals")]
     #[inline]
     fn ranked_query_cache_enabled(&self) -> bool {
-        #[cfg(feature = "conformance-internals")]
-        {
-            !self.conformance_controller.is_armed()
-        }
-        #[cfg(not(feature = "conformance-internals"))]
-        {
-            true
-        }
+        !self.conformance_controller.is_armed()
     }
 
     #[cfg(not(feature = "conformance-internals"))]
@@ -5116,6 +6065,8 @@ impl QuillReader {
             target: crate::tracing_conventions::TARGET,
             crate::tracing_conventions::ARGUS_QUERY,
             phase = "query",
+            query_form = "raw",
+            cache_lookup = tracing::field::Empty,
             query_len = query.len(),
             segment_count,
             doc_count = snapshot.live_doc_count(),
@@ -5128,27 +6079,34 @@ impl QuillReader {
         );
         let _query_timer = crate::tracing_conventions::StageTimer::new(&query_span);
         let _query_entered = query_span.enter();
-        check_cancel(cx, "search")?;
+        if let Err(error) = check_cancel(cx, "search") {
+            query_span.record("cache_lookup", "not_checked");
+            return Err(error);
+        }
         let cache_enabled = self.ranked_query_cache_enabled();
         #[cfg(feature = "pruning-conformance")]
         let cache_enabled = cache_enabled && pruning_trace.is_none();
-        if cache_enabled
-            && let Some(result) = self.published_snapshot.ranked_query_cache.get_raw(
+        if cache_enabled {
+            if let Some(result) = self.published_snapshot.ranked_query_cache.get_raw(
                 snapshot.snapshot_epoch(),
                 query,
                 limit,
                 offset,
                 exact_count,
-            )
-        {
-            query_span.record(
-                "result_count",
-                u64::try_from(result.hits.len()).unwrap_or(u64::MAX),
-            );
-            if let Some(total_count) = result.total_count {
-                query_span.record("total_count", total_count);
+            ) {
+                query_span.record("cache_lookup", "hit");
+                query_span.record(
+                    "result_count",
+                    u64::try_from(result.hits.len()).unwrap_or(u64::MAX),
+                );
+                if let Some(total_count) = result.total_count {
+                    query_span.record("total_count", total_count);
+                }
+                return Ok(result);
             }
-            return Ok(result);
+            query_span.record("cache_lookup", "miss");
+        } else {
+            query_span.record("cache_lookup", "disabled");
         }
         let parsed = {
             let parse_span = tracing::info_span!(
@@ -5358,19 +6316,55 @@ impl QuillReader {
         offset: usize,
         exact_count: bool,
     ) -> Result<QuillSearchResult, QuillIndexError> {
-        check_cancel(cx, "search_preparsed")?;
         let published = self.published_snapshot.load();
+        let keeper = published.keeper_snapshot();
+        let segment_count = keeper
+            .segments()
+            .len()
+            .saturating_add(published.delta_count());
+        let query_span = tracing::info_span!(
+            target: crate::tracing_conventions::TARGET,
+            crate::tracing_conventions::ARGUS_QUERY,
+            phase = "query",
+            query_form = "preparsed",
+            cache_lookup = tracing::field::Empty,
+            segment_count,
+            doc_count = published.live_doc_count(),
+            limit,
+            offset,
+            exact_count,
+            result_count = tracing::field::Empty,
+            total_count = tracing::field::Empty,
+            duration_us = tracing::field::Empty,
+        );
+        let _query_timer = crate::tracing_conventions::StageTimer::new(&query_span);
+        let _query_entered = query_span.enter();
+        if let Err(error) = check_cancel(cx, "search_preparsed") {
+            query_span.record("cache_lookup", "not_checked");
+            return Err(error);
+        }
         let cache_enabled = self.ranked_query_cache_enabled();
-        if cache_enabled
-            && let Some(result) = self.published_snapshot.ranked_query_cache.get_preparsed(
+        if cache_enabled {
+            if let Some(result) = self.published_snapshot.ranked_query_cache.get_preparsed(
                 published.snapshot_epoch(),
                 query,
                 limit,
                 offset,
                 exact_count,
-            )
-        {
-            return Ok(result);
+            ) {
+                query_span.record("cache_lookup", "hit");
+                query_span.record(
+                    "result_count",
+                    u64::try_from(result.hits.len()).unwrap_or(u64::MAX),
+                );
+                if let Some(total_count) = result.total_count {
+                    query_span.record("total_count", total_count);
+                }
+                return Ok(result);
+            }
+            query_span.record("cache_lookup", "miss");
+        } else {
+            query_span.record("cache_lookup", "disabled");
         }
         let mut canonical = query.clone();
         let _canonicalization = canonicalize_query(&mut canonical);
@@ -5383,6 +6377,13 @@ impl QuillReader {
             exact_count,
             Vec::new(),
         )?;
+        query_span.record(
+            "result_count",
+            u64::try_from(result.hits.len()).unwrap_or(u64::MAX),
+        );
+        if let Some(total_count) = result.total_count {
+            query_span.record("total_count", total_count);
+        }
         if cache_enabled {
             self.published_snapshot.ranked_query_cache.insert_preparsed(
                 published.snapshot_epoch(),
@@ -6691,6 +7692,37 @@ impl QuillIndex {
     ) -> Result<(), QuillIndexError> {
         let mut writer = self.lock_writer(cx, "index writer lock").await?;
         writer.index_documents(cx, documents).await
+    }
+
+    /// Accumulate one bounded batch through the scalar writer without
+    /// parallel-planner fanout for a conformance fixture.
+    ///
+    /// This proof-only seam does not alter shipping ingest: ordinary
+    /// [`Self::index_documents`] keeps its adaptive shared-nothing and
+    /// fixed-width internal fanout. The resulting leaf uses the same scalar
+    /// accumulator, segment encoding, commit path, and query execution as a
+    /// production scalar write; only ingest parallelization is suppressed.
+    /// Scalar lease, arena-budget, visibility-publication, and tier-merge
+    /// rules remain live, so callers must validate the realized leaf geometry
+    /// before treating it as proof evidence.
+    ///
+    /// # Errors
+    ///
+    /// Returns typed cancellation, writer-lock, duplicate-ID, accumulation,
+    /// flush, or publication failures.
+    #[cfg(feature = "pruning-conformance")]
+    #[doc(hidden)]
+    pub async fn index_documents_with_scalar_topology_conformance(
+        &self,
+        cx: &Cx,
+        documents: &[IndexableDocument],
+    ) -> Result<(), QuillIndexError> {
+        let mut writer = self
+            .lock_writer(cx, "scalar topology conformance writer lock")
+            .await?;
+        writer
+            .index_documents_with_scalar_topology_conformance(cx, documents)
+            .await
     }
 
     /// Seal pending writes and atomically publish the next MANIFEST.
@@ -9761,22 +10793,16 @@ fn open_owned_cursor(
             count: posting_count,
         }
     })?;
-    let mut posting_cursor = postings.cursor()?;
-    let mut admitted_block = None;
-    while let Some(posting) = posting_cursor.current() {
-        let block = posting_cursor
-            .block_index()
-            .ok_or_else(|| invalid_state("positioned posting cursor has no block index"))?;
-        if admitted_block != Some(block) {
-            if let Some(checkpoint) = checkpoint {
+    let positions = if positioned {
+        // Preserve the historical fuel/cancellation boundary: every validated
+        // POSTINGS block is admitted before POSITIONS parsing begins. The
+        // subsequent paired cursor traverses those same blocks without
+        // charging them a second time.
+        if let Some(checkpoint) = checkpoint {
+            for _ in postings.blocks() {
                 checkpoint.admit(QueryWorkKind::PostingBlock, 1)?;
             }
-            admitted_block = Some(block);
         }
-        rows.push(posting);
-        posting_cursor.next()?;
-    }
-    let positions = if positioned {
         let position_span =
             found
                 .metadata
@@ -9789,16 +10815,62 @@ fn open_owned_cursor(
         let positions = PositionList::parse(position_bytes, &postings)?;
         let mut decoded = Vec::new();
         decoded
-            .try_reserve_exact(rows.len())
+            .try_reserve_exact(posting_count)
             .map_err(|_| invalid_state("could not allocate owned position rows"))?;
-        for ordinal in 0..found.metadata.doc_freq {
-            let row = positions
-                .positions_for_ordinal(ordinal)?
-                .collect::<Result<Vec<_>, _>>()?;
+
+        // Phrase lowering needs owned position rows, but ordinal-at-a-time
+        // lookup restarts at the beginning of each POSITIONS block. Traverse
+        // the paired posting/position streams once so every run is decoded
+        // exactly once before the cursor advances to the next posting.
+        let mut position_cursor = positions.cursor()?;
+        while let Some(posting) = position_cursor.current() {
+            let mut row = Vec::new();
+            if !position_cursor.decode_current_positions_into(&mut row)? {
+                return Err(invalid_state(
+                    "position cursor exhausted before its current posting",
+                ));
+            }
+            let frequency = usize::try_from(posting.freq)
+                .map_err(|_| invalid_state("posting frequency does not fit usize"))?;
+            if row.len() != frequency {
+                return Err(invalid_state(format!(
+                    "position run length {} does not match posting frequency {frequency}",
+                    row.len(),
+                )));
+            }
+            rows.push(posting);
             decoded.push(row);
+            position_cursor.next()?;
+        }
+        if rows.len() != posting_count {
+            return Err(invalid_state(format!(
+                "position cursor materialized {} of {posting_count} postings",
+                rows.len(),
+            )));
         }
         Some(decoded)
     } else {
+        let mut posting_cursor = postings.cursor()?;
+        let mut admitted_block = None;
+        while let Some(posting) = posting_cursor.current() {
+            let block = posting_cursor
+                .block_index()
+                .ok_or_else(|| invalid_state("posting cursor has no block index"))?;
+            if admitted_block != Some(block) {
+                if let Some(checkpoint) = checkpoint {
+                    checkpoint.admit(QueryWorkKind::PostingBlock, 1)?;
+                }
+                admitted_block = Some(block);
+            }
+            rows.push(posting);
+            posting_cursor.next()?;
+        }
+        if rows.len() != posting_count {
+            return Err(invalid_state(format!(
+                "posting cursor materialized {} of {posting_count} postings",
+                rows.len(),
+            )));
+        }
         None
     };
     Ok(OwnedPostingCursor {
@@ -9884,7 +10956,11 @@ fn term_field_ords(schema: SchemaDescriptor) -> Vec<u16> {
 mod tests {
     use std::collections::BTreeMap;
     use std::future::Future;
+    #[cfg(all(feature = "bench-internals", feature = "conformance-internals"))]
+    use std::io::{self, Write};
     use std::sync::Arc;
+    #[cfg(all(feature = "bench-internals", feature = "conformance-internals"))]
+    use std::sync::Mutex as StdMutex;
     use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
     use std::task::{Context, Poll, Waker};
 
@@ -10172,6 +11248,51 @@ mod tests {
         name: "qg-positionless-typed-capability-test",
         fields: &POSITIONLESS_QG_FIELDS,
     };
+    const MIXED_BUDGET_FIELDS: [FieldDescriptor; 5] = [
+        FieldDescriptor {
+            id: 0,
+            name: "id",
+            kind: FieldKind::Keyword,
+            stored: true,
+        },
+        FieldDescriptor {
+            id: 1,
+            name: "content",
+            kind: FieldKind::Text {
+                analyzer: Analyzer::FrankensearchDefault,
+                positions: true,
+            },
+            stored: true,
+        },
+        FieldDescriptor {
+            id: 2,
+            name: "title",
+            kind: FieldKind::Text {
+                analyzer: Analyzer::FrankensearchDefault,
+                positions: false,
+            },
+            stored: true,
+        },
+        FieldDescriptor {
+            id: 3,
+            name: "metadata_json",
+            kind: FieldKind::StoredOnly,
+            stored: true,
+        },
+        FieldDescriptor {
+            id: 4,
+            name: "ord",
+            kind: FieldKind::U64 {
+                indexed: false,
+                fast: true,
+            },
+            stored: true,
+        },
+    ];
+    const MIXED_BUDGET_SCHEMA: SchemaDescriptor = SchemaDescriptor {
+        name: "parallel-budget-mixed-positions-test",
+        fields: &MIXED_BUDGET_FIELDS,
+    };
     #[cfg(feature = "bench-internals")]
     const POSITIONED_QG_FIELDS: [FieldDescriptor; 5] = [
         FieldDescriptor {
@@ -10314,6 +11435,118 @@ mod tests {
         }
     }
 
+    #[cfg(all(feature = "bench-internals", feature = "conformance-internals"))]
+    #[derive(Clone, Debug)]
+    struct RankedCacheTraceWriter {
+        buffer: Arc<StdMutex<Vec<u8>>>,
+    }
+
+    #[cfg(all(feature = "bench-internals", feature = "conformance-internals"))]
+    impl Write for RankedCacheTraceWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.buffer
+                .lock()
+                .expect("ranked-cache trace buffer lock is not poisoned")
+                .extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[cfg(all(feature = "bench-internals", feature = "conformance-internals"))]
+    fn trace_text_field<'a>(line: &'a str, field: &str) -> Option<&'a str> {
+        let prefix = format!("{field}=");
+        let start = line.find(&prefix)?.saturating_add(prefix.len());
+        let value = line.get(start..)?;
+        if let Some(quoted) = value.strip_prefix('"') {
+            return quoted.split_once('"').map(|(field_value, _)| field_value);
+        }
+        let end = value
+            .find(|ch: char| ch.is_ascii_whitespace() || matches!(ch, ',' | '}'))
+            .unwrap_or(value.len());
+        value.get(..end)
+    }
+
+    #[cfg(all(feature = "bench-internals", feature = "conformance-internals"))]
+    fn is_trace_stage_close(line: &str, stage: &str) -> bool {
+        if !line.contains(": close") {
+            return false;
+        }
+        let Some(stage_position) = line.rfind(stage) else {
+            return false;
+        };
+        crate::tracing_conventions::ALL_SPAN_NAMES
+            .iter()
+            .filter_map(|candidate| line.rfind(candidate))
+            .all(|candidate_position| candidate_position <= stage_position)
+    }
+
+    #[cfg(all(feature = "bench-internals", feature = "conformance-internals"))]
+    fn assert_ranked_cache_trace_case(
+        logs: &str,
+        trace_case: &str,
+        query_form: &str,
+        cache_lookup: &str,
+        expected_children: &[&str],
+    ) {
+        let case_lines = logs
+            .lines()
+            .filter(|line| trace_text_field(line, "trace_case") == Some(trace_case))
+            .collect::<Vec<_>>();
+        assert!(
+            !case_lines.is_empty(),
+            "missing trace case {trace_case}: {logs}"
+        );
+        let query = case_lines
+            .iter()
+            .copied()
+            .find(|line| is_trace_stage_close(line, crate::tracing_conventions::ARGUS_QUERY))
+            .expect("ranked-cache trace case must contain one ARGUS_QUERY close");
+        assert_eq!(
+            trace_text_field(query, "query_form"),
+            Some(query_form),
+            "trace case {trace_case} reported the wrong query form: {query}",
+        );
+        assert_eq!(
+            trace_text_field(query, "cache_lookup"),
+            Some(cache_lookup),
+            "trace case {trace_case} reported the wrong cache disposition: {query}",
+        );
+        assert!(
+            query.contains("duration_us="),
+            "trace case {trace_case} omitted query timing: {query}",
+        );
+        if cache_lookup == "not_checked" {
+            assert!(
+                !query.contains("result_count=") && !query.contains("total_count="),
+                "pre-cancelled trace case {trace_case} fabricated result evidence: {query}",
+            );
+        } else {
+            assert!(
+                query.contains("result_count=") && query.contains("total_count="),
+                "successful exact-count trace case {trace_case} omitted result evidence: {query}",
+            );
+        }
+
+        for stage in [
+            crate::tracing_conventions::ARGUS_PARSE,
+            crate::tracing_conventions::ARGUS_SCORE,
+            crate::tracing_conventions::ARGUS_COLLECT,
+        ] {
+            let observed = case_lines
+                .iter()
+                .any(|line| is_trace_stage_close(line, stage));
+            assert_eq!(
+                observed,
+                expected_children.contains(&stage),
+                "trace case {trace_case} child-stage mismatch for {stage}: {logs}",
+            );
+        }
+    }
+
     #[test]
     fn ranked_query_cache_requires_an_exact_key_and_snapshot_epoch() {
         let cache = RankedQueryCache::default();
@@ -10365,6 +11598,134 @@ mod tests {
                     true,
                 )
                 .is_none()
+        );
+    }
+
+    #[cfg(all(feature = "bench-internals", feature = "conformance-internals"))]
+    #[test]
+    fn ranked_query_cache_trace_contract_covers_every_lookup_disposition() {
+        let trace_buffer = Arc::new(StdMutex::new(Vec::<u8>::new()));
+        let writer_buffer = Arc::clone(&trace_buffer);
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_env_filter("off,frankensearch.quill=info")
+            .with_span_events(tracing_subscriber::fmt::format::FmtSpan::CLOSE)
+            .with_writer(move || RankedCacheTraceWriter {
+                buffer: Arc::clone(&writer_buffer),
+            })
+            .finish();
+
+        tracing::subscriber::with_default(subscriber, || {
+            run_with_cx(|cx| async move {
+                let index = QuillIndex::in_memory(deterministic_config())
+                    .expect("ranked-cache trace index");
+                index
+                    .index_document(&cx, &IndexableDocument::new("doc-1", "alpha beta"))
+                    .await
+                    .expect("index ranked-cache trace document");
+                index
+                    .commit(&cx)
+                    .await
+                    .expect("commit ranked-cache trace index");
+                let query = Query::Term {
+                    fields: vec![QueryField::new(1, 1.0)],
+                    text: "alpha".to_owned(),
+                };
+
+                let run_raw = |trace_case: &'static str, request_cx: &Cx| {
+                    let span = tracing::info_span!(
+                        target: crate::tracing_conventions::TARGET,
+                        "ranked_cache_trace_case",
+                        trace_case,
+                    );
+                    let _entered = span.enter();
+                    index.search_paginated(request_cx, "alpha", 10, 0, true)
+                };
+                let run_preparsed = |trace_case: &'static str, request_cx: &Cx| {
+                    let span = tracing::info_span!(
+                        target: crate::tracing_conventions::TARGET,
+                        "ranked_cache_trace_case",
+                        trace_case,
+                    );
+                    let _entered = span.enter();
+                    index.search_preparsed_paginated(request_cx, &query, 10, 0, true)
+                };
+
+                run_raw("raw-miss", &cx).expect("raw cache miss executes");
+                run_raw("raw-hit", &cx).expect("raw cache hit returns");
+                run_preparsed("preparsed-miss", &cx).expect("preparsed cache miss executes");
+                run_preparsed("preparsed-hit", &cx).expect("preparsed cache hit returns");
+
+                let controller = index.conformance_cancellation_controller();
+                controller
+                    .arm(ConformanceCancellationStage::CommitPublication, 1)
+                    .expect("arm unrelated conformance stage to disable the cache");
+                run_raw("raw-disabled", &cx).expect("disabled raw cache executes");
+                run_preparsed("preparsed-disabled", &cx)
+                    .expect("disabled preparsed cache executes");
+                assert_eq!(controller.observed_checkpoints(), 0);
+                assert!(!controller.fired());
+                controller.disarm();
+
+                let cancelled = cx.clone();
+                cancelled.set_cancel_requested(true);
+                assert!(matches!(
+                    run_raw("raw-not-checked", &cancelled),
+                    Err(QuillIndexError::Cancelled { phase }) if phase == "search"
+                ));
+                assert!(matches!(
+                    run_preparsed("preparsed-not-checked", &cancelled),
+                    Err(QuillIndexError::Cancelled { phase }) if phase == "search_preparsed"
+                ));
+            });
+        });
+
+        let logs = String::from_utf8(
+            trace_buffer
+                .lock()
+                .expect("ranked-cache trace buffer lock is not poisoned")
+                .clone(),
+        )
+        .expect("ranked-cache trace output is UTF-8");
+        let raw_children = [
+            crate::tracing_conventions::ARGUS_PARSE,
+            crate::tracing_conventions::ARGUS_SCORE,
+            crate::tracing_conventions::ARGUS_COLLECT,
+        ];
+        let preparsed_children = [
+            crate::tracing_conventions::ARGUS_SCORE,
+            crate::tracing_conventions::ARGUS_COLLECT,
+        ];
+        assert_ranked_cache_trace_case(&logs, "raw-miss", "raw", "miss", &raw_children);
+        assert_ranked_cache_trace_case(&logs, "raw-hit", "raw", "hit", &[]);
+        assert_ranked_cache_trace_case(
+            &logs,
+            "preparsed-miss",
+            "preparsed",
+            "miss",
+            &preparsed_children,
+        );
+        assert_ranked_cache_trace_case(&logs, "preparsed-hit", "preparsed", "hit", &[]);
+        assert_ranked_cache_trace_case(&logs, "raw-disabled", "raw", "disabled", &raw_children);
+        assert_ranked_cache_trace_case(
+            &logs,
+            "preparsed-disabled",
+            "preparsed",
+            "disabled",
+            &preparsed_children,
+        );
+        assert_ranked_cache_trace_case(&logs, "raw-not-checked", "raw", "not_checked", &[]);
+        assert_ranked_cache_trace_case(
+            &logs,
+            "preparsed-not-checked",
+            "preparsed",
+            "not_checked",
+            &[],
+        );
+        assert!(
+            !logs.contains("cache_key=") && !logs.contains("cache_fingerprint="),
+            "ranked-cache traces leaked a high-cardinality cache identity: {logs}",
         );
     }
 
@@ -15564,10 +16925,12 @@ mod tests {
                         .with_title(title),
                 );
             }
-            mixed
-                .index_documents(&cx, &sealed_documents)
-                .await
-                .expect("accumulate large sealed fixture");
+            for batch in sealed_documents.chunks(PARALLEL_INGEST_MIN_DOCS_PER_SHARD - 1) {
+                mixed
+                    .index_documents(&cx, batch)
+                    .await
+                    .expect("accumulate monolithic sealed fixture");
+            }
             mixed.commit(&cx).await.expect("seal large fixture");
             let keeper = mixed.snapshot();
             let sealed_snapshot = QuillSearchSnapshot::compose(0, Arc::clone(&keeper), Vec::new())
@@ -17103,6 +18466,139 @@ mod tests {
     }
 
     #[test]
+    fn owned_phrase_cursor_streams_positions_across_independent_block_seams() {
+        run_with_cx(|cx| async move {
+            const DOCUMENT_COUNT: usize = 270;
+            const TERM_FREQUENCY: usize = 24;
+
+            let content = std::iter::repeat_n("anchor", TERM_FREQUENCY)
+                .collect::<Vec<_>>()
+                .join(" ");
+            let documents = (0..DOCUMENT_COUNT)
+                .map(|ordinal| {
+                    IndexableDocument::new(format!("phrase-seam-{ordinal:03}"), content.clone())
+                })
+                .collect::<Vec<_>>();
+            let index = QuillIndex::in_memory(QuillConfig {
+                deterministic_ingest: true,
+                max_ingest_shards: 1,
+                ..QuillConfig::default()
+            })
+            .expect("construct phrase-seam index");
+            // Seed the deterministic accumulator below the internal bulk-parallel
+            // threshold. The following call must then stay on the scalar wrapper
+            // route, giving this cursor test one segment without coupling its
+            // seam oracle to the independent four-segment bulk-ingest policy.
+            index
+                .index_documents(&cx, &documents[..1])
+                .await
+                .expect("seed phrase-seam corpus");
+            index
+                .index_documents(&cx, &documents[1..])
+                .await
+                .expect("index remaining phrase-seam corpus");
+            index.commit(&cx).await.expect("commit phrase-seam corpus");
+
+            let snapshot = index.snapshot();
+            assert_eq!(snapshot.segments().len(), 1);
+            let segment = &snapshot.segments()[0];
+            let dictionary =
+                open_dictionary(segment, DEFAULT_SCHEMA).expect("open phrase-seam term dictionary");
+            let found = dictionary
+                .lookup(CONTENT_FIELD, b"anchor")
+                .expect("look up phrase-seam term")
+                .expect("phrase-seam term is present");
+            assert_eq!(
+                usize::try_from(found.metadata.doc_freq).expect("document frequency fits usize"),
+                DOCUMENT_COUNT,
+            );
+
+            let postings_section =
+                required_section(segment, SectionKind::POSTINGS).expect("POSTINGS section");
+            let postings_bytes = span(
+                postings_section,
+                found.metadata.postings,
+                "phrase-seam POSTINGS",
+            )
+            .expect("slice phrase-seam postings");
+            let postings = PostingList::parse(postings_bytes, found.metadata.doc_freq)
+                .expect("parse phrase-seam postings");
+            let position_span = found.metadata.positions.expect("positioned anchor term");
+            let position_section =
+                required_section(segment, SectionKind::POSITIONS).expect("POSITIONS section");
+            let position_bytes = span(position_section, position_span, "phrase-seam POSITIONS")
+                .expect("slice phrase-seam positions");
+            let position_list = PositionList::parse(position_bytes, &postings)
+                .expect("parse phrase-seam positions");
+            assert!(postings.blocks().len() >= 2, "fixture needs posting seams");
+            assert!(
+                position_list.block_count() >= 2,
+                "fixture needs position seams"
+            );
+            assert_ne!(
+                postings.blocks()[1].base_posting_ordinal,
+                position_list.blocks()[1].base_posting_ordinal(),
+                "the first posting and position seams must be independent",
+            );
+            let legacy_position_rows = (0..found.metadata.doc_freq)
+                .map(|ordinal| {
+                    position_list
+                        .positions_for_ordinal(ordinal)?
+                        .collect::<Result<Vec<_>, _>>()
+                })
+                .collect::<Result<Vec<_>, PositionCodecError>>()
+                .expect("materialize legacy ordinal position rows");
+
+            crate::quiver::reset_position_run_work_for_test();
+            PositionList::parse(position_bytes, &postings)
+                .expect("measure the mandatory position-validation pass");
+            let (validation_decodes, validation_consumes) =
+                crate::quiver::position_run_work_for_test();
+            assert_eq!(validation_decodes, 0);
+            assert_eq!(validation_consumes, DOCUMENT_COUNT);
+
+            crate::quiver::reset_position_run_work_for_test();
+            let owned = open_owned_cursor(
+                segment,
+                DEFAULT_SCHEMA,
+                CONTENT_FIELD,
+                b"anchor",
+                true,
+                None,
+            )
+            .expect("materialize production phrase cursor");
+            let (owned_decodes, scan_consumes) = crate::quiver::position_run_work_for_test();
+            assert_eq!(owned_decodes, DOCUMENT_COUNT);
+            assert_eq!(
+                scan_consumes, validation_consumes,
+                "materialization may validate each run once but must not rescan preceding rows",
+            );
+            assert_eq!(owned.postings.len(), DOCUMENT_COUNT);
+            let position_rows = owned.positions.expect("owned position rows");
+            assert_eq!(position_rows.len(), DOCUMENT_COUNT);
+            assert_eq!(position_rows, legacy_position_rows);
+            let expected_frequency =
+                u32::try_from(TERM_FREQUENCY).expect("term frequency fits u32");
+            let expected_positions = (0..expected_frequency).collect::<Vec<_>>();
+            for (ordinal, (posting, positions)) in
+                owned.postings.iter().zip(&position_rows).enumerate()
+            {
+                assert_eq!(posting.freq, expected_frequency);
+                assert_eq!(positions, &expected_positions, "posting ordinal {ordinal}");
+            }
+
+            let phrase = index
+                .search_paginated(&cx, "\"anchor anchor\"", DOCUMENT_COUNT, 0, true)
+                .expect("execute checkpointed phrase query across both seam families");
+            assert_eq!(
+                phrase.total_count,
+                Some(u64::try_from(DOCUMENT_COUNT).expect("document count fits u64")),
+            );
+            assert_eq!(phrase.hits.len(), DOCUMENT_COUNT);
+        });
+    }
+
+    #[test]
     fn scalar_memory_commit_is_visibility_boundary_and_queries_end_to_end() {
         run_with_cx(|cx| async move {
             let index = QuillIndex::in_memory(deterministic_config()).expect("memory index");
@@ -17199,6 +18695,725 @@ mod tests {
         });
     }
 
+    fn parallel_budget_fixture_documents(count: usize) -> Vec<IndexableDocument> {
+        (0..count)
+            .map(|ordinal| {
+                IndexableDocument::new(
+                    format!("parallel-budget-{ordinal:05}"),
+                    format!("shared budget token group-{}", ordinal % 17),
+                )
+                .with_title(format!("budget title {}", ordinal % 5))
+                .with_metadata("ordinal", ordinal.to_string())
+            })
+            .collect()
+    }
+
+    fn assert_parallel_budget_bound_for_schema(schema: SchemaDescriptor) {
+        let exact_maximum = "X".repeat(MAX_TERM_BYTES);
+        let dropped_oversized = "Y".repeat(MAX_TERM_BYTES + 1);
+        let mut documents = vec![
+            IndexableDocument::new("bound-0", "alpha alpha İSTANBUL 東京")
+                .with_title("Repeated REPEATED")
+                .with_metadata("escaped", "line\nquote\"nul\0"),
+            IndexableDocument::new("bound-1", format!("{exact_maximum} {dropped_oversized}"))
+                .with_title("z-z-z"),
+            IndexableDocument::new(exact_maximum.clone(), "keyword boundary admitted"),
+            IndexableDocument::new(dropped_oversized.clone(), "keyword boundary dropped"),
+        ];
+        documents.extend((0..32).map(|ordinal| {
+            IndexableDocument::new(
+                format!("bound-random-{ordinal:02}"),
+                format!(
+                    "{} {} shared-{} Ω{}",
+                    "unique".repeat(ordinal % 7 + 1),
+                    "repeat ".repeat(ordinal % 5 + 1),
+                    ordinal % 3,
+                    ordinal
+                ),
+            )
+            .with_title(format!("title-{}", ordinal % 4))
+            .with_metadata("bucket", format!("{}\n{}", ordinal % 9, ordinal))
+        }));
+
+        let mut accumulator = ColumnarAccumulator::new(schema).expect("budget-bound accumulator");
+        let mut analyzer = FrankensearchTokenizer::default();
+        let mut cumulative_upper_bound = accumulator.bytes_used();
+        for (ordinal, document) in documents.iter().enumerate() {
+            let document_bound =
+                parallel_document_logical_upper_bound(schema, &mut analyzer, document, usize::MAX)
+                    .expect("estimate budget-bound document")
+                    .expect("shipping-shaped schema has a bound");
+            let ParallelDocumentBudgetBound::Within(document_upper_bound) = document_bound else {
+                panic!("unbounded fixture must not reach the rejection ceiling");
+            };
+            cumulative_upper_bound = cumulative_upper_bound
+                .checked_add(document_upper_bound)
+                .expect("fixture upper bound fits usize");
+
+            let metadata = canonical_metadata(&document.metadata).expect("canonical metadata");
+            let title = document.title.as_deref().unwrap_or("");
+            let indexed = [
+                IndexedFieldValue::new(ID_FIELD, &document.id),
+                IndexedFieldValue::new(CONTENT_FIELD, &document.content),
+                IndexedFieldValue::new(TITLE_FIELD, title),
+            ];
+            let numeric = [IndexedNumericValue::u64(
+                ORD_FIELD,
+                u64::try_from(ordinal).expect("fixture ordinal fits u64"),
+            )];
+            let stored = [StoredFieldValue::new(METADATA_FIELD, &metadata)];
+            let mut fresh = ColumnarAccumulator::new(schema).expect("fresh bound accumulator");
+            let fresh_initial = fresh.bytes_used();
+            fresh
+                .add_document_with_values(0, &indexed, &numeric, &stored)
+                .expect("accumulate fresh budget-bound document");
+            let fresh_delta = fresh
+                .bytes_used()
+                .checked_sub(fresh_initial)
+                .expect("one document cannot reduce logical use");
+            assert!(
+                fresh_delta <= document_upper_bound,
+                "fresh-document logical increment {fresh_delta} exceeded bound {document_upper_bound} for document {ordinal}",
+            );
+
+            accumulator
+                .add_document_with_values(
+                    u32::try_from(ordinal).expect("fixture ordinal fits u32"),
+                    &indexed,
+                    &numeric,
+                    &stored,
+                )
+                .expect("accumulate budget-bound document");
+            assert!(
+                accumulator.bytes_used() <= cumulative_upper_bound,
+                "logical use {} exceeded conservative bound {cumulative_upper_bound} after document {ordinal}",
+                accumulator.bytes_used(),
+            );
+        }
+    }
+
+    #[test]
+    fn parallel_budget_fit_bound_is_conservative() {
+        assert_parallel_budget_bound_for_schema(DEFAULT_SCHEMA);
+        assert_parallel_budget_bound_for_schema(MIXED_BUDGET_SCHEMA);
+    }
+
+    #[test]
+    fn parallel_budget_source_length_validation_rejects_u32_overflow() {
+        let maximum = usize::try_from(u32::MAX).expect("test requires a usize at least u32 wide");
+        assert!(validate_parallel_source_len(CONTENT_FIELD, maximum).is_ok());
+        let Some(oversized) = maximum.checked_add(1) else {
+            return;
+        };
+        assert!(matches!(
+            validate_parallel_source_len(CONTENT_FIELD, oversized),
+            Err(QuillIndexError::Accumulator(
+                AccumulatorError::SourceTooLarge {
+                    field_ord: CONTENT_FIELD,
+                    bytes,
+                }
+            )) if bytes == oversized
+        ));
+    }
+
+    #[test]
+    fn parallel_budget_fixed_lower_bound_precedes_tokenization() {
+        let document = IndexableDocument::new("lower-bound-id", "content must not be tokenized")
+            .with_title("title must not be tokenized");
+        let mut analyzer = FrankensearchTokenizer::default();
+        assert_eq!(analyzer.bytes_reserved(), 0);
+        assert_eq!(
+            parallel_document_logical_upper_bound(DEFAULT_SCHEMA, &mut analyzer, &document, 1)
+                .expect("estimate lower-bound fixture"),
+            Some(ParallelDocumentBudgetBound::ReachesCeiling),
+        );
+        assert_eq!(
+            analyzer.bytes_reserved(),
+            0,
+            "fixed/stored rejection must precede tokenizer scratch allocation",
+        );
+    }
+
+    #[test]
+    fn parallel_budget_token_charge_honors_exclusive_ceiling() {
+        let document =
+            IndexableDocument::new("token-ceiling-id", "alpha beta").with_title("gamma delta");
+        let mut unbounded_analyzer = FrankensearchTokenizer::default();
+        let full = parallel_document_logical_upper_bound(
+            DEFAULT_SCHEMA,
+            &mut unbounded_analyzer,
+            &document,
+            usize::MAX,
+        )
+        .expect("estimate token-ceiling fixture")
+        .expect("shipping schema has token-ceiling bound");
+        let ParallelDocumentBudgetBound::Within(full) = full else {
+            panic!("unbounded token fixture must produce a complete bound");
+        };
+
+        let mut equality_analyzer = FrankensearchTokenizer::default();
+        assert_eq!(
+            parallel_document_logical_upper_bound(
+                DEFAULT_SCHEMA,
+                &mut equality_analyzer,
+                &document,
+                full,
+            )
+            .expect("estimate token-bound equality"),
+            Some(ParallelDocumentBudgetBound::ReachesCeiling),
+        );
+
+        let mut fitting_analyzer = FrankensearchTokenizer::default();
+        assert_eq!(
+            parallel_document_logical_upper_bound(
+                DEFAULT_SCHEMA,
+                &mut fitting_analyzer,
+                &document,
+                full.checked_add(1).expect("fixture bound fits usize"),
+            )
+            .expect("estimate token-bound fit"),
+            Some(ParallelDocumentBudgetBound::Within(full)),
+        );
+    }
+
+    #[cfg(feature = "bench-internals")]
+    #[test]
+    fn parallel_budget_fit_bound_is_conservative_without_positions() {
+        assert_parallel_budget_bound_for_schema(POSITIONLESS_QG_SCHEMA);
+    }
+
+    #[test]
+    fn parallel_budget_arena_chunk_slack_is_aggregate_bounded() {
+        const WIDTHS: [usize; 10] = [1, 2, 3, 4, 8, 16, 32, 128, 256, 512];
+        let near_default_budget = crate::config::DEFAULT_SCRIBE_SHARD_BUDGET_BYTES - 1;
+        for active_shards in WIDTHS {
+            let chunk_bytes = parallel_arena_chunk_bytes(near_default_budget, active_shards);
+            let aggregate_chunk_slack = active_shards
+                .checked_mul(chunk_bytes)
+                .expect("aggregate chunk slack fits usize");
+            let arena_floor = active_shards
+                .checked_mul(MIN_ARENA_CHUNK_BYTES)
+                .expect("aggregate arena floor fits usize");
+            assert!(
+                aggregate_chunk_slack <= DEFAULT_ARENA_CHUNK_BYTES.max(arena_floor),
+                "width {active_shards} selected {chunk_bytes} bytes per shard ({aggregate_chunk_slack} aggregate)",
+            );
+        }
+    }
+
+    #[test]
+    fn parallel_budget_threshold_falls_back_before_workers() {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .expect("build four-worker budget test pool");
+        pool.install(|| {
+            run_with_cx(|cx| async move {
+                let config = QuillConfig {
+                    max_ingest_shards: 4,
+                    max_visibility_lag_ms: 60_000,
+                    ..QuillConfig::default()
+                };
+                let mut index = QuillIndex::in_memory(config).expect("budget threshold index");
+                let documents = parallel_budget_fixture_documents(250);
+                let writer = index.writer_mut();
+                let plan = plan_parallel_ingest(
+                    documents.len(),
+                    writer.shard_router.shard_count(),
+                    rayon::current_num_threads(),
+                )
+                .expect("plan budget threshold fixture");
+                assert_eq!(plan.route, ParallelIngestRoute::SharedNothing);
+                let projected = writer
+                    .parallel_budget_admission(&cx, &documents, plan.active_shards)
+                    .expect("admit fixture under default budget")
+                    .expect("default budget fits fixture")
+                    .projected_logical_upper_bound;
+                let grants_before = writer.docid_allocator.lease_grants().len();
+                let watermark_before = writer.docid_allocator.watermark();
+                let next_shard_before = writer.shard_router.clone().route_batch();
+
+                for budget in [projected, projected.saturating_sub(1)] {
+                    writer.reader.config.scribe_shard_budget_bytes = budget;
+                    assert!(
+                        writer
+                            .try_index_documents_parallel(&cx, &documents, &BTreeSet::new(), false)
+                            .await
+                            .expect("budget fallback is not an error")
+                            .is_none(),
+                        "projected logical use {projected} must not be admitted at budget {budget}",
+                    );
+                    assert_eq!(writer.docid_allocator.lease_grants().len(), grants_before);
+                    assert_eq!(writer.docid_allocator.watermark(), watermark_before);
+                    assert_eq!(writer.shard_router.clone().route_batch(), next_shard_before);
+                    assert!(!writer.ingest_retry_required);
+                    assert!(writer.shards.iter().all(|shard| {
+                        shard.accumulator.document_count() == 0
+                            && shard.identities.is_empty()
+                            && shard.current_lease_base.is_none()
+                    }));
+                }
+            });
+        });
+    }
+
+    #[test]
+    fn parallel_budget_fit_uses_shared_nothing_without_budget_flush() {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .expect("build four-worker budget admission pool");
+        pool.install(|| {
+            run_with_cx(|cx| async move {
+                let config = QuillConfig {
+                    max_ingest_shards: 4,
+                    max_visibility_lag_ms: 60_000,
+                    ..QuillConfig::default()
+                };
+                let mut index = QuillIndex::in_memory(config).expect("budget fit index");
+                let documents = parallel_budget_fixture_documents(250);
+                let writer = index.writer_mut();
+                let plan = plan_parallel_ingest(
+                    documents.len(),
+                    writer.shard_router.shard_count(),
+                    rayon::current_num_threads(),
+                )
+                .expect("plan budget fit fixture");
+                assert_eq!(plan.route, ParallelIngestRoute::SharedNothing);
+                let projected = writer
+                    .parallel_budget_admission(&cx, &documents, plan.active_shards)
+                    .expect("estimate budget fit fixture")
+                    .expect("default budget fits fixture")
+                    .projected_logical_upper_bound;
+                writer.reader.config.scribe_shard_budget_bytes = projected + 1;
+
+                let receipt = writer
+                    .try_index_documents_parallel(&cx, &documents, &BTreeSet::new(), false)
+                    .await
+                    .expect("run budget-fit shared-nothing ingest")
+                    .expect("budget-fit fixture uses shared-nothing");
+                assert_eq!(receipt.route, ParallelIngestRoute::SharedNothing);
+                assert_eq!(receipt.logical_budget_bytes, projected + 1);
+                assert_eq!(receipt.projected_logical_upper_bound, projected);
+                assert!(receipt.arena_bytes_used_high_water <= projected);
+                assert!(receipt.arena_bytes_used_high_water < receipt.logical_budget_bytes);
+                assert!(receipt.arena_chunk_bytes < DEFAULT_ARENA_CHUNK_BYTES);
+                assert!(writer.pending_segments.is_empty());
+                assert_eq!(
+                    writer
+                        .shards
+                        .iter()
+                        .map(|shard| shard.accumulator.document_count())
+                        .sum::<usize>(),
+                    documents.len(),
+                );
+
+                writer
+                    .commit_with_trigger(&cx, LifecycleTrigger::ExplicitFlush)
+                    .await
+                    .expect("publish budget-fit shared-nothing batch");
+                assert_eq!(writer.snapshot().doc_count(), 250);
+            });
+        });
+    }
+
+    #[test]
+    fn parallel_budget_default_bounds_reused_generation_reservations() {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .expect("build four-worker default-budget pool");
+        pool.install(|| {
+            run_with_cx(|cx| async move {
+                let config = QuillConfig {
+                    max_ingest_shards: 4,
+                    max_visibility_lag_ms: 60_000,
+                    ..QuillConfig::default()
+                };
+                let mut index = QuillIndex::in_memory(config).expect("default-budget index");
+                let documents = parallel_budget_fixture_documents(256);
+                let writer = index.writer_mut();
+                if writer.shard_router.shard_count() < 2 {
+                    return;
+                }
+                let initial_reserved = writer
+                    .shards
+                    .iter()
+                    .try_fold(0_usize, |total, shard| {
+                        total.checked_add(shard.accumulator.bytes_reserved())
+                    })
+                    .expect("initial reserve total fits usize");
+                let first = writer
+                    .try_index_documents_parallel(&cx, &documents, &BTreeSet::new(), false)
+                    .await
+                    .expect("run first default-budget generation")
+                    .expect("first default-budget generation uses shared-nothing");
+                assert_eq!(
+                    first.logical_budget_bytes,
+                    crate::config::DEFAULT_SCRIBE_SHARD_BUDGET_BYTES,
+                );
+                assert_eq!(
+                    first.arena_chunk_bytes,
+                    parallel_arena_chunk_bytes(
+                        first.batch_logical_upper_bound,
+                        first.active_shards,
+                    ),
+                );
+                assert!(first.arena_chunk_bytes < DEFAULT_ARENA_CHUNK_BYTES);
+                let first_installed_reserved = writer
+                    .shards
+                    .iter()
+                    .filter(|shard| shard.accumulator.document_count() != 0)
+                    .try_fold(0_usize, |total, shard| {
+                        total.checked_add(shard.accumulator.bytes_reserved())
+                    })
+                    .expect("first installed reserve total fits usize");
+                assert_eq!(
+                    first.arena_bytes_reserved_high_water,
+                    initial_reserved
+                        .checked_add(first_installed_reserved)
+                        .expect("first exact reserve peak fits usize"),
+                );
+                let first_default_chunk_peak = initial_reserved
+                    .checked_add(
+                        first
+                            .active_shards
+                            .checked_mul(DEFAULT_ARENA_CHUNK_BYTES)
+                            .expect("default chunk peak fits usize"),
+                    )
+                    .expect("first-generation peak fits usize");
+                assert!(first.arena_bytes_reserved_high_water < first_default_chunk_peak);
+                assert!(
+                    writer
+                        .shards
+                        .iter()
+                        .filter(|shard| shard.accumulator.document_count() != 0)
+                        .all(|shard| {
+                            shard.accumulator.terms().arena_stats().1 < DEFAULT_ARENA_CHUNK_BYTES
+                        })
+                );
+
+                writer
+                    .commit_with_trigger(&cx, LifecycleTrigger::ExplicitFlush)
+                    .await
+                    .expect("publish first default-budget generation");
+                assert!(writer.shards.iter().all(|shard| {
+                    shard.accumulator.document_count() == 0
+                        && shard.identities.is_empty()
+                        && shard.current_lease_base.is_none()
+                }));
+                let retained_reserved = writer
+                    .shards
+                    .iter()
+                    .try_fold(0_usize, |total, shard| {
+                        total.checked_add(shard.accumulator.bytes_reserved())
+                    })
+                    .expect("retained reserve total fits usize");
+                assert!(retained_reserved > initial_reserved);
+                let (retained_arena_bytes, retained_arena_chunks) = writer
+                    .shards
+                    .iter()
+                    .try_fold((0_usize, 0_usize), |(bytes, chunks), shard| {
+                        let (_, shard_bytes, shard_chunks) =
+                            shard.accumulator.terms().arena_stats();
+                        Some((
+                            bytes.checked_add(shard_bytes)?,
+                            chunks.checked_add(shard_chunks)?,
+                        ))
+                    })
+                    .expect("retained arena totals fit usize");
+                assert!(retained_arena_bytes > 0);
+                assert!(retained_arena_chunks > 0);
+
+                let mut second_documents = parallel_budget_fixture_documents(256);
+                for (ordinal, document) in second_documents.iter_mut().enumerate() {
+                    document.id = format!("parallel-budget-second-{ordinal:05}");
+                }
+                let second = writer
+                    .try_index_documents_parallel(&cx, &second_documents, &BTreeSet::new(), false)
+                    .await
+                    .expect("run second default-budget generation")
+                    .expect("second default-budget generation uses shared-nothing");
+                assert!(second.arena_chunk_bytes < DEFAULT_ARENA_CHUNK_BYTES);
+                let second_installed_reserved = writer
+                    .shards
+                    .iter()
+                    .filter(|shard| shard.accumulator.document_count() != 0)
+                    .try_fold(0_usize, |total, shard| {
+                        total.checked_add(shard.accumulator.bytes_reserved())
+                    })
+                    .expect("second installed reserve total fits usize");
+                assert_eq!(
+                    second.arena_bytes_reserved_high_water,
+                    retained_reserved
+                        .checked_add(second_installed_reserved)
+                        .expect("second exact reserve peak fits usize"),
+                );
+                let second_default_chunk_peak = retained_reserved
+                    .checked_add(
+                        second
+                            .active_shards
+                            .checked_mul(DEFAULT_ARENA_CHUNK_BYTES)
+                            .expect("second default chunk peak fits usize"),
+                    )
+                    .expect("second-generation peak fits usize");
+                assert!(second.arena_bytes_reserved_high_water < second_default_chunk_peak);
+
+                writer
+                    .commit_with_trigger(&cx, LifecycleTrigger::ExplicitFlush)
+                    .await
+                    .expect("publish second default-budget generation");
+                assert_eq!(writer.snapshot().doc_count(), 512);
+            });
+        });
+    }
+
+    #[test]
+    fn dirty_prior_shard_blocks_parallel_budget_admission() {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .expect("build four-worker dirty-shard pool");
+        pool.install(|| {
+            run_with_cx(|cx| async move {
+                let config = QuillConfig {
+                    max_ingest_shards: 4,
+                    max_visibility_lag_ms: 60_000,
+                    ..QuillConfig::default()
+                };
+                let mut index = QuillIndex::in_memory(config).expect("dirty-shard index");
+                index
+                    .index_documents(
+                        &cx,
+                        &[IndexableDocument::new("prior", "retained prior shard")],
+                    )
+                    .await
+                    .expect("seed one dirty serial shard");
+                let documents = parallel_budget_fixture_documents(250);
+                let writer = index.writer_mut();
+                let grants_before = writer.docid_allocator.lease_grants().len();
+                let watermark_before = writer.docid_allocator.watermark();
+                assert!(
+                    writer
+                        .try_index_documents_parallel(&cx, &documents, &BTreeSet::new(), false)
+                        .await
+                        .expect("dirty-shard fallback is not an error")
+                        .is_none()
+                );
+                assert_eq!(writer.docid_allocator.lease_grants().len(), grants_before);
+                assert_eq!(writer.docid_allocator.watermark(), watermark_before);
+                assert_eq!(
+                    writer
+                        .shards
+                        .iter()
+                        .map(|shard| shard.accumulator.document_count())
+                        .sum::<usize>(),
+                    1,
+                );
+            });
+        });
+    }
+
+    #[test]
+    fn scalar_budget_overshoot_flushes_before_the_successor_document() {
+        run_with_cx(|cx| async move {
+            let config = QuillConfig {
+                scribe_shard_budget_bytes: 10_000,
+                deterministic_ingest: true,
+                max_visibility_lag_ms: 60_000,
+                ..QuillConfig::default()
+            };
+            let mut index = QuillIndex::in_memory(config).expect("scalar boundary index");
+            let documents = [
+                IndexableDocument::new("large", "unique ".repeat(5_000)),
+                IndexableDocument::new("tiny", "x"),
+            ];
+            index
+                .index_documents(&cx, &documents)
+                .await
+                .expect("index scalar boundary fixture");
+            let writer = index.writer_mut();
+            assert_eq!(writer.pending_segments.len(), 1);
+            assert_eq!(writer.pending_segments[0].doc_count, 1);
+            let dirty = writer
+                .shards
+                .iter()
+                .find(|shard| shard.accumulator.document_count() != 0)
+                .expect("successor document remains in a fresh accumulator");
+            assert_eq!(dirty.accumulator.document_count(), 1);
+            assert_eq!(dirty.identities[0].document_id, "tiny");
+        });
+    }
+
+    #[test]
+    fn parallel_budget_boundary_matches_forced_scalar() {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .expect("build four-worker boundary parity pool");
+        pool.install(|| {
+            run_with_cx(|cx| async move {
+                let documents = parallel_budget_fixture_documents(250);
+                let common = QuillConfig {
+                    scribe_shard_budget_bytes: 1,
+                    max_visibility_lag_ms: 60_000,
+                    tier_fanout: usize::MAX,
+                    ..QuillConfig::default()
+                };
+                let mut adaptive = QuillIndex::in_memory(QuillConfig {
+                    max_ingest_shards: 4,
+                    ..common.clone()
+                })
+                .expect("adaptive boundary index");
+                let mut scalar = QuillIndex::in_memory(QuillConfig {
+                    deterministic_ingest: true,
+                    ..common
+                })
+                .expect("forced scalar boundary index");
+
+                adaptive
+                    .index_documents(&cx, &documents)
+                    .await
+                    .expect("index adaptive boundary fixture");
+                scalar
+                    .index_documents(&cx, &documents)
+                    .await
+                    .expect("index scalar boundary fixture");
+                assert_eq!(adaptive.writer_mut().pending_segments.len(), 250);
+                assert_eq!(scalar.writer_mut().pending_segments.len(), 250);
+
+                adaptive
+                    .commit(&cx)
+                    .await
+                    .expect("publish adaptive boundary");
+                scalar.commit(&cx).await.expect("publish scalar boundary");
+                assert_eq!(
+                    adaptive.snapshot().loaded_manifest().manifest.field_stats,
+                    scalar.snapshot().loaded_manifest().manifest.field_stats,
+                );
+                for document in &documents {
+                    assert_eq!(
+                        adaptive
+                            .document_witness(&document.id)
+                            .expect("adaptive document witness"),
+                        scalar
+                            .document_witness(&document.id)
+                            .expect("scalar document witness"),
+                        "budget fallback witness differs for {}",
+                        document.id,
+                    );
+                }
+                assert_eq!(
+                    adaptive
+                        .search_doc_ids(&cx, "shared budget", 300)
+                        .expect("search adaptive boundary"),
+                    scalar
+                        .search_doc_ids(&cx, "shared budget", 300)
+                        .expect("search scalar boundary"),
+                );
+            });
+        });
+    }
+
+    #[test]
+    fn parallel_budget_equality_wrapper_matches_forced_scalar() {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .expect("build four-worker equality parity pool");
+        pool.install(|| {
+            run_with_cx(|cx| async move {
+                let documents = parallel_budget_fixture_documents(250);
+                let mut adaptive = QuillIndex::in_memory(QuillConfig {
+                    max_ingest_shards: 4,
+                    max_visibility_lag_ms: 60_000,
+                    ..QuillConfig::default()
+                })
+                .expect("adaptive equality index");
+                let projected = {
+                    let writer = adaptive.writer_mut();
+                    let plan = plan_parallel_ingest(
+                        documents.len(),
+                        writer.shard_router.shard_count(),
+                        rayon::current_num_threads(),
+                    )
+                    .expect("plan equality fixture");
+                    writer
+                        .parallel_budget_admission(&cx, &documents, plan.active_shards)
+                        .expect("estimate equality fixture")
+                        .expect("default budget fits equality fixture")
+                        .projected_logical_upper_bound
+                };
+                adaptive
+                    .writer_mut()
+                    .reader
+                    .config
+                    .scribe_shard_budget_bytes = projected;
+                let scalar = QuillIndex::in_memory(QuillConfig {
+                    scribe_shard_budget_bytes: projected,
+                    deterministic_ingest: true,
+                    max_visibility_lag_ms: 60_000,
+                    ..QuillConfig::default()
+                })
+                .expect("scalar equality control");
+
+                adaptive
+                    .index_documents(&cx, &documents)
+                    .await
+                    .expect("index equality fallback");
+                scalar
+                    .index_documents(&cx, &documents)
+                    .await
+                    .expect("index equality scalar control");
+                let adaptive_writer = adaptive.writer_mut();
+                assert!(adaptive_writer.pending_segments.is_empty());
+                assert_eq!(
+                    adaptive_writer
+                        .shards
+                        .iter()
+                        .filter(|shard| shard.accumulator.document_count() != 0)
+                        .count(),
+                    1,
+                    "budget equality must enter the scalar wrapper route",
+                );
+
+                adaptive
+                    .commit(&cx)
+                    .await
+                    .expect("publish equality fallback");
+                scalar
+                    .commit(&cx)
+                    .await
+                    .expect("publish equality scalar control");
+                assert_eq!(
+                    adaptive.snapshot().loaded_manifest().manifest.field_stats,
+                    scalar.snapshot().loaded_manifest().manifest.field_stats,
+                );
+                for document in [
+                    documents.first().expect("first equality document"),
+                    documents.last().expect("last equality document"),
+                ] {
+                    assert_eq!(
+                        adaptive
+                            .document_witness(&document.id)
+                            .expect("adaptive equality witness"),
+                        scalar
+                            .document_witness(&document.id)
+                            .expect("scalar equality witness"),
+                    );
+                }
+                assert_eq!(
+                    adaptive
+                        .search_doc_ids(&cx, "shared budget", 300)
+                        .expect("search equality fallback"),
+                    scalar
+                        .search_doc_ids(&cx, "shared budget", 300)
+                        .expect("search equality control"),
+                );
+            });
+        });
+    }
+
     #[test]
     fn large_batch_builds_all_available_shard_segments_shared_nothing() {
         run_with_cx(|cx| async move {
@@ -17221,11 +19436,10 @@ mod tests {
                 .await
                 .expect("accumulate one large batch");
 
-            let active_shards = parallel_ingest_active_shards(
-                documents.len(),
-                shard_count,
-                rayon::current_num_threads(),
-            );
+            let active_shards =
+                plan_parallel_ingest(documents.len(), shard_count, rayon::current_num_threads())
+                    .expect("plan large parallel fixture")
+                    .active_shards;
             let expected_segments = active_shards.max(1);
             index.commit(&cx).await.expect("publish parallel batch");
             assert_eq!(index.snapshot().segments().len(), expected_segments);
@@ -17245,12 +19459,232 @@ mod tests {
     }
 
     #[test]
-    fn adaptive_parallel_batch_activates_only_amortized_shards() {
-        assert_eq!(parallel_ingest_active_shards(127, 4, 4), 1);
-        assert_eq!(parallel_ingest_active_shards(250, 4, 4), 3);
-        assert_eq!(parallel_ingest_active_shards(256, 4, 2), 2);
-        assert_eq!(parallel_ingest_active_shards(5_000, 128, 128), 78);
+    fn deterministic_large_batch_builds_four_contiguous_segments() {
+        run_with_cx(|cx| async move {
+            let mut index =
+                QuillIndex::in_memory(deterministic_config()).expect("deterministic memory index");
+            let document_count = INTERNAL_PARALLEL_INGEST_SHARDS
+                .checked_mul(PARALLEL_INGEST_MIN_DOCS_PER_SHARD)
+                .expect("bounded deterministic parallel fixture");
+            let documents = (0..document_count)
+                .map(|ordinal| {
+                    IndexableDocument::new(
+                        format!("internal-parallel-{ordinal:05}"),
+                        "deterministic internal parallel indexing fixture",
+                    )
+                })
+                .collect::<Vec<_>>();
+            index
+                .index_documents(&cx, &documents)
+                .await
+                .expect("build deterministic internal segments");
 
+            assert_eq!(
+                index.writer_mut().pending_segments.len(),
+                INTERNAL_PARALLEL_INGEST_SHARDS,
+            );
+            assert!(index.writer_mut().shards.iter().all(|shard| {
+                shard.accumulator.document_count() == 0 && shard.identities.is_empty()
+            }));
+            index
+                .commit(&cx)
+                .await
+                .expect("publish deterministic internal segments");
+
+            let snapshot = index.snapshot();
+            let manifest = &snapshot.loaded_manifest().manifest;
+            assert_eq!(manifest.segments.len(), INTERNAL_PARALLEL_INGEST_SHARDS);
+            assert_eq!(
+                index.snapshot().doc_count(),
+                u64::try_from(document_count).expect("fixture document count fits u64"),
+            );
+            assert_eq!(
+                manifest.segments.first().map(|segment| segment.docid_lo),
+                Some(0)
+            );
+            assert_eq!(
+                manifest.segments.last().map(|segment| segment.docid_hi),
+                Some(u64::try_from(document_count).expect("fixture document count fits u64")),
+            );
+            assert!(
+                manifest
+                    .segments
+                    .windows(2)
+                    .all(|pair| pair[0].docid_hi == pair[1].docid_lo),
+                "internal segment ranges must be contiguous and gap-free",
+            );
+            assert_pairwise_disjoint_manifest(&manifest.segments);
+        });
+    }
+
+    #[cfg(feature = "pruning-conformance")]
+    #[test]
+    fn scalar_topology_conformance_seam_preserves_one_requested_leaf() {
+        run_with_cx(|cx| async move {
+            let document_count = INTERNAL_PARALLEL_INGEST_SHARDS
+                .checked_mul(PARALLEL_INGEST_MIN_DOCS_PER_SHARD)
+                .expect("bounded scalar-topology fixture");
+            let documents = (0..document_count)
+                .map(|ordinal| {
+                    IndexableDocument::new(
+                        format!("scalar-topology-{ordinal:05}"),
+                        "scalar topology conformance fixture",
+                    )
+                })
+                .collect::<Vec<_>>();
+            let config = QuillConfig {
+                max_visibility_lag_ms: u64::MAX,
+                ..deterministic_config()
+            };
+            let mut adaptive =
+                QuillIndex::in_memory(config.clone()).expect("adaptive control index");
+            let mut scalar = QuillIndex::in_memory(config).expect("scalar topology index");
+
+            adaptive
+                .index_documents(&cx, &documents)
+                .await
+                .expect("build adaptive internal segments");
+            scalar
+                .index_documents_with_scalar_topology_conformance(&cx, &documents)
+                .await
+                .expect("accumulate one scalar topology leaf");
+
+            assert_eq!(
+                adaptive.writer_mut().pending_segments.len(),
+                INTERNAL_PARALLEL_INGEST_SHARDS,
+                "shipping ingest must retain its fixed-width internal fanout",
+            );
+            assert!(scalar.writer_mut().pending_segments.is_empty());
+            assert_eq!(
+                scalar
+                    .writer_mut()
+                    .shards
+                    .iter()
+                    .map(|shard| shard.accumulator.document_count())
+                    .sum::<usize>(),
+                document_count,
+            );
+
+            adaptive
+                .commit(&cx)
+                .await
+                .expect("publish adaptive control");
+            scalar
+                .commit(&cx)
+                .await
+                .expect("publish scalar topology leaf");
+            assert_eq!(
+                adaptive.snapshot().segments().len(),
+                INTERNAL_PARALLEL_INGEST_SHARDS,
+            );
+            assert_eq!(scalar.snapshot().segments().len(), 1);
+            assert_eq!(
+                scalar.snapshot().segments()[0].doc_count(),
+                u32::try_from(document_count).expect("fixture count fits u32"),
+            );
+            assert_eq!(
+                adaptive.snapshot().loaded_manifest().manifest.field_stats,
+                scalar.snapshot().loaded_manifest().manifest.field_stats,
+            );
+            assert_eq!(
+                adaptive
+                    .search_doc_ids(&cx, "scalar topology", document_count)
+                    .expect("search adaptive control"),
+                scalar
+                    .search_doc_ids(&cx, "scalar topology", document_count)
+                    .expect("search scalar topology leaf"),
+            );
+        });
+    }
+
+    #[test]
+    fn adaptive_parallel_planner_v1_covers_frozen_matrix() {
+        const DOCUMENT_COUNTS: [usize; 10] = [0, 1, 63, 64, 127, 128, 249, 250, 5_000, 8_192];
+        const WIDTHS: [usize; 6] = [1, 2, 4, 64, 96, 128];
+
+        let goldens = [
+            (250, 4, 4, 3),
+            (5_000, 96, 96, 78),
+            (5_000, 128, 128, 78),
+            (8_192, 128, 128, 128),
+        ];
+        for (document_count, configured_width, pool_capacity, expected_active) in goldens {
+            let plan = plan_parallel_ingest(document_count, configured_width, pool_capacity)
+                .expect("plan frozen adaptive-ingest golden");
+            assert_eq!(plan.active_shards, expected_active);
+        }
+
+        for document_count in DOCUMENT_COUNTS {
+            for width in WIDTHS {
+                let plan = plan_parallel_ingest(document_count, width, width)
+                    .expect("plan frozen adaptive-ingest matrix cell");
+                let repeated = plan_parallel_ingest(document_count, width, width)
+                    .expect("repeat frozen adaptive-ingest matrix cell");
+                assert_eq!(plan, repeated, "planner must be deterministic");
+                assert_eq!(plan.planner_version, PARALLEL_INGEST_PLANNER_VERSION);
+                assert_eq!(plan.configured_width, width);
+                assert_eq!(plan.verified_pool_capacity, width);
+                assert_eq!(plan.eligible_shards, width);
+                assert_eq!(
+                    plan.active_shards,
+                    width.min(document_count / PARALLEL_INGEST_MIN_DOCS_PER_SHARD),
+                );
+
+                if plan.active_shards < 2 {
+                    assert_eq!(plan.route, ParallelIngestRoute::Serial);
+                    assert!(plan.ranges.is_empty());
+                    continue;
+                }
+
+                assert_eq!(plan.route, ParallelIngestRoute::SharedNothing);
+                assert_eq!(plan.ranges.len(), plan.active_shards);
+                assert_eq!(plan.ranges.first().map(|range| range.start), Some(0));
+                assert_eq!(
+                    plan.ranges.last().map(|range| range.end),
+                    Some(document_count),
+                );
+                assert!(
+                    plan.ranges.windows(2).all(|pair| pair
+                        .first()
+                        .zip(pair.get(1))
+                        .is_some_and(|(first, second)| first.end == second.start)),
+                    "ranges must be contiguous and nonoverlapping",
+                );
+                assert!(
+                    plan.ranges.iter().all(|range| {
+                        range.len() >= PARALLEL_INGEST_MIN_DOCS_PER_SHARD
+                            && range.end <= document_count
+                    }),
+                    "tail documents must be folded into nonempty amortized ranges",
+                );
+                let shortest = plan
+                    .ranges
+                    .iter()
+                    .map(|range| range.len())
+                    .min()
+                    .expect("parallel plan has ranges");
+                let longest = plan
+                    .ranges
+                    .iter()
+                    .map(|range| range.len())
+                    .max()
+                    .expect("parallel plan has ranges");
+                assert!(longest - shortest <= 1, "ranges must remain balanced");
+                assert_eq!(
+                    plan.ranges.iter().map(|range| range.len()).sum::<usize>(),
+                    document_count,
+                );
+            }
+        }
+
+        let capacity_limited =
+            plan_parallel_ingest(8_192, 128, 96).expect("plan capacity-limited adaptive ingest");
+        assert_eq!(capacity_limited.eligible_shards, 96);
+        assert_eq!(capacity_limited.active_shards, 96);
+    }
+
+    #[test]
+    fn adaptive_parallel_batch_activates_only_amortized_shards() {
         run_with_cx(|cx| async move {
             let config = QuillConfig {
                 max_ingest_shards: 4,
@@ -17271,11 +19705,10 @@ mod tests {
                 .await
                 .expect("accumulate one adaptive batch");
 
-            let active_shards = parallel_ingest_active_shards(
-                documents.len(),
-                shard_count,
-                rayon::current_num_threads(),
-            );
+            let active_shards =
+                plan_parallel_ingest(documents.len(), shard_count, rayon::current_num_threads())
+                    .expect("plan adaptive parallel fixture")
+                    .active_shards;
             index.commit(&cx).await.expect("publish adaptive batch");
             assert_eq!(index.snapshot().segments().len(), active_shards.max(1));
             assert_eq!(index.snapshot().doc_count(), 250);
@@ -17290,8 +19723,190 @@ mod tests {
         });
     }
 
+    #[cfg(feature = "conformance-internals")]
     #[test]
-    fn deterministic_batch_keeps_adaptive_parallel_route_disabled() {
+    fn cancelled_parallel_budget_preflight_is_pristine_and_retryable() {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .expect("build four-worker budget cancellation pool");
+        pool.install(|| {
+            run_with_cx(|cx| async move {
+                let config = QuillConfig {
+                    max_ingest_shards: 4,
+                    max_visibility_lag_ms: 60_000,
+                    ..QuillConfig::default()
+                };
+                let index =
+                    QuillIndex::in_memory(config.clone()).expect("budget cancellation index");
+                let documents = parallel_budget_fixture_documents(250);
+                let state_before = index
+                    .conformance_pending_writer_state()
+                    .expect("capture pristine budget-preflight state");
+                let controller = index.conformance_cancellation_controller();
+                controller
+                    .arm(ConformanceCancellationStage::ParallelBudgetAdmission, 3)
+                    .expect("arm budget-preflight cancellation");
+
+                let cancelled = index
+                    .index_documents(&cx, &documents)
+                    .await
+                    .expect_err("budget preflight must observe injected cancellation");
+                assert!(matches!(
+                    &cancelled,
+                    QuillIndexError::Cancelled {
+                        phase: "parallel budget admission"
+                    }
+                ));
+                assert!(controller.fired());
+                assert!(controller.observed_checkpoints() >= 3);
+                assert_eq!(
+                    index
+                        .conformance_pending_writer_state()
+                        .expect("capture cancelled budget-preflight state"),
+                    state_before,
+                );
+
+                controller.disarm();
+                cx.set_cancel_requested(false);
+                index
+                    .index_documents(&cx, &documents)
+                    .await
+                    .expect("retry cancelled budget preflight");
+                let retry_state = index
+                    .conformance_pending_writer_state()
+                    .expect("capture retried budget-preflight state");
+                let control = QuillIndex::in_memory(config).expect("fresh budget control index");
+                control
+                    .index_documents(&cx, &documents)
+                    .await
+                    .expect("run fresh budget control");
+                assert_eq!(
+                    retry_state,
+                    control
+                        .conformance_pending_writer_state()
+                        .expect("capture fresh budget-control state"),
+                );
+            });
+        });
+    }
+
+    #[cfg(feature = "conformance-internals")]
+    #[test]
+    fn cancelled_parallel_batch_preserves_exact_state_and_retries_identically() {
+        run_with_cx(|cx| async move {
+            let config = QuillConfig {
+                max_ingest_shards: 4,
+                max_visibility_lag_ms: 60_000,
+                ..QuillConfig::default()
+            };
+            let mut index = QuillIndex::in_memory(config.clone()).expect("parallel memory index");
+            let shard_count = index.writer_mut().shard_router.shard_count();
+            let plan = plan_parallel_ingest(256, shard_count, rayon::current_num_threads())
+                .expect("plan cancellation fixture");
+            assert_eq!(
+                plan.route,
+                ParallelIngestRoute::SharedNothing,
+                "transaction test requires at least two verified worker shards",
+            );
+            let documents = (0..256)
+                .map(|ordinal| {
+                    IndexableDocument::new(
+                        format!("parallel-transaction-{ordinal:05}"),
+                        "shared nothing cancellation transaction fixture",
+                    )
+                })
+                .collect::<Vec<_>>();
+            let state_before = index
+                .conformance_pending_writer_state()
+                .expect("capture pristine writer state");
+            let controller = index.conformance_cancellation_controller();
+            controller
+                .arm(ConformanceCancellationStage::ParallelIngest, 3)
+                .expect("arm mid-worker cancellation");
+
+            let cancelled = index
+                .index_documents(&cx, &documents)
+                .await
+                .expect_err("parallel worker must observe injected cancellation");
+            assert!(
+                matches!(
+                    &cancelled,
+                    QuillIndexError::Cancelled {
+                        phase: "parallel index worker"
+                    }
+                ),
+                "unexpected cancellation result: {cancelled:?}",
+            );
+            assert!(controller.fired());
+            assert!(controller.observed_checkpoints() >= 3);
+            assert!(cx.is_cancel_requested());
+            assert!(!index.has_uncommitted_changes());
+            assert_eq!(
+                index
+                    .conformance_pending_writer_state()
+                    .expect("capture cancelled writer state"),
+                state_before,
+                "a joined worker cancellation must not commit allocator, router, shard, or retry-guard state",
+            );
+
+            controller.disarm();
+            cx.set_cancel_requested(false);
+            index
+                .index_documents(&cx, &documents)
+                .await
+                .expect("retry cancelled parallel batch");
+            let retry_state = index
+                .conformance_pending_writer_state()
+                .expect("capture retried writer state");
+
+            let control = QuillIndex::in_memory(config).expect("fresh parallel control index");
+            control
+                .index_documents(&cx, &documents)
+                .await
+                .expect("accumulate fresh parallel control batch");
+            assert_eq!(
+                retry_state,
+                control
+                    .conformance_pending_writer_state()
+                    .expect("capture control writer state"),
+                "retry must reproduce the exact fresh allocator, router, shard, and identity state",
+            );
+
+            index.commit(&cx).await.expect("publish retried batch");
+            control.commit(&cx).await.expect("publish control batch");
+            assert_eq!(index.snapshot().doc_count(), 256);
+            assert_eq!(control.snapshot().doc_count(), 256);
+            for document in &documents {
+                assert_eq!(
+                    index
+                        .document_witness(&document.id)
+                        .expect("resolve retried witness"),
+                    control
+                        .document_witness(&document.id)
+                        .expect("resolve control witness"),
+                    "retry witness differs for {}",
+                    document.id,
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn parallel_worker_panic_is_a_typed_precommit_failure() {
+        let error = catch_parallel_ingest_worker(7, || -> Result<(), QuillIndexError> {
+            panic!("injected parallel worker panic");
+        })
+        .expect_err("worker panic must be caught");
+        assert!(matches!(
+            error,
+            QuillIndexError::InvalidState { detail }
+                if detail == "parallel ingest worker 7 panicked before transactional commit"
+        ));
+    }
+
+    #[test]
+    fn deterministic_batch_uses_fixed_internal_parallel_plan() {
         run_with_cx(|cx| async move {
             let config = QuillConfig {
                 max_ingest_shards: 4,
@@ -17315,7 +19930,9 @@ mod tests {
                 .commit(&cx)
                 .await
                 .expect("publish deterministic batch");
-            assert_eq!(index.snapshot().segments().len(), 1);
+            let expected_segments = INTERNAL_PARALLEL_INGEST_SHARDS
+                .min(documents.len() / PARALLEL_INGEST_MIN_DOCS_PER_SHARD);
+            assert_eq!(index.snapshot().segments().len(), expected_segments);
             assert_eq!(index.snapshot().doc_count(), 250);
         });
     }

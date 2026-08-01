@@ -48,7 +48,7 @@ use crate::generator::{
 use crate::version_contract::oracle_version_contract;
 
 /// Schema version for deterministic campaign reports.
-pub(crate) const CAMPAIGN_REPORT_V7_SCHEMA_VERSION: u32 = 7;
+pub const CAMPAIGN_REPORT_V7_SCHEMA_VERSION: u32 = 7;
 pub const CAMPAIGN_REPORT_SCHEMA_VERSION: u32 = CAMPAIGN_REPORT_V7_SCHEMA_VERSION;
 /// Schema version for the append-only machine-readable Divergence Register.
 pub const DIVERGENCE_REGISTER_LEDGER_SCHEMA_VERSION: u32 = 2;
@@ -801,7 +801,7 @@ pub struct DivergencePredictionEvent {
 #[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct DivergenceClassCensus {
+pub struct DivergenceClassCensus {
     pub(crate) class: DivergenceClass,
     pub(crate) active_entries: u64,
     pub(crate) observed_mismatches: u64,
@@ -814,7 +814,7 @@ pub(crate) struct DivergenceClassCensus {
 #[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct DivergenceCensus {
+pub struct DivergenceCensus {
     pub(crate) schema_version: u32,
     pub(crate) prediction_policy_version: String,
     pub(crate) prediction_policy_sha256: String,
@@ -1348,7 +1348,7 @@ impl DivergenceRegisterLedger {
         })?;
         match ledger.schema_version {
             LEGACY_DIVERGENCE_REGISTER_LEDGER_SCHEMA_VERSION_V1 => {
-                ledger.validate_for_schema(LEGACY_DIVERGENCE_REGISTER_LEDGER_SCHEMA_VERSION_V1)?
+                ledger.validate_for_schema(LEGACY_DIVERGENCE_REGISTER_LEDGER_SCHEMA_VERSION_V1)?;
             }
             DIVERGENCE_REGISTER_LEDGER_SCHEMA_VERSION => {
                 ledger.validate_for_schema(DIVERGENCE_REGISTER_LEDGER_SCHEMA_VERSION)?;
@@ -3148,6 +3148,11 @@ impl CampaignReport {
     /// This does not validate the DTO or establish durable relational
     /// integrity. The opaque [`crate::IntegrityCheckedCampaign`] capability,
     /// not a scalar value from these bytes, represents completed store replay.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the report names a reserved or unsupported schema
+    /// version that has no defined trust ceiling.
     pub fn schema_trust_ceiling(&self) -> Result<ArtifactTrustCeiling, GauntletError> {
         match self.schema_version {
             1 | 2 | 3 | 5 => Ok(ArtifactTrustCeiling::UnauthenticatedLegacy),
@@ -3247,8 +3252,7 @@ impl CampaignReport {
                 self.producer_build_identity
                     .validate_builtin_engines(&self.engines)?;
             }
-            (ArtifactExecutionRole::Diagnostic, _)
-            | (ArtifactExecutionRole::BuiltInExecution, _) => {
+            (ArtifactExecutionRole::Diagnostic | ArtifactExecutionRole::BuiltInExecution, _) => {
                 return Err(campaign_error(
                     "campaign report execution role does not match its oracle dependency role",
                 ));
@@ -4114,6 +4118,12 @@ impl DifferentialCampaignRunner {
     /// Quill subject and pinned Tantivy oracle. Custom trait implementations
     /// intentionally cannot call this typed execution path. The resulting raw
     /// report remains integrity-only until store replay and F0 authentication.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the configured semantic contract is not supported
+    /// by this typed path, or when replay, ingest, querying, comparison,
+    /// provenance capture, or report construction fails.
     #[cfg(feature = "tantivy-oracle")]
     #[allow(clippy::too_many_arguments)]
     pub async fn run_quill_tantivy_evidence_replay(
@@ -4153,6 +4163,11 @@ impl DifferentialCampaignRunner {
     }
 
     /// Slice-backed variant of [`Self::run_quill_tantivy_evidence_replay`].
+    ///
+    /// # Errors
+    ///
+    /// Returns the same typed replay, engine, comparison, provenance, and
+    /// report-construction errors as [`Self::run_quill_tantivy_evidence_replay`].
     #[cfg(feature = "tantivy-oracle")]
     #[allow(clippy::too_many_arguments)]
     pub async fn run_quill_tantivy_evidence(
@@ -4180,6 +4195,11 @@ impl DifferentialCampaignRunner {
 
     /// Run provenance-bearing CASS-profile evidence through the concrete
     /// Quill and pinned Tantivy adapters.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when replay, CASS-profile ingest or querying,
+    /// comparison, provenance capture, or report construction fails.
     #[cfg(feature = "tantivy-oracle")]
     #[allow(clippy::too_many_arguments)]
     pub async fn run_cass_quill_tantivy_evidence(
@@ -7410,6 +7430,96 @@ mod tests {
     }
 
     #[cfg(feature = "tantivy-oracle")]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum RankedQueryForm {
+        Raw,
+        Preparsed,
+    }
+
+    #[cfg(feature = "tantivy-oracle")]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum RankedQueryCacheLookup {
+        NotChecked,
+        Disabled,
+        Miss,
+        Hit,
+    }
+
+    #[cfg(feature = "tantivy-oracle")]
+    fn trace_ranked_query_contract(
+        line: &str,
+        context: &str,
+    ) -> (RankedQueryForm, RankedQueryCacheLookup) {
+        let observed_query_form = trace_field_text(line, "query_form");
+        assert!(
+            matches!(observed_query_form, Some("raw" | "preparsed")),
+            "{context}: ranked query close has invalid query_form {observed_query_form:?}: {line}",
+        );
+        let query_form = if observed_query_form == Some("raw") {
+            RankedQueryForm::Raw
+        } else {
+            RankedQueryForm::Preparsed
+        };
+        let observed_cache_lookup = trace_field_text(line, "cache_lookup");
+        assert!(
+            matches!(
+                observed_cache_lookup,
+                Some("not_checked" | "disabled" | "miss" | "hit")
+            ),
+            "{context}: ranked query close has invalid cache_lookup {observed_cache_lookup:?}: {line}",
+        );
+        let cache_lookup = if observed_cache_lookup == Some("not_checked") {
+            RankedQueryCacheLookup::NotChecked
+        } else if observed_cache_lookup == Some("disabled") {
+            RankedQueryCacheLookup::Disabled
+        } else if observed_cache_lookup == Some("miss") {
+            RankedQueryCacheLookup::Miss
+        } else {
+            RankedQueryCacheLookup::Hit
+        };
+        (query_form, cache_lookup)
+    }
+
+    #[cfg(feature = "tantivy-oracle")]
+    fn assert_ranked_query_cache_fixture(
+        logs: &str,
+        query_id: &str,
+        expected_form: RankedQueryForm,
+        expected_lookup: RankedQueryCacheLookup,
+    ) {
+        use frankensearch_quill::tracing_conventions::ARGUS_QUERY;
+
+        let context = format!("query_id={query_id}");
+        let query_closes = logs
+            .lines()
+            .filter(|line| {
+                trace_has_text_field(line, "query_id", query_id)
+                    && is_stage_close(line, ARGUS_QUERY)
+                    && trace_field_text(line, "collector") != Some("docset")
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            !query_closes.is_empty(),
+            "{context}: missing ranked query close record",
+        );
+        for close in query_closes {
+            let (query_form, cache_lookup) = trace_ranked_query_contract(close, &context);
+            assert_eq!(
+                query_form, expected_form,
+                "{context}: ranked query form changed: {close}",
+            );
+            assert_eq!(
+                cache_lookup, expected_lookup,
+                "{context}: cache lookup disposition changed: {close}",
+            );
+            assert!(
+                close.contains("duration_us=") && trace_field_u64(close, "result_count").is_some(),
+                "{context}: successful ranked query close lacks timing or result count: {close}",
+            );
+        }
+    }
+
+    #[cfg(feature = "tantivy-oracle")]
     fn assert_score_trace_contract(score: &str, context: &str) {
         let plan = trace_field_text(score, "plan")
             .unwrap_or_else(|| panic!("{context}: score span omitted plan: {score}"));
@@ -7453,7 +7563,9 @@ mod tests {
 
     #[cfg(feature = "tantivy-oracle")]
     fn assert_harvested_query_trace_contract(logs: &str, golden: &E410RankGolden) {
-        use frankensearch_quill::tracing_conventions::{ARGUS_COLLECT, ARGUS_PARSE, ARGUS_SCORE};
+        use frankensearch_quill::tracing_conventions::{
+            ARGUS_COLLECT, ARGUS_PARSE, ARGUS_QUERY, ARGUS_SCORE,
+        };
 
         for case in &golden.cases {
             let query_lines = logs
@@ -7475,7 +7587,64 @@ mod tests {
                 }),
                 "{context}: trace omitted replay provenance",
             );
-            let parse = query_lines
+            let ranked_lines = query_lines
+                .iter()
+                .copied()
+                .filter(|line| trace_field_text(line, "collector") != Some("docset"))
+                .collect::<Vec<_>>();
+            let query_closes = ranked_lines
+                .iter()
+                .copied()
+                .filter(|line| is_stage_close(line, ARGUS_QUERY))
+                .collect::<Vec<_>>();
+            assert!(
+                !query_closes.is_empty(),
+                "{context}: missing ranked query close record",
+            );
+            let query_contracts = query_closes
+                .iter()
+                .map(|close| {
+                    assert!(
+                        close.contains("duration_us=")
+                            && trace_field_u64(close, "result_count").is_some(),
+                        "{context}: successful ranked query close lacks timing or result count: {close}",
+                    );
+                    let contract = trace_ranked_query_contract(close, &context);
+                    assert_eq!(
+                        contract.0,
+                        RankedQueryForm::Raw,
+                        "{context}: harvested string query did not report raw form: {close}",
+                    );
+                    assert!(
+                        matches!(
+                            contract.1,
+                            RankedQueryCacheLookup::Miss | RankedQueryCacheLookup::Hit
+                        ),
+                        "{context}: successful cache-enabled fixture reported {:?}: {close}",
+                        contract.1,
+                    );
+                    contract
+                })
+                .collect::<Vec<_>>();
+            let executed = query_contracts
+                .iter()
+                .any(|(_, lookup)| *lookup == RankedQueryCacheLookup::Miss);
+            if !executed {
+                assert!(
+                    query_contracts
+                        .iter()
+                        .all(|(_, lookup)| *lookup == RankedQueryCacheLookup::Hit),
+                    "{context}: child-stage suppression is valid only for authenticated cache hits",
+                );
+                for stage in [ARGUS_PARSE, ARGUS_SCORE, ARGUS_COLLECT] {
+                    assert!(
+                        !ranked_lines.iter().any(|line| is_stage_close(line, stage)),
+                        "{context}: cache-hit-only execution emitted impossible {stage} work",
+                    );
+                }
+                continue;
+            }
+            let parse = ranked_lines
                 .iter()
                 .copied()
                 .find(|line| is_stage_close(line, ARGUS_PARSE))
@@ -7488,7 +7657,7 @@ mod tests {
                     && parse.contains("duration_us="),
                 "{context}: parse trace lacks tree shape or timing: {parse}",
             );
-            let score_lines = query_lines
+            let score_lines = ranked_lines
                 .iter()
                 .copied()
                 .filter(|line| is_stage_close(line, ARGUS_SCORE))
@@ -7504,7 +7673,7 @@ mod tests {
                     "{context}: score trace omitted timing: {score}",
                 );
             }
-            let collect = query_lines
+            let collect = ranked_lines
                 .iter()
                 .copied()
                 .find(|line| is_stage_close(line, ARGUS_COLLECT))
@@ -7653,6 +7822,22 @@ mod tests {
             }),
             "live G1a trace did not execute Quill's independent count-only evidence: {logs}",
         );
+
+        assert_ranked_query_cache_fixture(
+            logs,
+            "multi-term",
+            RankedQueryForm::Raw,
+            RankedQueryCacheLookup::Miss,
+        );
+        // `harvested-00` deliberately replays the identical raw query and
+        // collector shapes executed earlier by `multi-term`.
+        assert_ranked_query_cache_fixture(
+            logs,
+            "harvested-00",
+            RankedQueryForm::Raw,
+            RankedQueryCacheLookup::Hit,
+        );
+
         let golden: E410RankGolden = serde_json::from_str(E410_RANK_GOLDEN_JSON)
             .expect("parse committed E4.10 rank-list golden for trace contract");
         assert_harvested_query_trace_contract(logs, &golden);
@@ -8821,7 +9006,7 @@ mod tests {
             } else {
                 &mut candidate["events"][0]["event"][field]
             };
-            *target = serde_json::Value::String("é".repeat(128));
+            *target = serde_json::Value::String("e\u{301}".repeat(128));
             assert_contract(&candidate, false, &format!("non-ASCII multibyte {field}"));
         }
 
@@ -9652,7 +9837,9 @@ mod tests {
                         && entry.filename.bytes().all(|byte| {
                             byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.')
                         })
-                        && entry.filename.ends_with(".json"),
+                        && std::path::Path::new(&entry.filename)
+                            .extension()
+                            .is_some_and(|extension| extension == "json"),
                     "UNION_HORIZON completion contains an unsafe artifact filename",
                 );
                 assert_lower_hex(
@@ -10612,7 +10799,7 @@ mod tests {
         subject
             .index_mut()
             .expect("tombstoned UNION_HORIZON Quill index")
-            .index_documents(cx, &documents)
+            .index_documents_with_scalar_topology_conformance(cx, &documents)
             .await
             .expect("index tombstoned UNION_HORIZON Quill segment");
         subject
@@ -10914,7 +11101,9 @@ mod tests {
         );
         value
             .as_bytes()
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|pair| {
                 let high = char::from(pair[0])
                     .to_digit(16)
@@ -10945,7 +11134,7 @@ mod tests {
         );
         let mut hasher = Sha256::new();
         let mut byte_len = 0_u64;
-        let mut buffer = [0_u8; 64 * 1024];
+        let mut buffer = vec![0_u8; 64 * 1024].into_boxed_slice();
         loop {
             let read = file
                 .read(&mut buffer)
@@ -11515,7 +11704,7 @@ mod tests {
             subject
                 .index_mut()
                 .expect("UNION_HORIZON Quill index")
-                .index_documents(cx, &documents)
+                .index_documents_with_scalar_topology_conformance(cx, &documents)
                 .await
                 .expect("index UNION_HORIZON Quill segment");
             subject
@@ -11775,7 +11964,7 @@ mod tests {
                 )
             }
             (None, Ok(_) | Err(std::env::VarError::NotUnicode(_))) => {
-                panic!("{ARTIFACT_ROOT_ENV} must be configured when {RUN_ID_ENV} is present",)
+                panic!("{ARTIFACT_ROOT_ENV} must be configured when {RUN_ID_ENV} is present")
             }
         }
     }
@@ -14275,7 +14464,7 @@ mod tests {
             .unwrap_or_else(|error| panic!("open independently hashed test executable: {error}"));
         let mut independent_hasher = Sha256::new();
         let mut independent_len = 0_u64;
-        let mut independent_buffer = [0_u8; 17 * 1024 + 3];
+        let mut independent_buffer = vec![0_u8; 17 * 1024 + 3].into_boxed_slice();
         loop {
             let read = executable
                 .read(&mut independent_buffer)
@@ -14427,9 +14616,7 @@ mod tests {
             directory
                 .entry_names(4)
                 .expect("list pinned no-replace directory"),
-            [std::ffi::OsString::from(target_name)]
-                .into_iter()
-                .collect(),
+            std::iter::once(std::ffi::OsString::from(target_name)).collect(),
             "failed no-replace publication must not create a staging entry",
         );
     }

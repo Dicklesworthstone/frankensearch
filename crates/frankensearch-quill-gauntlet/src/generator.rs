@@ -1838,7 +1838,7 @@ impl QueryManifest {
 
 /// Validate an archived query generator identity through an immutable,
 /// version-specific protocol route.
-pub(crate) fn validate_stored_query_generator_identity(
+pub fn validate_stored_query_generator_identity(
     schema_version: u32,
     generator_id: &str,
 ) -> Result<(), GauntletError> {
@@ -1850,7 +1850,7 @@ pub(crate) fn validate_stored_query_generator_identity(
     }
 }
 
-pub(crate) fn is_supported_stored_generator_id(generator_id: &str) -> bool {
+pub fn is_supported_stored_generator_id(generator_id: &str) -> bool {
     matches!(generator_id, GENERATOR_V2_ID)
 }
 
