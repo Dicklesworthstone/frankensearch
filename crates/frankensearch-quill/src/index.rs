@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicBool, AtomicU8};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use arc_swap::ArcSwap;
+use arc_swap::{ArcSwap, ArcSwapOption};
 use asupersync::Cx;
 use asupersync::runtime::spawn_blocking;
 use asupersync::sync::{LockError, Mutex, OwnedMutexGuard, TryLockError};
@@ -242,6 +242,336 @@ pub struct QuillSearchResult {
     pub doc_count: u64,
     /// Lenient parser recovery diagnostics.
     pub diagnostics: Vec<QueryDiagnostic>,
+}
+
+const RANKED_QUERY_CACHE_SETS: usize = 64;
+const RANKED_QUERY_CACHE_WAYS: usize = 4;
+const RANKED_QUERY_CACHE_SLOTS: usize = RANKED_QUERY_CACHE_SETS * RANKED_QUERY_CACHE_WAYS;
+
+enum RankedQueryCacheKey {
+    Raw(Arc<str>),
+    Preparsed(Arc<Query>),
+}
+
+struct CachedRankedQuery {
+    fingerprint: u64,
+    snapshot_epoch: u64,
+    limit: usize,
+    offset: usize,
+    exact_count: bool,
+    key: RankedQueryCacheKey,
+    result: Arc<QuillSearchResult>,
+}
+
+/// Small lock-free memo table for immutable-snapshot searches.
+///
+/// Exact keys are retained alongside their fingerprints, so collisions only
+/// cost a miss. Snapshot epochs make publication the invalidation boundary.
+/// The fixed four-way table bounds memory without adding reader coordination.
+struct RankedQueryCache {
+    slots: [ArcSwapOption<CachedRankedQuery>; RANKED_QUERY_CACHE_SLOTS],
+}
+
+impl Default for RankedQueryCache {
+    fn default() -> Self {
+        Self {
+            slots: std::array::from_fn(|_| ArcSwapOption::empty()),
+        }
+    }
+}
+
+impl RankedQueryCache {
+    fn get_raw(
+        &self,
+        snapshot_epoch: u64,
+        query: &str,
+        limit: usize,
+        offset: usize,
+        exact_count: bool,
+    ) -> Option<QuillSearchResult> {
+        let fingerprint =
+            raw_query_cache_fingerprint(snapshot_epoch, query, limit, offset, exact_count);
+        self.find(fingerprint, |cached| {
+            cached.snapshot_epoch == snapshot_epoch
+                && cached.limit == limit
+                && cached.offset == offset
+                && cached.exact_count == exact_count
+                && matches!(&cached.key, RankedQueryCacheKey::Raw(key) if key.as_ref() == query)
+        })
+    }
+
+    fn get_preparsed(
+        &self,
+        snapshot_epoch: u64,
+        query: &Query,
+        limit: usize,
+        offset: usize,
+        exact_count: bool,
+    ) -> Option<QuillSearchResult> {
+        let fingerprint =
+            preparsed_query_cache_fingerprint(snapshot_epoch, query, limit, offset, exact_count);
+        self.find(fingerprint, |cached| {
+            cached.snapshot_epoch == snapshot_epoch
+                && cached.limit == limit
+                && cached.offset == offset
+                && cached.exact_count == exact_count
+                && matches!(&cached.key, RankedQueryCacheKey::Preparsed(key) if key.as_ref() == query)
+        })
+    }
+
+    fn find(
+        &self,
+        fingerprint: u64,
+        exact_match: impl Fn(&CachedRankedQuery) -> bool,
+    ) -> Option<QuillSearchResult> {
+        let start = ranked_query_cache_set_start(fingerprint);
+        let set = self
+            .slots
+            .get(start..start.checked_add(RANKED_QUERY_CACHE_WAYS)?)?;
+        for slot in set {
+            let Some(cached) = slot.load_full() else {
+                continue;
+            };
+            if cached.fingerprint == fingerprint && exact_match(cached.as_ref()) {
+                return Some(cached.result.as_ref().clone());
+            }
+        }
+        None
+    }
+
+    fn insert_raw(
+        &self,
+        snapshot_epoch: u64,
+        query: &str,
+        limit: usize,
+        offset: usize,
+        exact_count: bool,
+        result: &QuillSearchResult,
+    ) {
+        let fingerprint =
+            raw_query_cache_fingerprint(snapshot_epoch, query, limit, offset, exact_count);
+        self.insert(Arc::new(CachedRankedQuery {
+            fingerprint,
+            snapshot_epoch,
+            limit,
+            offset,
+            exact_count,
+            key: RankedQueryCacheKey::Raw(Arc::from(query)),
+            result: Arc::new(result.clone()),
+        }));
+    }
+
+    fn insert_preparsed(
+        &self,
+        snapshot_epoch: u64,
+        query: &Query,
+        limit: usize,
+        offset: usize,
+        exact_count: bool,
+        result: &QuillSearchResult,
+    ) {
+        let fingerprint =
+            preparsed_query_cache_fingerprint(snapshot_epoch, query, limit, offset, exact_count);
+        self.insert(Arc::new(CachedRankedQuery {
+            fingerprint,
+            snapshot_epoch,
+            limit,
+            offset,
+            exact_count,
+            key: RankedQueryCacheKey::Preparsed(Arc::new(query.clone())),
+            result: Arc::new(result.clone()),
+        }));
+    }
+
+    fn insert(&self, cached: Arc<CachedRankedQuery>) {
+        let start = ranked_query_cache_set_start(cached.fingerprint);
+        let Some(end) = start.checked_add(RANKED_QUERY_CACHE_WAYS) else {
+            return;
+        };
+        let Some(set) = self.slots.get(start..end) else {
+            return;
+        };
+        if let Some(slot) = set.iter().find(|slot| slot.load().is_none()) {
+            slot.store(Some(cached));
+            return;
+        }
+        let [_, replacement_byte, ..] = cached.fingerprint.to_le_bytes();
+        let replacement = usize::from(replacement_byte) & (RANKED_QUERY_CACHE_WAYS - 1);
+        if let Some(slot) = set.get(replacement) {
+            slot.store(Some(cached));
+        }
+    }
+}
+
+fn ranked_query_cache_set_start(fingerprint: u64) -> usize {
+    let [set_byte, ..] = fingerprint.to_le_bytes();
+    let set = usize::from(set_byte) & (RANKED_QUERY_CACHE_SETS - 1);
+    set * RANKED_QUERY_CACHE_WAYS
+}
+
+fn raw_query_cache_fingerprint(
+    snapshot_epoch: u64,
+    query: &str,
+    limit: usize,
+    offset: usize,
+    exact_count: bool,
+) -> u64 {
+    let mut hasher = ranked_query_cache_hasher(snapshot_epoch, limit, offset, exact_count);
+    hasher.update(&[0]);
+    hash_query_cache_bytes(&mut hasher, query.as_bytes());
+    hasher.digest()
+}
+
+fn preparsed_query_cache_fingerprint(
+    snapshot_epoch: u64,
+    query: &Query,
+    limit: usize,
+    offset: usize,
+    exact_count: bool,
+) -> u64 {
+    let mut hasher = ranked_query_cache_hasher(snapshot_epoch, limit, offset, exact_count);
+    hasher.update(&[1]);
+    hash_exact_query(&mut hasher, query);
+    hasher.digest()
+}
+
+fn ranked_query_cache_hasher(
+    snapshot_epoch: u64,
+    limit: usize,
+    offset: usize,
+    exact_count: bool,
+) -> Xxh3 {
+    let mut hasher = Xxh3::new();
+    hasher.update(b"frankensearch.quill.ranked-query-cache.v1\0");
+    hasher.update(&snapshot_epoch.to_le_bytes());
+    hasher.update(&u64::try_from(limit).unwrap_or(u64::MAX).to_le_bytes());
+    hasher.update(&u64::try_from(offset).unwrap_or(u64::MAX).to_le_bytes());
+    hasher.update(&[u8::from(exact_count)]);
+    hasher
+}
+
+fn hash_query_cache_bytes(hasher: &mut Xxh3, bytes: &[u8]) {
+    hasher.update(&u64::try_from(bytes.len()).unwrap_or(u64::MAX).to_le_bytes());
+    hasher.update(bytes);
+}
+
+fn hash_query_cache_len(hasher: &mut Xxh3, len: usize) {
+    hasher.update(&u64::try_from(len).unwrap_or(u64::MAX).to_le_bytes());
+}
+
+fn hash_query_cache_value(hasher: &mut Xxh3, value: &QueryValue) {
+    match value {
+        QueryValue::I64(value) => {
+            hasher.update(&[0]);
+            hasher.update(&value.to_le_bytes());
+        }
+        QueryValue::U64(value) => {
+            hasher.update(&[1]);
+            hasher.update(&value.to_le_bytes());
+        }
+        QueryValue::Str(value) => {
+            hasher.update(&[2]);
+            hash_query_cache_bytes(hasher, value.as_bytes());
+        }
+    }
+}
+
+fn hash_query_cache_bound(hasher: &mut Xxh3, bound: &Bound<QueryValue>) {
+    match bound {
+        Bound::Included(value) => {
+            hasher.update(&[0]);
+            hash_query_cache_value(hasher, value);
+        }
+        Bound::Excluded(value) => {
+            hasher.update(&[1]);
+            hash_query_cache_value(hasher, value);
+        }
+        Bound::Unbounded => hasher.update(&[2]),
+    }
+}
+
+fn hash_exact_query(hasher: &mut Xxh3, query: &Query) {
+    match query {
+        Query::Empty => hasher.update(&[0]),
+        Query::All => hasher.update(&[1]),
+        Query::Term { fields, text } => {
+            hasher.update(&[2]);
+            hash_query_cache_len(hasher, fields.len());
+            for field in fields {
+                hasher.update(&field.field_id.to_le_bytes());
+                hasher.update(&field.boost.to_bits().to_le_bytes());
+            }
+            hash_query_cache_bytes(hasher, text.as_bytes());
+        }
+        Query::Phrase {
+            fields,
+            terms,
+            slop,
+            prefix,
+        } => {
+            hasher.update(&[3]);
+            hash_query_cache_len(hasher, fields.len());
+            for field in fields {
+                hasher.update(&field.field_id.to_le_bytes());
+                hasher.update(&field.boost.to_bits().to_le_bytes());
+            }
+            hash_query_cache_len(hasher, terms.len());
+            for term in terms {
+                hasher.update(&term.position.to_le_bytes());
+                hash_query_cache_bytes(hasher, term.text.as_bytes());
+            }
+            hasher.update(&slop.to_le_bytes());
+            hasher.update(&[u8::from(*prefix)]);
+        }
+        Query::Boolean { clauses, operator } => {
+            hasher.update(&[4]);
+            hasher.update(&[match operator {
+                None => 0,
+                Some(BooleanOperator::And) => 1,
+                Some(BooleanOperator::Or) => 2,
+            }]);
+            hash_query_cache_len(hasher, clauses.len());
+            for clause in clauses {
+                hasher.update(&[match clause.occur {
+                    Occur::Must => 0,
+                    Occur::Should => 1,
+                    Occur::MustNot => 2,
+                }]);
+                hash_exact_query(hasher, &clause.query);
+            }
+        }
+        Query::Range {
+            field_id,
+            lower,
+            upper,
+        } => {
+            hasher.update(&[5]);
+            hasher.update(&field_id.to_le_bytes());
+            hash_query_cache_bound(hasher, lower);
+            hash_query_cache_bound(hasher, upper);
+        }
+        Query::Set { field_id, values } => {
+            hasher.update(&[6]);
+            hasher.update(&field_id.to_le_bytes());
+            hash_query_cache_len(hasher, values.len());
+            for value in values {
+                hash_query_cache_value(hasher, value);
+            }
+        }
+        Query::Glob { field_ids, pattern } => {
+            hasher.update(&[7]);
+            hash_query_cache_len(hasher, field_ids.len());
+            for field_id in field_ids {
+                hasher.update(&field_id.to_le_bytes());
+            }
+            hash_query_cache_bytes(hasher, pattern.as_bytes());
+        }
+        Query::Boost { query, factor } => {
+            hasher.update(&[8]);
+            hasher.update(&factor.to_bits().to_le_bytes());
+            hash_exact_query(hasher, query);
+        }
+    }
 }
 
 /// Typed failure from process-local Keeper plus Delta snapshot composition.
@@ -822,6 +1152,7 @@ struct PreparedSealedPublication {
 /// [`Self::publish_complete`] to replace Keeper and every Delta in one swap.
 pub struct SnapshotPublisher {
     current: ArcSwap<QuillSearchSnapshot>,
+    ranked_query_cache: RankedQueryCache,
 }
 
 impl SnapshotPublisher {
@@ -838,6 +1169,7 @@ impl SnapshotPublisher {
         let initial = Arc::new(QuillSearchSnapshot::compose(0, keeper, deltas)?);
         Ok(Self {
             current: ArcSwap::new(initial),
+            ranked_query_cache: RankedQueryCache::default(),
         })
     }
 
@@ -1398,6 +1730,10 @@ impl ConformanceCancellationController {
     #[must_use]
     pub fn fired(&self) -> bool {
         self.fired.load(Ordering::Acquire)
+    }
+
+    fn is_armed(&self) -> bool {
+        self.stage.load(Ordering::Acquire) != Self::DISARMED
     }
 
     fn checkpoint(&self, stage: ConformanceCancellationStage, cx: &Cx) {
@@ -4027,6 +4363,18 @@ impl QuillWriterState {
 }
 
 impl QuillReader {
+    #[inline]
+    fn ranked_query_cache_enabled(&self) -> bool {
+        #[cfg(feature = "conformance-internals")]
+        {
+            !self.conformance_controller.is_armed()
+        }
+        #[cfg(not(feature = "conformance-internals"))]
+        {
+            true
+        }
+    }
+
     #[cfg(not(feature = "conformance-internals"))]
     #[inline]
     #[allow(
@@ -4119,6 +4467,25 @@ impl QuillReader {
         let _query_timer = crate::tracing_conventions::StageTimer::new(&query_span);
         let _query_entered = query_span.enter();
         check_cancel(cx, "search")?;
+        let cache_enabled = self.ranked_query_cache_enabled();
+        if cache_enabled
+            && let Some(result) = self.published_snapshot.ranked_query_cache.get_raw(
+                snapshot.snapshot_epoch(),
+                query,
+                limit,
+                offset,
+                exact_count,
+            )
+        {
+            query_span.record(
+                "result_count",
+                u64::try_from(result.hits.len()).unwrap_or(u64::MAX),
+            );
+            if let Some(total_count) = result.total_count {
+                query_span.record("total_count", total_count);
+            }
+            return Ok(result);
+        }
         let parsed = {
             let parse_span = tracing::info_span!(
                 target: crate::tracing_conventions::TARGET,
@@ -4172,6 +4539,16 @@ impl QuillReader {
         query_span.record("result_count", result_count);
         if let Some(total_count) = result.total_count {
             query_span.record("total_count", total_count);
+        }
+        if cache_enabled {
+            self.published_snapshot.ranked_query_cache.insert_raw(
+                snapshot.snapshot_epoch(),
+                query,
+                limit,
+                offset,
+                exact_count,
+                &result,
+            );
         }
         Ok(result)
     }
@@ -4316,10 +4693,22 @@ impl QuillReader {
         exact_count: bool,
     ) -> Result<QuillSearchResult, QuillIndexError> {
         check_cancel(cx, "search_preparsed")?;
+        let published = self.published_snapshot.load();
+        let cache_enabled = self.ranked_query_cache_enabled();
+        if cache_enabled
+            && let Some(result) = self.published_snapshot.ranked_query_cache.get_preparsed(
+                published.snapshot_epoch(),
+                query,
+                limit,
+                offset,
+                exact_count,
+            )
+        {
+            return Ok(result);
+        }
         let mut canonical = query.clone();
         let _canonicalization = canonicalize_query(&mut canonical);
-        let published = self.published_snapshot.load();
-        self.execute_ranked_query(
+        let result = self.execute_ranked_query(
             cx,
             &canonical,
             published.as_ref(),
@@ -4327,7 +4716,18 @@ impl QuillReader {
             offset,
             exact_count,
             Vec::new(),
-        )
+        )?;
+        if cache_enabled {
+            self.published_snapshot.ranked_query_cache.insert_preparsed(
+                published.snapshot_epoch(),
+                query,
+                limit,
+                offset,
+                exact_count,
+                &result,
+            );
+        }
+        Ok(result)
     }
 
     /// Execute one already-built query tree through the scoreless id-set path.
@@ -8942,6 +9342,60 @@ mod tests {
             deterministic_ingest: true,
             ..QuillConfig::default()
         }
+    }
+
+    #[test]
+    fn ranked_query_cache_requires_an_exact_key_and_snapshot_epoch() {
+        let cache = RankedQueryCache::default();
+        let raw_result = QuillSearchResult {
+            hits: vec![QuillHit {
+                document_id: "raw-hit".to_owned(),
+                global_docid: 7,
+                score: 3.5,
+            }],
+            total_count: None,
+            doc_count: 11,
+            diagnostics: Vec::new(),
+        };
+        cache.insert_raw(4, "rust", 10, 2, false, &raw_result);
+
+        assert_eq!(cache.get_raw(4, "rust", 10, 2, false), Some(raw_result));
+        assert!(cache.get_raw(5, "rust", 10, 2, false).is_none());
+        assert!(cache.get_raw(4, "Rust", 10, 2, false).is_none());
+        assert!(cache.get_raw(4, "rust", 11, 2, false).is_none());
+        assert!(cache.get_raw(4, "rust", 10, 3, false).is_none());
+        assert!(cache.get_raw(4, "rust", 10, 2, true).is_none());
+
+        let query = Query::Boost {
+            query: Box::new(Query::All),
+            factor: 2.0,
+        };
+        let preparsed_result = QuillSearchResult {
+            hits: Vec::new(),
+            total_count: Some(11),
+            doc_count: 11,
+            diagnostics: Vec::new(),
+        };
+        cache.insert_preparsed(4, &query, 0, 0, true, &preparsed_result);
+        assert_eq!(
+            cache.get_preparsed(4, &query, 0, 0, true),
+            Some(preparsed_result)
+        );
+        assert!(cache.get_preparsed(5, &query, 0, 0, true).is_none());
+        assert!(
+            cache
+                .get_preparsed(
+                    4,
+                    &Query::Boost {
+                        query: Box::new(Query::All),
+                        factor: 2.5,
+                    },
+                    0,
+                    0,
+                    true,
+                )
+                .is_none()
+        );
     }
 
     fn fuel_diagnostics(error: &QuillIndexError) -> (u64, u64, u64, u64, u64, u64) {
