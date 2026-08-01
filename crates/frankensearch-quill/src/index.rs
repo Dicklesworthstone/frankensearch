@@ -10710,9 +10710,10 @@ mod tests {
                 full_validations_after, 1,
                 "no query path may repeat complete TERMDICT validation"
             );
-            assert!(
-                borrowed_views_after >= borrowed_views_before.saturating_add(35),
-                "doc-frequency, two cursor opens, and 32 searches must use borrowed views"
+            assert_eq!(
+                borrowed_views_after,
+                borrowed_views_before.saturating_add(4),
+                "doc-frequency, two cursor opens, and the first search must borrow views; the remaining 31 searches must use the immutable-snapshot result cache"
             );
         });
     }
