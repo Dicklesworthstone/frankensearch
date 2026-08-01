@@ -2016,6 +2016,7 @@ impl NumericFieldColumns {
 #[derive(Debug)]
 pub struct ColumnarAccumulator<A = FrankensearchTokenizer> {
     schema: SchemaDescriptor,
+    default_document_layout: bool,
     terms: TermInterner,
     fields: Vec<FieldTokenColumns>,
     numeric_fields: Vec<NumericFieldColumns>,
@@ -2040,6 +2041,38 @@ impl ColumnarAccumulator<FrankensearchTokenizer> {
 }
 
 impl<A: TokenAnalyzer> ColumnarAccumulator<A> {
+    fn is_default_document_layout(schema: SchemaDescriptor) -> bool {
+        schema.fields.len() == 5
+            && matches!(schema.fields[0].kind, FieldKind::Keyword)
+            && schema.fields[0].stored
+            && matches!(
+                schema.fields[1].kind,
+                FieldKind::Text {
+                    analyzer: AnalyzerKind::FrankensearchDefault,
+                    ..
+                }
+            )
+            && schema.fields[1].stored
+            && matches!(
+                schema.fields[2].kind,
+                FieldKind::Text {
+                    analyzer: AnalyzerKind::FrankensearchDefault,
+                    ..
+                }
+            )
+            && schema.fields[2].stored
+            && matches!(schema.fields[3].kind, FieldKind::StoredOnly)
+            && schema.fields[3].stored
+            && matches!(
+                schema.fields[4].kind,
+                FieldKind::U64 {
+                    indexed: false,
+                    fast: true
+                }
+            )
+            && schema.fields[4].stored
+    }
+
     /// Create an empty accumulator with an injected analyzer implementation.
     ///
     /// This is the stable scalar/SIMD swap seam. One family may advertise
@@ -2099,6 +2132,7 @@ impl<A: TokenAnalyzer> ColumnarAccumulator<A> {
             .collect();
         Ok(Self {
             schema,
+            default_document_layout: Self::is_default_document_layout(schema),
             terms: TermInterner::new(),
             fields,
             numeric_fields,
@@ -2207,6 +2241,219 @@ impl<A: TokenAnalyzer> ColumnarAccumulator<A> {
         );
         let _accumulate_timer = crate::tracing_conventions::StageTimer::new(&accumulate_span);
         let _accumulate_entered = accumulate_span.enter();
+        let (admitted_tokens, oversized_tokens) = self.add_document_with_values_inner::<true>(
+            doc_ord,
+            values,
+            numeric_values,
+            stored_values,
+        )?;
+        let arena_bytes_used = self.bytes_used();
+        let arena_bytes_reserved = self.bytes_reserved();
+        accumulate_span.record(
+            "doc_count",
+            u64::try_from(self.document_ords.len()).unwrap_or(u64::MAX),
+        );
+        accumulate_span.record("result_count", 1_u64);
+        accumulate_span.record("admitted_tokens", admitted_tokens);
+        accumulate_span.record("oversized_tokens", oversized_tokens);
+        accumulate_span.record(
+            "token_count",
+            u64::try_from(self.token_count()).unwrap_or(u64::MAX),
+        );
+        accumulate_span.record(
+            "arena_bytes_used_high_water",
+            u64::try_from(arena_bytes_used).unwrap_or(u64::MAX),
+        );
+        accumulate_span.record(
+            "arena_bytes_reserved_high_water",
+            u64::try_from(arena_bytes_reserved).unwrap_or(u64::MAX),
+        );
+        tracing::info!(
+            target: crate::tracing_conventions::TARGET,
+            phase = "accumulate.complete",
+            doc_count = self.document_ords.len(),
+            admitted_tokens,
+            oversized_tokens,
+            arena_bytes_used,
+            arena_bytes_reserved,
+            "scalar document accumulated"
+        );
+        Ok(DocumentAccumulation {
+            admitted_tokens,
+            oversized_tokens,
+            bytes_reserved: arena_bytes_reserved,
+            bytes_used: arena_bytes_used,
+        })
+    }
+
+    /// Production ingest path that defers exact accumulator telemetry to the
+    /// surrounding batch or flush boundary.
+    ///
+    /// Logical and retained capacity are monotone between accumulator resets.
+    /// Measuring both immediately before every reset and once after the batch
+    /// preserves their exact high-water marks while removing document and
+    /// tokenization spans, timers, and whole-accumulator scans from hot ingest.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same validation and capacity errors as
+    /// [`Self::add_document_with_values`].
+    pub(crate) fn add_document_with_values_deferred_telemetry(
+        &mut self,
+        doc_ord: u32,
+        values: &[IndexedFieldValue<'_>],
+        numeric_values: &[IndexedNumericValue],
+        stored_values: &[StoredFieldValue<'_>],
+    ) -> Result<(), AccumulatorError> {
+        if self.default_document_layout
+            && let [id, content, title] = values
+            && id.field_ord == 0
+            && content.field_ord == 1
+            && title.field_ord == 2
+            && let [ordinal] = numeric_values
+            && ordinal.field_ord == 4
+            && let NumericValue::U64(global_docid) = ordinal.value
+            && let [metadata] = stored_values
+            && metadata.field_ord == 3
+        {
+            return self
+                .add_default_document_deferred(
+                    doc_ord,
+                    id.text,
+                    content.text,
+                    title.text,
+                    global_docid,
+                    metadata.bytes,
+                )
+                .map(|_| ());
+        }
+        self.add_document_with_values_inner::<false>(doc_ord, values, numeric_values, stored_values)
+            .map(|_| ())
+    }
+
+    fn add_default_document_deferred(
+        &mut self,
+        doc_ord: u32,
+        id: &str,
+        content: &str,
+        title: &str,
+        global_docid: u64,
+        metadata: &[u8],
+    ) -> Result<(u64, u64), AccumulatorError> {
+        if doc_ord >= DOC_ORDS_PER_LEASE {
+            return Err(AccumulatorError::DocumentOutsideLease { doc_ord });
+        }
+        if let Some(previous) = self.last_doc_ord
+            && doc_ord <= previous
+        {
+            return Err(AccumulatorError::OutOfOrderDocument {
+                previous,
+                current: doc_ord,
+            });
+        }
+        if self.document_ords.len() == u32::MAX as usize {
+            return Err(AccumulatorError::TooManyDocuments);
+        }
+
+        for (field_ord, text) in [(0_u16, id), (1, content), (2, title)] {
+            if u32::try_from(text.len()).is_err() {
+                return Err(AccumulatorError::SourceTooLarge {
+                    field_ord,
+                    bytes: text.len(),
+                });
+            }
+        }
+        if u32::try_from(metadata.len()).is_err() {
+            return Err(AccumulatorError::StoredValueTooLarge {
+                field_ord: 3,
+                bytes: metadata.len(),
+            });
+        }
+        let stored_lengths = [
+            id.len(),
+            content.len(),
+            title.len(),
+            metadata.len(),
+            std::mem::size_of::<u64>(),
+        ];
+        for (field, appended) in self.stored_fields.iter().zip(stored_lengths) {
+            if !field.can_append_len(Some(appended)) {
+                return Err(AccumulatorError::StoredBlobTooLarge {
+                    field_ord: field.field_ord,
+                    current: field.blob.len(),
+                    appended,
+                });
+            }
+        }
+
+        for field in &mut self.fields {
+            field.begin_document();
+        }
+
+        let (id_length, mut oversized_tokens) = if id.len() > MAX_TERM_BYTES {
+            tracing::warn!(
+                field_ord = 0_u16,
+                token_bytes = id.len(),
+                max_token_bytes = MAX_TERM_BYTES,
+                "Quill dropped an oversized keyword token"
+            );
+            (0_u32, 1_u64)
+        } else {
+            let term_id = self.terms.intern(0, id.as_bytes());
+            self.fields[0].append_token(term_id, doc_ord, 0);
+            (1, 0)
+        };
+        self.fields[0].finish_document_field(id_length);
+        let mut admitted_tokens = u64::from(id_length);
+
+        for (field_index, text) in [(1_usize, content), (2, title)] {
+            let field_ord = u16::try_from(field_index).expect("default field ordinal fits u16");
+            let FieldKind::Text { analyzer, .. } = self.schema.fields[field_index].kind else {
+                unreachable!("default ingest layout has analyzed content and title fields");
+            };
+            let report = {
+                let terms = &mut self.terms;
+                let column = &mut self.fields[field_index];
+                analyze_admitted(&mut self.analyzer, analyzer, text, &mut |token| {
+                    let term_id = terms.intern(field_ord, token.text.as_bytes());
+                    column.append_token(term_id, doc_ord, token.position);
+                })
+                .expect("constructor validated the default analyzer family")
+            };
+            let length = u32::try_from(report.admitted_tokens)
+                .expect("validated source length bounds admitted token count to u32");
+            self.fields[field_index].finish_document_field(length);
+            admitted_tokens = admitted_tokens.saturating_add(u64::from(length));
+            oversized_tokens = oversized_tokens.saturating_add(
+                u64::try_from(report.oversized_tokens).expect("token count always fits u64"),
+            );
+        }
+
+        self.numeric_fields[0].append_document(Some(NumericValue::U64(global_docid)));
+        let ordinal_bytes = global_docid.to_le_bytes();
+        let stored_values: [&[u8]; 5] = [
+            id.as_bytes(),
+            content.as_bytes(),
+            title.as_bytes(),
+            metadata,
+            &ordinal_bytes,
+        ];
+        for (field, value) in self.stored_fields.iter_mut().zip(stored_values) {
+            field.append_document(Some(value));
+        }
+
+        self.document_ords.push(doc_ord);
+        self.last_doc_ord = Some(doc_ord);
+        Ok((admitted_tokens, oversized_tokens))
+    }
+
+    fn add_document_with_values_inner<const INSTRUMENT_TOKENIZATION: bool>(
+        &mut self,
+        doc_ord: u32,
+        values: &[IndexedFieldValue<'_>],
+        numeric_values: &[IndexedNumericValue],
+        stored_values: &[StoredFieldValue<'_>],
+    ) -> Result<(u64, u64), AccumulatorError> {
         if doc_ord >= DOC_ORDS_PER_LEASE {
             return Err(AccumulatorError::DocumentOutsideLease { doc_ord });
         }
@@ -2451,20 +2698,23 @@ impl<A: TokenAnalyzer> ColumnarAccumulator<A> {
                     let terms = &mut self.terms;
                     let column = &mut self.fields[field_index];
                     let report = {
-                        let tokenize_span = tracing::info_span!(
-                            target: crate::tracing_conventions::TARGET,
-                            crate::tracing_conventions::SCRIBE_TOKENIZE,
-                            phase = "tokenize",
-                            field_ord,
-                            source_bytes = value.text.len(),
-                            result_count = tracing::field::Empty,
-                            oversized_tokens = tracing::field::Empty,
-                            analyzer_bytes_reserved = tracing::field::Empty,
-                            duration_us = tracing::field::Empty,
-                        );
-                        let _tokenize_timer =
-                            crate::tracing_conventions::StageTimer::new(&tokenize_span);
-                        let _tokenize_entered = tokenize_span.enter();
+                        let tokenize_span = INSTRUMENT_TOKENIZATION.then(|| {
+                            tracing::info_span!(
+                                target: crate::tracing_conventions::TARGET,
+                                crate::tracing_conventions::SCRIBE_TOKENIZE,
+                                phase = "tokenize",
+                                field_ord,
+                                source_bytes = value.text.len(),
+                                result_count = tracing::field::Empty,
+                                oversized_tokens = tracing::field::Empty,
+                                analyzer_bytes_reserved = tracing::field::Empty,
+                                duration_us = tracing::field::Empty,
+                            )
+                        });
+                        let _tokenize_timer = tokenize_span
+                            .as_ref()
+                            .map(crate::tracing_conventions::StageTimer::new);
+                        let _tokenize_entered = tokenize_span.as_ref().map(|span| span.enter());
                         let report = analyze_admitted(
                             &mut self.analyzer,
                             analyzer,
@@ -2475,18 +2725,20 @@ impl<A: TokenAnalyzer> ColumnarAccumulator<A> {
                             },
                         )
                         .expect("document validation checked analyzer-family support");
-                        tokenize_span.record(
-                            "result_count",
-                            u64::try_from(report.admitted_tokens).unwrap_or(u64::MAX),
-                        );
-                        tokenize_span.record(
-                            "oversized_tokens",
-                            u64::try_from(report.oversized_tokens).unwrap_or(u64::MAX),
-                        );
-                        tokenize_span.record(
-                            "analyzer_bytes_reserved",
-                            u64::try_from(self.analyzer.bytes_reserved()).unwrap_or(u64::MAX),
-                        );
+                        if let Some(tokenize_span) = &tokenize_span {
+                            tokenize_span.record(
+                                "result_count",
+                                u64::try_from(report.admitted_tokens).unwrap_or(u64::MAX),
+                            );
+                            tokenize_span.record(
+                                "oversized_tokens",
+                                u64::try_from(report.oversized_tokens).unwrap_or(u64::MAX),
+                            );
+                            tokenize_span.record(
+                                "analyzer_bytes_reserved",
+                                u64::try_from(self.analyzer.bytes_reserved()).unwrap_or(u64::MAX),
+                            );
+                        }
                         report
                     };
                     (
@@ -2533,43 +2785,7 @@ impl<A: TokenAnalyzer> ColumnarAccumulator<A> {
 
         self.document_ords.push(doc_ord);
         self.last_doc_ord = Some(doc_ord);
-        let arena_bytes_used = self.bytes_used();
-        let arena_bytes_reserved = self.bytes_reserved();
-        accumulate_span.record(
-            "doc_count",
-            u64::try_from(self.document_ords.len()).unwrap_or(u64::MAX),
-        );
-        accumulate_span.record("result_count", 1_u64);
-        accumulate_span.record("admitted_tokens", admitted_tokens);
-        accumulate_span.record("oversized_tokens", oversized_tokens);
-        accumulate_span.record(
-            "token_count",
-            u64::try_from(self.token_count()).unwrap_or(u64::MAX),
-        );
-        accumulate_span.record(
-            "arena_bytes_used_high_water",
-            u64::try_from(arena_bytes_used).unwrap_or(u64::MAX),
-        );
-        accumulate_span.record(
-            "arena_bytes_reserved_high_water",
-            u64::try_from(arena_bytes_reserved).unwrap_or(u64::MAX),
-        );
-        tracing::info!(
-            target: crate::tracing_conventions::TARGET,
-            phase = "accumulate.complete",
-            doc_count = self.document_ords.len(),
-            admitted_tokens,
-            oversized_tokens,
-            arena_bytes_used,
-            arena_bytes_reserved,
-            "scalar document accumulated"
-        );
-        Ok(DocumentAccumulation {
-            admitted_tokens,
-            oversized_tokens,
-            bytes_reserved: arena_bytes_reserved,
-            bytes_used: arena_bytes_used,
-        })
+        Ok((admitted_tokens, oversized_tokens))
     }
 
     /// Validated schema associated with the accumulator.
