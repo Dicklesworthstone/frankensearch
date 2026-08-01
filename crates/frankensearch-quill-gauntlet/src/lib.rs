@@ -10,6 +10,7 @@
 //! subject used by the G1a default-syntax campaign.
 
 mod artifact;
+mod campaign_contract;
 mod comparator;
 mod engine;
 mod generator;
@@ -157,6 +158,12 @@ pub use perf_ratchet::{
     PERF_REGRESSION_ROBUST_Z, PerfCellComparison, PerfEvidenceFile, PerfGateDecision,
     PerfRatchetEvaluation, PerfRatchetMode, PerfRatchetReason, PerfRatchetRequest,
     evaluate_perf_ratchet, is_explicit_bootstrap, is_explicit_bootstrap_for,
+};
+pub use campaign_contract::{
+    REPLACEMENT_COMPLETENESS_EXPECTED_CELL_COUNT, REPLACEMENT_COMPLETENESS_POLICY_SCHEMA_VERSION,
+    frozen_replacement_cell_keys, frozen_replacement_completeness_policy,
+    frozen_replacement_seed_bundle, frozen_replacement_seed_schedule,
+    replacement_completeness_policy_sha256, validate_replacement_completeness,
 };
 pub use qg2_contract::{
     QG2_CANONICAL_CONTRACT, QG2_CONTRACT_REPORT_SCHEMA_VERSION, QG2_LOGICAL_SURFACE_COUNT,
