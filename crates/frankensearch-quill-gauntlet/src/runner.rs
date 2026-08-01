@@ -6153,6 +6153,96 @@ mod tests {
     }
 
     #[cfg(feature = "tantivy-oracle")]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum RankedQueryForm {
+        Raw,
+        Preparsed,
+    }
+
+    #[cfg(feature = "tantivy-oracle")]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum RankedQueryCacheLookup {
+        NotChecked,
+        Disabled,
+        Miss,
+        Hit,
+    }
+
+    #[cfg(feature = "tantivy-oracle")]
+    fn trace_ranked_query_contract(
+        line: &str,
+        context: &str,
+    ) -> (RankedQueryForm, RankedQueryCacheLookup) {
+        let observed_query_form = trace_field_text(line, "query_form");
+        assert!(
+            matches!(observed_query_form, Some("raw" | "preparsed")),
+            "{context}: ranked query close has invalid query_form {observed_query_form:?}: {line}",
+        );
+        let query_form = if observed_query_form == Some("raw") {
+            RankedQueryForm::Raw
+        } else {
+            RankedQueryForm::Preparsed
+        };
+        let observed_cache_lookup = trace_field_text(line, "cache_lookup");
+        assert!(
+            matches!(
+                observed_cache_lookup,
+                Some("not_checked" | "disabled" | "miss" | "hit")
+            ),
+            "{context}: ranked query close has invalid cache_lookup {observed_cache_lookup:?}: {line}",
+        );
+        let cache_lookup = if observed_cache_lookup == Some("not_checked") {
+            RankedQueryCacheLookup::NotChecked
+        } else if observed_cache_lookup == Some("disabled") {
+            RankedQueryCacheLookup::Disabled
+        } else if observed_cache_lookup == Some("miss") {
+            RankedQueryCacheLookup::Miss
+        } else {
+            RankedQueryCacheLookup::Hit
+        };
+        (query_form, cache_lookup)
+    }
+
+    #[cfg(feature = "tantivy-oracle")]
+    fn assert_ranked_query_cache_fixture(
+        logs: &str,
+        query_id: &str,
+        expected_form: RankedQueryForm,
+        expected_lookup: RankedQueryCacheLookup,
+    ) {
+        use frankensearch_quill::tracing_conventions::ARGUS_QUERY;
+
+        let context = format!("query_id={query_id}");
+        let query_closes = logs
+            .lines()
+            .filter(|line| {
+                trace_has_text_field(line, "query_id", query_id)
+                    && is_stage_close(line, ARGUS_QUERY)
+                    && trace_field_text(line, "collector") != Some("docset")
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            !query_closes.is_empty(),
+            "{context}: missing ranked query close record",
+        );
+        for close in query_closes {
+            let (query_form, cache_lookup) = trace_ranked_query_contract(close, &context);
+            assert_eq!(
+                query_form, expected_form,
+                "{context}: ranked query form changed: {close}",
+            );
+            assert_eq!(
+                cache_lookup, expected_lookup,
+                "{context}: cache lookup disposition changed: {close}",
+            );
+            assert!(
+                close.contains("duration_us=") && trace_field_u64(close, "result_count").is_some(),
+                "{context}: successful ranked query close lacks timing or result count: {close}",
+            );
+        }
+    }
+
+    #[cfg(feature = "tantivy-oracle")]
     fn assert_score_trace_contract(score: &str, context: &str) {
         let plan = trace_field_text(score, "plan")
             .unwrap_or_else(|| panic!("{context}: score span omitted plan: {score}"));
@@ -6196,7 +6286,9 @@ mod tests {
 
     #[cfg(feature = "tantivy-oracle")]
     fn assert_harvested_query_trace_contract(logs: &str, golden: &E410RankGolden) {
-        use frankensearch_quill::tracing_conventions::{ARGUS_COLLECT, ARGUS_PARSE, ARGUS_SCORE};
+        use frankensearch_quill::tracing_conventions::{
+            ARGUS_COLLECT, ARGUS_PARSE, ARGUS_QUERY, ARGUS_SCORE,
+        };
 
         for case in &golden.cases {
             let query_lines = logs
@@ -6218,7 +6310,64 @@ mod tests {
                 }),
                 "{context}: trace omitted replay provenance",
             );
-            let parse = query_lines
+            let ranked_lines = query_lines
+                .iter()
+                .copied()
+                .filter(|line| trace_field_text(line, "collector") != Some("docset"))
+                .collect::<Vec<_>>();
+            let query_closes = ranked_lines
+                .iter()
+                .copied()
+                .filter(|line| is_stage_close(line, ARGUS_QUERY))
+                .collect::<Vec<_>>();
+            assert!(
+                !query_closes.is_empty(),
+                "{context}: missing ranked query close record",
+            );
+            let query_contracts = query_closes
+                .iter()
+                .map(|close| {
+                    assert!(
+                        close.contains("duration_us=")
+                            && trace_field_u64(close, "result_count").is_some(),
+                        "{context}: successful ranked query close lacks timing or result count: {close}",
+                    );
+                    let contract = trace_ranked_query_contract(close, &context);
+                    assert_eq!(
+                        contract.0,
+                        RankedQueryForm::Raw,
+                        "{context}: harvested string query did not report raw form: {close}",
+                    );
+                    assert!(
+                        matches!(
+                            contract.1,
+                            RankedQueryCacheLookup::Miss | RankedQueryCacheLookup::Hit
+                        ),
+                        "{context}: successful cache-enabled fixture reported {:?}: {close}",
+                        contract.1,
+                    );
+                    contract
+                })
+                .collect::<Vec<_>>();
+            let executed = query_contracts
+                .iter()
+                .any(|(_, lookup)| *lookup == RankedQueryCacheLookup::Miss);
+            if !executed {
+                assert!(
+                    query_contracts
+                        .iter()
+                        .all(|(_, lookup)| *lookup == RankedQueryCacheLookup::Hit),
+                    "{context}: child-stage suppression is valid only for authenticated cache hits",
+                );
+                for stage in [ARGUS_PARSE, ARGUS_SCORE, ARGUS_COLLECT] {
+                    assert!(
+                        !ranked_lines.iter().any(|line| is_stage_close(line, stage)),
+                        "{context}: cache-hit-only execution emitted impossible {stage} work",
+                    );
+                }
+                continue;
+            }
+            let parse = ranked_lines
                 .iter()
                 .copied()
                 .find(|line| is_stage_close(line, ARGUS_PARSE))
@@ -6231,7 +6380,7 @@ mod tests {
                     && parse.contains("duration_us="),
                 "{context}: parse trace lacks tree shape or timing: {parse}",
             );
-            let score_lines = query_lines
+            let score_lines = ranked_lines
                 .iter()
                 .copied()
                 .filter(|line| is_stage_close(line, ARGUS_SCORE))
@@ -6247,7 +6396,7 @@ mod tests {
                     "{context}: score trace omitted timing: {score}",
                 );
             }
-            let collect = query_lines
+            let collect = ranked_lines
                 .iter()
                 .copied()
                 .find(|line| is_stage_close(line, ARGUS_COLLECT))
@@ -6396,6 +6545,22 @@ mod tests {
             }),
             "live G1a trace did not execute Quill's independent count-only evidence: {logs}",
         );
+
+        assert_ranked_query_cache_fixture(
+            logs,
+            "multi-term",
+            RankedQueryForm::Raw,
+            RankedQueryCacheLookup::Miss,
+        );
+        // `harvested-00` deliberately replays the identical raw query and
+        // collector shapes executed earlier by `multi-term`.
+        assert_ranked_query_cache_fixture(
+            logs,
+            "harvested-00",
+            RankedQueryForm::Raw,
+            RankedQueryCacheLookup::Hit,
+        );
+
         let golden: E410RankGolden = serde_json::from_str(E410_RANK_GOLDEN_JSON)
             .expect("parse committed E4.10 rank-list golden for trace contract");
         assert_harvested_query_trace_contract(logs, &golden);

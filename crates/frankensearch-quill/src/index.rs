@@ -5050,6 +5050,8 @@ impl QuillReader {
             target: crate::tracing_conventions::TARGET,
             crate::tracing_conventions::ARGUS_QUERY,
             phase = "query",
+            query_form = "raw",
+            cache_lookup = tracing::field::Empty,
             query_len = query.len(),
             segment_count,
             doc_count = snapshot.live_doc_count(),
@@ -5062,25 +5064,32 @@ impl QuillReader {
         );
         let _query_timer = crate::tracing_conventions::StageTimer::new(&query_span);
         let _query_entered = query_span.enter();
-        check_cancel(cx, "search")?;
+        if let Err(error) = check_cancel(cx, "search") {
+            query_span.record("cache_lookup", "not_checked");
+            return Err(error);
+        }
         let cache_enabled = self.ranked_query_cache_enabled();
-        if cache_enabled
-            && let Some(result) = self.published_snapshot.ranked_query_cache.get_raw(
+        if cache_enabled {
+            if let Some(result) = self.published_snapshot.ranked_query_cache.get_raw(
                 snapshot.snapshot_epoch(),
                 query,
                 limit,
                 offset,
                 exact_count,
-            )
-        {
-            query_span.record(
-                "result_count",
-                u64::try_from(result.hits.len()).unwrap_or(u64::MAX),
-            );
-            if let Some(total_count) = result.total_count {
-                query_span.record("total_count", total_count);
+            ) {
+                query_span.record("cache_lookup", "hit");
+                query_span.record(
+                    "result_count",
+                    u64::try_from(result.hits.len()).unwrap_or(u64::MAX),
+                );
+                if let Some(total_count) = result.total_count {
+                    query_span.record("total_count", total_count);
+                }
+                return Ok(result);
             }
-            return Ok(result);
+            query_span.record("cache_lookup", "miss");
+        } else {
+            query_span.record("cache_lookup", "disabled");
         }
         let parsed = {
             let parse_span = tracing::info_span!(
@@ -5288,19 +5297,55 @@ impl QuillReader {
         offset: usize,
         exact_count: bool,
     ) -> Result<QuillSearchResult, QuillIndexError> {
-        check_cancel(cx, "search_preparsed")?;
         let published = self.published_snapshot.load();
+        let keeper = published.keeper_snapshot();
+        let segment_count = keeper
+            .segments()
+            .len()
+            .saturating_add(published.delta_count());
+        let query_span = tracing::info_span!(
+            target: crate::tracing_conventions::TARGET,
+            crate::tracing_conventions::ARGUS_QUERY,
+            phase = "query",
+            query_form = "preparsed",
+            cache_lookup = tracing::field::Empty,
+            segment_count,
+            doc_count = published.live_doc_count(),
+            limit,
+            offset,
+            exact_count,
+            result_count = tracing::field::Empty,
+            total_count = tracing::field::Empty,
+            duration_us = tracing::field::Empty,
+        );
+        let _query_timer = crate::tracing_conventions::StageTimer::new(&query_span);
+        let _query_entered = query_span.enter();
+        if let Err(error) = check_cancel(cx, "search_preparsed") {
+            query_span.record("cache_lookup", "not_checked");
+            return Err(error);
+        }
         let cache_enabled = self.ranked_query_cache_enabled();
-        if cache_enabled
-            && let Some(result) = self.published_snapshot.ranked_query_cache.get_preparsed(
+        if cache_enabled {
+            if let Some(result) = self.published_snapshot.ranked_query_cache.get_preparsed(
                 published.snapshot_epoch(),
                 query,
                 limit,
                 offset,
                 exact_count,
-            )
-        {
-            return Ok(result);
+            ) {
+                query_span.record("cache_lookup", "hit");
+                query_span.record(
+                    "result_count",
+                    u64::try_from(result.hits.len()).unwrap_or(u64::MAX),
+                );
+                if let Some(total_count) = result.total_count {
+                    query_span.record("total_count", total_count);
+                }
+                return Ok(result);
+            }
+            query_span.record("cache_lookup", "miss");
+        } else {
+            query_span.record("cache_lookup", "disabled");
         }
         let mut canonical = query.clone();
         let _canonicalization = canonicalize_query(&mut canonical);
@@ -5313,6 +5358,13 @@ impl QuillReader {
             exact_count,
             Vec::new(),
         )?;
+        query_span.record(
+            "result_count",
+            u64::try_from(result.hits.len()).unwrap_or(u64::MAX),
+        );
+        if let Some(total_count) = result.total_count {
+            query_span.record("total_count", total_count);
+        }
         if cache_enabled {
             self.published_snapshot.ranked_query_cache.insert_preparsed(
                 published.snapshot_epoch(),
@@ -9711,7 +9763,11 @@ fn term_field_ords(schema: SchemaDescriptor) -> Vec<u16> {
 mod tests {
     use std::collections::BTreeMap;
     use std::future::Future;
+    #[cfg(all(feature = "bench-internals", feature = "conformance-internals"))]
+    use std::io::{self, Write};
     use std::sync::Arc;
+    #[cfg(all(feature = "bench-internals", feature = "conformance-internals"))]
+    use std::sync::Mutex as StdMutex;
     use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
     use std::task::{Context, Poll, Waker};
 
@@ -9985,6 +10041,118 @@ mod tests {
         }
     }
 
+    #[cfg(all(feature = "bench-internals", feature = "conformance-internals"))]
+    #[derive(Clone, Debug)]
+    struct RankedCacheTraceWriter {
+        buffer: Arc<StdMutex<Vec<u8>>>,
+    }
+
+    #[cfg(all(feature = "bench-internals", feature = "conformance-internals"))]
+    impl Write for RankedCacheTraceWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.buffer
+                .lock()
+                .expect("ranked-cache trace buffer lock is not poisoned")
+                .extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[cfg(all(feature = "bench-internals", feature = "conformance-internals"))]
+    fn trace_text_field<'a>(line: &'a str, field: &str) -> Option<&'a str> {
+        let prefix = format!("{field}=");
+        let start = line.find(&prefix)?.saturating_add(prefix.len());
+        let value = line.get(start..)?;
+        if let Some(quoted) = value.strip_prefix('"') {
+            return quoted.split_once('"').map(|(field_value, _)| field_value);
+        }
+        let end = value
+            .find(|ch: char| ch.is_ascii_whitespace() || matches!(ch, ',' | '}'))
+            .unwrap_or(value.len());
+        value.get(..end)
+    }
+
+    #[cfg(all(feature = "bench-internals", feature = "conformance-internals"))]
+    fn is_trace_stage_close(line: &str, stage: &str) -> bool {
+        if !line.contains(": close") {
+            return false;
+        }
+        let Some(stage_position) = line.rfind(stage) else {
+            return false;
+        };
+        crate::tracing_conventions::ALL_SPAN_NAMES
+            .iter()
+            .filter_map(|candidate| line.rfind(candidate))
+            .all(|candidate_position| candidate_position <= stage_position)
+    }
+
+    #[cfg(all(feature = "bench-internals", feature = "conformance-internals"))]
+    fn assert_ranked_cache_trace_case(
+        logs: &str,
+        trace_case: &str,
+        query_form: &str,
+        cache_lookup: &str,
+        expected_children: &[&str],
+    ) {
+        let case_lines = logs
+            .lines()
+            .filter(|line| trace_text_field(line, "trace_case") == Some(trace_case))
+            .collect::<Vec<_>>();
+        assert!(
+            !case_lines.is_empty(),
+            "missing trace case {trace_case}: {logs}"
+        );
+        let query = case_lines
+            .iter()
+            .copied()
+            .find(|line| is_trace_stage_close(line, crate::tracing_conventions::ARGUS_QUERY))
+            .expect("ranked-cache trace case must contain one ARGUS_QUERY close");
+        assert_eq!(
+            trace_text_field(query, "query_form"),
+            Some(query_form),
+            "trace case {trace_case} reported the wrong query form: {query}",
+        );
+        assert_eq!(
+            trace_text_field(query, "cache_lookup"),
+            Some(cache_lookup),
+            "trace case {trace_case} reported the wrong cache disposition: {query}",
+        );
+        assert!(
+            query.contains("duration_us="),
+            "trace case {trace_case} omitted query timing: {query}",
+        );
+        if cache_lookup == "not_checked" {
+            assert!(
+                !query.contains("result_count=") && !query.contains("total_count="),
+                "pre-cancelled trace case {trace_case} fabricated result evidence: {query}",
+            );
+        } else {
+            assert!(
+                query.contains("result_count=") && query.contains("total_count="),
+                "successful exact-count trace case {trace_case} omitted result evidence: {query}",
+            );
+        }
+
+        for stage in [
+            crate::tracing_conventions::ARGUS_PARSE,
+            crate::tracing_conventions::ARGUS_SCORE,
+            crate::tracing_conventions::ARGUS_COLLECT,
+        ] {
+            let observed = case_lines
+                .iter()
+                .any(|line| is_trace_stage_close(line, stage));
+            assert_eq!(
+                observed,
+                expected_children.contains(&stage),
+                "trace case {trace_case} child-stage mismatch for {stage}: {logs}",
+            );
+        }
+    }
+
     #[test]
     fn ranked_query_cache_requires_an_exact_key_and_snapshot_epoch() {
         let cache = RankedQueryCache::default();
@@ -10036,6 +10204,134 @@ mod tests {
                     true,
                 )
                 .is_none()
+        );
+    }
+
+    #[cfg(all(feature = "bench-internals", feature = "conformance-internals"))]
+    #[test]
+    fn ranked_query_cache_trace_contract_covers_every_lookup_disposition() {
+        let trace_buffer = Arc::new(StdMutex::new(Vec::<u8>::new()));
+        let writer_buffer = Arc::clone(&trace_buffer);
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_env_filter("off,frankensearch.quill=info")
+            .with_span_events(tracing_subscriber::fmt::format::FmtSpan::CLOSE)
+            .with_writer(move || RankedCacheTraceWriter {
+                buffer: Arc::clone(&writer_buffer),
+            })
+            .finish();
+
+        tracing::subscriber::with_default(subscriber, || {
+            run_with_cx(|cx| async move {
+                let index = QuillIndex::in_memory(deterministic_config())
+                    .expect("ranked-cache trace index");
+                index
+                    .index_document(&cx, &IndexableDocument::new("doc-1", "alpha beta"))
+                    .await
+                    .expect("index ranked-cache trace document");
+                index
+                    .commit(&cx)
+                    .await
+                    .expect("commit ranked-cache trace index");
+                let query = Query::Term {
+                    fields: vec![QueryField::new(1, 1.0)],
+                    text: "alpha".to_owned(),
+                };
+
+                let run_raw = |trace_case: &'static str, request_cx: &Cx| {
+                    let span = tracing::info_span!(
+                        target: crate::tracing_conventions::TARGET,
+                        "ranked_cache_trace_case",
+                        trace_case,
+                    );
+                    let _entered = span.enter();
+                    index.search_paginated(request_cx, "alpha", 10, 0, true)
+                };
+                let run_preparsed = |trace_case: &'static str, request_cx: &Cx| {
+                    let span = tracing::info_span!(
+                        target: crate::tracing_conventions::TARGET,
+                        "ranked_cache_trace_case",
+                        trace_case,
+                    );
+                    let _entered = span.enter();
+                    index.search_preparsed_paginated(request_cx, &query, 10, 0, true)
+                };
+
+                run_raw("raw-miss", &cx).expect("raw cache miss executes");
+                run_raw("raw-hit", &cx).expect("raw cache hit returns");
+                run_preparsed("preparsed-miss", &cx).expect("preparsed cache miss executes");
+                run_preparsed("preparsed-hit", &cx).expect("preparsed cache hit returns");
+
+                let controller = index.conformance_cancellation_controller();
+                controller
+                    .arm(ConformanceCancellationStage::CommitPublication, 1)
+                    .expect("arm unrelated conformance stage to disable the cache");
+                run_raw("raw-disabled", &cx).expect("disabled raw cache executes");
+                run_preparsed("preparsed-disabled", &cx)
+                    .expect("disabled preparsed cache executes");
+                assert_eq!(controller.observed_checkpoints(), 0);
+                assert!(!controller.fired());
+                controller.disarm();
+
+                let cancelled = cx.clone();
+                cancelled.set_cancel_requested(true);
+                assert!(matches!(
+                    run_raw("raw-not-checked", &cancelled),
+                    Err(QuillIndexError::Cancelled { phase }) if phase == "search"
+                ));
+                assert!(matches!(
+                    run_preparsed("preparsed-not-checked", &cancelled),
+                    Err(QuillIndexError::Cancelled { phase }) if phase == "search_preparsed"
+                ));
+            });
+        });
+
+        let logs = String::from_utf8(
+            trace_buffer
+                .lock()
+                .expect("ranked-cache trace buffer lock is not poisoned")
+                .clone(),
+        )
+        .expect("ranked-cache trace output is UTF-8");
+        let raw_children = [
+            crate::tracing_conventions::ARGUS_PARSE,
+            crate::tracing_conventions::ARGUS_SCORE,
+            crate::tracing_conventions::ARGUS_COLLECT,
+        ];
+        let preparsed_children = [
+            crate::tracing_conventions::ARGUS_SCORE,
+            crate::tracing_conventions::ARGUS_COLLECT,
+        ];
+        assert_ranked_cache_trace_case(&logs, "raw-miss", "raw", "miss", &raw_children);
+        assert_ranked_cache_trace_case(&logs, "raw-hit", "raw", "hit", &[]);
+        assert_ranked_cache_trace_case(
+            &logs,
+            "preparsed-miss",
+            "preparsed",
+            "miss",
+            &preparsed_children,
+        );
+        assert_ranked_cache_trace_case(&logs, "preparsed-hit", "preparsed", "hit", &[]);
+        assert_ranked_cache_trace_case(&logs, "raw-disabled", "raw", "disabled", &raw_children);
+        assert_ranked_cache_trace_case(
+            &logs,
+            "preparsed-disabled",
+            "preparsed",
+            "disabled",
+            &preparsed_children,
+        );
+        assert_ranked_cache_trace_case(&logs, "raw-not-checked", "raw", "not_checked", &[]);
+        assert_ranked_cache_trace_case(
+            &logs,
+            "preparsed-not-checked",
+            "preparsed",
+            "not_checked",
+            &[],
+        );
+        assert!(
+            !logs.contains("cache_key=") && !logs.contains("cache_fingerprint="),
+            "ranked-cache traces leaked a high-cardinality cache identity: {logs}",
         );
     }
 
