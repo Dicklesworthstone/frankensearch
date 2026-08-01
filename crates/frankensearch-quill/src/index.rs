@@ -14,6 +14,7 @@ use std::sync::atomic::{AtomicBool, AtomicU8};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use ahash::AHashSet;
 use arc_swap::{ArcSwap, ArcSwapOption};
 use asupersync::Cx;
 use asupersync::runtime::spawn_blocking;
@@ -1458,7 +1459,7 @@ fn clone_delta_arcs(
 #[derive(Debug)]
 struct PendingIdentity {
     doc_ord: u32,
-    document_id: String,
+    document_id: Arc<str>,
     content_hash: u64,
 }
 
@@ -2192,7 +2193,7 @@ struct QuillWriterState {
     shards: Vec<ScribeShardState>,
     shard_router: ShardRouter,
     docid_allocator: DocIdAllocator,
-    uncommitted_ids: BTreeSet<String>,
+    uncommitted_ids: AHashSet<Arc<str>>,
     next_lease_base: u64,
     next_seal_seq: u64,
     staged_flush: Option<StagedFlush>,
@@ -2518,7 +2519,7 @@ impl QuillWriterState {
             shards,
             shard_router,
             docid_allocator,
-            uncommitted_ids: BTreeSet::new(),
+            uncommitted_ids: AHashSet::new(),
             next_lease_base,
             next_seal_seq,
             staged_flush: None,
@@ -2937,7 +2938,13 @@ impl QuillWriterState {
         }
 
         hasher.update(uncommitted_id_count.to_be_bytes());
-        for document_id in &self.uncommitted_ids {
+        let mut sorted_uncommitted_ids = self
+            .uncommitted_ids
+            .iter()
+            .map(AsRef::as_ref)
+            .collect::<Vec<&str>>();
+        sorted_uncommitted_ids.sort_unstable();
+        for document_id in sorted_uncommitted_ids {
             conformance_hash_bytes(&mut hasher, document_id.as_bytes());
         }
 
@@ -3030,14 +3037,17 @@ impl QuillWriterState {
             return Ok(None);
         }
 
-        let mut batch_ids = BTreeSet::new();
+        let mut batch_ids = AHashSet::new();
+        batch_ids
+            .try_reserve(documents.len())
+            .map_err(|_| invalid_state("could not reserve parallel duplicate-id table"))?;
         for document in documents {
             check_cancel(cx, "parallel index validation")?;
             if document.id.is_empty() {
                 return Err(invalid_state("document id must be nonempty"));
             }
             if !batch_ids.insert(document.id.as_str())
-                || self.uncommitted_ids.contains(&document.id)
+                || self.uncommitted_ids.contains(document.id.as_str())
                 || self
                     .backend
                     .snapshot()
@@ -3171,7 +3181,14 @@ impl QuillWriterState {
         });
 
         self.uncommitted_ids
-            .extend(documents.iter().map(|document| document.id.clone()));
+            .try_reserve(documents.len())
+            .map_err(|_| invalid_state("could not reserve pending duplicate-id table"))?;
+        self.uncommitted_ids.extend(
+            self.shards
+                .iter()
+                .flat_map(|shard| shard.identities.iter())
+                .map(|identity| Arc::clone(&identity.document_id)),
+        );
         self.unpublished_since.get_or_insert_with(Instant::now);
 
         if self.shards.iter().any(|shard| {
@@ -3260,7 +3277,7 @@ impl QuillWriterState {
             let content_hash = canonical_document_content_hash(document, &metadata)?;
             state.identities.push(PendingIdentity {
                 doc_ord,
-                document_id: document.id.clone(),
+                document_id: Arc::from(document.id.as_str()),
                 content_hash,
             });
         }
@@ -3293,6 +3310,9 @@ impl QuillWriterState {
         let _ingest_timer = crate::tracing_conventions::StageTimer::new(&ingest_span);
         let instrumented = ingest_span.clone();
         async move {
+            self.uncommitted_ids
+                .try_reserve(documents.len())
+                .map_err(|_| invalid_state("could not reserve pending duplicate-id table"))?;
             check_cancel(cx, "index")?;
             if self.pending_delta_seal.is_some() {
                 return Err(invalid_state(
@@ -3402,7 +3422,7 @@ impl QuillWriterState {
                     if document.id.is_empty() {
                         return Err(invalid_state("document id must be nonempty"));
                     }
-                    if self.uncommitted_ids.contains(&document.id)
+                    if self.uncommitted_ids.contains(document.id.as_str())
                         || self
                             .backend
                             .snapshot()
@@ -3442,12 +3462,13 @@ impl QuillWriterState {
                     arena_bytes_reserved_high_water =
                         arena_bytes_reserved_high_water.max(accumulated.bytes_reserved);
                     let content_hash = canonical_document_content_hash(document, &metadata)?;
+                    let document_id = Arc::<str>::from(document.id.as_str());
                     self.shards[shard_id].identities.push(PendingIdentity {
                         doc_ord,
-                        document_id: document.id.clone(),
+                        document_id: Arc::clone(&document_id),
                         content_hash,
                     });
-                    self.uncommitted_ids.insert(document.id.clone());
+                    self.uncommitted_ids.insert(document_id);
                     self.unpublished_since.get_or_insert_with(Instant::now);
 
                     if self.shards[shard_id]
@@ -3635,7 +3656,7 @@ impl QuillWriterState {
                 shard
                     .identities
                     .iter()
-                    .map(|identity| identity.document_id.clone()),
+                    .map(|identity| Arc::clone(&identity.document_id)),
             );
         }
         if self
