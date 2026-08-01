@@ -32,7 +32,7 @@ use thiserror::Error;
 use crate::error::QuillError;
 use crate::grimoire::{
     ByteSpan, EncodedTermDictionary, OwnedTerm, TermDictionary, TermDictionaryError, TermInput,
-    TermMetadata, TermSectionLengths, ValidatedTermDictionaryMetadata,
+    TermMatch, TermMetadata, TermSectionLengths, ValidatedTermDictionaryMetadata,
 };
 use crate::quiver::{
     BlockMaxConcatList, DocLenFieldInput, DocLenSection, EncodedBlockMax, EncodedDocLenSection,
@@ -2209,6 +2209,141 @@ impl RankPruningCache {
     }
 }
 
+#[derive(Clone)]
+struct CachedExactTerm {
+    fingerprint: u64,
+    field_ord: u16,
+    term: Arc<[u8]>,
+    found: Option<TermMatch>,
+}
+
+const EXACT_TERM_CACHE_SET_COUNT: usize = 64;
+const EXACT_TERM_CACHE_WAYS: usize = 4;
+const EXACT_TERM_CACHE_SLOTS: usize = EXACT_TERM_CACHE_SET_COUNT * EXACT_TERM_CACHE_WAYS;
+const EXACT_TERM_CACHE_SET_MASK: u64 = 63;
+const EXACT_TERM_CACHE_WAY_MASK: u64 = 3;
+
+/// Tiny set-associative sidecar for the exact terms reused by live queries.
+///
+/// The durable dictionary remains the correctness oracle on a miss. A hit
+/// avoids its block binary search, restart binary search, and prefix decode.
+/// Both positive and negative answers are safe to retain because a recovered
+/// segment is immutable. Copy-on-write publication keeps reads wait-free and
+/// confines the sidecar to the hot vocabulary instead of duplicating the full
+/// term dictionary in memory.
+struct ExactTermCache {
+    slots: ArcSwap<Vec<Option<CachedExactTerm>>>,
+}
+
+impl ExactTermCache {
+    fn new() -> Self {
+        Self {
+            slots: ArcSwap::from_pointee(Vec::new()),
+        }
+    }
+
+    fn fingerprint(field_ord: u16, term: &[u8]) -> u64 {
+        xxhash_rust::xxh3::xxh3_64(term) ^ u64::from(field_ord).wrapping_mul(0x9e37_79b9_7f4a_7c15)
+    }
+
+    fn set_start(fingerprint: u64) -> usize {
+        let set = usize::try_from(fingerprint & EXACT_TERM_CACHE_SET_MASK)
+            .expect("masked exact-term cache set fits usize");
+        set * EXACT_TERM_CACHE_WAYS
+    }
+
+    fn get(&self, field_ord: u16, term: &[u8]) -> Option<Option<TermMatch>> {
+        let fingerprint = Self::fingerprint(field_ord, term);
+        let start = Self::set_start(fingerprint);
+        let slots = self.slots.load();
+        let set = slots.get(start..start + EXACT_TERM_CACHE_WAYS)?;
+        set.iter().find_map(|slot| {
+            let entry = slot.as_ref()?;
+            (entry.fingerprint == fingerprint
+                && entry.field_ord == field_ord
+                && entry.term.as_ref() == term)
+                .then_some(entry.found)
+        })
+    }
+
+    fn insert(
+        &self,
+        field_ord: u16,
+        term: &[u8],
+        found: Option<TermMatch>,
+    ) -> Result<Option<TermMatch>, TermDictionaryError> {
+        let fingerprint = Self::fingerprint(field_ord, term);
+        let start = Self::set_start(fingerprint);
+        let mut owned_term = Vec::new();
+        owned_term
+            .try_reserve_exact(term.len())
+            .map_err(|_| TermDictionaryError::Allocation {
+                context: "exact-term cache key bytes",
+                count: term.len(),
+            })?;
+        owned_term.extend_from_slice(term);
+        let term: Arc<[u8]> = owned_term.into();
+
+        loop {
+            let current = self.slots.load_full();
+            if let Some(cached) =
+                current
+                    .get(start..start + EXACT_TERM_CACHE_WAYS)
+                    .and_then(|set| {
+                        set.iter().find_map(|slot| {
+                            let entry = slot.as_ref()?;
+                            (entry.fingerprint == fingerprint
+                                && entry.field_ord == field_ord
+                                && entry.term.as_ref() == term.as_ref())
+                            .then_some(entry.found)
+                        })
+                    })
+            {
+                return Ok(cached);
+            }
+
+            let mut next = Vec::new();
+            next.try_reserve_exact(EXACT_TERM_CACHE_SLOTS)
+                .map_err(|_| TermDictionaryError::Allocation {
+                    context: "exact-term cache slots",
+                    count: EXACT_TERM_CACHE_SLOTS,
+                })?;
+            if current.len() == EXACT_TERM_CACHE_SLOTS {
+                next.extend(current.iter().cloned());
+            } else {
+                next.resize_with(EXACT_TERM_CACHE_SLOTS, || None);
+            }
+            let insertion = (start..start + EXACT_TERM_CACHE_WAYS)
+                .find(|&index| next[index].is_none())
+                .unwrap_or_else(|| {
+                    start
+                        + usize::try_from((fingerprint >> 32) & EXACT_TERM_CACHE_WAY_MASK)
+                            .expect("masked exact-term cache way fits usize")
+                });
+            next[insertion] = Some(CachedExactTerm {
+                fingerprint,
+                field_ord,
+                term: Arc::clone(&term),
+                found,
+            });
+            let next = Arc::new(next);
+            let previous = self.slots.compare_and_swap(&current, next);
+            if Arc::ptr_eq(&current, &previous) {
+                return Ok(found);
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn retained_entries(&self) -> usize {
+        self.slots
+            .load()
+            .iter()
+            .filter(|slot| slot.is_some())
+            .count()
+    }
+}
+
 /// One immutable mapped or owned segment admitted by a recovered snapshot.
 ///
 /// Structural framing, MANIFEST witnesses, and the IDMAP-bound IDHASH identity
@@ -2239,6 +2374,7 @@ pub struct RecoveredSegment {
     id_lookup: IdHashLookupPlan,
     live_doc_count: u32,
     rank_pruning_cache: Arc<RankPruningCache>,
+    exact_term_cache: Arc<ExactTermCache>,
     term_dictionary_metadata: Arc<ValidatedTermDictionaryMetadata>,
     #[cfg(test)]
     term_dictionary_cache_counters: Arc<TermDictionaryCacheCounters>,
@@ -2291,6 +2427,7 @@ impl RecoveredSegment {
             manifest,
             Arc::new(reader),
             Arc::new(RankPruningCache::new()),
+            Arc::new(ExactTermCache::new()),
             schema,
         )
     }
@@ -2300,6 +2437,7 @@ impl RecoveredSegment {
         manifest: ManifestSegment,
         reader: Arc<RecoveredSegmentBacking>,
         rank_pruning_cache: Arc<RankPruningCache>,
+        exact_term_cache: Arc<ExactTermCache>,
         schema: SchemaDescriptor,
     ) -> Result<Self, KeeperError> {
         let id_map_bytes = required_identity_section(&path, &reader, SectionKind::IDMAP)?;
@@ -2362,6 +2500,7 @@ impl RecoveredSegment {
             id_lookup,
             live_doc_count,
             rank_pruning_cache,
+            exact_term_cache,
             term_dictionary_metadata,
             #[cfg(test)]
             term_dictionary_cache_counters,
@@ -2376,6 +2515,7 @@ impl RecoveredSegment {
             manifest,
             Arc::clone(&self.reader),
             Arc::clone(&self.rank_pruning_cache),
+            Arc::clone(&self.exact_term_cache),
             schema,
         )
     }
@@ -2384,14 +2524,7 @@ impl RecoveredSegment {
         &self,
         schema: SchemaDescriptor,
     ) -> Result<TermDictionary<'_>, KeeperError> {
-        if schema != self.term_dictionary_metadata.schema() {
-            return Err(term_dictionary_admission_error(
-                &self.path,
-                TermDictionaryError::InvalidSchema {
-                    detail: "query schema disagrees with validated TERMDICT metadata".to_owned(),
-                },
-            ));
-        }
+        self.validate_term_dictionary_schema(schema)?;
         let bytes = self
             .reader
             .section(SectionKind::TERMDICT)
@@ -2410,6 +2543,37 @@ impl RecoveredSegment {
             .borrowed_views
             .fetch_add(1, AtomicOrdering::Relaxed);
         Ok(dictionary)
+    }
+
+    fn validate_term_dictionary_schema(&self, schema: SchemaDescriptor) -> Result<(), KeeperError> {
+        if schema != self.term_dictionary_metadata.schema() {
+            return Err(term_dictionary_admission_error(
+                &self.path,
+                TermDictionaryError::InvalidSchema {
+                    detail: "query schema disagrees with validated TERMDICT metadata".to_owned(),
+                },
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn lookup_term(
+        &self,
+        schema: SchemaDescriptor,
+        field_ord: u16,
+        term: &[u8],
+    ) -> Result<Option<TermMatch>, KeeperError> {
+        self.validate_term_dictionary_schema(schema)?;
+        if let Some(found) = self.exact_term_cache.get(field_ord, term) {
+            return Ok(found);
+        }
+        let found = self
+            .term_dictionary(schema)?
+            .lookup(field_ord, term)
+            .map_err(|source| term_dictionary_admission_error(&self.path, source))?;
+        self.exact_term_cache
+            .insert(field_ord, term, found)
+            .map_err(|source| term_dictionary_admission_error(&self.path, source))
     }
 
     #[cfg(test)]
@@ -13054,6 +13218,44 @@ mod tests {
         assert!(cache.get(0, drifted).is_err());
     }
 
+    #[test]
+    fn exact_term_cache_is_set_associative_and_exact_key_checked() {
+        let cache = ExactTermCache::new();
+        let metadata = TermMetadata::without_positions(3, ByteSpan::new(4, 5), ByteSpan::new(6, 7));
+        let found = TermMatch {
+            term_ord: 11,
+            metadata,
+        };
+
+        assert_eq!(cache.get(1, b"needle"), None);
+        assert_eq!(cache.insert(1, b"needle", Some(found)), Ok(Some(found)));
+        assert_eq!(cache.get(1, b"needle"), Some(Some(found)));
+        assert_eq!(cache.get(2, b"needle"), None);
+        assert_eq!(cache.insert(1, b"absent", None), Ok(None));
+        assert_eq!(cache.get(1, b"absent"), Some(None));
+        assert_eq!(cache.retained_entries(), 2);
+
+        let target_set = ExactTermCache::set_start(ExactTermCache::fingerprint(1, b"needle"));
+        let mut colliding = Vec::new();
+        for candidate in 0_u32..10_000 {
+            let term = candidate.to_le_bytes();
+            if ExactTermCache::set_start(ExactTermCache::fingerprint(1, &term)) == target_set {
+                colliding.push(term);
+                if colliding.len() == EXACT_TERM_CACHE_WAYS {
+                    break;
+                }
+            }
+        }
+        assert_eq!(colliding.len(), EXACT_TERM_CACHE_WAYS);
+        for term in &colliding {
+            cache
+                .insert(1, term, Some(found))
+                .expect("colliding cache insertion");
+            assert_eq!(cache.get(1, term), Some(Some(found)));
+        }
+        assert!(cache.retained_entries() <= EXACT_TERM_CACHE_SLOTS);
+    }
+
     fn array_tombstone_bytes(chunk_id: u16, lows: &[u16]) -> Vec<u8> {
         let mut bytes = Vec::new();
         put_u32(&mut bytes, 1);
@@ -15420,6 +15622,32 @@ mod tests {
             (1, 128),
             "the prior snapshot retains its own cache generation"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn exact_term_lookup_caches_verified_negative_answers() -> TestResult {
+        let original = KeeperSnapshot::in_memory(DEFAULT_SCHEMA)?;
+        let encoded = encoded_identity_test_segment(0xc03, 0, &[Some("cache-negative")])?;
+        let mut proposed = original.next_manifest()?;
+        proposed.docid_high_watermark = 1;
+        proposed.segments = vec![manifest_segment(&encoded, 10)];
+        let published = original.publish_owned_segments(&proposed, vec![encoded])?;
+        let segment = &published.segments()[0];
+
+        assert_eq!(segment.term_dictionary_cache_counts(), (1, 0));
+        assert_eq!(segment.lookup_term(DEFAULT_SCHEMA, 1, b"missing")?, None);
+        assert_eq!(segment.term_dictionary_cache_counts(), (1, 1));
+        assert_eq!(segment.lookup_term(DEFAULT_SCHEMA, 1, b"missing")?, None);
+        assert_eq!(
+            segment.term_dictionary_cache_counts(),
+            (1, 1),
+            "the second exact lookup must not bind or decode TERMDICT again"
+        );
+        assert!(matches!(
+            segment.lookup_term(FSFS_CHUNK_SCHEMA, 1, b"missing"),
+            Err(KeeperError::SegmentTermDictionaryUnavailable { .. })
+        ));
         Ok(())
     }
 
