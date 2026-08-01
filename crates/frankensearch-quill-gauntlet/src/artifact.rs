@@ -1035,7 +1035,7 @@ fn canonical_json_matches<T: Serialize>(value: &T, expected: &[u8]) -> Result<bo
     target_os = "tvos",
     target_os = "watchos"
 ))]
-pub(crate) struct PinnedDirectory {
+pub struct PinnedDirectory {
     file: File,
     display_path: PathBuf,
 }
@@ -1047,7 +1047,7 @@ pub(crate) struct PinnedDirectory {
     target_os = "tvos",
     target_os = "watchos"
 )))]
-pub(crate) struct PinnedDirectory;
+pub struct PinnedDirectory;
 
 #[cfg(any(
     target_os = "linux",

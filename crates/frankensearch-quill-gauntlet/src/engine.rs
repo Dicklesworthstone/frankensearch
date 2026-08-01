@@ -1021,7 +1021,7 @@ fn offset_tie_group(
     (group, complete)
 }
 
-pub(crate) fn quill_config_hash(config: &QuillConfig) -> String {
+pub fn quill_config_hash(config: &QuillConfig) -> String {
     let canonical = format!(
         "scribe={};delta={};fanout={};tier_small={};tier_medium={};bulk={};bulk_cadence={};compact={:016x};holes={:016x};glob={};fuel={};shards={};deterministic={};visibility_ms={};quarantine={}",
         config.scribe_shard_budget_bytes,
