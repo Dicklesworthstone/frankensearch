@@ -29,7 +29,7 @@ pub const LEXICAL_CONTRACT_COMPARISON_SCHEMA_VERSION: &str = "lexical-contract-c
 /// `ArtifactStore` v4 consumers. This does not revise or promote `ArtifactObject`
 /// v1-v3, which remain diagnostic legacy formats.
 pub const CASS_LEXICAL_PROFILE_OBSERVATION_SCHEMA_VERSION: &str =
-    "cass-lexical-layer-a-observation-v1";
+    "cass-lexical-layer-a-observation-v2";
 /// Stable schema identifier for the live, method-bound Quill cancellation
 /// receipt owned by bd-fjpu.
 pub const QUILL_CANCELLATION_RECEIPT_SCHEMA_VERSION: &str =
@@ -50,8 +50,16 @@ pub const MAX_LEXICAL_ERROR_SOURCE_DEPTH: usize = 16;
 pub const MAX_CASS_PROFILE_TOKENS: usize = 20_000;
 /// Maximum structured CASS filters of one kind admitted into an observation.
 pub const MAX_CASS_PROFILE_FILTER_VALUES: usize = 4_096;
+/// Maximum bytes admitted for one exact CASS filter value.
+pub const MAX_CASS_PROFILE_FILTER_VALUE_BYTES: usize = 4_096;
+/// Maximum aggregate bytes admitted across exact CASS filter values.
+pub const MAX_CASS_PROFILE_FILTER_BYTES: usize = 1_048_576;
 /// Maximum native parser diagnostics admitted into one CASS observation.
 pub const MAX_CASS_PROFILE_DIAGNOSTICS: usize = 4_096;
+/// Maximum request or expanded-cutoff cardinality admitted by the profile.
+pub const MAX_CASS_PROFILE_FETCH_HITS: usize = MAX_LEXICAL_OBSERVATION_HITS;
+/// Maximum aggregate document-identity bytes retained across hits and cutoff evidence.
+pub const MAX_CASS_PROFILE_DOCUMENT_ID_BYTES: usize = 16 * 1_024 * 1_024;
 
 /// Closed artifact-stable projection of [`QueryClass`].
 ///
@@ -5026,7 +5034,12 @@ pub struct CassLexicalProfileContext {
     pub schema_sha256: String,
     pub analyzer_sha256: String,
     pub raw_query: SensitiveValueObservation,
+    pub raw_query_char_count: u64,
+    pub admitted_query: SensitiveValueObservation,
+    pub admitted_query_char_count: u64,
     pub sanitized_query: SensitiveValueObservation,
+    pub sanitized_query_char_count: u64,
+    pub sanitization_changed: bool,
     pub tokens: Vec<CassProfileTokenObservation>,
     pub has_boolean_operators: bool,
     pub filters: CassProfileFilters,
@@ -5093,6 +5106,16 @@ pub enum CassLexicalProfileOutcome {
 pub struct CassLexicalProfileObservation {
     pub context: CassLexicalProfileContext,
     pub outcome: CassLexicalProfileOutcome,
+    /// Content-integrity seal for replay diagnostics. This detects mutation but
+    /// does not authenticate the producer or assigned comparison role.
+    pub diagnostic_sha256: String,
+}
+
+#[derive(Serialize)]
+struct CassLexicalProfileDiagnosticBody<'a> {
+    seal_domain: &'static str,
+    context: &'a CassLexicalProfileContext,
+    outcome: &'a CassLexicalProfileOutcome,
 }
 
 /// Mismatch class for the standalone CASS profile comparator.
@@ -5121,6 +5144,9 @@ pub struct CassProfileMismatch {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CassLexicalProfileComparison {
+    /// This comparator is replay/diagnostic material until an authenticated
+    /// producer binds subject and oracle roles outside this DTO.
+    pub authority: CassProfileAuthority,
     pub equivalent: bool,
     pub rank_comparison: Option<ComparisonReport>,
     pub mismatches: Vec<CassProfileMismatch>,
@@ -5128,9 +5154,17 @@ pub struct CassLexicalProfileComparison {
     pub oracle: CassLexicalProfileObservation,
 }
 
+/// Evidentiary authority of a standalone CASS profile comparison.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CassProfileAuthority {
+    /// Caller-supplied provenance and roles are validated structurally only.
+    DiagnosticOnlyUnbound,
+}
+
 /// Native secondary ordering evidence retained for every ranked hit.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum NativeTieKey {
     /// Quill's globally assigned document ID.
     QuillDocId { doc_id: u32 },
@@ -5211,7 +5245,33 @@ pub fn observe_quill_cass_profile(
     limit: usize,
     tie_expansion_limit: usize,
 ) -> Result<CassLexicalProfileObservation, GauntletError> {
-    use frankensearch_quill::query::CassQueryToken;
+    use frankensearch_quill::query::{CassQueryToken, CassSourceFilter};
+
+    let (expected_admitted_query, expected_truncated) = cass_admitted_query_prefix(raw_query);
+    if parsed.admitted_query != expected_admitted_query
+        || parsed.parsed.was_truncated != expected_truncated
+        || parsed.sanitized_query
+            != frankensearch_quill::query::cass_sanitize_query(expected_admitted_query)
+    {
+        return cass_profile_invalid(
+            "Quill CASS observation is not coherent with the raw admitted prefix",
+        );
+    }
+    let source_value = match &filters.source_filter {
+        CassSourceFilter::SourceId(value) => Some(value.as_str()),
+        CassSourceFilter::All | CassSourceFilter::Local | CassSourceFilter::Remote => None,
+    };
+    cass_profile_plaintext_preflight(
+        raw_query,
+        &parsed.admitted_query,
+        &parsed.sanitized_query,
+        parsed.tokens.len(),
+        &filters.agents,
+        &filters.workspaces,
+        source_value,
+        limit,
+        tie_expansion_limit,
+    )?;
 
     let has_boolean_operators = parsed.tokens.iter().any(|token| {
         matches!(
@@ -5292,6 +5352,7 @@ pub fn observe_quill_cass_profile(
     let context = cass_profile_context(
         provenance,
         raw_query,
+        &parsed.admitted_query,
         &parsed.sanitized_query,
         tokens,
         has_boolean_operators,
@@ -5304,12 +5365,14 @@ pub fn observe_quill_cass_profile(
         tie_expansion_limit,
     )?;
     let outcome = match retrieval {
-        Ok(observation) => {
-            CassLexicalProfileOutcome::Success(cass_success_from_engine(observation)?)
-        }
+        Ok(observation) => CassLexicalProfileOutcome::Success(cass_success_from_engine(
+            observation,
+            limit,
+            tie_expansion_limit,
+        )?),
         Err(error) => CassLexicalProfileOutcome::Error(observe_lexical_search_error(&error)?),
     };
-    let observation = CassLexicalProfileObservation { context, outcome };
+    let observation = CassLexicalProfileObservation::seal(context, outcome)?;
     observation.validate()?;
     Ok(observation)
 }
@@ -5340,6 +5403,39 @@ pub fn observe_tantivy_cass_profile(
         filters,
         outcome,
     } = profile;
+    let expected_sanitized = frankensearch_lexical::cass_compat::cass_sanitize_query(raw_query);
+    if sanitized_query != expected_sanitized
+        || has_boolean_operators
+            != tokens.iter().any(|token| {
+                matches!(
+                    token,
+                    CassQueryToken::Phrase(_)
+                        | CassQueryToken::And
+                        | CassQueryToken::Or
+                        | CassQueryToken::Not
+                )
+            })
+    {
+        return cass_profile_invalid(
+            "Tantivy CASS observation is not coherent with its raw parser input",
+        );
+    }
+    use frankensearch_lexical::cass_compat::CassSourceFilter;
+    let source_value = match &filters.source_filter {
+        CassSourceFilter::SourceId(value) => Some(value.as_str()),
+        CassSourceFilter::All | CassSourceFilter::Local | CassSourceFilter::Remote => None,
+    };
+    cass_profile_plaintext_preflight(
+        raw_query,
+        raw_query,
+        &sanitized_query,
+        tokens.len(),
+        &filters.agents,
+        &filters.workspaces,
+        source_value,
+        limit,
+        tie_expansion_limit,
+    )?;
     let tokens = tokens
         .into_iter()
         .map(|token| CassProfileTokenObservation {
@@ -5362,6 +5458,7 @@ pub fn observe_tantivy_cass_profile(
     let context = cass_profile_context(
         provenance,
         raw_query,
+        raw_query,
         &sanitized_query,
         tokens,
         has_boolean_operators,
@@ -5376,14 +5473,14 @@ pub fn observe_tantivy_cass_profile(
         tie_expansion_limit,
     )?;
     let outcome = match outcome {
-        CassOracleProfileOutcome::Success(observation) => {
-            CassLexicalProfileOutcome::Success(cass_success_from_oracle(observation)?)
-        }
+        CassOracleProfileOutcome::Success(observation) => CassLexicalProfileOutcome::Success(
+            cass_success_from_oracle(observation, limit, tie_expansion_limit)?,
+        ),
         CassOracleProfileOutcome::Error(error) => {
             CassLexicalProfileOutcome::Error(observe_lexical_search_error(&error)?)
         }
     };
-    let observation = CassLexicalProfileObservation { context, outcome };
+    let observation = CassLexicalProfileObservation::seal(context, outcome)?;
     observation.validate()?;
     Ok(observation)
 }
@@ -5392,6 +5489,7 @@ pub fn observe_tantivy_cass_profile(
 fn cass_profile_context(
     provenance: CassLexicalProfileProvenance,
     raw_query: &str,
+    admitted_query: &str,
     sanitized_query: &str,
     tokens: Vec<CassProfileTokenObservation>,
     has_boolean_operators: bool,
@@ -5408,7 +5506,21 @@ fn cass_profile_context(
         schema_sha256: provenance.schema_sha256,
         analyzer_sha256: provenance.analyzer_sha256,
         raw_query: SensitiveValueObservation::from_text(raw_query),
+        raw_query_char_count: usize_to_u64(
+            raw_query.chars().count(),
+            "CASS profile raw-query character count",
+        )?,
+        admitted_query: SensitiveValueObservation::from_text(admitted_query),
+        admitted_query_char_count: usize_to_u64(
+            admitted_query.chars().count(),
+            "CASS profile admitted-query character count",
+        )?,
         sanitized_query: SensitiveValueObservation::from_text(sanitized_query),
+        sanitized_query_char_count: usize_to_u64(
+            sanitized_query.chars().count(),
+            "CASS profile sanitized-query character count",
+        )?,
+        sanitization_changed: admitted_query != sanitized_query,
         tokens,
         has_boolean_operators,
         filters,
@@ -5433,6 +5545,90 @@ fn cass_profile_context(
             },
         },
     })
+}
+
+fn cass_admitted_query_prefix(raw_query: &str) -> (&str, bool) {
+    let Some((byte_offset, _)) = raw_query
+        .char_indices()
+        .nth(frankensearch_quill::query::MAX_QUERY_LENGTH)
+    else {
+        return (raw_query, false);
+    };
+    (&raw_query[..byte_offset], true)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn cass_profile_plaintext_preflight(
+    raw_query: &str,
+    admitted_query: &str,
+    sanitized_query: &str,
+    token_count: usize,
+    agents: &[String],
+    workspaces: &[String],
+    source_value: Option<&str>,
+    limit: usize,
+    tie_expansion_limit: usize,
+) -> Result<(), GauntletError> {
+    cass_profile_usize_bound("raw_query_bytes", raw_query.len(), MAX_LEXICAL_QUERY_BYTES)?;
+    if admitted_query.len() > raw_query.len()
+        || admitted_query.chars().count() > raw_query.chars().count()
+        || sanitized_query.len() > admitted_query.len()
+        || sanitized_query.chars().count() != admitted_query.chars().count()
+    {
+        return cass_profile_invalid("CASS admitted/sanitized query lengths are incoherent");
+    }
+    cass_profile_usize_bound("token_count", token_count, MAX_CASS_PROFILE_TOKENS)?;
+    cass_profile_usize_bound("limit", limit, MAX_CASS_PROFILE_FETCH_HITS)?;
+    cass_profile_usize_bound(
+        "tie_expansion_limit",
+        tie_expansion_limit,
+        MAX_CASS_PROFILE_FETCH_HITS,
+    )?;
+    let expanded_fetch = limit.saturating_add(tie_expansion_limit);
+    cass_profile_usize_bound(
+        "expanded_fetch_hits",
+        expanded_fetch,
+        MAX_CASS_PROFILE_FETCH_HITS,
+    )?;
+
+    let filter_count = agents
+        .len()
+        .saturating_add(workspaces.len())
+        .saturating_add(usize::from(source_value.is_some()));
+    cass_profile_usize_bound(
+        "filter_value_count",
+        filter_count,
+        MAX_CASS_PROFILE_FILTER_VALUES,
+    )?;
+    let mut aggregate_bytes = 0_usize;
+    for value in agents
+        .iter()
+        .chain(workspaces)
+        .map(String::as_str)
+        .chain(source_value)
+    {
+        cass_profile_usize_bound(
+            "filter_value_bytes",
+            value.len(),
+            MAX_CASS_PROFILE_FILTER_VALUE_BYTES,
+        )?;
+        aggregate_bytes = aggregate_bytes.saturating_add(value.len());
+        cass_profile_usize_bound(
+            "aggregate_filter_bytes",
+            aggregate_bytes,
+            MAX_CASS_PROFILE_FILTER_BYTES,
+        )?;
+    }
+    Ok(())
+}
+
+fn cass_profile_usize_bound(field: &str, actual: usize, limit: usize) -> Result<(), GauntletError> {
+    if actual > limit {
+        return cass_profile_invalid(&format!(
+            "CASS {field} {actual} exceeds contract limit {limit}"
+        ));
+    }
+    Ok(())
 }
 
 fn quill_cass_filters(
@@ -5483,9 +5679,59 @@ fn redact_string_values(values: &[String]) -> Vec<SensitiveValueObservation> {
         .collect()
 }
 
+fn cass_profile_retrieval_preflight<'a, Hits, Cutoff>(
+    hits_len: usize,
+    cutoff_len: usize,
+    hit_ids: Hits,
+    cutoff_ids: Cutoff,
+    limit: usize,
+    tie_expansion_limit: usize,
+) -> Result<(), GauntletError>
+where
+    Hits: Iterator<Item = &'a str>,
+    Cutoff: Iterator<Item = &'a str>,
+{
+    let expanded_fetch = limit.saturating_add(tie_expansion_limit);
+    if hits_len > limit
+        || hits_len > MAX_CASS_PROFILE_FETCH_HITS
+        || cutoff_len > expanded_fetch
+        || cutoff_len > MAX_CASS_PROFILE_FETCH_HITS
+    {
+        return cass_profile_invalid(
+            "CASS retrieval cardinality exceeds request or cutoff-witness bounds",
+        );
+    }
+    let mut aggregate_identity_bytes = 0_usize;
+    for identity in hit_ids.chain(cutoff_ids) {
+        if identity.is_empty() || identity.len() > MAX_LEXICAL_DOC_ID_BYTES {
+            return cass_profile_invalid("CASS document identity bounds are invalid");
+        }
+        aggregate_identity_bytes = aggregate_identity_bytes.saturating_add(identity.len());
+        if aggregate_identity_bytes > MAX_CASS_PROFILE_DOCUMENT_ID_BYTES {
+            return cass_profile_invalid(
+                "CASS aggregate document identity bytes exceed the profile limit",
+            );
+        }
+    }
+    Ok(())
+}
+
 fn cass_success_from_engine(
     observation: EngineObservation,
+    limit: usize,
+    tie_expansion_limit: usize,
 ) -> Result<CassLexicalProfileSuccess, GauntletError> {
+    cass_profile_retrieval_preflight(
+        observation.hits.len(),
+        observation.cutoff_tie_group.len(),
+        observation.hits.iter().map(|hit| hit.doc_id.as_str()),
+        observation
+            .cutoff_tie_group
+            .iter()
+            .map(|hit| hit.doc_id.as_str()),
+        limit,
+        tie_expansion_limit,
+    )?;
     validate_observation("CASS profile", &observation)?;
     if !observation.snippets.is_empty() {
         return Err(GauntletError::InvalidObservation {
@@ -5544,7 +5790,20 @@ fn cass_success_from_engine(
 #[cfg(feature = "tantivy-oracle")]
 fn cass_success_from_oracle(
     observation: frankensearch_lexical::OracleQueryObservation,
+    limit: usize,
+    tie_expansion_limit: usize,
 ) -> Result<CassLexicalProfileSuccess, GauntletError> {
+    cass_profile_retrieval_preflight(
+        observation.hits.len(),
+        observation.cutoff_tie_group.len(),
+        observation.hits.iter().map(|hit| hit.doc_id.as_str()),
+        observation
+            .cutoff_tie_group
+            .iter()
+            .map(|hit| hit.doc_id.as_str()),
+        limit,
+        tie_expansion_limit,
+    )?;
     let hits = observation
         .hits
         .into_iter()
@@ -5593,6 +5852,33 @@ fn usize_to_u64(value: usize, label: &str) -> Result<u64, GauntletError> {
 }
 
 impl CassLexicalProfileObservation {
+    fn seal(
+        context: CassLexicalProfileContext,
+        outcome: CassLexicalProfileOutcome,
+    ) -> Result<Self, GauntletError> {
+        let mut observation = Self {
+            context,
+            outcome,
+            diagnostic_sha256: String::new(),
+        };
+        observation.refresh_diagnostic_seal()?;
+        Ok(observation)
+    }
+
+    fn refresh_diagnostic_seal(&mut self) -> Result<(), GauntletError> {
+        self.diagnostic_sha256 = self.compute_diagnostic_sha256()?;
+        Ok(())
+    }
+
+    fn compute_diagnostic_sha256(&self) -> Result<String, GauntletError> {
+        let bytes = canonical_json_bytes(&CassLexicalProfileDiagnosticBody {
+            seal_domain: "cass-lexical-profile-diagnostic-seal-v1",
+            context: &self.context,
+            outcome: &self.outcome,
+        })?;
+        Ok(sha256_hex(&bytes))
+    }
+
     /// Validate the bounded, redacted Layer-A contract independently of any
     /// legacy artifact container.
     ///
@@ -5602,13 +5888,37 @@ impl CassLexicalProfileObservation {
     /// exposure states, redaction digests, ranks, counts, or backend tie keys.
     pub fn validate(&self) -> Result<(), GauntletError> {
         let context = &self.context;
+        let diagnostics_len = match &context.diagnostics {
+            CassProfileField::Value { value } => value.len(),
+            CassProfileField::NotExposed { .. } => 0,
+        };
+        let (hits_len, cutoff_len) = match &self.outcome {
+            CassLexicalProfileOutcome::Success(success) => {
+                (success.hits.len(), success.cutoff_tie_group.len())
+            }
+            CassLexicalProfileOutcome::Error(_) => (0, 0),
+        };
+        if context.tokens.len() > MAX_CASS_PROFILE_TOKENS
+            || context.filters.agents.len() > MAX_CASS_PROFILE_FILTER_VALUES
+            || context.filters.workspaces.len() > MAX_CASS_PROFILE_FILTER_VALUES
+            || diagnostics_len > MAX_CASS_PROFILE_DIAGNOSTICS
+            || hits_len > MAX_CASS_PROFILE_FETCH_HITS
+            || cutoff_len > MAX_CASS_PROFILE_FETCH_HITS
+        {
+            return cass_profile_invalid(
+                "CASS container bounds are invalid before diagnostic seal verification",
+            );
+        }
         context.backend.validate()?;
-        if context.schema_version != CASS_LEXICAL_PROFILE_OBSERVATION_SCHEMA_VERSION
+        if !is_lower_sha256(&self.diagnostic_sha256)
+            || self.diagnostic_sha256 != self.compute_diagnostic_sha256()?
+            || context.schema_version != CASS_LEXICAL_PROFILE_OBSERVATION_SCHEMA_VERSION
             || !is_lower_sha256(&context.corpus_sha256)
             || !is_lower_sha256(&context.schema_sha256)
             || !is_lower_sha256(&context.analyzer_sha256)
-            || !context.raw_query.validate()
-            || !context.sanitized_query.validate()
+            || !valid_cass_sensitive_present(&context.raw_query, true)
+            || !valid_cass_sensitive_present(&context.admitted_query, true)
+            || !valid_cass_sensitive_present(&context.sanitized_query, true)
         {
             return cass_profile_invalid("schema, provenance, or query redaction is invalid");
         }
@@ -5617,11 +5927,32 @@ impl CassLexicalProfileObservation {
                 reason: "CASS raw query must be present, including explicit empty state".to_owned(),
             }
         })?;
+        let admitted_query_bytes =
+            cass_sensitive_len(&context.admitted_query).ok_or_else(|| {
+                GauntletError::InvalidObservation {
+                    reason: "CASS admitted query must be present, including explicit empty state"
+                        .to_owned(),
+                }
+            })?;
+        let sanitized_query_bytes =
+            cass_sensitive_len(&context.sanitized_query).ok_or_else(|| {
+                GauntletError::InvalidObservation {
+                    reason: "CASS sanitized query must be present, including explicit empty state"
+                        .to_owned(),
+                }
+            })?;
         if raw_query_bytes > u64::try_from(MAX_LEXICAL_QUERY_BYTES).unwrap_or(u64::MAX)
-            || cass_sensitive_len(&context.sanitized_query).is_none()
+            || admitted_query_bytes > raw_query_bytes
+            || sanitized_query_bytes > admitted_query_bytes
+            || !valid_utf8_redaction_count(raw_query_bytes, context.raw_query_char_count)
+            || !valid_utf8_redaction_count(admitted_query_bytes, context.admitted_query_char_count)
+            || !valid_utf8_redaction_count(
+                sanitized_query_bytes,
+                context.sanitized_query_char_count,
+            )
+            || context.sanitized_query_char_count != context.admitted_query_char_count
+            || context.sanitization_changed != (context.admitted_query != context.sanitized_query)
             || context.tokens.len() > MAX_CASS_PROFILE_TOKENS
-            || context.filters.agents.len() > MAX_CASS_PROFILE_FILTER_VALUES
-            || context.filters.workspaces.len() > MAX_CASS_PROFILE_FILTER_VALUES
         {
             return cass_profile_invalid("query, token, or filter bounds are invalid");
         }
@@ -5629,19 +5960,62 @@ impl CassLexicalProfileObservation {
         if backend != "quill" && backend != "tantivy" {
             return cass_profile_invalid("backend engine must be exactly quill or tantivy");
         }
+        match (&context.was_truncated, backend) {
+            (CassProfileField::Value { value }, "quill") => {
+                let expected_truncated = context.raw_query_char_count
+                    > u64::try_from(frankensearch_quill::query::MAX_QUERY_LENGTH)
+                        .unwrap_or(u64::MAX);
+                let expected_admitted_chars = context.raw_query_char_count.min(
+                    u64::try_from(frankensearch_quill::query::MAX_QUERY_LENGTH).unwrap_or(u64::MAX),
+                );
+                if *value != expected_truncated
+                    || context.admitted_query_char_count != expected_admitted_chars
+                    || (!expected_truncated && context.admitted_query != context.raw_query)
+                    || (expected_truncated && admitted_query_bytes >= raw_query_bytes)
+                {
+                    return cass_profile_invalid(
+                        "Quill CASS admitted-prefix and truncation evidence is incoherent",
+                    );
+                }
+            }
+            (
+                CassProfileField::NotExposed {
+                    reason: CassProfileNotExposedReason::TantivyParserHasNoDiagnosticChannel,
+                },
+                "tantivy",
+            ) if context.admitted_query == context.raw_query
+                && context.admitted_query_char_count == context.raw_query_char_count => {}
+            _ => return cass_profile_invalid("CASS truncation exposure is invalid"),
+        }
+        if !context.sanitization_changed && context.sanitized_query != context.admitted_query {
+            return cass_profile_invalid("unchanged CASS sanitization must preserve the digest");
+        }
+        let mut previous_offset = None;
+        let mut observed_boolean_operator = false;
         for token in &context.tokens {
             match &token.token {
                 CassProfileTokenKind::Term { text } | CassProfileTokenKind::Phrase { text } => {
-                    if !text.validate() || cass_sensitive_len(text).is_none() {
+                    if !valid_cass_sensitive_present(text, false) {
                         return cass_profile_invalid("CASS token redaction is invalid");
                     }
                 }
                 CassProfileTokenKind::And
                 | CassProfileTokenKind::Or
-                | CassProfileTokenKind::Not => {}
+                | CassProfileTokenKind::Not => {
+                    observed_boolean_operator = true;
+                }
+            }
+            if matches!(&token.token, CassProfileTokenKind::Phrase { .. }) {
+                observed_boolean_operator = true;
             }
             match (&token.byte_offset, backend) {
-                (CassProfileField::Value { value }, "quill") if *value <= raw_query_bytes => {}
+                (CassProfileField::Value { value }, "quill")
+                    if *value < admitted_query_bytes
+                        && previous_offset.is_none_or(|previous| previous < *value)
+                        && valid_cass_token_extent(&token.token, *value, admitted_query_bytes) =>
+                {
+                    previous_offset = Some(*value);
+                }
                 (
                     CassProfileField::NotExposed {
                         reason: CassProfileNotExposedReason::TantivyParserDoesNotRetainOffsets,
@@ -5651,18 +6025,10 @@ impl CassLexicalProfileObservation {
                 _ => return cass_profile_invalid("CASS token offset exposure is invalid"),
             }
         }
-        if !context
-            .filters
-            .agents
-            .iter()
-            .chain(&context.filters.workspaces)
-            .all(SensitiveValueObservation::validate)
-            || matches!(
-                &context.filters.source_filter,
-                CassProfileSourceFilter::SourceId { value }
-                    if !value.validate() || cass_sensitive_len(value).is_none()
-            )
-        {
+        if context.has_boolean_operators != observed_boolean_operator {
+            return cass_profile_invalid("CASS Boolean-operator evidence is incoherent");
+        }
+        if !valid_cass_filters(&context.filters) {
             return cass_profile_invalid("CASS filter redaction is invalid");
         }
         match (&context.was_truncated, &context.diagnostics, backend) {
@@ -5672,7 +6038,9 @@ impl CassLexicalProfileObservation {
                 "quill",
             ) => {
                 if diagnostics.len() > MAX_CASS_PROFILE_DIAGNOSTICS
-                    || !diagnostics.iter().all(valid_cass_diagnostic)
+                    || !diagnostics
+                        .iter()
+                        .all(|diagnostic| valid_cass_diagnostic(diagnostic, admitted_query_bytes))
                 {
                     return cass_profile_invalid("Quill CASS diagnostics are invalid");
                 }
@@ -5689,7 +6057,12 @@ impl CassLexicalProfileObservation {
             _ => return cass_profile_invalid("CASS diagnostic exposure is invalid"),
         }
         let request = &context.request;
-        if request.offset != 0
+        let expanded_fetch = request.limit.saturating_add(request.tie_expansion_limit);
+        if request.limit > u64::try_from(MAX_CASS_PROFILE_FETCH_HITS).unwrap_or(u64::MAX)
+            || request.tie_expansion_limit
+                > u64::try_from(MAX_CASS_PROFILE_FETCH_HITS).unwrap_or(u64::MAX)
+            || expanded_fetch > u64::try_from(MAX_CASS_PROFILE_FETCH_HITS).unwrap_or(u64::MAX)
+            || request.offset != 0
             || request.total_count != LexicalCountExposure::ExactRequested
             || request.offset_tie_evidence
                 != (CassProfileField::NotExposed {
@@ -5715,16 +6088,25 @@ impl CassLexicalProfileObservation {
                 } else {
                     LexicalEmptyShape::NonEmpty
                 };
+                let expected_hits = request.limit.min(success.total_count);
                 if success.empty_shape != expected_empty_shape
                     || success.hits.len() > MAX_LEXICAL_OBSERVATION_HITS
+                    || u64::try_from(success.hits.len()).unwrap_or(u64::MAX) != expected_hits
+                    || u64::try_from(success.hits.len()).unwrap_or(u64::MAX) > request.limit
+                    || u64::try_from(success.cutoff_tie_group.len()).unwrap_or(u64::MAX)
+                        > expanded_fetch
                     || success.total_count < u64::try_from(success.hits.len()).unwrap_or(u64::MAX)
+                    || success.total_count
+                        < u64::try_from(success.cutoff_tie_group.len()).unwrap_or(u64::MAX)
                     || success.doc_count < success.total_count
+                    || (!success.cutoff_tie_complete && success.total_count <= expanded_fetch)
                     || !success
                         .hits
                         .iter()
                         .enumerate()
                         .all(|(rank, hit)| hit.rank == u64::try_from(rank).unwrap_or(u64::MAX))
                     || !cass_tie_keys_match_backend(success, backend)
+                    || !valid_cass_success_payload(success)
                 {
                     return cass_profile_invalid(
                         "CASS success shape or backend tie keys are invalid",
@@ -5741,13 +6123,154 @@ impl CassLexicalProfileObservation {
     }
 }
 
-fn valid_cass_diagnostic(diagnostic: &CassProfileDiagnosticObservation) -> bool {
-    diagnostic.message.validate()
-        && diagnostic.fragment.validate()
-        && matches!(
-            diagnostic.byte_offset,
-            LexicalObserved::Absent | LexicalObserved::Value(_)
-        )
+fn valid_utf8_redaction_count(byte_len: u64, char_count: u64) -> bool {
+    char_count <= byte_len && byte_len <= char_count.saturating_mul(4)
+}
+
+fn valid_cass_sensitive_present(value: &SensitiveValueObservation, allow_empty: bool) -> bool {
+    match value {
+        SensitiveValueObservation::PresentEmpty { sha256, byte_len } => {
+            allow_empty && *byte_len == 0 && *sha256 == sha256_hex(b"")
+        }
+        SensitiveValueObservation::Present { sha256, byte_len } => {
+            *byte_len > 0
+                && *byte_len
+                    <= u64::try_from(MAX_LEXICAL_SENSITIVE_PAYLOAD_BYTES).unwrap_or(u64::MAX)
+                && is_lower_sha256(sha256)
+        }
+        SensitiveValueObservation::NotExposed | SensitiveValueObservation::Absent => false,
+    }
+}
+
+fn valid_cass_token_extent(
+    token: &CassProfileTokenKind,
+    byte_offset: u64,
+    admitted_query_bytes: u64,
+) -> bool {
+    let content_bytes = match token {
+        CassProfileTokenKind::Term { text } => cass_sensitive_len(text),
+        CassProfileTokenKind::Phrase { text } => {
+            cass_sensitive_len(text).and_then(|length| length.checked_add(1))
+        }
+        CassProfileTokenKind::And | CassProfileTokenKind::Or | CassProfileTokenKind::Not => Some(1),
+    };
+    content_bytes.is_some_and(|length| {
+        byte_offset
+            .checked_add(length)
+            .is_some_and(|end| end <= admitted_query_bytes)
+    })
+}
+
+fn valid_cass_filters(filters: &CassProfileFilters) -> bool {
+    let source_value = match &filters.source_filter {
+        CassProfileSourceFilter::SourceId { value } => Some(value),
+        CassProfileSourceFilter::All
+        | CassProfileSourceFilter::Local
+        | CassProfileSourceFilter::Remote => None,
+    };
+    let filter_count = filters
+        .agents
+        .len()
+        .saturating_add(filters.workspaces.len())
+        .saturating_add(usize::from(source_value.is_some()));
+    if filter_count > MAX_CASS_PROFILE_FILTER_VALUES {
+        return false;
+    }
+    let mut aggregate_bytes = 0_u64;
+    for value in filters
+        .agents
+        .iter()
+        .chain(&filters.workspaces)
+        .chain(source_value)
+    {
+        if !valid_cass_sensitive_present(value, false) {
+            return false;
+        }
+        let Some(length) = cass_sensitive_len(value) else {
+            return false;
+        };
+        if length > u64::try_from(MAX_CASS_PROFILE_FILTER_VALUE_BYTES).unwrap_or(u64::MAX) {
+            return false;
+        }
+        aggregate_bytes = aggregate_bytes.saturating_add(length);
+        if aggregate_bytes > u64::try_from(MAX_CASS_PROFILE_FILTER_BYTES).unwrap_or(u64::MAX) {
+            return false;
+        }
+    }
+    true
+}
+
+fn valid_cass_diagnostic(
+    diagnostic: &CassProfileDiagnosticObservation,
+    admitted_query_bytes: u64,
+) -> bool {
+    valid_cass_sensitive_present(&diagnostic.message, false)
+        && match &diagnostic.fragment {
+            SensitiveValueObservation::Absent => true,
+            fragment => {
+                valid_cass_sensitive_present(fragment, true)
+                    && cass_sensitive_len(fragment)
+                        .is_some_and(|length| length <= admitted_query_bytes)
+            }
+        }
+        && match &diagnostic.byte_offset {
+            LexicalObserved::Absent => true,
+            LexicalObserved::Value(offset) => *offset <= admitted_query_bytes,
+            LexicalObserved::NotExposed => false,
+        }
+}
+
+fn valid_cass_success_payload(success: &CassLexicalProfileSuccess) -> bool {
+    let mut aggregate_identity_bytes = 0_u64;
+    for identity in success.hits.iter().map(|hit| &hit.document_identity).chain(
+        success
+            .cutoff_tie_group
+            .iter()
+            .map(|hit| &hit.document_identity),
+    ) {
+        if !valid_cass_document_identity(identity) {
+            return false;
+        }
+        aggregate_identity_bytes = aggregate_identity_bytes
+            .saturating_add(cass_sensitive_len(identity).unwrap_or(u64::MAX));
+        if aggregate_identity_bytes
+            > u64::try_from(MAX_CASS_PROFILE_DOCUMENT_ID_BYTES).unwrap_or(u64::MAX)
+        {
+            return false;
+        }
+    }
+    if success.hits.is_empty() {
+        return success.cutoff_tie_group.is_empty() && success.cutoff_tie_complete;
+    }
+    let Some(cutoff) = success.hits.last() else {
+        return false;
+    };
+    !success.cutoff_tie_group.is_empty()
+        && success
+            .cutoff_tie_group
+            .iter()
+            .all(|hit| scores_exact(hit.score_bits, cutoff.score_bits))
+        && success
+            .hits
+            .iter()
+            .filter(|hit| scores_exact(hit.score_bits, cutoff.score_bits))
+            .all(|hit| {
+                success.cutoff_tie_group.iter().any(|member| {
+                    member.document_identity == hit.document_identity
+                        && member.native_tie_key == hit.native_tie_key
+                })
+            })
+        && success.cutoff_tie_group.iter().any(|hit| {
+            hit.document_identity == cutoff.document_identity
+                && hit.native_tie_key == cutoff.native_tie_key
+        })
+}
+
+fn valid_cass_document_identity(value: &SensitiveValueObservation) -> bool {
+    valid_cass_sensitive_present(value, false)
+        && cass_sensitive_len(value).is_some_and(|length| {
+            length <= u64::try_from(MAX_LEXICAL_DOC_ID_BYTES).unwrap_or(u64::MAX)
+        })
 }
 
 fn cass_tie_keys_match_backend(success: &CassLexicalProfileSuccess, backend: &str) -> bool {
@@ -5846,6 +6369,11 @@ pub fn compare_cass_lexical_profiles(
 ) -> Result<CassLexicalProfileComparison, GauntletError> {
     subject.validate()?;
     oracle.validate()?;
+    if subject.context.backend.engine != "quill" || oracle.context.backend.engine != "tantivy" {
+        return cass_profile_invalid(
+            "CASS comparison topology must bind quill subject to tantivy oracle",
+        );
+    }
     let mut mismatches = Vec::new();
     compare_cass_debug(
         &mut mismatches,
@@ -5885,9 +6413,44 @@ pub fn compare_cass_lexical_profiles(
     compare_cass_debug(
         &mut mismatches,
         CassProfileMismatchClass::Query,
+        "/context/raw_query_char_count",
+        &oracle.context.raw_query_char_count,
+        &subject.context.raw_query_char_count,
+    );
+    compare_cass_debug(
+        &mut mismatches,
+        CassProfileMismatchClass::Query,
+        "/context/admitted_query",
+        &oracle.context.admitted_query,
+        &subject.context.admitted_query,
+    );
+    compare_cass_debug(
+        &mut mismatches,
+        CassProfileMismatchClass::Query,
+        "/context/admitted_query_char_count",
+        &oracle.context.admitted_query_char_count,
+        &subject.context.admitted_query_char_count,
+    );
+    compare_cass_debug(
+        &mut mismatches,
+        CassProfileMismatchClass::Query,
         "/context/sanitized_query",
         &oracle.context.sanitized_query,
         &subject.context.sanitized_query,
+    );
+    compare_cass_debug(
+        &mut mismatches,
+        CassProfileMismatchClass::Query,
+        "/context/sanitized_query_char_count",
+        &oracle.context.sanitized_query_char_count,
+        &subject.context.sanitized_query_char_count,
+    );
+    compare_cass_debug(
+        &mut mismatches,
+        CassProfileMismatchClass::Query,
+        "/context/sanitization_changed",
+        &oracle.context.sanitization_changed,
+        &subject.context.sanitization_changed,
     );
     compare_cass_debug(
         &mut mismatches,
@@ -5935,16 +6498,13 @@ pub fn compare_cass_lexical_profiles(
             CassLexicalProfileOutcome::Success(subject_success),
             CassLexicalProfileOutcome::Success(oracle_success),
         ) => {
+            compare_cass_success(&mut mismatches, subject_success, oracle_success);
             let report = compare_observations(
                 cass_success_to_engine(subject_success)?,
                 cass_success_to_engine(oracle_success)?,
                 ComparatorConfig::default(),
             )?;
-            for divergence in report
-                .divergences
-                .iter()
-                .filter(|divergence| divergence.class.is_failure())
-            {
+            for divergence in &report.divergences {
                 mismatches.push(CassProfileMismatch {
                     class: CassProfileMismatchClass::Outcome,
                     pointer: divergence.pointer.clone(),
@@ -5993,12 +6553,110 @@ pub fn compare_cass_lexical_profiles(
         }
     };
     Ok(CassLexicalProfileComparison {
+        authority: CassProfileAuthority::DiagnosticOnlyUnbound,
         equivalent: mismatches.is_empty(),
         rank_comparison,
         mismatches,
         subject,
         oracle,
     })
+}
+
+fn compare_cass_success(
+    mismatches: &mut Vec<CassProfileMismatch>,
+    subject: &CassLexicalProfileSuccess,
+    oracle: &CassLexicalProfileSuccess,
+) {
+    // Backend-native numeric keys are intentionally not compared across
+    // Quill/Tantivy families. Their shape, uniqueness, ordering, cross-witness
+    // consistency, and complete DTO bytes are validated by each observation's
+    // diagnostic seal; every engine-neutral success field is exact here.
+    compare_cass_debug(
+        mismatches,
+        CassProfileMismatchClass::Outcome,
+        "/outcome/success/hits/length",
+        &oracle.hits.len(),
+        &subject.hits.len(),
+    );
+    for (index, (subject_hit, oracle_hit)) in subject.hits.iter().zip(&oracle.hits).enumerate() {
+        compare_cass_debug(
+            mismatches,
+            CassProfileMismatchClass::Outcome,
+            &format!("/outcome/success/hits/{index}/rank"),
+            &oracle_hit.rank,
+            &subject_hit.rank,
+        );
+        compare_cass_debug(
+            mismatches,
+            CassProfileMismatchClass::Outcome,
+            &format!("/outcome/success/hits/{index}/document_identity"),
+            &oracle_hit.document_identity,
+            &subject_hit.document_identity,
+        );
+        compare_cass_debug(
+            mismatches,
+            CassProfileMismatchClass::Outcome,
+            &format!("/outcome/success/hits/{index}/score_bits"),
+            &oracle_hit.score_bits,
+            &subject_hit.score_bits,
+        );
+    }
+    compare_cass_debug(
+        mismatches,
+        CassProfileMismatchClass::Outcome,
+        "/outcome/success/cutoff_tie_group/length",
+        &oracle.cutoff_tie_group.len(),
+        &subject.cutoff_tie_group.len(),
+    );
+    for (index, (subject_hit, oracle_hit)) in subject
+        .cutoff_tie_group
+        .iter()
+        .zip(&oracle.cutoff_tie_group)
+        .enumerate()
+    {
+        compare_cass_debug(
+            mismatches,
+            CassProfileMismatchClass::Outcome,
+            &format!("/outcome/success/cutoff_tie_group/{index}/document_identity"),
+            &oracle_hit.document_identity,
+            &subject_hit.document_identity,
+        );
+        compare_cass_debug(
+            mismatches,
+            CassProfileMismatchClass::Outcome,
+            &format!("/outcome/success/cutoff_tie_group/{index}/score_bits"),
+            &oracle_hit.score_bits,
+            &subject_hit.score_bits,
+        );
+    }
+    compare_cass_debug(
+        mismatches,
+        CassProfileMismatchClass::Outcome,
+        "/outcome/success/cutoff_tie_complete",
+        &oracle.cutoff_tie_complete,
+        &subject.cutoff_tie_complete,
+    );
+    compare_cass_debug(
+        mismatches,
+        CassProfileMismatchClass::Outcome,
+        "/outcome/success/total_count",
+        &oracle.total_count,
+        &subject.total_count,
+    );
+    compare_cass_debug(
+        mismatches,
+        CassProfileMismatchClass::Outcome,
+        "/outcome/success/doc_count",
+        &oracle.doc_count,
+        &subject.doc_count,
+    );
+    compare_cass_debug(
+        mismatches,
+        CassProfileMismatchClass::Outcome,
+        "/outcome/success/empty_shape",
+        &oracle.empty_shape,
+        &subject.empty_shape,
+    );
 }
 
 fn compare_cass_tokens(
@@ -6996,6 +7654,55 @@ mod tests {
         }
     }
 
+    #[test]
+    fn cass_profile_bounds_match_the_quill_observation_boundary() {
+        assert_eq!(
+            MAX_LEXICAL_QUERY_BYTES,
+            frankensearch_quill::query::MAX_CASS_OBSERVATION_RAW_QUERY_BYTES
+        );
+        assert_eq!(
+            MAX_CASS_PROFILE_FILTER_VALUES,
+            frankensearch_quill::query::MAX_CASS_OBSERVATION_FILTER_VALUES
+        );
+        assert_eq!(
+            MAX_CASS_PROFILE_FILTER_VALUE_BYTES,
+            frankensearch_quill::query::MAX_CASS_OBSERVATION_FILTER_VALUE_BYTES
+        );
+        assert_eq!(
+            MAX_CASS_PROFILE_FILTER_BYTES,
+            frankensearch_quill::query::MAX_CASS_OBSERVATION_FILTER_BYTES
+        );
+    }
+
+    #[cfg(feature = "tantivy-oracle")]
+    #[test]
+    fn cass_profile_bounds_match_the_tantivy_oracle_boundary() {
+        use frankensearch_lexical::cass_compat::{
+            MAX_CASS_ORACLE_DOCUMENT_ID_AGGREGATE_BYTES, MAX_CASS_ORACLE_DOCUMENT_ID_BYTES,
+            MAX_CASS_ORACLE_FETCH_HITS, MAX_CASS_ORACLE_FILTER_BYTES,
+            MAX_CASS_ORACLE_FILTER_VALUE_BYTES, MAX_CASS_ORACLE_FILTER_VALUES,
+            MAX_CASS_ORACLE_RAW_QUERY_BYTES, MAX_CASS_ORACLE_TOKENS,
+        };
+
+        assert_eq!(MAX_LEXICAL_QUERY_BYTES, MAX_CASS_ORACLE_RAW_QUERY_BYTES);
+        assert_eq!(MAX_CASS_PROFILE_TOKENS, MAX_CASS_ORACLE_TOKENS);
+        assert_eq!(
+            MAX_CASS_PROFILE_FILTER_VALUES,
+            MAX_CASS_ORACLE_FILTER_VALUES
+        );
+        assert_eq!(
+            MAX_CASS_PROFILE_FILTER_VALUE_BYTES,
+            MAX_CASS_ORACLE_FILTER_VALUE_BYTES
+        );
+        assert_eq!(MAX_CASS_PROFILE_FILTER_BYTES, MAX_CASS_ORACLE_FILTER_BYTES);
+        assert_eq!(MAX_CASS_PROFILE_FETCH_HITS, MAX_CASS_ORACLE_FETCH_HITS);
+        assert_eq!(MAX_LEXICAL_DOC_ID_BYTES, MAX_CASS_ORACLE_DOCUMENT_ID_BYTES);
+        assert_eq!(
+            MAX_CASS_PROFILE_DOCUMENT_ID_BYTES,
+            MAX_CASS_ORACLE_DOCUMENT_ID_AGGREGATE_BYTES
+        );
+    }
+
     fn cass_profile_engine_observation() -> EngineObservation {
         let first = RankedHit {
             doc_id: "private-source-a#7".to_owned(),
@@ -7035,7 +7742,9 @@ mod tests {
             ),
         };
         let raw_query = "private-term AND";
-        let parsed = parser.parse_observed(raw_query, &filters);
+        let parsed = parser
+            .parse_observed(raw_query, &filters)
+            .expect("bounded CASS parser fixture");
         observe_quill_cass_profile(
             cass_profile_provenance("quill"),
             raw_query,
@@ -7063,21 +7772,23 @@ mod tests {
         observation.context.diagnostics = CassProfileField::NotExposed {
             reason: CassProfileNotExposedReason::TantivyParserHasNoDiagnosticChannel,
         };
-        let CassLexicalProfileOutcome::Success(success) = &mut observation.outcome else {
-            panic!("success fixture");
-        };
-        for (rank, hit) in success.hits.iter_mut().enumerate() {
-            hit.native_tie_key = NativeTieKey::TantivyDocAddress {
-                segment_ord: 0,
-                doc_id: u32::try_from(rank).expect("small fixture rank"),
-            };
+        if let CassLexicalProfileOutcome::Success(success) = &mut observation.outcome {
+            for (rank, hit) in success.hits.iter_mut().enumerate() {
+                hit.native_tie_key = NativeTieKey::TantivyDocAddress {
+                    segment_ord: 0,
+                    doc_id: u32::try_from(rank).expect("small fixture rank"),
+                };
+            }
+            for hit in &mut success.cutoff_tie_group {
+                hit.native_tie_key = NativeTieKey::TantivyDocAddress {
+                    segment_ord: 0,
+                    doc_id: 1,
+                };
+            }
         }
-        for hit in &mut success.cutoff_tie_group {
-            hit.native_tie_key = NativeTieKey::TantivyDocAddress {
-                segment_ord: 0,
-                doc_id: 1,
-            };
-        }
+        observation
+            .refresh_diagnostic_seal()
+            .expect("seal Tantivy projection");
         observation.validate().expect("valid Tantivy projection");
         observation
     }
@@ -7106,6 +7817,16 @@ mod tests {
             serde_json::json!(true),
         );
         assert!(serde_json::from_value::<CassLexicalProfileObservation>(unknown).is_err());
+
+        let mut nested_unknown = serde_json::to_value(&observation).expect("profile JSON value");
+        nested_unknown["outcome"]["hits"][0]["native_tie_key"]
+            .as_object_mut()
+            .expect("nested native tie key")
+            .insert("legacy_doc_address".to_owned(), serde_json::json!(7));
+        assert!(
+            serde_json::from_value::<CassLexicalProfileObservation>(nested_unknown).is_err(),
+            "nested backend evidence must reject unknown fields"
+        );
     }
 
     #[test]
@@ -7119,8 +7840,12 @@ mod tests {
             "unexpected mismatches: {:?}",
             exact.mismatches
         );
+        assert_eq!(exact.authority, CassProfileAuthority::DiagnosticOnlyUnbound);
 
-        let assert_mutation = |mutated: CassLexicalProfileObservation, pointer: &str| {
+        let assert_mutation = |mut mutated: CassLexicalProfileObservation, pointer: &str| {
+            mutated
+                .refresh_diagnostic_seal()
+                .expect("seal coherent semantic mutation");
             let report = compare_cass_lexical_profiles(mutated, oracle.clone())
                 .expect("compare mutated CASS profile");
             assert!(!report.equivalent, "mutation at {pointer} was ignored");
@@ -7135,7 +7860,14 @@ mod tests {
         };
 
         let mut raw_query = subject.clone();
-        raw_query.context.raw_query = SensitiveValueObservation::from_text("different-query");
+        let different_query = "different OR term";
+        raw_query.context.raw_query = SensitiveValueObservation::from_text(different_query);
+        raw_query.context.raw_query_char_count = different_query.chars().count() as u64;
+        raw_query.context.admitted_query = SensitiveValueObservation::from_text(different_query);
+        raw_query.context.admitted_query_char_count = different_query.chars().count() as u64;
+        raw_query.context.sanitized_query = SensitiveValueObservation::from_text(different_query);
+        raw_query.context.sanitized_query_char_count = different_query.chars().count() as u64;
+        raw_query.context.sanitization_changed = false;
         assert_mutation(raw_query, "raw_query");
 
         let mut token = subject.clone();
@@ -7147,16 +7879,6 @@ mod tests {
         let mut filter = subject.clone();
         filter.context.filters.agents[0] = SensitiveValueObservation::from_text("different-agent");
         assert_mutation(filter, "filters");
-
-        let mut presence = subject.clone();
-        let CassProfileField::Value { value: diagnostics } = &mut presence.context.diagnostics
-        else {
-            panic!("Quill diagnostics are exposed");
-        };
-        diagnostics[0].fragment = SensitiveValueObservation::from_text("");
-        let presence_report = compare_cass_lexical_profiles(presence, subject.clone())
-            .expect("compare None-versus-empty diagnostic presence");
-        assert!(!presence_report.equivalent);
 
         let mut score = subject.clone();
         let CassLexicalProfileOutcome::Success(success) = &mut score.outcome else {
@@ -7172,6 +7894,180 @@ mod tests {
         success.total_count = 3;
         success.doc_count = 3;
         assert_mutation(count, "match_count");
+
+        let mut cutoff_complete = quill_cass_profile_fixture();
+        let CassLexicalProfileOutcome::Success(success) = &mut cutoff_complete.outcome else {
+            panic!("success fixture");
+        };
+        success.cutoff_tie_complete = false;
+        success.total_count = 11;
+        success.doc_count = 11;
+        assert_mutation(cutoff_complete, "cutoff_tie_complete");
+    }
+
+    #[test]
+    fn cass_profile_rejects_mutation_bounds_and_incoherent_witnesses() {
+        let subject = quill_cass_profile_fixture();
+
+        let mut native_key_mutation = subject.clone();
+        let CassLexicalProfileOutcome::Success(success) = &mut native_key_mutation.outcome else {
+            panic!("success fixture");
+        };
+        success.hits[0].native_tie_key = NativeTieKey::QuillDocId { doc_id: 10 };
+        success.hits[1].native_tie_key = NativeTieKey::QuillDocId { doc_id: 11 };
+        success.cutoff_tie_group[0].native_tie_key = NativeTieKey::QuillDocId { doc_id: 11 };
+        assert!(
+            native_key_mutation.validate().is_err(),
+            "the diagnostic content seal must expose a preserving-order native-key mutation"
+        );
+
+        let mut request_limit = subject.clone();
+        request_limit.context.request.limit = 1;
+        request_limit
+            .refresh_diagnostic_seal()
+            .expect("seal hostile request mutation");
+        assert!(
+            request_limit.validate().is_err(),
+            "hits may never exceed the declared request limit"
+        );
+
+        let mut cutoff_bound = subject.clone();
+        let CassLexicalProfileOutcome::Success(success) = &mut cutoff_bound.outcome else {
+            panic!("success fixture");
+        };
+        let cutoff_identity = success.hits[1].document_identity.clone();
+        success.cutoff_tie_group = (1_u32..=11)
+            .map(|doc_id| CassProfileTieMember {
+                document_identity: if doc_id == 1 {
+                    cutoff_identity.clone()
+                } else {
+                    SensitiveValueObservation::from_text(&format!("bounded-cutoff#{doc_id}"))
+                },
+                score_bits: 1.0_f32.to_bits(),
+                native_tie_key: NativeTieKey::QuillDocId { doc_id },
+            })
+            .collect();
+        success.total_count = 12;
+        success.doc_count = 12;
+        cutoff_bound
+            .refresh_diagnostic_seal()
+            .expect("seal hostile cutoff mutation");
+        assert!(
+            cutoff_bound.validate().is_err(),
+            "expanded cutoff evidence must remain inside limit plus tie expansion"
+        );
+
+        let mut boolean = subject.clone();
+        boolean.context.has_boolean_operators = false;
+        boolean
+            .refresh_diagnostic_seal()
+            .expect("seal hostile Boolean mutation");
+        assert!(
+            boolean.validate().is_err(),
+            "Boolean presence must be recomputed from the retained token kinds"
+        );
+
+        let mut offset = subject.clone();
+        let admitted_bytes =
+            cass_sensitive_len(&offset.context.admitted_query).expect("admitted query is present");
+        offset.context.tokens[0].byte_offset = CassProfileField::Value {
+            value: admitted_bytes,
+        };
+        offset
+            .refresh_diagnostic_seal()
+            .expect("seal hostile offset mutation");
+        assert!(
+            offset.validate().is_err(),
+            "token offsets must be strictly inside the admitted prefix"
+        );
+
+        let mut diagnostic_offset = subject.clone();
+        let CassProfileField::Value { value: diagnostics } =
+            &mut diagnostic_offset.context.diagnostics
+        else {
+            panic!("Quill diagnostics are exposed");
+        };
+        diagnostics[0].byte_offset = LexicalObserved::Value(admitted_bytes + 1);
+        diagnostic_offset
+            .refresh_diagnostic_seal()
+            .expect("seal hostile diagnostic offset mutation");
+        assert!(
+            diagnostic_offset.validate().is_err(),
+            "diagnostic offsets may not escape the admitted prefix"
+        );
+
+        let mut malformed_empty = subject;
+        malformed_empty.context.raw_query = SensitiveValueObservation::PresentEmpty {
+            sha256: sha256_hex(b"x"),
+            byte_len: 1,
+        };
+        malformed_empty
+            .refresh_diagnostic_seal()
+            .expect("seal hostile redaction mutation");
+        assert!(
+            malformed_empty.validate().is_err(),
+            "present-empty and present-nonempty shapes must agree with byte length"
+        );
+    }
+
+    #[test]
+    fn cass_profile_rejects_same_engine_and_swapped_role_topologies() {
+        let subject = quill_cass_profile_fixture();
+        let oracle = tantivy_projection_of(subject.clone());
+
+        assert!(
+            compare_cass_lexical_profiles(subject.clone(), subject.clone()).is_err(),
+            "caller-supplied same-engine evidence has no comparison authority"
+        );
+        assert!(
+            compare_cass_lexical_profiles(oracle, subject).is_err(),
+            "caller-supplied swapped roles must be rejected"
+        );
+    }
+
+    #[test]
+    fn cass_profile_preserves_multibyte_admitted_offsets_and_character_counts() {
+        let parser = frankensearch_quill::query::CassQueryParser::new(
+            frankensearch_quill::CASS_SEMANTIC_SCHEMA,
+        )
+        .expect("CASS parser fixture");
+        let filters = frankensearch_quill::query::CassQueryFilters::default();
+        let raw_query = "搜索 OR 尾巴";
+        let parsed = parser
+            .parse_observed(raw_query, &filters)
+            .expect("bounded multibyte parser witness");
+        let observation = observe_quill_cass_profile(
+            cass_profile_provenance("quill"),
+            raw_query,
+            &filters,
+            &parsed,
+            Ok(cass_profile_engine_observation()),
+            2,
+            8,
+        )
+        .expect("valid multibyte profile");
+
+        assert_eq!(
+            observation.context.raw_query_char_count,
+            raw_query.chars().count() as u64
+        );
+        assert_eq!(
+            observation.context.admitted_query_char_count,
+            raw_query.chars().count() as u64
+        );
+        assert_eq!(
+            observation
+                .context
+                .tokens
+                .iter()
+                .map(|token| match &token.byte_offset {
+                    CassProfileField::Value { value } => *value,
+                    CassProfileField::NotExposed { .. } => panic!("Quill retains offsets"),
+                })
+                .collect::<Vec<_>>(),
+            vec![0, "搜索 ".len() as u64, "搜索 OR ".len() as u64]
+        );
+        observation.validate().expect("multibyte profile validates");
     }
 
     #[test]
@@ -7182,7 +8078,9 @@ mod tests {
         .expect("CASS parser fixture");
         let filters = frankensearch_quill::query::CassQueryFilters::default();
         let raw_query = "private-error-query";
-        let parsed = parser.parse_observed(raw_query, &filters);
+        let parsed = parser
+            .parse_observed(raw_query, &filters)
+            .expect("bounded CASS parser fixture");
         let make = |detail: &str| {
             observe_quill_cass_profile(
                 cass_profile_provenance("quill"),
@@ -7199,14 +8097,17 @@ mod tests {
             .expect("typed error profile")
         };
         let left = make("private-parser-detail-a");
-        let right = make("private-parser-detail-a");
+        let right = tantivy_projection_of(make("private-parser-detail-a"));
         assert!(
             compare_cass_lexical_profiles(left.clone(), right)
                 .expect("compare equal errors")
                 .equivalent
         );
-        let mismatch = compare_cass_lexical_profiles(left.clone(), make("different-detail"))
-            .expect("compare distinct errors");
+        let mismatch = compare_cass_lexical_profiles(
+            left.clone(),
+            tantivy_projection_of(make("different-detail")),
+        )
+        .expect("compare distinct errors");
         assert!(!mismatch.equivalent);
         let encoded = serde_json::to_string(&left).expect("serialize error profile");
         assert!(!encoded.contains(raw_query));
