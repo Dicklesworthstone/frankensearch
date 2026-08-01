@@ -3365,6 +3365,11 @@ impl QuillWriterState {
         if plan.route == ParallelIngestRoute::Serial {
             return Ok(None);
         }
+        let Some(budget_admission) =
+            self.parallel_budget_admission(cx, documents, plan.active_shards)?
+        else {
+            return Ok(None);
+        };
 
         let mut batch_ids = BTreeSet::new();
         for document in documents {
@@ -3424,7 +3429,10 @@ impl QuillWriterState {
                     },
                 },
                 state: ScribeShardState {
-                    accumulator: ColumnarAccumulator::new(self.schema)?,
+                    accumulator: ColumnarAccumulator::with_arena_chunk_size(
+                        self.schema,
+                        budget_admission.arena_chunk_bytes,
+                    )?,
                     identities: Vec::new(),
                     current_lease_base: Some(batch_span.lease_base),
                 },
@@ -3506,6 +3514,13 @@ impl QuillWriterState {
         let arena_bytes_used_high_water = completed.iter().fold(0_usize, |total, shard| {
             total.saturating_add(shard.state.accumulator.bytes_used())
         });
+        if arena_bytes_used_high_water > budget_admission.projected_logical_upper_bound
+            || arena_bytes_used_high_water >= budget_admission.logical_budget_bytes
+        {
+            return Err(invalid_state(
+                "internal parallel ingest exceeded its pre-worker logical budget proof",
+            ));
+        }
         let arena_bytes_reserved_high_water = completed.iter().fold(0_usize, |total, shard| {
             total.saturating_add(shard.state.accumulator.bytes_reserved())
         });
@@ -3554,6 +3569,11 @@ impl QuillWriterState {
             verified_pool_capacity: rayon::current_num_threads(),
             eligible_shards: plan.eligible_shards,
             active_shards: plan.active_shards,
+            logical_budget_bytes: budget_admission.logical_budget_bytes,
+            initial_logical_bytes: budget_admission.initial_logical_bytes,
+            batch_logical_upper_bound: budget_admission.batch_logical_upper_bound,
+            projected_logical_upper_bound: budget_admission.projected_logical_upper_bound,
+            arena_chunk_bytes: budget_admission.arena_chunk_bytes,
             arena_bytes_used_high_water,
             arena_bytes_reserved_high_water,
         }))
