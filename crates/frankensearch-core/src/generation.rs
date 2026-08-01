@@ -71,6 +71,8 @@ pub const EMBEDDING_PRODUCER_ATTESTATION_SCHEMA_V1: u16 = 1;
 pub const EMBEDDING_INPUT_CONTRACT_SCHEMA_V1: u16 = 1;
 /// Current schema for vector-storage identities.
 pub const VECTOR_STORAGE_IDENTITY_SCHEMA_V1: u16 = 1;
+/// Current schema for explicit foreign-producer conformance certificates.
+pub const FOREIGN_PRODUCER_CONFORMANCE_CERTIFICATE_SCHEMA_V1: u16 = 1;
 /// Current schema for immutable artifact-generation identities.
 pub const ARTIFACT_GENERATION_IDENTITY_SCHEMA_V1: u16 = 1;
 
@@ -928,6 +930,463 @@ pub struct FrozenEmbeddingIdentityBundleV1 {
     pub fingerprint: String,
 }
 
+/// Why producer compatibility could not be established.
+///
+/// Variants deliberately carry no caller-controlled text. Callers may log the
+/// stable variant name together with bounded witness fingerprints without ever
+/// exposing conformance inputs, vectors, model paths, or policy material.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, thiserror::Error)]
+pub enum ProducerCompatibilityErrorV1 {
+    /// The reference bundle failed its complete identity validation.
+    #[error("reference embedding identity is invalid")]
+    InvalidReferenceIdentity,
+    /// The candidate bundle failed its complete identity validation.
+    #[error("candidate embedding identity is invalid")]
+    InvalidCandidateIdentity,
+    /// The bundles describe different mathematical embedding spaces.
+    #[error("producer comparison crossed mathematical embedding spaces")]
+    SpaceMismatch,
+    /// Exact producer identity did not match, so certified evidence is required.
+    #[error("foreign producer requires an explicit conformance certificate")]
+    CertificateRequired,
+    /// The certified path was invoked for an already-exact producer.
+    #[error("foreign-producer certificate is forbidden for an exact producer")]
+    CertificateForbiddenForExactProducer,
+    /// The ordered fixture or one of its exact vector sets was malformed.
+    #[error("golden conformance fixture is malformed")]
+    GoldenFixtureInvalid,
+    /// Reference and candidate outputs or their embedded certificates differ.
+    #[error("golden conformance vectors do not match exactly")]
+    GoldenVectorMismatch,
+    /// The raw certificate has an unknown schema or malformed field.
+    #[error("foreign-producer certificate is malformed")]
+    CertificateMalformed,
+    /// The canonical raw certificate does not match the independently pinned digest.
+    #[error("foreign-producer certificate fingerprint is not trusted")]
+    CertificateFingerprintMismatch,
+    /// The certificate names a policy other than the independently pinned policy.
+    #[error("foreign-producer certificate policy does not match trusted policy")]
+    PolicyMismatch,
+    /// One or both direction-sensitive producer bindings are wrong.
+    #[error("foreign-producer certificate does not bind the exact producer pair")]
+    ProducerBindingMismatch,
+    /// The certificate does not bind the independently verified golden fixture.
+    #[error("foreign-producer certificate does not bind the trusted fixture")]
+    FixtureBindingMismatch,
+    /// The certificate is not active yet at the trusted evaluation time.
+    #[error("foreign-producer certificate is not yet valid")]
+    CertificateNotYetValid,
+    /// The certificate is expired at the trusted evaluation time.
+    #[error("foreign-producer certificate is expired")]
+    CertificateExpired,
+    /// The certificate revision is outside the trusted policy window.
+    #[error("foreign-producer certificate revision is outside trusted policy")]
+    CertificateRevisionOutsidePolicy,
+}
+
+/// Authority-free fixture receipt derived from both producers' actual outputs.
+///
+/// This type is intentionally serializable but not deserializable. Untrusted
+/// bytes can never regain the authority established by executing both producers
+/// over the same ordered inputs and comparing their exact `f32` output bits.
+///
+/// ```compile_fail
+/// use frankensearch_core::generation::VerifiedGoldenConformanceManifestV1;
+/// let _: VerifiedGoldenConformanceManifestV1 = serde_json::from_str("{}").unwrap();
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
+pub struct VerifiedGoldenConformanceManifestV1 {
+    certificate: GoldenVectorCertificateV1,
+    canonical_bytes: Vec<u8>,
+    fingerprint: String,
+}
+
+/// Raw, non-authoritative certificate claiming that two distinct producers are
+/// bit-exact on one verified fixture.
+///
+/// Deserialization only recovers an untrusted claim. The sole authority-bearing
+/// promotion path is
+/// [`EmbeddingIdentityBundleV1::verify_certified_foreign_producer_with`], which
+/// compares every field with independently trusted identity, policy, time, and
+/// fixture state.
+///
+/// Raw certificate bytes alone cannot become either trust context or witness:
+///
+/// ```compile_fail
+/// use frankensearch_core::generation::{
+///     ForeignProducerConformanceCertificateV1, ProducerCompatibilityWitnessV1,
+///     TrustedProducerConformanceContextV1,
+/// };
+/// let raw: ForeignProducerConformanceCertificateV1 = serde_json::from_str("{}").unwrap();
+/// let _: TrustedProducerConformanceContextV1<'_> = raw.clone().into();
+/// let _: ProducerCompatibilityWitnessV1 = raw.into();
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ForeignProducerConformanceCertificateV1 {
+    schema_version: u16,
+    reference_producer_fingerprint: String,
+    candidate_producer_fingerprint: String,
+    space_fingerprint: String,
+    golden_fixture_fingerprint: String,
+    policy_fingerprint: String,
+    certificate_revision: u64,
+    not_before_unix_seconds: u64,
+    expires_at_unix_seconds: u64,
+}
+
+/// Independently sourced authority for validating one raw foreign-producer
+/// certificate.
+///
+/// The pinned certificate and policy fingerprints, evaluation time, revision
+/// window, and verified fixture must come from retained owners or sealed local
+/// policy. Never populate this context from the certificate being validated.
+/// This type is intentionally neither serializable nor deserializable.
+///
+/// ```compile_fail
+/// use frankensearch_core::generation::TrustedProducerConformanceContextV1;
+/// let _: TrustedProducerConformanceContextV1<'_> = serde_json::from_str("{}").unwrap();
+/// ```
+#[derive(Debug, Clone, Copy)]
+pub struct TrustedProducerConformanceContextV1<'a> {
+    policy_fingerprint: &'a str,
+    certificate_fingerprint: &'a str,
+    fixture: &'a VerifiedGoldenConformanceManifestV1,
+    evaluation_time_unix_seconds: u64,
+    minimum_certificate_revision: u64,
+    maximum_certificate_revision: u64,
+}
+
+/// How an opaque producer-compatibility witness was established.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProducerCompatibilityKindV1 {
+    /// Both validated bundles carry the exact same producer identity.
+    Exact,
+    /// A distinct producer was promoted through an independently trusted certificate.
+    Certified,
+}
+
+/// Opaque proof that one candidate producer is admissible relative to one
+/// reference producer.
+///
+/// Fields are private and the type is not deserializable, so a caller cannot
+/// manufacture runtime authority from JSON or plausible digest strings.
+///
+/// ```compile_fail
+/// use frankensearch_core::generation::ProducerCompatibilityWitnessV1;
+/// let _: ProducerCompatibilityWitnessV1 = serde_json::from_str("{}").unwrap();
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
+pub struct ProducerCompatibilityWitnessV1 {
+    kind: ProducerCompatibilityKindV1,
+    space_fingerprint: String,
+    reference_producer_fingerprint: String,
+    candidate_producer_fingerprint: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    certificate_fingerprint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    policy_fingerprint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    golden_fixture_fingerprint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    certificate_revision: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    expires_at_unix_seconds: Option<u64>,
+}
+
+impl VerifiedGoldenConformanceManifestV1 {
+    /// Execute the fixture comparison boundary over already-produced exact vectors.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProducerCompatibilityErrorV1::GoldenFixtureInvalid`] for malformed
+    /// corpus/vector shapes, or [`ProducerCompatibilityErrorV1::GoldenVectorMismatch`]
+    /// when the producers differ in any ordered input, shape, or exact `f32` bit.
+    pub fn from_exact_pair_f32(
+        texts: &[&str],
+        reference_vectors: &[Vec<f32>],
+        candidate_vectors: &[Vec<f32>],
+    ) -> Result<Self, ProducerCompatibilityErrorV1> {
+        let reference = GoldenVectorCertificateV1::from_exact_f32(texts, reference_vectors)
+            .map_err(|_| ProducerCompatibilityErrorV1::GoldenFixtureInvalid)?;
+        let candidate = GoldenVectorCertificateV1::from_exact_f32(texts, candidate_vectors)
+            .map_err(|_| ProducerCompatibilityErrorV1::GoldenFixtureInvalid)?;
+        if reference != candidate {
+            return Err(ProducerCompatibilityErrorV1::GoldenVectorMismatch);
+        }
+        let canonical_bytes = Self::canonical_bytes_for(&reference);
+        Ok(Self {
+            certificate: reference,
+            fingerprint: sha256_hex(&canonical_bytes),
+            canonical_bytes,
+        })
+    }
+
+    /// Exact common golden-vector certificate produced by the fixture run.
+    #[must_use]
+    pub const fn certificate(&self) -> &GoldenVectorCertificateV1 {
+        &self.certificate
+    }
+
+    /// Domain-separated SHA-256 of the frozen fixture manifest.
+    #[must_use]
+    pub fn fingerprint(&self) -> &str {
+        &self.fingerprint
+    }
+
+    /// Exact canonical bytes bound by [`Self::fingerprint`].
+    #[must_use]
+    pub fn canonical_bytes(&self) -> &[u8] {
+        &self.canonical_bytes
+    }
+
+    fn canonical_bytes_for(certificate: &GoldenVectorCertificateV1) -> Vec<u8> {
+        let mut encoder =
+            CanonicalEncoder::new(b"frankensearch.verified-golden-conformance-manifest.v1");
+        certificate.encode(&mut encoder);
+        encoder.finish()
+    }
+
+    fn validate(&self) -> Result<(), ProducerCompatibilityErrorV1> {
+        self.certificate
+            .validate()
+            .map_err(|_| ProducerCompatibilityErrorV1::GoldenFixtureInvalid)?;
+        let canonical_bytes = Self::canonical_bytes_for(&self.certificate);
+        if self.canonical_bytes != canonical_bytes
+            || self.fingerprint != sha256_hex(&canonical_bytes)
+        {
+            return Err(ProducerCompatibilityErrorV1::GoldenFixtureInvalid);
+        }
+        Ok(())
+    }
+}
+
+impl ForeignProducerConformanceCertificateV1 {
+    /// Create an authority-free raw receipt for a verified producer pair.
+    ///
+    /// The returned value remains untrusted until promoted against a
+    /// [`TrustedProducerConformanceContextV1`] that independently pins its
+    /// canonical fingerprint. Computing that fingerprint from this returned
+    /// value and immediately feeding it back as the supposed independent pin is
+    /// self-assertion, not certification.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed producer-compatibility error for invalid identities,
+    /// cross-space or exact-producer use, fixture disagreement, malformed policy,
+    /// zero revision, or an empty validity interval.
+    pub fn new_untrusted_receipt_from_verified_pair(
+        reference: &EmbeddingIdentityBundleV1,
+        candidate: &EmbeddingIdentityBundleV1,
+        fixture: &VerifiedGoldenConformanceManifestV1,
+        policy_fingerprint: &str,
+        certificate_revision: u64,
+        not_before_unix_seconds: u64,
+        expires_at_unix_seconds: u64,
+    ) -> Result<Self, ProducerCompatibilityErrorV1> {
+        validate_reference_and_candidate(reference, candidate)?;
+        if reference.space.fingerprint() != candidate.space.fingerprint() {
+            return Err(ProducerCompatibilityErrorV1::SpaceMismatch);
+        }
+        let reference_producer_fingerprint = reference.producer.fingerprint();
+        let candidate_producer_fingerprint = candidate.producer.fingerprint();
+        if reference_producer_fingerprint == candidate_producer_fingerprint {
+            return Err(ProducerCompatibilityErrorV1::CertificateForbiddenForExactProducer);
+        }
+        fixture.validate()?;
+        if fixture.certificate != reference.producer.golden_vectors
+            || fixture.certificate != candidate.producer.golden_vectors
+        {
+            return Err(ProducerCompatibilityErrorV1::GoldenVectorMismatch);
+        }
+        if validate_sha256(
+            "producer_conformance.policy_fingerprint",
+            policy_fingerprint,
+        )
+        .is_err()
+            || certificate_revision == 0
+            || not_before_unix_seconds >= expires_at_unix_seconds
+        {
+            return Err(ProducerCompatibilityErrorV1::CertificateMalformed);
+        }
+        Ok(Self {
+            schema_version: FOREIGN_PRODUCER_CONFORMANCE_CERTIFICATE_SCHEMA_V1,
+            reference_producer_fingerprint,
+            candidate_producer_fingerprint,
+            space_fingerprint: reference.space.fingerprint(),
+            golden_fixture_fingerprint: fixture.fingerprint.clone(),
+            policy_fingerprint: policy_fingerprint.to_owned(),
+            certificate_revision,
+            not_before_unix_seconds,
+            expires_at_unix_seconds,
+        })
+    }
+
+    /// Domain-separated canonical bytes for policy pinning.
+    #[must_use]
+    pub fn canonical_bytes(&self) -> Vec<u8> {
+        let mut encoder =
+            CanonicalEncoder::new(b"frankensearch.foreign-producer-conformance-certificate.v1");
+        encoder.u16(self.schema_version);
+        encoder.text(&self.reference_producer_fingerprint);
+        encoder.text(&self.candidate_producer_fingerprint);
+        encoder.text(&self.space_fingerprint);
+        encoder.text(&self.golden_fixture_fingerprint);
+        encoder.text(&self.policy_fingerprint);
+        encoder.u64(self.certificate_revision);
+        encoder.u64(self.not_before_unix_seconds);
+        encoder.u64(self.expires_at_unix_seconds);
+        encoder.finish()
+    }
+
+    /// Lowercase SHA-256 of [`Self::canonical_bytes`].
+    #[must_use]
+    pub fn fingerprint(&self) -> String {
+        sha256_hex(&self.canonical_bytes())
+    }
+
+    /// Certificate revision bound by the canonical fingerprint.
+    #[must_use]
+    pub const fn certificate_revision(&self) -> u64 {
+        self.certificate_revision
+    }
+
+    /// Exclusive expiry bound in Unix seconds.
+    #[must_use]
+    pub const fn expires_at_unix_seconds(&self) -> u64 {
+        self.expires_at_unix_seconds
+    }
+
+    fn validate(&self) -> Result<(), ProducerCompatibilityErrorV1> {
+        if self.schema_version != FOREIGN_PRODUCER_CONFORMANCE_CERTIFICATE_SCHEMA_V1
+            || self.certificate_revision == 0
+            || self.not_before_unix_seconds >= self.expires_at_unix_seconds
+        {
+            return Err(ProducerCompatibilityErrorV1::CertificateMalformed);
+        }
+        for (field, fingerprint) in [
+            (
+                "producer_conformance.reference_producer_fingerprint",
+                &self.reference_producer_fingerprint,
+            ),
+            (
+                "producer_conformance.candidate_producer_fingerprint",
+                &self.candidate_producer_fingerprint,
+            ),
+            (
+                "producer_conformance.space_fingerprint",
+                &self.space_fingerprint,
+            ),
+            (
+                "producer_conformance.golden_fixture_fingerprint",
+                &self.golden_fixture_fingerprint,
+            ),
+            (
+                "producer_conformance.policy_fingerprint",
+                &self.policy_fingerprint,
+            ),
+        ] {
+            if validate_sha256(field, fingerprint).is_err() {
+                return Err(ProducerCompatibilityErrorV1::CertificateMalformed);
+            }
+        }
+        Ok(())
+    }
+}
+
+impl<'a> TrustedProducerConformanceContextV1<'a> {
+    /// Bind independently trusted policy, certificate, fixture, time, and revision state.
+    ///
+    /// The C1 foundation deliberately provides no production policy registry or
+    /// consumer. Applications must source these pins from an owner-controlled
+    /// channel independent of the raw certificate; this constructor does not
+    /// authenticate caller authority and must never be populated from fields or
+    /// digests learned only from the certificate under review.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ProducerCompatibilityErrorV1::CertificateMalformed`] for malformed
+    /// pinned digests or an invalid revision window, and propagates fixture defects.
+    pub fn from_independent_policy(
+        policy_fingerprint: &'a str,
+        certificate_fingerprint: &'a str,
+        fixture: &'a VerifiedGoldenConformanceManifestV1,
+        evaluation_time_unix_seconds: u64,
+        minimum_certificate_revision: u64,
+        maximum_certificate_revision: u64,
+    ) -> Result<Self, ProducerCompatibilityErrorV1> {
+        if validate_sha256(
+            "trusted_producer_conformance.policy_fingerprint",
+            policy_fingerprint,
+        )
+        .is_err()
+            || validate_sha256(
+                "trusted_producer_conformance.certificate_fingerprint",
+                certificate_fingerprint,
+            )
+            .is_err()
+            || minimum_certificate_revision == 0
+            || minimum_certificate_revision > maximum_certificate_revision
+        {
+            return Err(ProducerCompatibilityErrorV1::CertificateMalformed);
+        }
+        fixture.validate()?;
+        Ok(Self {
+            policy_fingerprint,
+            certificate_fingerprint,
+            fixture,
+            evaluation_time_unix_seconds,
+            minimum_certificate_revision,
+            maximum_certificate_revision,
+        })
+    }
+}
+
+impl ProducerCompatibilityWitnessV1 {
+    /// Exact versus explicitly certified producer compatibility.
+    #[must_use]
+    pub const fn kind(&self) -> ProducerCompatibilityKindV1 {
+        self.kind
+    }
+
+    /// Mathematical space shared by the producer pair.
+    #[must_use]
+    pub fn space_fingerprint(&self) -> &str {
+        &self.space_fingerprint
+    }
+
+    /// Reference producer bound into the witness.
+    #[must_use]
+    pub fn reference_producer_fingerprint(&self) -> &str {
+        &self.reference_producer_fingerprint
+    }
+
+    /// Candidate producer bound into the witness.
+    #[must_use]
+    pub fn candidate_producer_fingerprint(&self) -> &str {
+        &self.candidate_producer_fingerprint
+    }
+
+    /// Canonical certificate fingerprint for certified witnesses.
+    #[must_use]
+    pub fn certificate_fingerprint(&self) -> Option<&str> {
+        self.certificate_fingerprint.as_deref()
+    }
+}
+
+fn validate_reference_and_candidate(
+    reference: &EmbeddingIdentityBundleV1,
+    candidate: &EmbeddingIdentityBundleV1,
+) -> Result<(), ProducerCompatibilityErrorV1> {
+    reference
+        .validate()
+        .map_err(|_| ProducerCompatibilityErrorV1::InvalidReferenceIdentity)?;
+    candidate
+        .validate()
+        .map_err(|_| ProducerCompatibilityErrorV1::InvalidCandidateIdentity)
+}
+
 impl EmbeddingIdentityBundleV1 {
     /// Validate every component and all cross-component bindings.
     ///
@@ -1007,17 +1466,121 @@ impl EmbeddingIdentityBundleV1 {
         sha256_hex(&self.canonical_bytes())
     }
 
-    /// Whether two validated producers may intentionally share one mathematical
-    /// space under the same explicit golden-vector certificate.
+    /// Prove that a candidate carries the exact same producer identity.
     ///
-    /// Backend names, display identifiers, dimensions, or artifact filenames
-    /// alone never establish compatibility. Invalid bundles are incompatible.
-    #[must_use]
-    pub fn is_conformance_compatible_with(&self, other: &Self) -> bool {
-        self.validate().is_ok()
-            && other.validate().is_ok()
-            && self.space.fingerprint() == other.space.fingerprint()
-            && self.producer.golden_vectors == other.producer.golden_vectors
+    /// Storage identity is deliberately excluded: the same producer may persist
+    /// an identical mathematical space in a different physical encoding. A
+    /// same-space producer with any implementation, protocol, numeric, provenance,
+    /// or golden-certificate drift must use the explicitly certified path.
+    ///
+    /// # Errors
+    ///
+    /// Returns a closed [`ProducerCompatibilityErrorV1`] when either bundle is
+    /// invalid, the mathematical spaces differ, or the producer fingerprints are
+    /// not identical.
+    pub fn verify_exact_producer_with(
+        &self,
+        candidate: &Self,
+    ) -> Result<ProducerCompatibilityWitnessV1, ProducerCompatibilityErrorV1> {
+        validate_reference_and_candidate(self, candidate)?;
+        let space_fingerprint = self.space.fingerprint();
+        if space_fingerprint != candidate.space.fingerprint() {
+            return Err(ProducerCompatibilityErrorV1::SpaceMismatch);
+        }
+        let reference_producer_fingerprint = self.producer.fingerprint();
+        let candidate_producer_fingerprint = candidate.producer.fingerprint();
+        if reference_producer_fingerprint != candidate_producer_fingerprint {
+            return Err(ProducerCompatibilityErrorV1::CertificateRequired);
+        }
+        Ok(ProducerCompatibilityWitnessV1 {
+            kind: ProducerCompatibilityKindV1::Exact,
+            space_fingerprint,
+            reference_producer_fingerprint,
+            candidate_producer_fingerprint,
+            certificate_fingerprint: None,
+            policy_fingerprint: None,
+            golden_fixture_fingerprint: None,
+            certificate_revision: None,
+            expires_at_unix_seconds: None,
+        })
+    }
+
+    /// Prove that a distinct producer is admissible under an explicitly trusted
+    /// conformance certificate.
+    ///
+    /// The certificate is direction-sensitive and binds the exact producer pair,
+    /// mathematical space, independently executed golden fixture, policy,
+    /// revision, and validity interval. The trusted context must independently
+    /// pin the certificate's canonical fingerprint; copying fields from the raw
+    /// certificate into the context does not establish a trustworthy boundary.
+    ///
+    /// # Errors
+    ///
+    /// Returns a closed [`ProducerCompatibilityErrorV1`] for invalid identities,
+    /// cross-space use, exact-producer misuse, malformed or untrusted certificate
+    /// state, binding drift, fixture disagreement, expiry, or revision-policy
+    /// violations.
+    pub fn verify_certified_foreign_producer_with(
+        &self,
+        candidate: &Self,
+        certificate: &ForeignProducerConformanceCertificateV1,
+        trusted: TrustedProducerConformanceContextV1<'_>,
+    ) -> Result<ProducerCompatibilityWitnessV1, ProducerCompatibilityErrorV1> {
+        validate_reference_and_candidate(self, candidate)?;
+        let space_fingerprint = self.space.fingerprint();
+        if space_fingerprint != candidate.space.fingerprint() {
+            return Err(ProducerCompatibilityErrorV1::SpaceMismatch);
+        }
+        let reference_producer_fingerprint = self.producer.fingerprint();
+        let candidate_producer_fingerprint = candidate.producer.fingerprint();
+        if reference_producer_fingerprint == candidate_producer_fingerprint {
+            return Err(ProducerCompatibilityErrorV1::CertificateForbiddenForExactProducer);
+        }
+
+        certificate.validate()?;
+        trusted.fixture.validate()?;
+        let certificate_fingerprint = certificate.fingerprint();
+        if certificate_fingerprint != trusted.certificate_fingerprint {
+            return Err(ProducerCompatibilityErrorV1::CertificateFingerprintMismatch);
+        }
+        if certificate.policy_fingerprint != trusted.policy_fingerprint {
+            return Err(ProducerCompatibilityErrorV1::PolicyMismatch);
+        }
+        if certificate.reference_producer_fingerprint != reference_producer_fingerprint
+            || certificate.candidate_producer_fingerprint != candidate_producer_fingerprint
+            || certificate.space_fingerprint != space_fingerprint
+        {
+            return Err(ProducerCompatibilityErrorV1::ProducerBindingMismatch);
+        }
+        if certificate.golden_fixture_fingerprint != trusted.fixture.fingerprint
+            || trusted.fixture.certificate != self.producer.golden_vectors
+            || trusted.fixture.certificate != candidate.producer.golden_vectors
+        {
+            return Err(ProducerCompatibilityErrorV1::FixtureBindingMismatch);
+        }
+        if certificate.certificate_revision < trusted.minimum_certificate_revision
+            || certificate.certificate_revision > trusted.maximum_certificate_revision
+        {
+            return Err(ProducerCompatibilityErrorV1::CertificateRevisionOutsidePolicy);
+        }
+        if trusted.evaluation_time_unix_seconds < certificate.not_before_unix_seconds {
+            return Err(ProducerCompatibilityErrorV1::CertificateNotYetValid);
+        }
+        if trusted.evaluation_time_unix_seconds >= certificate.expires_at_unix_seconds {
+            return Err(ProducerCompatibilityErrorV1::CertificateExpired);
+        }
+
+        Ok(ProducerCompatibilityWitnessV1 {
+            kind: ProducerCompatibilityKindV1::Certified,
+            space_fingerprint,
+            reference_producer_fingerprint,
+            candidate_producer_fingerprint,
+            certificate_fingerprint: Some(certificate_fingerprint),
+            policy_fingerprint: Some(certificate.policy_fingerprint.clone()),
+            golden_fixture_fingerprint: Some(certificate.golden_fixture_fingerprint.clone()),
+            certificate_revision: Some(certificate.certificate_revision),
+            expires_at_unix_seconds: Some(certificate.expires_at_unix_seconds),
+        })
     }
 
     /// Validate and freeze the exact bytes that persistence must store.
@@ -1969,6 +2532,39 @@ mod tests {
         identity
     }
 
+    fn sample_foreign_producer_pair() -> (
+        EmbeddingIdentityBundleV1,
+        EmbeddingIdentityBundleV1,
+        VerifiedGoldenConformanceManifestV1,
+    ) {
+        let texts = ["query: alpha", "document: beta"];
+        let vectors = vec![
+            vec![0.0, -0.0, 1.0, -1.0, 0.25, 0.5, 0.75, 1.25],
+            vec![2.0, 1.5, 1.0, 0.5, 0.0, -0.5, -1.0, -1.5],
+        ];
+        let fixture =
+            VerifiedGoldenConformanceManifestV1::from_exact_pair_f32(&texts, &vectors, &vectors)
+                .expect("exact fixture");
+
+        let mut reference = sample_semantic_identity();
+        reference.producer.golden_vectors = fixture.certificate().clone();
+        reference.validate().expect("reference identity");
+
+        let mut candidate = reference.clone();
+        candidate.producer.backend = "alternate-native-kernel".to_owned();
+        candidate.producer.implementation_revision = "alternate-implementation-v2".to_owned();
+        candidate.producer.protocol_revision = "alternate-protocol-v3".to_owned();
+        candidate.producer.numeric_profile = "deterministic-f32-alternate-v1".to_owned();
+        candidate.producer.provenance_manifest_fingerprint = "6".repeat(64);
+        candidate.validate().expect("candidate identity");
+        assert_ne!(
+            reference.producer.fingerprint(),
+            candidate.producer.fingerprint()
+        );
+
+        (reference, candidate, fixture)
+    }
+
     #[test]
     fn artifact_generation_identity_is_full_width_and_round_trips() {
         let identity =
@@ -2049,6 +2645,544 @@ mod tests {
 
         let inconsistent = vec![vec![1.0, 2.0], vec![3.0]];
         assert!(GoldenVectorCertificateV1::from_exact_f32(&texts[..2], &inconsistent).is_err());
+    }
+
+    #[test]
+    fn exact_producer_witness_allows_storage_drift_but_rejects_foreign_producers() {
+        let (reference, foreign, _) = sample_foreign_producer_pair();
+        assert_eq!(
+            reference.verify_exact_producer_with(&foreign),
+            Err(ProducerCompatibilityErrorV1::CertificateRequired)
+        );
+
+        let mut alternate_storage = reference.clone();
+        alternate_storage.storage.format = "fsvi-v2".to_owned();
+        alternate_storage.storage.quantization = QuantizationFormat::F16;
+        alternate_storage.storage.endianness = "little-endian".to_owned();
+        alternate_storage
+            .validate()
+            .expect("valid alternate storage");
+        assert_ne!(reference.fingerprint(), alternate_storage.fingerprint());
+
+        let witness = reference
+            .verify_exact_producer_with(&alternate_storage)
+            .expect("exact producer remains compatible across storage encodings");
+        assert_eq!(witness.kind(), ProducerCompatibilityKindV1::Exact);
+        assert_eq!(
+            witness.reference_producer_fingerprint(),
+            witness.candidate_producer_fingerprint()
+        );
+        assert!(witness.certificate_fingerprint().is_none());
+    }
+
+    #[test]
+    fn certified_foreign_producer_requires_pinned_directional_evidence() {
+        let (reference, candidate, fixture) = sample_foreign_producer_pair();
+        let policy_fingerprint = "9".repeat(64);
+        let certificate =
+            ForeignProducerConformanceCertificateV1::new_untrusted_receipt_from_verified_pair(
+                &reference,
+                &candidate,
+                &fixture,
+                &policy_fingerprint,
+                7,
+                100,
+                200,
+            )
+            .expect("certificate receipt");
+        let certificate_fingerprint = certificate.fingerprint();
+        let trusted = TrustedProducerConformanceContextV1::from_independent_policy(
+            &policy_fingerprint,
+            &certificate_fingerprint,
+            &fixture,
+            150,
+            7,
+            7,
+        )
+        .expect("trusted context");
+
+        let witness = reference
+            .verify_certified_foreign_producer_with(&candidate, &certificate, trusted)
+            .expect("trusted foreign producer");
+        assert_eq!(witness.kind(), ProducerCompatibilityKindV1::Certified);
+        assert_eq!(
+            witness.certificate_fingerprint(),
+            Some(certificate_fingerprint.as_str())
+        );
+        assert_eq!(
+            witness.reference_producer_fingerprint(),
+            reference.producer.fingerprint()
+        );
+        assert_eq!(
+            witness.candidate_producer_fingerprint(),
+            candidate.producer.fingerprint()
+        );
+
+        let serialized = serde_json::to_string(&witness).expect("serialize opaque witness");
+        assert!(!serialized.contains("alternate-native-kernel"));
+        assert!(!serialized.contains("query: alpha"));
+        assert!(!serialized.contains("document: beta"));
+        assert!(!serialized.contains("canonical_bytes"));
+    }
+
+    #[test]
+    fn every_foreign_certificate_field_is_bound_by_the_pinned_fingerprint() {
+        let (reference, candidate, fixture) = sample_foreign_producer_pair();
+        let policy_fingerprint = "9".repeat(64);
+        let certificate =
+            ForeignProducerConformanceCertificateV1::new_untrusted_receipt_from_verified_pair(
+                &reference,
+                &candidate,
+                &fixture,
+                &policy_fingerprint,
+                7,
+                100,
+                200,
+            )
+            .unwrap();
+        let pinned_fingerprint = certificate.fingerprint();
+
+        let mut unknown_schema = certificate.clone();
+        unknown_schema.schema_version += 1;
+        let mut changed_reference = certificate.clone();
+        changed_reference.reference_producer_fingerprint = "a".repeat(64);
+        let mut changed_candidate = certificate.clone();
+        changed_candidate.candidate_producer_fingerprint = "b".repeat(64);
+        let mut changed_space = certificate.clone();
+        changed_space.space_fingerprint = "c".repeat(64);
+        let mut changed_fixture = certificate.clone();
+        changed_fixture.golden_fixture_fingerprint = "d".repeat(64);
+        let mut changed_policy = certificate.clone();
+        changed_policy.policy_fingerprint = "e".repeat(64);
+        let mut changed_revision = certificate.clone();
+        changed_revision.certificate_revision += 1;
+        let mut changed_start = certificate.clone();
+        changed_start.not_before_unix_seconds += 1;
+        let mut changed_expiry = certificate.clone();
+        changed_expiry.expires_at_unix_seconds -= 1;
+
+        let malformed_context = TrustedProducerConformanceContextV1::from_independent_policy(
+            &policy_fingerprint,
+            &pinned_fingerprint,
+            &fixture,
+            150,
+            1,
+            u64::MAX,
+        )
+        .unwrap();
+        assert_eq!(
+            reference.verify_certified_foreign_producer_with(
+                &candidate,
+                &unknown_schema,
+                malformed_context,
+            ),
+            Err(ProducerCompatibilityErrorV1::CertificateMalformed)
+        );
+
+        for (label, mutated) in [
+            ("reference producer", changed_reference),
+            ("candidate producer", changed_candidate),
+            ("space", changed_space),
+            ("fixture", changed_fixture),
+            ("policy", changed_policy),
+            ("revision", changed_revision),
+            ("not-before", changed_start),
+            ("expiry", changed_expiry),
+        ] {
+            let trusted = TrustedProducerConformanceContextV1::from_independent_policy(
+                &policy_fingerprint,
+                &pinned_fingerprint,
+                &fixture,
+                150,
+                1,
+                u64::MAX,
+            )
+            .unwrap();
+            assert_eq!(
+                reference.verify_certified_foreign_producer_with(&candidate, &mutated, trusted,),
+                Err(ProducerCompatibilityErrorV1::CertificateFingerprintMismatch),
+                "mutated {label} must invalidate the pinned certificate"
+            );
+        }
+    }
+
+    #[test]
+    fn foreign_certificate_rejects_policy_pair_fixture_and_bundle_substitution() {
+        let (reference, candidate, fixture) = sample_foreign_producer_pair();
+        let policy_fingerprint = "9".repeat(64);
+        let certificate =
+            ForeignProducerConformanceCertificateV1::new_untrusted_receipt_from_verified_pair(
+                &reference,
+                &candidate,
+                &fixture,
+                &policy_fingerprint,
+                7,
+                100,
+                200,
+            )
+            .unwrap();
+
+        let mut wrong_policy = certificate.clone();
+        wrong_policy.policy_fingerprint = "8".repeat(64);
+        let wrong_policy_fingerprint = wrong_policy.fingerprint();
+        let trusted = TrustedProducerConformanceContextV1::from_independent_policy(
+            &policy_fingerprint,
+            &wrong_policy_fingerprint,
+            &fixture,
+            150,
+            7,
+            7,
+        )
+        .unwrap();
+        assert_eq!(
+            reference.verify_certified_foreign_producer_with(&candidate, &wrong_policy, trusted,),
+            Err(ProducerCompatibilityErrorV1::PolicyMismatch)
+        );
+
+        let swapped =
+            ForeignProducerConformanceCertificateV1::new_untrusted_receipt_from_verified_pair(
+                &candidate,
+                &reference,
+                &fixture,
+                &policy_fingerprint,
+                7,
+                100,
+                200,
+            )
+            .unwrap();
+        let swapped_fingerprint = swapped.fingerprint();
+        let trusted = TrustedProducerConformanceContextV1::from_independent_policy(
+            &policy_fingerprint,
+            &swapped_fingerprint,
+            &fixture,
+            150,
+            7,
+            7,
+        )
+        .unwrap();
+        assert_eq!(
+            reference.verify_certified_foreign_producer_with(&candidate, &swapped, trusted),
+            Err(ProducerCompatibilityErrorV1::ProducerBindingMismatch)
+        );
+
+        for (label, reference_slot, substituted_fingerprint) in [
+            (
+                "reference storage fingerprint",
+                true,
+                reference.storage.fingerprint(),
+            ),
+            (
+                "candidate storage fingerprint",
+                false,
+                candidate.storage.fingerprint(),
+            ),
+            (
+                "reference full-bundle fingerprint",
+                true,
+                reference.fingerprint(),
+            ),
+            (
+                "candidate full-bundle fingerprint",
+                false,
+                candidate.fingerprint(),
+            ),
+        ] {
+            let mut substitution = certificate.clone();
+            if reference_slot {
+                substitution.reference_producer_fingerprint = substituted_fingerprint;
+            } else {
+                substitution.candidate_producer_fingerprint = substituted_fingerprint;
+            }
+            let substitution_fingerprint = substitution.fingerprint();
+            let trusted = TrustedProducerConformanceContextV1::from_independent_policy(
+                &policy_fingerprint,
+                &substitution_fingerprint,
+                &fixture,
+                150,
+                7,
+                7,
+            )
+            .unwrap();
+            assert_eq!(
+                reference.verify_certified_foreign_producer_with(
+                    &candidate,
+                    &substitution,
+                    trusted,
+                ),
+                Err(ProducerCompatibilityErrorV1::ProducerBindingMismatch),
+                "{label} must never stand in for a producer fingerprint"
+            );
+        }
+
+        let mut fixture_substitution = certificate.clone();
+        fixture_substitution.golden_fixture_fingerprint = "a".repeat(64);
+        let fixture_substitution_fingerprint = fixture_substitution.fingerprint();
+        let trusted = TrustedProducerConformanceContextV1::from_independent_policy(
+            &policy_fingerprint,
+            &fixture_substitution_fingerprint,
+            &fixture,
+            150,
+            7,
+            7,
+        )
+        .unwrap();
+        assert_eq!(
+            reference.verify_certified_foreign_producer_with(
+                &candidate,
+                &fixture_substitution,
+                trusted,
+            ),
+            Err(ProducerCompatibilityErrorV1::FixtureBindingMismatch)
+        );
+
+        let mut fabricated_candidate = candidate.clone();
+        fabricated_candidate.producer.golden_vectors.vectors_sha256 = "f".repeat(64);
+        fabricated_candidate.validate().unwrap();
+        assert_eq!(
+            ForeignProducerConformanceCertificateV1::new_untrusted_receipt_from_verified_pair(
+                &reference,
+                &fabricated_candidate,
+                &fixture,
+                &policy_fingerprint,
+                7,
+                100,
+                200,
+            ),
+            Err(ProducerCompatibilityErrorV1::GoldenVectorMismatch)
+        );
+
+        let mut fabricated_reference = reference.clone();
+        let mut fabricated_candidate = candidate;
+        fabricated_reference.producer.golden_vectors.vectors_sha256 = "e".repeat(64);
+        fabricated_candidate.producer.golden_vectors.vectors_sha256 = "e".repeat(64);
+        fabricated_reference.validate().unwrap();
+        fabricated_candidate.validate().unwrap();
+        assert_eq!(
+            ForeignProducerConformanceCertificateV1::new_untrusted_receipt_from_verified_pair(
+                &fabricated_reference,
+                &fabricated_candidate,
+                &fixture,
+                &policy_fingerprint,
+                7,
+                100,
+                200,
+            ),
+            Err(ProducerCompatibilityErrorV1::GoldenVectorMismatch),
+            "two matching self-asserted summaries cannot replace the independently executed fixture"
+        );
+    }
+
+    #[test]
+    fn foreign_certificate_enforces_time_revision_and_full_width_boundaries() {
+        let (reference, candidate, fixture) = sample_foreign_producer_pair();
+        let policy_fingerprint = "9".repeat(64);
+        let certificate =
+            ForeignProducerConformanceCertificateV1::new_untrusted_receipt_from_verified_pair(
+                &reference,
+                &candidate,
+                &fixture,
+                &policy_fingerprint,
+                7,
+                100,
+                200,
+            )
+            .unwrap();
+        let certificate_fingerprint = certificate.fingerprint();
+
+        for (time, expected) in [
+            (
+                99,
+                Err(ProducerCompatibilityErrorV1::CertificateNotYetValid),
+            ),
+            (100, Ok(ProducerCompatibilityKindV1::Certified)),
+            (199, Ok(ProducerCompatibilityKindV1::Certified)),
+            (200, Err(ProducerCompatibilityErrorV1::CertificateExpired)),
+        ] {
+            let trusted = TrustedProducerConformanceContextV1::from_independent_policy(
+                &policy_fingerprint,
+                &certificate_fingerprint,
+                &fixture,
+                time,
+                7,
+                7,
+            )
+            .unwrap();
+            let observed = reference
+                .verify_certified_foreign_producer_with(&candidate, &certificate, trusted)
+                .map(|witness| witness.kind());
+            assert_eq!(observed, expected, "evaluation time {time}");
+        }
+
+        for (minimum_revision, maximum_revision) in [(8, 8), (1, 6)] {
+            let trusted = TrustedProducerConformanceContextV1::from_independent_policy(
+                &policy_fingerprint,
+                &certificate_fingerprint,
+                &fixture,
+                150,
+                minimum_revision,
+                maximum_revision,
+            )
+            .unwrap();
+            assert_eq!(
+                reference
+                    .verify_certified_foreign_producer_with(&candidate, &certificate, trusted,),
+                Err(ProducerCompatibilityErrorV1::CertificateRevisionOutsidePolicy)
+            );
+        }
+
+        let full_width =
+            ForeignProducerConformanceCertificateV1::new_untrusted_receipt_from_verified_pair(
+                &reference,
+                &candidate,
+                &fixture,
+                &policy_fingerprint,
+                u64::MAX,
+                u64::MAX - 2,
+                u64::MAX,
+            )
+            .unwrap();
+        let full_width_fingerprint = full_width.fingerprint();
+        let trusted = TrustedProducerConformanceContextV1::from_independent_policy(
+            &policy_fingerprint,
+            &full_width_fingerprint,
+            &fixture,
+            u64::MAX - 1,
+            u64::MAX,
+            u64::MAX,
+        )
+        .unwrap();
+        assert_eq!(
+            reference
+                .verify_certified_foreign_producer_with(&candidate, &full_width, trusted)
+                .unwrap()
+                .kind(),
+            ProducerCompatibilityKindV1::Certified
+        );
+    }
+
+    #[test]
+    fn producer_compatibility_rejects_input_tokenizer_and_invalid_identity_drift() {
+        let (reference, candidate, fixture) = sample_foreign_producer_pair();
+        let policy_fingerprint = "9".repeat(64);
+
+        let mut changed_input = candidate.clone();
+        changed_input.input.canonicalization.push_str("-drift");
+        changed_input.space.input_contract_fingerprint = changed_input.input.fingerprint();
+        changed_input.producer.space_fingerprint = changed_input.space.fingerprint();
+        changed_input.validate().unwrap();
+        assert_eq!(
+            ForeignProducerConformanceCertificateV1::new_untrusted_receipt_from_verified_pair(
+                &reference,
+                &changed_input,
+                &fixture,
+                &policy_fingerprint,
+                7,
+                100,
+                200,
+            ),
+            Err(ProducerCompatibilityErrorV1::SpaceMismatch)
+        );
+
+        let mut changed_tokenizer = candidate.clone();
+        changed_tokenizer.space.tokenizer_fingerprint = "7".repeat(64);
+        changed_tokenizer.producer.space_fingerprint = changed_tokenizer.space.fingerprint();
+        changed_tokenizer.validate().unwrap();
+        assert_eq!(
+            ForeignProducerConformanceCertificateV1::new_untrusted_receipt_from_verified_pair(
+                &reference,
+                &changed_tokenizer,
+                &fixture,
+                &policy_fingerprint,
+                7,
+                100,
+                200,
+            ),
+            Err(ProducerCompatibilityErrorV1::SpaceMismatch)
+        );
+
+        let mut invalid_reference = reference.clone();
+        invalid_reference.storage.dimension = 0;
+        assert_eq!(
+            invalid_reference.verify_exact_producer_with(&reference),
+            Err(ProducerCompatibilityErrorV1::InvalidReferenceIdentity)
+        );
+        let mut invalid_candidate = candidate;
+        invalid_candidate.storage.dimension = 0;
+        assert_eq!(
+            reference.verify_exact_producer_with(&invalid_candidate),
+            Err(ProducerCompatibilityErrorV1::InvalidCandidateIdentity)
+        );
+    }
+
+    #[test]
+    fn foreign_certificate_and_verified_fixture_fail_closed_on_untrusted_bytes() {
+        let (reference, candidate, fixture) = sample_foreign_producer_pair();
+        let policy_fingerprint = "9".repeat(64);
+        let certificate =
+            ForeignProducerConformanceCertificateV1::new_untrusted_receipt_from_verified_pair(
+                &reference,
+                &candidate,
+                &fixture,
+                &policy_fingerprint,
+                7,
+                100,
+                200,
+            )
+            .unwrap();
+
+        let mut unknown = serde_json::to_value(&certificate).unwrap();
+        unknown
+            .as_object_mut()
+            .unwrap()
+            .insert("unexpected".to_owned(), serde_json::json!(true));
+        assert!(
+            serde_json::from_value::<ForeignProducerConformanceCertificateV1>(unknown).is_err()
+        );
+
+        let raw = serde_json::to_string(&certificate).unwrap();
+        let duplicate_schema = raw.replacen('{', "{\"schema_version\":1,", 1);
+        assert!(
+            serde_json::from_str::<ForeignProducerConformanceCertificateV1>(&duplicate_schema)
+                .is_err()
+        );
+
+        let texts = ["query: alpha", "document: beta"];
+        let reference_vectors = vec![
+            vec![0.0, -0.0, 1.0, -1.0, 0.25, 0.5, 0.75, 1.25],
+            vec![2.0, 1.5, 1.0, 0.5, 0.0, -0.5, -1.0, -1.5],
+        ];
+        let mut changed_bits = reference_vectors.clone();
+        changed_bits[0][0] = -0.0;
+        assert_eq!(
+            VerifiedGoldenConformanceManifestV1::from_exact_pair_f32(
+                &texts,
+                &reference_vectors,
+                &changed_bits,
+            ),
+            Err(ProducerCompatibilityErrorV1::GoldenVectorMismatch)
+        );
+
+        let nan_texts = ["NaN payload"];
+        let reference_nan = vec![vec![f32::from_bits(0x7fc0_0041)]];
+        let candidate_nan = vec![vec![f32::from_bits(0x7fc0_0042)]];
+        assert_eq!(
+            VerifiedGoldenConformanceManifestV1::from_exact_pair_f32(
+                &nan_texts,
+                &reference_nan,
+                &candidate_nan,
+            ),
+            Err(ProducerCompatibilityErrorV1::GoldenVectorMismatch),
+            "NaN payload bits are part of exact producer conformance"
+        );
+        let malformed = vec![vec![1.0], vec![]];
+        assert_eq!(
+            VerifiedGoldenConformanceManifestV1::from_exact_pair_f32(
+                &texts,
+                &reference_vectors,
+                &malformed,
+            ),
+            Err(ProducerCompatibilityErrorV1::GoldenFixtureInvalid)
+        );
     }
 
     #[test]
@@ -2379,7 +3513,10 @@ mod tests {
         right.validate().unwrap();
         assert_eq!(left.space.fingerprint(), right.space.fingerprint());
         assert_eq!(left.fingerprint(), right.fingerprint());
-        assert!(left.is_conformance_compatible_with(&right));
+        assert_eq!(
+            left.verify_exact_producer_with(&right).unwrap().kind(),
+            ProducerCompatibilityKindV1::Exact
+        );
 
         let mut duplicate = left;
         duplicate

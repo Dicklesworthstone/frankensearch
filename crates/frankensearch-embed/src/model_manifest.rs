@@ -3067,6 +3067,11 @@ fn to_hex_lowercase(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use frankensearch_core::generation::{
+        ForeignProducerConformanceCertificateV1, ProducerCompatibilityErrorV1,
+        ProducerCompatibilityKindV1, TrustedProducerConformanceContextV1,
+        VerifiedGoldenConformanceManifestV1,
+    };
     use std::io::Write;
 
     fn write_temp_file(path: &Path, bytes: &[u8]) {
@@ -3149,8 +3154,19 @@ mod tests {
     }
 
     #[test]
-    fn compatible_producers_share_only_the_space_contract() {
-        let left = sample_artifact_manifest();
+    fn foreign_producers_require_explicit_trusted_conformance_certificates() {
+        let conformance_texts = ["query: alpha", "document: beta"];
+        let conformance_vectors = vec![vec![0.0, -0.0, 1.0], vec![0.5, -0.5, 0.25]];
+        let fixture = VerifiedGoldenConformanceManifestV1::from_exact_pair_f32(
+            &conformance_texts,
+            &conformance_vectors,
+            &conformance_vectors,
+        )
+        .unwrap();
+        let policy_fingerprint = "9".repeat(64);
+
+        let mut left = sample_artifact_manifest();
+        left.execution.golden_vectors = fixture.certificate().clone();
         let left_manifest_fingerprint = left.freeze().unwrap().fingerprint;
         let left_identity = left
             .identity_bundle(QuantizationFormat::F32, "in-memory-f32-v1")
@@ -3179,7 +3195,42 @@ mod tests {
             left_identity.space.fingerprint(),
             right_identity.space.fingerprint()
         );
-        assert!(left_identity.is_conformance_compatible_with(&right_identity));
+        assert_eq!(
+            left_identity.verify_exact_producer_with(&right_identity),
+            Err(ProducerCompatibilityErrorV1::CertificateRequired)
+        );
+        let right_certificate =
+            ForeignProducerConformanceCertificateV1::new_untrusted_receipt_from_verified_pair(
+                &left_identity,
+                &right_identity,
+                &fixture,
+                &policy_fingerprint,
+                1,
+                100,
+                200,
+            )
+            .unwrap();
+        let right_certificate_fingerprint = right_certificate.fingerprint();
+        let trusted = TrustedProducerConformanceContextV1::from_independent_policy(
+            &policy_fingerprint,
+            &right_certificate_fingerprint,
+            &fixture,
+            150,
+            1,
+            1,
+        )
+        .unwrap();
+        assert_eq!(
+            left_identity
+                .verify_certified_foreign_producer_with(
+                    &right_identity,
+                    &right_certificate,
+                    trusted,
+                )
+                .unwrap()
+                .kind(),
+            ProducerCompatibilityKindV1::Certified
+        );
         assert_ne!(
             left_identity.producer.fingerprint(),
             right_identity.producer.fingerprint()
@@ -3213,9 +3264,42 @@ mod tests {
             left_identity.producer.fingerprint(),
             redistributed_identity.producer.fingerprint()
         );
-        assert!(
-            left_identity.is_conformance_compatible_with(&redistributed_identity),
-            "distribution metadata may differ when space and explicit conformance stay exact"
+        assert_eq!(
+            left_identity.verify_exact_producer_with(&redistributed_identity),
+            Err(ProducerCompatibilityErrorV1::CertificateRequired)
+        );
+        let redistributed_certificate =
+            ForeignProducerConformanceCertificateV1::new_untrusted_receipt_from_verified_pair(
+                &left_identity,
+                &redistributed_identity,
+                &fixture,
+                &policy_fingerprint,
+                2,
+                100,
+                200,
+            )
+            .unwrap();
+        let redistributed_certificate_fingerprint = redistributed_certificate.fingerprint();
+        let trusted = TrustedProducerConformanceContextV1::from_independent_policy(
+            &policy_fingerprint,
+            &redistributed_certificate_fingerprint,
+            &fixture,
+            150,
+            2,
+            2,
+        )
+        .unwrap();
+        assert_eq!(
+            left_identity
+                .verify_certified_foreign_producer_with(
+                    &redistributed_identity,
+                    &redistributed_certificate,
+                    trusted,
+                )
+                .unwrap()
+                .kind(),
+            ProducerCompatibilityKindV1::Certified,
+            "distribution metadata may differ only with explicit trusted evidence"
         );
 
         let mut nonconformant = right.clone();
@@ -3227,7 +3311,18 @@ mod tests {
             left_identity.space.fingerprint(),
             nonconformant_identity.space.fingerprint()
         );
-        assert!(!left_identity.is_conformance_compatible_with(&nonconformant_identity));
+        assert_eq!(
+            ForeignProducerConformanceCertificateV1::new_untrusted_receipt_from_verified_pair(
+                &left_identity,
+                &nonconformant_identity,
+                &fixture,
+                &policy_fingerprint,
+                3,
+                100,
+                200,
+            ),
+            Err(ProducerCompatibilityErrorV1::GoldenVectorMismatch)
+        );
 
         let mut changed_semantics = right;
         changed_semantics.execution.pooling.push_str("-drift");

@@ -119,11 +119,15 @@ pub use generation::{
     EMBEDDING_PRODUCER_ATTESTATION_SCHEMA_V1, EMBEDDING_SPACE_IDENTITY_SCHEMA_V1, EmbedderRevision,
     EmbedderTierTag, EmbeddingArtifactIdentityV1, EmbeddingIdentityBundleV1,
     EmbeddingInputContractV1, EmbeddingProducerAttestationV1, EmbeddingProjectionV1,
-    EmbeddingSpaceIdentityV1, EmbeddingSpaceKindV1, FrozenEmbeddingIdentityBundleV1,
-    GenerationManifest, GoldenVectorCertificateV1, HashControlProfileV1, InvariantKind,
-    LexicalArtifact, MANIFEST_SCHEMA_VERSION, QuantizationFormat, RepairDescriptor,
+    EmbeddingSpaceIdentityV1, EmbeddingSpaceKindV1,
+    FOREIGN_PRODUCER_CONFORMANCE_CERTIFICATE_SCHEMA_V1, ForeignProducerConformanceCertificateV1,
+    FrozenEmbeddingIdentityBundleV1, GenerationManifest, GoldenVectorCertificateV1,
+    HashControlProfileV1, InvariantKind, LexicalArtifact, MANIFEST_SCHEMA_VERSION,
+    ProducerCompatibilityErrorV1, ProducerCompatibilityKindV1, ProducerCompatibilityWitnessV1,
+    QuantizationFormat, RepairDescriptor, TrustedProducerConformanceContextV1,
     VECTOR_STORAGE_IDENTITY_SCHEMA_V1, ValidationFinding, ValidationResult, VectorArtifact,
-    VectorStorageIdentityV1, compute_manifest_hash, require_valid, validate_manifest,
+    VectorStorageIdentityV1, VerifiedGoldenConformanceManifestV1, compute_manifest_hash,
+    require_valid, validate_manifest,
 };
 pub use graph::{DocumentGraph, EdgeType, GraphDocId, GraphEdge};
 pub use host_adapter::{
