@@ -5441,6 +5441,33 @@ mod tests {
         tokens
     }
 
+    #[test]
+    fn borrowed_default_reuses_normalized_input_and_scratches_changed_tokens() {
+        let text = "lowercase123 MIXED ÜBER";
+        let input_start = text.as_ptr() as usize;
+        let input_end = input_start + text.len();
+        let mut analyzer = FrankensearchTokenizer::default();
+        let mut observed = Vec::new();
+        analyzer.analyze_borrowed(AnalyzerKind::FrankensearchDefault, text, &mut |token| {
+            let token_start = token.text.as_ptr() as usize;
+            observed.push((
+                token.text.to_owned(),
+                token.offset_from,
+                token.offset_to,
+                (input_start..input_end).contains(&token_start),
+            ));
+        });
+
+        assert_eq!(
+            observed,
+            vec![
+                ("lowercase123".to_owned(), 0, 12, true),
+                ("mixed".to_owned(), 13, 18, false),
+                ("über".to_owned(), 19, 24, false),
+            ]
+        );
+    }
+
     fn boundary_mask_tokens(text: &str) -> Vec<AnalyzedToken> {
         let mut analyzer = BoundaryMaskTokenizer::default();
         let mut tokens = Vec::new();
