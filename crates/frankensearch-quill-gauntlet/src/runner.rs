@@ -15492,7 +15492,11 @@ mod tests {
         salej_union_horizon_late_winner_matches_tantivy_across_fresh_segment_shapes();
         salej_union_horizon_cutoff_ties_are_exact_or_registered_across_fresh_segment_shapes();
         let (completion, manifest) = publish_union_horizon_diagnostic_completion_manifest();
-        assert!(completion.path.ends_with(".json"));
+        assert_eq!(
+            completion.path.extension(),
+            Some(std::ffi::OsStr::new("json")),
+            "UNION_HORIZON completion receipt must use a JSON filename",
+        );
         assert_lower_hex(
             &completion.raw_file_sha256,
             64,
