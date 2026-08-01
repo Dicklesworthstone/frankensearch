@@ -7,12 +7,14 @@ use std::process::Command;
 
 use sha2::{Digest, Sha256};
 
-const PRODUCER_CONTRACT_VERSION: &str = "frankensearch.quill-local-perf-producer.v4";
+const ARTIFACT_PRODUCER_CONTRACT_VERSION: &str = "frankensearch.quill-local-perf-producer.v5";
+const LOCAL_PERF_PRODUCER_CONTRACT_VERSION: &str = "frankensearch.quill-local-perf-producer.v4";
 const SUBJECT_REVISION_ENV: &str = "GAUNTLET_SUBJECT_REVISION";
 const SUBJECT_DIRTY_ENV: &str = "GAUNTLET_SUBJECT_DIRTY";
 const SOURCE_VERIFICATION_GIT: &str = "git_checkout_verified";
 const SOURCE_VERIFICATION_EXPLICIT: &str = "explicit_unverified";
 const SOURCE_VERIFICATION_UNAVAILABLE: &str = "unavailable";
+const CRATES_IO_REGISTRY_SOURCE: &str = "registry+https://github.com/rust-lang/crates.io-index";
 
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
@@ -29,10 +31,18 @@ fn main() {
         .to_path_buf();
     let cargo_lock = repository.join("Cargo.lock");
     println!("cargo:rerun-if-changed={}", cargo_lock.display());
+    let lexical_manifest = repository.join("crates/frankensearch-lexical/Cargo.toml");
+    println!("cargo:rerun-if-changed={}", lexical_manifest.display());
 
-    let cargo_lock_sha256 = fs::read(&cargo_lock)
-        .map(|bytes| sha256_hex(&bytes))
-        .unwrap_or_else(|_| "unavailable".to_owned());
+    let cargo_lock_bytes = fs::read(&cargo_lock)
+        .unwrap_or_else(|error| panic!("read exact {}: {error}", cargo_lock.display()));
+    assert!(
+        !cargo_lock_bytes.is_empty(),
+        "Cargo.lock must not be empty when sealing producer dependencies"
+    );
+    let cargo_lock_sha256 = sha256_hex(&cargo_lock_bytes);
+    let tantivy = locked_registry_package(&cargo_lock_bytes, "tantivy");
+    let lexical_crate_version = manifest_package_version(&lexical_manifest);
     let repository_identity_is_exact = git_output(&repository, &["rev-parse", "--show-toplevel"])
         .and_then(|path| fs::canonicalize(path).ok())
         .zip(fs::canonicalize(&repository).ok())
@@ -90,7 +100,12 @@ fn main() {
 
     register_repository_inputs(&repository);
     register_git_identity_inputs(&repository);
-    println!("cargo:rustc-env=QUILL_PERF_PRODUCER_CONTRACT_VERSION={PRODUCER_CONTRACT_VERSION}");
+    println!(
+        "cargo:rustc-env=QUILL_ARTIFACT_PRODUCER_CONTRACT_VERSION={ARTIFACT_PRODUCER_CONTRACT_VERSION}"
+    );
+    println!(
+        "cargo:rustc-env=QUILL_PERF_PRODUCER_CONTRACT_VERSION={LOCAL_PERF_PRODUCER_CONTRACT_VERSION}"
+    );
     println!("cargo:rustc-env=QUILL_PERF_PRODUCER_GIT_REVISION={git_revision}");
     println!("cargo:rustc-env=QUILL_PERF_PRODUCER_GIT_DIRTY={git_dirty}");
     println!("cargo:rustc-env=QUILL_PERF_PRODUCER_SOURCE_VERIFICATION={source_verification}");
@@ -109,6 +124,91 @@ fn main() {
         "cargo:rustc-env=QUILL_PERF_PRODUCER_ENABLED_FEATURES_SHA256={}",
         sha256_hex(enabled_features_canonical.as_bytes()),
     );
+    println!(
+        "cargo:rustc-env=QUILL_ORACLE_TANTIVY_VERSION={}",
+        tantivy.version
+    );
+    println!(
+        "cargo:rustc-env=QUILL_ORACLE_TANTIVY_SOURCE={}",
+        tantivy.source
+    );
+    println!(
+        "cargo:rustc-env=QUILL_ORACLE_TANTIVY_CHECKSUM_SHA256={}",
+        tantivy.checksum
+    );
+    println!("cargo:rustc-env=FRANKENSEARCH_LEXICAL_CRATE_VERSION={lexical_crate_version}");
+}
+
+struct LockedRegistryPackage {
+    version: String,
+    source: String,
+    checksum: String,
+}
+
+fn locked_registry_package(cargo_lock_bytes: &[u8], package_name: &str) -> LockedRegistryPackage {
+    let cargo_lock = std::str::from_utf8(cargo_lock_bytes)
+        .expect("Cargo.lock must be UTF-8 for dependency provenance");
+    let document = cargo_lock
+        .parse::<toml::Table>()
+        .expect("Cargo.lock must be valid TOML for dependency provenance");
+    let packages = document
+        .get("package")
+        .and_then(toml::Value::as_array)
+        .expect("Cargo.lock must contain package records");
+    let matches = packages
+        .iter()
+        .filter(|package| package.get("name").and_then(toml::Value::as_str) == Some(package_name))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        matches.len(),
+        1,
+        "Cargo.lock must resolve exactly one {package_name} package"
+    );
+    let package = matches[0];
+    let required = |field| {
+        package
+            .get(field)
+            .and_then(toml::Value::as_str)
+            .unwrap_or_else(|| panic!("locked {package_name} package must carry {field}"))
+            .to_owned()
+    };
+    let version = required("version");
+    let source = required("source");
+    let checksum = required("checksum");
+    assert_eq!(
+        source, CRATES_IO_REGISTRY_SOURCE,
+        "the Tantivy oracle must resolve from the crates.io registry, never a patch or Git source"
+    );
+    assert!(
+        is_lower_hex(&checksum, 64),
+        "locked {package_name} checksum must be canonical lowercase SHA-256"
+    );
+    LockedRegistryPackage {
+        version,
+        source,
+        checksum,
+    }
+}
+
+fn manifest_package_version(manifest_path: &Path) -> String {
+    let manifest = fs::read_to_string(manifest_path)
+        .unwrap_or_else(|error| panic!("read {}: {error}", manifest_path.display()));
+    let document = manifest
+        .parse::<toml::Table>()
+        .expect("lexical Cargo.toml must be valid TOML");
+    let package = document
+        .get("package")
+        .expect("lexical Cargo.toml must declare [package]");
+    assert_eq!(
+        package.get("name").and_then(toml::Value::as_str),
+        Some("frankensearch-lexical"),
+        "oracle wrapper path must resolve the frankensearch-lexical package"
+    );
+    package
+        .get("version")
+        .and_then(toml::Value::as_str)
+        .expect("lexical Cargo.toml must declare package.version")
+        .to_owned()
 }
 
 fn required_unicode_env(name: &str) -> String {
@@ -169,7 +269,11 @@ fn explicit_subject_identity() -> Option<(String, bool)> {
 }
 
 fn is_lower_git_revision(value: &str) -> bool {
-    value.len() == 40
+    is_lower_hex(value, 40)
+}
+
+fn is_lower_hex(value: &str, width: usize) -> bool {
+    value.len() == width
         && value
             .bytes()
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))

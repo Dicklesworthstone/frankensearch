@@ -132,7 +132,7 @@ impl LexicalExposureContract {
 }
 
 /// Honest evidence for an optional named query transform.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
 pub enum LexicalNormalizedQuery {
     /// The observed public boundary exposes no normalized query bytes.
@@ -143,6 +143,37 @@ pub enum LexicalNormalizedQuery {
         sha256: String,
         byte_len: u64,
     },
+}
+
+impl<'de> Deserialize<'de> for LexicalNormalizedQuery {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
+        enum StrictWire {
+            NotExposed {},
+            Value {
+                transform_id: String,
+                sha256: String,
+                byte_len: u64,
+            },
+        }
+
+        Ok(match StrictWire::deserialize(deserializer)? {
+            StrictWire::NotExposed {} => Self::NotExposed,
+            StrictWire::Value {
+                transform_id,
+                sha256,
+                byte_len,
+            } => Self::Value {
+                transform_id,
+                sha256,
+                byte_len,
+            },
+        })
+    }
 }
 
 impl LexicalNormalizedQuery {
@@ -357,7 +388,7 @@ pub enum LexicalObserved<T> {
 ///
 /// Payload bytes never enter the artifact. Presence, emptiness, byte length,
 /// and a stable digest remain independently observable.
-#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize)]
 #[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
 pub enum SensitiveValueObservation {
     /// The selected public boundary does not expose this field.
@@ -379,6 +410,31 @@ pub enum SensitiveValueObservation {
         /// Canonical payload byte length.
         byte_len: u64,
     },
+}
+
+impl<'de> Deserialize<'de> for SensitiveValueObservation {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
+        enum StrictWire {
+            NotExposed {},
+            Absent {},
+            PresentEmpty { sha256: String, byte_len: u64 },
+            Present { sha256: String, byte_len: u64 },
+        }
+
+        Ok(match StrictWire::deserialize(deserializer)? {
+            StrictWire::NotExposed {} => Self::NotExposed,
+            StrictWire::Absent {} => Self::Absent,
+            StrictWire::PresentEmpty { sha256, byte_len } => {
+                Self::PresentEmpty { sha256, byte_len }
+            }
+            StrictWire::Present { sha256, byte_len } => Self::Present { sha256, byte_len },
+        })
+    }
 }
 
 impl SensitiveValueObservation {
@@ -593,7 +649,7 @@ pub enum LexicalEngineRole {
 }
 
 /// Candidate selection passed to one hydration invocation.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum LexicalHydrationSelection {
     /// Every candidate projected as a lexical-only fused winner.
@@ -604,6 +660,33 @@ pub enum LexicalHydrationSelection {
     SemanticOnlyControl { control_id: u32 },
     /// Ordered production-shaped lexical and non-lexical final winners.
     MixedFinalWinners { origins: Vec<LexicalWinnerOrigin> },
+}
+
+impl<'de> Deserialize<'de> for LexicalHydrationSelection {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+        enum StrictWire {
+            AllLexicalWinners {},
+            StrictHybridWinnerSubset { candidate_ranks: Vec<u64> },
+            SemanticOnlyControl { control_id: u32 },
+            MixedFinalWinners { origins: Vec<LexicalWinnerOrigin> },
+        }
+
+        Ok(match StrictWire::deserialize(deserializer)? {
+            StrictWire::AllLexicalWinners {} => Self::AllLexicalWinners,
+            StrictWire::StrictHybridWinnerSubset { candidate_ranks } => {
+                Self::StrictHybridWinnerSubset { candidate_ranks }
+            }
+            StrictWire::SemanticOnlyControl { control_id } => {
+                Self::SemanticOnlyControl { control_id }
+            }
+            StrictWire::MixedFinalWinners { origins } => Self::MixedFinalWinners { origins },
+        })
+    }
 }
 
 /// Production result projection used for a lexical-origin fused winner.
@@ -647,11 +730,30 @@ pub enum LexicalHydrationNotRunReason {
 }
 
 /// Public return value from `hydrate_fusion_metadata`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum LexicalHydrationResult {
     Success,
     Error(LexicalErrorObservation),
+}
+
+impl<'de> Deserialize<'de> for LexicalHydrationResult {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+        enum StrictWire {
+            Success {},
+            Error(LexicalErrorObservation),
+        }
+
+        Ok(match StrictWire::deserialize(deserializer)? {
+            StrictWire::Success {} => Self::Success,
+            StrictWire::Error(error) => Self::Error(error),
+        })
+    }
 }
 
 /// Method-bound hydration execution evidence.
@@ -1919,7 +2021,7 @@ pub struct LexicalWaivedDifference {
 }
 
 /// Coverage state remains separate from equivalence.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
 pub enum LexicalProbeCoverage {
     ExercisedSuccess,
@@ -1931,6 +2033,33 @@ pub enum LexicalProbeCoverage {
     NotRun {
         reason: LexicalHydrationNotRunReason,
     },
+}
+
+impl<'de> Deserialize<'de> for LexicalProbeCoverage {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
+        enum StrictWire {
+            ExercisedSuccess {},
+            ExercisedRestoration {},
+            ExercisedError {},
+            ExercisedEmpty {},
+            NotRun {
+                reason: LexicalHydrationNotRunReason,
+            },
+        }
+
+        Ok(match StrictWire::deserialize(deserializer)? {
+            StrictWire::ExercisedSuccess {} => Self::ExercisedSuccess,
+            StrictWire::ExercisedRestoration {} => Self::ExercisedRestoration,
+            StrictWire::ExercisedError {} => Self::ExercisedError,
+            StrictWire::ExercisedEmpty {} => Self::ExercisedEmpty,
+            StrictWire::NotRun { reason } => Self::NotRun { reason },
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -4888,7 +5017,7 @@ fn is_lower_sha256(value: &str) -> bool {
 
 /// Native secondary ordering evidence retained for every ranked hit.
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum NativeTieKey {
     /// Quill's globally assigned document ID.
     QuillDocId { doc_id: u32 },
@@ -4898,6 +5027,7 @@ pub enum NativeTieKey {
 
 /// One engine-native ranked hit. Scores are stored as raw bits in artifacts.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RankedHit {
     pub doc_id: String,
     pub score_bits: u32,
@@ -4914,6 +5044,7 @@ impl RankedHit {
 
 /// Complete observable output for one differential query.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EngineObservation {
     /// Native top-k order. The comparator never sorts this vector by external ID.
     pub hits: Vec<RankedHit>,
@@ -4979,6 +5110,7 @@ pub enum AstLoweringKind {
 /// One recorded AST/diagnostic lowering difference between subject and oracle
 /// for the same logical query.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AstDifference {
     /// Stable lowering class.
     pub kind: AstLoweringKind,
@@ -5006,6 +5138,7 @@ pub enum ScoreEpsilonReason {
 
 /// Comparator configuration encoded without JSON floating-point ambiguity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ComparatorConfig {
     pub score_epsilon_bits: u32,
     pub score_epsilon_reason: Option<ScoreEpsilonReason>,
@@ -5021,6 +5154,8 @@ impl Default for ComparatorConfig {
 }
 
 impl ComparatorConfig {
+    const V7_SCORE_EPSILON_BITS: u32 = 0.0001_f32.to_bits();
+
     /// Construct a comparator configuration.
     ///
     /// # Errors
@@ -5052,11 +5187,22 @@ impl ComparatorConfig {
     }
 
     pub(crate) fn validate_contract(self) -> Result<(), GauntletError> {
-        if self.score_epsilon_bits == SCORE_EPSILON.to_bits() {
+        self.validate_stored_v7()?;
+        if SCORE_EPSILON.to_bits() != Self::V7_SCORE_EPSILON_BITS {
+            return Err(GauntletError::InvalidComparatorConfig {
+                reason: "current comparator epsilon changed without a schema-version bump"
+                    .to_owned(),
+            });
+        }
+        Ok(())
+    }
+
+    pub(crate) fn validate_stored_v7(self) -> Result<(), GauntletError> {
+        if self.score_epsilon_bits == Self::V7_SCORE_EPSILON_BITS {
             Ok(())
         } else {
             Err(GauntletError::InvalidComparatorConfig {
-                reason: format!("score epsilon must be the contract-pinned {SCORE_EPSILON}"),
+                reason: "stored v7 score epsilon is outside its frozen contract".to_owned(),
             })
         }
     }
@@ -5128,6 +5274,7 @@ impl DivergenceClass {
 
 /// First-class, pointer-addressable comparison difference.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Divergence {
     pub class: DivergenceClass,
     /// RFC 6901 JSON pointer into the containing `ArtifactObject`.
@@ -5138,6 +5285,7 @@ pub struct Divergence {
 
 /// Pure comparator output, including the native-order evidence it evaluated.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ComparisonReport {
     pub status: ComparisonStatus,
     pub rank_class: RankClass,
@@ -5165,6 +5313,28 @@ pub fn compare_observations(
     config: ComparatorConfig,
 ) -> Result<ComparisonReport, GauntletError> {
     config.validate_contract()?;
+    // Current creation is v7 today. A future comparator must add a new
+    // versioned implementation instead of modifying the frozen v7 path.
+    compare_observations_validated_v7(subject, oracle, config)
+}
+
+pub(crate) fn compare_observations_stored_v7(
+    subject: EngineObservation,
+    oracle: EngineObservation,
+    config: ComparatorConfig,
+) -> Result<ComparisonReport, GauntletError> {
+    config.validate_stored_v7()?;
+    compare_observations_validated_v7(subject, oracle, config)
+}
+
+/// Frozen artifact/report-v7 comparator implementation. Every helper reached
+/// from this function is part of the v7 archive contract. Semantic changes
+/// require a new object/report schema and a separate implementation.
+fn compare_observations_validated_v7(
+    subject: EngineObservation,
+    oracle: EngineObservation,
+    config: ComparatorConfig,
+) -> Result<ComparisonReport, GauntletError> {
     let epsilon = config.score_epsilon();
 
     validate_observation("subject", &subject)?;
@@ -5873,6 +6043,26 @@ fn escape_json_pointer_token(value: &str) -> String {
 mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
+
+    fn assert_strict_tagged_round_trip<T>(value: &T)
+    where
+        T: Serialize + serde::de::DeserializeOwned + PartialEq + std::fmt::Debug,
+    {
+        let encoded = serde_json::to_value(value).expect("serialize tagged wire value");
+        let decoded: T =
+            serde_json::from_value(encoded.clone()).expect("deserialize tagged wire value");
+        assert_eq!(&decoded, value);
+
+        let mut with_unknown = encoded;
+        with_unknown
+            .as_object_mut()
+            .expect("tagged wire value must be an object")
+            .insert("future_unbound_field".to_owned(), serde_json::json!(true));
+        assert!(
+            serde_json::from_value::<T>(with_unknown).is_err(),
+            "tagged wire variant accepted an unknown field: {value:?}"
+        );
+    }
 
     fn assert_cancellation_receipt_tamper_rejected(
         receipt: &QuillCancellationReceipt,
@@ -8047,6 +8237,154 @@ mod tests {
             compare_lexical_contracts(wrong_schema, lexical_contract_bundle("tantivy", false)),
             Err(GauntletError::InvalidObservation { .. })
         ));
+    }
+
+    #[test]
+    fn lexical_contract_tagged_variants_reject_unknown_fields_exhaustively() {
+        for normalized_query in [
+            LexicalNormalizedQuery::NotExposed,
+            LexicalNormalizedQuery::Value {
+                transform_id: "identity-v1".to_owned(),
+                sha256: "a".repeat(64),
+                byte_len: 7,
+            },
+        ] {
+            assert_strict_tagged_round_trip(&normalized_query);
+        }
+
+        for sensitive in [
+            SensitiveValueObservation::NotExposed,
+            SensitiveValueObservation::Absent,
+            SensitiveValueObservation::PresentEmpty {
+                sha256: "b".repeat(64),
+                byte_len: 0,
+            },
+            SensitiveValueObservation::Present {
+                sha256: "c".repeat(64),
+                byte_len: 11,
+            },
+        ] {
+            assert_strict_tagged_round_trip(&sensitive);
+        }
+
+        for selection in [
+            LexicalHydrationSelection::AllLexicalWinners,
+            LexicalHydrationSelection::StrictHybridWinnerSubset {
+                candidate_ranks: vec![2, 0],
+            },
+            LexicalHydrationSelection::SemanticOnlyControl { control_id: 9 },
+            LexicalHydrationSelection::MixedFinalWinners {
+                origins: vec![
+                    LexicalWinnerOrigin::Lexical {
+                        candidate_rank: 0,
+                        projection: LexicalWinnerProjection::LexicalOnly,
+                    },
+                    LexicalWinnerOrigin::NonLexicalControl {
+                        control_id: 1,
+                        kind: LexicalNonLexicalControlKind::SemanticFast,
+                    },
+                ],
+            },
+        ] {
+            assert_strict_tagged_round_trip(&selection);
+        }
+
+        let error = LexicalErrorObservation {
+            class: LexicalErrorClass::Query,
+            code: "query_parse_error".to_owned(),
+            contract_payload: SensitiveValueObservation::Absent,
+            diagnostic: SensitiveValueObservation::Absent,
+            source_chain: Vec::new(),
+        };
+        for result in [
+            LexicalHydrationResult::Success,
+            LexicalHydrationResult::Error(error),
+        ] {
+            assert_strict_tagged_round_trip(&result);
+        }
+
+        for coverage in [
+            LexicalProbeCoverage::ExercisedSuccess,
+            LexicalProbeCoverage::ExercisedRestoration,
+            LexicalProbeCoverage::ExercisedError,
+            LexicalProbeCoverage::ExercisedEmpty,
+            LexicalProbeCoverage::NotRun {
+                reason: LexicalHydrationNotRunReason::CandidateSearchFailed,
+            },
+        ] {
+            assert_strict_tagged_round_trip(&coverage);
+        }
+
+        // Adjacently tagged unit variants are already protected by the outer
+        // tag/content field decoder. Keep them in this matrix so a future wire
+        // representation cannot silently reintroduce the internally tagged
+        // unit-variant hole.
+        for observed in [
+            LexicalObserved::<u64>::NotExposed,
+            LexicalObserved::<u64>::Absent,
+            LexicalObserved::Value(17),
+        ] {
+            assert_strict_tagged_round_trip(&observed);
+        }
+
+        let flattened_error = serde_json::json!({
+            "kind": "error",
+            "class": "query",
+            "code": "query_parse_error",
+            "contract_payload": {"state": "absent"},
+            "diagnostic": {"state": "absent"},
+            "source_chain": [],
+        });
+        let error = LexicalErrorObservation {
+            class: LexicalErrorClass::Query,
+            code: "query_parse_error".to_owned(),
+            contract_payload: SensitiveValueObservation::Absent,
+            diagnostic: SensitiveValueObservation::Absent,
+            source_chain: Vec::new(),
+        };
+        assert_eq!(
+            serde_json::to_value(LexicalHydrationResult::Error(error.clone()))
+                .expect("serialize hydration error"),
+            flattened_error,
+            "hydration Error must remain a flattened internally tagged newtype"
+        );
+        assert_eq!(
+            serde_json::to_value(LexicalObservationOutcome::Error(error))
+                .expect("serialize observation error"),
+            flattened_error,
+            "observation Error must remain a flattened internally tagged newtype"
+        );
+
+        assert!(
+            serde_json::from_str::<LexicalNormalizedQuery>(
+                r#"{"state":"not_exposed","state":"value"}"#,
+            )
+            .is_err()
+        );
+        assert!(
+            serde_json::from_str::<SensitiveValueObservation>(
+                r#"{"state":"absent","state":"not_exposed"}"#,
+            )
+            .is_err()
+        );
+        assert!(
+            serde_json::from_str::<LexicalHydrationSelection>(
+                r#"{"kind":"all_lexical_winners","kind":"semantic_only_control","control_id":1}"#,
+            )
+            .is_err()
+        );
+        assert!(
+            serde_json::from_str::<LexicalHydrationResult>(
+                r#"{"kind":"success","kind":"error","class":"query","code":"query_parse_error","contract_payload":{"state":"absent"},"diagnostic":{"state":"absent"},"source_chain":[]}"#,
+            )
+            .is_err()
+        );
+        assert!(
+            serde_json::from_str::<LexicalProbeCoverage>(
+                r#"{"state":"exercised_success","state":"exercised_empty"}"#,
+            )
+            .is_err()
+        );
     }
 
     #[test]

@@ -22,13 +22,21 @@ use sha2::{Digest, Sha256};
 use crate::DifferentialCaseMetadata;
 use crate::{DifferentialCase, GauntletError};
 
-/// Schema version for generator specifications and manifests.
-pub const GENERATOR_SCHEMA_VERSION: u32 = 2;
-/// Schema version for query manifests with explicit suite provenance and the
-/// complete CASS Boolean/glob/range/structured-filter profile.
-pub const QUERY_MANIFEST_SCHEMA_VERSION: u32 = 3;
-/// Stable identity of this generator implementation.
-pub const GENERATOR_ID: &str = "frankensearch-quill-gauntlet/generator-v2";
+// These version-specific constants are archival protocol identifiers. Keep
+// them immutable when a future generator becomes current: stored validation
+// dispatches through these frozen routes rather than through the mutable
+// aliases below.
+const GENERATOR_V2_SCHEMA_VERSION: u32 = 2;
+const GENERATOR_V2_ID: &str = "frankensearch-quill-gauntlet/generator-v2";
+const QUERY_MANIFEST_V3_SCHEMA_VERSION: u32 = 3;
+
+/// Schema version for the current generator specifications and manifests.
+pub const GENERATOR_SCHEMA_VERSION: u32 = GENERATOR_V2_SCHEMA_VERSION;
+/// Schema version for current query manifests with explicit suite provenance
+/// and the complete CASS Boolean/glob/range/structured-filter profile.
+pub const QUERY_MANIFEST_SCHEMA_VERSION: u32 = QUERY_MANIFEST_V3_SCHEMA_VERSION;
+/// Stable identity of the current generator implementation.
+pub const GENERATOR_ID: &str = GENERATOR_V2_ID;
 /// Maximum accepted document size, in UTF-8 bytes.
 pub const MAX_DOCUMENT_BYTES: u32 = 2 * 1024 * 1024;
 /// Maximum UTF-8 bytes in an external document ID carried into observations.
@@ -93,6 +101,7 @@ impl ZipfExponent {
 
 /// Deterministic synthetic-corpus recipe.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SyntheticCorpusSpec {
     /// Seed for all document-local streams.
     pub seed: u64,
@@ -199,6 +208,7 @@ pub enum Pathology {
 
 /// Typed CASS fields retained until an adapter-specific runner lowers them.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CassDocumentFields {
     /// Agent name.
     pub agent: String,
@@ -216,6 +226,7 @@ pub struct CassDocumentFields {
 
 /// Engine-neutral generated document with canonical metadata ordering.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GeneratedDocument {
     /// Stable document identifier.
     pub id: String,
@@ -531,6 +542,7 @@ pub enum RepositorySkipReason {
 
 /// A skipped tracked path recorded in a repository manifest.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SkippedRepositoryEntry {
     /// Normalized repository-relative path.
     pub path: String,
@@ -540,6 +552,7 @@ pub struct SkippedRepositoryEntry {
 
 /// Digest of one included repository file.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RepositoryFileDigest {
     /// Normalized repository-relative path.
     pub path: String,
@@ -790,6 +803,7 @@ fn read_tracked_path_beneath(
 
 /// Identifies one embedded shared source file.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SourceFileDigest {
     /// Stable repository-relative fixture path.
     pub path: String,
@@ -799,7 +813,7 @@ pub struct SourceFileDigest {
 
 /// Corpus source and exact replay inputs recorded in a manifest.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum CorpusSourceManifest {
     /// Integer-only synthetic generator.
     Synthetic {
@@ -824,6 +838,7 @@ pub enum CorpusSourceManifest {
 
 /// Canonical, replay-verifiable corpus identity.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CorpusManifest {
     /// Generator/manifest schema.
     pub schema_version: u32,
@@ -1041,10 +1056,16 @@ impl CorpusManifest {
         Ok(lower_hex(&hasher.finalize()))
     }
 
-    pub(crate) fn validate_contract(&self) -> Result<(), GauntletError> {
-        if self.schema_version != GENERATOR_SCHEMA_VERSION
-            || self.generator_id != GENERATOR_ID
-            || self.document_count > MAX_CORPUS_DOCUMENT_COUNT
+    /// Validate only invariants carried by the stored manifest bytes.
+    ///
+    /// This path deliberately does not regenerate a synthetic corpus or read
+    /// the verifier's currently embedded shared fixtures. Archive validation
+    /// must remain stable when generator code or fixture assets advance.
+    pub(crate) fn validate_stored_contract(&self) -> Result<(), GauntletError> {
+        if !matches!(
+            (self.schema_version, self.generator_id.as_str()),
+            (GENERATOR_V2_SCHEMA_VERSION, GENERATOR_V2_ID)
+        ) || self.document_count > MAX_CORPUS_DOCUMENT_COUNT
             || validate_sha256(&self.content_sha256, "corpus content hash").is_err()
         {
             return Err(manifest_error(
@@ -1053,18 +1074,47 @@ impl CorpusManifest {
         }
         match &self.source {
             CorpusSourceManifest::Synthetic { spec } => {
-                let expected = SyntheticCorpus::new(spec.clone())?.manifest()?;
-                if self != &expected {
+                spec.validate()?;
+                let max_content_bytes = spec
+                    .document_count
+                    .checked_mul(u64::from(spec.max_document_bytes));
+                if self.document_count != spec.document_count
+                    || !self.skipped_repository_entries.is_empty()
+                    || max_content_bytes.is_none_or(|maximum| self.total_content_bytes > maximum)
+                {
                     return Err(manifest_error(
-                        "synthetic manifest does not match its replay recipe",
+                        "stored synthetic manifest is inconsistent with its bounded recipe",
                     ));
                 }
             }
-            CorpusSourceManifest::SharedFixtures { view, .. } => {
-                let expected = SharedFixtureSuite::load()?.manifest(*view)?;
-                if self != &expected {
+            CorpusSourceManifest::SharedFixtures { view, sources } => {
+                const SOURCE_PATHS: [&str; 4] = [
+                    "tests/fixtures/corpus.json",
+                    "tests/fixtures/queries.json",
+                    "tests/fixtures/edge_cases.json",
+                    "tests/fixtures/quill_language_contract.json",
+                ];
+                let expected_document_count = match view {
+                    SharedCorpusView::Core100 => CORE_RELEVANCE_DOCUMENT_COUNT as u64,
+                    SharedCorpusView::Full120 => FULL_SHARED_DOCUMENT_COUNT as u64,
+                };
+                let source_paths = sources
+                    .iter()
+                    .map(|source| source.path.as_str())
+                    .collect::<Vec<_>>();
+                let maximum_content_bytes =
+                    expected_document_count.checked_mul(u64::from(MAX_DOCUMENT_BYTES));
+                if source_paths != SOURCE_PATHS
+                    || sources.iter().any(|source| {
+                        validate_sha256(&source.sha256, "shared fixture source hash").is_err()
+                    })
+                    || self.document_count != expected_document_count
+                    || !self.skipped_repository_entries.is_empty()
+                    || maximum_content_bytes
+                        .is_none_or(|maximum| self.total_content_bytes > maximum)
+                {
                     return Err(manifest_error(
-                        "shared-fixture manifest does not match its embedded sources",
+                        "stored shared-fixture manifest has invalid source, count, or byte bounds",
                     ));
                 }
             }
@@ -1141,6 +1191,36 @@ impl CorpusManifest {
         Ok(())
     }
 
+    /// Validate a manifest for new evidence under the exact generator and
+    /// embedded fixture assets compiled into this verifier.
+    pub(crate) fn validate_creation_contract(&self) -> Result<(), GauntletError> {
+        self.validate_stored_contract()?;
+        if self.schema_version != GENERATOR_SCHEMA_VERSION || self.generator_id != GENERATOR_ID {
+            return Err(manifest_error(
+                "campaign-creation corpus manifest does not use the current generator",
+            ));
+        }
+        let expected = match &self.source {
+            CorpusSourceManifest::Synthetic { spec } => {
+                Some(SyntheticCorpus::new(spec.clone())?.manifest()?)
+            }
+            CorpusSourceManifest::SharedFixtures { view, .. } => {
+                Some(SharedFixtureSuite::load()?.manifest(*view)?)
+            }
+            CorpusSourceManifest::Repository { .. } => None,
+        };
+        if expected.as_ref().is_some_and(|expected| self != expected) {
+            return Err(manifest_error(
+                "campaign-creation manifest does not match the current replay source",
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn validate_contract(&self) -> Result<(), GauntletError> {
+        self.validate_creation_contract()
+    }
+
     /// Verify arbitrary replay documents against this manifest's content pins.
     ///
     /// # Errors
@@ -1151,7 +1231,27 @@ impl CorpusManifest {
         I: IntoIterator<Item = D>,
         D: Borrow<GeneratedDocument>,
     {
-        self.validate_contract()?;
+        self.validate_creation_contract()?;
+        self.verify_document_content(documents)
+    }
+
+    /// Verify archived document bytes without consulting current replay
+    /// sources.
+    #[cfg(test)]
+    pub(crate) fn verify_stored_documents<I, D>(&self, documents: I) -> Result<(), GauntletError>
+    where
+        I: IntoIterator<Item = D>,
+        D: Borrow<GeneratedDocument>,
+    {
+        self.validate_stored_contract()?;
+        self.verify_document_content(documents)
+    }
+
+    fn verify_document_content<I, D>(&self, documents: I) -> Result<(), GauntletError>
+    where
+        I: IntoIterator<Item = D>,
+        D: Borrow<GeneratedDocument>,
+    {
         let mut verifier = self.replay_verifier();
         for document in documents {
             let _ = verifier.observe(document.borrow())?;
@@ -1172,6 +1272,7 @@ pub enum SharedCorpusView {
 
 /// One committed relevance-query row.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SharedRelevanceQuery {
     /// Raw query.
     pub query: String,
@@ -1179,10 +1280,14 @@ pub struct SharedRelevanceQuery {
     pub query_class: String,
     /// Ordered ground-truth document IDs.
     pub relevant_ids: Vec<String>,
+    /// Human-authored rationale retained from the committed fixture.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
 }
 
 /// One committed edge-case row.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SharedEdgeCase {
     /// Stable edge-case ID.
     pub id: String,
@@ -1356,8 +1461,8 @@ pub enum StructuredFilterClass {
 }
 
 /// Semantic/syntactic purpose of a generated query.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum GeneratedQueryKind {
     /// One term.
     Term,
@@ -1393,9 +1498,46 @@ pub enum GeneratedQueryKind {
     },
 }
 
+impl<'de> Deserialize<'de> for GeneratedQueryKind {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+        enum StrictWire {
+            Term {},
+            MultiTerm {},
+            Phrase {},
+            Boolean {},
+            Glob { pattern_class: GlobPatternClass },
+            Range { range_class: RangeClass },
+            StructuredFilter { filter_class: StructuredFilterClass },
+            Paginated {},
+            Counted {},
+            Harvested { semantic_class: String },
+        }
+
+        Ok(match StrictWire::deserialize(deserializer)? {
+            StrictWire::Term {} => Self::Term,
+            StrictWire::MultiTerm {} => Self::MultiTerm,
+            StrictWire::Phrase {} => Self::Phrase,
+            StrictWire::Boolean {} => Self::Boolean,
+            StrictWire::Glob { pattern_class } => Self::Glob { pattern_class },
+            StrictWire::Range { range_class } => Self::Range { range_class },
+            StrictWire::StructuredFilter { filter_class } => {
+                Self::StructuredFilter { filter_class }
+            }
+            StrictWire::Paginated {} => Self::Paginated,
+            StrictWire::Counted {} => Self::Counted,
+            StrictWire::Harvested { semantic_class } => Self::Harvested { semantic_class },
+        })
+    }
+}
+
 /// Engine-neutral source restriction lowered by both CASS adapters.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum GeneratedSourceFilter {
     /// Do not restrict the durable source identity.
     #[default]
@@ -1411,8 +1553,32 @@ pub enum GeneratedSourceFilter {
     },
 }
 
+impl<'de> Deserialize<'de> for GeneratedSourceFilter {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+        enum StrictWire {
+            All {},
+            Local {},
+            Remote {},
+            SourceId { source_id: String },
+        }
+
+        Ok(match StrictWire::deserialize(deserializer)? {
+            StrictWire::All {} => Self::All,
+            StrictWire::Local {} => Self::Local,
+            StrictWire::Remote {} => Self::Remote,
+            StrictWire::SourceId { source_id } => Self::SourceId { source_id },
+        })
+    }
+}
+
 /// CASS structured filters kept separate from raw query syntax.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GeneratedQueryFilters {
     /// Exact agent names, combined with OR and required by the root query.
     #[serde(default)]
@@ -1480,6 +1646,7 @@ impl GeneratedQueryFilters {
 
 /// Rich engine-neutral query case; E6.2 adapters lower this without data loss.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GeneratedQueryCase {
     /// Stable case ID.
     pub id: String,
@@ -1534,6 +1701,7 @@ impl GeneratedQueryCase {
 
 /// Versioned query-generation recipe.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct QueryGeneratorSpec {
     /// Independent query stream seed.
     pub seed: u64,
@@ -1555,6 +1723,7 @@ pub enum QuerySuiteSource {
 
 /// Canonical query-suite identity bound to one corpus manifest.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct QueryManifest {
     /// Generator/manifest schema.
     pub schema_version: u32,
@@ -1575,7 +1744,15 @@ pub struct QueryManifest {
 }
 
 impl QueryManifest {
-    fn validate_contract(&self, cases: &[GeneratedQueryCase]) -> Result<(), GauntletError> {
+    /// Validate only invariants carried by the stored manifest and query bytes.
+    ///
+    /// This path deliberately does not regenerate cases or read the verifier's
+    /// currently embedded shared fixtures. It is suitable for archive
+    /// validation after generator code or fixture assets have advanced.
+    pub(crate) fn validate_stored_contract(
+        &self,
+        cases: &[GeneratedQueryCase],
+    ) -> Result<(), GauntletError> {
         let expected_source_identity = query_source_identity(
             self.source,
             &self.spec,
@@ -1583,14 +1760,36 @@ impl QueryManifest {
             self.query_count,
             &self.content_sha256,
         )?;
-        if self.schema_version != QUERY_MANIFEST_SCHEMA_VERSION
-            || self.generator_id != GENERATOR_ID
+        if validate_stored_query_generator_identity(self.schema_version, &self.generator_id)
+            .is_err()
             || validate_sha256(&self.content_sha256, "query content hash").is_err()
             || self.source_identity_sha256 != expected_source_identity
             || validate_query_inputs(&self.spec, &self.corpus_manifest_hash, cases).is_err()
         {
             return Err(manifest_error(
                 "query manifest schema, generator, recipe, or cases are invalid",
+            ));
+        }
+        let (query_count, content_sha256) = hash_queries(cases)?;
+        if query_count != self.query_count || content_sha256 != self.content_sha256 {
+            return Err(GauntletError::ManifestMismatch {
+                reason: "stored query suite does not match query content pins".to_owned(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Validate new evidence against the exact generator and fixture assets
+    /// compiled into this verifier.
+    pub(crate) fn validate_creation_contract(
+        &self,
+        cases: &[GeneratedQueryCase],
+    ) -> Result<(), GauntletError> {
+        self.validate_stored_contract(cases)?;
+        if self.schema_version != QUERY_MANIFEST_SCHEMA_VERSION || self.generator_id != GENERATOR_ID
+        {
+            return Err(manifest_error(
+                "campaign-creation query manifest does not use the current generator",
             ));
         }
         if self.source == QuerySuiteSource::Generated {
@@ -1603,6 +1802,10 @@ impl QueryManifest {
             }
         }
         Ok(())
+    }
+
+    fn validate_contract(&self, cases: &[GeneratedQueryCase]) -> Result<(), GauntletError> {
+        self.validate_creation_contract(cases)
     }
 
     /// Domain-separated manifest hash.
@@ -1623,19 +1826,37 @@ impl QueryManifest {
     ///
     /// Returns an error when replayed queries differ.
     pub fn verify(&self, cases: &[GeneratedQueryCase]) -> Result<(), GauntletError> {
-        self.validate_contract(cases)?;
-        let (query_count, content_sha256) = hash_queries(cases)?;
-        if query_count != self.query_count || content_sha256 != self.content_sha256 {
-            return Err(GauntletError::ManifestMismatch {
-                reason: "replayed query suite does not match query content pins".to_owned(),
-            });
-        }
-        Ok(())
+        self.validate_contract(cases)
     }
+
+    /// Verify archived ordered query content without consulting current replay
+    /// sources.
+    pub(crate) fn verify_stored(&self, cases: &[GeneratedQueryCase]) -> Result<(), GauntletError> {
+        self.validate_stored_contract(cases)
+    }
+}
+
+/// Validate an archived query generator identity through an immutable,
+/// version-specific protocol route.
+pub(crate) fn validate_stored_query_generator_identity(
+    schema_version: u32,
+    generator_id: &str,
+) -> Result<(), GauntletError> {
+    match (schema_version, generator_id) {
+        (QUERY_MANIFEST_V3_SCHEMA_VERSION, GENERATOR_V2_ID) => Ok(()),
+        _ => Err(manifest_error(
+            "query manifest schema and generator identity are unsupported",
+        )),
+    }
+}
+
+pub(crate) fn is_supported_stored_generator_id(generator_id: &str) -> bool {
+    matches!(generator_id, GENERATOR_V2_ID)
 }
 
 /// Generated query suite plus replay manifest.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GeneratedQuerySuite {
     /// Ordered generated and harvested cases.
     pub cases: Vec<GeneratedQueryCase>,
@@ -1829,6 +2050,7 @@ fn contract_query_case(
 
 /// Broad query anchor parsed from the committed language contract.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct HarvestedContractQuery {
     /// Stable fixture ID.
     pub id: String,
@@ -2650,7 +2872,12 @@ fn manifest_error(reason: impl Into<String>) -> GauntletError {
 }
 
 pub fn validate_generated_case_metadata(case: &DifferentialCase) -> Result<(), GauntletError> {
-    if case.metadata.generator_id.as_deref() != Some(GENERATOR_ID) {
+    if !case
+        .metadata
+        .generator_id
+        .as_deref()
+        .is_some_and(is_supported_stored_generator_id)
+    {
         return Ok(());
     }
     if case.metadata.generator_seed.is_none() {
@@ -2757,6 +2984,171 @@ mod tests {
                 .collect(),
         };
         (golden, documents, query_suite.cases)
+    }
+
+    fn assert_unknown_field_rejected_at<T>(value: &T, path: &str)
+    where
+        T: Serialize + serde::de::DeserializeOwned,
+    {
+        let mut encoded = serde_json::to_value(value).expect("serialize strict generator DTO");
+        encoded
+            .pointer_mut(path)
+            .and_then(serde_json::Value::as_object_mut)
+            .unwrap_or_else(|| panic!("strict-Serde path must name an object: {path}"))
+            .insert("future_unbound_field".to_owned(), serde_json::json!(true));
+        assert!(
+            serde_json::from_value::<T>(encoded).is_err(),
+            "unknown field at {path:?} must fail {} decoding",
+            std::any::type_name::<T>(),
+        );
+    }
+
+    fn assert_strict_tagged_round_trip<T>(value: &T)
+    where
+        T: Serialize + serde::de::DeserializeOwned + PartialEq + std::fmt::Debug,
+    {
+        let encoded = serde_json::to_value(value).expect("serialize tagged generator value");
+        let decoded: T =
+            serde_json::from_value(encoded.clone()).expect("deserialize tagged generator value");
+        assert_eq!(&decoded, value);
+        assert_unknown_field_rejected_at(value, "");
+    }
+
+    #[test]
+    fn current_generator_graph_rejects_unknown_fields_except_explicit_maps() {
+        let (golden, mut documents, cases) = generate_small_golden();
+        let mut document = documents.remove(0);
+        document.cass = Some(CassDocumentFields {
+            agent: "agent-a".to_owned(),
+            workspace: "workspace-a".to_owned(),
+            source_id: "source-a".to_owned(),
+            source_path: "src/lib.rs".to_owned(),
+            origin_kind: "local".to_owned(),
+            message_index: 7,
+        });
+        let suite = GeneratedQuerySuite {
+            cases,
+            manifest: golden.query_manifest.clone(),
+        };
+        let repository_file = RepositoryFileDigest {
+            path: "src/lib.rs".to_owned(),
+            bytes: 12,
+            sha256: "a".repeat(64),
+        };
+        let source_file = SourceFileDigest {
+            path: "tests/fixtures/relevance.json".to_owned(),
+            sha256: "b".repeat(64),
+        };
+        let skipped = SkippedRepositoryEntry {
+            path: "target/large.bin".to_owned(),
+            reason: RepositorySkipReason::TooLarge,
+        };
+        let repository_source = CorpusSourceManifest::Repository {
+            repository_id: "strict-repository".to_owned(),
+            files: vec![repository_file.clone()],
+        };
+        let shared_source = CorpusSourceManifest::SharedFixtures {
+            view: SharedCorpusView::Core100,
+            sources: vec![source_file.clone()],
+        };
+        let source_filter = GeneratedSourceFilter::SourceId {
+            source_id: "source-a".to_owned(),
+        };
+        let shared = SharedFixtureSuite::load().expect("shared strict-Serde fixtures");
+
+        assert_unknown_field_rejected_at(&golden.corpus_spec, "");
+        assert_unknown_field_rejected_at(&document, "");
+        assert_unknown_field_rejected_at(&document, "/cass");
+        assert_unknown_field_rejected_at(&repository_file, "");
+        assert_unknown_field_rejected_at(&source_file, "");
+        assert_unknown_field_rejected_at(&skipped, "");
+        assert_unknown_field_rejected_at(&repository_source, "");
+        assert_unknown_field_rejected_at(&repository_source, "/files/0");
+        assert_unknown_field_rejected_at(&shared_source, "");
+        assert_unknown_field_rejected_at(&shared_source, "/sources/0");
+        assert_unknown_field_rejected_at(&golden.corpus_manifest, "");
+        assert_unknown_field_rejected_at(&golden.corpus_manifest, "/source");
+        assert_unknown_field_rejected_at(&golden.corpus_manifest, "/source/spec");
+        assert_unknown_field_rejected_at(&suite, "");
+        assert_unknown_field_rejected_at(&suite, "/manifest");
+        assert_unknown_field_rejected_at(&suite, "/manifest/spec");
+        assert_unknown_field_rejected_at(&suite, "/cases/0");
+        assert_unknown_field_rejected_at(&suite, "/cases/0/query_kind");
+        assert_unknown_field_rejected_at(&suite, "/cases/0/filters");
+        assert_unknown_field_rejected_at(&suite, "/cases/0/filters/source_filter");
+        assert_unknown_field_rejected_at(&source_filter, "");
+        assert_unknown_field_rejected_at(&shared.relevance_queries[0], "");
+        assert_unknown_field_rejected_at(&shared.edge_cases[0], "");
+        assert_unknown_field_rejected_at(&shared.harvested_contract_queries[0], "");
+
+        // These two paths are intentionally map-valued user data, not schema
+        // objects. Arbitrary keys must remain round-trippable while every
+        // surrounding DTO fails closed above.
+        document
+            .metadata
+            .insert("future_metadata_key".to_owned(), "value".to_owned());
+        let decoded_document: GeneratedDocument = serde_json::from_value(
+            serde_json::to_value(&document).expect("serialize document map allowlist"),
+        )
+        .expect("metadata map remains extensible");
+        assert_eq!(decoded_document.metadata, document.metadata);
+        let mut harvested = shared.harvested_contract_queries[0].clone();
+        harvested
+            .filters
+            .insert("future_numeric_filter".to_owned(), 42);
+        let decoded_harvested: HarvestedContractQuery = serde_json::from_value(
+            serde_json::to_value(&harvested).expect("serialize filter map allowlist"),
+        )
+        .expect("harvested filter map remains extensible");
+        assert_eq!(decoded_harvested.filters, harvested.filters);
+    }
+
+    #[test]
+    fn generator_tagged_variants_reject_unknown_and_duplicate_tags_exhaustively() {
+        for kind in [
+            GeneratedQueryKind::Term,
+            GeneratedQueryKind::MultiTerm,
+            GeneratedQueryKind::Phrase,
+            GeneratedQueryKind::Boolean,
+            GeneratedQueryKind::Glob {
+                pattern_class: GlobPatternClass::Prefix,
+            },
+            GeneratedQueryKind::Range {
+                range_class: RangeClass::Inclusive,
+            },
+            GeneratedQueryKind::StructuredFilter {
+                filter_class: StructuredFilterClass::Agent,
+            },
+            GeneratedQueryKind::Paginated,
+            GeneratedQueryKind::Counted,
+            GeneratedQueryKind::Harvested {
+                semantic_class: "identifier".to_owned(),
+            },
+        ] {
+            assert_strict_tagged_round_trip(&kind);
+        }
+
+        for filter in [
+            GeneratedSourceFilter::All,
+            GeneratedSourceFilter::Local,
+            GeneratedSourceFilter::Remote,
+            GeneratedSourceFilter::SourceId {
+                source_id: "source-a".to_owned(),
+            },
+        ] {
+            assert_strict_tagged_round_trip(&filter);
+        }
+
+        assert!(
+            serde_json::from_str::<GeneratedQueryKind>(r#"{"kind":"term","kind":"phrase"}"#,)
+                .is_err(),
+            "duplicate generated-query kind tags must fail closed"
+        );
+        assert!(
+            serde_json::from_str::<GeneratedSourceFilter>(r#"{"kind":"all","kind":"local"}"#,)
+                .is_err(),
+            "duplicate generated-source kind tags must fail closed"
+        );
     }
 
     #[test]
@@ -3070,6 +3462,101 @@ mod tests {
     }
 
     #[test]
+    fn stored_generator_identity_archived_manifests_validate_without_current_replay_sources() {
+        let corpus = SyntheticCorpus::new(small_spec(117, 12)).expect("valid corpus");
+        let current_manifest = corpus.manifest().expect("current manifest");
+        let mut historical_documents = corpus.iter().collect::<Vec<_>>();
+        historical_documents[3]
+            .content
+            .push_str(" archived-generator-output");
+        let historical_manifest = CorpusManifest::from_documents(
+            current_manifest.source.clone(),
+            &historical_documents,
+            Vec::new(),
+        )
+        .expect("self-consistent historical manifest");
+        historical_manifest
+            .validate_stored_contract()
+            .expect("stored corpus contract is independent of current generator output");
+        historical_manifest
+            .verify_stored_documents(&historical_documents)
+            .expect("stored corpus content pins verify");
+        let mut unsupported_corpus_schema = historical_manifest.clone();
+        unsupported_corpus_schema.schema_version = GENERATOR_SCHEMA_VERSION.saturating_add(1);
+        assert!(
+            unsupported_corpus_schema
+                .validate_stored_contract()
+                .is_err()
+        );
+        let mut unsupported_corpus_generator = historical_manifest.clone();
+        unsupported_corpus_generator.generator_id =
+            "frankensearch-quill-gauntlet/generator-v3".to_owned();
+        assert!(
+            unsupported_corpus_generator
+                .validate_stored_contract()
+                .is_err()
+        );
+        assert!(historical_manifest.validate_creation_contract().is_err());
+        assert!(
+            historical_manifest
+                .verify_documents(&historical_documents)
+                .is_err()
+        );
+
+        let shared = SharedFixtureSuite::load().expect("fixtures");
+        let corpus_hash = current_manifest.manifest_hash().expect("corpus hash");
+        let suite = GeneratedQuerySuite::generate(
+            QueryGeneratorSpec {
+                seed: 117,
+                default_limit: 20,
+                include_shared_relevance_queries: false,
+            },
+            corpus_hash,
+            &shared,
+        )
+        .expect("current generated suite");
+        let mut historical_cases = suite.cases.clone();
+        historical_cases[0].query.push_str(" archived");
+        let (query_count, content_sha256) =
+            hash_queries(&historical_cases).expect("historical query content hash");
+        let mut historical_query_manifest = suite.manifest.clone();
+        historical_query_manifest.query_count = query_count;
+        historical_query_manifest.content_sha256 = content_sha256;
+        historical_query_manifest.source_identity_sha256 = query_source_identity(
+            historical_query_manifest.source,
+            &historical_query_manifest.spec,
+            &historical_query_manifest.corpus_manifest_hash,
+            historical_query_manifest.query_count,
+            &historical_query_manifest.content_sha256,
+        )
+        .expect("historical query source identity");
+        historical_query_manifest
+            .verify_stored(&historical_cases)
+            .expect("stored query contract is independent of current generator output");
+        let mut unsupported_query_schema = historical_query_manifest.clone();
+        unsupported_query_schema.schema_version = QUERY_MANIFEST_SCHEMA_VERSION.saturating_add(1);
+        assert!(
+            unsupported_query_schema
+                .verify_stored(&historical_cases)
+                .is_err()
+        );
+        let mut unsupported_query_generator = historical_query_manifest.clone();
+        unsupported_query_generator.generator_id =
+            "frankensearch-quill-gauntlet/generator-v3".to_owned();
+        assert!(
+            unsupported_query_generator
+                .verify_stored(&historical_cases)
+                .is_err()
+        );
+        assert!(
+            historical_query_manifest
+                .validate_creation_contract(&historical_cases)
+                .is_err()
+        );
+        assert!(historical_query_manifest.verify(&historical_cases).is_err());
+    }
+
+    #[test]
     fn shared_fixtures_expose_explicit_core_and_full_views() {
         let shared = SharedFixtureSuite::load().expect("committed fixtures are valid");
         assert_eq!(
@@ -3081,6 +3568,22 @@ mod tests {
             FULL_SHARED_DOCUMENT_COUNT
         );
         assert_eq!(shared.relevance_queries().len(), 26);
+        assert_eq!(
+            shared
+                .relevance_queries()
+                .iter()
+                .filter(|query| query.note.is_some())
+                .count(),
+            6,
+            "all committed query rationales must survive strict fixture decoding"
+        );
+        assert_eq!(
+            shared
+                .relevance_queries()
+                .last()
+                .and_then(|query| query.note.as_deref()),
+            Some("Single-token known miss for non-vacuous empty-result conformance")
+        );
         assert_eq!(shared.edge_cases().len(), 21);
         assert_eq!(shared.harvested_contract_queries().len(), 7);
         let core = shared

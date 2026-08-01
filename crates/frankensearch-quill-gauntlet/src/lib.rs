@@ -28,9 +28,12 @@ use std::path::PathBuf;
 use thiserror::Error;
 
 pub use artifact::{
-    ArtifactLexicalContractEvidence, ArtifactObject, ArtifactStore, CANONICALIZATION_VERSION,
+    ArtifactExecutionRole, ArtifactLexicalContractEvidence, ArtifactObject,
+    ArtifactOracleDependency, ArtifactStore, ArtifactTrustCeiling, CANONICALIZATION_VERSION,
     CampaignArtifactContext, GauntletProducerBuildIdentity, GauntletProducerSourceVerification,
-    OBJECT_SCHEMA_VERSION, PreparedArtifact, RUN_MANIFEST_SCHEMA_VERSION, RunManifest,
+    IntegrityCheckedCampaign, OBJECT_SCHEMA_VERSION, PreparedArtifact, RUN_MANIFEST_SCHEMA_VERSION,
+    RunManifest, SerializedSchemaDisposition, classify_artifact_object_schema,
+    classify_campaign_report_schema,
 };
 pub use comparator::{
     AstDifference, AstLoweringKind, ComparatorConfig, ComparisonReport, ComparisonStatus,
@@ -153,9 +156,10 @@ pub use qg6_prepared::{
 };
 pub use runner::{
     CAMPAIGN_REPORT_SCHEMA_VERSION, CASS_ANALYZER_CONTRACT_PREIMAGE, CASS_SCHEMA_CONTRACT_PREIMAGE,
-    CampaignCaseResult, CampaignConfig, CampaignContractMode, CampaignDisposition, CampaignFuture,
-    CampaignLexicalCaseSummary, CampaignLexicalCoverageSummary, CampaignProvenance, CampaignReport,
-    CampaignSelection, DEFAULT_ANALYZER_CONTRACT_HASH, DEFAULT_ANALYZER_CONTRACT_PREIMAGE,
+    CampaignCaseReason, CampaignCaseResult, CampaignConfig, CampaignContractMode,
+    CampaignDisposition, CampaignFuture, CampaignLexicalCaseSummary,
+    CampaignLexicalCoverageSummary, CampaignProvenance, CampaignReport, CampaignSelection,
+    DEFAULT_ANALYZER_CONTRACT_HASH, DEFAULT_ANALYZER_CONTRACT_PREIMAGE,
     DEFAULT_SCHEMA_CONTRACT_HASH, DEFAULT_SCHEMA_CONTRACT_PREIMAGE, DEFAULT_SHRINK_FUEL,
     DIVERGENCE_PREDICTION_POLICY_PREIMAGE, DIVERGENCE_PREDICTION_POLICY_VERSION,
     DIVERGENCE_REGISTER_LEDGER_SCHEMA_VERSION, DIVERGENCE_REGISTER_REDACTION_POLICY_VERSION,

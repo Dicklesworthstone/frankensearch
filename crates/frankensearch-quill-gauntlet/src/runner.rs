@@ -18,7 +18,8 @@ use frankensearch_core::LexicalSearch;
 
 use crate::GauntletError;
 use crate::artifact::{
-    ArtifactDivergenceBinding, ArtifactLexicalContractEvidence, ArtifactObject, ArtifactStore,
+    ArtifactDivergenceBinding, ArtifactExecutionRole, ArtifactLexicalContractEvidence,
+    ArtifactObject, ArtifactOracleDependency, ArtifactStore, ArtifactTrustCeiling,
     CampaignArtifactContext, GauntletProducerBuildIdentity, OBJECT_HASH_SCHEME_V7_SHA256,
 };
 use crate::comparator::{
@@ -31,8 +32,9 @@ use crate::comparator::{
 #[cfg(feature = "tantivy-oracle")]
 use crate::engine::GauntletEngine;
 use crate::engine::{
-    ComparisonMode, DifferentialCase, DifferentialCaseMetadata, EngineDescriptor,
-    EnginePairIdentity, HARNESS_RUN_SCHEMA_VERSION, HarnessRun, MAX_SNIPPET_CHARS,
+    BuiltInEngineProfile, BuiltInEngineProfileReceipt, ComparisonMode, DifferentialCase,
+    DifferentialCaseMetadata, EngineDescriptor, EnginePairIdentity, HARNESS_RUN_SCHEMA_VERSION,
+    HarnessRun, MAX_SNIPPET_CHARS,
 };
 #[cfg(feature = "tantivy-oracle")]
 use crate::generator::GeneratedSourceFilter;
@@ -41,11 +43,13 @@ use crate::generator::{
     GeneratedQueryKind, GeneratedQuerySuite, GlobPatternClass, MAX_DOCUMENT_BYTES, MAX_QUERY_CASES,
     MAX_QUERY_ID_BYTES, QUERY_MANIFEST_SCHEMA_VERSION, QueryManifest, QuerySuiteSource,
     QuerySyntax, RangeClass, StructuredFilterClass, SyntheticCorpus, is_canonical_query_id,
+    validate_stored_query_generator_identity,
 };
 use crate::version_contract::oracle_version_contract;
 
 /// Schema version for deterministic campaign reports.
-pub const CAMPAIGN_REPORT_SCHEMA_VERSION: u32 = 6;
+pub(crate) const CAMPAIGN_REPORT_V7_SCHEMA_VERSION: u32 = 7;
+pub const CAMPAIGN_REPORT_SCHEMA_VERSION: u32 = CAMPAIGN_REPORT_V7_SCHEMA_VERSION;
 /// Schema version for the append-only machine-readable Divergence Register.
 pub const DIVERGENCE_REGISTER_LEDGER_SCHEMA_VERSION: u32 = 2;
 const LEGACY_DIVERGENCE_REGISTER_LEDGER_SCHEMA_VERSION_V1: u32 = 1;
@@ -77,7 +81,7 @@ const LEXICAL_MISMATCH_SIGNATURE_DOMAIN: &[u8] =
     b"frankensearch/quill/lexical-mismatch-signature/v1\0";
 const LEXICAL_QUERY_CONTRACT_DOMAIN: &[u8] = b"frankensearch/quill/lexical-query-contract/v1\0";
 const LEXICAL_INDEX_IDENTITY_DOMAIN: &[u8] = b"frankensearch/quill/lexical-index-identity/v1\0";
-const CAMPAIGN_REPORT_HASH_DOMAIN: &[u8] = b"frankensearch/quill/campaign-report/v6\0";
+const CAMPAIGN_REPORT_V7_HASH_DOMAIN: &[u8] = b"frankensearch/quill/campaign-report/v7\0";
 const DIVERGENCE_REGISTRY_HASH_DOMAIN: &[u8] = b"frankensearch/quill/divergence-registry/v1\0";
 const DIVERGENCE_REGISTER_LEDGER_HASH_DOMAIN: &[u8] =
     b"frankensearch/quill/divergence-register-ledger/v2\0";
@@ -90,13 +94,13 @@ const MAX_DIVERGENCE_REVIEWER_BYTES: usize = 1_024;
 const MAX_DIVERGENCE_REGISTRY_TEXT_BYTES: usize = 16 * 1024 * 1024;
 const MAX_DIVERGENCE_REGISTER_MARKER_BYTES: usize = 256;
 const DIVERGENCE_ARTIFACT_OBJECT_SCHEMA_VERSION_V7: u32 = 7;
-const MAX_CAMPAIGN_REASON_BYTES: usize = 4 * 1024;
 const MAX_CAMPAIGN_POINTER_BYTES: usize = 1024 * 1024;
 const MAX_MISMATCH_GROUPS: usize = MAX_QUERY_CASES;
 const MAX_MISMATCH_TEXT_BYTES: usize = 64 * 1024 * 1024;
 
 /// Shared analyzer and schema profile that both adapters must acknowledge.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SemanticContract {
     pub analyzer_contract_hash: String,
     pub schema_contract_hash: String,
@@ -161,6 +165,7 @@ impl SemanticContract {
 
 /// Adapter receipt proving what was indexed and under which semantic profile.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EngineIndexReceipt {
     pub corpus_manifest_hash: String,
     pub document_count: u64,
@@ -307,8 +312,8 @@ impl Drop for IndexSession<'_> {
 }
 
 /// Query subset executed from a fully verified generated suite.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum CampaignSelection {
     /// Execute every query in manifest order.
     #[default]
@@ -321,8 +326,31 @@ pub enum CampaignSelection {
     CaseIds { ids: Vec<String> },
 }
 
+impl<'de> Deserialize<'de> for CampaignSelection {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+        enum StrictWire {
+            All {},
+            DefaultSyntax {},
+            CassSyntax {},
+            CaseIds { ids: Vec<String> },
+        }
+
+        Ok(match StrictWire::deserialize(deserializer)? {
+            StrictWire::All {} => Self::All,
+            StrictWire::DefaultSyntax {} => Self::DefaultSyntax,
+            StrictWire::CassSyntax {} => Self::CassSyntax,
+            StrictWire::CaseIds { ids } => Self::CaseIds { ids },
+        })
+    }
+}
+
 impl CampaignSelection {
-    fn select<'a>(
+    fn select_stored_v7<'a>(
         &self,
         cases: &'a [GeneratedQueryCase],
     ) -> Result<Vec<&'a GeneratedQueryCase>, GauntletError> {
@@ -387,10 +415,20 @@ impl CampaignSelection {
         }
         Ok(selected)
     }
+
+    fn select<'a>(
+        &self,
+        cases: &'a [GeneratedQueryCase],
+    ) -> Result<Vec<&'a GeneratedQueryCase>, GauntletError> {
+        // Current creation is report v7. A future selection policy must add a
+        // new current implementation rather than editing stored v7 semantics.
+        self.select_stored_v7(cases)
+    }
 }
 
 /// One reviewed per-fixture divergence allowlist row.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DivergenceRegisterEntry {
     pub id: String,
     pub class: DivergenceClass,
@@ -479,6 +517,7 @@ impl DivergenceRegisterEntry {
 
 /// Validated machine-facing subset of the Markdown Divergence Register.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DivergenceRegistry {
     entries: Vec<DivergenceRegisterEntry>,
 }
@@ -1076,7 +1115,7 @@ impl DivergenceObservationEvent {
             .as_ref()
             .ok_or_else(|| {
                 campaign_error(
-                    "admissible divergence evidence requires a recorded artifact-object witness",
+                    "current relational-integrity divergence evidence requires a recorded artifact-object witness",
                 )
             })?;
         let DivergenceRevisionSet::CurrentV2 {
@@ -1091,7 +1130,7 @@ impl DivergenceObservationEvent {
         } = &self.revisions
         else {
             return Err(campaign_error(
-                "admissible divergence evidence requires current producer and oracle identities",
+                "current relational-integrity divergence evidence requires producer and oracle identities",
             ));
         };
         let mut artifact_signatures = binding
@@ -1116,7 +1155,7 @@ impl DivergenceObservationEvent {
             || !artifact_divergence_is_exact
         {
             return Err(campaign_error(
-                "divergence observation does not match its verified ArtifactObject evidence",
+                "divergence observation does not match its integrity-checked ArtifactObject evidence",
             ));
         }
         Ok(())
@@ -1327,8 +1366,8 @@ impl DivergenceRegisterLedger {
     ///
     /// This proves the ledger's canonical shape, but cannot prove that an
     /// externally named artifact exists or that its co-located producer and
-    /// oracle identities are authentic. Evidence admission must additionally
-    /// call [`Self::validate_against_artifact_objects`].
+    /// oracle identities are authentic. The crate-internal integrity join is
+    /// necessary but not sufficient for any F0 terminal decision.
     ///
     /// # Errors
     ///
@@ -1337,13 +1376,14 @@ impl DivergenceRegisterLedger {
     pub fn validate(&self) -> Result<(), GauntletError> {
         if self.schema_version != DIVERGENCE_REGISTER_LEDGER_SCHEMA_VERSION {
             return Err(campaign_error(
-                "only divergence register schema v2 is admissible evidence",
+                "only divergence register schema v2 satisfies the current structural contract",
             ));
         }
         self.validate_for_schema(DIVERGENCE_REGISTER_LEDGER_SCHEMA_VERSION)
     }
 
-    /// Bind every observation to a verified, admissible gauntlet artifact.
+    /// Check relational integrity between every observation and its built-in
+    /// gauntlet object witness.
     ///
     /// Each supplied [`ArtifactObject`] is validated by its owning artifact
     /// contract before this method compares the exact object schema/hash
@@ -1354,10 +1394,15 @@ impl DivergenceRegisterLedger {
     ///
     /// # Errors
     ///
-    /// Returns an error for a structurally invalid ledger, an inadmissible or
+    /// This is an integrity-only join. Raw objects can reproduce their own
+    /// claims, so this method never authenticates a producer, admits evidence,
+    /// or authorizes a replacement. F0 must instead consume an externally
+    /// authenticated receipt chain built from [`crate::IntegrityCheckedCampaign`].
+    ///
+    /// Returns an error for a structurally invalid ledger, an invalid or
     /// duplicate artifact, a missing first-recorded artifact, or any well-formed
     /// but substituted artifact/producer/oracle identity.
-    pub fn validate_against_artifact_objects(
+    pub fn validate_relational_integrity_against_artifact_objects(
         &self,
         artifacts: &[ArtifactObject],
     ) -> Result<(), GauntletError> {
@@ -1385,12 +1430,12 @@ impl DivergenceRegisterLedger {
                 .map(|address| address.digest.as_str())
                 .ok_or_else(|| {
                     campaign_error(
-                        "admissible divergence evidence requires a recorded artifact-object witness",
+                        "current relational-integrity divergence evidence requires a recorded artifact-object witness",
                     )
                 })?;
             let binding = bindings.get(object_hash).ok_or_else(|| {
                 campaign_error(format!(
-                    "divergence observation {} has no verified ArtifactObject witness",
+                    "divergence observation {} has no integrity-checked ArtifactObject witness",
                     observation.divergence_id
                 ))
             })?;
@@ -1595,9 +1640,8 @@ impl DivergenceRegisterLedger {
     /// Domain-separated structural identity of the immutable event stream.
     ///
     /// This hash commits to the ledger bytes; it is not proof that referenced
-    /// artifact objects were supplied. Call
-    /// [`Self::validate_against_artifact_objects`] before citing the hash as
-    /// evidence.
+    /// artifact objects were supplied or authenticated. It is never terminal
+    /// evidence by itself.
     ///
     /// # Errors
     ///
@@ -1663,7 +1707,7 @@ impl DivergenceRegisterLedger {
     }
 
     // Deliberately test-only and nonadmissible. A public terminal census must
-    // derive both signature sets from a frozen, store-verified complete
+    // derive both signature sets from a frozen, store-integrity-checked complete
     // campaign matrix; raw caller slices permit omission and cherry-picking.
     #[cfg(test)]
     fn nonadmissible_structural_census(
@@ -1914,7 +1958,7 @@ impl DivergenceRegisterLedger {
                 .map(|address| address.digest.clone())
                 .ok_or_else(|| {
                     campaign_error(
-                        "admissible divergence evidence requires a recorded artifact-object witness",
+                        "current relational-integrity divergence evidence requires a recorded artifact-object witness",
                     )
                 })?;
             let object_claims = claims_by_object.entry(object_hash).or_default();
@@ -2043,6 +2087,7 @@ const fn divergence_class_name(class: DivergenceClass) -> &'static str {
     }
 }
 
+#[cfg(test)]
 fn count_to_u64(value: usize) -> Result<u64, GauntletError> {
     u64::try_from(value).map_err(|_| campaign_error("divergence census count overflow"))
 }
@@ -2063,6 +2108,7 @@ pub enum CampaignContractMode {
 
 /// Deterministic runner policy included in the report hash.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CampaignConfig {
     pub selection: CampaignSelection,
     pub comparator_config: ComparatorConfig,
@@ -2107,16 +2153,31 @@ impl Default for CampaignConfig {
 
 impl CampaignConfig {
     fn validate(&self) -> Result<(), GauntletError> {
+        self.validate_stored_v7()?;
         self.comparator_config.validate_contract()?;
+        if u64::from(MAX_DOCUMENT_BYTES) != 2 * 1024 * 1024 || MAX_SNIPPET_CHARS != 1_000_000 {
+            return Err(campaign_error(
+                "current campaign limits changed without a report schema-version bump",
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_stored_v7(&self) -> Result<(), GauntletError> {
+        const V7_MAX_DOCUMENT_BYTES: u64 = 2 * 1024 * 1024;
+        const V7_MAX_INDEX_BATCH_BYTES: u64 = V7_MAX_DOCUMENT_BYTES * 512;
+        const V7_MAX_SNIPPET_CHARS: u64 = 1_000_000;
+
+        self.comparator_config.validate_stored_v7()?;
         let confidence = f64::from_bits(self.posterior_confidence_bits);
         if self.index_batch_size == 0
             || self.index_batch_size > 100_000
             || self.index_batch_max_bytes == 0
-            || self.index_batch_max_bytes > u64::from(MAX_DOCUMENT_BYTES) * 512
+            || self.index_batch_max_bytes > V7_MAX_INDEX_BATCH_BYTES
             || self.tie_expansion_limit > 100_000
             || self
                 .snippet_max_chars
-                .is_some_and(|value| value > MAX_SNIPPET_CHARS)
+                .is_some_and(|value| value > V7_MAX_SNIPPET_CHARS)
             || !confidence.is_finite()
             || !(0.0 < confidence && confidence < 1.0)
         {
@@ -2139,6 +2200,154 @@ pub enum CampaignDisposition {
     InfrastructureError,
 }
 
+/// Frozen, machine-facing reason for a non-passing campaign case.
+///
+/// Backend and operating-system details belong in the noncanonical
+/// [`CampaignCaseResult::diagnostic`] field. Keeping the canonical reason as a
+/// closed enum prevents an infrastructure-only report from accepting arbitrary
+/// replacement text while retaining the same disposition.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "code", rename_all = "snake_case", deny_unknown_fields)]
+pub enum CampaignCaseReason {
+    ComparatorUnclassified,
+    MissingDivergenceRegistration,
+    ExpectedDivergenceNotRegistered { divergence_id: String },
+    ExpectedDivergenceMismatch { divergence_id: String },
+    LexicalContractMismatch,
+    ObservationDocumentCountDrift,
+    ComparisonFailed,
+    MismatchBudgetExceeded,
+    LexicalMismatchBudgetExceeded,
+    LexicalSummaryFailed,
+    ArtifactValidationFailed,
+    ArtifactPrepareFailed,
+    ArtifactPersistFailed,
+    LexicalContractObservationFailed,
+    BothEngineExecutionsFailed,
+    SubjectExecutionFailed,
+    OracleExecutionFailed,
+    MultipleObservationLanesFailed,
+    InvalidEngineErrorState,
+}
+
+impl<'de> Deserialize<'de> for CampaignCaseReason {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(tag = "code", rename_all = "snake_case", deny_unknown_fields)]
+        enum StrictWire {
+            ComparatorUnclassified {},
+            MissingDivergenceRegistration {},
+            ExpectedDivergenceNotRegistered { divergence_id: String },
+            ExpectedDivergenceMismatch { divergence_id: String },
+            LexicalContractMismatch {},
+            ObservationDocumentCountDrift {},
+            ComparisonFailed {},
+            MismatchBudgetExceeded {},
+            LexicalMismatchBudgetExceeded {},
+            LexicalSummaryFailed {},
+            ArtifactValidationFailed {},
+            ArtifactPrepareFailed {},
+            ArtifactPersistFailed {},
+            LexicalContractObservationFailed {},
+            BothEngineExecutionsFailed {},
+            SubjectExecutionFailed {},
+            OracleExecutionFailed {},
+            MultipleObservationLanesFailed {},
+            InvalidEngineErrorState {},
+        }
+
+        Ok(match StrictWire::deserialize(deserializer)? {
+            StrictWire::ComparatorUnclassified {} => Self::ComparatorUnclassified,
+            StrictWire::MissingDivergenceRegistration {} => Self::MissingDivergenceRegistration,
+            StrictWire::ExpectedDivergenceNotRegistered { divergence_id } => {
+                Self::ExpectedDivergenceNotRegistered { divergence_id }
+            }
+            StrictWire::ExpectedDivergenceMismatch { divergence_id } => {
+                Self::ExpectedDivergenceMismatch { divergence_id }
+            }
+            StrictWire::LexicalContractMismatch {} => Self::LexicalContractMismatch,
+            StrictWire::ObservationDocumentCountDrift {} => Self::ObservationDocumentCountDrift,
+            StrictWire::ComparisonFailed {} => Self::ComparisonFailed,
+            StrictWire::MismatchBudgetExceeded {} => Self::MismatchBudgetExceeded,
+            StrictWire::LexicalMismatchBudgetExceeded {} => Self::LexicalMismatchBudgetExceeded,
+            StrictWire::LexicalSummaryFailed {} => Self::LexicalSummaryFailed,
+            StrictWire::ArtifactValidationFailed {} => Self::ArtifactValidationFailed,
+            StrictWire::ArtifactPrepareFailed {} => Self::ArtifactPrepareFailed,
+            StrictWire::ArtifactPersistFailed {} => Self::ArtifactPersistFailed,
+            StrictWire::LexicalContractObservationFailed {} => {
+                Self::LexicalContractObservationFailed
+            }
+            StrictWire::BothEngineExecutionsFailed {} => Self::BothEngineExecutionsFailed,
+            StrictWire::SubjectExecutionFailed {} => Self::SubjectExecutionFailed,
+            StrictWire::OracleExecutionFailed {} => Self::OracleExecutionFailed,
+            StrictWire::MultipleObservationLanesFailed {} => Self::MultipleObservationLanesFailed,
+            StrictWire::InvalidEngineErrorState {} => Self::InvalidEngineErrorState,
+        })
+    }
+}
+
+impl CampaignCaseReason {
+    const fn disposition(&self) -> CampaignDisposition {
+        match self {
+            Self::ComparatorUnclassified
+            | Self::MissingDivergenceRegistration
+            | Self::ExpectedDivergenceNotRegistered { .. }
+            | Self::ExpectedDivergenceMismatch { .. }
+            | Self::LexicalContractMismatch => CampaignDisposition::Unclassified,
+            Self::ObservationDocumentCountDrift
+            | Self::ComparisonFailed
+            | Self::MismatchBudgetExceeded
+            | Self::LexicalMismatchBudgetExceeded
+            | Self::LexicalSummaryFailed
+            | Self::ArtifactValidationFailed
+            | Self::ArtifactPrepareFailed
+            | Self::ArtifactPersistFailed
+            | Self::LexicalContractObservationFailed
+            | Self::BothEngineExecutionsFailed
+            | Self::SubjectExecutionFailed
+            | Self::OracleExecutionFailed
+            | Self::MultipleObservationLanesFailed
+            | Self::InvalidEngineErrorState => CampaignDisposition::InfrastructureError,
+        }
+    }
+
+    fn validate_for_query(&self, query: &GeneratedQueryCase) -> Result<(), GauntletError> {
+        match self {
+            Self::ExpectedDivergenceNotRegistered { divergence_id }
+            | Self::ExpectedDivergenceMismatch { divergence_id } => {
+                if !is_canonical_query_id(divergence_id)
+                    || query.expected_divergence.as_deref() != Some(divergence_id)
+                {
+                    return Err(campaign_error(
+                        "campaign case reason does not bind the query's expected divergence",
+                    ));
+                }
+            }
+            Self::ComparatorUnclassified
+            | Self::MissingDivergenceRegistration
+            | Self::LexicalContractMismatch
+            | Self::ObservationDocumentCountDrift
+            | Self::ComparisonFailed
+            | Self::MismatchBudgetExceeded
+            | Self::LexicalMismatchBudgetExceeded
+            | Self::LexicalSummaryFailed
+            | Self::ArtifactValidationFailed
+            | Self::ArtifactPrepareFailed
+            | Self::ArtifactPersistFailed
+            | Self::LexicalContractObservationFailed
+            | Self::BothEngineExecutionsFailed
+            | Self::SubjectExecutionFailed
+            | Self::OracleExecutionFailed
+            | Self::MultipleObservationLanesFailed
+            | Self::InvalidEngineErrorState => {}
+        }
+        Ok(())
+    }
+}
+
 impl CampaignDisposition {
     const fn passes(self) -> bool {
         matches!(
@@ -2149,7 +2358,7 @@ impl CampaignDisposition {
 }
 
 /// Total-lexical evidence retained for one submitted query.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 #[serde(tag = "scope", rename_all = "snake_case", deny_unknown_fields)]
 pub enum CampaignLexicalCaseSummary {
     /// Decode-only marker for pre-v5 campaign reports.
@@ -2169,8 +2378,47 @@ pub enum CampaignLexicalCaseSummary {
     },
 }
 
+impl<'de> Deserialize<'de> for CampaignLexicalCaseSummary {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(tag = "scope", rename_all = "snake_case", deny_unknown_fields)]
+        enum StrictWire {
+            LegacyMissing {},
+            RankEnvelopeOnly {},
+            CoreLexicalV3Unavailable {},
+            CoreLexicalV3 {
+                status: LexicalComparisonStatus,
+                first_mismatch: Option<LexicalFieldMismatch>,
+                mismatch_count: u64,
+                waived_difference_count: u64,
+            },
+        }
+
+        Ok(match StrictWire::deserialize(deserializer)? {
+            StrictWire::LegacyMissing {} => Self::LegacyMissing,
+            StrictWire::RankEnvelopeOnly {} => Self::RankEnvelopeOnly,
+            StrictWire::CoreLexicalV3Unavailable {} => Self::CoreLexicalV3Unavailable,
+            StrictWire::CoreLexicalV3 {
+                status,
+                first_mismatch,
+                mismatch_count,
+                waived_difference_count,
+            } => Self::CoreLexicalV3 {
+                status,
+                first_mismatch,
+                mismatch_count,
+                waived_difference_count,
+            },
+        })
+    }
+}
+
 /// Stable evidence row for one campaign query.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CampaignCaseResult {
     pub case_id: String,
     pub query_class: String,
@@ -2188,7 +2436,7 @@ pub struct CampaignCaseResult {
     pub registered_divergence: Option<DivergenceRegisterEntry>,
     pub first_divergence: Option<String>,
     /// Stable machine-facing outcome reason included in canonical reports.
-    pub reason: Option<String>,
+    pub reason: Option<CampaignCaseReason>,
     /// Noncanonical backend/OS diagnostic retained in memory for triage.
     #[serde(default, skip)]
     pub diagnostic: Option<String>,
@@ -2196,6 +2444,7 @@ pub struct CampaignCaseResult {
 
 /// Per-query-class raw counts and an informational Beta(1,1) posterior bound.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct QueryClassSummary {
     pub query_class: String,
     pub total: u64,
@@ -2239,6 +2488,7 @@ impl QueryClassSummary {
 
 /// Deduplicated mismatch descriptor with every affected fixture retained.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MismatchGroup {
     pub signature: String,
     pub divergence: Divergence,
@@ -2248,6 +2498,7 @@ pub struct MismatchGroup {
 
 /// Deduplicated total-lexical mismatch descriptor.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LexicalMismatchGroup {
     pub signature: String,
     pub mismatch: LexicalFieldMismatch,
@@ -2280,7 +2531,7 @@ pub struct LexicalSideCoverageCounts {
 }
 
 /// Campaign-level total-contract coverage, kept separate from equivalence.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 #[serde(tag = "scope", rename_all = "snake_case", deny_unknown_fields)]
 pub enum CampaignLexicalCoverageSummary {
     /// Decode-only marker for pre-v5 campaign reports.
@@ -2296,12 +2547,60 @@ pub enum CampaignLexicalCoverageSummary {
     },
 }
 
+impl<'de> Deserialize<'de> for CampaignLexicalCoverageSummary {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(tag = "scope", rename_all = "snake_case", deny_unknown_fields)]
+        enum StrictWire {
+            LegacyMissing {},
+            RankEnvelopeOnly {},
+            CoreLexicalV3 {
+                subject: Box<LexicalSideCoverageCounts>,
+                oracle: Box<LexicalSideCoverageCounts>,
+                admissible: bool,
+            },
+        }
+
+        Ok(match StrictWire::deserialize(deserializer)? {
+            StrictWire::LegacyMissing {} => Self::LegacyMissing,
+            StrictWire::RankEnvelopeOnly {} => Self::RankEnvelopeOnly,
+            StrictWire::CoreLexicalV3 {
+                subject,
+                oracle,
+                admissible,
+            } => Self::CoreLexicalV3 {
+                subject,
+                oracle,
+                admissible,
+            },
+        })
+    }
+}
+
 /// Deterministic campaign report; wall-clock data deliberately lives outside it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CampaignReport {
     pub schema_version: u32,
     pub run_id: String,
+    /// Maximum trust permitted by this schema after validation. Serialized
+    /// bytes cannot prove that the validation occurred.
+    #[serde(default)]
+    pub trust_ceiling: ArtifactTrustCeiling,
+    /// Durable execution role. It is independently bound into the run
+    /// reservation so archived diagnostics cannot be promoted after creation.
+    #[serde(default)]
+    pub execution_role: ArtifactExecutionRole,
+    #[serde(default)]
     pub producer_build_identity: GauntletProducerBuildIdentity,
+    /// Exact dependency role sealed into the reservation, report, and every
+    /// immutable case object, including campaigns with only infrastructure
+    /// failures and therefore no case objects.
+    #[serde(default)]
+    pub oracle_dependency: ArtifactOracleDependency,
     pub engines: EnginePairIdentity,
     pub semantic_contract: SemanticContract,
     pub config: CampaignConfig,
@@ -2333,7 +2632,10 @@ pub struct CampaignReport {
 struct CampaignRunReservation<'a> {
     schema_version: u32,
     run_id: &'a str,
+    trust_ceiling: ArtifactTrustCeiling,
+    execution_role: ArtifactExecutionRole,
     producer_build_identity: &'a GauntletProducerBuildIdentity,
+    oracle_dependency: &'a ArtifactOracleDependency,
     engines: &'a EnginePairIdentity,
     semantic_contract: &'a SemanticContract,
     config: &'a CampaignConfig,
@@ -2349,11 +2651,12 @@ struct CampaignRunReservation<'a> {
 /// Immutable source and semantic provenance stamped into every production
 /// campaign (bd-quill-e6-gauntlet-scale-rm3q.9).
 ///
-/// A campaign is admissible evidence only with the full environment pinned:
-/// engine commits and dirty state, lockfile, exact toolchain, Unicode tables,
-/// and the query profile identity. Missing or mismatched provenance fails
-/// closed; the reservation equality check inside
-/// [`ArtifactStore::load_verified_campaign`] replays these bytes verbatim.
+/// A campaign can satisfy the built-in integrity contract only with the full
+/// environment pinned: engine commits and dirty state, lockfile, exact
+/// toolchain, Unicode tables, and query profile identity. This remains
+/// necessary but not sufficient for terminal admission. Missing or mismatched
+/// provenance fails closed; the reservation equality check inside
+/// [`ArtifactStore::load_integrity_checked_campaign`] replays these bytes verbatim.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CampaignProvenance {
@@ -2497,8 +2800,8 @@ impl CampaignProvenance {
                         .any(|line| line.starts_with(label))
                 });
 
-        producer_build_identity.validate_structure()?;
-        producer_build_identity.validate_engines(engines)?;
+        producer_build_identity.validate_stored_v2()?;
+        producer_build_identity.validate_builtin_engines(engines)?;
         let producer_hash = producer_build_identity.identity_hash()?;
         let producer_rustc = producer_build_identity.rustc_version_verbose()?;
         if !is_lower_sha256(&self.producer_build_identity_sha256)
@@ -2511,9 +2814,12 @@ impl CampaignProvenance {
             || !is_numeric_version(&self.unicode_version)
             || !is_bounded_text(&self.unicode_normalization_version, 256)
             || !is_bounded_text(&self.unicode_normalization_table_version, 256)
-            || self.query_generator_id != GENERATOR_ID
+            || validate_stored_query_generator_identity(
+                self.query_generator_schema_version,
+                &self.query_generator_id,
+            )
+            .is_err()
             || self.query_generator_id != query_manifest.generator_id
-            || self.query_generator_schema_version != QUERY_MANIFEST_SCHEMA_VERSION
             || self.query_generator_schema_version != query_manifest.schema_version
             || self.query_seed != query_manifest.spec.seed
             || !is_lower_sha256(&self.query_source_identity_sha256)
@@ -2550,8 +2856,15 @@ impl CampaignProvenance {
             corpus_manifest,
             query_manifest,
         )?;
+        if self.query_generator_id != GENERATOR_ID
+            || self.query_generator_schema_version != QUERY_MANIFEST_SCHEMA_VERSION
+        {
+            return Err(campaign_error(
+                "campaign creation provenance does not use the current query generator",
+            ));
+        }
         producer_build_identity.validate_matches_compiled()?;
-        producer_build_identity.validate_admissible()?;
+        producer_build_identity.validate_stored_sealed_v2()?;
         let expected_unicode_version = format!(
             "{}.{}.{}",
             char::UNICODE_VERSION.0,
@@ -2630,57 +2943,8 @@ fn unicode_normalization_table_version() -> String {
     )
 }
 
-fn collect_git_state(revision_env: &str, dirty_env: &str) -> Result<(String, bool), GauntletError> {
-    match (std::env::var(revision_env), std::env::var(dirty_env)) {
-        (Ok(revision), Ok(dirty)) => {
-            return Ok((revision, parse_dirty_state(&dirty, dirty_env)?));
-        }
-        (Err(std::env::VarError::NotPresent), Err(std::env::VarError::NotPresent)) => {}
-        _ => {
-            return Err(campaign_error(format!(
-                "provenance overrides {revision_env} and {dirty_env} must be supplied together as valid UTF-8"
-            )));
-        }
-    }
-    let revision = run_capture(ProvenanceProgram::Git, &["rev-parse", "HEAD"], revision_env)?;
-    let porcelain = run_capture(
-        ProvenanceProgram::Git,
-        &["status", "--porcelain"],
-        dirty_env,
-    )?;
-    Ok((revision.trim().to_owned(), !porcelain.trim().is_empty()))
-}
-
-fn collect_oracle_git_state() -> Result<(String, bool), GauntletError> {
-    const REVISION_ENV: &str = "GAUNTLET_ORACLE_REVISION";
-    const DIRTY_ENV: &str = "GAUNTLET_ORACLE_DIRTY";
-    match (std::env::var(REVISION_ENV), std::env::var(DIRTY_ENV)) {
-        (Ok(revision), Ok(dirty)) => Ok((revision, parse_dirty_state(&dirty, DIRTY_ENV)?)),
-        (Err(std::env::VarError::NotPresent), Err(std::env::VarError::NotPresent)) => {
-            let contract = oracle_version_contract()?;
-            Ok((contract.lexical_contract_audit_revision, false))
-        }
-        _ => Err(campaign_error(format!(
-            "provenance overrides {REVISION_ENV} and {DIRTY_ENV} must be supplied together as valid UTF-8"
-        ))),
-    }
-}
-
-fn parse_dirty_state(value: &str, label: &str) -> Result<bool, GauntletError> {
-    match value {
-        "1" => Ok(true),
-        "0" => Ok(false),
-        _ if value.eq_ignore_ascii_case("true") => Ok(true),
-        _ if value.eq_ignore_ascii_case("false") => Ok(false),
-        _ => Err(campaign_error(format!(
-            "provenance dirty-state override {label} must be true, false, 1, or 0"
-        ))),
-    }
-}
-
 #[derive(Clone, Copy)]
 enum ProvenanceProgram {
-    Git,
     Rustc,
     Rustup,
 }
@@ -2688,7 +2952,6 @@ enum ProvenanceProgram {
 impl ProvenanceProgram {
     fn command(self) -> std::process::Command {
         match self {
-            Self::Git => std::process::Command::new("git"),
             Self::Rustc => std::process::Command::new("rustc"),
             Self::Rustup => std::process::Command::new("rustup"),
         }
@@ -2880,6 +3143,24 @@ pub fn lexical_backend_identity(
 }
 
 impl CampaignReport {
+    /// Return the maximum trust permitted by this report's schema version.
+    ///
+    /// This does not validate the DTO or establish durable relational
+    /// integrity. The opaque [`crate::IntegrityCheckedCampaign`] capability,
+    /// not a scalar value from these bytes, represents completed store replay.
+    pub fn schema_trust_ceiling(&self) -> Result<ArtifactTrustCeiling, GauntletError> {
+        match self.schema_version {
+            1 | 2 | 3 | 5 => Ok(ArtifactTrustCeiling::UnauthenticatedLegacy),
+            4 => Err(campaign_error(
+                "reserved pre-policy campaign report v4 has no trust classification",
+            )),
+            6 | CAMPAIGN_REPORT_V7_SCHEMA_VERSION => Ok(ArtifactTrustCeiling::IntegrityOnly),
+            schema_version => Err(campaign_error(format!(
+                "campaign report schema version {schema_version} has no trust classification"
+            ))),
+        }
+    }
+
     /// Validate every self-contained report invariant before structural hashing.
     ///
     /// This does not trust stored summary fields: manifest identities,
@@ -2887,48 +3168,101 @@ impl CampaignReport {
     /// structure, and the final pass bit are all recomputed. This deliberately
     /// does not prove that referenced immutable artifacts exist or agree with
     /// the reported classifications. Use
-    /// [`crate::ArtifactStore::load_verified_campaign`] when evidence-backed
-    /// replay verification is required.
+    /// [`crate::ArtifactStore::load_integrity_checked_campaign`] when durable
+    /// relational replay checks are required. Neither method authenticates the
+    /// bytes or grants admission authority.
     ///
     /// # Errors
     ///
     /// Returns an error when any report field is malformed or inconsistent.
     pub fn validate_contract(&self) -> Result<(), GauntletError> {
         validate_campaign_run_id(&self.run_id)?;
-        self.semantic_contract.validate()?;
-        self.config.validate()?;
-        self.divergence_registry.validate()?;
-        if matches!(self.schema_version, 3 | 4 | 5) {
+        if matches!(self.schema_version, 1 | 2 | 3 | 5) {
+            return Err(campaign_error(format!(
+                "unauthenticated legacy campaign report v{} is decode-only and non-admissible; rerun the campaign",
+                self.schema_version
+            )));
+        }
+        if self.schema_version == 4 {
             return Err(campaign_error(
-                "legacy campaign report schema lacks the current producer/run identity contract and is non-admissible; rerun the campaign",
+                "reserved pre-policy campaign report v4 is rejected and cannot be promoted; rerun the campaign",
             ));
         }
-        if self.schema_version != CAMPAIGN_REPORT_SCHEMA_VERSION {
+        if self.schema_version == 6 {
+            return Err(campaign_error(
+                "campaign report v6 provides self-consistency integrity only, not admission authority; rerun under the current contract",
+            ));
+        }
+        if self.schema_version != CAMPAIGN_REPORT_V7_SCHEMA_VERSION {
             return Err(campaign_error("campaign report schema version is invalid"));
         }
-
-        let mut rebuilt_engines = EnginePairIdentity::new(
-            self.engines.comparison_mode,
-            self.engines.subject.clone(),
-            self.engines.oracle.clone(),
-        )?;
-        rebuilt_engines.bind_semantic_contract(self.semantic_contract.clone())?;
-        self.engines.validate_gauntlet_contract()?;
-        self.producer_build_identity.validate_structure()?;
-        self.producer_build_identity
-            .validate_engines(&self.engines)?;
-        if rebuilt_engines != self.engines {
+        if self.trust_ceiling != self.schema_trust_ceiling()? {
             return Err(campaign_error(
-                "campaign report engine and semantic identities are inconsistent",
+                "campaign report trust ceiling does not match its schema",
             ));
         }
-        self.corpus_manifest.validate_contract()?;
+        if self.execution_role == ArtifactExecutionRole::LegacyMissing {
+            return Err(campaign_error(
+                "campaign report is missing its durable execution role",
+            ));
+        }
+        self.semantic_contract.validate()?;
+        self.config.validate_stored_v7()?;
+        self.divergence_registry.validate()?;
+        self.producer_build_identity.validate_stored_v2()?;
+        self.engines.validate_stored_contract()?;
+        if self.engines.semantic_contract.as_ref() != Some(&self.semantic_contract) {
+            return Err(campaign_error(
+                "campaign report semantic contract does not match its engine-pair receipt",
+            ));
+        }
+        match (self.execution_role, &self.oracle_dependency) {
+            (ArtifactExecutionRole::LegacyMissing, _) => unreachable!("rejected above"),
+            (
+                ArtifactExecutionRole::Diagnostic,
+                ArtifactOracleDependency::DiagnosticUnspecified,
+            ) => {
+                if self.config.require_provenance
+                    || self.provenance.is_some()
+                    || self.engines.has_builtin_profile()
+                {
+                    return Err(campaign_error(
+                        "diagnostic campaign role forbids provenance, provenance policy, and built-in profile receipts",
+                    ));
+                }
+            }
+            (
+                ArtifactExecutionRole::BuiltInExecution,
+                ArtifactOracleDependency::BuiltInTantivy { contract },
+            ) => {
+                contract.validate_stored_structure()?;
+                if !self.config.require_provenance || !self.engines.has_builtin_profile() {
+                    return Err(campaign_error(
+                        "built-in evidence role requires provenance policy and a typed engine profile receipt",
+                    ));
+                }
+                self.producer_build_identity.validate_stored_sealed_v2()?;
+                self.producer_build_identity
+                    .require_features(&["tantivy_oracle"])?;
+                self.producer_build_identity
+                    .validate_builtin_engines(&self.engines)?;
+            }
+            (ArtifactExecutionRole::Diagnostic, _)
+            | (ArtifactExecutionRole::BuiltInExecution, _) => {
+                return Err(campaign_error(
+                    "campaign report execution role does not match its oracle dependency role",
+                ));
+            }
+        }
+        self.corpus_manifest.validate_stored_contract()?;
         if self.corpus_manifest.manifest_hash()? != self.corpus_manifest_hash {
             return Err(campaign_error(
                 "campaign report corpus manifest hash is inconsistent",
             ));
         }
-        self.query_suite.manifest.verify(&self.query_suite.cases)?;
+        self.query_suite
+            .manifest
+            .verify_stored(&self.query_suite.cases)?;
         if self.query_suite.manifest.corpus_manifest_hash != self.corpus_manifest_hash
             || self.query_suite.manifest.manifest_hash()? != self.query_manifest_hash
         {
@@ -2936,24 +3270,45 @@ impl CampaignReport {
                 "campaign report query suite is not bound to its manifest and corpus",
             ));
         }
-        match (&self.provenance, self.config.require_provenance) {
-            (Some(provenance), _) => provenance.validate_stored(
+        if self.execution_role == ArtifactExecutionRole::BuiltInExecution {
+            let provenance = self.provenance.as_ref().ok_or_else(|| {
+                campaign_error("built-in evidence campaign report is missing required provenance")
+            })?;
+            provenance.validate_stored(
                 &self.producer_build_identity,
                 &self.engines,
                 &self.semantic_contract,
                 &self.config,
                 &self.corpus_manifest,
                 &self.query_suite.manifest,
-            )?,
-            (None, true) => {
-                return Err(campaign_error(
-                    "production campaign report is missing required provenance",
-                ));
-            }
-            (None, false) => {}
+            )?;
         }
 
-        let selected = self.config.selection.select(&self.query_suite.cases)?;
+        let selected = self
+            .config
+            .selection
+            .select_stored_v7(&self.query_suite.cases)?;
+        if self.execution_role == ArtifactExecutionRole::BuiltInExecution {
+            let selected_default_query = selected
+                .iter()
+                .any(|query| query.syntax == QuerySyntax::Default);
+            let selected_non_default_query = selected
+                .iter()
+                .any(|query| query.syntax != QuerySyntax::Default);
+            match self.config.contract_mode {
+                CampaignContractMode::CoreLexicalV3 if selected_non_default_query => {
+                    return Err(campaign_error(
+                        "stored core lexical v3 evidence cannot contain CASS or other non-default query syntax",
+                    ));
+                }
+                CampaignContractMode::RankEnvelopeOnly if selected_default_query => {
+                    return Err(campaign_error(
+                        "stored built-in default evidence requires core lexical v3 coverage",
+                    ));
+                }
+                CampaignContractMode::RankEnvelopeOnly | CampaignContractMode::CoreLexicalV3 => {}
+            }
+        }
         let submitted_count = u64::try_from(self.query_suite.cases.len()).unwrap_or(u64::MAX);
         let selected_count = u64::try_from(selected.len()).unwrap_or(u64::MAX);
         if self.submitted_query_count != submitted_count
@@ -2985,7 +3340,7 @@ impl CampaignReport {
             )?;
         }
         let confidence = f64::from_bits(self.config.posterior_confidence_bits);
-        if summarize_query_classes(&self.cases, confidence) != self.query_classes {
+        if summarize_query_classes_stored_v7(&self.cases, confidence) != self.query_classes {
             return Err(campaign_error(
                 "campaign report query-class summaries are inconsistent",
             ));
@@ -3017,30 +3372,66 @@ impl CampaignReport {
 
     pub(crate) fn validate_creation_environment(&self) -> Result<(), GauntletError> {
         self.validate_contract()?;
+        if self.schema_version != CAMPAIGN_REPORT_SCHEMA_VERSION {
+            return Err(campaign_error(
+                "new campaign completion requires the current report schema",
+            ));
+        }
+        self.config.validate()?;
         self.producer_build_identity.validate_matches_compiled()?;
-        match (&self.provenance, self.config.require_provenance) {
-            (Some(provenance), _) => provenance.validate_for_creation(
-                &self.producer_build_identity,
-                &self.engines,
-                &self.semantic_contract,
-                &self.config,
-                &self.corpus_manifest,
-                &self.query_suite.manifest,
-            ),
-            (None, false) => Ok(()),
-            (None, true) => Err(campaign_error(
-                "production campaign report is missing required provenance",
+        self.corpus_manifest.validate_creation_contract()?;
+        self.query_suite
+            .manifest
+            .validate_creation_contract(&self.query_suite.cases)?;
+        match self.execution_role {
+            ArtifactExecutionRole::LegacyMissing => Err(campaign_error(
+                "campaign report is missing its durable execution role",
             )),
+            ArtifactExecutionRole::Diagnostic => Ok(()),
+            ArtifactExecutionRole::BuiltInExecution => {
+                match &self.oracle_dependency {
+                    ArtifactOracleDependency::BuiltInTantivy { contract }
+                        if contract == &oracle_version_contract()? => {}
+                    _ => {
+                        return Err(campaign_error(
+                            "new built-in campaign report requires the exact current oracle dependency contract",
+                        ));
+                    }
+                }
+                self.producer_build_identity.validate_stored_sealed_v2()?;
+                self.engines.validate_builtin_contract()?;
+                self.provenance
+                    .as_ref()
+                    .ok_or_else(|| {
+                        campaign_error(
+                            "built-in evidence campaign report is missing required provenance",
+                        )
+                    })?
+                    .validate_for_creation(
+                        &self.producer_build_identity,
+                        &self.engines,
+                        &self.semantic_contract,
+                        &self.config,
+                        &self.corpus_manifest,
+                        &self.query_suite.manifest,
+                    )
+            }
         }
     }
 
     pub(crate) fn reservation_bytes_unchecked(&self) -> Result<Vec<u8>, GauntletError> {
-        let selected = self.config.selection.select(&self.query_suite.cases)?;
+        let selected = self
+            .config
+            .selection
+            .select_stored_v7(&self.query_suite.cases)?;
         let divergence_registry_hash = self.divergence_registry.registry_hash()?;
         let reservation = CampaignRunReservation {
             schema_version: self.schema_version,
             run_id: &self.run_id,
+            trust_ceiling: self.trust_ceiling,
+            execution_role: self.execution_role,
             producer_build_identity: &self.producer_build_identity,
+            oracle_dependency: &self.oracle_dependency,
             engines: &self.engines,
             semantic_contract: &self.semantic_contract,
             config: &self.config,
@@ -3055,7 +3446,9 @@ impl CampaignReport {
     }
 
     pub(crate) fn selected_queries(&self) -> Result<Vec<&GeneratedQueryCase>, GauntletError> {
-        self.config.selection.select(&self.query_suite.cases)
+        self.config
+            .selection
+            .select_stored_v7(&self.query_suite.cases)
     }
 
     pub(crate) fn begin_evidence_validation(
@@ -3085,7 +3478,7 @@ impl CampaignReport {
     /// Returns an error if validation or serialization fails.
     pub fn report_hash(&self) -> Result<String, GauntletError> {
         let mut hasher = Sha256::new();
-        hasher.update(CAMPAIGN_REPORT_HASH_DOMAIN);
+        hasher.update(CAMPAIGN_REPORT_V7_HASH_DOMAIN);
         hasher.update(self.canonical_bytes()?);
         Ok(lower_hex(&hasher.finalize()))
     }
@@ -3108,7 +3501,10 @@ pub struct CampaignEvidenceValidator<'a> {
 
 impl<'a> CampaignEvidenceValidator<'a> {
     fn new(report: &'a CampaignReport) -> Result<Self, GauntletError> {
-        let selected = report.config.selection.select(&report.query_suite.cases)?;
+        let selected = report
+            .config
+            .selection
+            .select_stored_v7(&report.query_suite.cases)?;
         if selected.len() != report.cases.len() {
             return Err(campaign_error(
                 "campaign evidence count does not match the final report",
@@ -3155,6 +3551,7 @@ impl<'a> CampaignEvidenceValidator<'a> {
             query,
             self.report.query_suite.manifest.spec.seed,
             self.report.query_suite.manifest.source,
+            &self.report.query_suite.manifest.generator_id,
             &self.report.corpus_manifest_hash,
         );
         let (disposition, reason, registered_divergence) = classify_case_with_lexical(
@@ -3167,6 +3564,8 @@ impl<'a> CampaignEvidenceValidator<'a> {
         let expected_context = CampaignArtifactContext {
             corpus_manifest_hash: self.report.corpus_manifest_hash.clone(),
             query_manifest_hash: self.report.query_manifest_hash.clone(),
+            query_generator_schema_version: self.report.query_suite.manifest.schema_version,
+            query_generator_id: self.report.query_suite.manifest.generator_id.clone(),
             query_suite_source: self.report.query_suite.manifest.source,
             query_source_identity_sha256: self
                 .report
@@ -3180,7 +3579,8 @@ impl<'a> CampaignEvidenceValidator<'a> {
             query: (*query).clone(),
             registered_divergence: registered_divergence.clone(),
         };
-        if object.engines != self.report.engines
+        if object.oracle_dependency() != &self.report.oracle_dependency
+            || object.engines != self.report.engines
             || object.case != expected_case
             || object.comparator_config != self.report.config.comparator_config
             || object.campaign.as_ref() != Some(&expected_context)
@@ -3247,18 +3647,16 @@ fn validate_campaign_case_result(
             "campaign case ID, order, or query class is inconsistent",
         ));
     }
-    if result.reason.as_ref().is_some_and(|reason| {
-        reason.is_empty()
-            || reason.len() > MAX_CAMPAIGN_REASON_BYTES
-            || reason.trim() != reason
-            || reason.chars().any(char::is_control)
-    }) || result.first_divergence.as_ref().is_some_and(|pointer| {
+    if let Some(reason) = &result.reason {
+        reason.validate_for_query(query)?;
+    }
+    if result.first_divergence.as_ref().is_some_and(|pointer| {
         !pointer.starts_with('/')
             || pointer.len() > MAX_CAMPAIGN_POINTER_BYTES
             || pointer.chars().any(char::is_control)
     }) {
         return Err(campaign_error(
-            "campaign case reason or divergence pointer is not bounded canonical text",
+            "campaign case divergence pointer is not bounded canonical text",
         ));
     }
 
@@ -3325,7 +3723,10 @@ fn validate_campaign_case_result(
         CampaignDisposition::Unclassified => {
             non_infrastructure_fields
                 && result.registered_divergence.is_none()
-                && result.reason.is_some()
+                && result
+                    .reason
+                    .as_ref()
+                    .is_some_and(|reason| reason.disposition() == CampaignDisposition::Unclassified)
         }
         CampaignDisposition::InfrastructureError => {
             result.comparison_status.is_none()
@@ -3333,7 +3734,9 @@ fn validate_campaign_case_result(
                 && result.artifact_hash.is_none()
                 && result.registered_divergence.is_none()
                 && result.first_divergence.is_none()
-                && result.reason.is_some()
+                && result.reason.as_ref().is_some_and(|reason| {
+                    reason.disposition() == CampaignDisposition::InfrastructureError
+                })
         }
     };
     let lexical_disposition_matches = match &result.lexical_contract {
@@ -3342,7 +3745,7 @@ fn validate_campaign_case_result(
             ..
         } => {
             result.disposition == CampaignDisposition::Unclassified
-                && result.reason.as_deref() == Some("lexical_contract_mismatch")
+                && result.reason == Some(CampaignCaseReason::LexicalContractMismatch)
                 && result.registered_divergence.is_none()
         }
         CampaignLexicalCaseSummary::CoreLexicalV3 {
@@ -3568,10 +3971,19 @@ pub struct DifferentialCampaignRunner {
     provenance: Option<CampaignProvenance>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum CampaignAdmission {
     Diagnostic,
-    BuiltInEvidence,
+    BuiltInEvidence(BuiltInEngineProfileReceipt),
+}
+
+impl CampaignAdmission {
+    const fn durable_role(&self) -> ArtifactExecutionRole {
+        match self {
+            Self::Diagnostic => ArtifactExecutionRole::Diagnostic,
+            Self::BuiltInEvidence(_) => ArtifactExecutionRole::BuiltInExecution,
+        }
+    }
 }
 
 impl DifferentialCampaignRunner {
@@ -3602,6 +4014,7 @@ impl DifferentialCampaignRunner {
     /// Every production campaign run stamps it into the reservation and the
     /// report; regression fixtures deliberately leave it absent.
     #[must_use]
+    #[cfg(test)]
     pub(crate) fn with_provenance(mut self, provenance: CampaignProvenance) -> Self {
         self.provenance = Some(provenance);
         self
@@ -3697,9 +4110,10 @@ impl DifferentialCampaignRunner {
         .await
     }
 
-    /// Run provenance-bearing replacement evidence through the concrete
+    /// Run a provenance-bearing built-in execution through the concrete
     /// Quill subject and pinned Tantivy oracle. Custom trait implementations
-    /// intentionally cannot call this admission path.
+    /// intentionally cannot call this typed execution path. The resulting raw
+    /// report remains integrity-only until store replay and F0 authentication.
     #[cfg(feature = "tantivy-oracle")]
     #[allow(clippy::too_many_arguments)]
     pub async fn run_quill_tantivy_evidence_replay(
@@ -3712,6 +4126,19 @@ impl DifferentialCampaignRunner {
         corpus_manifest: &CorpusManifest,
         query_suite: &GeneratedQuerySuite,
     ) -> Result<CampaignReport, GauntletError> {
+        let profile = if self.semantic_contract == SemanticContract::shipping_default() {
+            BuiltInEngineProfile::ScalarShipping
+        } else if self.semantic_contract == SemanticContract::scalar_g1a() {
+            BuiltInEngineProfile::ScalarG1a
+        } else {
+            return Err(campaign_error(
+                "the typed scalar evidence entrypoint requires the shipping or scalar G1a semantic contract",
+            ));
+        };
+        let admission = CampaignAdmission::BuiltInEvidence(BuiltInEngineProfileReceipt::new(
+            profile,
+            subject.config(),
+        ));
         self.run_replay_internal(
             cx,
             run_id,
@@ -3720,7 +4147,7 @@ impl DifferentialCampaignRunner {
             documents,
             corpus_manifest,
             query_suite,
-            CampaignAdmission::BuiltInEvidence,
+            admission,
         )
         .await
     }
@@ -3766,6 +4193,10 @@ impl DifferentialCampaignRunner {
         query_suite: &GeneratedQuerySuite,
     ) -> Result<CampaignReport, GauntletError> {
         let replay = BorrowedCorpus(documents);
+        let admission = CampaignAdmission::BuiltInEvidence(BuiltInEngineProfileReceipt::new(
+            BuiltInEngineProfile::Cass,
+            subject.config(),
+        ));
         self.run_replay_internal(
             cx,
             run_id,
@@ -3774,7 +4205,7 @@ impl DifferentialCampaignRunner {
             &replay,
             corpus_manifest,
             query_suite,
-            CampaignAdmission::BuiltInEvidence,
+            admission,
         )
         .await
     }
@@ -3794,12 +4225,62 @@ impl DifferentialCampaignRunner {
         self.config.validate()?;
         self.registry.validate()?;
         validate_campaign_run_id(run_id)?;
-        if self.config.require_provenance && admission != CampaignAdmission::BuiltInEvidence {
+        match (
+            &admission,
+            self.config.require_provenance,
+            self.provenance.as_ref(),
+        ) {
+            (CampaignAdmission::Diagnostic, false, None)
+            | (CampaignAdmission::BuiltInEvidence(_), true, Some(_)) => {}
+            (CampaignAdmission::Diagnostic, _, _) => {
+                return Err(campaign_error(
+                    "open custom-engine campaigns are diagnostic-only and require provenance policy off with no attached provenance",
+                ));
+            }
+            (CampaignAdmission::BuiltInEvidence(_), false, _) => {
+                return Err(campaign_error(
+                    "typed built-in evidence requires provenance policy to be enabled",
+                ));
+            }
+            (CampaignAdmission::BuiltInEvidence(_), true, None) => {
+                return Err(campaign_error(
+                    "production campaign is missing required provenance",
+                ));
+            }
+        }
+        let producer_build_identity = GauntletProducerBuildIdentity::compiled()?;
+        let mut engines = EnginePairIdentity::new(
+            ComparisonMode::CrossEngine,
+            subject.descriptor(),
+            oracle.descriptor(),
+        )?;
+        let subject_semantics = subject.semantic_contract();
+        let oracle_semantics = oracle.semantic_contract();
+        subject_semantics.validate()?;
+        oracle_semantics.validate()?;
+        if subject_semantics != self.semantic_contract || oracle_semantics != self.semantic_contract
+        {
             return Err(campaign_error(
-                "open custom-engine campaigns are diagnostic-only; provenance-bearing evidence requires a typed built-in subject/oracle entrypoint",
+                "engine-declared semantic contracts do not match the campaign contract",
             ));
         }
-        corpus_manifest.verify_documents(documents.replay())?;
+        engines.bind_semantic_contract(self.semantic_contract.clone())?;
+        let oracle_dependency = match &admission {
+            CampaignAdmission::Diagnostic => {
+                engines.validate_stored_contract()?;
+                ArtifactOracleDependency::DiagnosticUnspecified
+            }
+            CampaignAdmission::BuiltInEvidence(profile) => {
+                engines.bind_builtin_profile(profile.clone())?;
+                producer_build_identity.validate_builtin_engines(&engines)?;
+                engines.validate_builtin_contract()?;
+                self.store
+                    .validate_live_source_checkout_for_creation(&producer_build_identity)?;
+                ArtifactOracleDependency::BuiltInTantivy {
+                    contract: oracle_version_contract()?,
+                }
+            }
+        };
         let corpus_manifest_hash = corpus_manifest.manifest_hash()?;
         query_suite.manifest.verify(&query_suite.cases)?;
         if query_suite.manifest.corpus_manifest_hash != corpus_manifest_hash {
@@ -3811,12 +4292,8 @@ impl DifferentialCampaignRunner {
         let selected = self.config.selection.select(&query_suite.cases)?;
         let mut prepared_cases = Vec::with_capacity(selected.len());
         for query in selected {
-            let evidence_case = self.evidence_case(
-                query,
-                query_suite.manifest.spec.seed,
-                query_suite.manifest.source,
-                &corpus_manifest_hash,
-            );
+            let evidence_case =
+                self.evidence_case(query, &query_suite.manifest, &corpus_manifest_hash);
             evidence_case.validate_shape()?;
             prepared_cases.push((query, query_class(query), evidence_case));
         }
@@ -3841,25 +4318,6 @@ impl DifferentialCampaignRunner {
             }
             CampaignContractMode::RankEnvelopeOnly | CampaignContractMode::CoreLexicalV3 => {}
         }
-        let producer_build_identity = GauntletProducerBuildIdentity::compiled()?;
-        let mut engines = EnginePairIdentity::new(
-            ComparisonMode::CrossEngine,
-            subject.descriptor(),
-            oracle.descriptor(),
-        )?;
-        producer_build_identity.validate_engines(&engines)?;
-        let subject_semantics = subject.semantic_contract();
-        let oracle_semantics = oracle.semantic_contract();
-        subject_semantics.validate()?;
-        oracle_semantics.validate()?;
-        if subject_semantics != self.semantic_contract || oracle_semantics != self.semantic_contract
-        {
-            return Err(campaign_error(
-                "engine-declared semantic contracts do not match the campaign contract",
-            ));
-        }
-        engines.bind_semantic_contract(self.semantic_contract.clone())?;
-        engines.validate_gauntlet_contract()?;
         match (&self.provenance, self.config.require_provenance) {
             (Some(provenance), _) => provenance.validate_for_creation(
                 &producer_build_identity,
@@ -3876,12 +4334,26 @@ impl DifferentialCampaignRunner {
             }
             (None, false) => {}
         }
+        corpus_manifest.verify_documents(documents.replay())?;
+        if matches!(&admission, CampaignAdmission::BuiltInEvidence(_)) {
+            // The manifest replay can be long. Re-resolve the checkout after
+            // it and immediately before reservation/indexing so ordinary
+            // source drift cannot start an evidence run on stale build-time
+            // state. A malicious change-and-revert adversary remains the F0
+            // external-supervisor threat model.
+            self.store
+                .validate_live_source_checkout_for_creation(&producer_build_identity)?;
+        }
 
+        let durable_admission = admission.durable_role();
         let divergence_registry_hash = self.registry.registry_hash()?;
         let reservation = CampaignRunReservation {
             schema_version: CAMPAIGN_REPORT_SCHEMA_VERSION,
             run_id,
+            trust_ceiling: ArtifactTrustCeiling::IntegrityOnly,
+            execution_role: durable_admission,
             producer_build_identity: &producer_build_identity,
+            oracle_dependency: &oracle_dependency,
             engines: &engines,
             semantic_contract: &self.semantic_contract,
             config: &self.config,
@@ -4052,6 +4524,8 @@ impl DifferentialCampaignRunner {
                         query,
                         query_class,
                         &query_manifest_hash,
+                        query_suite.manifest.schema_version,
+                        &query_suite.manifest.generator_id,
                         query_suite.manifest.source,
                         &query_suite.manifest.source_identity_sha256,
                         query_suite.manifest.spec.seed,
@@ -4065,6 +4539,7 @@ impl DifferentialCampaignRunner {
                         &mut lexical_mismatches,
                         &mut lexical_coverage,
                         lexical_contract,
+                        &admission,
                     ),
                 (subject_result, oracle_result, lexical_result) => {
                     let (reason, diagnostic) =
@@ -4097,7 +4572,10 @@ impl DifferentialCampaignRunner {
         let report = CampaignReport {
             schema_version: CAMPAIGN_REPORT_SCHEMA_VERSION,
             run_id: run_id.to_owned(),
+            trust_ceiling: ArtifactTrustCeiling::IntegrityOnly,
+            execution_role: durable_admission,
             producer_build_identity,
+            oracle_dependency,
             engines,
             semantic_contract: self.semantic_contract.clone(),
             config: self.config.clone(),
@@ -4125,15 +4603,15 @@ impl DifferentialCampaignRunner {
     fn evidence_case(
         &self,
         query: &GeneratedQueryCase,
-        query_seed: u64,
-        query_suite_source: QuerySuiteSource,
+        query_manifest: &QueryManifest,
         corpus_manifest_hash: &str,
     ) -> DifferentialCase {
         evidence_case_for(
             &self.config,
             query,
-            query_seed,
-            query_suite_source,
+            query_manifest.spec.seed,
+            query_manifest.source,
+            &query_manifest.generator_id,
             corpus_manifest_hash,
         )
     }
@@ -4146,6 +4624,8 @@ impl DifferentialCampaignRunner {
         query: &GeneratedQueryCase,
         query_class: String,
         query_manifest_hash: &str,
+        query_generator_schema_version: u32,
+        query_generator_id: &str,
         query_suite_source: QuerySuiteSource,
         query_source_identity_sha256: &str,
         query_seed: u64,
@@ -4159,13 +4639,14 @@ impl DifferentialCampaignRunner {
         lexical_mismatches: &mut LexicalMismatchCollection,
         lexical_coverage: &mut CampaignLexicalCoverageAccumulator,
         lexical_contract: ArtifactLexicalContractEvidence,
+        admission: &CampaignAdmission,
     ) -> CampaignCaseResult {
         if subject.doc_count != expected_doc_count || oracle.doc_count != expected_doc_count {
             return infrastructure_case(
                 query,
                 query_class,
                 self.config.contract_mode,
-                "observation_document_count_drift",
+                CampaignCaseReason::ObservationDocumentCountDrift,
                 format!(
                     "expected {expected_doc_count}; subject {}; oracle {}",
                     subject.doc_count, oracle.doc_count
@@ -4182,7 +4663,7 @@ impl DifferentialCampaignRunner {
                     query,
                     query_class,
                     self.config.contract_mode,
-                    "comparison_failed",
+                    CampaignCaseReason::ComparisonFailed,
                     error.to_string(),
                 );
             }
@@ -4194,7 +4675,7 @@ impl DifferentialCampaignRunner {
                     query,
                     query_class,
                     self.config.contract_mode,
-                    "mismatch_budget_exceeded",
+                    CampaignCaseReason::MismatchBudgetExceeded,
                     error.to_string(),
                 );
             }
@@ -4207,7 +4688,7 @@ impl DifferentialCampaignRunner {
                         query,
                         query_class,
                         self.config.contract_mode,
-                        "lexical_mismatch_budget_exceeded",
+                        CampaignCaseReason::LexicalMismatchBudgetExceeded,
                         error.to_string(),
                     );
                 }
@@ -4224,7 +4705,7 @@ impl DifferentialCampaignRunner {
                     query,
                     query_class,
                     self.config.contract_mode,
-                    "lexical_summary_failed",
+                    CampaignCaseReason::LexicalSummaryFailed,
                     error.to_string(),
                 );
             }
@@ -4240,6 +4721,8 @@ impl DifferentialCampaignRunner {
         let context = CampaignArtifactContext {
             corpus_manifest_hash: run.case.metadata.corpus_hash.clone().unwrap_or_default(),
             query_manifest_hash: query_manifest_hash.to_owned(),
+            query_generator_schema_version,
+            query_generator_id: query_generator_id.to_owned(),
             query_suite_source,
             query_source_identity_sha256: query_source_identity_sha256.to_owned(),
             semantic_contract: self.semantic_contract.clone(),
@@ -4248,14 +4731,22 @@ impl DifferentialCampaignRunner {
             query: query.clone(),
             registered_divergence: registered_divergence.clone(),
         };
-        let object = match ArtifactObject::from_campaign_run(run, context, lexical_contract) {
+        let object = match admission {
+            CampaignAdmission::Diagnostic => {
+                ArtifactObject::from_diagnostic_campaign_run(run, context, lexical_contract)
+            }
+            CampaignAdmission::BuiltInEvidence(_) => {
+                ArtifactObject::from_builtin_campaign_execution(run, context, lexical_contract)
+            }
+        };
+        let object = match object {
             Ok(object) => object,
             Err(error) => {
                 return infrastructure_case(
                     query,
                     query_class,
                     self.config.contract_mode,
-                    "artifact_validation_failed",
+                    CampaignCaseReason::ArtifactValidationFailed,
                     error.to_string(),
                 );
             }
@@ -4265,28 +4756,30 @@ impl DifferentialCampaignRunner {
             ("query_class".to_owned(), query_class.clone()),
             ("query_source".to_owned(), query.source.clone()),
         ]);
-        let prepared =
-            match self
-                .store
-                .prepare_campaign_case(campaign_run_id, ordinal, &object, provenance)
-            {
-                Ok(prepared) => prepared,
-                Err(error) => {
-                    return infrastructure_case(
-                        query,
-                        query_class,
-                        self.config.contract_mode,
-                        "artifact_prepare_failed",
-                        error.to_string(),
-                    );
-                }
-            };
+        let prepared = match self.store.prepare_campaign_case(
+            campaign_run_id,
+            ordinal,
+            admission.durable_role(),
+            &object,
+            provenance,
+        ) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                return infrastructure_case(
+                    query,
+                    query_class,
+                    self.config.contract_mode,
+                    CampaignCaseReason::ArtifactPrepareFailed,
+                    error.to_string(),
+                );
+            }
+        };
         if let Err(error) = self.store.persist(&prepared) {
             return infrastructure_case(
                 query,
                 query_class,
                 self.config.contract_mode,
-                "artifact_persist_failed",
+                CampaignCaseReason::ArtifactPersistFailed,
                 error.to_string(),
             );
         }
@@ -4318,6 +4811,7 @@ fn evidence_case_for(
     query: &GeneratedQueryCase,
     query_seed: u64,
     query_suite_source: QuerySuiteSource,
+    query_generator_id: &str,
     corpus_manifest_hash: &str,
 ) -> DifferentialCase {
     let mut case = DifferentialCase::new(&query.id, &query.query, query.limit);
@@ -4327,7 +4821,7 @@ fn evidence_case_for(
     case.snippet_max_chars = config.snippet_max_chars;
     case.metadata = DifferentialCaseMetadata {
         generator_id: (query_suite_source == QuerySuiteSource::Generated)
-            .then(|| GENERATOR_ID.to_owned()),
+            .then(|| query_generator_id.to_owned()),
         generator_seed: (query_suite_source == QuerySuiteSource::Generated).then_some(query_seed),
         corpus_hash: Some(corpus_manifest_hash.to_owned()),
     };
@@ -4338,7 +4832,7 @@ fn infrastructure_case(
     query: &GeneratedQueryCase,
     query_class: String,
     contract_mode: CampaignContractMode,
-    reason: &'static str,
+    reason: CampaignCaseReason,
     diagnostic: String,
 ) -> CampaignCaseResult {
     CampaignCaseResult {
@@ -4351,7 +4845,7 @@ fn infrastructure_case(
         artifact_hash: None,
         registered_divergence: None,
         first_divergence: None,
-        reason: Some(reason.to_owned()),
+        reason: Some(reason),
         diagnostic: Some(diagnostic),
     }
 }
@@ -4395,13 +4889,13 @@ fn classify_case(
     registry: &DivergenceRegistry,
 ) -> (
     CampaignDisposition,
-    Option<String>,
+    Option<CampaignCaseReason>,
     Option<DivergenceRegisterEntry>,
 ) {
     if comparison.status == ComparisonStatus::Failed {
         return (
             CampaignDisposition::Unclassified,
-            Some("comparator reported an unclassified result-level failure".to_owned()),
+            Some(CampaignCaseReason::ComparatorUnclassified),
             None,
         );
     }
@@ -4419,16 +4913,16 @@ fn classify_case(
         }
         None => (
             CampaignDisposition::Unclassified,
-            Some("classified divergence has no reviewed register entry".to_owned()),
+            Some(CampaignCaseReason::MissingDivergenceRegistration),
             None,
         ),
         Some(expected_id) => {
             let Some(entry) = registry.find(expected_id) else {
                 return (
                     CampaignDisposition::Unclassified,
-                    Some(format!(
-                        "expected divergence {expected_id} is not registered"
-                    )),
+                    Some(CampaignCaseReason::ExpectedDivergenceNotRegistered {
+                        divergence_id: expected_id.to_owned(),
+                    }),
                     None,
                 );
             };
@@ -4442,9 +4936,9 @@ fn classify_case(
             } else {
                 (
                     CampaignDisposition::Unclassified,
-                    Some(format!(
-                        "expected divergence {expected_id} did not match this fixture and comparator class"
-                    )),
+                    Some(CampaignCaseReason::ExpectedDivergenceMismatch {
+                        divergence_id: expected_id.to_owned(),
+                    }),
                     None,
                 )
             }
@@ -4459,7 +4953,7 @@ fn classify_case_with_lexical(
     registry: &DivergenceRegistry,
 ) -> (
     CampaignDisposition,
-    Option<String>,
+    Option<CampaignCaseReason>,
     Option<DivergenceRegisterEntry>,
 ) {
     if let ArtifactLexicalContractEvidence::CoreLexicalV3 {
@@ -4469,7 +4963,7 @@ fn classify_case_with_lexical(
     {
         return (
             CampaignDisposition::Unclassified,
-            Some("lexical_contract_mismatch".to_owned()),
+            Some(CampaignCaseReason::LexicalContractMismatch),
             None,
         );
     }
@@ -4552,7 +5046,7 @@ struct SummaryAccumulator {
     infrastructure_errors: u64,
 }
 
-fn summarize_query_classes(
+fn summarize_query_classes_stored_v7(
     cases: &[CampaignCaseResult],
     confidence: f64,
 ) -> Vec<QueryClassSummary> {
@@ -4589,6 +5083,15 @@ fn summarize_query_classes(
             posterior_confidence_bits: confidence.to_bits(),
         })
         .collect()
+}
+
+fn summarize_query_classes(
+    cases: &[CampaignCaseResult],
+    confidence: f64,
+) -> Vec<QueryClassSummary> {
+    // Current creation is report v7. Preserve the archived implementation
+    // above when a future report schema changes aggregation policy.
+    summarize_query_classes_stored_v7(cases, confidence)
 }
 
 #[derive(Debug)]
@@ -5205,43 +5708,43 @@ fn validate_engine_state(
     expected_engines: &EnginePairIdentity,
     expected_semantics: &SemanticContract,
 ) -> Result<(), GauntletError> {
-    let mut observed = EnginePairIdentity::new(
-        ComparisonMode::CrossEngine,
-        subject.descriptor(),
-        oracle.descriptor(),
-    )?;
-    observed.bind_semantic_contract(expected_semantics.clone())?;
-    if &observed != expected_engines
-        || subject.semantic_contract() != *expected_semantics
-        || oracle.semantic_contract() != *expected_semantics
-    {
+    if expected_engines.semantic_contract.as_ref() != Some(expected_semantics) {
         return Err(campaign_error(
-            "engine identity or semantic contract changed during campaign execution",
+            "campaign semantic contract does not match its expected engine identity",
         ));
     }
-    Ok(())
+    expected_engines.validate_runtime_state(
+        subject.descriptor(),
+        oracle.descriptor(),
+        &subject.semantic_contract(),
+        &oracle.semantic_contract(),
+    )
 }
 
 fn observation_error_details(
     subject: &Result<EngineObservation, GauntletError>,
     oracle: &Result<EngineObservation, GauntletError>,
     lexical: &Result<ArtifactLexicalContractEvidence, GauntletError>,
-) -> (String, String) {
+) -> (CampaignCaseReason, String) {
     match (subject, oracle, lexical) {
         (Ok(_), Ok(_), Err(lexical)) => (
-            "lexical_contract_observation_failed".to_owned(),
+            CampaignCaseReason::LexicalContractObservationFailed,
             lexical.to_string(),
         ),
         (Err(subject), Err(oracle), Ok(_)) => (
-            "both_engine_executions_failed".to_owned(),
+            CampaignCaseReason::BothEngineExecutionsFailed,
             format!("subject: {subject}; oracle: {oracle}"),
         ),
-        (Err(subject), Ok(_), Ok(_)) => {
-            ("subject_execution_failed".to_owned(), subject.to_string())
-        }
-        (Ok(_), Err(oracle), Ok(_)) => ("oracle_execution_failed".to_owned(), oracle.to_string()),
+        (Err(subject), Ok(_), Ok(_)) => (
+            CampaignCaseReason::SubjectExecutionFailed,
+            subject.to_string(),
+        ),
+        (Ok(_), Err(oracle), Ok(_)) => (
+            CampaignCaseReason::OracleExecutionFailed,
+            oracle.to_string(),
+        ),
         (Err(subject), oracle, Err(lexical)) => (
-            "multiple_observation_lanes_failed".to_owned(),
+            CampaignCaseReason::MultipleObservationLanesFailed,
             format!(
                 "subject legacy: {subject}; oracle legacy: {}; lexical: {lexical}",
                 oracle
@@ -5251,11 +5754,11 @@ fn observation_error_details(
             ),
         ),
         (Ok(_), Err(oracle), Err(lexical)) => (
-            "multiple_observation_lanes_failed".to_owned(),
+            CampaignCaseReason::MultipleObservationLanesFailed,
             format!("oracle legacy: {oracle}; lexical: {lexical}"),
         ),
         (Ok(_), Ok(_), Ok(_)) => (
-            "invalid_engine_error_state".to_owned(),
+            CampaignCaseReason::InvalidEngineErrorState,
             "all observation results unexpectedly succeeded".to_owned(),
         ),
     }
@@ -6794,6 +7297,26 @@ mod tests {
 
     use super::*;
 
+    fn assert_strict_tagged_round_trip<T>(value: &T)
+    where
+        T: Serialize + serde::de::DeserializeOwned + PartialEq + std::fmt::Debug,
+    {
+        let encoded = serde_json::to_value(value).expect("serialize tagged wire value");
+        let decoded: T =
+            serde_json::from_value(encoded.clone()).expect("deserialize tagged wire value");
+        assert_eq!(&decoded, value);
+
+        let mut with_unknown = encoded;
+        with_unknown
+            .as_object_mut()
+            .expect("tagged wire value must be an object")
+            .insert("future_unbound_field".to_owned(), serde_json::json!(true));
+        assert!(
+            serde_json::from_value::<T>(with_unknown).is_err(),
+            "tagged wire variant accepted an unknown field: {value:?}"
+        );
+    }
+
     #[cfg(feature = "tantivy-oracle")]
     #[derive(Clone, Debug)]
     struct TraceLogWriter {
@@ -7580,54 +8103,21 @@ mod tests {
         fixture: &Fixture,
         config: &CampaignConfig,
         semantic_contract: &SemanticContract,
-        subject: &EngineDescriptor,
-        oracle: &EngineDescriptor,
     ) -> CampaignProvenance {
-        CampaignProvenance {
-            subject_git_revision: subject.source_revision.clone(),
-            subject_source_dirty: subject.source_dirty,
-            oracle_git_revision: oracle.source_revision.clone(),
-            oracle_source_dirty: oracle.source_dirty,
-            cargo_lock_sha256: hash_workspace_lockfile().expect("Cargo.lock hash"),
-            rustc_version_verbose: collect_rustc_verbose().expect("rustc provenance"),
-            rust_toolchain_channel: collect_dated_toolchain_channel()
-                .expect("dated nightly provenance"),
-            unicode_version: format!(
-                "{}.{}.{}",
-                char::UNICODE_VERSION.0,
-                char::UNICODE_VERSION.1,
-                char::UNICODE_VERSION.2
-            ),
-            unicode_normalization_version: locked_crate_version("unicode-normalization")
-                .expect("locked normalization version"),
-            unicode_normalization_table_version: unicode_normalization_table_version(),
-            query_generator_id: fixture.query_suite.manifest.generator_id.clone(),
-            query_generator_schema_version: fixture.query_suite.manifest.schema_version,
-            query_seed: fixture.query_suite.manifest.spec.seed,
-            query_source_identity_sha256: fixture
-                .query_suite
-                .manifest
-                .source_identity_sha256
-                .clone(),
-            query_profile_sha256: query_profile_sha256(
-                &fixture.query_suite.manifest,
-                &config.selection,
-                semantic_contract,
-            )
-            .expect("query profile hash"),
-            analyzer_contract_hash: semantic_contract.analyzer_contract_hash.clone(),
-            schema_contract_hash: semantic_contract.schema_contract_hash.clone(),
-            corpus_manifest_hash: fixture
-                .corpus_manifest
-                .manifest_hash()
-                .expect("corpus manifest hash"),
-            query_manifest_hash: fixture
-                .query_suite
-                .manifest
-                .manifest_hash()
-                .expect("query manifest hash"),
-            corpus_seed: Some(0x6200),
-        }
+        CampaignProvenance::collect(
+            &fixture.corpus_manifest,
+            &fixture.query_suite.manifest,
+            &config.selection,
+            semantic_contract,
+        )
+        .expect("collect fixture provenance from the exact test producer")
+    }
+
+    fn bind_descriptor_to_compiled_producer(mut descriptor: EngineDescriptor) -> EngineDescriptor {
+        let producer = GauntletProducerBuildIdentity::compiled().expect("compiled producer");
+        descriptor.source_revision = producer.source_git_revision;
+        descriptor.source_dirty = producer.source_git_dirty;
+        descriptor
     }
 
     #[test]
@@ -7793,6 +8283,153 @@ mod tests {
     }
 
     #[test]
+    fn campaign_case_reason_has_one_exhaustive_disposition_and_strict_wire_contract() {
+        let reasons = vec![
+            CampaignCaseReason::ComparatorUnclassified,
+            CampaignCaseReason::MissingDivergenceRegistration,
+            CampaignCaseReason::ExpectedDivergenceNotRegistered {
+                divergence_id: "DIV-001".to_owned(),
+            },
+            CampaignCaseReason::ExpectedDivergenceMismatch {
+                divergence_id: "DIV-002".to_owned(),
+            },
+            CampaignCaseReason::LexicalContractMismatch,
+            CampaignCaseReason::ObservationDocumentCountDrift,
+            CampaignCaseReason::ComparisonFailed,
+            CampaignCaseReason::MismatchBudgetExceeded,
+            CampaignCaseReason::LexicalMismatchBudgetExceeded,
+            CampaignCaseReason::LexicalSummaryFailed,
+            CampaignCaseReason::ArtifactValidationFailed,
+            CampaignCaseReason::ArtifactPrepareFailed,
+            CampaignCaseReason::ArtifactPersistFailed,
+            CampaignCaseReason::LexicalContractObservationFailed,
+            CampaignCaseReason::BothEngineExecutionsFailed,
+            CampaignCaseReason::SubjectExecutionFailed,
+            CampaignCaseReason::OracleExecutionFailed,
+            CampaignCaseReason::MultipleObservationLanesFailed,
+            CampaignCaseReason::InvalidEngineErrorState,
+        ];
+
+        let mut unclassified = 0_usize;
+        let mut infrastructure = 0_usize;
+        for reason in &reasons {
+            match reason.disposition() {
+                CampaignDisposition::Unclassified => unclassified += 1,
+                CampaignDisposition::InfrastructureError => infrastructure += 1,
+                CampaignDisposition::Exact
+                | CampaignDisposition::AutoClassified
+                | CampaignDisposition::RegisterClassified => {
+                    panic!("failure reason mapped to a passing disposition: {reason:?}");
+                }
+            }
+
+            let encoded = serde_json::to_value(reason).expect("serialize case reason");
+            let decoded: CampaignCaseReason =
+                serde_json::from_value(encoded.clone()).expect("round-trip case reason");
+            assert_eq!(&decoded, reason);
+
+            let mut with_unknown = encoded;
+            with_unknown
+                .as_object_mut()
+                .expect("reason wire object")
+                .insert("future_unbound_field".to_owned(), serde_json::json!(true));
+            assert!(
+                serde_json::from_value::<CampaignCaseReason>(with_unknown).is_err(),
+                "every current reason variant must reject unknown payload fields: {reason:?}"
+            );
+        }
+        assert_eq!(unclassified, 5);
+        assert_eq!(infrastructure, 14);
+        assert_eq!(reasons.len(), unclassified + infrastructure);
+
+        for malformed in [
+            serde_json::json!({}),
+            serde_json::json!({"code": "future_reason"}),
+            serde_json::json!({"code": "expected_divergence_mismatch"}),
+            serde_json::json!({
+                "code": "expected_divergence_not_registered",
+                "divergence_id": 7
+            }),
+            serde_json::json!({
+                "code": "comparison_failed",
+                "divergence_id": "DIV-003"
+            }),
+        ] {
+            assert!(
+                serde_json::from_value::<CampaignCaseReason>(malformed).is_err(),
+                "unknown, missing, extra, and mistyped reason payloads must fail closed"
+            );
+        }
+    }
+
+    #[test]
+    fn campaign_tagged_variants_reject_unknown_fields_exhaustively() {
+        for selection in [
+            CampaignSelection::All,
+            CampaignSelection::DefaultSyntax,
+            CampaignSelection::CassSyntax,
+            CampaignSelection::CaseIds {
+                ids: vec!["query-1".to_owned(), "query-2".to_owned()],
+            },
+        ] {
+            assert_strict_tagged_round_trip(&selection);
+        }
+
+        for summary in [
+            CampaignLexicalCaseSummary::LegacyMissing,
+            CampaignLexicalCaseSummary::RankEnvelopeOnly,
+            CampaignLexicalCaseSummary::CoreLexicalV3Unavailable,
+            CampaignLexicalCaseSummary::CoreLexicalV3 {
+                status: LexicalComparisonStatus::Equivalent,
+                first_mismatch: None,
+                mismatch_count: 0,
+                waived_difference_count: 0,
+            },
+        ] {
+            assert_strict_tagged_round_trip(&summary);
+        }
+
+        for coverage in [
+            CampaignLexicalCoverageSummary::LegacyMissing,
+            CampaignLexicalCoverageSummary::RankEnvelopeOnly,
+            CampaignLexicalCoverageSummary::CoreLexicalV3 {
+                subject: Box::default(),
+                oracle: Box::default(),
+                admissible: true,
+            },
+        ] {
+            assert_strict_tagged_round_trip(&coverage);
+        }
+
+        assert!(
+            serde_json::from_str::<CampaignSelection>(r#"{"kind":"all","kind":"default_syntax"}"#,)
+                .is_err(),
+            "duplicate campaign-selection kind tags must fail closed"
+        );
+        assert!(
+            serde_json::from_str::<CampaignCaseReason>(
+                r#"{"code":"comparison_failed","code":"artifact_validation_failed"}"#,
+            )
+            .is_err(),
+            "duplicate campaign-reason code tags must fail closed"
+        );
+        assert!(
+            serde_json::from_str::<CampaignLexicalCaseSummary>(
+                r#"{"scope":"legacy_missing","scope":"rank_envelope_only"}"#,
+            )
+            .is_err(),
+            "duplicate case-summary scope tags must fail closed"
+        );
+        assert!(
+            serde_json::from_str::<CampaignLexicalCoverageSummary>(
+                r#"{"scope":"legacy_missing","scope":"rank_envelope_only"}"#,
+            )
+            .is_err(),
+            "duplicate coverage-summary scope tags must fail closed"
+        );
+    }
+
+    #[test]
     fn divergence_register_accepts_only_reviewed_semantic_taxonomy() {
         let entry = |class| DivergenceRegisterEntry {
             id: "DIV-999".to_owned(),
@@ -7827,6 +8464,30 @@ mod tests {
                 .validate()
                 .is_err(),
             "posting record semantics are fix-only and must never become an accepted wildcard"
+        );
+
+        let valid = entry(DivergenceClass::SnippetWindow);
+        let mut unknown_entry = serde_json::to_value(&valid).expect("serialize register entry");
+        unknown_entry
+            .as_object_mut()
+            .expect("register entry object")
+            .insert("future_unbound_field".to_owned(), serde_json::json!(true));
+        assert!(
+            serde_json::from_value::<DivergenceRegisterEntry>(unknown_entry).is_err(),
+            "registry entries must reject unknown fields",
+        );
+
+        let registry = DivergenceRegistry::new(vec![valid]).expect("strict registry fixture");
+        let mut unknown_registry =
+            serde_json::to_value(&registry).expect("serialize divergence registry");
+        unknown_registry
+            .pointer_mut("/entries/0")
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("nested registry entry")
+            .insert("future_unbound_field".to_owned(), serde_json::json!(true));
+        assert!(
+            serde_json::from_value::<DivergenceRegistry>(unknown_registry).is_err(),
+            "registry decoder must reject unknown nested entry fields",
         );
     }
 
@@ -8583,15 +9244,17 @@ mod tests {
             deterministic_ingest: true,
             ..frankensearch_quill::QuillConfig::default()
         };
-        let mut subject = crate::engine::QuillSubject::in_memory(
+        let mut subject = crate::engine::QuillSubject::in_memory_with_source(
             config,
             "g1a-deterministic-regression-not-live-provenance",
             false,
         )
         .expect("fresh scalar Quill subject");
-        let mut oracle =
-            crate::engine::TantivyOracle::in_memory_scalar_g1a(&lexical_revision, false)
-                .expect("fresh scalar G1a Tantivy oracle");
+        let mut oracle = crate::engine::TantivyOracle::in_memory_scalar_g1a_with_source(
+            &lexical_revision,
+            false,
+        )
+        .expect("fresh scalar G1a Tantivy oracle");
         let campaign = DifferentialCampaignRunner::new(
             ArtifactStore::new(root),
             SemanticContract::scalar_g1a(),
@@ -9204,8 +9867,8 @@ mod tests {
                     .zip(expected_limits)
                 {
                     run.engines
-                        .validate_gauntlet_contract()
-                        .expect("UNION_HORIZON engine identity contract");
+                        .validate_stored_contract()
+                        .expect("UNION_HORIZON diagnostic engine identity contract");
                     assert_eq!(run.engines.comparison_mode, ComparisonMode::CrossEngine);
                     assert_eq!(
                         run.engines.semantic_contract.as_ref(),
@@ -9924,19 +10587,10 @@ mod tests {
         cx: &Cx,
         fixture: &Fixture,
     ) -> (crate::engine::QuillSubject, crate::engine::TantivyOracle) {
-        let build_identity = union_horizon_build_identity();
-        let oracle_dependency = union_horizon_oracle_dependency_identity();
-        let mut subject = crate::engine::QuillSubject::in_memory(
-            union_horizon_quill_config(),
-            build_identity.source_git_revision,
-            build_identity.source_git_dirty,
-        )
-        .expect("fresh tombstoned UNION_HORIZON Quill subject");
-        let mut oracle = crate::engine::TantivyOracle::in_memory_scalar_g1a(
-            &oracle_dependency.pinned_lexical_contract_revision,
-            false,
-        )
-        .expect("fresh tombstoned UNION_HORIZON Tantivy oracle");
+        let mut subject = crate::engine::QuillSubject::in_memory(union_horizon_quill_config())
+            .expect("fresh tombstoned UNION_HORIZON Quill subject");
+        let mut oracle = crate::engine::TantivyOracle::in_memory_scalar_g1a()
+            .expect("fresh tombstoned UNION_HORIZON Tantivy oracle");
         oracle
             .index()
             .oracle_disable_auto_merge(cx)
@@ -10827,18 +11481,14 @@ mod tests {
         let build_identity = union_horizon_validated_build_identity();
         let oracle_dependency = union_horizon_oracle_dependency_identity();
         let config = union_horizon_quill_config();
-        let mut subject = crate::engine::QuillSubject::in_memory(
-            config,
-            build_identity.source_git_revision.clone(),
-            build_identity.source_git_dirty,
-        )
-        .expect("fresh UNION_HORIZON Quill subject");
+        let mut subject = crate::engine::QuillSubject::in_memory(config)
+            .expect("fresh UNION_HORIZON Quill subject");
         assert_eq!(
             subject.config().tier_fanout,
             9,
             "UNION_HORIZON eight-leaf fixture must not trigger the default eight-way merge",
         );
-        let mut oracle = crate::engine::TantivyOracle::in_memory_scalar_g1a(
+        let mut oracle = crate::engine::TantivyOracle::in_memory_scalar_g1a_with_source(
             &oracle_dependency.pinned_lexical_contract_revision,
             false,
         )
@@ -11662,7 +12312,7 @@ mod tests {
         };
 
         asupersync::test_utils::run_test_with_cx(|cx| async move {
-            let mut before_begin = crate::engine::QuillSubject::in_memory(
+            let mut before_begin = crate::engine::QuillSubject::in_memory_with_source(
                 deterministic_config.clone(),
                 "lifecycle-before-begin",
                 false,
@@ -11680,7 +12330,7 @@ mod tests {
                 GauntletError::InvalidCampaign { .. }
             ));
 
-            let mut before_commit = crate::engine::QuillSubject::in_memory(
+            let mut before_commit = crate::engine::QuillSubject::in_memory_with_source(
                 deterministic_config.clone(),
                 "lifecycle-before-commit",
                 false,
@@ -11707,7 +12357,7 @@ mod tests {
                 GauntletError::InvalidCampaign { .. }
             ));
 
-            let mut after_commit = crate::engine::QuillSubject::in_memory(
+            let mut after_commit = crate::engine::QuillSubject::in_memory_with_source(
                 deterministic_config,
                 "lifecycle-after-commit",
                 false,
@@ -11808,7 +12458,7 @@ mod tests {
     }
 
     #[test]
-    fn production_campaign_missing_provenance_fails_before_ingest() {
+    fn custom_campaign_cannot_request_production_provenance() {
         let fixture = make_fixture();
         let mut subject = ScriptedEngine::new(subject_descriptor(), BTreeMap::new());
         let mut oracle = ScriptedEngine::new(oracle_descriptor(), BTreeMap::new());
@@ -11837,9 +12487,9 @@ mod tests {
                     &fixture.query_suite,
                 )
                 .await
-                .expect_err("production provenance is mandatory");
+                .expect_err("custom adapters cannot mint production evidence");
             assert!(
-                error.to_string().contains("missing required provenance"),
+                error.to_string().contains("diagnostic-only"),
                 "unexpected fail-closed reason: {error}"
             );
             assert_eq!(subject.index_calls.load(Ordering::Relaxed), 0);
@@ -11848,27 +12498,611 @@ mod tests {
     }
 
     #[test]
+    fn admission_tuple_mismatches_fail_before_replay_ingest_or_persistence() {
+        let diagnostic_fixture = make_fixture();
+        let diagnostic_config = CampaignConfig {
+            selection: CampaignSelection::DefaultSyntax,
+            ..CampaignConfig::default()
+        };
+        let diagnostic_provenance = fixture_provenance(
+            &diagnostic_fixture,
+            &diagnostic_config,
+            &semantic_contract(),
+        );
+        let diagnostic_root = tempfile::tempdir().expect("diagnostic tempdir");
+        let diagnostic_replay = DriftingReplay {
+            calls: AtomicUsize::new(0),
+            first: diagnostic_fixture.documents.clone(),
+            second: diagnostic_fixture.documents.clone(),
+        };
+        let mut diagnostic_subject = ScriptedEngine::new(subject_descriptor(), BTreeMap::new());
+        let mut diagnostic_oracle = ScriptedEngine::new(oracle_descriptor(), BTreeMap::new());
+        let diagnostic_campaign = DifferentialCampaignRunner::new(
+            ArtifactStore::new(diagnostic_root.path()),
+            semantic_contract(),
+            diagnostic_config,
+            DivergenceRegistry::default(),
+        )
+        .expect("diagnostic runner")
+        .with_provenance(diagnostic_provenance);
+
+        let built_in_fixture = make_fixture();
+        let built_in_root = tempfile::tempdir().expect("built-in tempdir");
+        let built_in_replay = DriftingReplay {
+            calls: AtomicUsize::new(0),
+            first: built_in_fixture.documents.clone(),
+            second: built_in_fixture.documents.clone(),
+        };
+        let mut built_in_subject = ScriptedEngine::new(subject_descriptor(), BTreeMap::new());
+        let mut built_in_oracle = ScriptedEngine::new(oracle_descriptor(), BTreeMap::new());
+        let built_in_campaign = DifferentialCampaignRunner::new(
+            ArtifactStore::new(built_in_root.path()),
+            semantic_contract(),
+            CampaignConfig {
+                selection: CampaignSelection::DefaultSyntax,
+                require_provenance: false,
+                ..CampaignConfig::default()
+            },
+            DivergenceRegistry::default(),
+        )
+        .expect("built-in runner with intentionally invalid policy tuple");
+
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let diagnostic_error = diagnostic_campaign
+                .run_replay(
+                    &cx,
+                    "diagnostic-with-production-provenance",
+                    &mut diagnostic_subject,
+                    &mut diagnostic_oracle,
+                    &diagnostic_replay,
+                    &diagnostic_fixture.corpus_manifest,
+                    &diagnostic_fixture.query_suite,
+                )
+                .await
+                .expect_err("diagnostic role must reject attached provenance at preflight");
+            assert!(diagnostic_error.to_string().contains("diagnostic-only"));
+            assert_eq!(diagnostic_replay.calls.load(Ordering::Relaxed), 0);
+            assert_eq!(diagnostic_subject.index_calls.load(Ordering::Relaxed), 0);
+            assert_eq!(diagnostic_oracle.index_calls.load(Ordering::Relaxed), 0);
+            assert!(!diagnostic_root.path().join("campaigns").exists());
+
+            let built_in_error = built_in_campaign
+                .run_replay_internal(
+                    &cx,
+                    "built-in-without-production-policy",
+                    &mut built_in_subject,
+                    &mut built_in_oracle,
+                    &built_in_replay,
+                    &built_in_fixture.corpus_manifest,
+                    &built_in_fixture.query_suite,
+                    CampaignAdmission::BuiltInEvidence(BuiltInEngineProfileReceipt::new(
+                        BuiltInEngineProfile::ScalarShipping,
+                        &frankensearch_quill::QuillConfig::default(),
+                    )),
+                )
+                .await
+                .expect_err("built-in role must reject a disabled provenance policy at preflight");
+            assert!(
+                built_in_error
+                    .to_string()
+                    .contains("requires provenance policy")
+            );
+            assert_eq!(built_in_replay.calls.load(Ordering::Relaxed), 0);
+            assert_eq!(built_in_subject.index_calls.load(Ordering::Relaxed), 0);
+            assert_eq!(built_in_oracle.index_calls.load(Ordering::Relaxed), 0);
+            assert!(!built_in_root.path().join("campaigns").exists());
+        });
+    }
+
+    #[cfg(feature = "tantivy-oracle")]
+    #[test]
+    fn semantic_profile_and_dependency_substitutions_fail_before_replay_or_persistence() {
+        let semantic_fixture = make_fixture();
+        let semantic_root = tempfile::tempdir().expect("semantic tempdir");
+        let semantic_replay = DriftingReplay {
+            calls: AtomicUsize::new(0),
+            first: semantic_fixture.documents.clone(),
+            second: semantic_fixture.documents.clone(),
+        };
+        let mut semantic_subject = ScriptedEngine::new(subject_descriptor(), BTreeMap::new())
+            .with_semantic_contract(SemanticContract::scalar_g1a());
+        let mut semantic_oracle = ScriptedEngine::new(oracle_descriptor(), BTreeMap::new());
+        let semantic_campaign = runner(
+            semantic_root.path(),
+            CampaignSelection::DefaultSyntax,
+            DivergenceRegistry::default(),
+        );
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let error = semantic_campaign
+                .run_replay(
+                    &cx,
+                    "semantic-substitution",
+                    &mut semantic_subject,
+                    &mut semantic_oracle,
+                    &semantic_replay,
+                    &semantic_fixture.corpus_manifest,
+                    &semantic_fixture.query_suite,
+                )
+                .await
+                .expect_err("split semantic contracts must fail during admission");
+            assert!(error.to_string().contains("semantic contracts"));
+            assert_eq!(semantic_replay.calls.load(Ordering::Relaxed), 0);
+            assert_eq!(semantic_subject.index_calls.load(Ordering::Relaxed), 0);
+            assert_eq!(semantic_oracle.index_calls.load(Ordering::Relaxed), 0);
+            assert!(!semantic_root.path().join("campaigns").exists());
+        });
+
+        let profile_fixture = make_fixture();
+        let profile_semantics = SemanticContract::shipping_default();
+        let profile_config = CampaignConfig {
+            selection: CampaignSelection::DefaultSyntax,
+            contract_mode: CampaignContractMode::CoreLexicalV3,
+            require_provenance: true,
+            ..CampaignConfig::default()
+        };
+        let profile_provenance =
+            fixture_provenance(&profile_fixture, &profile_config, &profile_semantics);
+        let producer = GauntletProducerBuildIdentity::compiled().expect("compiled producer");
+        let quill_config = frankensearch_quill::QuillConfig::default();
+        let profile_subject_descriptor = EngineDescriptor {
+            family: EngineFamily::Quill,
+            implementation: "frankensearch-quill/scalar-index".to_owned(),
+            crate_version: frankensearch_quill::FRANKENSEARCH_QUILL_CRATE_VERSION.to_owned(),
+            source_revision: producer.source_git_revision.clone(),
+            source_dirty: producer.source_git_dirty,
+            config_hash: crate::engine::quill_config_hash(&quill_config),
+        };
+        let oracle_version = oracle_version_contract().expect("oracle dependency contract");
+        let profile_oracle_descriptor = EngineDescriptor {
+            family: EngineFamily::Tantivy,
+            implementation: "frankensearch-lexical/tantivy-index".to_owned(),
+            crate_version: oracle_version.lexical_package_version.clone(),
+            source_revision: producer.source_git_revision.clone(),
+            source_dirty: producer.source_git_dirty,
+            config_hash: crate::engine::TANTIVY_ORACLE_CONFIG_HASH.to_owned(),
+        };
+        let profile_root = tempfile::tempdir().expect("profile tempdir");
+        let profile_replay = DriftingReplay {
+            calls: AtomicUsize::new(0),
+            first: profile_fixture.documents.clone(),
+            second: profile_fixture.documents.clone(),
+        };
+        let mut profile_subject = ScriptedEngine::new(profile_subject_descriptor, BTreeMap::new())
+            .with_semantic_contract(profile_semantics.clone());
+        let mut profile_oracle =
+            ScriptedEngine::new(profile_oracle_descriptor.clone(), BTreeMap::new())
+                .with_semantic_contract(profile_semantics.clone());
+        let profile_campaign = DifferentialCampaignRunner::new(
+            ArtifactStore::with_test_live_source_bypass(profile_root.path()),
+            profile_semantics.clone(),
+            profile_config,
+            DivergenceRegistry::default(),
+        )
+        .expect("profile substitution runner")
+        .with_provenance(profile_provenance);
+        let mut substituted_config = quill_config.clone();
+        substituted_config.deterministic_ingest = !substituted_config.deterministic_ingest;
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let error = profile_campaign
+                .run_replay_internal(
+                    &cx,
+                    "profile-substitution",
+                    &mut profile_subject,
+                    &mut profile_oracle,
+                    &profile_replay,
+                    &profile_fixture.corpus_manifest,
+                    &profile_fixture.query_suite,
+                    CampaignAdmission::BuiltInEvidence(BuiltInEngineProfileReceipt::new(
+                        BuiltInEngineProfile::ScalarShipping,
+                        &substituted_config,
+                    )),
+                )
+                .await
+                .expect_err("profile/config substitution must fail during admission");
+            assert!(error.to_string().contains("profile receipt"));
+            assert_eq!(profile_replay.calls.load(Ordering::Relaxed), 0);
+            assert_eq!(profile_subject.index_calls.load(Ordering::Relaxed), 0);
+            assert_eq!(profile_oracle.index_calls.load(Ordering::Relaxed), 0);
+            assert!(!profile_root.path().join("campaigns").exists());
+        });
+
+        let dependency_fixture = make_fixture();
+        let dependency_semantics = SemanticContract::shipping_default();
+        let dependency_config = CampaignConfig {
+            selection: CampaignSelection::DefaultSyntax,
+            contract_mode: CampaignContractMode::CoreLexicalV3,
+            require_provenance: true,
+            ..CampaignConfig::default()
+        };
+        let dependency_provenance = fixture_provenance(
+            &dependency_fixture,
+            &dependency_config,
+            &dependency_semantics,
+        );
+        let dependency_root = tempfile::tempdir().expect("dependency tempdir");
+        let dependency_replay = DriftingReplay {
+            calls: AtomicUsize::new(0),
+            first: dependency_fixture.documents.clone(),
+            second: dependency_fixture.documents.clone(),
+        };
+        let mut dependency_subject = ScriptedEngine::new(
+            EngineDescriptor {
+                family: EngineFamily::Quill,
+                implementation: "frankensearch-quill/scalar-index".to_owned(),
+                crate_version: frankensearch_quill::FRANKENSEARCH_QUILL_CRATE_VERSION.to_owned(),
+                source_revision: producer.source_git_revision.clone(),
+                source_dirty: producer.source_git_dirty,
+                config_hash: crate::engine::quill_config_hash(&quill_config),
+            },
+            BTreeMap::new(),
+        )
+        .with_semantic_contract(dependency_semantics.clone());
+        let mut wrong_oracle_descriptor = profile_oracle_descriptor;
+        wrong_oracle_descriptor
+            .crate_version
+            .push_str("-substituted");
+        let mut dependency_oracle = ScriptedEngine::new(wrong_oracle_descriptor, BTreeMap::new())
+            .with_semantic_contract(dependency_semantics.clone());
+        let dependency_campaign = DifferentialCampaignRunner::new(
+            ArtifactStore::with_test_live_source_bypass(dependency_root.path()),
+            dependency_semantics,
+            dependency_config,
+            DivergenceRegistry::default(),
+        )
+        .expect("dependency substitution runner")
+        .with_provenance(dependency_provenance);
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let error = dependency_campaign
+                .run_replay_internal(
+                    &cx,
+                    "dependency-substitution",
+                    &mut dependency_subject,
+                    &mut dependency_oracle,
+                    &dependency_replay,
+                    &dependency_fixture.corpus_manifest,
+                    &dependency_fixture.query_suite,
+                    CampaignAdmission::BuiltInEvidence(BuiltInEngineProfileReceipt::new(
+                        BuiltInEngineProfile::ScalarShipping,
+                        &quill_config,
+                    )),
+                )
+                .await
+                .expect_err("oracle dependency substitution must fail during admission");
+            assert!(error.to_string().contains("profile receipt"));
+            assert_eq!(dependency_replay.calls.load(Ordering::Relaxed), 0);
+            assert_eq!(dependency_subject.index_calls.load(Ordering::Relaxed), 0);
+            assert_eq!(dependency_oracle.index_calls.load(Ordering::Relaxed), 0);
+            assert!(!dependency_root.path().join("campaigns").exists());
+        });
+    }
+
+    #[cfg(feature = "tantivy-oracle")]
+    #[test]
+    fn built_in_all_infrastructure_report_binds_dependency_without_case_objects() {
+        let fixture = make_fixture();
+        let semantic_contract = SemanticContract::shipping_default();
+        let quill_config = frankensearch_quill::QuillConfig::default();
+        let producer = GauntletProducerBuildIdentity::compiled().expect("compiled producer");
+        let oracle_version = oracle_version_contract().expect("oracle dependency contract");
+        let subject_descriptor = EngineDescriptor {
+            family: EngineFamily::Quill,
+            implementation: "frankensearch-quill/scalar-index".to_owned(),
+            crate_version: frankensearch_quill::FRANKENSEARCH_QUILL_CRATE_VERSION.to_owned(),
+            source_revision: producer.source_git_revision.clone(),
+            source_dirty: producer.source_git_dirty,
+            config_hash: crate::engine::quill_config_hash(&quill_config),
+        };
+        let oracle_descriptor = EngineDescriptor {
+            family: EngineFamily::Tantivy,
+            implementation: "frankensearch-lexical/tantivy-index".to_owned(),
+            crate_version: oracle_version.lexical_package_version.clone(),
+            source_revision: producer.source_git_revision.clone(),
+            source_dirty: producer.source_git_dirty,
+            config_hash: crate::engine::TANTIVY_ORACLE_CONFIG_HASH.to_owned(),
+        };
+        let behaviors = fixture
+            .query_suite
+            .cases
+            .iter()
+            .map(|query| (query.id.clone(), ScriptedBehavior::Error))
+            .collect::<BTreeMap<_, _>>();
+        let mut subject = ScriptedEngine::new(subject_descriptor, behaviors.clone())
+            .with_semantic_contract(semantic_contract.clone());
+        let mut oracle = ScriptedEngine::new(oracle_descriptor, behaviors)
+            .with_semantic_contract(semantic_contract.clone());
+        let config = CampaignConfig {
+            selection: CampaignSelection::CaseIds {
+                ids: vec!["term".to_owned(), "counted".to_owned()],
+            },
+            contract_mode: CampaignContractMode::CoreLexicalV3,
+            require_provenance: true,
+            ..CampaignConfig::default()
+        };
+        let provenance = fixture_provenance(&fixture, &config, &semantic_contract);
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().join("gauntlet");
+        let campaign = DifferentialCampaignRunner::new(
+            ArtifactStore::with_test_live_source_bypass(&root),
+            semantic_contract,
+            config,
+            DivergenceRegistry::default(),
+        )
+        .expect("built-in all-infrastructure runner")
+        .with_provenance(provenance);
+
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let report = campaign
+                .run_replay_internal(
+                    &cx,
+                    "built-in-all-infrastructure",
+                    &mut subject,
+                    &mut oracle,
+                    &fixture.documents,
+                    &fixture.corpus_manifest,
+                    &fixture.query_suite,
+                    CampaignAdmission::BuiltInEvidence(BuiltInEngineProfileReceipt::new(
+                        BuiltInEngineProfile::ScalarShipping,
+                        &quill_config,
+                    )),
+                )
+                .await
+                .expect("failed built-in campaign remains durable evidence");
+            assert!(!report.passed);
+            assert_eq!(
+                report.execution_role,
+                ArtifactExecutionRole::BuiltInExecution
+            );
+            assert_eq!(
+                report
+                    .schema_trust_ceiling()
+                    .expect("current trust ceiling"),
+                ArtifactTrustCeiling::IntegrityOnly,
+                "a typed built-in execution remains integrity-only before F0 admission"
+            );
+            assert!(matches!(
+                report.oracle_dependency,
+                ArtifactOracleDependency::BuiltInTantivy { .. }
+            ));
+            assert!(report.cases.iter().all(|case| {
+                case.disposition == CampaignDisposition::InfrastructureError
+                    && case.artifact_hash.is_none()
+            }));
+            assert!(!root.join("objects").exists());
+            assert!(
+                !root
+                    .join("campaigns/built-in-all-infrastructure/cases")
+                    .exists()
+            );
+            let store = ArtifactStore::new(&root);
+            let loaded = store
+                .load_integrity_checked_campaign("built-in-all-infrastructure")
+                .expect("untouched no-object report reloads");
+            assert_eq!(loaded.report(), &report);
+            assert_eq!(
+                loaded
+                    .report()
+                    .canonical_bytes_unchecked()
+                    .expect("loaded canonical report"),
+                report
+                    .canonical_bytes_unchecked()
+                    .expect("original canonical report"),
+            );
+            assert!(
+                loaded
+                    .report()
+                    .cases
+                    .iter()
+                    .all(|case| case.diagnostic.is_none()),
+                "noncanonical backend diagnostics must not survive durable reload",
+            );
+
+            let campaign_path = root.join("campaigns/built-in-all-infrastructure");
+            let completion_files = std::fs::read_dir(&campaign_path)
+                .expect("completed campaign directory")
+                .map(|entry| entry.expect("campaign entry").file_name())
+                .filter(|name| name.to_string_lossy().starts_with("completion-"))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                completion_files.len(),
+                1,
+                "exactly one write-last completion receipt is required"
+            );
+            let completion_path = campaign_path.join(&completion_files[0]);
+            let completion_bytes =
+                std::fs::read(&completion_path).expect("stored completion receipt");
+            let report_path = campaign_path.join("report.json");
+            let reservation_path = campaign_path.join("reservation.json");
+            let original_report = std::fs::read(&report_path).expect("stored report");
+            let original_reservation =
+                std::fs::read(&reservation_path).expect("stored reservation");
+            let mut mutations = Vec::new();
+
+            let mut split_semantics = report.clone();
+            split_semantics.semantic_contract = SemanticContract::scalar_g1a();
+            mutations.push(("semantic contract", split_semantics));
+
+            let mut wrong_dependency = report.clone();
+            wrong_dependency.oracle_dependency = ArtifactOracleDependency::DiagnosticUnspecified;
+            mutations.push(("oracle dependency", wrong_dependency));
+
+            let mut profile_value = serde_json::to_value(&report).expect("report value");
+            profile_value["engines"]["built_in_profile"]["profile"] = serde_json::json!("cass");
+            let wrong_profile: CampaignReport =
+                serde_json::from_value(profile_value).expect("mutated profile report");
+            mutations.push(("engine profile", wrong_profile));
+
+            for (label, mutation) in mutations {
+                std::fs::write(
+                    &report_path,
+                    mutation
+                        .canonical_bytes_unchecked()
+                        .expect("tampered report bytes"),
+                )
+                .expect("write tampered report");
+                std::fs::write(
+                    &reservation_path,
+                    mutation
+                        .reservation_bytes_unchecked()
+                        .expect("tampered reservation bytes"),
+                )
+                .expect("write tampered reservation");
+                assert!(
+                    store
+                        .load_integrity_checked_campaign("built-in-all-infrastructure")
+                        .is_err(),
+                    "coherent {label} mutation must fail without relying on case objects"
+                );
+            }
+
+            std::fs::write(&report_path, original_report).expect("restore report");
+            std::fs::write(&reservation_path, original_reservation).expect("restore reservation");
+            store
+                .load_integrity_checked_campaign("built-in-all-infrastructure")
+                .expect("restored no-object report reloads");
+
+            let mut arbitrary_reason: serde_json::Value = serde_json::from_slice(
+                &std::fs::read(&report_path).expect("restored report bytes"),
+            )
+            .expect("decode report for hostile reason mutation");
+            arbitrary_reason["cases"][0]["reason"] =
+                serde_json::json!("arbitrary canonical replacement text");
+            std::fs::write(
+                &report_path,
+                serde_json::to_vec(&arbitrary_reason).expect("hostile reason report bytes"),
+            )
+            .expect("write hostile reason report");
+            assert!(
+                store
+                    .load_integrity_checked_campaign("built-in-all-infrastructure")
+                    .is_err(),
+                "free-form canonical reason replacement must not decode as report v7"
+            );
+            std::fs::write(
+                &report_path,
+                report
+                    .canonical_bytes_unchecked()
+                    .expect("restore canonical report bytes"),
+            )
+            .expect("restore report after hostile reason mutation");
+
+            let incomplete_root = temp.path().join("incomplete-copy");
+            let incomplete_campaign = incomplete_root
+                .join("campaigns")
+                .join("built-in-all-infrastructure");
+            std::fs::create_dir_all(&incomplete_campaign).expect("create incomplete campaign copy");
+            std::fs::write(
+                incomplete_campaign.join("report.json"),
+                report
+                    .canonical_bytes_unchecked()
+                    .expect("incomplete report bytes"),
+            )
+            .expect("write incomplete report");
+            std::fs::write(
+                incomplete_campaign.join("reservation.json"),
+                report
+                    .reservation_bytes_unchecked()
+                    .expect("incomplete reservation bytes"),
+            )
+            .expect("write incomplete reservation");
+            assert!(
+                ArtifactStore::new(&incomplete_root)
+                    .load_integrity_checked_campaign("built-in-all-infrastructure")
+                    .is_err(),
+                "report publication without the write-last completion receipt is incomplete"
+            );
+
+            let mut wrong_completion: serde_json::Value =
+                serde_json::from_slice(&completion_bytes).expect("decode completion receipt");
+            wrong_completion["report_identity_sha256"] = serde_json::json!("0".repeat(64));
+            std::fs::write(
+                &completion_path,
+                serde_json::to_vec(&wrong_completion).expect("hostile completion bytes"),
+            )
+            .expect("write hostile completion receipt");
+            assert!(
+                store
+                    .load_integrity_checked_campaign("built-in-all-infrastructure")
+                    .is_err(),
+                "completion receipt mutation must fail integrity-checked reload"
+            );
+            std::fs::write(&completion_path, completion_bytes).expect("restore completion receipt");
+            store
+                .load_integrity_checked_campaign("built-in-all-infrastructure")
+                .expect("fully restored completed campaign reloads");
+
+            std::fs::write(campaign_path.join("unexpected.json"), b"{}")
+                .expect("write unexpected top-level campaign entry");
+            assert!(
+                store
+                    .load_integrity_checked_campaign("built-in-all-infrastructure")
+                    .is_err(),
+                "unexpected top-level entries invalidate completed campaign closure"
+            );
+        });
+    }
+
+    #[cfg(feature = "tantivy-oracle")]
+    #[test]
+    fn typed_campaign_missing_provenance_fails_before_ingest() {
+        let fixture = make_fixture();
+        let mut subject =
+            crate::engine::QuillSubject::in_memory(frankensearch_quill::QuillConfig::default())
+                .expect("typed subject");
+        let mut oracle = crate::engine::TantivyOracle::in_memory().expect("typed oracle");
+        let temp = tempfile::tempdir().expect("tempdir");
+        let campaign = DifferentialCampaignRunner::new(
+            ArtifactStore::new(temp.path()),
+            semantic_contract(),
+            CampaignConfig {
+                selection: CampaignSelection::DefaultSyntax,
+                contract_mode: CampaignContractMode::CoreLexicalV3,
+                require_provenance: true,
+                ..CampaignConfig::default()
+            },
+            DivergenceRegistry::default(),
+        )
+        .expect("production campaign policy");
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let error = campaign
+                .run_quill_tantivy_evidence(
+                    &cx,
+                    "typed-missing-production-provenance",
+                    &mut subject,
+                    &mut oracle,
+                    &fixture.documents,
+                    &fixture.corpus_manifest,
+                    &fixture.query_suite,
+                )
+                .await
+                .expect_err("typed production evidence requires provenance");
+            assert!(
+                error.to_string().contains("missing required provenance"),
+                "unexpected fail-closed reason: {error}"
+            );
+            subject
+                .claim_fresh_campaign()
+                .expect("subject was not claimed before provenance rejection");
+            oracle
+                .claim_fresh_campaign()
+                .expect("oracle was not claimed before provenance rejection");
+        });
+    }
+
+    #[test]
     fn production_default_rank_envelope_is_rejected_before_ingest_with_valid_provenance() {
         let fixture = make_fixture();
         let semantic_contract = semantic_contract();
-        let subject_descriptor = EngineDescriptor {
-            source_revision: "1".repeat(40),
-            ..subject_descriptor()
-        };
-        let oracle_descriptor = oracle_descriptor();
+        let subject_descriptor = bind_descriptor_to_compiled_producer(subject_descriptor());
+        let oracle_descriptor = bind_descriptor_to_compiled_producer(oracle_descriptor());
         let config = CampaignConfig {
             selection: CampaignSelection::DefaultSyntax,
             contract_mode: CampaignContractMode::RankEnvelopeOnly,
             require_provenance: true,
             ..CampaignConfig::default()
         };
-        let provenance = fixture_provenance(
-            &fixture,
-            &config,
-            &semantic_contract,
-            &subject_descriptor,
-            &oracle_descriptor,
-        );
+        let provenance = fixture_provenance(&fixture, &config, &semantic_contract);
+        let producer_build_identity =
+            GauntletProducerBuildIdentity::compiled().expect("compiled producer");
         let mut engines = EnginePairIdentity::new(
             ComparisonMode::CrossEngine,
             subject_descriptor.clone(),
@@ -11879,7 +13113,8 @@ mod tests {
             .bind_semantic_contract(semantic_contract.clone())
             .expect("semantic contract");
         provenance
-            .validate_for_campaign(
+            .validate_for_creation(
+                &producer_build_identity,
                 &engines,
                 &semantic_contract,
                 &config,
@@ -11891,8 +13126,14 @@ mod tests {
         let mut subject = ScriptedEngine::new(subject_descriptor, BTreeMap::new());
         let mut oracle = ScriptedEngine::new(oracle_descriptor, BTreeMap::new());
         let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().to_path_buf();
+        let replay = DriftingReplay {
+            calls: AtomicUsize::new(0),
+            first: fixture.documents.clone(),
+            second: fixture.documents.clone(),
+        };
         let campaign = DifferentialCampaignRunner::new(
-            ArtifactStore::new(temp.path()),
+            ArtifactStore::with_test_live_source_bypass(&root),
             semantic_contract,
             config,
             DivergenceRegistry::default(),
@@ -11901,14 +13142,18 @@ mod tests {
         .with_provenance(provenance);
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             let error = campaign
-                .run(
+                .run_replay_internal(
                     &cx,
                     "default-rank-envelope-is-not-replacement-evidence",
                     &mut subject,
                     &mut oracle,
-                    &fixture.documents,
+                    &replay,
                     &fixture.corpus_manifest,
                     &fixture.query_suite,
+                    CampaignAdmission::BuiltInEvidence(BuiltInEngineProfileReceipt::new(
+                        BuiltInEngineProfile::ScalarShipping,
+                        &frankensearch_quill::QuillConfig::default(),
+                    )),
                 )
                 .await
                 .expect_err("default production evidence requires core lexical v3");
@@ -11918,59 +13163,28 @@ mod tests {
                     .contains("require core lexical v3 evidence"),
                 "unexpected fail-closed reason: {error}"
             );
+            assert_eq!(replay.calls.load(Ordering::Relaxed), 0);
             assert_eq!(subject.index_calls.load(Ordering::Relaxed), 0);
             assert_eq!(oracle.index_calls.load(Ordering::Relaxed), 0);
+            assert!(!root.join("campaigns").exists());
         });
     }
 
+    #[cfg(feature = "tantivy-oracle")]
     #[test]
     fn production_cass_rank_envelope_remains_admissible_with_valid_provenance() {
-        let fixture = make_fixture();
+        let fixture = make_cass_activation_fixture();
         let semantic_contract = SemanticContract::cass();
-        let subject_descriptor = EngineDescriptor {
-            source_revision: "1".repeat(40),
-            ..subject_descriptor()
-        };
-        let oracle_descriptor = EngineDescriptor {
-            config_hash: crate::engine::CASS_TANTIVY_ORACLE_CONFIG_HASH.to_owned(),
-            ..oracle_descriptor()
-        };
         let config = CampaignConfig {
             selection: CampaignSelection::CassSyntax,
             contract_mode: CampaignContractMode::RankEnvelopeOnly,
             require_provenance: true,
             index_batch_size: 5,
+            snippet_max_chars: None,
             ..CampaignConfig::default()
         };
-        let provenance = fixture_provenance(
-            &fixture,
-            &config,
-            &semantic_contract,
-            &subject_descriptor,
-            &oracle_descriptor,
-        );
-        let mut engines = EnginePairIdentity::new(
-            ComparisonMode::CrossEngine,
-            subject_descriptor.clone(),
-            oracle_descriptor.clone(),
-        )
-        .expect("distinct CASS engines");
-        engines
-            .bind_semantic_contract(semantic_contract.clone())
-            .expect("CASS semantic contract");
-        provenance
-            .validate_for_campaign(
-                &engines,
-                &semantic_contract,
-                &config,
-                &fixture.corpus_manifest,
-                &fixture.query_suite.manifest,
-            )
-            .expect("the CASS positive control must carry valid provenance");
-        let mut subject = ScriptedEngine::new(subject_descriptor, BTreeMap::new())
-            .with_semantic_contract(semantic_contract.clone());
-        let mut oracle = ScriptedEngine::new(oracle_descriptor, BTreeMap::new())
-            .with_semantic_contract(semantic_contract.clone());
+        let provenance = fixture_provenance(&fixture, &config, &semantic_contract);
+        let (mut subject, mut oracle) = live_cass_campaign_engines();
         let temp = tempfile::tempdir().expect("tempdir");
         let campaign = DifferentialCampaignRunner::new(
             ArtifactStore::new(temp.path()),
@@ -11982,7 +13196,7 @@ mod tests {
         .with_provenance(provenance);
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             let report = campaign
-                .run(
+                .run_cass_quill_tantivy_evidence(
                     &cx,
                     "cass-rank-envelope-remains-supported",
                     &mut subject,
@@ -11998,8 +13212,15 @@ mod tests {
             assert!(report.cases.iter().all(|case| {
                 case.lexical_contract == CampaignLexicalCaseSummary::RankEnvelopeOnly
             }));
-            assert!(subject.index_calls.load(Ordering::Relaxed) > 0);
-            assert!(oracle.index_calls.load(Ordering::Relaxed) > 0);
+            assert!(report.engines.has_builtin_profile());
+            assert_eq!(
+                report.engines.subject.implementation,
+                "frankensearch-quill/cass-index"
+            );
+            assert_eq!(
+                report.engines.oracle.config_hash,
+                crate::engine::CASS_TANTIVY_ORACLE_CONFIG_HASH
+            );
         });
     }
 
@@ -12012,65 +13233,19 @@ mod tests {
             require_provenance: true,
             ..CampaignConfig::default()
         };
-        let subject_revision = "1".repeat(40);
-        let subject = EngineDescriptor {
-            source_revision: subject_revision.clone(),
-            ..subject_descriptor()
-        };
-        let oracle = oracle_descriptor();
-        let mut engines =
-            EnginePairIdentity::new(ComparisonMode::CrossEngine, subject, oracle.clone())
-                .expect("engine identity");
+        let producer_build_identity =
+            GauntletProducerBuildIdentity::compiled().expect("compiled producer");
+        let subject = bind_descriptor_to_compiled_producer(subject_descriptor());
+        let oracle = bind_descriptor_to_compiled_producer(oracle_descriptor());
+        let mut engines = EnginePairIdentity::new(ComparisonMode::CrossEngine, subject, oracle)
+            .expect("engine identity");
         engines
             .bind_semantic_contract(semantic_contract.clone())
             .expect("semantic contract");
-        let provenance = CampaignProvenance {
-            subject_git_revision: subject_revision,
-            subject_source_dirty: false,
-            oracle_git_revision: oracle.source_revision,
-            oracle_source_dirty: oracle.source_dirty,
-            cargo_lock_sha256: hash_workspace_lockfile().expect("Cargo.lock hash"),
-            rustc_version_verbose: collect_rustc_verbose().expect("rustc provenance"),
-            rust_toolchain_channel: collect_dated_toolchain_channel()
-                .expect("dated nightly provenance"),
-            unicode_version: format!(
-                "{}.{}.{}",
-                char::UNICODE_VERSION.0,
-                char::UNICODE_VERSION.1,
-                char::UNICODE_VERSION.2
-            ),
-            unicode_normalization_version: locked_crate_version("unicode-normalization")
-                .expect("locked normalization version"),
-            unicode_normalization_table_version: unicode_normalization_table_version(),
-            query_generator_id: fixture.query_suite.manifest.generator_id.clone(),
-            query_generator_schema_version: fixture.query_suite.manifest.schema_version,
-            query_seed: fixture.query_suite.manifest.spec.seed,
-            query_source_identity_sha256: fixture
-                .query_suite
-                .manifest
-                .source_identity_sha256
-                .clone(),
-            query_profile_sha256: query_profile_sha256(
-                &fixture.query_suite.manifest,
-                &config.selection,
-                &semantic_contract,
-            )
-            .expect("query profile hash"),
-            analyzer_contract_hash: semantic_contract.analyzer_contract_hash.clone(),
-            schema_contract_hash: semantic_contract.schema_contract_hash.clone(),
-            corpus_manifest_hash: fixture
-                .corpus_manifest
-                .manifest_hash()
-                .expect("corpus manifest hash"),
-            query_manifest_hash: fixture
-                .query_suite
-                .manifest
-                .manifest_hash()
-                .expect("query manifest hash"),
-            corpus_seed: Some(0x6200),
-        };
+        let provenance = fixture_provenance(&fixture, &config, &semantic_contract);
         provenance
-            .validate_for_campaign(
+            .validate_for_creation(
+                &producer_build_identity,
                 &engines,
                 &semantic_contract,
                 &config,
@@ -12081,10 +13256,7 @@ mod tests {
 
         let serialized = serde_json::to_value(&provenance).expect("serialize provenance");
         for field in [
-            "subject_git_revision",
-            "subject_source_dirty",
-            "oracle_git_revision",
-            "oracle_source_dirty",
+            "producer_build_identity_sha256",
             "cargo_lock_sha256",
             "rustc_version_verbose",
             "rust_toolchain_channel",
@@ -12114,18 +13286,9 @@ mod tests {
         }
 
         type CorruptProvenance = fn(&mut CampaignProvenance);
-        let corruptions: [(&str, CorruptProvenance); 20] = [
-            ("subject_git_revision", |value| {
-                value.subject_git_revision = "2".repeat(40);
-            }),
-            ("subject_source_dirty", |value| {
-                value.subject_source_dirty = !value.subject_source_dirty;
-            }),
-            ("oracle_git_revision", |value| {
-                value.oracle_git_revision = "3".repeat(40);
-            }),
-            ("oracle_source_dirty", |value| {
-                value.oracle_source_dirty = !value.oracle_source_dirty;
+        let corruptions: [(&str, CorruptProvenance); 17] = [
+            ("producer_build_identity_sha256", |value| {
+                value.producer_build_identity_sha256 = "0".repeat(64);
             }),
             ("cargo_lock_sha256", |value| {
                 value.cargo_lock_sha256 = "0".repeat(64);
@@ -12182,7 +13345,8 @@ mod tests {
             corrupt(&mut mismatched);
             assert!(
                 mismatched
-                    .validate_for_campaign(
+                    .validate_for_creation(
+                        &producer_build_identity,
                         &engines,
                         &semantic_contract,
                         &config,
@@ -12542,6 +13706,11 @@ mod tests {
                 .await
                 .expect("campaign report");
             assert!(report.passed);
+            assert_eq!(report.execution_role, ArtifactExecutionRole::Diagnostic);
+            assert_eq!(
+                report.oracle_dependency,
+                ArtifactOracleDependency::DiagnosticUnspecified
+            );
             assert_eq!(report.selected_query_count, 3);
             assert_eq!(report.cases.len(), 3);
             assert_eq!(
@@ -12596,13 +13765,38 @@ mod tests {
             let replayed: CampaignReport =
                 serde_json::from_slice(&canonical).expect("report round-trip");
             assert_eq!(replayed, report);
-            let verified = ArtifactStore::new(&root)
-                .load_verified_campaign("rich-fast")
+            let reservation_path = root.join("campaigns/rich-fast/reservation.json");
+            let reservation_bytes = std::fs::read(&reservation_path).expect("stored reservation");
+            let reservation_value: serde_json::Value =
+                serde_json::from_slice(&reservation_bytes).expect("decode reservation");
+            assert_eq!(reservation_value["trust_ceiling"], "integrity_only");
+            assert_eq!(reservation_value["execution_role"], "diagnostic");
+            assert_eq!(
+                reservation_value["oracle_dependency"]["kind"],
+                "diagnostic_unspecified"
+            );
+            let integrity_checked = ArtifactStore::new(&root)
+                .load_integrity_checked_campaign("rich-fast")
                 .expect("evidence-backed campaign replay");
-            assert_eq!(verified, report);
+            assert_eq!(integrity_checked.report(), &report);
             ArtifactStore::new(&root)
                 .complete_campaign(&replayed)
                 .expect("idempotent campaign completion");
+            let mut changed_reservation = reservation_value.clone();
+            changed_reservation["execution_role"] = serde_json::json!("built_in_execution");
+            std::fs::write(
+                &reservation_path,
+                serde_json::to_vec(&changed_reservation).expect("changed reservation"),
+            )
+            .expect("write changed reservation");
+            assert!(
+                ArtifactStore::new(&root)
+                    .load_integrity_checked_campaign("rich-fast")
+                    .is_err(),
+                "reservation role changes must invalidate integrity-checked replay"
+            );
+            std::fs::write(&reservation_path, &reservation_bytes)
+                .expect("restore reservation bytes");
             let mut with_diagnostic = report.clone();
             with_diagnostic.cases[0].diagnostic = Some("/tmp/host-specific error".to_owned());
             assert_eq!(
@@ -12613,25 +13807,143 @@ mod tests {
             let mut wrong_pass = report.clone();
             wrong_pass.passed = false;
             assert!(wrong_pass.canonical_bytes().is_err());
+            let mut split_semantics = report.clone();
+            split_semantics.engines.semantic_contract = Some(SemanticContract::scalar_g1a());
+            assert!(
+                split_semantics.validate_contract().is_err(),
+                "report and engine-pair semantic contracts must remain identical"
+            );
             let mut wrong_count = report.clone();
             wrong_count.selected_query_count += 1;
             assert!(wrong_count.canonical_bytes().is_err());
             let mut wrong_summary = report.clone();
             wrong_summary.query_classes[0].total += 1;
             assert!(wrong_summary.canonical_bytes().is_err());
-            for legacy_version in [3, 4] {
+            for legacy_version in 1..=6 {
                 let mut legacy = report.clone();
                 legacy.schema_version = legacy_version;
                 let error = legacy
                     .validate_contract()
-                    .expect_err("pre-v5 report must require a campaign rerun");
-                assert!(matches!(
-                    error,
-                    GauntletError::InvalidCampaign { ref reason }
-                        if reason.contains("legacy campaign report")
-                            && reason.contains("non-admissible")
-                            && reason.contains("rerun")
-                ));
+                    .expect_err("pre-v7 report must require a campaign rerun");
+                let GauntletError::InvalidCampaign { reason } = error else {
+                    panic!("historical report must fail as an explicit campaign contract");
+                };
+                match legacy_version {
+                    1 | 2 | 3 | 5 => {
+                        assert!(reason.contains("unauthenticated legacy"));
+                        assert!(reason.contains("non-admissible"));
+                    }
+                    4 => assert!(reason.contains("reserved pre-policy")),
+                    6 => assert!(reason.contains("integrity only")),
+                    _ => unreachable!(),
+                }
+                assert!(reason.contains("rerun"));
+            }
+            let mut missing_role = report.clone();
+            missing_role.execution_role = ArtifactExecutionRole::LegacyMissing;
+            assert!(
+                missing_role.validate_contract().is_err(),
+                "v7 reports must fail closed when the durable role is absent"
+            );
+            let mut promoted_diagnostic = report.clone();
+            promoted_diagnostic.execution_role = ArtifactExecutionRole::BuiltInExecution;
+            assert!(
+                promoted_diagnostic.validate_contract().is_err(),
+                "changing only the report role cannot promote diagnostic artifacts"
+            );
+            let mut diagnostic_with_provenance = report.clone();
+            diagnostic_with_provenance.provenance = Some(fixture_provenance(
+                &fixture,
+                &report.config,
+                &report.semantic_contract,
+            ));
+            assert!(
+                diagnostic_with_provenance.validate_contract().is_err(),
+                "diagnostics cannot borrow a production provenance envelope"
+            );
+            let mut archived_producer = report.clone();
+            let replacement = if archived_producer
+                .producer_build_identity
+                .executable_sha256
+                .starts_with('0')
+            {
+                "1"
+            } else {
+                "0"
+            };
+            archived_producer
+                .producer_build_identity
+                .executable_sha256
+                .replace_range(0..1, replacement);
+            archived_producer
+                .validate_contract()
+                .expect("stored diagnostic validation must not consult the current executable");
+            assert!(
+                archived_producer.validate_creation_environment().is_err(),
+                "new campaign completion must remain bound to the executing producer"
+            );
+            let mut report_with_unknown = serde_json::to_value(&report).expect("report value");
+            report_with_unknown
+                .as_object_mut()
+                .expect("report object")
+                .insert("future_unbound_field".to_owned(), serde_json::json!(true));
+            assert!(
+                serde_json::from_value::<CampaignReport>(report_with_unknown).is_err(),
+                "unknown v7 report fields must fail closed instead of escaping the hash contract"
+            );
+            for path in [
+                "/config",
+                "/config/comparator_config",
+                "/config/selection",
+                "/semantic_contract",
+                "/producer_build_identity",
+                "/oracle_dependency",
+                "/engines",
+                "/engines/subject",
+                "/engines/oracle",
+                "/engines/semantic_contract",
+                "/divergence_registry",
+                "/corpus_manifest",
+                "/corpus_manifest/source",
+                "/corpus_manifest/source/spec",
+                "/query_suite",
+                "/query_suite/manifest",
+                "/query_suite/manifest/spec",
+                "/query_suite/cases/0",
+                "/query_suite/cases/0/query_kind",
+                "/query_suite/cases/0/filters",
+                "/query_suite/cases/0/filters/source_filter",
+                "/subject_index",
+                "/oracle_index",
+                "/cases/0",
+                "/query_classes/0",
+                "/mismatches/0",
+                "/mismatches/0/divergence",
+                "/lexical_coverage",
+            ] {
+                let mut nested_unknown = serde_json::to_value(&report).expect("report value");
+                nested_unknown
+                    .pointer_mut(path)
+                    .and_then(serde_json::Value::as_object_mut)
+                    .expect("nested report object")
+                    .insert("future_unbound_field".to_owned(), serde_json::json!(true));
+                assert!(
+                    serde_json::from_value::<CampaignReport>(nested_unknown).is_err(),
+                    "unknown field at {path} must fail closed"
+                );
+            }
+            for missing_field in ["trust_ceiling", "execution_role", "oracle_dependency"] {
+                let mut missing = serde_json::to_value(&report).expect("report value");
+                missing
+                    .as_object_mut()
+                    .expect("report object")
+                    .remove(missing_field);
+                let decoded: CampaignReport =
+                    serde_json::from_value(missing).expect("legacy default decodes");
+                assert!(
+                    decoded.validate_contract().is_err(),
+                    "missing {missing_field} must never validate as v7"
+                );
             }
             let mut changed_query = report.clone();
             changed_query.query_suite.cases[0]
@@ -14572,8 +15884,8 @@ mod tests {
                 CampaignDisposition::InfrastructureError
             );
             assert_eq!(
-                report.cases[0].reason.as_deref(),
-                Some("observation_document_count_drift")
+                report.cases[0].reason,
+                Some(CampaignCaseReason::ObservationDocumentCountDrift)
             );
             assert!(report.cases[0].artifact_hash.is_none());
             let report_path = root.join("campaigns/asymmetric-doc-count/report.json");
@@ -14587,8 +15899,8 @@ mod tests {
                 CampaignDisposition::InfrastructureError
             );
             assert_eq!(
-                stored.cases[0].reason.as_deref(),
-                Some("observation_document_count_drift")
+                stored.cases[0].reason,
+                Some(CampaignCaseReason::ObservationDocumentCountDrift)
             );
         });
 
@@ -14619,8 +15931,8 @@ mod tests {
                 CampaignDisposition::InfrastructureError
             );
             assert_eq!(
-                report.cases[0].reason.as_deref(),
-                Some("observation_document_count_drift")
+                report.cases[0].reason,
+                Some(CampaignCaseReason::ObservationDocumentCountDrift)
             );
             assert!(report.cases[0].artifact_hash.is_none());
         });
@@ -14674,8 +15986,9 @@ mod tests {
         evidence_case.offset = query.offset;
         evidence_case.count_requested = query.count_requested;
         asupersync::test_utils::run_test_with_cx(|cx| async move {
-            let mut before_begin = crate::TantivyOracle::in_memory(&lexical_revision, false)
-                .expect("oracle before begin");
+            let mut before_begin =
+                crate::TantivyOracle::in_memory_with_source(&lexical_revision, false)
+                    .expect("oracle before begin");
             assert!(matches!(
                 before_begin.index_batch(&cx, &fixture.documents[..1]).await,
                 Err(GauntletError::InvalidCampaign { .. })
@@ -14693,8 +16006,9 @@ mod tests {
                 Err(GauntletError::InvalidCampaign { .. })
             ));
 
-            let mut before_commit = crate::TantivyOracle::in_memory(&lexical_revision, false)
-                .expect("oracle before commit");
+            let mut before_commit =
+                crate::TantivyOracle::in_memory_with_source(&lexical_revision, false)
+                    .expect("oracle before commit");
             before_commit
                 .begin_corpus(&cx, &fixture.corpus_manifest, &contract)
                 .await
@@ -14726,7 +16040,7 @@ mod tests {
                 Err(GauntletError::InvalidCampaign { .. })
             ));
 
-            let mut oracle = crate::TantivyOracle::in_memory(&lexical_revision, false)
+            let mut oracle = crate::TantivyOracle::in_memory_with_source(&lexical_revision, false)
                 .expect("committed in-memory oracle");
             oracle
                 .begin_corpus(&cx, &fixture.corpus_manifest, &contract)
@@ -14773,8 +16087,8 @@ mod tests {
             .lexical_contract_audit_revision;
         let contract = SemanticContract::shipping_default();
         asupersync::test_utils::run_test_with_cx(|cx| async move {
-            let mut oracle =
-                crate::TantivyOracle::in_memory(&lexical_revision, false).expect("fresh oracle");
+            let mut oracle = crate::TantivyOracle::in_memory_with_source(&lexical_revision, false)
+                .expect("fresh oracle");
             oracle
                 .index_documents(
                     &cx,
@@ -15395,31 +16709,20 @@ mod tests {
     // ==== Live oracle campaign activation (bd-quill-e6-gauntlet-scale-rm3q.9) ====
 
     #[cfg(feature = "tantivy-oracle")]
-    fn live_campaign_engines(
-        provenance: &CampaignProvenance,
-    ) -> (crate::engine::QuillSubject, crate::engine::TantivyOracle) {
+    fn live_campaign_engines() -> (crate::engine::QuillSubject, crate::engine::TantivyOracle) {
         let config = frankensearch_quill::QuillConfig {
             deterministic_ingest: true,
             ..frankensearch_quill::QuillConfig::default()
         };
-        let subject = crate::engine::QuillSubject::in_memory(
-            config,
-            &provenance.subject_git_revision,
-            provenance.subject_source_dirty,
-        )
-        .expect("fresh scalar Quill subject");
-        let oracle = crate::engine::TantivyOracle::in_memory_scalar_g1a(
-            &provenance.oracle_git_revision,
-            provenance.oracle_source_dirty,
-        )
-        .expect("fresh scalar G1a Tantivy oracle");
+        let subject =
+            crate::engine::QuillSubject::in_memory(config).expect("fresh scalar Quill subject");
+        let oracle = crate::engine::TantivyOracle::in_memory_scalar_g1a()
+            .expect("fresh scalar G1a Tantivy oracle");
         (subject, oracle)
     }
 
     #[cfg(feature = "tantivy-oracle")]
-    fn live_cass_campaign_engines(
-        provenance: &CampaignProvenance,
-    ) -> (
+    fn live_cass_campaign_engines() -> (
         crate::engine::CassQuillSubject,
         crate::engine::CassTantivyOracle,
     ) {
@@ -15428,17 +16731,10 @@ mod tests {
             glob_expansion_limit: 4_096,
             ..frankensearch_quill::QuillConfig::default()
         };
-        let subject = crate::engine::CassQuillSubject::in_memory(
-            config,
-            &provenance.subject_git_revision,
-            provenance.subject_source_dirty,
-        )
-        .expect("fresh CASS Quill subject");
-        let oracle = crate::engine::CassTantivyOracle::in_memory(
-            &provenance.oracle_git_revision,
-            provenance.oracle_source_dirty,
-        )
-        .expect("fresh CASS Tantivy oracle");
+        let subject =
+            crate::engine::CassQuillSubject::in_memory(config).expect("fresh CASS Quill subject");
+        let oracle =
+            crate::engine::CassTantivyOracle::in_memory().expect("fresh CASS Tantivy oracle");
         (subject, oracle)
     }
 
@@ -15468,7 +16764,7 @@ mod tests {
             &semantic_contract,
         )
         .expect("collect provenance");
-        let (mut subject, mut oracle) = live_campaign_engines(&provenance);
+        let (mut subject, mut oracle) = live_campaign_engines();
         let campaign = DifferentialCampaignRunner::new(
             ArtifactStore::new(root),
             semantic_contract,
@@ -15485,7 +16781,7 @@ mod tests {
         .expect("live campaign runner")
         .with_provenance(provenance);
         campaign
-            .run(
+            .run_quill_tantivy_evidence(
                 cx,
                 run_id,
                 &mut subject,
@@ -15513,7 +16809,7 @@ mod tests {
             &semantic_contract,
         )
         .expect("collect CASS provenance");
-        let (mut subject, mut oracle) = live_cass_campaign_engines(&provenance);
+        let (mut subject, mut oracle) = live_cass_campaign_engines();
         let campaign = DifferentialCampaignRunner::new(
             ArtifactStore::new(root),
             semantic_contract,
@@ -15529,7 +16825,7 @@ mod tests {
         .expect("live CASS campaign runner")
         .with_provenance(provenance);
         campaign
-            .run(
+            .run_cass_quill_tantivy_evidence(
                 cx,
                 run_id,
                 &mut subject,
@@ -15760,9 +17056,10 @@ mod tests {
         let store = ArtifactStore::new(scratch_root);
         assert_eq!(
             store
-                .load_verified_campaign(&report.run_id)
-                .expect("copied campaign starts verified"),
-            *report
+                .load_integrity_checked_campaign(&report.run_id)
+                .expect("copied campaign starts integrity-checked")
+                .report(),
+            report
         );
 
         let (target_ordinal, target_hash, target_object) = report
@@ -15850,12 +17147,14 @@ mod tests {
             assert_ne!(bytes, original_bytes, "{label} must alter persisted bytes");
             std::fs::write(&target_path, bytes).expect("write scratch mutation");
             assert!(
-                store.load_verified_campaign(&report.run_id).is_err(),
-                "verified campaign reload accepted persisted mutation {label}"
+                store
+                    .load_integrity_checked_campaign(&report.run_id)
+                    .is_err(),
+                "integrity-checked campaign reload accepted persisted mutation {label}"
             );
             std::fs::write(&target_path, &original_bytes).expect("restore scratch object");
             store
-                .load_verified_campaign(&report.run_id)
+                .load_integrity_checked_campaign(&report.run_id)
                 .unwrap_or_else(|error| panic!("restored campaign failed after {label}: {error}"));
         };
 
@@ -16275,13 +17574,13 @@ mod tests {
             .expect("write coherently referenced campaign report");
 
             let error = store
-                .load_verified_campaign(&report.run_id)
+                .load_integrity_checked_campaign(&report.run_id)
                 .expect_err("semantic replay must reject canonical typed mutation");
             std::fs::write(&target_case_path, &original_case_bytes)
                 .expect("restore target run manifest");
             std::fs::write(&report_path, &original_report_bytes).expect("restore campaign report");
             store
-                .load_verified_campaign(&report.run_id)
+                .load_integrity_checked_campaign(&report.run_id)
                 .unwrap_or_else(|error| panic!("restored campaign failed after {label}: {error}"));
             assert!(
                 matches!(
@@ -16304,17 +17603,8 @@ mod tests {
 
         type ProvenanceMutation = fn(&mut CampaignProvenance);
         let provenance_mutations: &[(&str, ProvenanceMutation)] = &[
-            ("subject_git_revision", |value| {
-                value.subject_git_revision = "2".repeat(40);
-            }),
-            ("subject_source_dirty", |value| {
-                value.subject_source_dirty = !value.subject_source_dirty;
-            }),
-            ("oracle_git_revision", |value| {
-                value.oracle_git_revision = "3".repeat(40);
-            }),
-            ("oracle_source_dirty", |value| {
-                value.oracle_source_dirty = !value.oracle_source_dirty;
+            ("producer_build_identity_sha256", |value| {
+                value.producer_build_identity_sha256 = "0".repeat(64);
             }),
             ("cargo_lock_sha256", |value| {
                 value.cargo_lock_sha256 = "0".repeat(64);
@@ -16368,7 +17658,7 @@ mod tests {
         ];
         assert_eq!(
             provenance_mutations.len(),
-            20,
+            17,
             "campaign provenance mutation coverage must remain field-complete"
         );
         for &(field, mutate) in provenance_mutations {
@@ -16395,14 +17685,14 @@ mod tests {
             .expect("write coherently mutated campaign report");
 
             let error = store
-                .load_verified_campaign(&report.run_id)
-                .expect_err("verified campaign reload must reject mutated provenance");
+                .load_integrity_checked_campaign(&report.run_id)
+                .expect_err("integrity-checked campaign reload must reject mutated provenance");
             std::fs::write(&reservation_path, &original_reservation_bytes)
                 .expect("restore campaign reservation");
             std::fs::write(&report_path, &original_report_bytes)
                 .expect("restore campaign report after provenance mutation");
             store
-                .load_verified_campaign(&report.run_id)
+                .load_integrity_checked_campaign(&report.run_id)
                 .unwrap_or_else(|error| {
                     panic!("restored campaign failed after provenance {field}: {error}")
                 });
@@ -16440,15 +17730,17 @@ mod tests {
                 .expect("encode ordinal-swapped campaign report"),
         )
         .expect("write ordinal-swapped campaign report");
-        let error = store.load_verified_campaign(&report.run_id).expect_err(
-            "campaign evidence validator must reject a valid object at the wrong ordinal",
-        );
+        let error = store
+            .load_integrity_checked_campaign(&report.run_id)
+            .expect_err(
+                "campaign evidence validator must reject a valid object at the wrong ordinal",
+            );
         std::fs::write(&target_case_path, &original_case_bytes)
             .expect("restore target run manifest after ordinal swap");
         std::fs::write(&report_path, &original_report_bytes)
             .expect("restore campaign report after ordinal swap");
         store
-            .load_verified_campaign(&report.run_id)
+            .load_integrity_checked_campaign(&report.run_id)
             .unwrap_or_else(|error| panic!("restored campaign failed after ordinal swap: {error}"));
         assert!(
             matches!(&error, GauntletError::InvalidCampaign { .. })
@@ -16525,12 +17817,17 @@ mod tests {
             deterministic_ingest: true,
             ..frankensearch_quill::QuillConfig::default()
         };
-        let mut subject =
-            crate::engine::QuillSubject::in_memory(config, "harvested-14-score-regression", false)
-                .expect("fresh scalar Quill subject");
-        let mut oracle =
-            crate::engine::TantivyOracle::in_memory_scalar_g1a(&lexical_revision, false)
-                .expect("fresh scalar G1a Tantivy oracle");
+        let mut subject = crate::engine::QuillSubject::in_memory_with_source(
+            config,
+            "harvested-14-score-regression",
+            false,
+        )
+        .expect("fresh scalar Quill subject");
+        let mut oracle = crate::engine::TantivyOracle::in_memory_scalar_g1a_with_source(
+            &lexical_revision,
+            false,
+        )
+        .expect("fresh scalar G1a Tantivy oracle");
         let semantic_contract = SemanticContract::scalar_g1a();
 
         asupersync::test_utils::run_test_with_cx(|cx| async move {
@@ -16699,13 +17996,17 @@ mod tests {
 
     #[cfg(feature = "tantivy-oracle")]
     #[test]
-    fn live_default_profile_campaign_stamps_provenance_and_reloads_verified() {
+    fn live_default_profile_campaign_stamps_provenance_and_reloads_integrity_checked() {
         let temp = tempfile::tempdir().expect("tempdir");
         let root = live_pr_artifact_root(temp.path(), "default");
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             let report = run_live_default_profile_campaign(&cx, &root, "e6.9-default-pr-lane")
                 .await
                 .expect("live default-profile campaign must complete and pass");
+            assert_eq!(
+                report.execution_role,
+                ArtifactExecutionRole::BuiltInExecution
+            );
             assert!(
                 report.passed,
                 "default profile must be admissible: rank_mismatches={:?} lexical_mismatches={:?} coverage={:?} cases={:?}",
@@ -16864,7 +18165,7 @@ mod tests {
                 .provenance
                 .as_ref()
                 .expect("production campaign stamps provenance");
-            assert!(!provenance.subject_git_revision.is_empty());
+            assert!(is_lower_sha256(&provenance.producer_build_identity_sha256));
             assert!(!provenance.cargo_lock_sha256.is_empty());
             assert!(provenance.rustc_version_verbose.contains("release:"));
             assert!(provenance.rust_toolchain_channel.starts_with("nightly-"));
@@ -16902,19 +18203,39 @@ mod tests {
             assert_eq!(provenance.query_manifest_hash, report.query_manifest_hash);
             assert_eq!(provenance.corpus_seed, None);
 
-            // CI-grade acceptance: ONLY a verified reload counts as evidence.
+            let mut demoted = report.clone();
+            demoted.execution_role = ArtifactExecutionRole::Diagnostic;
+            assert!(
+                demoted.validate_contract().is_err(),
+                "a provenance-bearing built-in report cannot be relabeled diagnostic"
+            );
+            let mut without_provenance = report.clone();
+            without_provenance.provenance = None;
+            assert!(
+                without_provenance.validate_contract().is_err(),
+                "the built-in evidence role cannot survive removal of provenance"
+            );
+            let mut without_provenance_policy = report.clone();
+            without_provenance_policy.config.require_provenance = false;
+            assert!(
+                without_provenance_policy.validate_contract().is_err(),
+                "the built-in evidence role cannot survive removal of its provenance policy"
+            );
+
+            // This establishes durable relational integrity only. Terminal CI
+            // acceptance still requires the externally authenticated F0 chain.
             let reloaded = ArtifactStore::new(&root)
-                .load_verified_campaign("e6.9-default-pr-lane")
-                .expect("verified reload accepts the completed campaign");
-            assert_eq!(reloaded, report);
-            assert_eq!(reloaded.provenance, report.provenance);
+                .load_integrity_checked_campaign("e6.9-default-pr-lane")
+                .expect("integrity-checked reload accepts the completed campaign");
+            assert_eq!(reloaded.report(), &report);
+            assert_eq!(reloaded.report().provenance, report.provenance);
             assert_persisted_core_object_mutation_matrix_fails(&root, &report);
         });
     }
 
     #[cfg(feature = "tantivy-oracle")]
     #[test]
-    fn live_cass_profile_campaign_covers_contract_and_reloads_verified() {
+    fn live_cass_profile_campaign_covers_contract_and_reloads_integrity_checked() {
         let temp = tempfile::tempdir().expect("tempdir");
         let root = live_pr_artifact_root(temp.path(), "cass");
         asupersync::test_utils::run_test_with_cx(|cx| async move {
@@ -16922,6 +18243,10 @@ mod tests {
             let report = run_live_cass_profile_fixture(&cx, &root, "e6.9-cass-pr-lane", &fixture)
                 .await
                 .expect("live CASS campaign must complete");
+            assert_eq!(
+                report.execution_role,
+                ArtifactExecutionRole::BuiltInExecution
+            );
             assert!(
                 report.passed,
                 "CASS profile is green: {:?}",
@@ -16938,9 +18263,9 @@ mod tests {
             );
             assert_cass_campaign_is_nonvacuous(&root, &report);
             let reloaded = ArtifactStore::new(&root)
-                .load_verified_campaign("e6.9-cass-pr-lane")
-                .expect("verified reload accepts the CASS campaign");
-            assert_eq!(reloaded, report);
+                .load_integrity_checked_campaign("e6.9-cass-pr-lane")
+                .expect("integrity-checked reload accepts the CASS campaign");
+            assert_eq!(reloaded.report(), &report);
         });
     }
 
@@ -16952,7 +18277,7 @@ mod tests {
             run_live_default_profile_campaign(&cx, temp.path(), "e6.9-provenance-tamper")
                 .await
                 .expect("campaign completes");
-            // Tamper with the reservation's provenance block: the verified reload
+            // Tamper with the reservation's provenance block: relational replay
             // must reject the campaign instead of trusting it.
             let reservation_path = temp
                 .path()
@@ -16969,8 +18294,8 @@ mod tests {
                 serde_json::to_vec(&reservation).expect("serialize tampered"),
             )
             .expect("write tampered");
-            let rejected =
-                ArtifactStore::new(temp.path()).load_verified_campaign("e6.9-provenance-tamper");
+            let rejected = ArtifactStore::new(temp.path())
+                .load_integrity_checked_campaign("e6.9-provenance-tamper");
             assert!(rejected.is_err(), "tampered provenance fails closed");
         });
     }
@@ -17117,10 +18442,10 @@ mod tests {
             .expect("nightly full lane completes");
         assert!(report.passed, "nightly lane green: {:?}", report.mismatches);
         let reloaded = ArtifactStore::new(root)
-            .load_verified_campaign(run_id)
-            .expect("verified reload accepts the nightly campaign");
-        assert_eq!(reloaded, report);
-        reloaded
+            .load_integrity_checked_campaign(run_id)
+            .expect("integrity-checked reload accepts the nightly campaign");
+        assert_eq!(reloaded.report(), &report);
+        reloaded.report().clone()
     }
 
     #[cfg(feature = "tantivy-oracle")]
@@ -17140,10 +18465,10 @@ mod tests {
             report.mismatches
         );
         let reloaded = ArtifactStore::new(root)
-            .load_verified_campaign(run_id)
-            .expect("verified reload accepts the CASS nightly campaign");
-        assert_eq!(reloaded, report);
-        reloaded
+            .load_integrity_checked_campaign(run_id)
+            .expect("integrity-checked reload accepts the CASS nightly campaign");
+        assert_eq!(reloaded.report(), &report);
+        reloaded.report().clone()
     }
 
     #[cfg(feature = "tantivy-oracle")]

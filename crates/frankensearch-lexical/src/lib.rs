@@ -4,6 +4,9 @@
 //! including schema creation, document indexing, BM25 query parsing,
 //! and search result ranking.
 //!
+//! The crate version constant is part of gauntlet dependency provenance: it
+//! identifies the concrete lexical wrapper compiled around Tantivy.
+//!
 //! # Schema
 //!
 //! | Field | Tantivy Options | Source |
@@ -15,6 +18,9 @@
 //!
 //! The `content` and `title` fields are searched with BM25 scoring.
 //! Title matches receive a 2× boost via `QueryParser::set_field_boost`.
+
+/// Exact `frankensearch-lexical` crate version compiled into this adapter.
+pub const FRANKENSEARCH_LEXICAL_CRATE_VERSION: &str = env!("CARGO_PKG_VERSION");
 
 pub mod cass_compat;
 pub mod quill_contract;

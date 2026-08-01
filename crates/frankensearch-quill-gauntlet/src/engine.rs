@@ -17,6 +17,7 @@ use frankensearch_quill::{
 };
 use frankensearch_quill::{QuillConfig, QuillIndex, QuillSearchResult};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use xxhash_rust::xxh3::xxh3_64;
 
 use crate::GauntletError;
@@ -45,6 +46,20 @@ const MAX_OBSERVATION_AGGREGATE_TEXT_BYTES: usize = 64 * 1024 * 1024;
 pub const MAX_SNIPPET_CHARS: u64 = 1_000_000;
 pub const TANTIVY_ORACLE_CONFIG_HASH: &str = "shipping-schema-and-parser-v1";
 pub const CASS_TANTIVY_ORACLE_CONFIG_HASH: &str = "cass-schema-and-parser-v1";
+const BUILT_IN_PROFILE_V1_QUILL_CRATE_VERSION: &str = "0.2.1";
+const BUILT_IN_PROFILE_V1_LEXICAL_CRATE_VERSION: &str = "0.2.1";
+const BUILT_IN_PROFILE_V1_DEFAULT_ANALYZER_HASH: &str =
+    "7425c0f2d0a909ca4103bd20f439b6282d3ce00ab3c9f6784ec7333398197041";
+const BUILT_IN_PROFILE_V1_DEFAULT_SCHEMA_HASH: &str =
+    "9fed22a53e5060243e9528fbbf40605a0df8ea120b3d74ac41ecbb097c2df571";
+const BUILT_IN_PROFILE_V1_SCALAR_G1A_SCHEMA_HASH: &str =
+    "31c57f7e822289f5d1b685b3d92a75ab66697e3c4846ebb9315cc96e75dd9f53";
+const BUILT_IN_PROFILE_V1_CASS_ANALYZER_HASH: &str =
+    "8db8c441617927a16604df40ff17f57a5478996eaa2b0c7b4018dfac1340edcf";
+const BUILT_IN_PROFILE_V1_CASS_SCHEMA_HASH: &str =
+    "24e54284be158fe39dfa4bf0def76dba6dd9d50d8c59f7cb75f24e52b0cccae4";
+const BUILT_IN_PROFILE_V1_SCALAR_ORACLE_CONFIG_HASH: &str = "shipping-schema-and-parser-v1";
+const BUILT_IN_PROFILE_V1_CASS_ORACLE_CONFIG_HASH: &str = "cass-schema-and-parser-v1";
 
 /// Closed engine family used by the cross-engine false-green guard.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -64,6 +79,7 @@ pub enum ComparisonMode {
 
 /// Build identity stamped into every immutable gauntlet object.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EngineDescriptor {
     pub family: EngineFamily,
     pub implementation: String,
@@ -129,8 +145,362 @@ fn validate_recorded_producer_source(
     Ok(())
 }
 
+fn canonical_f64_bits(value: f64) -> u64 {
+    if value == 0.0 { 0 } else { value.to_bits() }
+}
+
+fn usize_to_receipt_u64(value: usize, field: &str) -> u64 {
+    match u64::try_from(value) {
+        Ok(value) => value,
+        Err(_) => panic!("Quill config field {field} exceeds the portable u64 receipt domain"),
+    }
+}
+
+fn receipt_u64_to_usize(value: u64, field: &str) -> Result<usize, GauntletError> {
+    usize::try_from(value).map_err(|_| GauntletError::InvalidContract {
+        reason: format!(
+            "stored Quill runtime configuration field {field} does not fit this target's usize"
+        ),
+    })
+}
+
+fn sha256_lower_hex(bytes: &[u8]) -> String {
+    const DOMAIN: &[u8] = b"frankensearch-quill-config-receipt-v1\0";
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut hasher = Sha256::new();
+    hasher.update(DOMAIN);
+    hasher.update(bytes);
+    let digest = hasher.finalize();
+    let mut output = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        output.push(char::from(HEX[usize::from(byte >> 4)]));
+        output.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    output
+}
+
+/// Canonical, replayable preimage of every public Quill runtime knob.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct QuillConfigReceipt {
+    schema_version: u32,
+    scribe_shard_budget_bytes: u64,
+    delta_budget_bytes: u64,
+    tier_fanout: u64,
+    tier_small_max_docid_width: u64,
+    tier_medium_max_docid_width: u64,
+    bulk_load_mode: bool,
+    bulk_publish_segment_cadence: u64,
+    compaction_tombstone_density_bits: u64,
+    merge_max_hole_ratio_bits: u64,
+    glob_expansion_limit: u64,
+    query_fuel_budget: u64,
+    max_ingest_shards: u64,
+    deterministic_ingest: bool,
+    max_visibility_lag_ms: u64,
+    quarantine_on_unrepairable: bool,
+}
+
+impl QuillConfigReceipt {
+    const V1_SCHEMA_VERSION: u32 = 1;
+    const CURRENT_SCHEMA_VERSION: u32 = Self::V1_SCHEMA_VERSION;
+
+    fn from_config(config: &QuillConfig) -> Self {
+        let QuillConfig {
+            scribe_shard_budget_bytes,
+            delta_budget_bytes,
+            tier_fanout,
+            tier_small_max_docid_width,
+            tier_medium_max_docid_width,
+            bulk_load_mode,
+            bulk_publish_segment_cadence,
+            compaction_tombstone_density,
+            merge_max_hole_ratio,
+            glob_expansion_limit,
+            query_fuel_budget,
+            max_ingest_shards,
+            deterministic_ingest,
+            max_visibility_lag_ms,
+            quarantine_on_unrepairable,
+        } = config.clone();
+        Self {
+            schema_version: Self::CURRENT_SCHEMA_VERSION,
+            scribe_shard_budget_bytes: usize_to_receipt_u64(
+                scribe_shard_budget_bytes,
+                "scribe_shard_budget_bytes",
+            ),
+            delta_budget_bytes: usize_to_receipt_u64(delta_budget_bytes, "delta_budget_bytes"),
+            tier_fanout: usize_to_receipt_u64(tier_fanout, "tier_fanout"),
+            tier_small_max_docid_width,
+            tier_medium_max_docid_width,
+            bulk_load_mode,
+            bulk_publish_segment_cadence: usize_to_receipt_u64(
+                bulk_publish_segment_cadence,
+                "bulk_publish_segment_cadence",
+            ),
+            compaction_tombstone_density_bits: canonical_f64_bits(compaction_tombstone_density),
+            merge_max_hole_ratio_bits: canonical_f64_bits(merge_max_hole_ratio),
+            glob_expansion_limit: usize_to_receipt_u64(
+                glob_expansion_limit,
+                "glob_expansion_limit",
+            ),
+            query_fuel_budget,
+            max_ingest_shards: usize_to_receipt_u64(max_ingest_shards, "max_ingest_shards"),
+            deterministic_ingest,
+            max_visibility_lag_ms,
+            quarantine_on_unrepairable,
+        }
+    }
+
+    fn to_config(&self) -> Result<QuillConfig, GauntletError> {
+        Ok(QuillConfig {
+            scribe_shard_budget_bytes: receipt_u64_to_usize(
+                self.scribe_shard_budget_bytes,
+                "scribe_shard_budget_bytes",
+            )?,
+            delta_budget_bytes: receipt_u64_to_usize(
+                self.delta_budget_bytes,
+                "delta_budget_bytes",
+            )?,
+            tier_fanout: receipt_u64_to_usize(self.tier_fanout, "tier_fanout")?,
+            tier_small_max_docid_width: self.tier_small_max_docid_width,
+            tier_medium_max_docid_width: self.tier_medium_max_docid_width,
+            bulk_load_mode: self.bulk_load_mode,
+            bulk_publish_segment_cadence: receipt_u64_to_usize(
+                self.bulk_publish_segment_cadence,
+                "bulk_publish_segment_cadence",
+            )?,
+            compaction_tombstone_density: f64::from_bits(self.compaction_tombstone_density_bits),
+            merge_max_hole_ratio: f64::from_bits(self.merge_max_hole_ratio_bits),
+            glob_expansion_limit: receipt_u64_to_usize(
+                self.glob_expansion_limit,
+                "glob_expansion_limit",
+            )?,
+            query_fuel_budget: self.query_fuel_budget,
+            max_ingest_shards: receipt_u64_to_usize(self.max_ingest_shards, "max_ingest_shards")?,
+            deterministic_ingest: self.deterministic_ingest,
+            max_visibility_lag_ms: self.max_visibility_lag_ms,
+            quarantine_on_unrepairable: self.quarantine_on_unrepairable,
+        })
+    }
+
+    fn canonical_preimage_v1(&self) -> String {
+        format!(
+            "quill-config-v1;scribe={};delta={};fanout={};tier_small={};tier_medium={};bulk={};bulk_cadence={};compact={:016x};holes={:016x};glob={};fuel={};shards={};deterministic={};visibility_ms={};quarantine={}",
+            self.scribe_shard_budget_bytes,
+            self.delta_budget_bytes,
+            self.tier_fanout,
+            self.tier_small_max_docid_width,
+            self.tier_medium_max_docid_width,
+            self.bulk_load_mode,
+            self.bulk_publish_segment_cadence,
+            self.compaction_tombstone_density_bits,
+            self.merge_max_hole_ratio_bits,
+            self.glob_expansion_limit,
+            self.query_fuel_budget,
+            self.max_ingest_shards,
+            self.deterministic_ingest,
+            self.max_visibility_lag_ms,
+            self.quarantine_on_unrepairable
+        )
+    }
+
+    fn descriptor_hash_v1(&self) -> String {
+        sha256_lower_hex(self.canonical_preimage_v1().as_bytes())
+    }
+
+    fn validate_stored_v1(&self) -> Result<(), GauntletError> {
+        let compaction_tombstone_density = f64::from_bits(self.compaction_tombstone_density_bits);
+        let merge_max_hole_ratio = f64::from_bits(self.merge_max_hole_ratio_bits);
+        if self.schema_version != Self::V1_SCHEMA_VERSION
+            || self.scribe_shard_budget_bytes == 0
+            || self.delta_budget_bytes == 0
+            || self.tier_fanout < 2
+            || self.tier_small_max_docid_width == 0
+            || self.tier_medium_max_docid_width <= self.tier_small_max_docid_width
+            || self.bulk_publish_segment_cadence == 0
+            || !compaction_tombstone_density.is_finite()
+            || !(0.0..=1.0).contains(&compaction_tombstone_density)
+            || compaction_tombstone_density == 0.0
+            || !merge_max_hole_ratio.is_finite()
+            || !(0.0..=1.0).contains(&merge_max_hole_ratio)
+            || self.merge_max_hole_ratio_bits == (-0.0_f64).to_bits()
+            || self.glob_expansion_limit == 0
+            || self.query_fuel_budget == 0
+            || self.max_ingest_shards == 0
+            || self.max_visibility_lag_ms == 0
+        {
+            return Err(GauntletError::InvalidContract {
+                reason: "stored Quill runtime configuration receipt v1 is invalid".to_owned(),
+            });
+        }
+        Ok(())
+    }
+
+    fn validate_creation(&self) -> Result<(), GauntletError> {
+        self.validate_stored_v1()?;
+        self.to_config()?
+            .validate()
+            .map_err(|error| GauntletError::InvalidContract {
+                reason: format!(
+                    "Quill runtime configuration receipt is invalid under the current engine: {error}"
+                ),
+            })
+    }
+}
+
+/// Exact built-in adapter/profile lane selected by a typed execution path.
+///
+/// This enum is a configuration identity, not authentication or admission
+/// authority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum BuiltInEngineProfile {
+    ScalarShipping,
+    ScalarG1a,
+    Cass,
+}
+
+/// Stored profile receipt binding the adapter role to the full Quill config.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct BuiltInEngineProfileReceipt {
+    schema_version: u32,
+    profile: BuiltInEngineProfile,
+    subject_config: QuillConfigReceipt,
+}
+
+impl BuiltInEngineProfileReceipt {
+    const V1_SCHEMA_VERSION: u32 = 1;
+    const CURRENT_SCHEMA_VERSION: u32 = Self::V1_SCHEMA_VERSION;
+
+    pub(crate) fn new(profile: BuiltInEngineProfile, subject_config: &QuillConfig) -> Self {
+        Self {
+            schema_version: Self::CURRENT_SCHEMA_VERSION,
+            profile,
+            subject_config: QuillConfigReceipt::from_config(subject_config),
+        }
+    }
+
+    fn current_semantic_contract(&self) -> crate::runner::SemanticContract {
+        match self.profile {
+            BuiltInEngineProfile::ScalarShipping => {
+                crate::runner::SemanticContract::shipping_default()
+            }
+            BuiltInEngineProfile::ScalarG1a => crate::runner::SemanticContract::scalar_g1a(),
+            BuiltInEngineProfile::Cass => crate::runner::SemanticContract::cass(),
+        }
+    }
+
+    fn validate_stored(&self, engines: &EnginePairIdentity) -> Result<(), GauntletError> {
+        match self.schema_version {
+            1 => self.validate_stored_v1(engines),
+            _ => Err(GauntletError::InvalidContract {
+                reason: "built-in engine profile receipt schema is unsupported".to_owned(),
+            }),
+        }
+    }
+
+    fn stored_semantic_contract_v1(&self) -> crate::runner::SemanticContract {
+        let (analyzer_contract_hash, schema_contract_hash) = match self.profile {
+            BuiltInEngineProfile::ScalarShipping => (
+                BUILT_IN_PROFILE_V1_DEFAULT_ANALYZER_HASH,
+                BUILT_IN_PROFILE_V1_DEFAULT_SCHEMA_HASH,
+            ),
+            BuiltInEngineProfile::ScalarG1a => (
+                BUILT_IN_PROFILE_V1_DEFAULT_ANALYZER_HASH,
+                BUILT_IN_PROFILE_V1_SCALAR_G1A_SCHEMA_HASH,
+            ),
+            BuiltInEngineProfile::Cass => (
+                BUILT_IN_PROFILE_V1_CASS_ANALYZER_HASH,
+                BUILT_IN_PROFILE_V1_CASS_SCHEMA_HASH,
+            ),
+        };
+        crate::runner::SemanticContract {
+            analyzer_contract_hash: analyzer_contract_hash.to_owned(),
+            schema_contract_hash: schema_contract_hash.to_owned(),
+        }
+    }
+
+    fn validate_stored_v1(&self, engines: &EnginePairIdentity) -> Result<(), GauntletError> {
+        self.subject_config.validate_stored_v1()?;
+        let (subject_implementation, subject_hash, oracle_hash) = match self.profile {
+            BuiltInEngineProfile::ScalarShipping => (
+                "frankensearch-quill/scalar-index",
+                self.subject_config.descriptor_hash_v1(),
+                BUILT_IN_PROFILE_V1_SCALAR_ORACLE_CONFIG_HASH,
+            ),
+            BuiltInEngineProfile::ScalarG1a => (
+                "frankensearch-quill/scalar-index",
+                self.subject_config.descriptor_hash_v1(),
+                BUILT_IN_PROFILE_V1_SCALAR_ORACLE_CONFIG_HASH,
+            ),
+            BuiltInEngineProfile::Cass => (
+                "frankensearch-quill/cass-index",
+                format!(
+                    "cass-semantic-v1:{}",
+                    self.subject_config.descriptor_hash_v1()
+                ),
+                BUILT_IN_PROFILE_V1_CASS_ORACLE_CONFIG_HASH,
+            ),
+        };
+        if self.schema_version != Self::V1_SCHEMA_VERSION
+            || engines.comparison_mode != ComparisonMode::CrossEngine
+            || engines.subject.implementation != subject_implementation
+            || engines.subject.crate_version != BUILT_IN_PROFILE_V1_QUILL_CRATE_VERSION
+            || engines.subject.config_hash != subject_hash
+            || engines.oracle.implementation != "frankensearch-lexical/tantivy-index"
+            || engines.oracle.crate_version != BUILT_IN_PROFILE_V1_LEXICAL_CRATE_VERSION
+            || engines.oracle.config_hash != oracle_hash
+            || engines.semantic_contract.as_ref() != Some(&self.stored_semantic_contract_v1())
+            || engines.subject.source_revision != engines.oracle.source_revision
+            || engines.subject.source_dirty != engines.oracle.source_dirty
+        {
+            return Err(GauntletError::InvalidContract {
+                reason: "built-in engine profile receipt does not match its stored adapter identities and semantic contract"
+                    .to_owned(),
+            });
+        }
+        validate_recorded_producer_source(
+            &engines.subject.source_revision,
+            engines.subject.source_dirty,
+        )?;
+        Ok(())
+    }
+
+    fn validate_creation(&self, engines: &EnginePairIdentity) -> Result<(), GauntletError> {
+        self.validate_stored(engines)?;
+        self.subject_config.validate_creation()?;
+        let current_config = self.subject_config.to_config()?;
+        let oracle_version = oracle_version_contract()?;
+        let (expected_subject_hash, expected_oracle_hash) = match self.profile {
+            BuiltInEngineProfile::ScalarShipping | BuiltInEngineProfile::ScalarG1a => (
+                quill_config_hash(&current_config),
+                TANTIVY_ORACLE_CONFIG_HASH,
+            ),
+            BuiltInEngineProfile::Cass => (
+                format!("cass-semantic-v1:{}", quill_config_hash(&current_config)),
+                CASS_TANTIVY_ORACLE_CONFIG_HASH,
+            ),
+        };
+        if engines.subject.crate_version != frankensearch_quill::FRANKENSEARCH_QUILL_CRATE_VERSION
+            || engines.subject.config_hash != expected_subject_hash
+            || engines.oracle.crate_version != oracle_version.lexical_package_version
+            || engines.oracle.config_hash != expected_oracle_hash
+            || engines.semantic_contract.as_ref() != Some(&self.current_semantic_contract())
+        {
+            return Err(GauntletError::InvalidContract {
+                reason: "built-in engine profile receipt does not match the current adapter versions and semantic contract"
+                    .to_owned(),
+            });
+        }
+        Ok(())
+    }
+}
+
 /// Subject/oracle pair with mode-specific distinctness validation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EnginePairIdentity {
     pub comparison_mode: ComparisonMode,
     pub subject: EngineDescriptor,
@@ -138,6 +508,9 @@ pub struct EnginePairIdentity {
     /// Shared campaign semantic contract declared by both adapters.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub semantic_contract: Option<crate::runner::SemanticContract>,
+    /// Typed evidence lane and complete Quill runtime configuration preimage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    built_in_profile: Option<BuiltInEngineProfileReceipt>,
 }
 
 impl EnginePairIdentity {
@@ -176,6 +549,7 @@ impl EnginePairIdentity {
             subject,
             oracle,
             semantic_contract: None,
+            built_in_profile: None,
         })
     }
 
@@ -188,7 +562,69 @@ impl EnginePairIdentity {
         Ok(())
     }
 
-    pub(crate) fn validate_gauntlet_contract(&self) -> Result<(), GauntletError> {
+    pub(crate) fn bind_builtin_profile(
+        &mut self,
+        receipt: BuiltInEngineProfileReceipt,
+    ) -> Result<(), GauntletError> {
+        if self.built_in_profile.is_some() {
+            return Err(GauntletError::InvalidContract {
+                reason: "built-in engine profile receipt may be bound only once".to_owned(),
+            });
+        }
+        receipt.validate_stored(self)?;
+        self.built_in_profile = Some(receipt);
+        Ok(())
+    }
+
+    pub(crate) const fn has_builtin_profile(&self) -> bool {
+        self.built_in_profile.is_some()
+    }
+
+    /// Revalidate the live adapters against this exact stored identity.
+    ///
+    /// The built-in profile is part of the identity. Reconstructing a live
+    /// pair from only descriptors and semantics would silently discard that
+    /// receipt and make every valid built-in campaign fail its mid-run drift
+    /// checks. Rebinding the already-validated receipt also proves that it
+    /// remains compatible with the observed descriptors.
+    pub(crate) fn validate_runtime_state(
+        &self,
+        subject: EngineDescriptor,
+        oracle: EngineDescriptor,
+        subject_semantics: &crate::runner::SemanticContract,
+        oracle_semantics: &crate::runner::SemanticContract,
+    ) -> Result<(), GauntletError> {
+        let expected_semantics =
+            self.semantic_contract
+                .as_ref()
+                .ok_or_else(|| GauntletError::InvalidContract {
+                    reason: "runtime engine identity is missing its semantic contract".to_owned(),
+                })?;
+        if subject_semantics != expected_semantics || oracle_semantics != expected_semantics {
+            return Err(GauntletError::InvalidContract {
+                reason: "engine semantic contract changed during campaign execution".to_owned(),
+            });
+        }
+
+        let mut observed = Self::new(self.comparison_mode, subject, oracle)?;
+        observed.bind_semantic_contract(expected_semantics.clone())?;
+        if let Some(receipt) = &self.built_in_profile {
+            observed.bind_builtin_profile(receipt.clone())?;
+        }
+        if &observed != self {
+            return Err(GauntletError::InvalidContract {
+                reason: "engine identity changed during campaign execution".to_owned(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Validate only the identity pair's recorded, engine-neutral invariants.
+    ///
+    /// Diagnostic adapters may come from a different source revision than the
+    /// gauntlet binary, so stored/diagnostic validation must not consult the
+    /// currently linked oracle or rewrite their identities.
+    pub(crate) fn validate_stored_contract(&self) -> Result<(), GauntletError> {
         let mut rebuilt = Self::new(
             self.comparison_mode,
             self.subject.clone(),
@@ -197,11 +633,29 @@ impl EnginePairIdentity {
         if let Some(semantic_contract) = &self.semantic_contract {
             rebuilt.bind_semantic_contract(semantic_contract.clone())?;
         }
+        if let Some(receipt) = &self.built_in_profile {
+            rebuilt.bind_builtin_profile(receipt.clone())?;
+        }
         if &rebuilt != self {
             return Err(GauntletError::InvalidContract {
                 reason: "engine identity is not self-consistent".to_owned(),
             });
         }
+        Ok(())
+    }
+
+    /// Validate the concrete Quill/Tantivy adapters linked into this producer.
+    ///
+    /// This creation-time gate is intentionally stronger than diagnostic
+    /// validation and may consult the current oracle dependency contract.
+    pub(crate) fn validate_builtin_contract(&self) -> Result<(), GauntletError> {
+        self.validate_stored_contract()?;
+        let Some(receipt) = &self.built_in_profile else {
+            return Err(GauntletError::InvalidContract {
+                reason: "built-in evidence is missing its typed adapter/profile receipt".to_owned(),
+            });
+        };
+        receipt.validate_creation(self)?;
         for descriptor in [&self.subject, &self.oracle] {
             validate_recorded_producer_source(
                 &descriptor.source_revision,
@@ -219,6 +673,8 @@ impl EnginePairIdentity {
             };
             if self.oracle.implementation != "frankensearch-lexical/tantivy-index"
                 || self.oracle.crate_version != oracle_version.lexical_package_version
+                || self.subject.crate_version
+                    != frankensearch_quill::FRANKENSEARCH_QUILL_CRATE_VERSION
                 || self.oracle.source_revision != self.subject.source_revision
                 || self.oracle.source_dirty != self.subject.source_dirty
                 || self.oracle.config_hash != expected_config_hash
@@ -235,6 +691,7 @@ impl EnginePairIdentity {
 
 /// Engine-neutral query case consumed by both adapters.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DifferentialCase {
     pub fixture_id: String,
     pub query: String,
@@ -250,6 +707,7 @@ pub struct DifferentialCase {
 
 /// Deterministic fixture-generation inputs allowed in the object hash basis.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DifferentialCaseMetadata {
     pub generator_id: Option<String>,
     pub generator_seed: Option<u64>,
@@ -586,7 +1044,7 @@ pub struct HarnessRun {
 pub const HARNESS_RUN_SCHEMA_VERSION: u32 = 2;
 
 impl HarnessRun {
-    pub(crate) fn validate_for_creation(&self) -> Result<(), GauntletError> {
+    pub(crate) fn validate_diagnostic_creation(&self) -> Result<(), GauntletError> {
         if self.schema_version != HARNESS_RUN_SCHEMA_VERSION {
             return Err(GauntletError::InvalidContract {
                 reason: "legacy or unknown harness-run schema cannot produce current evidence"
@@ -594,8 +1052,15 @@ impl HarnessRun {
             });
         }
         self.producer_build_identity.validate_matches_compiled()?;
+        self.engines.validate_stored_contract()?;
+        Ok(())
+    }
+
+    pub(crate) fn validate_builtin_evidence_creation(&self) -> Result<(), GauntletError> {
+        self.validate_diagnostic_creation()?;
         self.producer_build_identity
-            .validate_engines(&self.engines)?;
+            .validate_builtin_engines(&self.engines)?;
+        self.engines.validate_builtin_contract()?;
         Ok(())
     }
 }
@@ -631,14 +1096,59 @@ impl DifferentialHarness {
         oracle: &dyn GauntletEngine,
         case: &DifferentialCase,
     ) -> Result<HarnessRun, GauntletError> {
+        self.run_internal(cx, subject, oracle, case, HarnessAdmission::Diagnostic)
+            .await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn run_builtin_evidence(
+        &self,
+        cx: &Cx,
+        subject: &dyn GauntletEngine,
+        oracle: &dyn GauntletEngine,
+        case: &DifferentialCase,
+        profile: BuiltInEngineProfileReceipt,
+    ) -> Result<HarnessRun, GauntletError> {
+        self.run_internal(
+            cx,
+            subject,
+            oracle,
+            case,
+            HarnessAdmission::BuiltInEvidence(profile),
+        )
+        .await
+    }
+
+    async fn run_internal(
+        &self,
+        cx: &Cx,
+        subject: &dyn GauntletEngine,
+        oracle: &dyn GauntletEngine,
+        case: &DifferentialCase,
+        admission: HarnessAdmission,
+    ) -> Result<HarnessRun, GauntletError> {
         let producer_build_identity = GauntletProducerBuildIdentity::compiled()?;
         let engines = EnginePairIdentity::new(
             self.comparison_mode,
             subject.descriptor(),
             oracle.descriptor(),
         )?;
-        producer_build_identity.validate_engines(&engines)?;
-        engines.validate_gauntlet_contract()?;
+        #[cfg(test)]
+        let mut engines = engines;
+        #[cfg(test)]
+        if let HarnessAdmission::BuiltInEvidence(profile) = admission {
+            engines.bind_semantic_contract(profile.current_semantic_contract())?;
+            engines.bind_builtin_profile(profile)?;
+            producer_build_identity.validate_builtin_engines(&engines)?;
+            engines.validate_builtin_contract()?;
+        } else {
+            engines.validate_stored_contract()?;
+        }
+        #[cfg(not(test))]
+        {
+            let _ = admission;
+            engines.validate_stored_contract()?;
+        }
         self.comparator_config.validate_contract()?;
         case.validate_shape()?;
         let subject_observation = subject.observe(cx, case).await?;
@@ -658,6 +1168,13 @@ impl DifferentialHarness {
             comparison,
         })
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum HarnessAdmission {
+    Diagnostic,
+    #[cfg(test)]
+    BuiltInEvidence(BuiltInEngineProfileReceipt),
 }
 
 impl Default for DifferentialHarness {
@@ -689,7 +1206,16 @@ impl QuillSubject {
     ///
     /// Returns a typed Quill configuration/schema failure or invalid engine
     /// descriptor input.
-    pub fn in_memory(
+    pub fn in_memory(config: QuillConfig) -> Result<Self, GauntletError> {
+        let producer = GauntletProducerBuildIdentity::compiled()?;
+        Self::in_memory_with_source(
+            config,
+            producer.source_git_revision,
+            producer.source_git_dirty,
+        )
+    }
+
+    pub(crate) fn in_memory_with_source(
         config: QuillConfig,
         source_revision: impl Into<String>,
         source_dirty: bool,
@@ -1082,25 +1608,7 @@ fn offset_tie_group(
 }
 
 pub fn quill_config_hash(config: &QuillConfig) -> String {
-    let canonical = format!(
-        "scribe={};delta={};fanout={};tier_small={};tier_medium={};bulk={};bulk_cadence={};compact={:016x};holes={:016x};glob={};fuel={};shards={};deterministic={};visibility_ms={};quarantine={}",
-        config.scribe_shard_budget_bytes,
-        config.delta_budget_bytes,
-        config.tier_fanout,
-        config.tier_small_max_docid_width,
-        config.tier_medium_max_docid_width,
-        config.bulk_load_mode,
-        config.bulk_publish_segment_cadence,
-        config.compaction_tombstone_density.to_bits(),
-        config.merge_max_hole_ratio.to_bits(),
-        config.glob_expansion_limit,
-        config.query_fuel_budget,
-        config.max_ingest_shards,
-        config.deterministic_ingest,
-        config.max_visibility_lag_ms,
-        config.quarantine_on_unrepairable
-    );
-    format!("{:016x}", xxh3_64(canonical.as_bytes()))
+    QuillConfigReceipt::from_config(config).descriptor_hash_v1()
 }
 
 #[cfg(feature = "tantivy-oracle")]
@@ -1136,7 +1644,16 @@ impl CassQuillSubject {
     ///
     /// Returns a typed schema, analyzer, parser, configuration, or descriptor
     /// failure before a campaign can claim the adapter.
-    pub fn in_memory(
+    pub fn in_memory(config: QuillConfig) -> Result<Self, GauntletError> {
+        let producer = GauntletProducerBuildIdentity::compiled()?;
+        Self::in_memory_with_source(
+            config,
+            producer.source_git_revision,
+            producer.source_git_dirty,
+        )
+    }
+
+    pub(crate) fn in_memory_with_source(
         config: QuillConfig,
         source_revision: impl Into<String>,
         source_dirty: bool,
@@ -1173,6 +1690,10 @@ impl CassQuillSubject {
             document_count: 0,
             state: QuillCampaignState::Fresh,
         })
+    }
+
+    pub(crate) const fn config(&self) -> &QuillConfig {
+        &self.config
     }
 
     pub(crate) fn claim_fresh_campaign(&mut self) -> Result<(), GauntletError> {
@@ -1550,7 +2071,12 @@ impl TantivyOracle {
     ///
     /// Returns an error when the embedded version contract or Tantivy index
     /// cannot be initialized.
-    pub fn in_memory(
+    pub fn in_memory() -> Result<Self, GauntletError> {
+        let producer = GauntletProducerBuildIdentity::compiled()?;
+        Self::in_memory_with_source(&producer.source_git_revision, producer.source_git_dirty)
+    }
+
+    pub(crate) fn in_memory_with_source(
         observed_lexical_revision: &str,
         source_dirty: bool,
     ) -> Result<Self, GauntletError> {
@@ -1568,7 +2094,15 @@ impl TantivyOracle {
     /// # Errors
     ///
     /// Returns the same provenance or index-construction errors as [`Self::in_memory`].
-    pub fn in_memory_scalar_g1a(
+    pub fn in_memory_scalar_g1a() -> Result<Self, GauntletError> {
+        let producer = GauntletProducerBuildIdentity::compiled()?;
+        Self::in_memory_scalar_g1a_with_source(
+            &producer.source_git_revision,
+            producer.source_git_dirty,
+        )
+    }
+
+    pub(crate) fn in_memory_scalar_g1a_with_source(
         observed_lexical_revision: &str,
         source_dirty: bool,
     ) -> Result<Self, GauntletError> {
@@ -1586,7 +2120,16 @@ impl TantivyOracle {
     /// # Errors
     ///
     /// Returns an error when the committed oracle version contract is invalid.
-    pub fn from_index(
+    pub fn from_index(index: frankensearch_lexical::TantivyIndex) -> Result<Self, GauntletError> {
+        let producer = GauntletProducerBuildIdentity::compiled()?;
+        Self::from_index_with_source(
+            index,
+            &producer.source_git_revision,
+            producer.source_git_dirty,
+        )
+    }
+
+    pub(crate) fn from_index_with_source(
         index: frankensearch_lexical::TantivyIndex,
         observed_lexical_revision: &str,
         source_dirty: bool,
@@ -1987,7 +2530,12 @@ impl CassTantivyOracle {
     ///
     /// Returns a version-contract or Tantivy setup failure before the campaign
     /// can claim the adapter.
-    pub fn in_memory(
+    pub fn in_memory() -> Result<Self, GauntletError> {
+        let producer = GauntletProducerBuildIdentity::compiled()?;
+        Self::in_memory_with_source(&producer.source_git_revision, producer.source_git_dirty)
+    }
+
+    pub(crate) fn in_memory_with_source(
         observed_lexical_revision: &str,
         source_dirty: bool,
     ) -> Result<Self, GauntletError> {
@@ -2297,6 +2845,59 @@ mod tests {
         (identity.source_git_revision, identity.source_git_dirty)
     }
 
+    fn test_scalar_g1a_profile() -> BuiltInEngineProfileReceipt {
+        BuiltInEngineProfileReceipt::new(BuiltInEngineProfile::ScalarG1a, &QuillConfig::default())
+    }
+
+    fn stored_profile_pair(
+        profile: BuiltInEngineProfile,
+        config: &QuillConfig,
+    ) -> EnginePairIdentity {
+        let receipt = BuiltInEngineProfileReceipt::new(profile, config);
+        let semantic_contract = receipt.stored_semantic_contract_v1();
+        let (subject_implementation, subject_config_hash, oracle_config_hash) = match profile {
+            BuiltInEngineProfile::ScalarShipping | BuiltInEngineProfile::ScalarG1a => (
+                "frankensearch-quill/scalar-index",
+                receipt.subject_config.descriptor_hash_v1(),
+                BUILT_IN_PROFILE_V1_SCALAR_ORACLE_CONFIG_HASH,
+            ),
+            BuiltInEngineProfile::Cass => (
+                "frankensearch-quill/cass-index",
+                format!(
+                    "cass-semantic-v1:{}",
+                    receipt.subject_config.descriptor_hash_v1()
+                ),
+                BUILT_IN_PROFILE_V1_CASS_ORACLE_CONFIG_HASH,
+            ),
+        };
+        let producer_revision = "a".repeat(40);
+        let mut pair = EnginePairIdentity::new(
+            ComparisonMode::CrossEngine,
+            EngineDescriptor {
+                family: EngineFamily::Quill,
+                implementation: subject_implementation.to_owned(),
+                crate_version: BUILT_IN_PROFILE_V1_QUILL_CRATE_VERSION.to_owned(),
+                source_revision: producer_revision.clone(),
+                source_dirty: false,
+                config_hash: subject_config_hash,
+            },
+            EngineDescriptor {
+                family: EngineFamily::Tantivy,
+                implementation: "frankensearch-lexical/tantivy-index".to_owned(),
+                crate_version: BUILT_IN_PROFILE_V1_LEXICAL_CRATE_VERSION.to_owned(),
+                source_revision: producer_revision,
+                source_dirty: false,
+                config_hash: oracle_config_hash.to_owned(),
+            },
+        )
+        .expect("frozen v1 profile pair");
+        pair.bind_semantic_contract(semantic_contract)
+            .expect("frozen v1 semantic contract");
+        pair.bind_builtin_profile(receipt)
+            .expect("frozen v1 profile receipt");
+        pair
+    }
+
     #[cfg(feature = "perf-harness")]
     fn qg_position_mode_subject(positions: bool) -> QuillSubject {
         let (producer_revision, producer_dirty) = test_producer_source();
@@ -2364,6 +2965,34 @@ mod tests {
                 self.observe_calls.fetch_add(1, Ordering::Relaxed);
                 Err(GauntletError::SubjectUnavailable {
                     reason: "counting test engine executed".to_owned(),
+                })
+            })
+        }
+    }
+
+    struct ExactDiagnosticEngine {
+        descriptor: EngineDescriptor,
+        observe_calls: Arc<AtomicUsize>,
+    }
+
+    impl GauntletEngine for ExactDiagnosticEngine {
+        fn descriptor(&self) -> EngineDescriptor {
+            self.descriptor.clone()
+        }
+
+        fn observe<'a>(&'a self, _cx: &'a Cx, _case: &'a DifferentialCase) -> GauntletFuture<'a> {
+            Box::pin(async move {
+                self.observe_calls.fetch_add(1, Ordering::Relaxed);
+                Ok(EngineObservation {
+                    hits: Vec::new(),
+                    cutoff_tie_group: Vec::new(),
+                    cutoff_tie_complete: true,
+                    offset_tie_group: Vec::new(),
+                    offset_tie_complete: false,
+                    snippets: BTreeMap::new(),
+                    match_count: CountState::Value(0),
+                    doc_count: 0,
+                    ast_differences: Vec::new(),
                 })
             })
         }
@@ -4025,11 +4654,11 @@ mod tests {
     #[test]
     fn live_subject_is_a_trait_object_with_quill_identity() {
         let subject: Box<dyn GauntletEngine> = Box::new(
-            QuillSubject::in_memory(QuillConfig::default(), "test-revision", false)
+            QuillSubject::in_memory_with_source(QuillConfig::default(), "test-revision", false)
                 .expect("live Quill subject"),
         );
         assert_eq!(subject.descriptor().family, EngineFamily::Quill);
-        assert_eq!(subject.descriptor().config_hash.len(), 16);
+        assert_eq!(subject.descriptor().config_hash.len(), 64);
     }
 
     #[test]
@@ -4156,6 +4785,269 @@ mod tests {
     }
 
     #[test]
+    fn built_in_profile_v1_accepts_every_frozen_lane_and_current_creation_policy() {
+        for profile in [
+            BuiltInEngineProfile::ScalarShipping,
+            BuiltInEngineProfile::ScalarG1a,
+            BuiltInEngineProfile::Cass,
+        ] {
+            let pair = stored_profile_pair(profile, &QuillConfig::default());
+            pair.validate_stored_contract()
+                .expect("frozen receipt must validate without mutable current policy");
+            pair.validate_builtin_contract()
+                .expect("current adapters must remain compatible with receipt v1");
+        }
+    }
+
+    #[test]
+    fn quill_config_receipt_v1_rejects_every_invalid_boundary() {
+        let baseline = QuillConfigReceipt::from_config(&QuillConfig::default());
+        macro_rules! reject_receipt_mutation {
+            ($label:literal, $mutation:expr) => {{
+                let mut candidate = baseline.clone();
+                $mutation(&mut candidate);
+                assert!(
+                    candidate.validate_stored_v1().is_err(),
+                    "stored receipt accepted invalid {}",
+                    $label
+                );
+            }};
+        }
+
+        reject_receipt_mutation!("schema version", |receipt: &mut QuillConfigReceipt| {
+            receipt.schema_version = 2;
+        });
+        reject_receipt_mutation!("scribe budget", |receipt: &mut QuillConfigReceipt| {
+            receipt.scribe_shard_budget_bytes = 0;
+        });
+        reject_receipt_mutation!("delta budget", |receipt: &mut QuillConfigReceipt| {
+            receipt.delta_budget_bytes = 0;
+        });
+        reject_receipt_mutation!("tier fanout", |receipt: &mut QuillConfigReceipt| {
+            receipt.tier_fanout = 1;
+        });
+        reject_receipt_mutation!("small tier width", |receipt: &mut QuillConfigReceipt| {
+            receipt.tier_small_max_docid_width = 0;
+        });
+        reject_receipt_mutation!("tier ordering", |receipt: &mut QuillConfigReceipt| {
+            receipt.tier_medium_max_docid_width = receipt.tier_small_max_docid_width;
+        });
+        reject_receipt_mutation!("bulk cadence", |receipt: &mut QuillConfigReceipt| {
+            receipt.bulk_publish_segment_cadence = 0;
+        });
+        reject_receipt_mutation!(
+            "zero compaction density",
+            |receipt: &mut QuillConfigReceipt| {
+                receipt.compaction_tombstone_density_bits = 0.0_f64.to_bits();
+            }
+        );
+        reject_receipt_mutation!(
+            "NaN compaction density",
+            |receipt: &mut QuillConfigReceipt| {
+                receipt.compaction_tombstone_density_bits = f64::NAN.to_bits();
+            }
+        );
+        reject_receipt_mutation!(
+            "large compaction density",
+            |receipt: &mut QuillConfigReceipt| {
+                receipt.compaction_tombstone_density_bits = 1.1_f64.to_bits();
+            }
+        );
+        reject_receipt_mutation!(
+            "NaN merge hole ratio",
+            |receipt: &mut QuillConfigReceipt| {
+                receipt.merge_max_hole_ratio_bits = f64::NAN.to_bits();
+            }
+        );
+        reject_receipt_mutation!(
+            "large merge hole ratio",
+            |receipt: &mut QuillConfigReceipt| {
+                receipt.merge_max_hole_ratio_bits = 1.1_f64.to_bits();
+            }
+        );
+        reject_receipt_mutation!(
+            "negative-zero merge hole ratio",
+            |receipt: &mut QuillConfigReceipt| {
+                receipt.merge_max_hole_ratio_bits = (-0.0_f64).to_bits();
+            }
+        );
+        reject_receipt_mutation!("glob limit", |receipt: &mut QuillConfigReceipt| {
+            receipt.glob_expansion_limit = 0;
+        });
+        reject_receipt_mutation!("query fuel", |receipt: &mut QuillConfigReceipt| {
+            receipt.query_fuel_budget = 0;
+        });
+        reject_receipt_mutation!("ingest shards", |receipt: &mut QuillConfigReceipt| {
+            receipt.max_ingest_shards = 0;
+        });
+        reject_receipt_mutation!("visibility lag", |receipt: &mut QuillConfigReceipt| {
+            receipt.max_visibility_lag_ms = 0;
+        });
+    }
+
+    #[test]
+    fn built_in_profile_v1_rejects_every_bound_identity_mutation() {
+        let baseline =
+            stored_profile_pair(BuiltInEngineProfile::ScalarG1a, &QuillConfig::default());
+        macro_rules! reject_pair_mutation {
+            ($label:literal, $mutation:expr) => {{
+                let mut candidate = baseline.clone();
+                $mutation(&mut candidate);
+                assert!(
+                    candidate.validate_stored_contract().is_err(),
+                    "stored profile accepted mutated {}",
+                    $label
+                );
+            }};
+        }
+
+        reject_pair_mutation!("comparison mode", |pair: &mut EnginePairIdentity| {
+            pair.comparison_mode = ComparisonMode::InternalDifferential;
+        });
+        reject_pair_mutation!("subject family", |pair: &mut EnginePairIdentity| {
+            pair.subject.family = EngineFamily::Tantivy;
+        });
+        reject_pair_mutation!("subject implementation", |pair: &mut EnginePairIdentity| {
+            pair.subject.implementation = "frankensearch-quill/cass-index".to_owned();
+        });
+        reject_pair_mutation!("subject crate version", |pair: &mut EnginePairIdentity| {
+            pair.subject.crate_version = "0.2.2".to_owned();
+        });
+        reject_pair_mutation!("subject config hash", |pair: &mut EnginePairIdentity| {
+            pair.subject.config_hash = "mutated".to_owned();
+        });
+        reject_pair_mutation!("oracle family", |pair: &mut EnginePairIdentity| {
+            pair.oracle.family = EngineFamily::Quill;
+        });
+        reject_pair_mutation!("oracle implementation", |pair: &mut EnginePairIdentity| {
+            pair.oracle.implementation = "tantivy/direct".to_owned();
+        });
+        reject_pair_mutation!("oracle crate version", |pair: &mut EnginePairIdentity| {
+            pair.oracle.crate_version = "0.2.2".to_owned();
+        });
+        reject_pair_mutation!("oracle config hash", |pair: &mut EnginePairIdentity| {
+            pair.oracle.config_hash = "mutated".to_owned();
+        });
+        reject_pair_mutation!(
+            "producer revision mismatch",
+            |pair: &mut EnginePairIdentity| {
+                pair.oracle.source_revision = "b".repeat(40);
+            }
+        );
+        reject_pair_mutation!(
+            "producer dirty mismatch",
+            |pair: &mut EnginePairIdentity| {
+                pair.oracle.source_dirty = true;
+            }
+        );
+        reject_pair_mutation!(
+            "invalid shared producer",
+            |pair: &mut EnginePairIdentity| {
+                pair.subject.source_revision = "not-a-git-revision".to_owned();
+                pair.oracle.source_revision = "not-a-git-revision".to_owned();
+            }
+        );
+        reject_pair_mutation!("semantic contract", |pair: &mut EnginePairIdentity| {
+            pair.semantic_contract = Some(crate::runner::SemanticContract::shipping_default());
+        });
+        reject_pair_mutation!("profile schema", |pair: &mut EnginePairIdentity| {
+            pair.built_in_profile
+                .as_mut()
+                .expect("profile")
+                .schema_version = 2;
+        });
+        reject_pair_mutation!("profile kind", |pair: &mut EnginePairIdentity| {
+            pair.built_in_profile.as_mut().expect("profile").profile = BuiltInEngineProfile::Cass;
+        });
+        reject_pair_mutation!("profile config", |pair: &mut EnginePairIdentity| {
+            pair.built_in_profile
+                .as_mut()
+                .expect("profile")
+                .subject_config
+                .query_fuel_budget += 1;
+        });
+        let mut missing_profile = baseline.clone();
+        missing_profile.built_in_profile = None;
+        assert!(
+            missing_profile.validate_stored_contract().is_ok(),
+            "engine-neutral stored identities may omit built-in execution authority"
+        );
+        assert!(matches!(
+            missing_profile.validate_builtin_contract(),
+            Err(GauntletError::InvalidContract { ref reason })
+                if reason.contains("missing its typed adapter/profile receipt")
+        ));
+        reject_pair_mutation!(
+            "missing semantic contract",
+            |pair: &mut EnginePairIdentity| {
+                pair.semantic_contract = None;
+            }
+        );
+
+        let encoded = serde_json::to_value(
+            baseline
+                .built_in_profile
+                .as_ref()
+                .expect("baseline profile"),
+        )
+        .expect("serialize profile receipt");
+        let mut unknown_field = encoded;
+        unknown_field
+            .as_object_mut()
+            .expect("receipt object")
+            .insert("unknown".to_owned(), serde_json::json!(true));
+        assert!(
+            serde_json::from_value::<BuiltInEngineProfileReceipt>(unknown_field).is_err(),
+            "profile receipt must reject unknown fields"
+        );
+    }
+
+    #[test]
+    fn literal_engine_profile_v1_fixture_pins_archival_bytes_preimage_and_hash() {
+        const PROFILE_JSON: &str = "{\"schema_version\":1,\"profile\":\"scalar_g1a\",\"subject_config\":{\"schema_version\":1,\"scribe_shard_budget_bytes\":123,\"delta_budget_bytes\":456,\"tier_fanout\":3,\"tier_small_max_docid_width\":7,\"tier_medium_max_docid_width\":9,\"bulk_load_mode\":true,\"bulk_publish_segment_cadence\":11,\"compaction_tombstone_density_bits\":4598175219545276416,\"merge_max_hole_ratio_bits\":4604930618986332160,\"glob_expansion_limit\":13,\"query_fuel_budget\":17,\"max_ingest_shards\":19,\"deterministic_ingest\":true,\"max_visibility_lag_ms\":23,\"quarantine_on_unrepairable\":true}}";
+        const CONFIG_PREIMAGE: &str = "quill-config-v1;scribe=123;delta=456;fanout=3;tier_small=7;tier_medium=9;bulk=true;bulk_cadence=11;compact=3fd0000000000000;holes=3fe8000000000000;glob=13;fuel=17;shards=19;deterministic=true;visibility_ms=23;quarantine=true";
+        const CONFIG_SHA256: &str =
+            "514677086bef61af511a70172bbabc1996fc3e4d933653c21f2e127f7c463c44";
+
+        let fixture_bytes = include_bytes!("../fixtures/engine-pair-profile-v1.json");
+        assert_eq!(fixture_bytes.last(), Some(&b'\n'));
+        let pair: EnginePairIdentity =
+            serde_json::from_slice(fixture_bytes).expect("literal frozen v1 engine-pair fixture");
+        assert_eq!(
+            serde_json::to_vec(&pair).expect("canonical engine-pair JSON"),
+            fixture_bytes
+                .strip_suffix(b"\n")
+                .expect("fixture ends in exactly one LF"),
+            "the entire frozen engine-pair receipt must remain byte-for-byte canonical",
+        );
+        pair.validate_stored_contract()
+            .expect("literal v1 bytes remain archive-valid");
+        pair.validate_builtin_contract()
+            .expect("current creation policy remains compatible with v1");
+        let profile = pair.built_in_profile.as_ref().expect("profile receipt");
+        assert_eq!(
+            serde_json::to_string(profile).expect("profile JSON"),
+            PROFILE_JSON
+        );
+        assert_eq!(
+            profile.subject_config.canonical_preimage_v1(),
+            CONFIG_PREIMAGE
+        );
+        assert_eq!(profile.subject_config.descriptor_hash_v1(), CONFIG_SHA256);
+
+        let mut nested_unknown: serde_json::Value =
+            serde_json::from_slice(fixture_bytes).expect("fixture JSON value");
+        nested_unknown["built_in_profile"]["subject_config"]
+            .as_object_mut()
+            .expect("subject config object")
+            .insert("unknown".to_owned(), serde_json::json!(true));
+        assert!(
+            serde_json::from_value::<EnginePairIdentity>(nested_unknown).is_err(),
+            "nested receipt fields must fail closed"
+        );
+    }
+
+    #[test]
     fn case_shape_rejects_snippet_budget_at_every_entry_point() {
         let mut case = DifferentialCase::new("snippet-budget", "anything", 1);
         case.snippet_max_chars = Some(MAX_SNIPPET_CHARS + 1);
@@ -4211,13 +5103,14 @@ mod tests {
     fn cass_identity_requires_the_cass_oracle_config_hash() {
         let version = oracle_version_contract().expect("oracle version contract");
         let producer_revision = "a".repeat(40);
+        let subject_config = QuillConfig::default();
         let subject = EngineDescriptor {
             family: EngineFamily::Quill,
             implementation: "frankensearch-quill/cass-index".to_owned(),
             crate_version: frankensearch_quill::FRANKENSEARCH_QUILL_CRATE_VERSION.to_owned(),
             source_revision: producer_revision.clone(),
             source_dirty: false,
-            config_hash: "cass-subject-config".to_owned(),
+            config_hash: format!("cass-semantic-v1:{}", quill_config_hash(&subject_config)),
         };
         let oracle = EngineDescriptor {
             family: EngineFamily::Tantivy,
@@ -4225,23 +5118,32 @@ mod tests {
             crate_version: version.lexical_package_version,
             source_revision: producer_revision,
             source_dirty: false,
-            config_hash: TANTIVY_ORACLE_CONFIG_HASH.to_owned(),
+            config_hash: CASS_TANTIVY_ORACLE_CONFIG_HASH.to_owned(),
         };
         let mut pair =
             EnginePairIdentity::new(ComparisonMode::CrossEngine, subject, oracle.clone())
                 .expect("well-shaped cross-engine identity");
         pair.bind_semantic_contract(crate::runner::SemanticContract::cass())
             .expect("CASS semantic contract");
+        pair.bind_builtin_profile(BuiltInEngineProfileReceipt::new(
+            BuiltInEngineProfile::Cass,
+            &subject_config,
+        ))
+        .expect("CASS profile receipt");
+        pair.validate_builtin_contract()
+            .expect("the exact CASS oracle identity is admissible");
+
+        pair.oracle = EngineDescriptor {
+            config_hash: TANTIVY_ORACLE_CONFIG_HASH.to_owned(),
+            ..oracle.clone()
+        };
         assert!(matches!(
-            pair.validate_gauntlet_contract(),
+            pair.validate_builtin_contract(),
             Err(GauntletError::InvalidContract { .. })
         ));
 
-        pair.oracle = EngineDescriptor {
-            config_hash: CASS_TANTIVY_ORACLE_CONFIG_HASH.to_owned(),
-            ..oracle
-        };
-        pair.validate_gauntlet_contract()
+        pair.oracle = oracle;
+        pair.validate_builtin_contract()
             .expect("CASS oracle identity clears only with the CASS config hash");
     }
 
@@ -4311,11 +5213,70 @@ mod tests {
 
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             assert!(matches!(
-                harness.run(&cx, &subject, &oracle, &case).await,
+                harness
+                    .run_builtin_evidence(&cx, &subject, &oracle, &case, test_scalar_g1a_profile(),)
+                    .await,
                 Err(GauntletError::InvalidContract { .. })
             ));
         });
         assert_eq!(observe_calls.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn independent_engine_revisions_are_diagnostic_but_cannot_be_promoted() {
+        let observe_calls = Arc::new(AtomicUsize::new(0));
+        let subject = ExactDiagnosticEngine {
+            descriptor: EngineDescriptor {
+                family: EngineFamily::Quill,
+                implementation: "external-quill-diagnostic".to_owned(),
+                crate_version: "9.1.0".to_owned(),
+                source_revision: "external-subject-revision".to_owned(),
+                source_dirty: true,
+                config_hash: "external-subject-config".to_owned(),
+            },
+            observe_calls: Arc::clone(&observe_calls),
+        };
+        let oracle = ExactDiagnosticEngine {
+            descriptor: EngineDescriptor {
+                family: EngineFamily::Tantivy,
+                implementation: "external-oracle-diagnostic".to_owned(),
+                crate_version: "7.2.0".to_owned(),
+                source_revision: "independent-oracle-revision".to_owned(),
+                source_dirty: false,
+                config_hash: "external-oracle-config".to_owned(),
+            },
+            observe_calls: Arc::clone(&observe_calls),
+        };
+        let harness = DifferentialHarness::default();
+        let case = DifferentialCase::new("independent-diagnostic", "", 0);
+
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let run = harness
+                .run(&cx, &subject, &oracle, &case)
+                .await
+                .expect("independent adapters remain usable as diagnostics");
+            assert_eq!(
+                run.engines.subject.source_revision,
+                "external-subject-revision"
+            );
+            assert_eq!(
+                run.engines.oracle.source_revision,
+                "independent-oracle-revision"
+            );
+            assert_eq!(run.comparison.status, crate::ComparisonStatus::Exact);
+            assert_eq!(observe_calls.load(Ordering::Relaxed), 2);
+
+            let error = harness
+                .run_builtin_evidence(&cx, &subject, &oracle, &case, test_scalar_g1a_profile())
+                .await
+                .expect_err("diagnostic adapters cannot be promoted to built-in evidence");
+            assert!(matches!(error, GauntletError::InvalidContract { .. }));
+            assert_eq!(
+                observe_calls.load(Ordering::Relaxed),
+                2,
+                "promotion rejection must happen before either adapter executes again"
+            );
+        });
     }
 
     #[test]
@@ -4356,7 +5317,9 @@ mod tests {
 
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             assert!(matches!(
-                harness.run(&cx, &subject, &oracle, &case).await,
+                harness
+                    .run_builtin_evidence(&cx, &subject, &oracle, &case, test_scalar_g1a_profile(),)
+                    .await,
                 Err(GauntletError::InvalidContract { .. })
             ));
         });
@@ -4639,9 +5602,9 @@ mod tests {
     fn separate_tantivy_instances_fail_before_execution() {
         let revision = oracle_version_contract()
             .expect("version contract")
-            .lexical_git_revision;
-        let first = TantivyOracle::in_memory(&revision, false).expect("first oracle");
-        let second = TantivyOracle::in_memory(&revision, false).expect("second oracle");
+            .lexical_contract_audit_revision;
+        let first = TantivyOracle::in_memory_with_source(&revision, false).expect("first oracle");
+        let second = TantivyOracle::in_memory_with_source(&revision, false).expect("second oracle");
         let harness = DifferentialHarness::default();
         let case = DifferentialCase::new("identity-guard", "anything", 10);
 
@@ -4662,8 +5625,8 @@ mod tests {
     fn oracle_observation_retains_full_tie_evidence_and_exact_count() {
         let revision = oracle_version_contract()
             .expect("version contract")
-            .lexical_git_revision;
-        let mut oracle = TantivyOracle::in_memory(&revision, false).expect("oracle");
+            .lexical_contract_audit_revision;
+        let mut oracle = TantivyOracle::in_memory_with_source(&revision, false).expect("oracle");
         let documents = vec![
             frankensearch_core::IndexableDocument::new("a", "shared token"),
             frankensearch_core::IndexableDocument::new("b", "shared token"),
@@ -4734,8 +5697,8 @@ mod tests {
     fn oracle_lower_score_sentinel_completes_cutoff_tie_group() {
         let revision = oracle_version_contract()
             .expect("version contract")
-            .lexical_git_revision;
-        let mut oracle = TantivyOracle::in_memory(&revision, false).expect("oracle");
+            .lexical_contract_audit_revision;
+        let mut oracle = TantivyOracle::in_memory_with_source(&revision, false).expect("oracle");
         let documents = vec![
             frankensearch_core::IndexableDocument::new("a", "alpha beta"),
             frankensearch_core::IndexableDocument::new("b", "alpha beta"),
@@ -4960,10 +5923,11 @@ mod tests {
     #[test]
     fn e410_controlled_public_search_semantics_match_oracle() {
         let (revision, dirty) = test_producer_source();
-        let mut subject = QuillSubject::in_memory(e55_config(), revision.clone(), dirty)
-            .expect("E4.10 Quill subject");
-        let mut oracle =
-            TantivyOracle::in_memory_scalar_g1a(&revision, dirty).expect("E4.10 Tantivy oracle");
+        let mut subject =
+            QuillSubject::in_memory_with_source(e55_config(), revision.clone(), dirty)
+                .expect("E4.10 Quill subject");
+        let mut oracle = TantivyOracle::in_memory_scalar_g1a_with_source(&revision, dirty)
+            .expect("E4.10 Tantivy oracle");
         let documents = vec![
             frankensearch_core::IndexableDocument::new("title-hit", "quiet filler")
                 .with_title("Needle"),
@@ -5094,9 +6058,10 @@ mod tests {
     #[test]
     fn e410_limit_count_and_order_semantics_match_oracle() {
         let (revision, dirty) = test_producer_source();
-        let mut subject = QuillSubject::in_memory(e55_config(), revision.clone(), dirty)
-            .expect("E4.10 limits Quill subject");
-        let mut oracle = TantivyOracle::in_memory_scalar_g1a(&revision, dirty)
+        let mut subject =
+            QuillSubject::in_memory_with_source(e55_config(), revision.clone(), dirty)
+                .expect("E4.10 limits Quill subject");
+        let mut oracle = TantivyOracle::in_memory_scalar_g1a_with_source(&revision, dirty)
             .expect("E4.10 limits Tantivy oracle");
         // Every document carries "shared" exactly once at a distinct document
         // length, so the counted match-all case has five distinct scores;
@@ -5348,10 +6313,11 @@ mod tests {
 
         let revision = oracle_version_contract()
             .expect("oracle version contract")
-            .lexical_git_revision;
-        let mut subject = QuillSubject::in_memory(e55_config(), "e410-fusion-subject", false)
-            .expect("E4.10 fusion Quill subject");
-        let mut oracle = TantivyOracle::in_memory_scalar_g1a(&revision, false)
+            .lexical_contract_audit_revision;
+        let mut subject =
+            QuillSubject::in_memory_with_source(e55_config(), "e410-fusion-subject", false)
+                .expect("E4.10 fusion Quill subject");
+        let mut oracle = TantivyOracle::in_memory_scalar_g1a_with_source(&revision, false)
             .expect("E4.10 fusion Tantivy oracle");
         // Three documents match `rust` at distinct (tf, |d|) pairs so the
         // ranking is total, and each carries different stored metadata so a
@@ -5617,16 +6583,16 @@ mod tests {
     fn oracle_constructor_records_dirty_diagnostics_but_rejects_malformed_source() {
         let revision = oracle_version_contract()
             .expect("version contract")
-            .lexical_git_revision;
-        let dirty = TantivyOracle::in_memory(&revision, true)
+            .lexical_contract_audit_revision;
+        let dirty = TantivyOracle::in_memory_with_source(&revision, true)
             .expect("dirty producer identity remains recordable diagnostic provenance");
         assert!(dirty.descriptor().source_dirty);
-        let unavailable = TantivyOracle::in_memory("unavailable", true)
+        let unavailable = TantivyOracle::in_memory_with_source("unavailable", true)
             .expect("conservative unavailable producer identity remains recordable");
         assert_eq!(unavailable.descriptor().source_revision, "unavailable");
-        assert!(TantivyOracle::in_memory("unavailable", false).is_err());
-        assert!(TantivyOracle::in_memory(&"0".repeat(39), false).is_err());
-        assert!(TantivyOracle::in_memory(&"A".repeat(40), false).is_err());
+        assert!(TantivyOracle::in_memory_with_source("unavailable", false).is_err());
+        assert!(TantivyOracle::in_memory_with_source(&"0".repeat(39), false).is_err());
+        assert!(TantivyOracle::in_memory_with_source(&"A".repeat(40), false).is_err());
     }
 
     #[cfg(feature = "tantivy-oracle")]
@@ -5634,22 +6600,23 @@ mod tests {
     fn oracle_descriptor_keeps_compiled_producer_separate_from_dependency_contract() {
         let contract = oracle_version_contract().expect("version contract");
         let producer_revision = "f".repeat(40);
-        assert_ne!(producer_revision, contract.lexical_git_revision);
+        assert_ne!(producer_revision, contract.lexical_contract_audit_revision);
 
-        let oracle = TantivyOracle::in_memory(&producer_revision, false).expect("clean oracle");
+        let oracle =
+            TantivyOracle::in_memory_with_source(&producer_revision, false).expect("clean oracle");
         assert_eq!(oracle.descriptor().source_revision, producer_revision);
         assert_eq!(
             oracle_version_contract()
                 .expect("independent version contract")
-                .lexical_git_revision,
-            contract.lexical_git_revision,
+                .lexical_contract_audit_revision,
+            contract.lexical_contract_audit_revision,
         );
     }
 
     #[test]
     fn quill_descriptor_uses_the_linked_quill_package_version() {
-        let subject =
-            QuillSubject::in_memory(e55_config(), "a".repeat(40), false).expect("Quill subject");
+        let subject = QuillSubject::in_memory_with_source(e55_config(), "a".repeat(40), false)
+            .expect("Quill subject");
         assert_eq!(
             subject.descriptor().crate_version,
             frankensearch_quill::FRANKENSEARCH_QUILL_CRATE_VERSION
@@ -5661,8 +6628,8 @@ mod tests {
     fn oracle_rejects_oversized_case_before_query_execution() {
         let revision = oracle_version_contract()
             .expect("version contract")
-            .lexical_git_revision;
-        let oracle = TantivyOracle::in_memory(&revision, false).expect("oracle");
+            .lexical_contract_audit_revision;
+        let oracle = TantivyOracle::in_memory_with_source(&revision, false).expect("oracle");
         let mut case = DifferentialCase::new("oversized", "anything", MAX_ORACLE_LIMIT + 1);
         case.tie_expansion_limit = 0;
 

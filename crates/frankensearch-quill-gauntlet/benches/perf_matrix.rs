@@ -4890,7 +4890,8 @@ fn run_child_mode() -> bool {
 ///
 /// A manifest pin alone cannot catch that — it describes what Cargo resolved,
 /// not what the process linked. So this asserts both: the pinned contract
-/// (version, checksum, lexical package + git revision, `tantivy = "=0.26.1"`)
+/// (version, registry source, checksum, lexical package + audited contract
+/// revision, `tantivy = "=0.26.1"`)
 /// *and* the version string the linked Tantivy reports about itself at run
 /// time. Printed so it lands in the evidence log beside the ratios.
 fn assert_incumbent_is_genuine_tantivy() -> String {
@@ -4907,11 +4908,13 @@ fn assert_incumbent_is_genuine_tantivy() -> String {
     );
     eprintln!(
         "[quill-perf-oracle] incumbent=tantivy linked_runtime={linked} contract_version={} \
-         lexical={}@{} lexical_git={}",
+         source={} checksum={} lexical={}@{} lexical_contract_audit={}",
         contract.tantivy_version,
+        contract.tantivy_source,
+        contract.tantivy_checksum_sha256,
         contract.lexical_package,
         contract.lexical_package_version,
-        contract.lexical_git_revision,
+        contract.lexical_contract_audit_revision,
     );
     linked.to_owned()
 }
