@@ -6135,8 +6135,12 @@ mod tests {
         // admission seams refuse on. Nothing is silently dropped and
         // nothing on disk is touched.
         let observation = observe_tier(&fast_path).expect("observe crash state");
+        assert!(
+            matches!(observation, FsviTierObservation::V1(_)),
+            "crash state must observe as V1, got {observation:?}"
+        );
         let FsviTierObservation::V1(observed) = observation else {
-            panic!("crash state must observe as V1, got {observation:?}");
+            return;
         };
         assert_eq!(observed.record_count, 1);
         assert_eq!(

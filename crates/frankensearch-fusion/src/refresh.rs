@@ -4299,8 +4299,12 @@ mod tests {
             // Collision precondition, proven read-only: the leftover WAL
             // reads as ACTIVE against the fresh generation-1 main.
             let observation = observe_tier(&fast_path).expect("observe crash state");
+            assert!(
+                matches!(observation, FsviTierObservation::V1(_)),
+                "crash state must observe as V1, got {observation:?}"
+            );
             let FsviTierObservation::V1(observed) = observation else {
-                panic!("crash state must observe as V1, got {observation:?}");
+                return;
             };
             assert_eq!(
                 observed.active_wal_records, 1,
