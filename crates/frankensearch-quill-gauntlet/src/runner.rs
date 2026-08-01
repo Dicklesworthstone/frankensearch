@@ -2867,6 +2867,13 @@ impl CampaignProvenance {
         }
         producer_build_identity.validate_matches_compiled()?;
         producer_build_identity.validate_stored_sealed_v2()?;
+        self.validate_creation_environment()
+    }
+
+    // Compare the independently re-resolved environment pins without granting
+    // source or executable authority. Evidence admission must continue to use
+    // `validate_for_creation`, which applies the sealed-producer gates first.
+    fn validate_creation_environment(&self) -> Result<(), GauntletError> {
         let expected_unicode_version = format!(
             "{}.{}.{}",
             char::UNICODE_VERSION.0,
@@ -13304,7 +13311,7 @@ mod tests {
     }
 
     #[test]
-    fn production_default_rank_envelope_is_rejected_before_ingest_with_valid_provenance() {
+    fn production_default_rank_envelope_is_rejected_before_ingest_with_stored_provenance() {
         let fixture = make_fixture();
         let semantic_contract = semantic_contract();
         let quill_config = frankensearch_quill::QuillConfig::default();
@@ -13344,8 +13351,14 @@ mod tests {
         engines
             .bind_semantic_contract(semantic_contract.clone())
             .expect("semantic contract");
+        // This policy-ordering regression is part of the unconditional unit
+        // suite, which also runs from source snapshots that deliberately
+        // cannot claim clean-Git creation authority. Prove that every stored
+        // provenance binding is otherwise valid here; the live default-profile
+        // campaign below separately exercises positive creation admission from
+        // a clean Git-verified checkout.
         provenance
-            .validate_for_creation(
+            .validate_stored(
                 &producer_build_identity,
                 &engines,
                 &semantic_contract,
@@ -13353,7 +13366,7 @@ mod tests {
                 &fixture.corpus_manifest,
                 &fixture.query_suite.manifest,
             )
-            .expect("the policy regression must carry otherwise-valid provenance");
+            .expect("the policy regression must carry otherwise-valid stored provenance");
 
         let mut subject = ScriptedEngine::new(subject_descriptor, BTreeMap::new());
         let mut oracle = ScriptedEngine::new(oracle_descriptor, BTreeMap::new());
@@ -13457,7 +13470,7 @@ mod tests {
     }
 
     #[test]
-    fn provenance_matches_every_engine_toolchain_and_query_pin() {
+    fn stored_provenance_matches_every_engine_toolchain_and_query_pin() {
         let fixture = make_fixture();
         let semantic_contract = semantic_contract();
         let config = CampaignConfig {
@@ -13475,8 +13488,12 @@ mod tests {
             .bind_semantic_contract(semantic_contract.clone())
             .expect("semantic contract");
         let provenance = fixture_provenance(&fixture, &config, &semantic_contract);
+        // Stored-field completeness is independent of whether the build
+        // environment is a Git checkout or an unverified source snapshot.
+        // Creation-only environment admission remains covered by the live
+        // default-profile campaign.
         provenance
-            .validate_for_creation(
+            .validate_stored(
                 &producer_build_identity,
                 &engines,
                 &semantic_contract,
@@ -13485,6 +13502,9 @@ mod tests {
                 &fixture.query_suite.manifest,
             )
             .expect("all exact provenance pins validate");
+        provenance
+            .validate_creation_environment()
+            .expect("all exact creation-environment pins validate");
 
         let serialized = serde_json::to_value(&provenance).expect("serialize provenance");
         for field in [
@@ -13575,17 +13595,19 @@ mod tests {
         for (field, corrupt) in corruptions {
             let mut mismatched = provenance.clone();
             corrupt(&mut mismatched);
+            let stored_rejected = mismatched
+                .validate_stored(
+                    &producer_build_identity,
+                    &engines,
+                    &semantic_contract,
+                    &config,
+                    &fixture.corpus_manifest,
+                    &fixture.query_suite.manifest,
+                )
+                .is_err();
+            let creation_environment_rejected = mismatched.validate_creation_environment().is_err();
             assert!(
-                mismatched
-                    .validate_for_creation(
-                        &producer_build_identity,
-                        &engines,
-                        &semantic_contract,
-                        &config,
-                        &fixture.corpus_manifest,
-                        &fixture.query_suite.manifest,
-                    )
-                    .is_err(),
+                stored_rejected || creation_environment_rejected,
                 "mismatched provenance field {field} must fail closed"
             );
         }
