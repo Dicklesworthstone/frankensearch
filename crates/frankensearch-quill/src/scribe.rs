@@ -935,6 +935,14 @@ pub struct ByteArena {
     chunk_size: usize,
     /// Index of the chunk currently accepting writes.
     active: usize,
+    /// Running sum of every chunk's capacity, so [`Self::bytes_reserved`] is
+    /// O(1) instead of re-summing every chunk per call. This is the sibling of
+    /// `TermInterner::running_bytes_used` (bd-w4j5) on the *reserved* path,
+    /// which that fix left as an O(chunks) scan. Exact rather than
+    /// approximate: `push` only ever grows capacity by appending a whole new
+    /// chunk (the `needs_new` guard means `extend_from_slice` always fits an
+    /// existing chunk), so capacity changes exclusively at `chunks.push`.
+    running_bytes_reserved: usize,
 }
 
 impl ByteArena {
@@ -943,10 +951,13 @@ impl ByteArena {
     #[must_use]
     pub fn with_chunk_size(chunk_size: usize) -> Self {
         let chunk_size = chunk_size.max(4096);
+        let chunks = vec![Vec::with_capacity(chunk_size)];
+        let running_bytes_reserved = chunks.iter().map(Vec::capacity).sum();
         Self {
-            chunks: vec![Vec::with_capacity(chunk_size)],
+            chunks,
             chunk_size,
             active: 0,
+            running_bytes_reserved,
         }
     }
 
@@ -963,6 +974,8 @@ impl ByteArena {
         if bytes.len() > self.chunk_size {
             let mut chunk = Vec::with_capacity(bytes.len());
             chunk.extend_from_slice(bytes);
+            self.running_bytes_reserved =
+                self.running_bytes_reserved.saturating_add(chunk.capacity());
             self.chunks.push(chunk);
             let idx = self.chunks.len() - 1;
             return ArenaSpan {
@@ -983,7 +996,10 @@ impl ByteArena {
                 next += 1;
             }
             if next == self.chunks.len() {
-                self.chunks.push(Vec::with_capacity(self.chunk_size));
+                let chunk = Vec::with_capacity(self.chunk_size);
+                self.running_bytes_reserved =
+                    self.running_bytes_reserved.saturating_add(chunk.capacity());
+                self.chunks.push(chunk);
             }
             self.active = next;
         }
@@ -1020,7 +1036,12 @@ impl ByteArena {
     /// figure reported in flush-cycle tracing.
     #[must_use]
     pub fn bytes_reserved(&self) -> usize {
-        self.chunks.iter().map(Vec::capacity).sum()
+        debug_assert_eq!(
+            self.running_bytes_reserved,
+            self.chunks.iter().map(Vec::capacity).sum::<usize>(),
+            "arena running reserved drifted from the chunk capacity sum"
+        );
+        self.running_bytes_reserved
     }
 
     /// Number of chunks (soak tests assert this stabilizes across cycles).
@@ -1037,6 +1058,10 @@ impl ByteArena {
         if self.chunks.is_empty() {
             self.chunks.push(Vec::with_capacity(self.chunk_size));
         }
+        // `retain` drops the dedicated oversized chunks, so recompute rather
+        // than track the deletions. Reset is once per flush cycle, not per
+        // document, so an O(chunks) pass here is off the hot path.
+        self.running_bytes_reserved = self.chunks.iter().map(Vec::capacity).sum();
         for chunk in &mut self.chunks {
             chunk.clear();
         }
@@ -1084,6 +1109,12 @@ pub struct TermInterner<S: BuildHasher = ahash::RandomState> {
     /// ingested document). Exactly equals the former recompute because each
     /// increment already accounts for the arena key, span, and bucket bytes.
     running_bytes_used: usize,
+    /// Running sum of every `Bucket::Many` id-vector's capacity in bytes, so
+    /// [`Self::bytes_reserved`] is O(1) instead of iterating every bucket per
+    /// call. bd-w4j5 gave `bytes_used` this treatment but left `bytes_reserved`
+    /// scanning; at an 8,192-term vocabulary that scan was the single largest
+    /// self-time entry in the QG-2 ingest profile.
+    running_collision_id_bytes: usize,
 }
 
 impl TermInterner<ahash::RandomState> {
@@ -1109,6 +1140,7 @@ impl<S: BuildHasher> TermInterner<S> {
             hasher,
             key_scratch: Vec::with_capacity(64),
             running_bytes_used: 0,
+            running_collision_id_bytes: 0,
         }
     }
 
@@ -1173,23 +1205,31 @@ impl<S: BuildHasher> TermInterner<S> {
         let span = self.arena.push(&self.key_scratch);
         let id = u32::try_from(self.spans.len()).expect("term id space exceeds u32");
         self.spans.push(span);
-        let bucket_bytes = match self.buckets.entry(hash) {
+        // The second element is this insert's exact change to the collision-id
+        // capacity total, so `bytes_reserved` never has to re-scan the buckets.
+        let (bucket_bytes, collision_capacity_delta) = match self.buckets.entry(hash) {
             std::collections::hash_map::Entry::Vacant(v) => {
                 v.insert(Bucket::One(id));
-                TERM_BUCKET_BYTES_ESTIMATE
+                (TERM_BUCKET_BYTES_ESTIMATE, 0)
             }
             std::collections::hash_map::Entry::Occupied(mut o) => match o.get_mut() {
                 Bucket::One(existing) => {
                     let existing = *existing;
-                    *o.get_mut() = Bucket::Many(vec![existing, id]);
-                    2 * std::mem::size_of::<u32>()
+                    let promoted = vec![existing, id];
+                    let gained = promoted.capacity();
+                    *o.get_mut() = Bucket::Many(promoted);
+                    (2 * std::mem::size_of::<u32>(), gained)
                 }
                 Bucket::Many(ids) => {
+                    let before = ids.capacity();
                     ids.push(id);
-                    std::mem::size_of::<u32>()
+                    (std::mem::size_of::<u32>(), ids.capacity() - before)
                 }
             },
         };
+        self.running_collision_id_bytes = self
+            .running_collision_id_bytes
+            .saturating_add(collision_capacity_delta.saturating_mul(std::mem::size_of::<u32>()));
         let added_bytes = FIELD_PREFIX_BYTES
             .saturating_add(term.len())
             .saturating_add(std::mem::size_of::<ArenaSpan>())
@@ -1257,14 +1297,18 @@ impl<S: BuildHasher> TermInterner<S> {
     /// Complete retained interner allocation for RSS/reuse diagnostics.
     #[must_use]
     pub fn bytes_reserved(&self) -> usize {
-        let collision_ids = self
-            .buckets
-            .values()
-            .map(|bucket| match bucket {
-                Bucket::One(_) => 0,
-                Bucket::Many(ids) => ids.capacity() * std::mem::size_of::<u32>(),
-            })
-            .sum::<usize>();
+        let collision_ids = self.running_collision_id_bytes;
+        debug_assert_eq!(
+            collision_ids,
+            self.buckets
+                .values()
+                .map(|bucket| match bucket {
+                    Bucket::One(_) => 0,
+                    Bucket::Many(ids) => ids.capacity() * std::mem::size_of::<u32>(),
+                })
+                .sum::<usize>(),
+            "running collision-id bytes drifted from the bucket scan"
+        );
         self.arena
             .bytes_reserved()
             .saturating_add(
@@ -1289,6 +1333,7 @@ impl<S: BuildHasher> TermInterner<S> {
         self.buckets.clear();
         self.key_scratch.clear();
         self.running_bytes_used = 0;
+        self.running_collision_id_bytes = 0;
     }
 
     /// Arena diagnostics for flush-cycle tracing:
