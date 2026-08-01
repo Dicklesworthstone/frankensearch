@@ -1335,8 +1335,6 @@ pub struct TermScorer<'a> {
     cost: u64,
     size_hint: u32,
     segment_num_docs: u32,
-    blocks_skipped: u64,
-    candidate_docs: u64,
 }
 
 impl<'a> TermScorer<'a> {
@@ -1456,8 +1454,6 @@ impl<'a> TermScorer<'a> {
             cost,
             size_hint,
             segment_num_docs,
-            blocks_skipped: 0,
-            candidate_docs: 0,
         })
     }
 
@@ -1541,70 +1537,6 @@ impl<'a> TermScorer<'a> {
             record_option: self.record_option,
             term_upper_bound,
         })
-    }
-
-    fn current_block_upper_bound(&self) -> Option<f32> {
-        let live_avgdl = self.snapshot.average_field_length()?;
-        let bound = self.cursor.current_block_score_upper_bound(
-            live_avgdl,
-            self.weight,
-            self.record_option,
-        )?;
-        (bound.is_finite() && !bound.is_sign_negative()).then_some(bound)
-    }
-
-    /// Collect a direct term a posting block at a time, skipping a whole block
-    /// when even its best possible `(score, docid)` cannot displace the heap's
-    /// current worst winner.
-    fn collect_top_docs<L>(
-        &mut self,
-        collector: &mut TopDocsCollector,
-        live_docs: &L,
-    ) -> Result<(), ArgusError>
-    where
-        L: LiveDocs + ?Sized,
-    {
-        while let Some(block_first_doc) = self.doc() {
-            let block_last_doc =
-                self.cursor
-                    .current_block_last_doc()
-                    .ok_or(ArgusError::CursorInvariant(
-                        "block-max term cursor has no current block end",
-                    ))?;
-            if block_last_doc < block_first_doc {
-                return Err(ArgusError::CursorInvariant(
-                    "block-max term cursor escaped its current block",
-                ));
-            }
-
-            if let Some(upper_bound) = self.current_block_upper_bound()
-                && !collector.block_can_compete(block_first_doc, upper_bound)
-            {
-                self.blocks_skipped = self.blocks_skipped.saturating_add(1);
-                if block_last_doc == u32::MAX {
-                    while self.next()?.is_some() {}
-                } else {
-                    self.seek(block_last_doc + 1)?;
-                }
-                continue;
-            }
-
-            loop {
-                let Some(doc) = self.doc() else {
-                    break;
-                };
-                if doc > block_last_doc {
-                    break;
-                }
-                let score = self.score()?;
-                self.candidate_docs = self.candidate_docs.saturating_add(1);
-                if live_docs.is_live(doc) {
-                    collector.record_live(doc, Some(score))?;
-                }
-                self.next()?;
-            }
-        }
-        Ok(())
     }
 }
 
@@ -2773,25 +2705,8 @@ impl<'a> ReferenceScorer<'a> {
     /// actually executed while this scorer was collected.
     #[must_use]
     pub(crate) fn pruning_telemetry(&self) -> PruningTelemetry {
-        match &self.node {
-            ScorerNode::Term(term) => PruningTelemetry {
-                blocks_skipped: term.blocks_skipped,
-                candidate_docs: term.candidate_docs,
-                ..PruningTelemetry::default()
-            },
-            ScorerNode::Union(_) => self
-                .union_pruning_stats()
-                .map_or_else(PruningTelemetry::default, PruningTelemetry::from),
-            _ => PruningTelemetry::default(),
-        }
-    }
-
-    #[cfg(test)]
-    fn term_pruning_counts(&self) -> Option<(u64, u64)> {
-        let ScorerNode::Term(term) = &self.node else {
-            return None;
-        };
-        Some((term.blocks_skipped, term.candidate_docs))
+        self.union_pruning_stats()
+            .map_or_else(PruningTelemetry::default, PruningTelemetry::from)
     }
 
     #[cfg(test)]
@@ -3166,14 +3081,9 @@ impl<'a> ReferenceScorer<'a> {
         }
         if let CollectorState::TopDocs(top_docs) = collector
             && !top_docs.exact_count
+            && let ScorerNode::Union(union) = &mut self.node
         {
-            match &mut self.node {
-                ScorerNode::Term(term) if term.cursor.supports_block_max() => {
-                    return term.collect_top_docs(top_docs, live_docs);
-                }
-                ScorerNode::Union(union) => return union.collect_top_docs(top_docs, live_docs),
-                _ => {}
-            }
+            return union.collect_top_docs(top_docs, live_docs);
         }
         while let Some(doc) = self.doc() {
             match collector {
@@ -3915,12 +3825,6 @@ impl PruningTelemetry {
     /// Stable name for the pruning path observed during collection.
     #[must_use]
     pub(crate) const fn plan(self) -> &'static str {
-        if self.max_score_windows == 0
-            && self.block_max_wand_windows == 0
-            && self.blocks_skipped != 0
-        {
-            return "block_max_term";
-        }
         match (
             self.max_score_windows != 0,
             self.block_max_wand_windows != 0,
@@ -3934,17 +3838,8 @@ impl PruningTelemetry {
 
     #[must_use]
     pub(crate) const fn pruning_windows(self) -> u64 {
-        let term_block_max = if self.max_score_windows == 0
-            && self.block_max_wand_windows == 0
-            && self.blocks_skipped != 0
-        {
-            1
-        } else {
-            0
-        };
         self.max_score_windows
             .saturating_add(self.block_max_wand_windows)
-            .saturating_add(term_block_max)
     }
 
     #[must_use]
@@ -5254,16 +5149,6 @@ impl TopDocsCollector {
         } else {
             None
         }
-    }
-
-    /// Whether the best possible key in a posting block can beat the current
-    /// worst retained key. `first_doc` is the smallest remaining docid in the
-    /// block, so this remains exact when `upper_bound == cutoff_score`: a later
-    /// docid loses the tie and the whole block can be skipped.
-    fn block_can_compete(&self, first_doc: u32, upper_bound: f32) -> bool {
-        self.heap.peek().is_none_or(|&cutoff| {
-            self.heap.len() < self.retained || packed_selection_key(first_doc, upper_bound) < cutoff
-        })
     }
 
     /// Sort the global heap, apply offset once, and return page winners.
@@ -9262,97 +9147,6 @@ mod tests {
         }
         assert_ne!(union_order.to_bits(), parse_order.to_bits());
         assert_eq!(candidate_hits[0].score.to_bits(), union_order.to_bits());
-        Ok(())
-    }
-
-    #[test]
-    fn direct_term_block_max_skips_tail_blocks_with_exact_rank_and_ties()
-    -> Result<(), Box<dyn std::error::Error>> {
-        const NUM_DOCS: u32 = 8_192;
-        let lengths = vec![Some(8); usize::try_from(NUM_DOCS)?];
-        let encoded_doclens = EncodedDocLenSection::encode(
-            0,
-            u64::from(NUM_DOCS),
-            &[1],
-            &[DocLenFieldInput::new(1, &lengths)],
-        )?;
-        let doclens = encoded_doclens.section(&[1])?;
-        let field = doclens.field(1).expect("field exists");
-        let snapshot = snapshot(1, u64::from(NUM_DOCS) * 8, u64::from(NUM_DOCS))?;
-        let rows = (0..NUM_DOCS)
-            .map(|doc| Posting::new(doc, if doc < 32 { 64 } else { 1 }))
-            .collect::<Vec<_>>();
-        let encoded_terms = vec![EncodedPostingList::encode_with_block_max(&rows, |_| {
-            Some(fieldnorm_to_id(8))
-        })?];
-        let posting_lists = encoded_terms
-            .iter()
-            .map(|(postings, _)| postings.posting_list())
-            .collect::<Result<Vec<_>, _>>()?;
-        let block_max = validated_block_max_entries(&encoded_terms, &posting_lists, field)?;
-        let live_docs = |doc: u32| !doc.is_multiple_of(17);
-
-        for record_option in [TermRecordOption::WithFreqs, TermRecordOption::Basic] {
-            for (limit, offset) in [(1, 0), (10, 0), (10, 20), (8, 100)] {
-                let mut oracle = sealed_union_with_record_option(
-                    &posting_lists,
-                    None,
-                    field,
-                    &snapshot,
-                    std::slice::from_ref(&rows),
-                    &[1.0],
-                    NUM_DOCS,
-                    record_option,
-                )?;
-                let mut oracle_collector = TopDocsCollector::new(limit, offset)?;
-                oracle_collector.collect(&mut oracle, &live_docs)?;
-                let oracle_hits = oracle_collector.finish()?.hits;
-
-                let mut candidate = sealed_union_with_record_option(
-                    &posting_lists,
-                    Some(&block_max),
-                    field,
-                    &snapshot,
-                    std::slice::from_ref(&rows),
-                    &[1.0],
-                    NUM_DOCS,
-                    record_option,
-                )?;
-                let mut candidate_collector = TopDocsCollector::new(limit, offset)?;
-                candidate_collector.collect(&mut candidate, &live_docs)?;
-                let (blocks_skipped, candidate_docs) = candidate
-                    .term_pruning_counts()
-                    .expect("single-clause union lowers to a direct term");
-                assert_hits_bit_exact(&candidate_collector.finish()?.hits, &oracle_hits);
-                assert!(blocks_skipped > 0, "tail posting blocks should be skipped");
-                assert_eq!(candidate_docs, 128, "only the first block should score");
-                assert_eq!(candidate.pruning_telemetry().plan(), "block_max_term");
-            }
-
-            let mut counted = sealed_union_with_record_option(
-                &posting_lists,
-                Some(&block_max),
-                field,
-                &snapshot,
-                std::slice::from_ref(&rows),
-                &[1.0],
-                NUM_DOCS,
-                record_option,
-            )?;
-            let mut counted_collector = TopDocsCollector::with_exact_count(10, 0)?;
-            counted_collector.collect(&mut counted, &live_docs)?;
-            assert_eq!(counted.term_pruning_counts(), Some((0, 0)));
-            let counted_result = counted_collector.finish()?;
-            assert_eq!(counted_result.total_count, Some(7_710));
-            assert_eq!(
-                counted_result
-                    .hits
-                    .iter()
-                    .map(|hit| hit.global_docid)
-                    .collect::<Vec<_>>(),
-                (1..=10).collect::<Vec<_>>()
-            );
-        }
         Ok(())
     }
 
