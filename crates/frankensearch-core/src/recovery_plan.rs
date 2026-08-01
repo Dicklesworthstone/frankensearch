@@ -73,7 +73,7 @@ use crate::{
     config::ZeroSignalReason,
     generation::{EmbeddingSpaceIdentityV1, EmbeddingSpaceKindV1},
     traits::ModelTier,
-    types::RetrievalTopology,
+    types::{RetrievalTopology, retrieval_topology_fits_request},
 };
 
 mod recovery_model_tier_wire {
@@ -488,56 +488,6 @@ pub enum RequestMode {
     HashControl,
 }
 
-#[derive(Deserialize)]
-#[serde(rename_all = "snake_case")]
-enum RetrievalTopologyTagWire {
-    LexicalOnly,
-    HashControl,
-    FastOnly,
-    QualityOnly,
-    FullProgressive,
-    PartialQuality,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct RetrievalTopologyWire {
-    topology: RetrievalTopologyTagWire,
-    #[serde(default)]
-    coverage_ppm: WireField<u32>,
-}
-
-fn deserialize_retrieval_topology<'de, D>(deserializer: D) -> Result<RetrievalTopology, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let wire = RetrievalTopologyWire::deserialize(deserializer)?;
-    match (wire.topology, wire.coverage_ppm) {
-        (RetrievalTopologyTagWire::LexicalOnly, WireField::Missing) => {
-            Ok(RetrievalTopology::LexicalOnly)
-        }
-        (RetrievalTopologyTagWire::HashControl, WireField::Missing) => {
-            Ok(RetrievalTopology::HashControl)
-        }
-        (RetrievalTopologyTagWire::FastOnly, WireField::Missing) => Ok(RetrievalTopology::FastOnly),
-        (RetrievalTopologyTagWire::QualityOnly, WireField::Missing) => {
-            Ok(RetrievalTopology::QualityOnly)
-        }
-        (RetrievalTopologyTagWire::FullProgressive, WireField::Missing) => {
-            Ok(RetrievalTopology::FullProgressive)
-        }
-        (RetrievalTopologyTagWire::PartialQuality, WireField::Present(coverage_ppm)) => {
-            Ok(RetrievalTopology::PartialQuality { coverage_ppm })
-        }
-        (RetrievalTopologyTagWire::PartialQuality, WireField::Missing) => {
-            Err(serde::de::Error::missing_field("coverage_ppm"))
-        }
-        (_, WireField::Present(_)) => Err(serde::de::Error::custom(
-            "coverage_ppm is only valid for partial_quality topology",
-        )),
-    }
-}
-
 /// Requested operation, including the exact retrieval topology.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct RecoveryRequest {
@@ -549,7 +499,6 @@ pub struct RecoveryRequest {
 #[serde(deny_unknown_fields)]
 struct RecoveryRequestWire {
     mode: RequestMode,
-    #[serde(deserialize_with = "deserialize_retrieval_topology")]
     requested_topology: RetrievalTopology,
 }
 
@@ -1375,9 +1324,7 @@ pub struct SemanticResponseContract {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SemanticResponseContractWire {
-    #[serde(deserialize_with = "deserialize_retrieval_topology")]
     requested_topology: RetrievalTopology,
-    #[serde(deserialize_with = "deserialize_retrieval_topology")]
     realized_topology: RetrievalTopology,
     coverage_ppm: u32,
     admitted_semantic_scores: u64,
@@ -1458,28 +1405,8 @@ impl SemanticResponseContract {
     }
 
     fn validate(&self) -> Result<(), RecoveryContractError> {
-        let topology_compatible = match self.requested_topology {
-            RetrievalTopology::FastOnly => matches!(
-                self.realized_topology,
-                RetrievalTopology::FastOnly | RetrievalTopology::LexicalOnly
-            ),
-            RetrievalTopology::QualityOnly => matches!(
-                self.realized_topology,
-                RetrievalTopology::QualityOnly
-                    | RetrievalTopology::PartialQuality { .. }
-                    | RetrievalTopology::LexicalOnly
-            ),
-            RetrievalTopology::FullProgressive => matches!(
-                self.realized_topology,
-                RetrievalTopology::FullProgressive
-                    | RetrievalTopology::PartialQuality { .. }
-                    | RetrievalTopology::LexicalOnly
-            ),
-            RetrievalTopology::HashControl => {
-                matches!(self.realized_topology, RetrievalTopology::HashControl)
-            }
-            RetrievalTopology::LexicalOnly | RetrievalTopology::PartialQuality { .. } => false,
-        };
+        let topology_compatible =
+            retrieval_topology_fits_request(self.requested_topology, self.realized_topology);
         if !topology_compatible {
             return Err(RecoveryContractError::IncompatibleResponseTopology {
                 requested: self.requested_topology,
@@ -1514,15 +1441,20 @@ impl SemanticResponseContract {
         }
 
         match (
+            self.requested_topology,
             self.realized_topology,
             self.degradation_reason_code.as_deref(),
         ) {
-            (RetrievalTopology::LexicalOnly, Some(code)) if !code.trim().is_empty() => Ok(()),
-            (RetrievalTopology::LexicalOnly, _) => {
+            (RetrievalTopology::LexicalOnly, RetrievalTopology::LexicalOnly, None) => Ok(()),
+            (RetrievalTopology::LexicalOnly, RetrievalTopology::LexicalOnly, Some(_)) => {
+                Err(RecoveryContractError::UnexpectedDegradationReason)
+            }
+            (_, RetrievalTopology::LexicalOnly, Some(code)) if !code.trim().is_empty() => Ok(()),
+            (_, RetrievalTopology::LexicalOnly, _) => {
                 Err(RecoveryContractError::MissingDegradationReason)
             }
-            (_, None) => Ok(()),
-            (_, Some(_)) => Err(RecoveryContractError::UnexpectedDegradationReason),
+            (_, _, None) => Ok(()),
+            (_, _, Some(_)) => Err(RecoveryContractError::UnexpectedDegradationReason),
         }
     }
 }
@@ -1566,7 +1498,6 @@ struct RecoveryPlanWire {
     state_code: String,
     provenance: SemanticProvenance,
     mode: RequestMode,
-    #[serde(deserialize_with = "deserialize_retrieval_topology")]
     requested_topology: RetrievalTopology,
     policy: RecoveryPolicy,
     semantic_available: bool,
@@ -3433,6 +3364,16 @@ mod tests {
                 COMPLETE_COVERAGE_PPM,
             ),
             (
+                RetrievalTopology::FullProgressive,
+                RetrievalTopology::FastOnly,
+                COMPLETE_COVERAGE_PPM,
+            ),
+            (
+                RetrievalTopology::FullProgressive,
+                RetrievalTopology::QualityOnly,
+                COMPLETE_COVERAGE_PPM,
+            ),
+            (
                 RetrievalTopology::QualityOnly,
                 RetrievalTopology::PartialQuality {
                     coverage_ppm: 250_000,
@@ -3483,32 +3424,41 @@ mod tests {
 
     #[test]
     fn response_contract_rejects_silent_or_impossible_contribution_claims() {
-        for requested in [
+        assert_eq!(
+            SemanticResponseContract::new(
+                RetrievalTopology::LexicalOnly,
+                RetrievalTopology::LexicalOnly,
+                0,
+                0,
+                Some("recovery.state.model_missing".to_owned()),
+            ),
+            Err(RecoveryContractError::UnexpectedDegradationReason)
+        );
+        SemanticResponseContract::new(
             RetrievalTopology::LexicalOnly,
-            RetrievalTopology::PartialQuality {
-                coverage_ppm: 500_000,
-            },
-        ] {
-            assert!(matches!(
-                SemanticResponseContract::new(
-                    requested,
-                    RetrievalTopology::LexicalOnly,
-                    0,
-                    0,
-                    Some("recovery.state.model_missing".to_owned()),
-                ),
-                Err(RecoveryContractError::IncompatibleResponseTopology { .. })
-            ));
-        }
+            RetrievalTopology::LexicalOnly,
+            0,
+            0,
+            None,
+        )
+        .expect("an explicitly lexical request is not a degradation");
+        assert!(matches!(
+            SemanticResponseContract::new(
+                RetrievalTopology::PartialQuality {
+                    coverage_ppm: 500_000,
+                },
+                RetrievalTopology::LexicalOnly,
+                0,
+                0,
+                Some("recovery.state.model_missing".to_owned()),
+            ),
+            Err(RecoveryContractError::IncompatibleResponseTopology { .. })
+        ));
         for (requested, realized) in [
             (RetrievalTopology::FastOnly, RetrievalTopology::QualityOnly),
             (
                 RetrievalTopology::QualityOnly,
                 RetrievalTopology::FullProgressive,
-            ),
-            (
-                RetrievalTopology::FullProgressive,
-                RetrievalTopology::FastOnly,
             ),
             (
                 RetrievalTopology::HashControl,
@@ -4672,7 +4622,6 @@ mod tests {
         #[derive(Deserialize)]
         #[serde(deny_unknown_fields)]
         struct TopologyHarness {
-            #[serde(deserialize_with = "deserialize_retrieval_topology")]
             value: RetrievalTopology,
         }
 

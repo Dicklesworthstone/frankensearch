@@ -180,7 +180,13 @@ pub use traits::{
     cosine_similarity, l2_normalize, truncate_embedding,
 };
 pub use types::{
-    BoundQueryEmbedding, DocId, EmbeddingMetrics, FusedHit, IndexMetrics, IndexableDocument,
-    PhaseMetrics, RankChanges, RetrievalTopology, ScoreSource, ScoredResult, SearchMetrics,
-    SearchMode, SearchPhase, TieredQueryEmbeddings, VectorHit,
+    BoundQueryEmbedding, CoverageBasisV1, CoverageCountsV1, CoverageRelationV1, CoverageScopeV1,
+    CoverageTierV1, CoverageUnknownReasonV1, CoverageUnverifiedReasonV1, CoverageWitnessV1,
+    CrossScopeCoverageEvidenceV1, CrossTierUniverseEvidenceV1, DerivedRetrievalTopologyV1, DocId,
+    EmbeddingMetrics, FusedHit, IndexMetrics, IndexableDocument, PhaseMetrics, RankChanges,
+    RealizedTierCoverageV1, RetrievalIntentV1, RetrievalTopology, ScoreSource, ScoredResult,
+    SearchMetrics, SearchMode, SearchPhase, TIER_COVERAGE_SCHEMA_VERSION_V1, TierCoveragePairV1,
+    TierCoverageRealizationV1, TierCoverageRequestV1, TierCoverageV1, TieredQueryEmbeddings,
+    TrustedTierCoverageContextV1, UntrustedDerivedRetrievalTopologyV1, UntrustedTierCoveragePairV1,
+    UntrustedTierCoverageV1, VectorHit, retrieval_topology_fits_request,
 };
