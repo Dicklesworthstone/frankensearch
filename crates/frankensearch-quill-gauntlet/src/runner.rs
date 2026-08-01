@@ -10965,6 +10965,27 @@ mod tests {
     }
 
     #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
+    fn assert_union_horizon_interruption_location(
+        location: frankensearch_quill::index::ConformanceQueryInterruptionLocation,
+        phase: frankensearch_quill::argus::ConformanceQueryWorkPhase,
+        candidate_scored: bool,
+        units: u64,
+        consumed_before: u64,
+    ) {
+        assert_eq!(location.refill_ordinal(), 3);
+        assert_eq!(location.window_start(), 8_192);
+        assert_eq!(location.phase(), phase);
+        assert_eq!(location.candidate_doc(), Some(9_000));
+        assert_eq!(location.candidate_scored(), candidate_scored);
+        assert_eq!(
+            location.work_kind(),
+            frankensearch_quill::argus::QueryWorkKind::PostingBlock,
+        );
+        assert_eq!(location.units(), units);
+        assert_eq!(location.consumed_before(), consumed_before);
+    }
+
+    #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
     fn run_tombstoned_union_horizon_with_fuel(
         cx: &Cx,
         snapshot: &frankensearch_quill::KeeperSnapshot,
@@ -14905,6 +14926,7 @@ mod tests {
                 .index()
                 .expect("cancellation UNION_HORIZON Quill index");
             let controller = index.conformance_cancellation_controller();
+            assert_eq!(controller.query_interruption_location(), None);
             let snapshot_before = index.snapshot();
             let writer_before = index
                 .conformance_pending_writer_state()
@@ -14929,6 +14951,7 @@ mod tests {
             let control_checkpoints = controller.observed_checkpoints();
             assert!(control_checkpoints > 3);
             assert!(!controller.fired());
+            assert_eq!(controller.query_interruption_location(), None);
             assert_eq!(controller.recorded_pruning_receipts_at_fire(), 0);
             assert_eq!(controller.discarded_pruning_trace_sessions(), 0);
             assert_eq!(control_result.hits.len(), 1);
@@ -14943,6 +14966,7 @@ mod tests {
             );
             controller.disarm();
 
+            let mut expected_location = None;
             for attempt in 1..=2 {
                 controller
                     .arm(
@@ -14965,6 +14989,21 @@ mod tests {
                 ));
                 assert!(controller.fired());
                 assert_eq!(controller.observed_checkpoints(), control_checkpoints);
+                let location = controller
+                    .query_interruption_location()
+                    .expect("final UNION_HORIZON cancellation binds its exact scorer location");
+                assert_union_horizon_interruption_location(
+                    location,
+                    frankensearch_quill::argus::ConformanceQueryWorkPhase::Drain,
+                    true,
+                    0,
+                    0,
+                );
+                if let Some(expected_location) = expected_location {
+                    assert_eq!(location, expected_location);
+                } else {
+                    expected_location = Some(location);
+                }
                 assert_eq!(controller.recorded_pruning_receipts_at_fire(), 0);
                 assert_eq!(controller.discarded_pruning_trace_sessions(), 0);
                 assert!(cx.is_cancel_requested());
@@ -14995,6 +15034,11 @@ mod tests {
                 .expect("clean UNION_HORIZON replay after cancellation");
             assert_eq!(retry_result, control_result);
             assert_eq!(retry_trace, control_trace);
+            assert_eq!(
+                controller.query_interruption_location(),
+                None,
+                "a clean replay must reset the prior query's interruption receipt",
+            );
             assert!(Arc::ptr_eq(&snapshot_before, &index.snapshot()));
             assert_eq!(
                 index
@@ -15085,6 +15129,8 @@ mod tests {
                 failing_config,
             )
             .expect("bind UNION_HORIZON failing fuel snapshot");
+            let failing_controller = failing_index.conformance_cancellation_controller();
+            assert_eq!(failing_controller.query_interruption_location(), None);
             let failing_snapshot_before = failing_index.snapshot();
             let failing_writer_before = failing_index
                 .conformance_pending_writer_state()
@@ -15101,8 +15147,19 @@ mod tests {
                 )
                 .expect_err("N-1 UNION_HORIZON fuel must fail without a receipt");
             let first_diagnostics = union_horizon_fuel_diagnostics(&first_error);
-            assert_eq!(first_diagnostics.0, failing_budget);
-            assert_eq!(first_diagnostics.1, failing_budget);
+            assert_eq!(minimum_successful_budget, 75);
+            assert_eq!(failing_budget, 74);
+            assert_eq!(first_diagnostics, (74, 74, 1, 6, 67, 0));
+            let first_location = failing_controller
+                .query_interruption_location()
+                .expect("N-1 UNION_HORIZON fuel binds its exact scorer location");
+            assert_union_horizon_interruption_location(
+                first_location,
+                frankensearch_quill::argus::ConformanceQueryWorkPhase::Seek,
+                false,
+                1,
+                74,
+            );
             assert!(Arc::ptr_eq(
                 &failing_snapshot_before,
                 &failing_index.snapshot(),
@@ -15126,6 +15183,17 @@ mod tests {
                 .expect_err("repeated N-1 UNION_HORIZON fuel must fail without a receipt");
             let second_diagnostics = union_horizon_fuel_diagnostics(&second_error);
             assert_eq!(second_diagnostics, first_diagnostics);
+            let second_location = failing_controller
+                .query_interruption_location()
+                .expect("repeated N-1 UNION_HORIZON fuel rebinds its exact scorer location");
+            assert_eq!(second_location, first_location);
+            assert_union_horizon_interruption_location(
+                second_location,
+                frankensearch_quill::argus::ConformanceQueryWorkPhase::Seek,
+                false,
+                1,
+                74,
+            );
             assert!(Arc::ptr_eq(
                 &failing_snapshot_before,
                 &failing_index.snapshot(),
