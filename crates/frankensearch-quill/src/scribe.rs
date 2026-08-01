@@ -100,6 +100,37 @@ pub struct AnalyzedToken {
     pub position_length: usize,
 }
 
+/// Borrowed normalized token emitted directly into an ingest consumer.
+///
+/// The default tokenizer uses the original input slice when an ASCII token is
+/// already lowercase, and its retained scratch only when normalization changes
+/// bytes. The view is valid only for the duration of the sink call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AnalyzedTokenRef<'a> {
+    /// Normalized token text.
+    pub text: &'a str,
+    /// Logical token position, starting at zero.
+    pub position: u32,
+    /// Source byte offset of the first token byte.
+    pub offset_from: usize,
+    /// Source byte offset immediately after the token.
+    pub offset_to: usize,
+    /// Position span. The default analyzer always emits one.
+    pub position_length: usize,
+}
+
+impl<'a> From<&'a AnalyzedToken> for AnalyzedTokenRef<'a> {
+    fn from(token: &'a AnalyzedToken) -> Self {
+        Self {
+            text: token.text.as_str(),
+            position: token.position,
+            offset_from: token.offset_from,
+            offset_to: token.offset_to,
+            position_length: token.position_length,
+        }
+    }
+}
+
 /// Allocation-free callback surface shared by scalar and future SIMD/CASS
 /// analyzer families.
 ///
@@ -120,6 +151,20 @@ pub trait TokenAnalyzer: sealed::Sealed {
     ///
     /// Callers invoke this only for kinds accepted by [`Self::supports`].
     fn analyze(&mut self, analyzer: AnalyzerKind, text: &str, sink: &mut dyn FnMut(&AnalyzedToken));
+
+    /// Analyze directly into a consumer that does not require owned token text.
+    ///
+    /// The default bridge preserves custom analyzer behavior. Analyzer
+    /// families with a borrowed fast path override this method so unchanged
+    /// input bytes can flow straight into the term interner.
+    fn analyze_borrowed(
+        &mut self,
+        analyzer: AnalyzerKind,
+        text: &str,
+        sink: &mut dyn for<'token> FnMut(AnalyzedTokenRef<'token>),
+    ) {
+        self.analyze(analyzer, text, &mut |token| sink(token.into()));
+    }
 
     /// Retained analyzer scratch included in RSS/reuse diagnostics.
     fn bytes_reserved(&self) -> usize {
@@ -179,6 +224,41 @@ pub fn analyze_admitted<A: TokenAnalyzer + ?Sized>(
     }
     let mut report = AnalysisReport::default();
     analyzer.analyze(analyzer_kind, text, &mut |token| {
+        report.raw_tokens += 1;
+        if token.text.len() > MAX_TERM_BYTES {
+            report.oversized_tokens += 1;
+            tracing::warn!(
+                token_bytes = token.text.len(),
+                max_token_bytes = MAX_TERM_BYTES,
+                position = token.position,
+                "Quill dropped an oversized analyzed token"
+            );
+            return;
+        }
+        report.admitted_tokens += 1;
+        sink(token);
+    });
+    Ok(report)
+}
+
+/// Analyze directly into a borrowed consumer and apply the global term limit.
+///
+/// This is the ingest form of [`analyze_admitted`]. It preserves the same
+/// report and position-gap semantics while allowing unchanged normalized text
+/// to bypass analyzer-owned string construction.
+fn analyze_admitted_borrowed<A: TokenAnalyzer + ?Sized>(
+    analyzer: &mut A,
+    analyzer_kind: AnalyzerKind,
+    text: &str,
+    sink: &mut dyn for<'token> FnMut(AnalyzedTokenRef<'token>),
+) -> Result<AnalysisReport, UnsupportedAnalysis> {
+    if !analyzer.supports(analyzer_kind) {
+        return Err(UnsupportedAnalysis {
+            analyzer: analyzer_kind,
+        });
+    }
+    let mut report = AnalysisReport::default();
+    analyzer.analyze_borrowed(analyzer_kind, text, &mut |token| {
         report.raw_tokens += 1;
         if token.text.len() > MAX_TERM_BYTES {
             report.oversized_tokens += 1;
@@ -465,6 +545,45 @@ impl TokenAnalyzer for BoundaryMaskTokenizer {
     }
 }
 
+#[inline]
+fn emit_normalized_token(
+    scratch: &mut String,
+    source: &str,
+    all_ascii: bool,
+    position: u32,
+    offset_from: usize,
+    offset_to: usize,
+    sink: &mut dyn for<'token> FnMut(AnalyzedTokenRef<'token>),
+) {
+    if all_ascii && !source.as_bytes().iter().any(u8::is_ascii_uppercase) {
+        sink(AnalyzedTokenRef {
+            text: source,
+            position,
+            offset_from,
+            offset_to,
+            position_length: 1,
+        });
+        return;
+    }
+
+    scratch.clear();
+    if all_ascii {
+        scratch.push_str(source);
+        scratch.make_ascii_lowercase();
+    } else {
+        for source_char in source.chars() {
+            scratch.extend(source_char.to_lowercase());
+        }
+    }
+    sink(AnalyzedTokenRef {
+        text: scratch.as_str(),
+        position,
+        offset_from,
+        offset_to,
+        position_length: 1,
+    });
+}
+
 impl TokenAnalyzer for FrankensearchTokenizer {
     fn supports(&self, analyzer: AnalyzerKind) -> bool {
         analyzer == AnalyzerKind::FrankensearchDefault
@@ -475,6 +594,24 @@ impl TokenAnalyzer for FrankensearchTokenizer {
         analyzer: AnalyzerKind,
         text: &str,
         sink: &mut dyn FnMut(&AnalyzedToken),
+    ) {
+        let mut token = AnalyzedToken::default();
+        self.analyze_borrowed(analyzer, text, &mut |borrowed| {
+            token.text.clear();
+            token.text.push_str(borrowed.text);
+            token.position = borrowed.position;
+            token.offset_from = borrowed.offset_from;
+            token.offset_to = borrowed.offset_to;
+            token.position_length = borrowed.position_length;
+            sink(&token);
+        });
+    }
+
+    fn analyze_borrowed(
+        &mut self,
+        analyzer: AnalyzerKind,
+        text: &str,
+        sink: &mut dyn for<'token> FnMut(AnalyzedTokenRef<'token>),
     ) {
         debug_assert_eq!(analyzer, AnalyzerKind::FrankensearchDefault);
         const NO_TOKEN: usize = usize::MAX;
@@ -515,21 +652,16 @@ impl TokenAnalyzer for FrankensearchTokenizer {
                             all_ascii = true;
                         } else {
                             debug_assert_ne!(offset_from, NO_TOKEN);
-                            self.token.text.clear();
                             let source = &text[offset_from..at];
-                            if all_ascii {
-                                self.token.text.push_str(source);
-                                self.token.text.make_ascii_lowercase();
-                            } else {
-                                for source_char in source.chars() {
-                                    self.token.text.extend(source_char.to_lowercase());
-                                }
-                            }
-                            self.token.position = position;
-                            self.token.offset_from = offset_from;
-                            self.token.offset_to = at;
-                            self.token.position_length = 1;
-                            sink(&self.token);
+                            emit_normalized_token(
+                                &mut self.token.text,
+                                source,
+                                all_ascii,
+                                position,
+                                offset_from,
+                                at,
+                                sink,
+                            );
 
                             position = next_token_position(position);
                             offset_from = NO_TOKEN;
@@ -553,21 +685,16 @@ impl TokenAnalyzer for FrankensearchTokenizer {
                     all_ascii &= ch.is_ascii();
                 }
             } else if offset_from != NO_TOKEN {
-                self.token.text.clear();
                 let source = &text[offset_from..cursor];
-                if all_ascii {
-                    self.token.text.push_str(source);
-                    self.token.text.make_ascii_lowercase();
-                } else {
-                    for source_char in source.chars() {
-                        self.token.text.extend(source_char.to_lowercase());
-                    }
-                }
-                self.token.position = position;
-                self.token.offset_from = offset_from;
-                self.token.offset_to = cursor;
-                self.token.position_length = 1;
-                sink(&self.token);
+                emit_normalized_token(
+                    &mut self.token.text,
+                    source,
+                    all_ascii,
+                    position,
+                    offset_from,
+                    cursor,
+                    sink,
+                );
 
                 position = next_token_position(position);
                 offset_from = NO_TOKEN;
@@ -576,21 +703,16 @@ impl TokenAnalyzer for FrankensearchTokenizer {
         }
 
         if offset_from != NO_TOKEN {
-            self.token.text.clear();
             let source = &text[offset_from..len];
-            if all_ascii {
-                self.token.text.push_str(source);
-                self.token.text.make_ascii_lowercase();
-            } else {
-                for source_char in source.chars() {
-                    self.token.text.extend(source_char.to_lowercase());
-                }
-            }
-            self.token.position = position;
-            self.token.offset_from = offset_from;
-            self.token.offset_to = len;
-            self.token.position_length = 1;
-            sink(&self.token);
+            emit_normalized_token(
+                &mut self.token.text,
+                source,
+                all_ascii,
+                position,
+                offset_from,
+                len,
+                sink,
+            );
         }
     }
 
@@ -2500,7 +2622,7 @@ impl<A: TokenAnalyzer> ColumnarAccumulator<A> {
                         let _tokenize_timer =
                             crate::tracing_conventions::StageTimer::new(&tokenize_span);
                         let _tokenize_entered = tokenize_span.enter();
-                        let report = analyze_admitted(
+                        let report = analyze_admitted_borrowed(
                             &mut self.analyzer,
                             analyzer,
                             value.text,
