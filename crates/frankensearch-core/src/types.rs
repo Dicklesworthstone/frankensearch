@@ -808,18 +808,20 @@ mod tests {
         let error = bound
             .verify_space_identity(&quality_space.space.fingerprint(), "quality")
             .expect_err("fast vector must not enter the quality space");
-        match error {
-            SearchError::InvalidConfig {
-                field,
-                value,
-                reason,
-            } => {
-                assert_eq!(field, "query_embedding.quality.space_identity");
-                assert_eq!(value, bound.space_fingerprint());
-                assert!(reason.contains("different embedding space"));
-                assert!(reason.contains(&quality_space.space.fingerprint()));
-            }
-            other => panic!("expected InvalidConfig, got {other:?}"),
+        assert!(
+            matches!(&error, SearchError::InvalidConfig { .. }),
+            "expected InvalidConfig, got {error:?}",
+        );
+        if let SearchError::InvalidConfig {
+            field,
+            value,
+            reason,
+        } = error
+        {
+            assert_eq!(field, "query_embedding.quality.space_identity");
+            assert_eq!(value, bound.space_fingerprint());
+            assert!(reason.contains("different embedding space"));
+            assert!(reason.contains(&quality_space.space.fingerprint()));
         }
     }
 
