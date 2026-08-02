@@ -28216,15 +28216,15 @@ mod tests {
         let triples = [
             (
                 "x86_64-unknown-linux-musl",
-                "fsfs-1.0.0-x86_64-unknown-linux-musl.tar.xz",
+                "fsfs-lite-1.0.0-x86_64-unknown-linux-musl.tar.xz",
             ),
             (
                 "aarch64-unknown-linux-musl",
-                "fsfs-1.0.0-aarch64-unknown-linux-musl.tar.xz",
+                "fsfs-lite-1.0.0-aarch64-unknown-linux-musl.tar.xz",
             ),
             (
                 "x86_64-apple-darwin",
-                "fsfs-1.0.0-x86_64-apple-darwin.tar.xz",
+                "fsfs-lite-1.0.0-x86_64-apple-darwin.tar.xz",
             ),
             (
                 "aarch64-apple-darwin",
@@ -28256,7 +28256,7 @@ mod tests {
             "should not double-prefix the version"
         );
         assert!(
-            filename.starts_with("fsfs-2.3.4-"),
+            filename.starts_with("fsfs-lite-2.3.4-"),
             "version in filename should have v stripped: {filename}"
         );
     }
