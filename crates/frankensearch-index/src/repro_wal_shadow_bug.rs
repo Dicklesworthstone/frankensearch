@@ -16,7 +16,7 @@ mod tests {
         ))
     }
 
-    /// A WAL append that reuses a sealed record's doc_id supersedes that
+    /// A WAL append that reuses a sealed record's `doc_id` supersedes that
     /// record: search must score only the live WAL revision, never the stale
     /// main row. The query is aligned exactly with the SUPERSEDED vector, so
     /// a leak is loud — the stale row scores 1.0, the live revision 0.0.
@@ -42,9 +42,10 @@ mod tests {
             .expect("search after WAL supersession");
         assert_eq!(hits.len(), 1, "doc-a must remain searchable");
         assert_eq!(hits[0].doc_id, "doc-a");
-        assert_eq!(
-            hits[0].score, 0.0,
-            "sealed main record leaked past its WAL supersession"
+        assert!(
+            hits[0].score.abs() < f32::EPSILON,
+            "sealed main record leaked past its WAL supersession: score {}",
+            hits[0].score
         );
 
         let _ = fs::remove_file(&path);
