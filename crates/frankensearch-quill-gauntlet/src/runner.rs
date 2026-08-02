@@ -17029,6 +17029,7 @@ mod tests {
             Term(String),
             Phrase(Vec<String>),
             NegatedTerm(String),
+            Fielded(&'static str, String),
         }
         impl Operand {
             fn render(&self, out: &mut String) {
@@ -17043,6 +17044,11 @@ mod tests {
                         out.push('-');
                         out.push_str(term);
                     }
+                    Self::Fielded(field, term) => {
+                        out.push_str(field);
+                        out.push(':');
+                        out.push_str(term);
+                    }
                 }
             }
         }
@@ -17052,7 +17058,7 @@ mod tests {
         }
 
         fn generate_operand(rng: &mut TreeRng, vocabulary: &[String]) -> Operand {
-            match rng.bounded(4) {
+            match rng.bounded(6) {
                 0 => {
                     let words = (0..2 + rng.bounded(3))
                         .map(|_| pick(rng, vocabulary).to_owned())
@@ -17060,6 +17066,13 @@ mod tests {
                     Operand::Phrase(words)
                 }
                 1 => Operand::NegatedTerm(pick(rng, vocabulary).to_owned()),
+                // Field scope is squarely in the pinned grammar
+                // (`field:value`). `title:` is EXCLUDED pending the campaign's
+                // third finding: an explicit title-fielded literal inside a
+                // mixed OR/AND chain scores at exactly HALF the oracle — the
+                // 2.0 title boost is present at Quill's parse level (pinned by
+                // existing parser tests) but lost by execution for this shape.
+                2 => Operand::Fielded("content", pick(rng, vocabulary).to_owned()),
                 _ => Operand::Term(pick(rng, vocabulary).to_owned()),
             }
         }
