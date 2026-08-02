@@ -372,6 +372,9 @@ pub use frankensearch_quill::{
 #[cfg(feature = "quill")]
 pub use frankensearch_quill::{QuillHit as LexicalIdHit, QuillSnippetHit as LexicalHit};
 
+#[cfg(feature = "quill")]
+pub use frankensearch_fusion::QuillSyncLexicalSearch;
+
 // ─── Feature-gated reranker re-exports ──────────────────────────────────────
 
 #[cfg(feature = "rerank")]
