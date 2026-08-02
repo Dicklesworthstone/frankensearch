@@ -17,18 +17,27 @@
     clippy::significant_drop_tightening
 )]
 
+#[cfg(target_arch = "x86_64")]
 use std::hint::black_box;
+#[cfg(target_arch = "x86_64")]
 use std::time::{Duration, Instant};
 
-use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
+#[cfg(target_arch = "x86_64")]
+use criterion::BenchmarkId;
+use criterion::{Criterion, criterion_group, criterion_main};
+#[cfg(target_arch = "x86_64")]
 use frankensearch_index::{
     PreparedQuery4bit, dot_4bit_prepared, dot_4bit_prepared_dynamic, prepare_4bit_query,
 };
 
+#[cfg(target_arch = "x86_64")]
 const DIM: usize = 384;
+#[cfg(target_arch = "x86_64")]
 const PACKED_DIM: usize = DIM / 2;
+#[cfg(target_arch = "x86_64")]
 const N: usize = 4096;
 
+#[cfg(target_arch = "x86_64")]
 fn xorshift(s: &mut u64) -> i8 {
     *s ^= *s << 13;
     *s ^= *s >> 7;
@@ -37,11 +46,13 @@ fn xorshift(s: &mut u64) -> i8 {
     (((*s >> 40) % 255) as i8).wrapping_sub(127)
 }
 
+#[cfg(target_arch = "x86_64")]
 fn build_corpus(n: usize, dim: usize, seed: u64) -> Vec<i8> {
     let mut s = seed;
     (0..n * dim).map(|_| xorshift(&mut s)).collect()
 }
 
+#[cfg(target_arch = "x86_64")]
 fn build_fourbit_corpus(seed: u64) -> Vec<u8> {
     let mut state = seed;
     (0..N * PACKED_DIM)
@@ -191,6 +202,7 @@ fn paired_fixed_ratio<const CANDIDATE_FIXED: bool>(corpus: &[i8], query: &[i8]) 
     ratios
 }
 
+#[cfg(target_arch = "x86_64")]
 fn time_fourbit_batch<const FIXED: bool>(
     corpus: &[u8],
     query: &PreparedQuery4bit,
@@ -213,6 +225,7 @@ fn time_fourbit_batch<const FIXED: bool>(
     started.elapsed()
 }
 
+#[cfg(target_arch = "x86_64")]
 fn paired_fourbit_ratio<const CANDIDATE_FIXED: bool>(
     corpus: &[u8],
     query: &PreparedQuery4bit,
@@ -302,6 +315,7 @@ unsafe fn dot_i8_4acc(stored: &[i8], query: &[i8]) -> i32 {
     }
 }
 
+#[cfg_attr(not(target_arch = "x86_64"), allow(clippy::needless_pass_by_ref_mut))]
 fn bench(c: &mut Criterion) {
     #[cfg(target_arch = "x86_64")]
     if !std::is_x86_feature_detected!("avx2") {
@@ -310,8 +324,8 @@ fn bench(c: &mut Criterion) {
     }
     #[cfg(not(target_arch = "x86_64"))]
     {
+        let _ = c;
         eprintln!("i8_dot_ilp: non-x86_64; skipping");
-        return;
     }
     #[cfg(target_arch = "x86_64")]
     {
