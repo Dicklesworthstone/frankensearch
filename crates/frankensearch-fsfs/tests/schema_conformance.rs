@@ -892,6 +892,66 @@ fn test_release_manifest_conformance() {
 }
 
 #[test]
+fn test_release_manifest_optional_fields_are_optional_in_rust() {
+    let path = fixture_dir().join("fsfs-packaging-release-install-release-manifest-v1.json");
+    let raw = std::fs::read_to_string(&path).expect("read fixture");
+    let mut manifest: serde_json::Value =
+        serde_json::from_str(&raw).expect("parse release manifest fixture as JSON");
+
+    let artifacts = manifest
+        .get_mut("artifacts")
+        .and_then(serde_json::Value::as_array_mut)
+        .expect("release manifest artifacts array");
+    for artifact in artifacts {
+        let removed = artifact
+            .as_object_mut()
+            .expect("release artifact object")
+            .remove("signature");
+        assert!(
+            removed.is_some(),
+            "canonical artifact must carry a signature"
+        );
+    }
+    let removed = manifest
+        .as_object_mut()
+        .expect("release manifest object")
+        .remove("compatibility_notes");
+    assert!(
+        removed.is_some(),
+        "canonical manifest must carry compatibility notes"
+    );
+
+    let mut cache = BTreeMap::new();
+    let schema = load_schema(
+        &mut cache,
+        &schema_dir(),
+        "fsfs-packaging-release-install-v1.schema.json",
+    );
+    let errors: Vec<String> = schema
+        .iter_errors(&manifest)
+        .map(|error| error.to_string())
+        .collect();
+    assert!(
+        errors.is_empty(),
+        "unsigned release manifest without compatibility notes must remain schema-valid: {}",
+        errors.join("; ")
+    );
+
+    let parsed: frankensearch_fsfs::packaging::ReleaseManifest =
+        serde_json::from_value(manifest.clone()).expect("parse schema-valid optional omissions");
+    assert!(parsed.compatibility_notes.is_none());
+    assert!(
+        parsed
+            .artifacts
+            .iter()
+            .all(|artifact| artifact.signature.is_none()),
+        "omitted signatures must remain absent"
+    );
+    let round_tripped = serde_json::to_value(parsed).expect("serialize optional omissions");
+    assert_eq!(round_tripped, manifest);
+}
+
+#[test]
 fn test_upgrade_plan_conformance() {
     let path = fixture_dir().join("fsfs-packaging-release-install-upgrade-plan-v1.json");
     let raw = std::fs::read_to_string(&path).expect("read fixture");
