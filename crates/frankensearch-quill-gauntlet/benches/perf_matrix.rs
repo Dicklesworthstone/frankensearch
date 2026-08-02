@@ -4849,7 +4849,26 @@ fn run_memory_child() {
             };
             let _ = index_batches(&context, &index, &corpus, count, None);
             let _ = commit(&context, &index);
-            let bytes = index.segment_stats().managed_disk_bytes;
+            // bd-enf6z: managed_disk_bytes short-circuits to 0 when the keeper
+            // has no directory, so the in-memory Quill arm reported 0 index
+            // bytes while the Tantivy arm reported real file lengths — a
+            // structural bias in Quill's favor. The manifest's per-segment
+            // file_len records the exact FSLX byte image and is populated for
+            // in-memory indexes too.
+            let bytes: u64 = index
+                .snapshot()
+                .loaded_manifest()
+                .manifest
+                .segments
+                .iter()
+                .map(|segment| segment.file_len)
+                .sum();
+            assert!(
+                bytes > 0,
+                "QG-7 Quill arm measured a zero-byte index footprint for a \
+                 committed non-empty corpus; the footprint seam is broken \
+                 (bd-enf6z would regress)"
+            );
             let rss = peak_rss_bytes().unwrap_or_default();
             println!("quill-perf-child\t{rss}\t{bytes}");
             return;
