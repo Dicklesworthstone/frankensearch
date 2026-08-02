@@ -271,7 +271,7 @@ blob_stream() {
   esac
 }
 
-lint_one() {
+lint_one_materialized() {
   local requested="$1"
   resolve_ledger "${requested}"
 
@@ -366,13 +366,23 @@ coefficient of variation[_ -]*gate/ ||
       side_by_side = 0; self_speedup_class = 0; incumbent_class = 0
       actual_incumbent = 0; incumbent_ratio = 0; competitive_claim = 0
     }
-    function flush(    upper, explicit_reject, explicit_keep, exempt,
+    function entry_touched(first, last,    i) {
+      # bd-z4lqq: newness used to key on the HEADING line alone, so a body-only
+      # edit to a historical entry (e.g. flipping a REJECT rationale to KEEP
+      # wording) was never gated. An entry is touched if ANY line of its span
+      # appears in the diff.
+      for (i = first; i <= last; i++) {
+        if (added[i]) return 1
+      }
+      return 0
+    }
+    function flush(end_line,    upper, explicit_reject, explicit_keep, exempt,
                        is_reject, is_keep, new_entry, has_null,
                        incumbent_complete) {
       if (header == "") return
       new_entry = (mode == "all" ||
                    (mode == "selfcheck" && selfcheck_added_heading == "") ||
-                   added[start_line])
+                   entry_touched(start_line, end_line))
       if (!new_entry) {
         reset_entry_state()
         return
@@ -393,6 +403,20 @@ AUDIT|INVENTORY|METHODOLOGY|BLOCKED|UNTIMED|INVALID|HOLD/)
       if (ledger ~ /NEGATIVE_EVIDENCE[.]md$/ &&
           !explicit_keep && !exempt) {
         is_reject = 1
+      }
+      # bd-z4lqq: classification was an opt-in keyword allowlist — a new row
+      # whose verdict word fell outside every enumerated set (e.g. "ADOPTED")
+      # matched neither KEEP nor REJECT nor an exempt class and was admitted
+      # with zero evidence checks. Fail closed instead.
+      if (!is_keep && !is_reject && !exempt) {
+        violations++
+        if (mode != "all" || violations <= 20) {
+          print "BLOCKED UNCLASSIFIED " ledger ":" start_line
+          print "  " header
+          print "  missing: explicit verdict — the heading or a Decision/Verdict line"
+          print "           must classify the row as KEEP, REJECT, or an exempt"
+          print "           survey/audit/route-next class"
+        }
       }
       has_null = numeric_null && same_invocation
       incumbent_complete = actual_incumbent && incumbent_ratio &&
@@ -474,7 +498,7 @@ AUDIT|INVENTORY|METHODOLOGY|BLOCKED|UNTIMED|INVALID|HOLD/)
 
     {
       if (is_entry_heading($0)) {
-        flush()
+        flush(FNR - 1)
         header = $0
         sub(/^##+ /, "", header)
         start_line = FNR
@@ -490,7 +514,7 @@ AUDIT|INVENTORY|METHODOLOGY|BLOCKED|UNTIMED|INVALID|HOLD/)
       }
     }
     END {
-      flush()
+      flush(FNR)
       if (mode == "all") {
         print "[ledger-gate] mechanical report " ledger \
               ": checked=" (checked + 0) " violations=" (violations + 0)
@@ -500,7 +524,34 @@ AUDIT|INVENTORY|METHODOLOGY|BLOCKED|UNTIMED|INVALID|HOLD/)
       print "[ledger-gate] OK " ledger ": checked_new_rows=" (checked + 0)
       exit 0
     }
-  ' <(diff_stream "${LEDGER_REL}") <(blob_stream "${LEDGER_REL}" "${LEDGER_ABS}")
+  ' "${LINT_DIFF_TMP}" "${LINT_BLOB_TMP}"
+}
+
+lint_one() {
+  # bd-z4lqq: diff_stream/blob_stream used to run inside process substitutions
+  # <(...) whose failures are invisible to `set -euo pipefail` — a failing
+  # `git diff` (e.g. --since with no merge-base) produced an empty diff and the
+  # gate passed vacuously with checked_new_rows=0. Materialize both streams and
+  # check their exit status explicitly before awk runs.
+  local requested="$1"
+  local status=0
+  LINT_DIFF_TMP="$(mktemp "${TMPDIR:-/tmp}/ledger-gate-diff.XXXXXX")"
+  LINT_BLOB_TMP="$(mktemp "${TMPDIR:-/tmp}/ledger-gate-blob.XXXXXX")"
+  resolve_ledger "${requested}"
+  if ! diff_stream "${LEDGER_REL}" >"${LINT_DIFF_TMP}"; then
+    echo "ERROR: ledger diff stream failed for ${LEDGER_REL} (mode=${MODE}," \
+         "since=${SINCE_REF:-n/a}); refusing to lint against an empty diff" >&2
+    rm -f "${LINT_DIFF_TMP}" "${LINT_BLOB_TMP}"
+    return 64
+  fi
+  if ! blob_stream "${LEDGER_REL}" "${LEDGER_ABS}" >"${LINT_BLOB_TMP}"; then
+    echo "ERROR: ledger blob stream failed for ${LEDGER_REL} (mode=${MODE})" >&2
+    rm -f "${LINT_DIFF_TMP}" "${LINT_BLOB_TMP}"
+    return 64
+  fi
+  lint_one_materialized "${requested}" || status=$?
+  rm -f "${LINT_DIFF_TMP}" "${LINT_BLOB_TMP}"
+  return "${status}"
 }
 
 lint_ledgers() {
@@ -632,6 +683,9 @@ Decision: KEEP." || SELF_CHECK_FAILED=1
 Comparison class: SELF-SPEEDUP
 ELF sha256: ${sha}
 Decision: KEEP." || SELF_CHECK_FAILED=1
+  run_selfcheck_case "unclassified verdict word is blocked" 2 "${ledger}" $'### 2099-01-14 — synthetic adopted row\nA/B median CI: 0.900 [0.880, 0.920]\nDecision: ADOPTED into the build.' || SELF_CHECK_FAILED=1
+  run_selfcheck_case "body-only edit of an existing entry is gated" 2 "${ledger}" $'### 2099-01-15 — REJECT: synthetic historical row\nA/B median ratio: 1.02\nDecision: reject as no improvement.' 2 || SELF_CHECK_FAILED=1
+  run_selfcheck_case "body-only edit of a conformant entry stays admitted" 0 "${ledger}" $'### 2099-01-16 — REJECT: synthetic null-contained row\nA/A null: 1.000 [0.980, 1.020], same invocation\nDecision: no-ship because the effect remains inside the A/A null floor.' 2 || SELF_CHECK_FAILED=1
 }
 
 run_selfcheck() {
