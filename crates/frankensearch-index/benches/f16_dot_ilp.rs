@@ -146,6 +146,7 @@ unsafe fn dot_f16_4acc(stored_bytes: &[u8], query: &[f32]) -> f32 {
     result
 }
 
+#[cfg_attr(not(target_arch = "x86_64"), allow(clippy::needless_pass_by_ref_mut))]
 fn bench(c: &mut Criterion) {
     #[cfg(target_arch = "x86_64")]
     if !(std::is_x86_feature_detected!("avx2") && std::is_x86_feature_detected!("f16c")) {
@@ -156,7 +157,6 @@ fn bench(c: &mut Criterion) {
     {
         let _ = c;
         eprintln!("f16_dot_ilp: non-x86_64; skipping");
-        return;
     }
     #[cfg(target_arch = "x86_64")]
     bench_x86(c);
