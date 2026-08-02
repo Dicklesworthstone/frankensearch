@@ -2308,14 +2308,17 @@ impl Grammar {
             node.dedup_key = negative_boolean_dedup_key(dedup_key);
         }
         if not_count != 0 {
-            if occur.is_some() {
-                wrap_not_for_and(&mut node);
-            } else {
-                node.occur = Some(Occur::MustNot);
-                node.from_not = true;
-            }
-        }
-        if let Some(occur) = occur {
+            // A `NOT` stacked with an explicit `+`/`-` prefix (`NOT -x`) sits
+            // outside the contract grammar's single-prefix fragment rule; the
+            // pinned oracle collapses the stack to ONE exclusion rather than
+            // composing a double negation (bd-251nt, found by the bd-bsjw
+            // structure-aware campaign; oracle behavior pinned by
+            // stacked_negation_prefixes_pin_oracle_semantics in the lexical
+            // crate). `NOT +x` is unprobed on the oracle and takes the same
+            // collapse; revisit with a probe before relying on it.
+            node.occur = Some(Occur::MustNot);
+            node.from_not = true;
+        } else if let Some(occur) = occur {
             node.occur = Some(occur);
         }
         Some(node)

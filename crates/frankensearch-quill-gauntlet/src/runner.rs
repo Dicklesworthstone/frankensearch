@@ -17091,13 +17091,21 @@ mod tests {
                             2 => out.push_str(" NOT "),
                             _ => out.push(' '),
                         }
-                        // `NOT -term` double negation is a LIVE cross-engine
-                        // divergence found by this campaign's first run
-                        // (RankMismatch, unclassifiable as tie reorder) —
-                        // excluded from the exact lane pending adjudication;
-                        // repro pinned on the bd-bsjw follow-up bead.
+                        // `NOT -term` was this campaign's first finding
+                        // (bd-251nt): Quill nested it as a double negation
+                        // while the pinned oracle collapses the stack to one
+                        // exclusion; Quill now matches, so that shape
+                        // generates freely. A negated PHRASE, however, panics
+                        // the ORACLE itself (Tantivy 0.26.1 PhraseScorer
+                        // post-termination seek — second campaign finding,
+                        // pinned should_panic in the lexical crate), so
+                        // phrase operands stay out of the NOT position until
+                        // the oracle is upgraded past the upstream defect.
                         let operand = if connective == 2 {
-                            Operand::Term(pick(rng, vocabulary).to_owned())
+                            match rng.bounded(2) {
+                                0 => Operand::Term(pick(rng, vocabulary).to_owned()),
+                                _ => Operand::NegatedTerm(pick(rng, vocabulary).to_owned()),
+                            }
                         } else {
                             generate_operand(rng, vocabulary)
                         };

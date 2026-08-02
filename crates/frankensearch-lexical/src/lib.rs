@@ -2710,6 +2710,85 @@ mod tests {
         assert!(result.is_err());
     }
 
+    /// Pins the ORACLE's behavior for stacked unary prefixes (`NOT -x`,
+    /// `NOT NOT x`), which sit OUTSIDE the contract grammar's single-prefix
+    /// fragment rule (`docs/contracts/quill-language-contract.md` §"fragment").
+    /// The pinned Tantivy 0.26.1 parser is the normative behavior for such
+    /// sequences; Quill's lowering must reproduce whatever this test observes
+    /// (bd-251nt — found by the bd-bsjw structure-aware campaign).
+    #[test]
+    fn stacked_negation_prefixes_pin_oracle_semantics() {
+        run_with_cx(|cx| async move {
+            let docs = vec![
+                IndexableDocument::new("doc-a", "alpha need"),
+                IndexableDocument::new("doc-b", "alpha other"),
+                IndexableDocument::new("doc-c", "need only"),
+                IndexableDocument::new("doc-d", "plain filler"),
+            ];
+            let idx = TantivyIndex::in_memory().expect("create");
+            idx.index_documents(&cx, &docs).await.expect("index");
+            idx.commit(&cx).await.expect("commit");
+
+            let observe = |query: &str| {
+                let mut ids = idx
+                    .search_doc_ids(&cx, query, 10)
+                    .expect("search")
+                    .into_iter()
+                    .map(|hit| hit.doc_id)
+                    .collect::<Vec<_>>();
+                ids.sort_unstable();
+                ids
+            };
+
+            assert_eq!(
+                observe("NOT -need"),
+                vec!["doc-b".to_owned(), "doc-d".to_owned()],
+                "oracle collapses NOT + '-' to a single exclusion of `need`"
+            );
+            assert_eq!(
+                observe("NOT NOT need"),
+                vec![
+                    "doc-a".to_owned(),
+                    "doc-b".to_owned(),
+                    "doc-c".to_owned(),
+                    "doc-d".to_owned(),
+                ],
+                "oracle treats NOT NOT as a lenient-parse match-all, NOT as \
+                 logical double negation"
+            );
+            assert_eq!(
+                observe("alpha NOT -need"),
+                vec!["doc-b".to_owned()],
+                "oracle: alpha-docs minus need-docs"
+            );
+        });
+    }
+
+    /// Tantivy 0.26.1's `PhraseScorer` panics on an illegal post-termination
+    /// seek when a NEGATED PHRASE rides beside a positive term — found by the
+    /// bd-bsjw structure-aware campaign (`generic NOT "indexes Parser or
+    /// minimal"`). Pinned as `should_panic` so an oracle upgrade that fixes the
+    /// upstream defect becomes visible instead of silently changing the
+    /// conformance target. Quill executes the same shape without incident.
+    #[test]
+    #[should_panic(expected = "should be greater than or equal to doc")]
+    fn oracle_negated_phrase_beside_term_panics_in_phrase_scorer() {
+        run_with_cx(|cx| async move {
+            let docs = vec![
+                IndexableDocument::new("doc-a", "alpha need only"),
+                IndexableDocument::new("doc-b", "alpha other"),
+                IndexableDocument::new("doc-c", "need only"),
+            ];
+            let idx = TantivyIndex::in_memory().expect("create");
+            idx.index_documents(&cx, &docs).await.expect("index");
+            idx.commit(&cx).await.expect("commit");
+            // The phrase's terms exist but the SEQUENCE does not, so the
+            // phrase docset terminates immediately — the precondition for the
+            // upstream illegal seek.
+            let _ = idx.search_doc_ids(&cx, "alpha NOT \"only need\"", 10);
+        });
+    }
+
     #[test]
     fn reopen_on_disk_restores_fast_id_materialization() {
         let dir = tempfile::tempdir().expect("tempdir");
