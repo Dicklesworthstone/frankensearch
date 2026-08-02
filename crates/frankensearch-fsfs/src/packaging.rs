@@ -3,15 +3,19 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ReleaseTarget {
     pub target_triple: String,
+    pub profile: String,
     pub os_family: String,
     pub build_tool: String,
     pub archive_format: String,
     pub binary_name: String,
+    pub semantic_loaders: bool,
+    pub embedded_models: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ArtifactNaming {
-    pub archive_template: String,
+    pub embedded_archive_template: String,
+    pub lite_archive_template: String,
     pub checksum_suffix: String,
     pub metadata_suffix: String,
     pub signature_suffix: String,
@@ -80,11 +84,16 @@ pub struct ArtifactSignature {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ReleaseArtifact {
     pub target_triple: String,
+    pub profile: String,
+    pub archive_format: String,
     pub archive_path: String,
     pub checksum: String,
     pub metadata_path: String,
     pub build_tool: String,
-    pub signature: ArtifactSignature,
+    pub semantic_loaders: bool,
+    pub embedded_models: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub signature: Option<ArtifactSignature>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -104,7 +113,8 @@ pub struct ReleaseManifest {
     pub distribution_channels: Vec<String>,
     pub artifacts: Vec<ReleaseArtifact>,
     pub verification_summary: VerificationSummary,
-    pub compatibility_notes: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub compatibility_notes: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
