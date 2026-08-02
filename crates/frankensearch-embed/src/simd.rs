@@ -36,12 +36,15 @@ pub fn accumulate_f32_into(sum: &mut [f32], row: &[f32]) {
 /// prefetch instructions are added. Long document sequences are the cache-cold
 /// index-time regime where fetching a future full row can overlap the current
 /// row's accumulation.
+#[cfg(target_arch = "x86_64")]
 const MODEL2VEC_PREFETCH_MIN_TOKENS: usize = 512;
 
 /// Distance, in token rows, between the row being accumulated and prefetched.
+#[cfg(target_arch = "x86_64")]
 const MODEL2VEC_PREFETCH_DISTANCE: usize = 4;
 
 /// Number of `f32` values in one 64-byte cache line.
+#[cfg(target_arch = "x86_64")]
 const CACHE_LINE_F32: usize = 16;
 
 /// Mean-pool Model2Vec rows into `sum`, returning the number of in-vocabulary rows.
