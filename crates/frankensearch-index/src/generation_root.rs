@@ -3508,7 +3508,14 @@ mod platform {
         #[cfg(test)]
         test_boundary(TestBoundary::AfterFinalRouteStat)?;
         verify_exact_directory_entry(&parent, final_name, stage, index)?;
-        if FileType::from_raw_mode(route_stat.st_mode) != FileType::RegularFile {
+        let route_file_type = FileType::from_raw_mode(route_stat.st_mode);
+        if route_file_type == FileType::Symlink {
+            return Err(
+                GenerationRootError::new(GenerationRootErrorKind::SymbolicLink, stage)
+                    .at_component(index),
+            );
+        }
+        if route_file_type != FileType::RegularFile {
             return Err(
                 GenerationRootError::new(GenerationRootErrorKind::NotRegularFile, stage)
                     .at_component(index),
@@ -5747,8 +5754,9 @@ mod platform {
             #[cfg(test)]
             test_boundary(TestBoundary::BeforeRootComponentOpen { index })?;
             verify_exact_directory_entry(&descriptor, component, stage, index)?;
-            let next = openat(&descriptor, component, flags, Mode::empty())
-                .map_err(|error| macos_open_error(stage, error).at_component(index))?;
+            let next = openat(&descriptor, component, flags, Mode::empty()).map_err(|error| {
+                macos_component_open_error(&descriptor, component, stage, index, error)
+            })?;
             verify_exact_directory_entry(&descriptor, component, stage, index)?;
             descriptor = next;
             let stat = fstat(&descriptor).map_err(|error| os_error(stage, error))?;
@@ -5794,7 +5802,7 @@ mod platform {
                 | OFlags::NONBLOCK,
             Mode::empty(),
         )
-        .map_err(|error| macos_open_error(stage, error).at_component(index))?;
+        .map_err(|error| macos_component_open_error(parent, component, stage, index, error))?;
         verify_exact_directory_entry(parent, component, stage, index)?;
         let witness = object_witness(&descriptor, root.filesystem, root.mount_identity, stage)?;
         if witness.mount_identity != root.mount_identity {
@@ -6137,6 +6145,27 @@ mod platform {
             GenerationRootErrorKind::Io
         };
         GenerationRootError::new(kind, stage).with_raw_os_error(error.raw_os_error())
+    }
+
+    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    fn macos_component_open_error(
+        parent: &OwnedFd,
+        component: &OsStr,
+        stage: GenerationRootStage,
+        index: usize,
+        error: Errno,
+    ) -> GenerationRootError {
+        use rustix::fs::{AtFlags, statat};
+
+        if matches!(error, Errno::NOTDIR)
+            && statat(parent, component, AtFlags::SYMLINK_NOFOLLOW)
+                .is_ok_and(|stat| FileType::from_raw_mode(stat.st_mode) == FileType::Symlink)
+        {
+            return GenerationRootError::new(GenerationRootErrorKind::SymbolicLink, stage)
+                .at_component(index)
+                .with_raw_os_error(error.raw_os_error());
+        }
+        macos_open_error(stage, error).at_component(index)
     }
 
     #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
@@ -9560,6 +9589,67 @@ if not close_only_contended or not explicit_unlock_released:
         }
 
         #[test]
+        #[ignore = "requires FRANKENSEARCH_LINUX_NETWORK_TEST_ROOT on a writable native NFS mount"]
+        fn physical_linux_network_mount_fails_before_data_open_or_mutation() {
+            let network_root = std::env::var_os("FRANKENSEARCH_LINUX_NETWORK_TEST_ROOT")
+                .map(PathBuf::from)
+                .expect("FRANKENSEARCH_LINUX_NETWORK_TEST_ROOT must identify the native NFS mount");
+            assert!(
+                network_root.is_absolute(),
+                "the physical network receipt must use an absolute provider route"
+            );
+            let filesystem = rustix::fs::statfs(&network_root)
+                .expect("the physical network mount must be statable");
+            assert_eq!(
+                i128::from(filesystem.f_type),
+                i128::from(libc::NFS_SUPER_MAGIC),
+                "the provider route must be a real NFS mount"
+            );
+            let mount = rustix::fs::statvfs(&network_root)
+                .expect("the physical network mount flags must be readable");
+            assert!(
+                !mount.f_flag.contains(rustix::fs::StatVfsMountFlags::RDONLY),
+                "the provider NFS mount must be writable so this receipt isolates filesystem-type rejection"
+            );
+
+            let boundaries = Arc::new(Mutex::new(Vec::new()));
+            let hook_boundaries = Arc::clone(&boundaries);
+            let _hook = install_test_hook(move |boundary| {
+                hook_boundaries
+                    .lock()
+                    .expect("network boundary log should lock")
+                    .push(boundary);
+                Ok(())
+            });
+            let error = QualifiedGenerationRoot::admit(&network_root)
+                .expect_err("a network filesystem must fail qualification");
+            assert_eq!(error.kind(), GenerationRootErrorKind::UnsupportedFilesystem);
+            assert_eq!(error.stage(), GenerationRootStage::QualifyFilesystem);
+
+            let observed = boundaries.lock().expect("network boundary log should lock");
+            assert!(
+                observed.contains(&TestBoundary::BeforeFilesystemQualification),
+                "the receipt must reach the descriptor-bound filesystem classifier"
+            );
+            assert!(
+                !observed.contains(&TestBoundary::AfterFilesystemQualification),
+                "an NFS root must not cross the qualification boundary"
+            );
+            assert!(
+                !observed.iter().any(|boundary| matches!(
+                    boundary,
+                    TestBoundary::BeforeRegularFileOpen { .. }
+                        | TestBoundary::BeforeRead { .. }
+                        | TestBoundary::BeforeLock
+                        | TestBoundary::BeforeFileSync
+                        | TestBoundary::BeforeDirectorySync
+                )),
+                "NFS rejection must precede every regular-file, content, lock, and durability boundary"
+            );
+            drop(observed);
+        }
+
+        #[test]
         #[ignore = "requires FRANKENSEARCH_BTRFS_TEST_ROOT on a writable native Btrfs mount"]
         fn physical_btrfs_retained_files_locks_and_durability_succeed() {
             let base = std::env::var_os("FRANKENSEARCH_BTRFS_TEST_ROOT")
@@ -11626,7 +11716,7 @@ if not close_only_contended or not explicit_unlock_released:
         use std::io::{Read, Seek, SeekFrom, Write};
         use std::os::fd::{AsFd, OwnedFd};
         use std::os::macos::fs::MetadataExt;
-        use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
+        use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt, symlink};
         use std::path::{Path, PathBuf};
         use std::process::Command;
         use std::sync::atomic::{AtomicU64, Ordering};
@@ -12889,6 +12979,97 @@ if not close_only_contended or not explicit_unlock_released:
             assert!(
                 !*lock_reached.lock().expect("hook state should lock"),
                 "route revalidation must reject before flock"
+            );
+        }
+
+        #[test]
+        fn macos_absolute_root_route_rejects_ancestor_and_final_symlinks() {
+            let container = fixture_root("absolute-symlink-container");
+            let target_parent = fixture_root("absolute-symlink-target-parent");
+            let target_root = private_dir(&target_parent, "qualified-root");
+            let ancestor_link = container.join("ancestor-link");
+            let final_link = container.join("final-link");
+            symlink(&target_parent, &ancestor_link)
+                .expect("absolute-route ancestor symlink should be creatable");
+            symlink(&target_root, &final_link)
+                .expect("absolute-route final symlink should be creatable");
+
+            assert_eq!(
+                QualifiedGenerationRoot::admit(&ancestor_link.join("qualified-root"))
+                    .expect_err("an absolute-route ancestor symlink must fail")
+                    .kind(),
+                GenerationRootErrorKind::SymbolicLink
+            );
+            assert_eq!(
+                QualifiedGenerationRoot::admit(&final_link)
+                    .expect_err("an absolute-route final symlink must fail")
+                    .kind(),
+                GenerationRootErrorKind::SymbolicLink
+            );
+        }
+
+        #[test]
+        fn macos_preopened_rejects_ancestor_and_final_symlinks_without_touching_decoys() {
+            let root_path = fixture_root("preopened-symlink-routes");
+            let decoy_directory = private_dir(&root_path, "decoy-directory");
+            let ancestor_target =
+                private_file(&decoy_directory, "artifact", b"ancestor decoy stays exact");
+            let final_target = private_file(&root_path, "final-target", b"final decoy stays exact");
+            symlink(&decoy_directory, root_path.join("ancestor-link"))
+                .expect("ancestor symlink should be creatable");
+            symlink(&final_target, root_path.join("final-link"))
+                .expect("final symlink should be creatable");
+
+            let root =
+                QualifiedGenerationRoot::admit(&root_path).expect("local writable APFS root");
+            let boundaries = Arc::new(Mutex::new(Vec::new()));
+            let hook_boundaries = Arc::clone(&boundaries);
+            let _hook = install_test_hook(move |boundary| {
+                hook_boundaries
+                    .lock()
+                    .expect("symlink boundary log should lock")
+                    .push(boundary);
+                Ok(())
+            });
+            let ancestor_error = root
+                .admit_preopened_file(
+                    &confined("ancestor-link/artifact"),
+                    preopened_immutable(&ancestor_target),
+                    immutable_expectation(b"ancestor decoy stays exact"),
+                )
+                .expect_err("an ancestor symlink must not bind a trusted descriptor");
+            assert_eq!(ancestor_error.kind(), GenerationRootErrorKind::SymbolicLink);
+            assert_eq!(ancestor_error.component_index(), Some(0));
+
+            let final_error = root
+                .admit_preopened_file(
+                    &confined("final-link"),
+                    preopened_immutable(&final_target),
+                    immutable_expectation(b"final decoy stays exact"),
+                )
+                .expect_err("a final symlink must not bind a trusted descriptor");
+            assert_eq!(final_error.kind(), GenerationRootErrorKind::SymbolicLink);
+            assert_eq!(final_error.component_index(), Some(0));
+
+            let observed = boundaries.lock().expect("symlink boundary log should lock");
+            assert!(
+                !observed.iter().any(|boundary| matches!(
+                    boundary,
+                    TestBoundary::BeforeRead { .. }
+                        | TestBoundary::BeforeTrailingByteProbe
+                        | TestBoundary::AfterExactRead
+                )),
+                "route-bound symlink rejection must precede every content-read boundary"
+            );
+            drop(observed);
+
+            assert_eq!(
+                fs::read(&ancestor_target).expect("ancestor decoy should remain readable"),
+                b"ancestor decoy stays exact"
+            );
+            assert_eq!(
+                fs::read(&final_target).expect("final decoy should remain readable"),
+                b"final decoy stays exact"
             );
         }
 
