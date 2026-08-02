@@ -5,9 +5,10 @@
 //! assets into the configured model cache so normal auto-detection can load
 //! semantic embedders without runtime downloads.
 
-use std::fs::{self, File};
+use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use frankensearch_core::error::{SearchError, SearchResult};
 
@@ -18,6 +19,9 @@ include!(concat!(
     env!("OUT_DIR"),
     "/bundled_default_models_generated.rs"
 ));
+
+const MATERIALIZATION_LOCK_FILE: &str = ".bundled-default-models.lock";
+static NEXT_TEMP_FILE_ID: AtomicU64 = AtomicU64::new(0);
 
 /// Summary of bundled-model installation activity.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -41,6 +45,30 @@ pub fn ensure_default_semantic_models(
     let root = resolve_install_root(model_root)?;
     fs::create_dir_all(&root)?;
 
+    with_materialization_lock(&root, || materialize_default_semantic_models(&root))
+}
+
+fn with_materialization_lock<T>(
+    root: &Path,
+    operation: impl FnOnce() -> SearchResult<T>,
+) -> SearchResult<T> {
+    let lock_file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(root.join(MATERIALIZATION_LOCK_FILE))?;
+    lock_file.lock()?;
+
+    let operation_result = operation();
+    let unlock_result = lock_file.unlock();
+    match unlock_result {
+        Ok(()) => operation_result,
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn materialize_default_semantic_models(root: &Path) -> SearchResult<EmbeddedModelInstallSummary> {
     let manifests = [ModelManifest::potion_128m(), ModelManifest::minilm_v2()];
     let mut models_written = 0_usize;
     let mut bytes_written = 0_u64;
@@ -104,7 +132,7 @@ pub fn ensure_default_semantic_models(
     }
 
     Ok(EmbeddedModelInstallSummary {
-        model_root: root,
+        model_root: root.to_path_buf(),
         models_written,
         bytes_written,
     })
@@ -158,30 +186,95 @@ fn embedded_file_entry(
 }
 
 fn write_atomic_file(path: &Path, bytes: &[u8]) -> SearchResult<()> {
-    let pid = std::process::id();
-    let tmp_path = path.with_extension(format!("tmp.{pid}"));
-    let result = (|| -> SearchResult<()> {
-        let mut file = File::create(&tmp_path)?;
-        file.write_all(bytes)?;
-        file.sync_all()?;
-        drop(file);
+    let (tmp_path, mut file) = reserve_temp_file(path)?;
+    file.write_all(bytes)?;
+    file.sync_all()?;
+    drop(file);
 
-        // On POSIX, rename() atomically replaces the destination — no need
-        // to remove first.  The explicit remove_file before rename would
-        // create a crash-unsafe window where the file is gone entirely.
-        fs::rename(&tmp_path, path)?;
-        Ok(())
-    })();
-    if result.is_err() {
-        let _ = fs::remove_file(&tmp_path);
+    // On POSIX, rename() atomically replaces the destination — no need
+    // to remove first. The uniquely reserved temporary file is retained
+    // when an earlier step fails so the failure remains inspectable.
+    fs::rename(&tmp_path, path)?;
+    Ok(())
+}
+
+fn reserve_temp_file(path: &Path) -> SearchResult<(PathBuf, File)> {
+    loop {
+        let id = NEXT_TEMP_FILE_ID.fetch_add(1, Ordering::Relaxed);
+        let tmp_path = path.with_extension(format!("tmp.{}.{id}", std::process::id()));
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&tmp_path)
+        {
+            Ok(file) => return Ok((tmp_path, file)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error.into()),
+        }
     }
-    result
 }
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Barrier};
+    use std::thread;
+    use std::time::Duration;
+
     use super::*;
     use crate::model_manifest::{ModelFile, verify_dir_and_record};
+
+    fn reserve_materialization_test_root() -> std::io::Result<PathBuf> {
+        loop {
+            let id = NEXT_TEMP_FILE_ID.fetch_add(1, Ordering::Relaxed);
+            let candidate = std::env::temp_dir().join(format!(
+                "frankensearch_bundled_materialization_lock_{}_{id}",
+                std::process::id()
+            ));
+            match fs::create_dir(&candidate) {
+                Ok(()) => return Ok(candidate),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
+    #[test]
+    fn materialization_lock_serializes_same_root_transactions() {
+        let root = reserve_materialization_test_root()
+            .expect("materialization test root should be atomically reservable");
+        let entrants = 4;
+        let start = Arc::new(Barrier::new(entrants + 1));
+        let active = Arc::new(AtomicUsize::new(0));
+        let maximum_active = Arc::new(AtomicUsize::new(0));
+
+        let threads = (0..entrants)
+            .map(|_| {
+                let root = root.clone();
+                let start = Arc::clone(&start);
+                let active = Arc::clone(&active);
+                let maximum_active = Arc::clone(&maximum_active);
+                thread::spawn(move || {
+                    start.wait();
+                    with_materialization_lock(&root, || {
+                        let now_active = active.fetch_add(1, Ordering::SeqCst) + 1;
+                        maximum_active.fetch_max(now_active, Ordering::SeqCst);
+                        thread::sleep(Duration::from_millis(10));
+                        active.fetch_sub(1, Ordering::SeqCst);
+                        Ok(())
+                    })
+                    .unwrap();
+                })
+            })
+            .collect::<Vec<_>>();
+
+        start.wait();
+        for thread in threads {
+            thread.join().unwrap();
+        }
+
+        assert_eq!(maximum_active.load(Ordering::SeqCst), 1);
+    }
 
     #[test]
     fn bundled_entries_cover_default_manifest_files() {
