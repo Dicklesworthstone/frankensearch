@@ -7316,7 +7316,7 @@ pub fn persist_shrunk_reproduction(
 #[cfg(test)]
 mod tests {
     #[cfg(feature = "tantivy-oracle")]
-    use std::io::{self, Write};
+    use std::io::{self, Read, Write};
     #[cfg(feature = "tantivy-oracle")]
     use std::sync::Arc;
     use std::sync::Mutex;
