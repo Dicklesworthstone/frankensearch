@@ -663,6 +663,17 @@ fi
 if [[ "$MODE" == "e2e" || "$MODE" == "all" ]]; then
   check_e2e
 fi
+if [[ "$MODE" == "installer" || "$MODE" == "all" || "$MODE" == "model-features" ]]; then
+  # The --locked callers downstream (this script's cargo-tree profile audit,
+  # and the CI installer-platform build step that runs after `--mode installer`)
+  # need a current lockfile, but Cargo.lock is deliberately untracked
+  # (.gitignore): fresh checkouts and CI runners have none, and a dev tree's
+  # local copy can be stale after manifest changes — either way --locked fails
+  # with "cannot create/update the lock file". Refresh it here (the
+  # consumer-smoke idiom in ci.yml) so every --locked caller in the job
+  # resolves against this one snapshot.
+  (cd "$ROOT_DIR" && cargo generate-lockfile)
+fi
 if [[ "$MODE" == "installer" || "$MODE" == "all" ]]; then
   check_installer_behavior
 fi
