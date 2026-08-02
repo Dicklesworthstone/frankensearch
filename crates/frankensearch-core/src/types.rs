@@ -3966,12 +3966,13 @@ mod tests {
         let error = fast
             .verify_space(&quality_space.fingerprint(), "quality")
             .expect_err("fast vector must not enter the quality space");
-        match error {
-            SearchError::InvalidConfig { field, reason, .. } => {
-                assert_eq!(field, "query_embedding.quality.identity");
-                assert!(reason.contains("different embedding space"));
-            }
-            other => panic!("expected InvalidConfig, got {other:?}"),
+        assert!(
+            matches!(&error, SearchError::InvalidConfig { .. }),
+            "expected InvalidConfig, got {error:?}"
+        );
+        if let SearchError::InvalidConfig { field, reason, .. } = &error {
+            assert_eq!(field, "query_embedding.quality.identity");
+            assert!(reason.contains("different embedding space"));
         }
     }
 

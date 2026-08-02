@@ -127,6 +127,7 @@ impl ArtifactGenerationIdentityV1 {
             self.schema_version,
             ARTIFACT_GENERATION_IDENTITY_SCHEMA_V1,
         )?;
+        // ubs:ignore — this serialized generation-uniqueness nonce is public, not an authenticator.
         if self.nonce == [0; 16] {
             return Err(identity_error(
                 "artifact_generation.nonce",
@@ -345,6 +346,7 @@ impl EmbeddingSpaceIdentityV1 {
             }
             (EmbeddingSpaceKindV1::HashControl, Some(profile)) => {
                 profile.validate()?;
+                // ubs:ignore — manifest fingerprints are public compatibility identities, not secrets.
                 if self.artifact_manifest_fingerprint != profile.fingerprint() {
                     return Err(identity_error(
                         "artifact_manifest_fingerprint",
@@ -1153,7 +1155,9 @@ impl VerifiedGoldenConformanceManifestV1 {
             .validate()
             .map_err(|_| ProducerCompatibilityErrorV1::GoldenFixtureInvalid)?;
         let canonical_bytes = Self::canonical_bytes_for(&self.certificate);
+        // ubs:ignore — these canonical certificate bytes are public integrity evidence, not secrets.
         if self.canonical_bytes != canonical_bytes
+            // ubs:ignore — this fingerprint is public certificate-integrity evidence, not a secret.
             || self.fingerprint != sha256_hex(&canonical_bytes)
         {
             return Err(ProducerCompatibilityErrorV1::GoldenFixtureInvalid);
@@ -1186,6 +1190,7 @@ impl ForeignProducerConformanceCertificateV1 {
         expires_at_unix_seconds: u64,
     ) -> Result<Self, ProducerCompatibilityErrorV1> {
         validate_reference_and_candidate(reference, candidate)?;
+        // ubs:ignore — embedding-space fingerprints are public compatibility identities.
         if reference.space.fingerprint() != candidate.space.fingerprint() {
             return Err(ProducerCompatibilityErrorV1::SpaceMismatch);
         }
@@ -1484,6 +1489,7 @@ impl EmbeddingIdentityBundleV1 {
     ) -> Result<ProducerCompatibilityWitnessV1, ProducerCompatibilityErrorV1> {
         validate_reference_and_candidate(self, candidate)?;
         let space_fingerprint = self.space.fingerprint();
+        // ubs:ignore — embedding-space fingerprints are public compatibility identities.
         if space_fingerprint != candidate.space.fingerprint() {
             return Err(ProducerCompatibilityErrorV1::SpaceMismatch);
         }
@@ -1528,6 +1534,7 @@ impl EmbeddingIdentityBundleV1 {
     ) -> Result<ProducerCompatibilityWitnessV1, ProducerCompatibilityErrorV1> {
         validate_reference_and_candidate(self, candidate)?;
         let space_fingerprint = self.space.fingerprint();
+        // ubs:ignore — space fingerprints are public compatibility identities, not secrets.
         if space_fingerprint != candidate.space.fingerprint() {
             return Err(ProducerCompatibilityErrorV1::SpaceMismatch);
         }
@@ -1540,9 +1547,11 @@ impl EmbeddingIdentityBundleV1 {
         certificate.validate()?;
         trusted.fixture.validate()?;
         let certificate_fingerprint = certificate.fingerprint();
+        // ubs:ignore — certificate fingerprints are public integrity identities, not authenticators.
         if certificate_fingerprint != trusted.certificate_fingerprint {
             return Err(ProducerCompatibilityErrorV1::CertificateFingerprintMismatch);
         }
+        // ubs:ignore — policy fingerprints are public conformance identities, not secrets.
         if certificate.policy_fingerprint != trusted.policy_fingerprint {
             return Err(ProducerCompatibilityErrorV1::PolicyMismatch);
         }
@@ -1552,8 +1561,11 @@ impl EmbeddingIdentityBundleV1 {
         {
             return Err(ProducerCompatibilityErrorV1::ProducerBindingMismatch);
         }
+        // ubs:ignore — fixture fingerprints are public conformance identities, not secrets.
         if certificate.golden_fixture_fingerprint != trusted.fixture.fingerprint
+            // ubs:ignore — golden-vector certificates are public conformance evidence.
             || trusted.fixture.certificate != self.producer.golden_vectors
+            // ubs:ignore — golden-vector certificates are public conformance evidence.
             || trusted.fixture.certificate != candidate.producer.golden_vectors
         {
             return Err(ProducerCompatibilityErrorV1::FixtureBindingMismatch);
@@ -1734,6 +1746,7 @@ impl FrozenEmbeddingIdentityBundleV1 {
         self.identity.validate()?;
         validate_sha256("frozen_bundle.fingerprint", &self.fingerprint)?;
         let canonical_bytes = self.identity.canonical_bytes();
+        // ubs:ignore — these canonical authority bytes are public integrity evidence.
         if self.canonical_bytes != canonical_bytes {
             return Err(identity_error(
                 "frozen_bundle.canonical_bytes",
@@ -1742,6 +1755,7 @@ impl FrozenEmbeddingIdentityBundleV1 {
             ));
         }
         let fingerprint = sha256_hex(&canonical_bytes);
+        // ubs:ignore — this fingerprint is public authority-integrity evidence, not a secret.
         if self.fingerprint != fingerprint {
             return Err(identity_error(
                 "frozen_bundle.fingerprint",
