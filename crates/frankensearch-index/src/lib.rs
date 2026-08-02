@@ -1858,6 +1858,11 @@ impl VectorIndex {
         embedder_revision: &str,
         dimension: usize,
     ) -> SearchResult<Self> {
+        let replacement_gen = if path.exists() {
+            next_generation(Self::peek_compaction_gen(path)?)
+        } else {
+            1
+        };
         let replacement_path = temporary_output_path(path);
         let writer = Self::create_with_revision(
             &replacement_path,
@@ -1865,7 +1870,8 @@ impl VectorIndex {
             embedder_revision,
             dimension,
             Quantization::F16,
-        )?;
+        )?
+        .with_generation(replacement_gen);
         writer.finish()?;
         Self::install_replacement(path, &replacement_path)
     }
@@ -1898,11 +1904,35 @@ impl VectorIndex {
                 reason: "replacement generation must not have a live WAL".to_owned(),
             });
         }
+        let replacement_gen = replacement.metadata.compaction_gen;
         drop(replacement);
 
-        let wal_path = wal::wal_path_for(path);
-        wal::remove_wal(&wal_path)?;
-        sync_parent_directory(&wal_path)?;
+        // A two-resource commit (main file + WAL sidecar) cannot be made safe
+        // by rename ordering alone: removing the WAL before the rename opens a
+        // crash window that destroys acknowledged records of the SURVIVING
+        // generation, and removing it after opens one where the stale sidecar
+        // is adopted by the replacement. The generation byte is the authority
+        // that closes both: the replacement must carry
+        // next_generation(destination), so the rename atomically installs the
+        // new data AND invalidates the old sidecar (whose records bind to the
+        // superseded generation), letting WAL removal happen safely after.
+        if path.exists() {
+            let destination_gen = Self::peek_compaction_gen(path)?;
+            let required = next_generation(destination_gen);
+            if replacement_gen != required {
+                return Err(SearchError::InvalidConfig {
+                    field: "replacement_path".to_owned(),
+                    value: replacement_path.display().to_string(),
+                    reason: format!(
+                        "replacement compaction generation {replacement_gen} must be \
+                         next_generation(destination {destination_gen}) = {required}; build \
+                         the replacement with with_generation(next_generation(\
+                         VectorIndex::peek_compaction_gen(destination)?)) so the rename \
+                         atomically invalidates any surviving destination WAL"
+                    ),
+                });
+            }
+        }
 
         let temporary = tempfile::TempPath::try_from_path(replacement_path.to_path_buf())?;
         if let Err(error) = temporary.persist(path) {
@@ -1911,7 +1941,43 @@ impl VectorIndex {
             return Err(SearchError::Io(error));
         }
         sync_parent_directory(path)?;
+
+        // The stale sidecar is already invalid (generation mismatch); remove
+        // it so a healthy install leaves no residue. On failure, open() below
+        // and every future open reject and clean it anyway.
+        let wal_path = wal::wal_path_for(path);
+        if let Err(error) = wal::remove_wal(&wal_path) {
+            tracing::warn!(
+                path = %wal_path.display(),
+                error = %error,
+                "superseded WAL sidecar could not be removed after install; \
+                 open() will reject it by generation"
+            );
+        } else {
+            sync_parent_directory(&wal_path)?;
+        }
         Self::open(path)
+    }
+
+    /// Read the on-disk compaction generation of a published FSVI without
+    /// opening it — no WAL adoption, trailer truncation, or sidecar cleanup
+    /// side effects. Shares [`Self::open`]'s v1 header domain (the mutable
+    /// generation surface [`Self::install_replacement`] operates on).
+    ///
+    /// # Errors
+    ///
+    /// Returns the same header corruption/version errors as [`Self::open`].
+    pub fn peek_compaction_gen(path: &Path) -> SearchResult<u8> {
+        use std::io::Read;
+        // The variable-length header (two u16-length strings + fixed fields +
+        // CRC) cannot exceed 256 KiB, so this prefix always suffices.
+        let file = File::open(path).map_err(SearchError::Io)?;
+        let mut data = Vec::new();
+        file.take(256 * 1024)
+            .read_to_end(&mut data)
+            .map_err(SearchError::Io)?;
+        let (metadata, _header_len) = parse_header(path, &data)?;
+        Ok(metadata.compaction_gen)
     }
 
     /// Create a writer with explicit embedder revision and quantization.
@@ -3472,8 +3538,15 @@ impl VectorIndexWriter {
         Ok(())
     }
 
-    #[allow(dead_code)]
-    pub(crate) const fn with_generation(mut self, generation: u8) -> Self {
+    /// Override the compaction generation this writer stamps into the header.
+    ///
+    /// Required when the finished file will be handed to
+    /// [`VectorIndex::install_replacement`] over an existing destination: pass
+    /// `next_generation(VectorIndex::peek_compaction_gen(destination)?)` so
+    /// the install's rename atomically invalidates any surviving destination
+    /// WAL sidecar.
+    #[must_use]
+    pub const fn with_generation(mut self, generation: u8) -> Self {
         self.compaction_gen = generation;
         self
     }
@@ -5804,7 +5877,15 @@ const fn is_tombstoned_flags(flags: u16) -> bool {
     flags & RECORD_FLAG_TOMBSTONE != 0
 }
 
-const fn next_generation(current: u8) -> u8 {
+/// Successor in the wrapping compaction-generation sequence.
+///
+/// Zero is reserved for legacy/identity-v2 writers, so the wrap skips it. A
+/// WAL sidecar binds to main generation `G` iff its own tag equals
+/// `next_generation(G)`; a replacement built with
+/// `next_generation(destination)` therefore atomically invalidates the
+/// destination's sidecar at install time.
+#[must_use]
+pub const fn next_generation(current: u8) -> u8 {
     if current == 255 { 1 } else { current + 1 }
 }
 
@@ -8451,6 +8532,99 @@ mod tests {
         // Cleanup.
         std::fs::remove_file(&path).ok();
         std::fs::remove_file(wal::wal_path_for(&path)).ok();
+    }
+
+    /// A replacement whose compaction generation collides with the
+    /// destination's must be refused outright: installing it would require
+    /// destroying the destination's acknowledged WAL BEFORE the rename, and a
+    /// crash in that window loses acknowledged records of the SURVIVING
+    /// generation (bd-zhjv8 finding 2).
+    #[test]
+    fn install_replacement_refuses_generation_collision_and_preserves_destination_wal() {
+        let path = temp_index_path("install-gen-collision");
+        let mut writer = VectorIndex::create(&path, "old", 4).expect("writer");
+        writer
+            .write_record("main-old", &[1.0, 0.0, 0.0, 0.0])
+            .expect("write old main");
+        writer.finish().expect("finish old main");
+        let mut old = VectorIndex::open(&path).expect("open old generation");
+        old.append("wal-acknowledged", &[0.0, 1.0, 0.0, 0.0])
+            .expect("append acknowledged WAL record");
+        drop(old);
+
+        let replacement_path = path.with_extension("replacement");
+        let replacement_writer =
+            VectorIndex::create(&replacement_path, "new", 4).expect("replacement writer");
+        replacement_writer.finish().expect("finish replacement");
+
+        assert!(
+            VectorIndex::install_replacement(&path, &replacement_path).is_err(),
+            "a generation-colliding replacement must be refused, never installed by \
+             destroying the destination's acknowledged WAL first"
+        );
+        let survivor = VectorIndex::open(&path).expect("destination must survive intact");
+        assert_eq!(survivor.record_count(), 1);
+        assert_eq!(
+            survivor.wal_record_count(),
+            1,
+            "acknowledged WAL record must survive a refused install"
+        );
+        drop(survivor);
+
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_file(&replacement_path).ok();
+        std::fs::remove_file(wal::wal_path_for(&path)).ok();
+    }
+
+    /// The correct-by-construction path: a replacement built with the
+    /// carried-forward generation installs cleanly, and the destination's
+    /// surviving sidecar is superseded — never adopted — because its records
+    /// bind to the replaced generation.
+    #[test]
+    fn install_replacement_with_carried_generation_supersedes_stale_wal() {
+        let path = temp_index_path("install-gen-carried");
+        let mut writer = VectorIndex::create(&path, "old", 4).expect("writer");
+        writer
+            .write_record("main-old", &[1.0, 0.0, 0.0, 0.0])
+            .expect("write old main");
+        writer.finish().expect("finish old main");
+        let mut old = VectorIndex::open(&path).expect("open old generation");
+        old.append("wal-old", &[0.0, 1.0, 0.0, 0.0])
+            .expect("append old WAL");
+        drop(old);
+
+        let replacement_path = path.with_extension("replacement");
+        let destination_gen =
+            VectorIndex::peek_compaction_gen(&path).expect("peek destination generation");
+        let mut replacement_writer = VectorIndex::create(&replacement_path, "new", 4)
+            .expect("replacement writer")
+            .with_generation(next_generation(destination_gen));
+        replacement_writer
+            .write_record("main-new", &[0.0, 0.0, 1.0, 0.0])
+            .expect("write replacement record");
+        replacement_writer.finish().expect("finish replacement");
+
+        let installed = VectorIndex::install_replacement(&path, &replacement_path)
+            .expect("carried-generation replacement installs");
+        assert_eq!(installed.record_count(), 1);
+        assert_eq!(
+            installed.wal_record_count(),
+            0,
+            "the superseded sidecar must never be adopted"
+        );
+        assert!(
+            installed
+                .live_doc_ids()
+                .expect("live ids")
+                .contains("main-new")
+        );
+        drop(installed);
+        assert!(
+            !wal::wal_path_for(&path).exists(),
+            "a healthy install leaves no sidecar residue"
+        );
+
+        std::fs::remove_file(&path).ok();
     }
 
     #[test]

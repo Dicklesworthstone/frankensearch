@@ -1517,25 +1517,55 @@ impl TwoTierIndexBuilder {
                 reason: "at least one fast-tier record is required".to_owned(),
             })?;
 
+        // Build each tier at a staging path and route through
+        // install_replacement with a carried-forward generation: publishing
+        // over a live directory with a plain in-place build left the
+        // destination's WAL sidecar adoptable by the fresh generation
+        // (bd-zhjv8 finding 1 — acknowledged appends from the superseded
+        // generation resurrected inside the rebuild).
         let fast_path = self.dir.join(VECTOR_INDEX_FAST_FILENAME);
-        let mut fast_writer =
-            VectorIndex::create(&fast_path, &self.fast_embedder_id, fast_dimension)?;
-        for (doc_id, embedding) in &self.fast_records {
-            fast_writer.write_record(doc_id, embedding)?;
-        }
-        fast_writer.finish()?;
+        Self::publish_tier(
+            &fast_path,
+            &self.fast_embedder_id,
+            fast_dimension,
+            &self.fast_records,
+        )?;
 
         if let Some(quality_dimension) = self.quality_dimension {
             let quality_path = self.dir.join(VECTOR_INDEX_QUALITY_FILENAME);
-            let mut quality_writer =
-                VectorIndex::create(&quality_path, &self.quality_embedder_id, quality_dimension)?;
-            for (doc_id, embedding) in &self.quality_records {
-                quality_writer.write_record(doc_id, embedding)?;
-            }
-            quality_writer.finish()?;
+            Self::publish_tier(
+                &quality_path,
+                &self.quality_embedder_id,
+                quality_dimension,
+                &self.quality_records,
+            )?;
         }
 
         TwoTierIndex::open(&self.dir, self.config)
+    }
+
+    /// Stage one tier's records and durably install them over `path` with the
+    /// generation discipline `install_replacement` requires.
+    fn publish_tier(
+        path: &Path,
+        embedder_id: &str,
+        dimension: usize,
+        records: &[(String, Vec<f32>)],
+    ) -> SearchResult<()> {
+        let generation = if path.exists() {
+            crate::next_generation(VectorIndex::peek_compaction_gen(path)?)
+        } else {
+            1
+        };
+        let staging_path = crate::temporary_output_path(path);
+        let mut writer =
+            VectorIndex::create(&staging_path, embedder_id, dimension)?.with_generation(generation);
+        for (doc_id, embedding) in records {
+            writer.write_record(doc_id, embedding)?;
+        }
+        writer.finish()?;
+        VectorIndex::install_replacement(path, &staging_path)?;
+        Ok(())
     }
 }
 
@@ -1982,6 +2012,44 @@ mod tests {
             .quality_scores_for_hits(&[1.0, 0.0], &hits)
             .expect("scores");
         assert_eq!(scores, vec![None, None, None]);
+    }
+
+    /// Rebuilding a live directory must SUPERSEDE the prior generation's WAL,
+    /// never adopt it: an acknowledged append from the old generation may not
+    /// resurrect inside the freshly built one (bd-zhjv8 finding 1).
+    #[test]
+    fn finish_over_live_dir_never_adopts_the_prior_generations_wal() {
+        let dir = temp_index_dir("rebuild-wal-supersede");
+        let mut first = TwoTierIndex::create(&dir, TwoTierConfig::default()).expect("builder");
+        first
+            .add_record("doc-a", &[1.0, 0.0, 0.0, 0.0], None)
+            .expect("add doc-a");
+        drop(first.finish().expect("finish first generation"));
+
+        let fast_path = dir.join(VECTOR_INDEX_FAST_FILENAME);
+        let mut live = VectorIndex::open(&fast_path).expect("open first generation");
+        live.append("ghost", &[0.0, 1.0, 0.0, 0.0])
+            .expect("append acknowledged WAL record");
+        drop(live);
+
+        let mut second = TwoTierIndex::create(&dir, TwoTierConfig::default()).expect("builder");
+        second
+            .add_record("doc-b", &[0.0, 0.0, 1.0, 0.0], None)
+            .expect("add doc-b");
+        drop(second.finish().expect("finish second generation"));
+
+        let rebuilt = VectorIndex::open(&fast_path).expect("open second generation");
+        let live_ids = rebuilt.live_doc_ids().expect("live ids");
+        assert!(
+            !live_ids.contains("ghost"),
+            "prior generation's WAL record resurrected into the rebuilt index: {live_ids:?}"
+        );
+        assert!(live_ids.contains("doc-b"));
+        assert_eq!(
+            rebuilt.wal_record_count(),
+            0,
+            "rebuilt generation must start with no adopted WAL"
+        );
     }
 
     #[test]
