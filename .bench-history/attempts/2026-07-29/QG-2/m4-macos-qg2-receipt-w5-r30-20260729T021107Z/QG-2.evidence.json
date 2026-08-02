@@ -1,0 +1,3339 @@
+{
+  "schema_version": "quill-perf-evidence-v1",
+  "gate": "Qg2",
+  "policy": {
+    "reconciliation_dead_band_log": 0.004987541511038968,
+    "reconciliation_tolerance_log": 0.22314355131420976,
+    "min_hierarchical_groups": 2,
+    "min_group_pairs": 2,
+    "warmup_rounds": 5,
+    "max_raw_samples": 20000
+  },
+  "provenance": {
+    "run_id": "m4-macos-qg2-receipt-w5-r30-20260729T021107Z",
+    "run_window": "manual-window-1747",
+    "manifest_sha256": "68be56bd481ae44433b42b2310fa97352b08483a1f619366be549c20b07ae851",
+    "build": {
+      "executable_sha256": "f08f5dd1fb5574e1e322fd70937ef84e2f8c0a2130cfad8957b987cd479d66d3",
+      "git_revision": "f9c6c57eb2c8647e0b9a87588f4e1ce871b204dd",
+      "git_dirty": true,
+      "worktree_state_sha256": "7d80e68ae33bdd1bea5550defc76001ad54d4beabb798f8391d834d4bee1033e",
+      "cargo_lock_sha256": "7dfd6deb4cc4fb8ece3eb16825014c123a44f1e07f99ca1569043c7d34208f84",
+      "rustc_version": "rustc 1.99.0-nightly (9f36de775 2026-07-19)",
+      "target_triple": "aarch64-apple-darwin",
+      "build_profile": "release-perf",
+      "cargo_features": [
+        "perf-harness",
+        "tantivy-oracle"
+      ]
+    },
+    "machine": {
+      "fingerprint": "macos-aarch64-14cpu-unknown-cpu",
+      "os": "macos",
+      "arch": "aarch64",
+      "logical_cpus": 14,
+      "cpu_governor": null,
+      "load_average_start": null,
+      "load_average_end": null
+    },
+    "peak_rss": {
+      "method": "unsupported",
+      "bytes": null
+    },
+    "corpus": {
+      "corpus_sha256": "31272ba338d2a07389ce66677440ed763964207afb76448fec02c5524f4d0be8",
+      "query_set_sha256": "749b38f35df58646c9812fa5aa07aa500f1bfffd585ae102e2a93eb3f74ab111",
+      "qrels_sha256": null,
+      "document_count": 50000,
+      "content_bytes": null,
+      "generator_seed": 5860671082139239762,
+      "generator_revision": "synthetic-zipf-s11-vocab8192-doc4096-v1"
+    }
+  },
+  "cells": [
+    {
+      "cell_id": "QG-2/bulk/medium/1/positions_on/docs_per_second",
+      "spec": {
+        "gate": "Qg2",
+        "fixture": "bulk/medium/1/positions_on",
+        "metric": "docs_per_second",
+        "unit": "docs/s",
+        "role": "required",
+        "cold_cache": null
+      },
+      "estimand": "paired_log_ratio",
+      "body": {
+        "kind": "paired",
+        "paired": {
+          "schema_version": "quill-paired-estimator-v1",
+          "scope": {
+            "operation_id": "QG-2.bulk/medium/1/positions_on.docs_per_second",
+            "version": 1,
+            "semantics": "gauge_higher_is_better",
+            "unit": "docs/s"
+          },
+          "provenance": {
+            "run_id": "m4-macos-qg2-receipt-w5-r30-20260729T021107Z",
+            "executable_sha256": "f08f5dd1fb5574e1e322fd70937ef84e2f8c0a2130cfad8957b987cd479d66d3",
+            "corpus_sha256": "31272ba338d2a07389ce66677440ed763964207afb76448fec02c5524f4d0be8",
+            "worker_id": "macos-aarch64-14cpu-unknown-cpu",
+            "build_profile": "release-perf"
+          },
+          "config": {
+            "bootstrap_seed": 5860671082138523204,
+            "bootstrap_resamples": 2000,
+            "min_pairs": 10,
+            "max_order_imbalance": 1,
+            "max_null_center_log": 0.04879016416943205,
+            "max_null_ci_half_width_log": 0.09531017980432493,
+            "max_null_log_mad": 0.04879016416943205,
+            "max_null_order_effect_log": 0.04879016416943205,
+            "max_null_drift_log": 0.04879016416943205,
+            "summary_direction_dead_band_log": 9.999994999180668e-7,
+            "max_reproduction_delta_log": 0.01980262729617973
+          },
+          "effect": {
+            "median_log_ratio": -0.6379777894617118,
+            "treatment_over_control": 0.5283597992046201,
+            "ci95_low_log": -0.906131930320353,
+            "ci95_high_log": -0.6078806747628223,
+            "ci95_low_ratio": 0.4040842309425929,
+            "ci95_high_ratio": 0.5445036273873927,
+            "log_mad": 0.10709396576413266,
+            "mean_log_ratio": -0.745039597705513,
+            "ratio_of_arm_medians": 0.5382051105206827,
+            "algebraic_reconciliation_error": -2.7755575615628914e-15,
+            "control": {
+              "value": 163602.20904723945,
+              "p50": 163602.20904723945,
+              "median_ci95_low": 159398.2587267551,
+              "median_ci95_high": 210883.03640805514,
+              "p95": 250211.01045144402,
+              "p99": 251181.33722664404,
+              "mad": 10588.962978453303,
+              "cv_pct": 20.077789180060744,
+              "runs": 30
+            },
+            "treatment": {
+              "value": 88051.54500169733,
+              "p50": 88051.54500169733,
+              "median_ci95_low": 86344.89494009345,
+              "median_ci95_high": 88934.87672760402,
+              "p95": 90967.88907927235,
+              "p99": 91916.31963261886,
+              "mad": 1846.969880767072,
+              "cv_pct": 4.0222334930041335,
+              "runs": 30
+            },
+            "pair_count": 30,
+            "control_first_blocks": 15,
+            "treatment_first_blocks": 15,
+            "order_effect_log": 0.16098326400549323,
+            "drift_log": 0.026763319828695953
+          },
+          "null": {
+            "median_log_ratio": -0.002633836082612197,
+            "treatment_over_control": 0.9973696294204528,
+            "ci95_low_log": -0.036140587051948385,
+            "ci95_high_log": 0.06952705433699968,
+            "ci95_low_ratio": 0.9645046870805472,
+            "ci95_high_ratio": 1.0720010630904806,
+            "log_mad": 0.0896106196743553,
+            "mean_log_ratio": 0.02654962715654847,
+            "ratio_of_arm_medians": 1.0014914357098,
+            "algebraic_reconciliation_error": 2.0643209364124004e-15,
+            "control": {
+              "value": 165742.259389734,
+              "p50": 165742.259389734,
+              "median_ci95_low": 161499.03507718022,
+              "median_ci95_high": 170057.6143633545,
+              "p95": 262641.71115865407,
+              "p99": 265137.64543973084,
+              "mad": 6100.986256632299,
+              "cv_pct": 21.292106533961633,
+              "runs": 30
+            },
+            "treatment": {
+              "value": 165989.45331401078,
+              "p50": 165989.45331401078,
+              "median_ci95_low": 162755.76091313388,
+              "median_ci95_high": 195985.43252300116,
+              "p95": 258944.4259946541,
+              "p99": 259282.6413678578,
+              "mad": 8276.916272221555,
+              "cv_pct": 20.576287000100077,
+              "runs": 30
+            },
+            "pair_count": 30,
+            "control_first_blocks": 15,
+            "treatment_first_blocks": 15,
+            "order_effect_log": 0.05119522586618393,
+            "drift_log": -0.02447293698600774
+          },
+          "status": "invalid_null",
+          "claim_state": "no_decision",
+          "reasons": [
+            {
+              "code": "paired.null_dispersion",
+              "message": "A/A log-MAD 0.089611 exceeds 0.048790"
+            },
+            {
+              "code": "paired.null_order_effect",
+              "message": "A/A order effect 0.051195 exceeds 0.048790"
+            }
+          ],
+          "effect_samples": [
+            {
+              "block_id": 0,
+              "sample_id": 1,
+              "arm": "treatment",
+              "order": "first",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-2.bulk/medium/1/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "m4-macos-qg2-receipt-w5-r30-20260729T021107Z",
+                "executable_sha256": "f08f5dd1fb5574e1e322fd70937ef84e2f8c0a2130cfad8957b987cd479d66d3",
+                "corpus_sha256": "31272ba338d2a07389ce66677440ed763964207afb76448fec02c5524f4d0be8",
+                "worker_id": "macos-aarch64-14cpu-unknown-cpu",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 45202018541,
+              "ended_ns": 46019462375,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 90681.83662073308,
+              "group_id": null
+            },
+            {
+              "block_id": 0,
+              "sample_id": 0,
+              "arm": "control",
+              "order": "second",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-2.bulk/medium/1/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "m4-macos-qg2-receipt-w5-r30-20260729T021107Z",
+                "executable_sha256": "f08f5dd1fb5574e1e322fd70937ef84e2f8c0a2130cfad8957b987cd479d66d3",
+                "corpus_sha256": "31272ba338d2a07389ce66677440ed763964207afb76448fec02c5524f4d0be8",
+                "worker_id": "macos-aarch64-14cpu-unknown-cpu",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 46019463458,
+              "ended_ns": 46600952125,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 163278.45796898342,
+              "group_id": null
+            },
+            {
+              "block_id": 1,
+              "sample_id": 2,
+              "arm": "control",
+              "order": "first",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-2.bulk/medium/1/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "m4-macos-qg2-receipt-w5-r30-20260729T021107Z",
+                "executable_sha256": "f08f5dd1fb5574e1e322fd70937ef84e2f8c0a2130cfad8957b987cd479d66d3",
+                "corpus_sha256": "31272ba338d2a07389ce66677440ed763964207afb76448fec02c5524f4d0be8",
+                "worker_id": "macos-aarch64-14cpu-unknown-cpu",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 46600953125,
+              "ended_ns": 47077761000,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 244153.4382868882,
+              "group_id": null
+            },
+            {
+              "block_id": 1,
+              "sample_id": 3,
+              "arm": "treatment",
+              "order": "second",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-2.bulk/medium/1/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "m4-macos-qg2-receipt-w5-r30-20260729T021107Z",
+                "executable_sha256": "f08f5dd1fb5574e1e322fd70937ef84e2f8c0a2130cfad8957b987cd479d66d3",
+                "corpus_sha256": "31272ba338d2a07389ce66677440ed763964207afb76448fec02c5524f4d0be8",
+                "worker_id": "macos-aarch64-14cpu-unknown-cpu",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 47077762041,
+              "ended_ns": 47896262000,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 90967.88907927235,
+              "group_id": null
+            },
+            {
+              "block_id": 2,
+              "sample_id": 5,
+              "arm": "treatment",
+              "order": "first",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-2.bulk/medium/1/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "m4-macos-qg2-receipt-w5-r30-20260729T021107Z",
+                "executable_sha256": "f08f5dd1fb5574e1e322fd70937ef84e2f8c0a2130cfad8957b987cd479d66d3",
+                "corpus_sha256": "31272ba338d2a07389ce66677440ed763964207afb76448fec02c5524f4d0be8",
+                "worker_id": "macos-aarch64-14cpu-unknown-cpu",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 47896263833,
+              "ended_ns": 48703180250,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 91916.31963261886,
+              "group_id": null
+            },
+            {
+              "block_id": 2,
+              "sample_id": 4,
+              "arm": "control",
+              "order": "second",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-2.bulk/medium/1/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "m4-macos-qg2-receipt-w5-r30-20260729T021107Z",
+                "executable_sha256": "f08f5dd1fb5574e1e322fd70937ef84e2f8c0a2130cfad8957b987cd479d66d3",
+                "corpus_sha256": "31272ba338d2a07389ce66677440ed763964207afb76448fec02c5524f4d0be8",
+                "worker_id": "macos-aarch64-14cpu-unknown-cpu",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 48703181041,
+              "ended_ns": 49341724000,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 143484.494372508,
+              "group_id": null
+            },
+            {
+              "block_id": 3,
+              "sample_id": 7,
+              "arm": "treatment",
+              "order": "first",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-2.bulk/medium/1/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "m4-macos-qg2-receipt-w5-r30-20260729T021107Z",
+                "executable_sha256": "f08f5dd1fb5574e1e322fd70937ef84e2f8c0a2130cfad8957b987cd479d66d3",
+                "corpus_sha256": "31272ba338d2a07389ce66677440ed763964207afb76448fec02c5524f4d0be8",
+                "worker_id": "macos-aarch64-14cpu-unknown-cpu",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 49341724833,
+              "ended_ns": 50222229375,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 84185.08760275802,
+              "group_id": null
+            },
+            {
+              "block_id": 3,
+              "sample_id": 6,
+              "arm": "control",
+              "order": "second",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-2.bulk/medium/1/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "m4-macos-qg2-receipt-w5-r30-20260729T021107Z",
+                "executable_sha256": "f08f5dd1fb5574e1e322fd70937ef84e2f8c0a2130cfad8957b987cd479d66d3",
+                "corpus_sha256": "31272ba338d2a07389ce66677440ed763964207afb76448fec02c5524f4d0be8",
+                "worker_id": "macos-aarch64-14cpu-unknown-cpu",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 50222230125,
+              "ended_ns": 50714457416,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 237191.46182084637,
+              "group_id": null
+            },
+            {
+              "block_id": 4,
+              "sample_id": 9,
+              "arm": "treatment",
+              "order": "first",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-2.bulk/medium/1/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "m4-macos-qg2-receipt-w5-r30-20260729T021107Z",
+                "executable_sha256": "f08f5dd1fb5574e1e322fd70937ef84e2f8c0a2130cfad8957b987cd479d66d3",
+                "corpus_sha256": "31272ba338d2a07389ce66677440ed763964207afb76448fec02c5524f4d0be8",
+                "worker_id": "macos-aarch64-14cpu-unknown-cpu",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 50714458416,
+              "ended_ns": 51546375208,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 89426.54752439281,
+              "group_id": null
+            },
+            {
+              "block_id": 4,
+              "sample_id": 8,
+              "arm": "control",
+              "order": "second",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-2.bulk/medium/1/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "m4-macos-qg2-receipt-w5-r30-20260729T021107Z",
+                "executable_sha256": "f08f5dd1fb5574e1e322fd70937ef84e2f8c0a2130cfad8957b987cd479d66d3",
+                "corpus_sha256": "31272ba338d2a07389ce66677440ed763964207afb76448fec02c5524f4d0be8",
+                "worker_id": "macos-aarch64-14cpu-unknown-cpu",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 51546376541,
+              "ended_ns": 52030009875,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 241772.4835922192,
+              "group_id": null
+            },
+            {
+              "block_id": 5,
+              "sample_id": 11,
+              "arm": "treatment",
+              "order": "first",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-2.bulk/medium/1/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "m4-macos-qg2-receipt-w5-r30-20260729T021107Z",
+                "executable_sha256": "f08f5dd1fb5574e1e322fd70937ef84e2f8c0a2130cfad8957b987cd479d66d3",
+                "corpus_sha256": "31272ba338d2a07389ce66677440ed763964207afb76448fec02c5524f4d0be8",
+                "worker_id": "macos-aarch64-14cpu-unknown-cpu",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 52030011125,
+              "ended_ns": 52882103000,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 85480.4538838405,
+              "group_id": null
+            },
+            {
+              "block_id": 5,
+              "sample_id": 10,
+              "arm": "control",
+              "order": "second",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-2.bulk/medium/1/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "m4-macos-qg2-receipt-w5-r30-20260729T021107Z",
+                "executable_sha256": "f08f5dd1fb5574e1e322fd70937ef84e2f8c0a2130cfad8957b987cd479d66d3",
+                "corpus_sha256": "31272ba338d2a07389ce66677440ed763964207afb76448fec02c5524f4d0be8",
+                "worker_id": "macos-aarch64-14cpu-unknown-cpu",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 52882103916,
+              "ended_ns": 53466998458,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 163931.8070829642,
+              "group_id": null
+            },
+            {
+              "block_id": 6,
+              "sample_id": 13,
+              "arm": "treatment",
+              "order": "first",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-2.bulk/medium/1/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "m4-macos-qg2-receipt-w5-r30-20260729T021107Z",
+                "executable_sha256": "f08f5dd1fb5574e1e322fd70937ef84e2f8c0a2130cfad8957b987cd479d66d3",
+                "corpus_sha256": "31272ba338d2a07389ce66677440ed763964207afb76448fec02c5524f4d0be8",
+                "worker_id": "macos-aarch64-14cpu-unknown-cpu",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 53466999541,
+              "ended_ns": 54305962666,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 87414.14100027518,
+              "group_id": null
+            },
+            {
+              "block_id": 6,
+              "sample_id": 12,
+              "arm": "control",
+              "order": "second",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-2.bulk/medium/1/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "m4-macos-qg2-receipt-w5-r30-20260729T021107Z",
+                "executable_sha256": "f08f5dd1fb5574e1e322fd70937ef84e2f8c0a2130cfad8957b987cd479d66d3",
+                "corpus_sha256": "31272ba338d2a07389ce66677440ed763964207afb76448fec02c5524f4d0be8",
+                "worker_id": "macos-aarch64-14cpu-unknown-cpu",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 54305963708,
+              "ended_ns": 54888412666,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 163277.27907871435,
+              "group_id": null
+            },
+            {
+              "block_id": 7,
+              "sample_id": 14,
+              "arm": "control",
+              "order": "first",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-2.bulk/medium/1/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "m4-macos-qg2-receipt-w5-r30-20260729T021107Z",
+                "executable_sha256": "f08f5dd1fb5574e1e322fd70937ef84e2f8c0a2130cfad8957b987cd479d66d3",
+                "corpus_sha256": "31272ba338d2a07389ce66677440ed763964207afb76448fec02c5524f4d0be8",
+                "worker_id": "macos-aarch64-14cpu-unknown-cpu",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 54888413916,
+              "ended_ns": 55465258541,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 163925.96012549545,
+              "group_id": null
+            },
+            {
+              "block_id": 7,
+              "sample_id": 15,
+              "arm": "treatment",
+              "order": "second",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-2.bulk/medium/1/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "m4-macos-qg2-receipt-w5-r30-20260729T021107Z",
+                "executable_sha256": "f08f5dd1fb5574e1e322fd70937ef84e2f8c0a2130cfad8957b987cd479d66d3",
+                "corpus_sha256": "31272ba338d2a07389ce66677440ed763964207afb76448fec02c5524f4d0be8",
+                "worker_id": "macos-aarch64-14cpu-unknown-cpu",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 55465259333,
+              "ended_ns": 56385544958,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 77941.23405540586,
+              "group_id": null
+            },
+            {
+              "block_id": 8,
+              "sample_id": 16,
+              "arm": "control",
+              "order": "first",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-2.bulk/medium/1/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "m4-macos-qg2-receipt-w5-r30-20260729T021107Z",
+                "executable_sha256": "f08f5dd1fb5574e1e322fd70937ef84e2f8c0a2130cfad8957b987cd479d66d3",
+                "corpus_sha256": "31272ba338d2a07389ce66677440ed763964207afb76448fec02c5524f4d0be8",
+                "worker_id": "macos-aarch64-14cpu-unknown-cpu",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 56385545875,
+              "ended_ns": 56912037666,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 211218.14816068512,
+              "group_id": null
+            },
+            {
+              "block_id": 8,
+              "sample_id": 17,
+              "arm": "treatment",
+              "order": "second",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-2.bulk/medium/1/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "m4-macos-qg2-receipt-w5-r30-20260729T021107Z",
+                "executable_sha256": "f08f5dd1fb5574e1e322fd70937ef84e2f8c0a2130cfad8957b987cd479d66d3",
+                "corpus_sha256": "31272ba338d2a07389ce66677440ed763964207afb76448fec02c5524f4d0be8",
+                "worker_id": "macos-aarch64-14cpu-unknown-cpu",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 56912039333,
+              "ended_ns": 57866014166,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 76937.1576065675,
+              "group_id": null
+            },
+            {
+              "block_id": 9,
+              "sample_id": 19,
+              "arm": "treatment",
+              "order": "first",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-2.bulk/medium/1/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "m4-macos-qg2-receipt-w5-r30-20260729T021107Z",
+                "executable_sha256": "f08f5dd1fb5574e1e322fd70937ef84e2f8c0a2130cfad8957b987cd479d66d3",
+                "corpus_sha256": "31272ba338d2a07389ce66677440ed763964207afb76448fec02c5524f4d0be8",
+                "worker_id": "macos-aarch64-14cpu-unknown-cpu",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 57866015250,
+              "ended_ns": 58767287083,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 82095.60539285309,
+              "group_id": null
+            },
+            {
+              "block_id": 9,
+              "sample_id": 18,
+              "arm": "control",
+              "order": "second",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-2.bulk/medium/1/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "m4-macos-qg2-receipt-w5-r30-20260729T021107Z",
+                "executable_sha256": "f08f5dd1fb5574e1e322fd70937ef84e2f8c0a2130cfad8957b987cd479d66d3",
+                "corpus_sha256": "31272ba338d2a07389ce66677440ed763964207afb76448fec02c5524f4d0be8",
+                "worker_id": "macos-aarch64-14cpu-unknown-cpu",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 58767288291,
+              "ended_ns": 59360564291,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 158702.80592369396,
+              "group_id": null
+            },
+            {
+              "block_id": 10,
+              "sample_id": 20,
+              "arm": "control",
+              "order": "first",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-2.bulk/medium/1/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "m4-macos-qg2-receipt-w5-r30-20260729T021107Z",
+                "executable_sha256": "f08f5dd1fb5574e1e322fd70937ef84e2f8c0a2130cfad8957b987cd479d66d3",
+                "corpus_sha256": "31272ba338d2a07389ce66677440ed763964207afb76448fec02c5524f4d0be8",
+                "worker_id": "macos-aarch64-14cpu-unknown-cpu",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 59360565333,
+              "ended_ns": 59970478458,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 153877.50129724888,
+              "group_id": null
+            },
+            {
+              "block_id": 10,
+              "sample_id": 21,
+              "arm": "treatment",
+              "order": "second",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-2.bulk/medium/1/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "m4-macos-qg2-receipt-w5-r30-20260729T021107Z",
+                "executable_sha256": "f08f5dd1fb5574e1e322fd70937ef84e2f8c0a2130cfad8957b987cd479d66d3",
+                "corpus_sha256": "31272ba338d2a07389ce66677440ed763964207afb76448fec02c5524f4d0be8",
+                "worker_id": "macos-aarch64-14cpu-unknown-cpu",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 59970479583,
+              "ended_ns": 60788840125,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 90639.0414434092,
+              "group_id": null
+            },
+            {
+              "block_id": 11,
+              "sample_id": 22,
+              "arm": "control",
+              "order": "first",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-2.bulk/medium/1/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "m4-macos-qg2-receipt-w5-r30-20260729T021107Z",
+                "executable_sha256": "f08f5dd1fb5574e1e322fd70937ef84e2f8c0a2130cfad8957b987cd479d66d3",
+                "corpus_sha256": "31272ba338d2a07389ce66677440ed763964207afb76448fec02c5524f4d0be8",
+                "worker_id": "macos-aarch64-14cpu-unknown-cpu",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 60788841291,
+              "ended_ns": 61385624875,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 159029.11731537274,
+              "group_id": null
+            },
+            {
+              "block_id": 11,
+              "sample_id": 23,
+              "arm": "treatment",
+              "order": "second",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-2.bulk/medium/1/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "m4-macos-qg2-receipt-w5-r30-20260729T021107Z",
+                "executable_sha256": "f08f5dd1fb5574e1e322fd70937ef84e2f8c0a2130cfad8957b987cd479d66d3",
+                "corpus_sha256": "31272ba338d2a07389ce66677440ed763964207afb76448fec02c5524f4d0be8",
+                "worker_id": "macos-aarch64-14cpu-unknown-cpu",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 61385625833,
+              "ended_ns": 62223210166,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 88121.26789246828,
+              "group_id": null
+            },
+            {
+              "block_id": 12,
+              "sample_id": 25,
+              "arm": "treatment",
+              "order": "first",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-2.bulk/medium/1/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "m4-macos-qg2-receipt-w5-r30-20260729T021107Z",
+                "executable_sha256": "f08f5dd1fb5574e1e322fd70937ef84e2f8c0a2130cfad8957b987cd479d66d3",
+                "corpus_sha256": "31272ba338d2a07389ce66677440ed763964207afb76448fec02c5524f4d0be8",
+                "worker_id": "macos-aarch64-14cpu-unknown-cpu",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 62223211333,
+              "ended_ns": 63063765125,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 88773.66666670988,
+              "group_id": null
+            },
+            {
+              "block_id": 12,
+              "sample_id": 24,
+              "arm": "control",
+              "order": "second",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-2.bulk/medium/1/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "m4-macos-qg2-receipt-w5-r30-20260729T021107Z",
+                "executable_sha256": "f08f5dd1fb5574e1e322fd70937ef84e2f8c0a2130cfad8957b987cd479d66d3",
+                "corpus_sha256": "31272ba338d2a07389ce66677440ed763964207afb76448fec02c5524f4d0be8",
+                "worker_id": "macos-aarch64-14cpu-unknown-cpu",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 63063766208,
+              "ended_ns": 63642300916,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 162393.48509816482,
+              "group_id": null
+            },
+            {
+              "block_id": 13,
+              "sample_id": 27,
+              "arm": "treatment",
+              "order": "first",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-2.bulk/medium/1/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "m4-macos-qg2-receipt-w5-r30-20260729T021107Z",
+                "executable_sha256": "f08f5dd1fb5574e1e322fd70937ef84e2f8c0a2130cfad8957b987cd479d66d3",
+                "corpus_sha256": "31272ba338d2a07389ce66677440ed763964207afb76448fec02c5524f4d0be8",
+                "worker_id": "macos-aarch64-14cpu-unknown-cpu",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 63642302250,
+              "ended_ns": 64474249291,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 89631.41529191466,
+              "group_id": null
+            },
+            {
+              "block_id": 13,
+              "sample_id": 26,
+              "arm": "control",
+              "order": "second",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-2.bulk/medium/1/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "m4-macos-qg2-receipt-w5-r30-20260729T021107Z",
+                "executable_sha256": "f08f5dd1fb5574e1e322fd70937ef84e2f8c0a2130cfad8957b987cd479d66d3",
+                "corpus_sha256": "31272ba338d2a07389ce66677440ed763964207afb76448fec02c5524f4d0be8",
+                "worker_id": "macos-aarch64-14cpu-unknown-cpu",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 64474251666,
+              "ended_ns": 64952851833,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 250211.01045144402,
+              "group_id": null
+            },
+            {
+              "block_id": 14,
+              "sample_id": 28,
+              "arm": "control",
+              "order": "first",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-2.bulk/medium/1/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "m4-macos-qg2-receipt-w5-r30-20260729T021107Z",
+                "executable_sha256": "f08f5dd1fb5574e1e322fd70937ef84e2f8c0a2130cfad8957b987cd479d66d3",
+                "corpus_sha256": "31272ba338d2a07389ce66677440ed763964207afb76448fec02c5524f4d0be8",
+                "worker_id": "macos-aarch64-14cpu-unknown-cpu",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 64952852791,
+              "ended_ns": 65549764125,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 158750.1914924185,
+              "group_id": null
+            },
+            {
+              "block_id": 14,
+              "sample_id": 29,
+              "arm": "treatment",
+              "order": "second",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-2.bulk/medium/1/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "m4-macos-qg2-receipt-w5-r30-20260729T021107Z",
+                "executable_sha256": "f08f5dd1fb5574e1e322fd70937ef84e2f8c0a2130cfad8957b987cd479d66d3",
+                "corpus_sha256": "31272ba338d2a07389ce66677440ed763964207afb76448fec02c5524f4d0be8",
+                "worker_id": "macos-aarch64-14cpu-unknown-cpu",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 65549765041,
+              "ended_ns": 66383455291,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 87879.04786229349,
+              "group_id": null
+            },
+            {
+              "block_id": 15,
+              "sample_id": 31,
+              "arm": "treatment",
+              "order": "first",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-2.bulk/medium/1/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "m4-macos-qg2-receipt-w5-r30-20260729T021107Z",
+                "executable_sha256": "f08f5dd1fb5574e1e322fd70937ef84e2f8c0a2130cfad8957b987cd479d66d3",
+                "corpus_sha256": "31272ba338d2a07389ce66677440ed763964207afb76448fec02c5524f4d0be8",
+                "worker_id": "macos-aarch64-14cpu-unknown-cpu",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 66383457000,
+              "ended_ns": 67220808875,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 88320.29585631624,
+              "group_id": null
+            },
+            {
+              "block_id": 15,
+              "sample_id": 30,
+              "arm": "control",
+              "order": "second",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-2.bulk/medium/1/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "m4-macos-qg2-receipt-w5-r30-20260729T021107Z",
+                "executable_sha256": "f08f5dd1fb5574e1e322fd70937ef84e2f8c0a2130cfad8957b987cd479d66d3",
+                "corpus_sha256": "31272ba338d2a07389ce66677440ed763964207afb76448fec02c5524f4d0be8",
+                "worker_id": "macos-aarch64-14cpu-unknown-cpu",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 67220809916,
+              "ended_ns": 67809396625,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 162845.0330025815,
+              "group_id": null
+            },
+            {
+              "block_id": 16,
+              "sample_id": 33,
+              "arm": "treatment",
+              "order": "first",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-2.bulk/medium/1/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "m4-macos-qg2-receipt-w5-r30-20260729T021107Z",
+                "executable_sha256": "f08f5dd1fb5574e1e322fd70937ef84e2f8c0a2130cfad8957b987cd479d66d3",
+                "corpus_sha256": "31272ba338d2a07389ce66677440ed763964207afb76448fec02c5524f4d0be8",
+                "worker_id": "macos-aarch64-14cpu-unknown-cpu",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 67809397666,
+              "ended_ns": 68653123208,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 87809.66918420148,
+              "group_id": null
+            },
+            {
+              "block_id": 16,
+              "sample_id": 32,
+              "arm": "control",
+              "order": "second",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-2.bulk/medium/1/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "m4-macos-qg2-receipt-w5-r30-20260729T021107Z",
+                "executable_sha256": "f08f5dd1fb5574e1e322fd70937ef84e2f8c0a2130cfad8957b987cd479d66d3",
+                "corpus_sha256": "31272ba338d2a07389ce66677440ed763964207afb76448fec02c5524f4d0be8",
+                "worker_id": "macos-aarch64-14cpu-unknown-cpu",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 68653124791,
+              "ended_ns": 69259454791,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 157087.80127955807,
+              "group_id": null
+            },
+            {
+              "block_id": 17,
+              "sample_id": 34,
+              "arm": "control",
+              "order": "first",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-2.bulk/medium/1/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "m4-macos-qg2-receipt-w5-r30-20260729T021107Z",
+                "executable_sha256": "f08f5dd1fb5574e1e322fd70937ef84e2f8c0a2130cfad8957b987cd479d66d3",
+                "corpus_sha256": "31272ba338d2a07389ce66677440ed763964207afb76448fec02c5524f4d0be8",
+                "worker_id": "macos-aarch64-14cpu-unknown-cpu",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 69259455750,
+              "ended_ns": 69872961375,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 154825.54403234448,
+              "group_id": null
+            },
+            {
+              "block_id": 17,
+              "sample_id": 35,
+              "arm": "treatment",
+              "order": "second",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-2.bulk/medium/1/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "m4-macos-qg2-receipt-w5-r30-20260729T021107Z",
+                "executable_sha256": "f08f5dd1fb5574e1e322fd70937ef84e2f8c0a2130cfad8957b987cd479d66d3",
+                "corpus_sha256": "31272ba338d2a07389ce66677440ed763964207afb76448fec02c5524f4d0be8",
+                "worker_id": "macos-aarch64-14cpu-unknown-cpu",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 69872965166,
+              "ended_ns": 70761792333,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 83264.92287270112,
+              "group_id": null
+            },
+            {
+              "block_id": 18,
+              "sample_id": 37,
+              "arm": "treatment",
+              "order": "first",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-2.bulk/medium/1/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "m4-macos-qg2-receipt-w5-r30-20260729T021107Z",
+                "executable_sha256": "f08f5dd1fb5574e1e322fd70937ef84e2f8c0a2130cfad8957b987cd479d66d3",
+                "corpus_sha256": "31272ba338d2a07389ce66677440ed763964207afb76448fec02c5524f4d0be8",
+                "worker_id": "macos-aarch64-14cpu-unknown-cpu",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 70761793875,
+              "ended_ns": 71601865416,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 89096.08678849814,
+              "group_id": null
+            },
+            {
+              "block_id": 18,
+              "sample_id": 36,
+              "arm": "control",
+              "order": "second",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-2.bulk/medium/1/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "m4-macos-qg2-receipt-w5-r30-20260729T021107Z",
+                "executable_sha256": "f08f5dd1fb5574e1e322fd70937ef84e2f8c0a2130cfad8957b987cd479d66d3",
+                "corpus_sha256": "31272ba338d2a07389ce66677440ed763964207afb76448fec02c5524f4d0be8",
+                "worker_id": "macos-aarch64-14cpu-unknown-cpu",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 71601866416,
+              "ended_ns": 72232278583,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 147591.23677740074,
+              "group_id": null
+            },
+            {
+              "block_id": 19,
+              "sample_id": 39,
+              "arm": "treatment",
+              "order": "first",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-2.bulk/medium/1/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "m4-macos-qg2-receipt-w5-r30-20260729T021107Z",
+                "executable_sha256": "f08f5dd1fb5574e1e322fd70937ef84e2f8c0a2130cfad8957b987cd479d66d3",
+                "corpus_sha256": "31272ba338d2a07389ce66677440ed763964207afb76448fec02c5524f4d0be8",
+                "worker_id": "macos-aarch64-14cpu-unknown-cpu",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 72232279708,
+              "ended_ns": 73095505791,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 85223.65900201836,
+              "group_id": null
+            },
+            {
+              "block_id": 19,
+              "sample_id": 38,
+              "arm": "control",
+              "order": "second",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-2.bulk/medium/1/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "m4-macos-qg2-receipt-w5-r30-20260729T021107Z",
+                "executable_sha256": "f08f5dd1fb5574e1e322fd70937ef84e2f8c0a2130cfad8957b987cd479d66d3",
+                "corpus_sha256": "31272ba338d2a07389ce66677440ed763964207afb76448fec02c5524f4d0be8",
+                "worker_id": "macos-aarch64-14cpu-unknown-cpu",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 73095506958,
+              "ended_ns": 73713426916,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 152148.99084032341,
+              "group_id": null
+            },
+            {
+              "block_id": 20,
+              "sample_id": 41,
+              "arm": "treatment",
+              "order": "first",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-2.bulk/medium/1/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "m4-macos-qg2-receipt-w5-r30-20260729T021107Z",
+                "executable_sha256": "f08f5dd1fb5574e1e322fd70937ef84e2f8c0a2130cfad8957b987cd479d66d3",
+                "corpus_sha256": "31272ba338d2a07389ce66677440ed763964207afb76448fec02c5524f4d0be8",
+                "worker_id": "macos-aarch64-14cpu-unknown-cpu",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 73713428125,
+              "ended_ns": 74582384375,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 86195.81251330227,
+              "group_id": null
+            },
+            {
+              "block_id": 20,
+              "sample_id": 40,
+              "arm": "control",
+              "order": "second",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-2.bulk/medium/1/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "m4-macos-qg2-receipt-w5-r30-20260729T021107Z",
+                "executable_sha256": "f08f5dd1fb5574e1e322fd70937ef84e2f8c0a2130cfad8957b987cd479d66d3",
+                "corpus_sha256": "31272ba338d2a07389ce66677440ed763964207afb76448fec02c5524f4d0be8",
+                "worker_id": "macos-aarch64-14cpu-unknown-cpu",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 74582385416,
+              "ended_ns": 75102747500,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 218433.61447283113,
+              "group_id": null
+            },
+            {
+              "block_id": 21,
+              "sample_id": 42,
+              "arm": "control",
+              "order": "first",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-2.bulk/medium/1/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "m4-macos-qg2-receipt-w5-r30-20260729T021107Z",
+                "executable_sha256": "f08f5dd1fb5574e1e322fd70937ef84e2f8c0a2130cfad8957b987cd479d66d3",
+                "corpus_sha256": "31272ba338d2a07389ce66677440ed763964207afb76448fec02c5524f4d0be8",
+                "worker_id": "macos-aarch64-14cpu-unknown-cpu",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 75102748458,
+              "ended_ns": 75633996375,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 210547.92465542516,
+              "group_id": null
+            },
+            {
+              "block_id": 21,
+              "sample_id": 43,
+              "arm": "treatment",
+              "order": "second",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-2.bulk/medium/1/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "m4-macos-qg2-receipt-w5-r30-20260729T021107Z",
+                "executable_sha256": "f08f5dd1fb5574e1e322fd70937ef84e2f8c0a2130cfad8957b987cd479d66d3",
+                "corpus_sha256": "31272ba338d2a07389ce66677440ed763964207afb76448fec02c5524f4d0be8",
+                "worker_id": "macos-aarch64-14cpu-unknown-cpu",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 75633997333,
+              "ended_ns": 76511508041,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 84393.49753030109,
+              "group_id": null
+            },
+            {
+              "block_id": 22,
+              "sample_id": 44,
+              "arm": "control",
+              "order": "first",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-2.bulk/medium/1/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "m4-macos-qg2-receipt-w5-r30-20260729T021107Z",
+                "executable_sha256": "f08f5dd1fb5574e1e322fd70937ef84e2f8c0a2130cfad8957b987cd479d66d3",
+                "corpus_sha256": "31272ba338d2a07389ce66677440ed763964207afb76448fec02c5524f4d0be8",
+                "worker_id": "macos-aarch64-14cpu-unknown-cpu",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 76511510458,
+              "ended_ns": 77073938333,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 194151.79006727287,
+              "group_id": null
+            },
+            {
+              "block_id": 22,
+              "sample_id": 45,
+              "arm": "treatment",
+              "order": "second",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-2.bulk/medium/1/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "m4-macos-qg2-receipt-w5-r30-20260729T021107Z",
+                "executable_sha256": "f08f5dd1fb5574e1e322fd70937ef84e2f8c0a2130cfad8957b987cd479d66d3",
+                "corpus_sha256": "31272ba338d2a07389ce66677440ed763964207afb76448fec02c5524f4d0be8",
+                "worker_id": "macos-aarch64-14cpu-unknown-cpu",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 77073939583,
+              "ended_ns": 77918525166,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 88522.5694345717,
+              "group_id": null
+            },
+            {
+              "block_id": 23,
+              "sample_id": 46,
+              "arm": "control",
+              "order": "first",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-2.bulk/medium/1/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "m4-macos-qg2-receipt-w5-r30-20260729T021107Z",
+                "executable_sha256": "f08f5dd1fb5574e1e322fd70937ef84e2f8c0a2130cfad8957b987cd479d66d3",
+                "corpus_sha256": "31272ba338d2a07389ce66677440ed763964207afb76448fec02c5524f4d0be8",
+                "worker_id": "macos-aarch64-14cpu-unknown-cpu",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 77918526291,
+              "ended_ns": 78533199291,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 154288.28853731795,
+              "group_id": null
+            },
+            {
+              "block_id": 23,
+              "sample_id": 47,
+              "arm": "treatment",
+              "order": "second",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-2.bulk/medium/1/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "m4-macos-qg2-receipt-w5-r30-20260729T021107Z",
+                "executable_sha256": "f08f5dd1fb5574e1e322fd70937ef84e2f8c0a2130cfad8957b987cd479d66d3",
+                "corpus_sha256": "31272ba338d2a07389ce66677440ed763964207afb76448fec02c5524f4d0be8",
+                "worker_id": "macos-aarch64-14cpu-unknown-cpu",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 78533200208,
+              "ended_ns": 79405330916,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 86213.33772855825,
+              "group_id": null
+            },
+            {
+              "block_id": 24,
+              "sample_id": 48,
+              "arm": "control",
+              "order": "first",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-2.bulk/medium/1/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "m4-macos-qg2-receipt-w5-r30-20260729T021107Z",
+                "executable_sha256": "f08f5dd1fb5574e1e322fd70937ef84e2f8c0a2130cfad8957b987cd479d66d3",
+                "corpus_sha256": "31272ba338d2a07389ce66677440ed763964207afb76448fec02c5524f4d0be8",
+                "worker_id": "macos-aarch64-14cpu-unknown-cpu",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 79405332208,
+              "ended_ns": 79897087916,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 246636.44492190628,
+              "group_id": null
+            },
+            {
+              "block_id": 24,
+              "sample_id": 49,
+              "arm": "treatment",
+              "order": "second",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-2.bulk/medium/1/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "m4-macos-qg2-receipt-w5-r30-20260729T021107Z",
+                "executable_sha256": "f08f5dd1fb5574e1e322fd70937ef84e2f8c0a2130cfad8957b987cd479d66d3",
+                "corpus_sha256": "31272ba338d2a07389ce66677440ed763964207afb76448fec02c5524f4d0be8",
+                "worker_id": "macos-aarch64-14cpu-unknown-cpu",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 79897088625,
+              "ended_ns": 80726595708,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 90370.06763198262,
+              "group_id": null
+            },
+            {
+              "block_id": 25,
+              "sample_id": 50,
+              "arm": "control",
+              "order": "first",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-2.bulk/medium/1/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "m4-macos-qg2-receipt-w5-r30-20260729T021107Z",
+                "executable_sha256": "f08f5dd1fb5574e1e322fd70937ef84e2f8c0a2130cfad8957b987cd479d66d3",
+                "corpus_sha256": "31272ba338d2a07389ce66677440ed763964207afb76448fec02c5524f4d0be8",
+                "worker_id": "macos-aarch64-14cpu-unknown-cpu",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 80726597333,
+              "ended_ns": 81238832416,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 219881.10122946388,
+              "group_id": null
+            },
+            {
+              "block_id": 25,
+              "sample_id": 51,
+              "arm": "treatment",
+              "order": "second",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-2.bulk/medium/1/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "m4-macos-qg2-receipt-w5-r30-20260729T021107Z",
+                "executable_sha256": "f08f5dd1fb5574e1e322fd70937ef84e2f8c0a2130cfad8957b987cd479d66d3",
+                "corpus_sha256": "31272ba338d2a07389ce66677440ed763964207afb76448fec02c5524f4d0be8",
+                "worker_id": "macos-aarch64-14cpu-unknown-cpu",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 81238833083,
+              "ended_ns": 82065830416,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 89572.29219727128,
+              "group_id": null
+            },
+            {
+              "block_id": 26,
+              "sample_id": 52,
+              "arm": "control",
+              "order": "first",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-2.bulk/medium/1/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "m4-macos-qg2-receipt-w5-r30-20260729T021107Z",
+                "executable_sha256": "f08f5dd1fb5574e1e322fd70937ef84e2f8c0a2130cfad8957b987cd479d66d3",
+                "corpus_sha256": "31272ba338d2a07389ce66677440ed763964207afb76448fec02c5524f4d0be8",
+                "worker_id": "macos-aarch64-14cpu-unknown-cpu",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 82065831666,
+              "ended_ns": 82542984375,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 239653.31674510593,
+              "group_id": null
+            },
+            {
+              "block_id": 26,
+              "sample_id": 53,
+              "arm": "treatment",
+              "order": "second",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-2.bulk/medium/1/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "m4-macos-qg2-receipt-w5-r30-20260729T021107Z",
+                "executable_sha256": "f08f5dd1fb5574e1e322fd70937ef84e2f8c0a2130cfad8957b987cd479d66d3",
+                "corpus_sha256": "31272ba338d2a07389ce66677440ed763964207afb76448fec02c5524f4d0be8",
+                "worker_id": "macos-aarch64-14cpu-unknown-cpu",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 82542986833,
+              "ended_ns": 83363106500,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 90375.98237879462,
+              "group_id": null
+            },
+            {
+              "block_id": 27,
+              "sample_id": 54,
+              "arm": "control",
+              "order": "first",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-2.bulk/medium/1/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "m4-macos-qg2-receipt-w5-r30-20260729T021107Z",
+                "executable_sha256": "f08f5dd1fb5574e1e322fd70937ef84e2f8c0a2130cfad8957b987cd479d66d3",
+                "corpus_sha256": "31272ba338d2a07389ce66677440ed763964207afb76448fec02c5524f4d0be8",
+                "worker_id": "macos-aarch64-14cpu-unknown-cpu",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 83363107666,
+              "ended_ns": 83838178291,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 251181.33722664404,
+              "group_id": null
+            },
+            {
+              "block_id": 27,
+              "sample_id": 55,
+              "arm": "treatment",
+              "order": "second",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-2.bulk/medium/1/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "m4-macos-qg2-receipt-w5-r30-20260729T021107Z",
+                "executable_sha256": "f08f5dd1fb5574e1e322fd70937ef84e2f8c0a2130cfad8957b987cd479d66d3",
+                "corpus_sha256": "31272ba338d2a07389ce66677440ed763964207afb76448fec02c5524f4d0be8",
+                "worker_id": "macos-aarch64-14cpu-unknown-cpu",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 83838179083,
+              "ended_ns": 84675438416,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 88339.14473280348,
+              "group_id": null
+            },
+            {
+              "block_id": 28,
+              "sample_id": 56,
+              "arm": "control",
+              "order": "first",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-2.bulk/medium/1/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "m4-macos-qg2-receipt-w5-r30-20260729T021107Z",
+                "executable_sha256": "f08f5dd1fb5574e1e322fd70937ef84e2f8c0a2130cfad8957b987cd479d66d3",
+                "corpus_sha256": "31272ba338d2a07389ce66677440ed763964207afb76448fec02c5524f4d0be8",
+                "worker_id": "macos-aarch64-14cpu-unknown-cpu",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 84675440208,
+              "ended_ns": 85274514583,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 159767.40013813745,
+              "group_id": null
+            },
+            {
+              "block_id": 28,
+              "sample_id": 57,
+              "arm": "treatment",
+              "order": "second",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-2.bulk/medium/1/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "m4-macos-qg2-receipt-w5-r30-20260729T021107Z",
+                "executable_sha256": "f08f5dd1fb5574e1e322fd70937ef84e2f8c0a2130cfad8957b987cd479d66d3",
+                "corpus_sha256": "31272ba338d2a07389ce66677440ed763964207afb76448fec02c5524f4d0be8",
+                "worker_id": "macos-aarch64-14cpu-unknown-cpu",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 85274515333,
+              "ended_ns": 86135675208,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 86476.45215162865,
+              "group_id": null
+            },
+            {
+              "block_id": 29,
+              "sample_id": 59,
+              "arm": "treatment",
+              "order": "first",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-2.bulk/medium/1/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "m4-macos-qg2-receipt-w5-r30-20260729T021107Z",
+                "executable_sha256": "f08f5dd1fb5574e1e322fd70937ef84e2f8c0a2130cfad8957b987cd479d66d3",
+                "corpus_sha256": "31272ba338d2a07389ce66677440ed763964207afb76448fec02c5524f4d0be8",
+                "worker_id": "macos-aarch64-14cpu-unknown-cpu",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 86135676500,
+              "ended_ns": 86982063500,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 87981.82211092638,
+              "group_id": null
+            },
+            {
+              "block_id": 29,
+              "sample_id": 58,
+              "arm": "control",
+              "order": "second",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-2.bulk/medium/1/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "m4-macos-qg2-receipt-w5-r30-20260729T021107Z",
+                "executable_sha256": "f08f5dd1fb5574e1e322fd70937ef84e2f8c0a2130cfad8957b987cd479d66d3",
+                "corpus_sha256": "31272ba338d2a07389ce66677440ed763964207afb76448fec02c5524f4d0be8",
+                "worker_id": "macos-aarch64-14cpu-unknown-cpu",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 86982067208,
+              "ended_ns": 87563179708,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 164273.00312234354,
+              "group_id": null
+            }
+          ],
+          "null_samples": [
+            {
+              "block_id": 0,
+              "sample_id": 1000001,
+              "arm": "treatment",
+              "order": "first",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-2.bulk/medium/1/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "m4-macos-qg2-receipt-w5-r30-20260729T021107Z",
+                "executable_sha256": "f08f5dd1fb5574e1e322fd70937ef84e2f8c0a2130cfad8957b987cd479d66d3",
+                "corpus_sha256": "31272ba338d2a07389ce66677440ed763964207afb76448fec02c5524f4d0be8",
+                "worker_id": "macos-aarch64-14cpu-unknown-cpu",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 5073438000,
+              "ended_ns": 5622675916,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 168970.4389190991,
+              "group_id": null
+            },
+            {
+              "block_id": 0,
+              "sample_id": 1000000,
+              "arm": "control",
+              "order": "second",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-2.bulk/medium/1/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "m4-macos-qg2-receipt-w5-r30-20260729T021107Z",
+                "executable_sha256": "f08f5dd1fb5574e1e322fd70937ef84e2f8c0a2130cfad8957b987cd479d66d3",
+                "corpus_sha256": "31272ba338d2a07389ce66677440ed763964207afb76448fec02c5524f4d0be8",
+                "worker_id": "macos-aarch64-14cpu-unknown-cpu",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 5622676875,
+              "ended_ns": 6070189208,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 256211.25515751974,
+              "group_id": null
+            },
+            {
+              "block_id": 1,
+              "sample_id": 1000003,
+              "arm": "treatment",
+              "order": "first",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-2.bulk/medium/1/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "m4-macos-qg2-receipt-w5-r30-20260729T021107Z",
+                "executable_sha256": "f08f5dd1fb5574e1e322fd70937ef84e2f8c0a2130cfad8957b987cd479d66d3",
+                "corpus_sha256": "31272ba338d2a07389ce66677440ed763964207afb76448fec02c5524f4d0be8",
+                "worker_id": "macos-aarch64-14cpu-unknown-cpu",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 6070190291,
+              "ended_ns": 6531621625,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 250758.2301985629,
+              "group_id": null
+            },
+            {
+              "block_id": 1,
+              "sample_id": 1000002,
+              "arm": "control",
+              "order": "second",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-2.bulk/medium/1/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "m4-macos-qg2-receipt-w5-r30-20260729T021107Z",
+                "executable_sha256": "f08f5dd1fb5574e1e322fd70937ef84e2f8c0a2130cfad8957b987cd479d66d3",
+                "corpus_sha256": "31272ba338d2a07389ce66677440ed763964207afb76448fec02c5524f4d0be8",
+                "worker_id": "macos-aarch64-14cpu-unknown-cpu",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 6531622375,
+              "ended_ns": 7095593291,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 163264.57309783506,
+              "group_id": null
+            },
+            {
+              "block_id": 2,
+              "sample_id": 1000004,
+              "arm": "control",
+              "order": "first",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-2.bulk/medium/1/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "m4-macos-qg2-receipt-w5-r30-20260729T021107Z",
+                "executable_sha256": "f08f5dd1fb5574e1e322fd70937ef84e2f8c0a2130cfad8957b987cd479d66d3",
+                "corpus_sha256": "31272ba338d2a07389ce66677440ed763964207afb76448fec02c5524f4d0be8",
+                "worker_id": "macos-aarch64-14cpu-unknown-cpu",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 7095594458,
+              "ended_ns": 7651870416,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 166198.6092792885,
+              "group_id": null
+            },
+            {
+              "block_id": 2,
+              "sample_id": 1000005,
+              "arm": "treatment",
+              "order": "second",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-2.bulk/medium/1/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "m4-macos-qg2-receipt-w5-r30-20260729T021107Z",
+                "executable_sha256": "f08f5dd1fb5574e1e322fd70937ef84e2f8c0a2130cfad8957b987cd479d66d3",
+                "corpus_sha256": "31272ba338d2a07389ce66677440ed763964207afb76448fec02c5524f4d0be8",
+                "worker_id": "macos-aarch64-14cpu-unknown-cpu",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 7651871250,
+              "ended_ns": 8111721666,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 248910.13948695222,
+              "group_id": null
+            },
+            {
+              "block_id": 3,
+              "sample_id": 1000006,
+              "arm": "control",
+              "order": "first",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-2.bulk/medium/1/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "m4-macos-qg2-receipt-w5-r30-20260729T021107Z",
+                "executable_sha256": "f08f5dd1fb5574e1e322fd70937ef84e2f8c0a2130cfad8957b987cd479d66d3",
+                "corpus_sha256": "31272ba338d2a07389ce66677440ed763964207afb76448fec02c5524f4d0be8",
+                "worker_id": "macos-aarch64-14cpu-unknown-cpu",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 8111722625,
+              "ended_ns": 8557335708,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 262641.71115865407,
+              "group_id": null
+            },
+            {
+              "block_id": 3,
+              "sample_id": 1000007,
+              "arm": "treatment",
+              "order": "second",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-2.bulk/medium/1/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "m4-macos-qg2-receipt-w5-r30-20260729T021107Z",
+                "executable_sha256": "f08f5dd1fb5574e1e322fd70937ef84e2f8c0a2130cfad8957b987cd479d66d3",
+                "corpus_sha256": "31272ba338d2a07389ce66677440ed763964207afb76448fec02c5524f4d0be8",
+                "worker_id": "macos-aarch64-14cpu-unknown-cpu",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 8557336541,
+              "ended_ns": 9117546541,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 165315.9198801023,
+              "group_id": null
+            },
+            {
+              "block_id": 4,
+              "sample_id": 1000008,
+              "arm": "control",
+              "order": "first",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-2.bulk/medium/1/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "m4-macos-qg2-receipt-w5-r30-20260729T021107Z",
+                "executable_sha256": "f08f5dd1fb5574e1e322fd70937ef84e2f8c0a2130cfad8957b987cd479d66d3",
+                "corpus_sha256": "31272ba338d2a07389ce66677440ed763964207afb76448fec02c5524f4d0be8",
+                "worker_id": "macos-aarch64-14cpu-unknown-cpu",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 9117547458,
+              "ended_ns": 9558084666,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 265137.64543973084,
+              "group_id": null
+            },
+            {
+              "block_id": 4,
+              "sample_id": 1000009,
+              "arm": "treatment",
+              "order": "second",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-2.bulk/medium/1/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "m4-macos-qg2-receipt-w5-r30-20260729T021107Z",
+                "executable_sha256": "f08f5dd1fb5574e1e322fd70937ef84e2f8c0a2130cfad8957b987cd479d66d3",
+                "corpus_sha256": "31272ba338d2a07389ce66677440ed763964207afb76448fec02c5524f4d0be8",
+                "worker_id": "macos-aarch64-14cpu-unknown-cpu",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 9558085583,
+              "ended_ns": 10025818750,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 238414.78202165625,
+              "group_id": null
+            },
+            {
+              "block_id": 5,
+              "sample_id": 1000010,
+              "arm": "control",
+              "order": "first",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-2.bulk/medium/1/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "m4-macos-qg2-receipt-w5-r30-20260729T021107Z",
+                "executable_sha256": "f08f5dd1fb5574e1e322fd70937ef84e2f8c0a2130cfad8957b987cd479d66d3",
+                "corpus_sha256": "31272ba338d2a07389ce66677440ed763964207afb76448fec02c5524f4d0be8",
+                "worker_id": "macos-aarch64-14cpu-unknown-cpu",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 10025819875,
+              "ended_ns": 10575825125,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 171866.75898890645,
+              "group_id": null
+            },
+            {
+              "block_id": 5,
+              "sample_id": 1000011,
+              "arm": "treatment",
+              "order": "second",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-2.bulk/medium/1/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "m4-macos-qg2-receipt-w5-r30-20260729T021107Z",
+                "executable_sha256": "f08f5dd1fb5574e1e322fd70937ef84e2f8c0a2130cfad8957b987cd479d66d3",
+                "corpus_sha256": "31272ba338d2a07389ce66677440ed763964207afb76448fec02c5524f4d0be8",
+                "worker_id": "macos-aarch64-14cpu-unknown-cpu",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 10575826375,
+              "ended_ns": 11137763125,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 163772.10927569526,
+              "group_id": null
+            },
+            {
+              "block_id": 6,
+              "sample_id": 1000013,
+              "arm": "treatment",
+              "order": "first",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-2.bulk/medium/1/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "m4-macos-qg2-receipt-w5-r30-20260729T021107Z",
+                "executable_sha256": "f08f5dd1fb5574e1e322fd70937ef84e2f8c0a2130cfad8957b987cd479d66d3",
+                "corpus_sha256": "31272ba338d2a07389ce66677440ed763964207afb76448fec02c5524f4d0be8",
+                "worker_id": "macos-aarch64-14cpu-unknown-cpu",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 11137764083,
+              "ended_ns": 11585926625,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 259282.6413678578,
+              "group_id": null
+            },
+            {
+              "block_id": 6,
+              "sample_id": 1000012,
+              "arm": "control",
+              "order": "second",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-2.bulk/medium/1/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "m4-macos-qg2-receipt-w5-r30-20260729T021107Z",
+                "executable_sha256": "f08f5dd1fb5574e1e322fd70937ef84e2f8c0a2130cfad8957b987cd479d66d3",
+                "corpus_sha256": "31272ba338d2a07389ce66677440ed763964207afb76448fec02c5524f4d0be8",
+                "worker_id": "macos-aarch64-14cpu-unknown-cpu",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 11585927791,
+              "ended_ns": 12141771041,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 171819.73230382617,
+              "group_id": null
+            },
+            {
+              "block_id": 7,
+              "sample_id": 1000015,
+              "arm": "treatment",
+              "order": "first",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-2.bulk/medium/1/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "m4-macos-qg2-receipt-w5-r30-20260729T021107Z",
+                "executable_sha256": "f08f5dd1fb5574e1e322fd70937ef84e2f8c0a2130cfad8957b987cd479d66d3",
+                "corpus_sha256": "31272ba338d2a07389ce66677440ed763964207afb76448fec02c5524f4d0be8",
+                "worker_id": "macos-aarch64-14cpu-unknown-cpu",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 12141771958,
+              "ended_ns": 12596465041,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 258944.4259946541,
+              "group_id": null
+            },
+            {
+              "block_id": 7,
+              "sample_id": 1000014,
+              "arm": "control",
+              "order": "second",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-2.bulk/medium/1/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "m4-macos-qg2-receipt-w5-r30-20260729T021107Z",
+                "executable_sha256": "f08f5dd1fb5574e1e322fd70937ef84e2f8c0a2130cfad8957b987cd479d66d3",
+                "corpus_sha256": "31272ba338d2a07389ce66677440ed763964207afb76448fec02c5524f4d0be8",
+                "worker_id": "macos-aarch64-14cpu-unknown-cpu",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 12596466291,
+              "ended_ns": 13162722000,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 169558.74943273695,
+              "group_id": null
+            },
+            {
+              "block_id": 8,
+              "sample_id": 1000017,
+              "arm": "treatment",
+              "order": "first",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-2.bulk/medium/1/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "m4-macos-qg2-receipt-w5-r30-20260729T021107Z",
+                "executable_sha256": "f08f5dd1fb5574e1e322fd70937ef84e2f8c0a2130cfad8957b987cd479d66d3",
+                "corpus_sha256": "31272ba338d2a07389ce66677440ed763964207afb76448fec02c5524f4d0be8",
+                "worker_id": "macos-aarch64-14cpu-unknown-cpu",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 13162722916,
+              "ended_ns": 13641144291,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 230252.57975796246,
+              "group_id": null
+            },
+            {
+              "block_id": 8,
+              "sample_id": 1000016,
+              "arm": "control",
+              "order": "second",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-2.bulk/medium/1/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "m4-macos-qg2-receipt-w5-r30-20260729T021107Z",
+                "executable_sha256": "f08f5dd1fb5574e1e322fd70937ef84e2f8c0a2130cfad8957b987cd479d66d3",
+                "corpus_sha256": "31272ba338d2a07389ce66677440ed763964207afb76448fec02c5524f4d0be8",
+                "worker_id": "macos-aarch64-14cpu-unknown-cpu",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 13641145583,
+              "ended_ns": 14195466833,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 167316.08564834128,
+              "group_id": null
+            },
+            {
+              "block_id": 9,
+              "sample_id": 1000018,
+              "arm": "control",
+              "order": "first",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-2.bulk/medium/1/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "m4-macos-qg2-receipt-w5-r30-20260729T021107Z",
+                "executable_sha256": "f08f5dd1fb5574e1e322fd70937ef84e2f8c0a2130cfad8957b987cd479d66d3",
+                "corpus_sha256": "31272ba338d2a07389ce66677440ed763964207afb76448fec02c5524f4d0be8",
+                "worker_id": "macos-aarch64-14cpu-unknown-cpu",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 14195468125,
+              "ended_ns": 14753889333,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 165285.90950017952,
+              "group_id": null
+            },
+            {
+              "block_id": 9,
+              "sample_id": 1000019,
+              "arm": "treatment",
+              "order": "second",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-2.bulk/medium/1/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "m4-macos-qg2-receipt-w5-r30-20260729T021107Z",
+                "executable_sha256": "f08f5dd1fb5574e1e322fd70937ef84e2f8c0a2130cfad8957b987cd479d66d3",
+                "corpus_sha256": "31272ba338d2a07389ce66677440ed763964207afb76448fec02c5524f4d0be8",
+                "worker_id": "macos-aarch64-14cpu-unknown-cpu",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 14753890208,
+              "ended_ns": 15313162375,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 166748.51295093514,
+              "group_id": null
+            },
+            {
+              "block_id": 10,
+              "sample_id": 1000021,
+              "arm": "treatment",
+              "order": "first",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-2.bulk/medium/1/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "m4-macos-qg2-receipt-w5-r30-20260729T021107Z",
+                "executable_sha256": "f08f5dd1fb5574e1e322fd70937ef84e2f8c0a2130cfad8957b987cd479d66d3",
+                "corpus_sha256": "31272ba338d2a07389ce66677440ed763964207afb76448fec02c5524f4d0be8",
+                "worker_id": "macos-aarch64-14cpu-unknown-cpu",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 15313163500,
+              "ended_ns": 15859727541,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 173280.7687738545,
+              "group_id": null
+            },
+            {
+              "block_id": 10,
+              "sample_id": 1000020,
+              "arm": "control",
+              "order": "second",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-2.bulk/medium/1/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "m4-macos-qg2-receipt-w5-r30-20260729T021107Z",
+                "executable_sha256": "f08f5dd1fb5574e1e322fd70937ef84e2f8c0a2130cfad8957b987cd479d66d3",
+                "corpus_sha256": "31272ba338d2a07389ce66677440ed763964207afb76448fec02c5524f4d0be8",
+                "worker_id": "macos-aarch64-14cpu-unknown-cpu",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 15859728625,
+              "ended_ns": 16490924833,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 147082.36492710872,
+              "group_id": null
+            },
+            {
+              "block_id": 11,
+              "sample_id": 1000023,
+              "arm": "treatment",
+              "order": "first",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-2.bulk/medium/1/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "m4-macos-qg2-receipt-w5-r30-20260729T021107Z",
+                "executable_sha256": "f08f5dd1fb5574e1e322fd70937ef84e2f8c0a2130cfad8957b987cd479d66d3",
+                "corpus_sha256": "31272ba338d2a07389ce66677440ed763964207afb76448fec02c5524f4d0be8",
+                "worker_id": "macos-aarch64-14cpu-unknown-cpu",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 16490926166,
+              "ended_ns": 17105935333,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 147643.17262594475,
+              "group_id": null
+            },
+            {
+              "block_id": 11,
+              "sample_id": 1000022,
+              "arm": "control",
+              "order": "second",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-2.bulk/medium/1/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "m4-macos-qg2-receipt-w5-r30-20260729T021107Z",
+                "executable_sha256": "f08f5dd1fb5574e1e322fd70937ef84e2f8c0a2130cfad8957b987cd479d66d3",
+                "corpus_sha256": "31272ba338d2a07389ce66677440ed763964207afb76448fec02c5524f4d0be8",
+                "worker_id": "macos-aarch64-14cpu-unknown-cpu",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 17105936500,
+              "ended_ns": 17701712833,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 154594.13210577512,
+              "group_id": null
+            },
+            {
+              "block_id": 12,
+              "sample_id": 1000024,
+              "arm": "control",
+              "order": "first",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-2.bulk/medium/1/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "m4-macos-qg2-receipt-w5-r30-20260729T021107Z",
+                "executable_sha256": "f08f5dd1fb5574e1e322fd70937ef84e2f8c0a2130cfad8957b987cd479d66d3",
+                "corpus_sha256": "31272ba338d2a07389ce66677440ed763964207afb76448fec02c5524f4d0be8",
+                "worker_id": "macos-aarch64-14cpu-unknown-cpu",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 17701713750,
+              "ended_ns": 18280311875,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 161499.03507718022,
+              "group_id": null
+            },
+            {
+              "block_id": 12,
+              "sample_id": 1000025,
+              "arm": "treatment",
+              "order": "second",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-2.bulk/medium/1/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "m4-macos-qg2-receipt-w5-r30-20260729T021107Z",
+                "executable_sha256": "f08f5dd1fb5574e1e322fd70937ef84e2f8c0a2130cfad8957b987cd479d66d3",
+                "corpus_sha256": "31272ba338d2a07389ce66677440ed763964207afb76448fec02c5524f4d0be8",
+                "worker_id": "macos-aarch64-14cpu-unknown-cpu",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 18280313416,
+              "ended_ns": 18858946625,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 162497.8081483148,
+              "group_id": null
+            },
+            {
+              "block_id": 13,
+              "sample_id": 1000027,
+              "arm": "treatment",
+              "order": "first",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-2.bulk/medium/1/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "m4-macos-qg2-receipt-w5-r30-20260729T021107Z",
+                "executable_sha256": "f08f5dd1fb5574e1e322fd70937ef84e2f8c0a2130cfad8957b987cd479d66d3",
+                "corpus_sha256": "31272ba338d2a07389ce66677440ed763964207afb76448fec02c5524f4d0be8",
+                "worker_id": "macos-aarch64-14cpu-unknown-cpu",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 18858947708,
+              "ended_ns": 19483401791,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 153198.82939793984,
+              "group_id": null
+            },
+            {
+              "block_id": 13,
+              "sample_id": 1000026,
+              "arm": "control",
+              "order": "second",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-2.bulk/medium/1/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "m4-macos-qg2-receipt-w5-r30-20260729T021107Z",
+                "executable_sha256": "f08f5dd1fb5574e1e322fd70937ef84e2f8c0a2130cfad8957b987cd479d66d3",
+                "corpus_sha256": "31272ba338d2a07389ce66677440ed763964207afb76448fec02c5524f4d0be8",
+                "worker_id": "macos-aarch64-14cpu-unknown-cpu",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 19483402583,
+              "ended_ns": 20072434375,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 157277.69126264012,
+              "group_id": null
+            },
+            {
+              "block_id": 14,
+              "sample_id": 1000029,
+              "arm": "treatment",
+              "order": "first",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-2.bulk/medium/1/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "m4-macos-qg2-receipt-w5-r30-20260729T021107Z",
+                "executable_sha256": "f08f5dd1fb5574e1e322fd70937ef84e2f8c0a2130cfad8957b987cd479d66d3",
+                "corpus_sha256": "31272ba338d2a07389ce66677440ed763964207afb76448fec02c5524f4d0be8",
+                "worker_id": "macos-aarch64-14cpu-unknown-cpu",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 20072435375,
+              "ended_ns": 20647542416,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 164528.4148041957,
+              "group_id": null
+            },
+            {
+              "block_id": 14,
+              "sample_id": 1000028,
+              "arm": "control",
+              "order": "second",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-2.bulk/medium/1/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "m4-macos-qg2-receipt-w5-r30-20260729T021107Z",
+                "executable_sha256": "f08f5dd1fb5574e1e322fd70937ef84e2f8c0a2130cfad8957b987cd479d66d3",
+                "corpus_sha256": "31272ba338d2a07389ce66677440ed763964207afb76448fec02c5524f4d0be8",
+                "worker_id": "macos-aarch64-14cpu-unknown-cpu",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 20647543416,
+              "ended_ns": 21262655750,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 153477.84668223685,
+              "group_id": null
+            },
+            {
+              "block_id": 15,
+              "sample_id": 1000030,
+              "arm": "control",
+              "order": "first",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-2.bulk/medium/1/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "m4-macos-qg2-receipt-w5-r30-20260729T021107Z",
+                "executable_sha256": "f08f5dd1fb5574e1e322fd70937ef84e2f8c0a2130cfad8957b987cd479d66d3",
+                "corpus_sha256": "31272ba338d2a07389ce66677440ed763964207afb76448fec02c5524f4d0be8",
+                "worker_id": "macos-aarch64-14cpu-unknown-cpu",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 21262656666,
+              "ended_ns": 21845441041,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 162208.72115059497,
+              "group_id": null
+            },
+            {
+              "block_id": 15,
+              "sample_id": 1000031,
+              "arm": "treatment",
+              "order": "second",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-2.bulk/medium/1/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "m4-macos-qg2-receipt-w5-r30-20260729T021107Z",
+                "executable_sha256": "f08f5dd1fb5574e1e322fd70937ef84e2f8c0a2130cfad8957b987cd479d66d3",
+                "corpus_sha256": "31272ba338d2a07389ce66677440ed763964207afb76448fec02c5524f4d0be8",
+                "worker_id": "macos-aarch64-14cpu-unknown-cpu",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 21845441791,
+              "ended_ns": 22512015625,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 149999.53080146766,
+              "group_id": null
+            },
+            {
+              "block_id": 16,
+              "sample_id": 1000033,
+              "arm": "treatment",
+              "order": "first",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-2.bulk/medium/1/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "m4-macos-qg2-receipt-w5-r30-20260729T021107Z",
+                "executable_sha256": "f08f5dd1fb5574e1e322fd70937ef84e2f8c0a2130cfad8957b987cd479d66d3",
+                "corpus_sha256": "31272ba338d2a07389ce66677440ed763964207afb76448fec02c5524f4d0be8",
+                "worker_id": "macos-aarch64-14cpu-unknown-cpu",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 22512019208,
+              "ended_ns": 23101471666,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 159577.77915426024,
+              "group_id": null
+            },
+            {
+              "block_id": 16,
+              "sample_id": 1000032,
+              "arm": "control",
+              "order": "second",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-2.bulk/medium/1/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "m4-macos-qg2-receipt-w5-r30-20260729T021107Z",
+                "executable_sha256": "f08f5dd1fb5574e1e322fd70937ef84e2f8c0a2130cfad8957b987cd479d66d3",
+                "corpus_sha256": "31272ba338d2a07389ce66677440ed763964207afb76448fec02c5524f4d0be8",
+                "worker_id": "macos-aarch64-14cpu-unknown-cpu",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 23101472375,
+              "ended_ns": 23705356625,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 154464.72470854994,
+              "group_id": null
+            },
+            {
+              "block_id": 17,
+              "sample_id": 1000034,
+              "arm": "control",
+              "order": "first",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-2.bulk/medium/1/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "m4-macos-qg2-receipt-w5-r30-20260729T021107Z",
+                "executable_sha256": "f08f5dd1fb5574e1e322fd70937ef84e2f8c0a2130cfad8957b987cd479d66d3",
+                "corpus_sha256": "31272ba338d2a07389ce66677440ed763964207afb76448fec02c5524f4d0be8",
+                "worker_id": "macos-aarch64-14cpu-unknown-cpu",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 23705357458,
+              "ended_ns": 24190006125,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 239574.55966375614,
+              "group_id": null
+            },
+            {
+              "block_id": 17,
+              "sample_id": 1000035,
+              "arm": "treatment",
+              "order": "second",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-2.bulk/medium/1/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "m4-macos-qg2-receipt-w5-r30-20260729T021107Z",
+                "executable_sha256": "f08f5dd1fb5574e1e322fd70937ef84e2f8c0a2130cfad8957b987cd479d66d3",
+                "corpus_sha256": "31272ba338d2a07389ce66677440ed763964207afb76448fec02c5524f4d0be8",
+                "worker_id": "macos-aarch64-14cpu-unknown-cpu",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 24190007083,
+              "ended_ns": 24768944666,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 162298.93243754798,
+              "group_id": null
+            },
+            {
+              "block_id": 18,
+              "sample_id": 1000036,
+              "arm": "control",
+              "order": "first",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-2.bulk/medium/1/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "m4-macos-qg2-receipt-w5-r30-20260729T021107Z",
+                "executable_sha256": "f08f5dd1fb5574e1e322fd70937ef84e2f8c0a2130cfad8957b987cd479d66d3",
+                "corpus_sha256": "31272ba338d2a07389ce66677440ed763964207afb76448fec02c5524f4d0be8",
+                "worker_id": "macos-aarch64-14cpu-unknown-cpu",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 24768945541,
+              "ended_ns": 25329431083,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 170057.6143633545,
+              "group_id": null
+            },
+            {
+              "block_id": 18,
+              "sample_id": 1000037,
+              "arm": "treatment",
+              "order": "second",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-2.bulk/medium/1/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "m4-macos-qg2-receipt-w5-r30-20260729T021107Z",
+                "executable_sha256": "f08f5dd1fb5574e1e322fd70937ef84e2f8c0a2130cfad8957b987cd479d66d3",
+                "corpus_sha256": "31272ba338d2a07389ce66677440ed763964207afb76448fec02c5524f4d0be8",
+                "worker_id": "macos-aarch64-14cpu-unknown-cpu",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 25329432291,
+              "ended_ns": 25904430541,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 166975.1772397258,
+              "group_id": null
+            },
+            {
+              "block_id": 19,
+              "sample_id": 1000038,
+              "arm": "control",
+              "order": "first",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-2.bulk/medium/1/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "m4-macos-qg2-receipt-w5-r30-20260729T021107Z",
+                "executable_sha256": "f08f5dd1fb5574e1e322fd70937ef84e2f8c0a2130cfad8957b987cd479d66d3",
+                "corpus_sha256": "31272ba338d2a07389ce66677440ed763964207afb76448fec02c5524f4d0be8",
+                "worker_id": "macos-aarch64-14cpu-unknown-cpu",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 25904431708,
+              "ended_ns": 26488687000,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 159674.05186514033,
+              "group_id": null
+            },
+            {
+              "block_id": 19,
+              "sample_id": 1000039,
+              "arm": "treatment",
+              "order": "second",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-2.bulk/medium/1/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "m4-macos-qg2-receipt-w5-r30-20260729T021107Z",
+                "executable_sha256": "f08f5dd1fb5574e1e322fd70937ef84e2f8c0a2130cfad8957b987cd479d66d3",
+                "corpus_sha256": "31272ba338d2a07389ce66677440ed763964207afb76448fec02c5524f4d0be8",
+                "worker_id": "macos-aarch64-14cpu-unknown-cpu",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 26488690250,
+              "ended_ns": 27079840541,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 156726.9362294114,
+              "group_id": null
+            },
+            {
+              "block_id": 20,
+              "sample_id": 1000040,
+              "arm": "control",
+              "order": "first",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-2.bulk/medium/1/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "m4-macos-qg2-receipt-w5-r30-20260729T021107Z",
+                "executable_sha256": "f08f5dd1fb5574e1e322fd70937ef84e2f8c0a2130cfad8957b987cd479d66d3",
+                "corpus_sha256": "31272ba338d2a07389ce66677440ed763964207afb76448fec02c5524f4d0be8",
+                "worker_id": "macos-aarch64-14cpu-unknown-cpu",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 27079841708,
+              "ended_ns": 27554036000,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 251480.27577327043,
+              "group_id": null
+            },
+            {
+              "block_id": 20,
+              "sample_id": 1000041,
+              "arm": "treatment",
+              "order": "second",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-2.bulk/medium/1/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "m4-macos-qg2-receipt-w5-r30-20260729T021107Z",
+                "executable_sha256": "f08f5dd1fb5574e1e322fd70937ef84e2f8c0a2130cfad8957b987cd479d66d3",
+                "corpus_sha256": "31272ba338d2a07389ce66677440ed763964207afb76448fec02c5524f4d0be8",
+                "worker_id": "macos-aarch64-14cpu-unknown-cpu",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 27554037125,
+              "ended_ns": 28138573541,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 161188.19270182546,
+              "group_id": null
+            },
+            {
+              "block_id": 21,
+              "sample_id": 1000042,
+              "arm": "control",
+              "order": "first",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-2.bulk/medium/1/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "m4-macos-qg2-receipt-w5-r30-20260729T021107Z",
+                "executable_sha256": "f08f5dd1fb5574e1e322fd70937ef84e2f8c0a2130cfad8957b987cd479d66d3",
+                "corpus_sha256": "31272ba338d2a07389ce66677440ed763964207afb76448fec02c5524f4d0be8",
+                "worker_id": "macos-aarch64-14cpu-unknown-cpu",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 28138574500,
+              "ended_ns": 28788110166,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 151439.52674566364,
+              "group_id": null
+            },
+            {
+              "block_id": 21,
+              "sample_id": 1000043,
+              "arm": "treatment",
+              "order": "second",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-2.bulk/medium/1/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "m4-macos-qg2-receipt-w5-r30-20260729T021107Z",
+                "executable_sha256": "f08f5dd1fb5574e1e322fd70937ef84e2f8c0a2130cfad8957b987cd479d66d3",
+                "corpus_sha256": "31272ba338d2a07389ce66677440ed763964207afb76448fec02c5524f4d0be8",
+                "worker_id": "macos-aarch64-14cpu-unknown-cpu",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 28788111291,
+              "ended_ns": 29275017750,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 237711.59874190853,
+              "group_id": null
+            },
+            {
+              "block_id": 22,
+              "sample_id": 1000045,
+              "arm": "treatment",
+              "order": "first",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-2.bulk/medium/1/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "m4-macos-qg2-receipt-w5-r30-20260729T021107Z",
+                "executable_sha256": "f08f5dd1fb5574e1e322fd70937ef84e2f8c0a2130cfad8957b987cd479d66d3",
+                "corpus_sha256": "31272ba338d2a07389ce66677440ed763964207afb76448fec02c5524f4d0be8",
+                "worker_id": "macos-aarch64-14cpu-unknown-cpu",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 29275019708,
+              "ended_ns": 29852627916,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 164075.54949246082,
+              "group_id": null
+            },
+            {
+              "block_id": 22,
+              "sample_id": 1000044,
+              "arm": "control",
+              "order": "second",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-2.bulk/medium/1/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "m4-macos-qg2-receipt-w5-r30-20260729T021107Z",
+                "executable_sha256": "f08f5dd1fb5574e1e322fd70937ef84e2f8c0a2130cfad8957b987cd479d66d3",
+                "corpus_sha256": "31272ba338d2a07389ce66677440ed763964207afb76448fec02c5524f4d0be8",
+                "worker_id": "macos-aarch64-14cpu-unknown-cpu",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 29852628750,
+              "ended_ns": 30438059458,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 162968.4603357844,
+              "group_id": null
+            },
+            {
+              "block_id": 23,
+              "sample_id": 1000046,
+              "arm": "control",
+              "order": "first",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-2.bulk/medium/1/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "m4-macos-qg2-receipt-w5-r30-20260729T021107Z",
+                "executable_sha256": "f08f5dd1fb5574e1e322fd70937ef84e2f8c0a2130cfad8957b987cd479d66d3",
+                "corpus_sha256": "31272ba338d2a07389ce66677440ed763964207afb76448fec02c5524f4d0be8",
+                "worker_id": "macos-aarch64-14cpu-unknown-cpu",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 30438060333,
+              "ended_ns": 31031520625,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 157125.93683433006,
+              "group_id": null
+            },
+            {
+              "block_id": 23,
+              "sample_id": 1000047,
+              "arm": "treatment",
+              "order": "second",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-2.bulk/medium/1/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "m4-macos-qg2-receipt-w5-r30-20260729T021107Z",
+                "executable_sha256": "f08f5dd1fb5574e1e322fd70937ef84e2f8c0a2130cfad8957b987cd479d66d3",
+                "corpus_sha256": "31272ba338d2a07389ce66677440ed763964207afb76448fec02c5524f4d0be8",
+                "worker_id": "macos-aarch64-14cpu-unknown-cpu",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 31031521541,
+              "ended_ns": 31538363791,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 218690.0962721478,
+              "group_id": null
+            },
+            {
+              "block_id": 24,
+              "sample_id": 1000048,
+              "arm": "control",
+              "order": "first",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-2.bulk/medium/1/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "m4-macos-qg2-receipt-w5-r30-20260729T021107Z",
+                "executable_sha256": "f08f5dd1fb5574e1e322fd70937ef84e2f8c0a2130cfad8957b987cd479d66d3",
+                "corpus_sha256": "31272ba338d2a07389ce66677440ed763964207afb76448fec02c5524f4d0be8",
+                "worker_id": "macos-aarch64-14cpu-unknown-cpu",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 31538364875,
+              "ended_ns": 32019460500,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 249937.98163892602,
+              "group_id": null
+            },
+            {
+              "block_id": 24,
+              "sample_id": 1000049,
+              "arm": "treatment",
+              "order": "second",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-2.bulk/medium/1/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "m4-macos-qg2-receipt-w5-r30-20260729T021107Z",
+                "executable_sha256": "f08f5dd1fb5574e1e322fd70937ef84e2f8c0a2130cfad8957b987cd479d66d3",
+                "corpus_sha256": "31272ba338d2a07389ce66677440ed763964207afb76448fec02c5524f4d0be8",
+                "worker_id": "macos-aarch64-14cpu-unknown-cpu",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 32019461250,
+              "ended_ns": 32599924375,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 163212.5893887198,
+              "group_id": null
+            },
+            {
+              "block_id": 25,
+              "sample_id": 1000051,
+              "arm": "treatment",
+              "order": "first",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-2.bulk/medium/1/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "m4-macos-qg2-receipt-w5-r30-20260729T021107Z",
+                "executable_sha256": "f08f5dd1fb5574e1e322fd70937ef84e2f8c0a2130cfad8957b987cd479d66d3",
+                "corpus_sha256": "31272ba338d2a07389ce66677440ed763964207afb76448fec02c5524f4d0be8",
+                "worker_id": "macos-aarch64-14cpu-unknown-cpu",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 32599925875,
+              "ended_ns": 33211432125,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 151524.33480817018,
+              "group_id": null
+            },
+            {
+              "block_id": 25,
+              "sample_id": 1000050,
+              "arm": "control",
+              "order": "second",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-2.bulk/medium/1/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "m4-macos-qg2-receipt-w5-r30-20260729T021107Z",
+                "executable_sha256": "f08f5dd1fb5574e1e322fd70937ef84e2f8c0a2130cfad8957b987cd479d66d3",
+                "corpus_sha256": "31272ba338d2a07389ce66677440ed763964207afb76448fec02c5524f4d0be8",
+                "worker_id": "macos-aarch64-14cpu-unknown-cpu",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 33211432958,
+              "ended_ns": 33801581500,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 161717.67823882902,
+              "group_id": null
+            },
+            {
+              "block_id": 26,
+              "sample_id": 1000053,
+              "arm": "treatment",
+              "order": "first",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-2.bulk/medium/1/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "m4-macos-qg2-receipt-w5-r30-20260729T021107Z",
+                "executable_sha256": "f08f5dd1fb5574e1e322fd70937ef84e2f8c0a2130cfad8957b987cd479d66d3",
+                "corpus_sha256": "31272ba338d2a07389ce66677440ed763964207afb76448fec02c5524f4d0be8",
+                "worker_id": "macos-aarch64-14cpu-unknown-cpu",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 33801582791,
+              "ended_ns": 34391991333,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 161025.75518712102,
+              "group_id": null
+            },
+            {
+              "block_id": 26,
+              "sample_id": 1000052,
+              "arm": "control",
+              "order": "second",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-2.bulk/medium/1/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "m4-macos-qg2-receipt-w5-r30-20260729T021107Z",
+                "executable_sha256": "f08f5dd1fb5574e1e322fd70937ef84e2f8c0a2130cfad8957b987cd479d66d3",
+                "corpus_sha256": "31272ba338d2a07389ce66677440ed763964207afb76448fec02c5524f4d0be8",
+                "worker_id": "macos-aarch64-14cpu-unknown-cpu",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 34391992250,
+              "ended_ns": 34980298125,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 160049.14558691913,
+              "group_id": null
+            },
+            {
+              "block_id": 27,
+              "sample_id": 1000055,
+              "arm": "treatment",
+              "order": "first",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-2.bulk/medium/1/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "m4-macos-qg2-receipt-w5-r30-20260729T021107Z",
+                "executable_sha256": "f08f5dd1fb5574e1e322fd70937ef84e2f8c0a2130cfad8957b987cd479d66d3",
+                "corpus_sha256": "31272ba338d2a07389ce66677440ed763964207afb76448fec02c5524f4d0be8",
+                "worker_id": "macos-aarch64-14cpu-unknown-cpu",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 34980299041,
+              "ended_ns": 35473158375,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 229411.38045531488,
+              "group_id": null
+            },
+            {
+              "block_id": 27,
+              "sample_id": 1000054,
+              "arm": "control",
+              "order": "second",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-2.bulk/medium/1/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "m4-macos-qg2-receipt-w5-r30-20260729T021107Z",
+                "executable_sha256": "f08f5dd1fb5574e1e322fd70937ef84e2f8c0a2130cfad8957b987cd479d66d3",
+                "corpus_sha256": "31272ba338d2a07389ce66677440ed763964207afb76448fec02c5524f4d0be8",
+                "worker_id": "macos-aarch64-14cpu-unknown-cpu",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 35473159625,
+              "ended_ns": 36048575250,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 168664.6632070778,
+              "group_id": null
+            },
+            {
+              "block_id": 28,
+              "sample_id": 1000056,
+              "arm": "control",
+              "order": "first",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-2.bulk/medium/1/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "m4-macos-qg2-receipt-w5-r30-20260729T021107Z",
+                "executable_sha256": "f08f5dd1fb5574e1e322fd70937ef84e2f8c0a2130cfad8957b987cd479d66d3",
+                "corpus_sha256": "31272ba338d2a07389ce66677440ed763964207afb76448fec02c5524f4d0be8",
+                "worker_id": "macos-aarch64-14cpu-unknown-cpu",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 36048577541,
+              "ended_ns": 36628757083,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 169293.96797127422,
+              "group_id": null
+            },
+            {
+              "block_id": 28,
+              "sample_id": 1000057,
+              "arm": "treatment",
+              "order": "second",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-2.bulk/medium/1/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "m4-macos-qg2-receipt-w5-r30-20260729T021107Z",
+                "executable_sha256": "f08f5dd1fb5574e1e322fd70937ef84e2f8c0a2130cfad8957b987cd479d66d3",
+                "corpus_sha256": "31272ba338d2a07389ce66677440ed763964207afb76448fec02c5524f4d0be8",
+                "worker_id": "macos-aarch64-14cpu-unknown-cpu",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 36628758750,
+              "ended_ns": 37205490833,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 166662.98674791926,
+              "group_id": null
+            },
+            {
+              "block_id": 29,
+              "sample_id": 1000059,
+              "arm": "treatment",
+              "order": "first",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-2.bulk/medium/1/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "m4-macos-qg2-receipt-w5-r30-20260729T021107Z",
+                "executable_sha256": "f08f5dd1fb5574e1e322fd70937ef84e2f8c0a2130cfad8957b987cd479d66d3",
+                "corpus_sha256": "31272ba338d2a07389ce66677440ed763964207afb76448fec02c5524f4d0be8",
+                "worker_id": "macos-aarch64-14cpu-unknown-cpu",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 37205492041,
+              "ended_ns": 37690883041,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 240803.75515925657,
+              "group_id": null
+            },
+            {
+              "block_id": 29,
+              "sample_id": 1000058,
+              "arm": "control",
+              "order": "second",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-2.bulk/medium/1/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "m4-macos-qg2-receipt-w5-r30-20260729T021107Z",
+                "executable_sha256": "f08f5dd1fb5574e1e322fd70937ef84e2f8c0a2130cfad8957b987cd479d66d3",
+                "corpus_sha256": "31272ba338d2a07389ce66677440ed763964207afb76448fec02c5524f4d0be8",
+                "worker_id": "macos-aarch64-14cpu-unknown-cpu",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 37690884083,
+              "ended_ns": 38180581333,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 243552.70684186122,
+              "group_id": null
+            }
+          ]
+        },
+        "hierarchical": null,
+        "reconciliation": {
+          "paired_median_ratio": 0.5283597992046201,
+          "marginal_median_ratio": 0.5382051105206827,
+          "abs_log_delta": 0.018462244306417963,
+          "direction_agrees": true,
+          "within_tolerance": true
+        }
+      },
+      "status": "invalid_null",
+      "reasons": [
+        {
+          "code": "evidence.paired_invalid",
+          "message": "paired estimator status InvalidNull with 2 reason(s)",
+          "severity": "no_claim"
+        }
+      ]
+    }
+  ],
+  "gate_status": "invalid_null",
+  "gate_decision": null,
+  "reasons": [
+    {
+      "code": "evidence.gate_cell_invalid_null",
+      "message": "required cell QG-2/bulk/medium/1/positions_on/docs_per_second has an invalid A/A null",
+      "severity": "no_claim"
+    }
+  ],
+  "artifact_sha256": "b7adb4916b9b07dab30d3375717b6167443e781d4deeef35581f2bec7445d87c"
+}
