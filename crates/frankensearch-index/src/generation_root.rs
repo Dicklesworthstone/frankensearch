@@ -1552,6 +1552,10 @@ impl QualifiedGenerationControlFile {
     /// blocking. Route replacement, process-identity drift, and all normal
     /// file-admission errors remain fail-closed.
     #[cfg(test)]
+    #[cfg_attr(
+        all(target_os = "macos", target_arch = "aarch64"),
+        allow(clippy::unused_self)
+    )]
     fn try_lock(&self, mode: GenerationRootLockMode) -> GenerationRootResult<GenerationRootLock> {
         #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
         {
