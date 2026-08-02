@@ -1337,6 +1337,7 @@ mod tests {
         bytes[IDENTITY_BOUND_WAL_CRC_OFFSET..].copy_from_slice(&crc.to_le_bytes());
     }
 
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     fn encoded_test_batch(entries: &[WalEntry], quantization: Quantization) -> Vec<u8> {
         let mut batch = Vec::new();
         batch.extend_from_slice(&BATCH_MAGIC);
@@ -1360,6 +1361,7 @@ mod tests {
         batch
     }
 
+    #[cfg(any(target_os = "linux", target_os = "android"))]
     fn directory_entry_names(path: &Path) -> Vec<std::ffi::OsString> {
         let mut names: Vec<_> = fs::read_dir(path)
             .expect("read private WAL fixture directory")
