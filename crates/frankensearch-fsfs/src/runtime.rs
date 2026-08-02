@@ -19916,6 +19916,21 @@ mod tests {
                 .await
                 .expect("publish first expansion witness");
 
+            let vector_path = temp.path().join(super::FSFS_VECTOR_INDEX_FILE);
+            fs::create_dir_all(vector_path.parent().expect("vector parent"))
+                .expect("create vector parent");
+            let test_embedder = HashEmbedder::default_256();
+            let vector = test_embedder.embed_sync("alpha token");
+            let mut vector_writer =
+                VectorIndex::create(&vector_path, test_embedder.id(), vector.len())
+                    .expect("create expansion vector index");
+            vector_writer
+                .write_record("alpha.md", &vector)
+                .expect("write first expansion vector");
+            vector_writer
+                .finish()
+                .expect("publish first expansion vector generation");
+
             let mut config = FsfsConfig::default();
             config.storage.index_dir = temp.path().display().to_string();
             let runtime = FsfsRuntime::new(config).with_cli_input(CliInput {
