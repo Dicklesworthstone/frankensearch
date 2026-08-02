@@ -2186,16 +2186,18 @@ impl Grammar {
     }
 
     fn parse_or(&mut self, depth: usize) -> Option<ParsedNode> {
-        let mut nodes = Vec::new();
-        let mut syntactic_operands = 0;
-        let mut explicit_or = false;
+        let mut top_nodes = Vec::new();
+        let mut top_operands = 0_usize;
+        let mut run_nodes = Vec::new();
+        let mut run_operands = 0_usize;
+        let mut run_explicit = false;
         let mut joined_from_explicit_or = false;
 
         loop {
             if !self.peek().is_some_and(LexToken::can_start_operand) {
                 break;
             }
-            syntactic_operands += 1;
+            run_operands += 1;
             let mut node = self.parse_and(depth);
             let joined_to_explicit_or = matches!(self.peek(), Some(LexToken::Or(_)));
             if let Some(node) = node.as_mut()
@@ -2205,7 +2207,7 @@ impl Grammar {
                 wrap_direct_negative_or_operand(node);
             }
             if let Some(node) = node {
-                nodes.push(node);
+                run_nodes.push(node);
             }
             if let Some(LexToken::Or(offset)) = self.peek() {
                 let offset = *offset;
@@ -2216,16 +2218,72 @@ impl Grammar {
                     self.syntax_diagnostic_at("syntax recovery: OR has no right operand", offset);
                     break;
                 }
-                explicit_or = true;
+                run_explicit = true;
                 joined_from_explicit_or = true;
             } else if !self.peek().is_some_and(LexToken::can_start_operand) {
                 break;
             } else {
                 joined_from_explicit_or = false;
+                Self::flush_or_run(
+                    &mut top_nodes,
+                    &mut top_operands,
+                    &mut run_nodes,
+                    &mut run_operands,
+                    &mut run_explicit,
+                );
             }
         }
 
-        combine_or(nodes, syntactic_operands, explicit_or)
+        if top_operands == 0 {
+            // The whole chain is one run — a pure explicit-OR chain, a pure
+            // implicit chain, or a single operand. Keep the historical flat
+            // combination, including its same-level duplicate-retention rule.
+            return combine_or(run_nodes, run_operands, run_explicit);
+        }
+        Self::flush_or_run(
+            &mut top_nodes,
+            &mut top_operands,
+            &mut run_nodes,
+            &mut run_operands,
+            &mut run_explicit,
+        );
+        combine_or(top_nodes, top_operands, false)
+    }
+
+    /// Close one explicit-`OR` run at an implicit-adjacency boundary.
+    ///
+    /// The pinned grammar nests an explicit `OR` expression as its own node
+    /// beneath the implicit disjunction, so its operands live one level below
+    /// operands joined by plain adjacency — and the duplicate-retention
+    /// rewrite, which only compares children of the SAME boolean level, never
+    /// dedups across that boundary. Flattening the whole mixed chain instead
+    /// made Quill drop a trailing operand that duplicates an OR-run member,
+    /// scoring exactly one clause short of the oracle (bd-htcun, found by the
+    /// bd-bsjw campaign as a clean 2.0x score deficit on
+    /// `slices OR title:Nested AND reused slices`).
+    fn flush_or_run(
+        top_nodes: &mut Vec<ParsedNode>,
+        top_operands: &mut usize,
+        run_nodes: &mut Vec<ParsedNode>,
+        run_operands: &mut usize,
+        run_explicit: &mut bool,
+    ) {
+        if *run_operands == 0 && run_nodes.is_empty() {
+            return;
+        }
+        *top_operands += 1;
+        let nodes = std::mem::take(run_nodes);
+        let operands = std::mem::replace(run_operands, 0);
+        let explicit = std::mem::replace(run_explicit, false);
+        if explicit {
+            if let Some(node) = combine_or(nodes, operands, true) {
+                top_nodes.push(node);
+            }
+        } else {
+            // An adjacency boundary closes a run immediately, so a run
+            // without an explicit OR is a single implicit operand.
+            top_nodes.extend(nodes);
+        }
     }
 
     fn parse_and(&mut self, depth: usize) -> Option<ParsedNode> {
@@ -5846,6 +5904,45 @@ mod tests {
                 PositionedTerm::new(1, "main"),
                 PositionedTerm::new(2, "rs"),
             ]
+        );
+    }
+
+    /// A trailing operand that duplicates an explicit-OR-run member must
+    /// SURVIVE: the pinned grammar nests the OR run one level below the
+    /// implicit disjunction, and duplicate retention never crosses that
+    /// boundary (bd-htcun). A pure implicit chain still dedups.
+    #[test]
+    fn mixed_chain_duplicate_survives_or_run_nesting() {
+        let mixed = parser().parse("alpha OR beta AND gamma alpha");
+        let Query::Boolean { clauses, operator } = &mixed.query else {
+            panic!("mixed chain must lower to a boolean: {:?}", mixed.query);
+        };
+        assert_eq!(*operator, None, "implicit disjunction at the top level");
+        assert_eq!(
+            clauses.len(),
+            2,
+            "OR-run plus the surviving trailing duplicate: {clauses:?}"
+        );
+        assert!(
+            matches!(&clauses[1].query, Query::Term { text, .. } if text == "alpha"),
+            "the trailing duplicate survives at the outer level: {clauses:?}"
+        );
+
+        let pure = parser().parse("alpha alpha");
+        let Query::Boolean {
+            clauses: pure_clauses,
+            ..
+        } = &pure.query
+        else {
+            panic!(
+                "two-operand implicit chain lowers to a boolean: {:?}",
+                pure.query
+            );
+        };
+        assert_eq!(
+            pure_clauses.len(),
+            1,
+            "a pure implicit chain still retains only the first duplicate: {pure_clauses:?}"
         );
     }
 

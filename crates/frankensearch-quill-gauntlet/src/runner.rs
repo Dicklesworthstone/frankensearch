@@ -17067,12 +17067,18 @@ mod tests {
                 }
                 1 => Operand::NegatedTerm(pick(rng, vocabulary).to_owned()),
                 // Field scope is squarely in the pinned grammar
-                // (`field:value`). `title:` is EXCLUDED pending the campaign's
-                // third finding: an explicit title-fielded literal inside a
-                // mixed OR/AND chain scores at exactly HALF the oracle — the
-                // 2.0 title boost is present at Quill's parse level (pinned by
-                // existing parser tests) but lost by execution for this shape.
-                2 => Operand::Fielded("content", pick(rng, vocabulary).to_owned()),
+                // (`field:value`). The campaign's third finding initially
+                // implicated `title:` here, but discrimination proved the
+                // 2.0x deficit was duplicate-retention scope in mixed chains
+                // (bd-htcun, fixed) — both fields generate freely.
+                2 => {
+                    let field = if rng.bounded(2) == 0 {
+                        "title"
+                    } else {
+                        "content"
+                    };
+                    Operand::Fielded(field, pick(rng, vocabulary).to_owned())
+                }
                 _ => Operand::Term(pick(rng, vocabulary).to_owned()),
             }
         }
@@ -17280,6 +17286,98 @@ mod tests {
             crate::engine::GauntletEngine::observe(&oracle, &cx, &slop_case)
                 .await
                 .expect("the oracle executes the slop query the subject refuses");
+        });
+    }
+
+    /// bd-htcun: a trailing operand that duplicates an explicit-OR-run member
+    /// must survive and score additively, exactly like the pinned oracle
+    /// (whose grammar nests the OR run one level below the implicit
+    /// disjunction, out of duplicate-retention scope). Found by the bsjw
+    /// campaign as a clean 2.0x score deficit — initially misattributed to
+    /// the title boost; the fielded probes stay because they discriminated
+    /// the false theory and now pin the fielded shapes as Exact too.
+    #[cfg(feature = "tantivy-oracle")]
+    #[test]
+    fn mixed_chain_duplicates_and_fielded_literals_match_oracle_exactly() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let fixture = make_scalar_g1a_regression_fixture();
+            let (mut subject, mut oracle) = live_campaign_engines();
+            subject.claim_fresh_campaign().expect("claim subject");
+            oracle.claim_fresh_campaign().expect("claim oracle");
+            let documents = fixture
+                .documents
+                .iter()
+                .cloned()
+                .map(frankensearch_core::IndexableDocument::from)
+                .collect::<Vec<_>>();
+            subject
+                .index_mut()
+                .expect("subject index")
+                .index_documents(&cx, &documents)
+                .await
+                .expect("index subject");
+            subject
+                .index_mut()
+                .expect("subject index")
+                .commit(&cx)
+                .await
+                .expect("commit subject");
+            oracle
+                .index()
+                .index_documents(&cx, &documents)
+                .await
+                .expect("index oracle");
+            oracle.index().commit(&cx).await.expect("commit oracle");
+            subject.mark_committed().expect("subject committed");
+            oracle.mark_committed().expect("oracle committed");
+
+            let harness = crate::engine::DifferentialHarness::new(
+                ComparisonMode::CrossEngine,
+                ComparatorConfig::default(),
+            );
+            for (label, query) in [
+                ("bare-fielded", "title:nested"),
+                ("fielded-or", "title:nested OR slices"),
+                ("fielded-and", "title:nested AND reused"),
+                ("or-of-and", "slices OR title:nested AND reused"),
+                (
+                    "or-of-and-distinct-tail",
+                    "beta OR title:nested AND reused gamma",
+                ),
+                ("dup-tail-no-field", "slices OR generic AND reused slices"),
+                (
+                    "dup-tail-lowercase",
+                    "slices OR title:nested AND reused slices",
+                ),
+                ("capital-no-dup", "beta OR title:Nested AND reused gamma"),
+                ("found-chain", "slices OR title:Nested AND reused slices"),
+            ] {
+                let case = DifferentialCase {
+                    fixture_id: format!("htcun-{label}"),
+                    query: query.to_owned(),
+                    limit: 20,
+                    offset: 0,
+                    tie_expansion_limit: 256,
+                    count_requested: false,
+                    snippet_max_chars: None,
+                    metadata: DifferentialCaseMetadata {
+                        generator_id: Some("htcun-title-boost-probe".to_owned()),
+                        generator_seed: None,
+                        corpus_hash: Some(fixture.corpus_hash.clone()),
+                    },
+                };
+                let run = harness
+                    .run(&cx, &subject, &oracle, &case)
+                    .await
+                    .unwrap_or_else(|error| panic!("htcun probe {label} failed: {error}"));
+                assert_eq!(
+                    run.comparison.status,
+                    ComparisonStatus::Exact,
+                    "htcun probe {label} query={query:?} first={:?} divergences={:?}",
+                    run.comparison.first_divergence,
+                    run.comparison.divergences,
+                );
+            }
         });
     }
 
