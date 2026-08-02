@@ -9796,6 +9796,7 @@ fn parse_claim_name(name: &OsStr) -> Option<u64> {
 /// dev()` always yields the raw value widened to `u64` with a sign-extending
 /// cast. Device-identity checks must apply the identical conversion or they
 /// compare different bits on macOS.
+#[cfg(unix)]
 #[allow(clippy::unnecessary_cast, clippy::cast_sign_loss)]
 fn stat_dev_as_u64(stat: &rustix::fs::Stat) -> u64 {
     stat.st_dev as u64
