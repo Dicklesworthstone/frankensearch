@@ -54,6 +54,7 @@ pub mod native_hnsw;
 pub mod quantization;
 pub mod recall_certificate;
 mod repro_soft_delete_rollback;
+mod repro_wal_shadow_bug;
 mod repro_wal_truncation;
 pub mod search;
 pub mod simd;
