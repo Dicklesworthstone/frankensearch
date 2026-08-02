@@ -43,9 +43,26 @@ pub fn ensure_default_semantic_models(
     model_root: Option<&Path>,
 ) -> SearchResult<EmbeddedModelInstallSummary> {
     let root = resolve_install_root(model_root)?;
-    fs::create_dir_all(&root)?;
+    let manifests = [ModelManifest::potion_128m(), ModelManifest::minilm_v2()];
 
-    with_materialization_lock(&root, || materialize_default_semantic_models(&root))
+    ensure_materialized_semantic_models(&root, &manifests)
+}
+
+fn ensure_materialized_semantic_models(
+    root: &Path,
+    manifests: &[ModelManifest],
+) -> SearchResult<EmbeddedModelInstallSummary> {
+    // A pre-provisioned model cache may intentionally be mounted read-only. Keep the
+    // all-current path strictly observational: requiring every bundled receipt prevents
+    // a partially published cold install from bypassing the transaction lock.
+    if let Some(summary) = cached_materialization_summary(root, manifests)? {
+        return Ok(summary);
+    }
+
+    fs::create_dir_all(root)?;
+    with_materialization_lock(root, || {
+        materialize_default_semantic_models(root, manifests)
+    })
 }
 
 fn with_materialization_lock<T>(
@@ -68,8 +85,33 @@ fn with_materialization_lock<T>(
     }
 }
 
-fn materialize_default_semantic_models(root: &Path) -> SearchResult<EmbeddedModelInstallSummary> {
-    let manifests = [ModelManifest::potion_128m(), ModelManifest::minilm_v2()];
+fn cached_materialization_summary(
+    root: &Path,
+    manifests: &[ModelManifest],
+) -> SearchResult<Option<EmbeddedModelInstallSummary>> {
+    for manifest in manifests {
+        let install_dir =
+            install_dir_for_manifest(&manifest.id).ok_or_else(|| SearchError::InvalidConfig {
+                field: "bundled_default_models.manifest_id".to_owned(),
+                value: manifest.id.clone(),
+                reason: "unsupported bundled manifest id".to_owned(),
+            })?;
+        if !bundled_receipt_allows_materialization_skip(manifest, &root.join(install_dir)) {
+            return Ok(None);
+        }
+    }
+
+    Ok(Some(EmbeddedModelInstallSummary {
+        model_root: root.to_path_buf(),
+        models_written: 0,
+        bytes_written: 0,
+    }))
+}
+
+fn materialize_default_semantic_models(
+    root: &Path,
+    manifests: &[ModelManifest],
+) -> SearchResult<EmbeddedModelInstallSummary> {
     let mut models_written = 0_usize;
     let mut bytes_written = 0_u64;
 
@@ -274,6 +316,75 @@ mod tests {
         }
 
         assert_eq!(maximum_active.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn current_receipts_bypass_an_unopenable_materialization_lock() {
+        let root = reserve_materialization_test_root()
+            .expect("materialization test root should be atomically reservable");
+        let manifests = [
+            synthetic_bundled_manifest("potion-multilingual-128m"),
+            synthetic_bundled_manifest("all-minilm-l6-v2"),
+        ];
+
+        for manifest in &manifests {
+            let install_dir = install_dir_for_manifest(&manifest.id)
+                .expect("synthetic bundled manifest should use a registered id");
+            let model_dir = root.join(install_dir);
+            fs::create_dir_all(&model_dir).unwrap();
+            fs::write(model_dir.join("model.bin"), b"abc").unwrap();
+            verify_dir_and_record(manifest, &model_dir).unwrap();
+        }
+
+        // A directory at the lock pathname makes OpenOptions::open fail on every
+        // supported OS. Success therefore proves the verified warm path did not try
+        // to create or open the writer lock in this invocation.
+        fs::create_dir(root.join(MATERIALIZATION_LOCK_FILE)).unwrap();
+        let summary = ensure_materialized_semantic_models(&root, &manifests).unwrap();
+
+        assert_eq!(summary.model_root, root);
+        assert_eq!(summary.models_written, 0);
+        assert_eq!(summary.bytes_written, 0);
+    }
+
+    #[test]
+    fn same_destination_temp_reservations_are_distinct() {
+        let root = reserve_materialization_test_root()
+            .expect("materialization test root should be atomically reservable");
+        let destination = root.join("model.bin");
+
+        let (first_path, first_file) =
+            reserve_temp_file(&destination).expect("first temp file should be reservable");
+        let (second_path, second_file) =
+            reserve_temp_file(&destination).expect("second temp file should be reservable");
+
+        assert_ne!(first_path, second_path);
+        assert!(first_path.exists());
+        assert!(second_path.exists());
+        drop(first_file);
+        drop(second_file);
+    }
+
+    fn synthetic_bundled_manifest(id: &str) -> ModelManifest {
+        ModelManifest {
+            id: id.to_owned(),
+            version: "v1".to_owned(),
+            display_name: None,
+            description: None,
+            repo: "test/bundled".to_owned(),
+            revision: "a".repeat(40),
+            files: vec![ModelFile {
+                name: "model.bin".to_owned(),
+                sha256: "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+                    .to_owned(),
+                size: 3,
+                url: None,
+            }],
+            license: "MIT".to_owned(),
+            dimension: Some(1),
+            tier: None,
+            download_size_bytes: 3,
+        }
     }
 
     #[test]
