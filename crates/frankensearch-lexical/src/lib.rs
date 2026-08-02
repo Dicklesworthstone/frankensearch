@@ -2779,6 +2779,30 @@ mod tests {
                 vec!["doc-b".to_owned()],
                 "oracle: alpha-docs minus need-docs"
             );
+
+            // In-GROUP stacked prefixes (bd-bsjw finding 4): an unboosted
+            // group keeps the top-level collapse, but a BOOST on the group
+            // changes membership — the oracle's strict parse of the boosted
+            // group with stacked prefixes fails and the lenient fallback
+            // DROPS the negations entirely, leaving only the positive terms.
+            assert_eq!(
+                observe("(alpha NOT -need)"),
+                vec!["doc-b".to_owned()],
+                "unboosted group keeps the stacked-prefix collapse"
+            );
+            assert_eq!(
+                observe("(alpha NOT -need)^2"),
+                vec!["doc-a".to_owned(), "doc-b".to_owned()],
+                "a boost on the group makes the oracle drop the negations \
+                 (lenient-parse fallback), changing MEMBERSHIP"
+            );
+            assert_eq!(
+                observe("(alpha NOT need)^2"),
+                vec!["doc-a".to_owned(), "doc-b".to_owned()],
+                "the boosted-group fallback drops PLAIN NOT as well — the \
+                 whole negation family loses its exclusions under a group \
+                 boost"
+            );
         });
     }
 

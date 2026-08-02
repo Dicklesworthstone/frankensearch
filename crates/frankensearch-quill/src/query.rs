@@ -808,6 +808,7 @@ impl DefaultQueryParser {
         if let Some(node) = parsed.as_mut() {
             rewrite_parser_syntax(node);
             trim_parser_dropped(&mut node.query, &node.dedup_key);
+            flatten_should_of_should(&mut node.query);
         }
         repair_root_all_negative(&mut parsed, &mut grammar);
 
@@ -3011,6 +3012,51 @@ fn wrap_not_for_and(node: &mut ParsedNode) {
 
 fn negative_boolean_dedup_key(child: SyntaxKey) -> SyntaxKey {
     SyntaxKey::Boolean(vec![(Some(Occur::MustNot), child)])
+}
+
+/// Mirror the pinned grammar's lowering: an optional (`Should`) clause whose
+/// child is an all-optional boolean splices its children into the parent.
+///
+/// Duplicate retention already ran on the NESTED syntax (where the pinned
+/// grammar keeps explicit-`OR` runs and parenthesised groups one level below
+/// the implicit disjunction — bd-htcun), but the oracle then FLATTENS
+/// pure-disjunctive nesting for execution, so score accumulation associates
+/// left-to-right over one flat clause list. Executing the nested shape
+/// instead diverges by ULPs on boosted mixes (campaign finding: 2-ULP
+/// `RankMismatch` on `((small^3.0 OR when AND this reused) OR tracing NOT
+/// generic)`). Flattening after dedup reproduces the oracle's association
+/// exactly. A non-`Should` occurrence or a mixed-occurrence child is a
+/// boundary, as is any non-boolean node (boosts included).
+fn flatten_should_of_should(query: &mut Query) {
+    let Query::Boolean { clauses, .. } = query else {
+        return;
+    };
+    for clause in clauses.iter_mut() {
+        flatten_should_of_should(&mut clause.query);
+    }
+    let mut flattened = Vec::with_capacity(clauses.len());
+    for clause in clauses.drain(..) {
+        let splice = clause.occur == Occur::Should
+            && matches!(
+                &clause.query,
+                Query::Boolean { clauses: children, .. }
+                    if children
+                        .iter()
+                        .all(|child| child.occur == Occur::Should)
+            );
+        if splice {
+            let Query::Boolean {
+                clauses: children, ..
+            } = clause.query
+            else {
+                unreachable!("splice guard matched a boolean");
+            };
+            flattened.extend(children);
+        } else {
+            flattened.push(clause);
+        }
+    }
+    *clauses = flattened;
 }
 
 fn combine_and(nodes: Vec<ParsedNode>, syntactic_operands: usize) -> Option<ParsedNode> {
@@ -5909,23 +5955,29 @@ mod tests {
 
     /// A trailing operand that duplicates an explicit-OR-run member must
     /// SURVIVE: the pinned grammar nests the OR run one level below the
-    /// implicit disjunction, and duplicate retention never crosses that
-    /// boundary (bd-htcun). A pure implicit chain still dedups.
+    /// implicit disjunction, so duplicate retention never crosses that
+    /// boundary (bd-htcun) — and the nesting then FLATTENS for execution so
+    /// score accumulation associates exactly like the oracle's. A pure
+    /// implicit chain still dedups.
     #[test]
     fn mixed_chain_duplicate_survives_or_run_nesting() {
         let mixed = parser().parse("alpha OR beta AND gamma alpha");
-        let Query::Boolean { clauses, operator } = &mixed.query else {
+        let Query::Boolean { clauses, .. } = &mixed.query else {
             panic!("mixed chain must lower to a boolean: {:?}", mixed.query);
         };
-        assert_eq!(*operator, None, "implicit disjunction at the top level");
         assert_eq!(
             clauses.len(),
-            2,
-            "OR-run plus the surviving trailing duplicate: {clauses:?}"
+            3,
+            "flattened execution shape: alpha, the AND group, and the \
+             SURVIVING trailing duplicate: {clauses:?}"
         );
         assert!(
-            matches!(&clauses[1].query, Query::Term { text, .. } if text == "alpha"),
-            "the trailing duplicate survives at the outer level: {clauses:?}"
+            matches!(&clauses[0].query, Query::Term { text, .. } if text == "alpha"),
+            "leading operand first: {clauses:?}"
+        );
+        assert!(
+            matches!(&clauses[2].query, Query::Term { text, .. } if text == "alpha"),
+            "the trailing duplicate survives after flattening: {clauses:?}"
         );
 
         let pure = parser().parse("alpha alpha");
@@ -6146,9 +6198,14 @@ mod tests {
             panic!("raw-distinct groups must both survive");
         };
         assert_eq!(clauses.len(), 2);
-        assert!(clauses.iter().all(|clause| {
-            matches!(&clause.query, Query::Boolean { clauses, .. } if clauses.len() == 1)
-        }));
+        // Raw-identity dedup ran on the NESTED syntax (distinct /x/ vs /y/
+        // prevent it), then the post-trim singleton groups splice into the
+        // parent for oracle-associated execution (bd-htcun flatten).
+        assert!(
+            clauses
+                .iter()
+                .all(|clause| { matches!(&clause.query, Query::Term { text, .. } if text == "a") })
+        );
 
         let Query::Boolean { clauses, .. } = parser().parse("(a /x/) (a /x/)").query else {
             panic!("the rewritten duplicate keeps its root Boolean");
@@ -6944,6 +7001,7 @@ mod tests {
         if let Some(node) = parsed.as_mut() {
             rewrite_parser_syntax(node);
             trim_parser_dropped(&mut node.query, &node.dedup_key);
+            flatten_should_of_should(&mut node.query);
         }
         repair_root_all_negative(&mut parsed, &mut grammar);
         ParsedQuery {
