@@ -491,9 +491,29 @@ impl TwoTierIndex {
         let fast_index = VectorIndex::open(paths.fast_index())?;
         let mut quality_alignment = QualityAlignment::None;
 
-        let quality_index = if let Some(quality_path) = paths.quality_index() {
+        // A fast/quality pair is only blendable when both tiers came from the
+        // SAME publication: a crash between the two per-tier installs leaves
+        // a mixed-generation pair whose nonces disagree, and blending it
+        // silently launders vectors from different corpus states (bd-miio8).
+        // Legacy pre-nonce pairs read 0 == 0 and remain accepted.
+        let paired_quality = if let Some(quality_path) = paths.quality_index() {
             let quality = VectorIndex::open(quality_path)?;
+            if quality.publication_nonce() == fast_index.publication_nonce() {
+                Some(quality)
+            } else {
+                warn!(
+                    fast_nonce = fast_index.publication_nonce(),
+                    quality_nonce = quality.publication_nonce(),
+                    "fast/quality publication identities disagree (mixed-generation pair, \
+                     likely a crash between tier installs); degrading to fast-only"
+                );
+                None
+            }
+        } else {
+            None
+        };
 
+        let quality_index = if let Some(quality) = paired_quality {
             if quality.record_count() != fast_index.record_count() {
                 warn!(
                     fast_records = fast_index.record_count(),
@@ -1522,12 +1542,21 @@ impl TwoTierIndexBuilder {
         // over a live directory with a plain in-place build left the
         // destination's WAL sidecar adoptable by the fresh generation
         // (bd-zhjv8 finding 1 — acknowledged appends from the superseded
-        // generation resurrected inside the rebuild).
+        // generation resurrected inside the rebuild). Both tiers carry ONE
+        // publication nonce, the successor of the destination pair's, so a
+        // crash between the two installs is detectable at open time
+        // (bd-miio8).
         let fast_path = self.dir.join(VECTOR_INDEX_FAST_FILENAME);
+        let publication_nonce = crate::next_publication_nonce(if fast_path.exists() {
+            VectorIndex::peek_publication_nonce(&fast_path)?
+        } else {
+            0
+        });
         Self::publish_tier(
             &fast_path,
             &self.fast_embedder_id,
             fast_dimension,
+            publication_nonce,
             &self.fast_records,
         )?;
 
@@ -1537,6 +1566,7 @@ impl TwoTierIndexBuilder {
                 &quality_path,
                 &self.quality_embedder_id,
                 quality_dimension,
+                publication_nonce,
                 &self.quality_records,
             )?;
         }
@@ -1550,6 +1580,7 @@ impl TwoTierIndexBuilder {
         path: &Path,
         embedder_id: &str,
         dimension: usize,
+        publication_nonce: u16,
         records: &[(String, Vec<f32>)],
     ) -> SearchResult<()> {
         let generation = if path.exists() {
@@ -1558,8 +1589,9 @@ impl TwoTierIndexBuilder {
             1
         };
         let staging_path = crate::temporary_output_path(path);
-        let mut writer =
-            VectorIndex::create(&staging_path, embedder_id, dimension)?.with_generation(generation);
+        let mut writer = VectorIndex::create(&staging_path, embedder_id, dimension)?
+            .with_generation(generation)
+            .with_publication_nonce(publication_nonce);
         for (doc_id, embedding) in records {
             writer.write_record(doc_id, embedding)?;
         }
@@ -2012,6 +2044,77 @@ mod tests {
             .quality_scores_for_hits(&[1.0, 0.0], &hits)
             .expect("scores");
         assert_eq!(scores, vec![None, None, None]);
+    }
+
+    /// A crash between the two per-tier installs leaves a mixed-generation
+    /// pair (new fast + old quality). The pair's publication nonces disagree,
+    /// and open must degrade to fast-only instead of silently blending tiers
+    /// from different publications (bd-miio8).
+    #[test]
+    fn open_degrades_to_fast_only_when_tier_publication_identities_disagree() {
+        let dir = temp_index_dir("mixed-pair-degrade");
+        let mut builder = TwoTierIndex::create(&dir, TwoTierConfig::default()).expect("builder");
+        builder
+            .add_record("doc-a", &[1.0, 0.0, 0.0, 0.0], Some(&[1.0, 0.0]))
+            .expect("add doc-a");
+        drop(builder.finish().expect("finish pair"));
+
+        // Simulate the crash window: only the fast tier of the NEXT
+        // publication lands.
+        let fast_path = dir.join(VECTOR_INDEX_FAST_FILENAME);
+        let fast_gen =
+            crate::next_generation(VectorIndex::peek_compaction_gen(&fast_path).expect("peek gen"));
+        let fast_nonce = crate::next_publication_nonce(
+            VectorIndex::peek_publication_nonce(&fast_path).expect("peek nonce"),
+        );
+        let staging = crate::temporary_output_path(&fast_path);
+        let mut writer = VectorIndex::create(&staging, "fast-tier", 4)
+            .expect("staging writer")
+            .with_generation(fast_gen)
+            .with_publication_nonce(fast_nonce);
+        writer
+            .write_record("doc-b", &[0.0, 1.0, 0.0, 0.0])
+            .expect("write doc-b");
+        writer.finish().expect("finish staging");
+        VectorIndex::install_replacement(&fast_path, &staging).expect("install fast tier only");
+
+        let reopened = TwoTierIndex::open(&dir, TwoTierConfig::default()).expect("open mixed pair");
+        assert!(
+            !reopened.has_quality_index(),
+            "a mixed-publication pair must degrade to fast-only, not blend tiers"
+        );
+    }
+
+    #[test]
+    fn finish_stamps_both_tiers_with_one_nonzero_publication_nonce() {
+        let dir = temp_index_dir("pair-nonce");
+        let mut builder = TwoTierIndex::create(&dir, TwoTierConfig::default()).expect("builder");
+        builder
+            .add_record("doc-a", &[1.0, 0.0], Some(&[0.0, 1.0]))
+            .expect("add doc-a");
+        drop(builder.finish().expect("finish pair"));
+
+        let fast_nonce = VectorIndex::peek_publication_nonce(&dir.join(VECTOR_INDEX_FAST_FILENAME))
+            .expect("fast nonce");
+        let quality_nonce =
+            VectorIndex::peek_publication_nonce(&dir.join(VECTOR_INDEX_QUALITY_FILENAME))
+                .expect("quality nonce");
+        assert_ne!(fast_nonce, 0, "a published pair must carry a real identity");
+        assert_eq!(
+            fast_nonce, quality_nonce,
+            "both tiers share one publication"
+        );
+
+        // Republishing advances the shared identity.
+        let mut second = TwoTierIndex::create(&dir, TwoTierConfig::default()).expect("builder");
+        second
+            .add_record("doc-b", &[0.0, 1.0], Some(&[1.0, 0.0]))
+            .expect("add doc-b");
+        drop(second.finish().expect("finish second pair"));
+        let second_nonce =
+            VectorIndex::peek_publication_nonce(&dir.join(VECTOR_INDEX_FAST_FILENAME))
+                .expect("second fast nonce");
+        assert_ne!(second_nonce, fast_nonce);
     }
 
     /// Rebuilding a live directory must SUPERSEDE the prior generation's WAL,

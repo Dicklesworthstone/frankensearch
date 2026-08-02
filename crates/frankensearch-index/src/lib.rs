@@ -691,6 +691,13 @@ pub struct VectorMetadata {
     pub quantization: Quantization,
     /// Compaction generation counter (0-255) used for stale WAL detection.
     pub compaction_gen: u8,
+    /// Shared publication identity of a multi-tier install (bd-miio8).
+    ///
+    /// Every tier published by one `TwoTierIndexBuilder::finish` carries the
+    /// same non-zero nonce; a mismatch at open time means the pair is a
+    /// mixed-generation survivor of a crash between tier installs. Zero is
+    /// the legacy value (pre-nonce files and single-tier writers).
+    pub publication_nonce: u16,
     /// Number of records in the index.
     pub record_count: usize,
     /// Byte offset to the aligned vector slab.
@@ -1835,6 +1842,7 @@ impl VectorIndex {
             dimension: binding.dimension,
             quantization: binding.quantization,
             compaction_gen: 0,
+            publication_nonce: 0,
             records: Vec::new(),
             identity_v2: Some(binding),
         })
@@ -1968,6 +1976,21 @@ impl VectorIndex {
     ///
     /// Returns the same header corruption/version errors as [`Self::open`].
     pub fn peek_compaction_gen(path: &Path) -> SearchResult<u8> {
+        Ok(Self::peek_header_metadata(path)?.compaction_gen)
+    }
+
+    /// Read the on-disk publication nonce of a published FSVI without opening
+    /// it, with the same side-effect-free contract as
+    /// [`Self::peek_compaction_gen`].
+    ///
+    /// # Errors
+    ///
+    /// Returns the same header corruption/version errors as [`Self::open`].
+    pub fn peek_publication_nonce(path: &Path) -> SearchResult<u16> {
+        Ok(Self::peek_header_metadata(path)?.publication_nonce)
+    }
+
+    fn peek_header_metadata(path: &Path) -> SearchResult<VectorMetadata> {
         use std::io::Read;
         // The variable-length header (two u16-length strings + fixed fields +
         // CRC) cannot exceed 256 KiB, so this prefix always suffices.
@@ -1977,7 +2000,7 @@ impl VectorIndex {
             .read_to_end(&mut data)
             .map_err(SearchError::Io)?;
         let (metadata, _header_len) = parse_header(path, &data)?;
-        Ok(metadata.compaction_gen)
+        Ok(metadata)
     }
 
     /// Create a writer with explicit embedder revision and quantization.
@@ -2015,6 +2038,7 @@ impl VectorIndex {
             dimension,
             quantization,
             compaction_gen: 1,
+            publication_nonce: 0,
             records: Vec::new(),
             identity_v2: None,
         })
@@ -2048,6 +2072,13 @@ impl VectorIndex {
     #[must_use]
     pub const fn quantization(&self) -> Quantization {
         self.metadata.quantization
+    }
+
+    /// Shared publication identity of a multi-tier install; zero on legacy
+    /// and single-tier files (bd-miio8).
+    #[must_use]
+    pub const fn publication_nonce(&self) -> u16 {
+        self.metadata.publication_nonce
     }
 
     /// Full parsed metadata.
@@ -2780,6 +2811,7 @@ impl VectorIndex {
             self.dimension(),
             self.quantization(),
             new_gen,
+            self.metadata.publication_nonce,
             record_count,
             0,
         )?;
@@ -2829,6 +2861,7 @@ impl VectorIndex {
                     self.dimension(),
                     self.quantization(),
                     new_gen,
+                    self.metadata.publication_nonce,
                     record_count,
                     vectors_offset,
                 )?;
@@ -3411,6 +3444,7 @@ pub struct VectorIndexWriter {
     dimension: usize,
     quantization: Quantization,
     compaction_gen: u8,
+    publication_nonce: u16,
     records: Vec<PendingRecord>,
     identity_v2: Option<FsviV2IdentityBinding>,
 }
@@ -3551,6 +3585,15 @@ impl VectorIndexWriter {
         self
     }
 
+    /// Stamp the shared publication identity of a multi-tier install
+    /// (bd-miio8). Every tier of one publication must carry the same non-zero
+    /// nonce so a crash between per-tier installs is detectable at open time.
+    #[must_use]
+    pub const fn with_publication_nonce(mut self, publication_nonce: u16) -> Self {
+        self.publication_nonce = publication_nonce;
+        self
+    }
+
     /// Persist the index to disk, including fsync of file and parent directory.
     ///
     /// # Errors
@@ -3648,6 +3691,7 @@ impl VectorIndexWriter {
                 self.dimension,
                 self.quantization,
                 self.compaction_gen,
+                self.publication_nonce,
                 record_count,
                 0,
             )?
@@ -3695,6 +3739,7 @@ impl VectorIndexWriter {
                 self.dimension,
                 self.quantization,
                 self.compaction_gen,
+                self.publication_nonce,
                 record_count,
                 vectors_offset,
             )?;
@@ -3883,10 +3928,11 @@ fn parse_header(path: &Path, data: &[u8]) -> SearchResult<(VectorMetadata, usize
     let quantization_byte = read_array::<1>(path, data, &mut cursor, "quantization")?[0];
     let quantization = Quantization::from_wire(quantization_byte, path)?;
 
-    // Use first reserved byte for compaction generation
+    // Reserved bytes: [0] compaction generation, [1..3] publication nonce
+    // (little-endian u16; zero on pre-nonce files).
     let reserved = read_array::<3>(path, data, &mut cursor, "reserved")?;
     let compaction_gen = reserved[0];
-    // reserved[1..2] remain unused
+    let publication_nonce = u16::from_le_bytes([reserved[1], reserved[2]]);
 
     let record_count_u64 =
         u64::from_le_bytes(read_array::<8>(path, data, &mut cursor, "record_count")?);
@@ -3912,6 +3958,7 @@ fn parse_header(path: &Path, data: &[u8]) -> SearchResult<(VectorMetadata, usize
             dimension,
             quantization,
             compaction_gen,
+            publication_nonce,
             record_count,
             vectors_offset,
             identity_v2: None,
@@ -4285,6 +4332,9 @@ fn parse_v2_header(path: &Path, data: &[u8]) -> SearchResult<(VectorMetadata, us
             dimension,
             quantization,
             compaction_gen: 0,
+            // The v2 identity-complete header has no publication-nonce slot;
+            // pair binding applies to the v1 mutable tier surface only.
+            publication_nonce: 0,
             record_count,
             vectors_offset,
             identity_v2: Some(FsviV2IdentityMetadata {
@@ -5482,6 +5532,7 @@ fn build_header_prefix(
     dimension: usize,
     quantization: Quantization,
     compaction_gen: u8,
+    publication_nonce: u16,
     record_count: usize,
     vectors_offset: u64,
 ) -> SearchResult<Vec<u8>> {
@@ -5525,7 +5576,7 @@ fn build_header_prefix(
     out.extend_from_slice(&dimension_u32.to_le_bytes());
     out.push(quantization as u8);
     out.push(compaction_gen);
-    out.extend_from_slice(&[0_u8; 2]);
+    out.extend_from_slice(&publication_nonce.to_le_bytes());
     out.extend_from_slice(&record_count_u64.to_le_bytes());
     out.extend_from_slice(&vectors_offset.to_le_bytes());
     Ok(out)
@@ -5887,6 +5938,17 @@ const fn is_tombstoned_flags(flags: u16) -> bool {
 #[must_use]
 pub const fn next_generation(current: u8) -> u8 {
     if current == 255 { 1 } else { current + 1 }
+}
+
+/// Successor in the wrapping publication-nonce sequence (bd-miio8).
+///
+/// Zero is reserved for legacy/single-tier files, so the wrap skips it.
+/// Choosing the successor of the destination pair's current nonce guarantees
+/// successive multi-tier publications never share an identity, which is what
+/// makes a crash between per-tier installs detectable at open time.
+#[must_use]
+pub const fn next_publication_nonce(current: u16) -> u16 {
+    if current == u16::MAX { 1 } else { current + 1 }
 }
 
 #[cfg(test)]
@@ -9251,6 +9313,7 @@ mod tests {
             dimension: 256,
             quantization: Quantization::F16,
             compaction_gen: 0,
+            publication_nonce: 0,
             record_count: 100,
             vectors_offset: 1024,
             identity_v2: None,
