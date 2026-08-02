@@ -265,14 +265,24 @@ mod tests {
     #[test]
     fn macos_uses_library_locations() {
         let env = env_of(&[("HOME", "/Users/test")]);
+        assert_eq!(home_dir_from(&env), Some(PathBuf::from("/Users/test")));
         assert_eq!(
             data_local_dir_from(&env),
+            Some(PathBuf::from("/Users/test/Library/Application Support"))
+        );
+        assert_eq!(
+            data_dir_from(&env),
+            Some(PathBuf::from("/Users/test/Library/Application Support"))
+        );
+        assert_eq!(
+            config_dir_from(&env),
             Some(PathBuf::from("/Users/test/Library/Application Support"))
         );
         assert_eq!(
             cache_dir_from(&env),
             Some(PathBuf::from("/Users/test/Library/Caches"))
         );
+        assert_eq!(runtime_dir_from(&env), None);
     }
 
     #[cfg(windows)]
