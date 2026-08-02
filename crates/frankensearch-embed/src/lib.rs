@@ -87,8 +87,8 @@ pub use model_manifest::{
     ModelArtifactManifestV1, ModelArtifactRoleV1, ModelExecutionContractV1, ModelFile,
     ModelLifecycle, ModelManifest, ModelManifestCatalog, ModelState, ModelTier,
     PLACEHOLDER_VERIFY_AFTER_DOWNLOAD, VerificationMarker, VerifiedModelArtifactsV1,
-    is_verification_cached, resolve_download_consent, verify_dir_cached, verify_file_sha256,
-    write_verification_marker,
+    is_verification_cached, resolve_download_consent, verify_dir_and_record, verify_dir_cached,
+    verify_file_sha256,
 };
 pub use model_registry::{
     BAKEOFF_CUTOFF_DATE, EmbedderRegistry, RegisteredEmbedder, RegisteredReranker,

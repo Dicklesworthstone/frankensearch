@@ -16,7 +16,7 @@ Two-tier hybrid local search for Rust and the `fsfs` standalone CLI: fast first-
 ## Quick Navigation
 
 - [Install In One Line](#install-in-one-line)
-- [Quick Start](#quick-start-60-seconds)
+- [Quick Start](#quick-start)
 - [How It Works](#how-it-works)
 - [Architecture Breakdown](#architecture-breakdown)
 - [Algorithms Used](#algorithms-used)
@@ -35,6 +35,16 @@ Two-tier hybrid local search for Rust and the `fsfs` standalone CLI: fast first-
 curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/frankensearch/main/install.sh | bash -s -- --easy-mode
 ```
 
+The installer verifies every downloaded archive before replacing a binary. A
+missing or malformed checksum, unavailable SHA-256 tool, or mismatch is a hard
+failure. If the platform has no full semantic release artifact, the ordinary
+path builds the loader-capable default from source; it never silently installs
+the model-free lite profile. Use `--lite` only when that reduced capability is
+intentional. Intel macOS is the explicit exception: the pinned ONNX Runtime has
+no supported x86_64 Darwin distribution, so ordinary semantic installation
+fails with `unsupported_platform` and points to `--lite` instead of attempting
+a source build that cannot succeed.
+
 Installer goals:
 - zero-friction first run
 - auto-configured model cache path
@@ -43,19 +53,33 @@ Installer goals:
 ## Cargo Install (Developer Path)
 
 `fsfs` currently builds from this workspace and uses the pinned nightly toolchain
-(`rust-toolchain.toml`). Its default feature set is model-free, so normal
-workspace and crates.io builds need no model artifacts:
+(`rust-toolchain.toml`). Its default feature set compiles the Model2Vec and
+FastEmbed loaders, but keeps the large model bytes outside the crate. Normal
+workspace and crates.io builds therefore need no model artifacts at compile
+time. The documented default path is loader-capable without any feature flags:
 
 ```bash
 cargo +nightly install --path crates/frankensearch-fsfs
+fsfs download-models potion-multilingual-128m
+fsfs download-models all-minilm-l6-v2
+fsfs download-models potion-multilingual-128m --verify
+fsfs download-models all-minilm-l6-v2 --verify
 fsfs version
 fsfs status --format json
+fsfs doctor --format json
 ```
 
-That model-free binary can acquire and verify model files, but it does not
-compile the Model2Vec or FastEmbed execution backends. Explicit semantic
-requests therefore fail closed; downloading files alone does not add semantic
-capability to an already-built binary.
+The two downloads use revision-pinned manifests and verify every file before
+atomic promotion. Explicit `--verify` is fail-closed: a missing or corrupt
+registered cache returns a typed nonzero error rather than a successful payload.
+`fsfs status` reports manifest states (`missing`, `incomplete`, `mismatch`, or
+`verified`); only `fsfs doctor` also opens each verified cache through the
+compiled Model2Vec/FastEmbed loader. A hard doctor verdict exits nonzero with
+one stable `subsystem_error` report with the failing checks in its context. If the cache is absent or offline mode
+forbids acquisition, indexing fails with an actionable typed error; it never
+substitutes hash control embeddings for semantic results. Use
+`--no-default-features` only when you intentionally want the model-free lite
+binary.
 
 To build the full binary profile with Potion and MiniLM embedded, provision the
 revision-pinned inputs and select the feature explicitly:
@@ -68,20 +92,36 @@ cargo +nightly install --path crates/frankensearch-fsfs \
 ```
 
 Provisioning validates every artifact's byte length and SHA-256. Cargo's build
-script performs no network access.
+script performs no network access. The embedded profile changes distribution,
+not retrieval semantics: it uses the same loaders and registered model
+identities as the default source build.
 
-## Quick Start (60 Seconds)
+## Quick Start
+
+The first semantic setup downloads and verifies roughly 621 MB of pinned model
+artifacts, so its duration depends on network speed. Later starts reuse the
+verification receipt while the exact manifest and file states remain unchanged.
 
 ```bash
 # 1) Install
 curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/frankensearch/main/install.sh | bash -s -- --easy-mode
 
-# 2) Index a directory
+# 2) Acquire and independently verify both registered semantic tiers
+fsfs download-models potion-multilingual-128m
+fsfs download-models all-minilm-l6-v2
+fsfs download-models potion-multilingual-128m --verify
+fsfs download-models all-minilm-l6-v2 --verify
+
+# 3) Index a directory
 fsfs index ./my-project
 
-# 3) Search
+# 4) Search
 fsfs search "how does retry backoff work" --limit 5
 ```
+
+Plain `fsfs index <path>` is a one-shot operation: it seals the generation and
+exits. Use `fsfs watch <path>` or `fsfs index <path> --watch` only when you
+explicitly want a long-running incremental watcher.
 
 Example output:
 
@@ -508,6 +548,13 @@ The engine is intentionally designed to degrade gracefully:
 
 Practical implication: phase-1 UX can still stay responsive even when higher-cost
 quality paths fail.
+
+The shipping `fsfs` CLI applies a stricter mode contract than the reusable
+fallback-capable library primitive: `Full` and `FastOnly` require an admitted
+vector generation and matching real fast embedder before Initial is emitted.
+Only explicitly selected `LexicalOnly` bypasses that readiness boundary. A
+quality-tier failure remains progressive and emits actionable
+`RefinementFailed` output while preserving the admitted Initial results.
 
 ## Production Deployment Checklist
 

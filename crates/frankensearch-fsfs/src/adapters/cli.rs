@@ -1402,6 +1402,14 @@ mod tests {
     }
 
     #[test]
+    fn parse_plain_index_is_a_one_shot_request() {
+        let input = parse_cli_args(["index", "/tmp/corpus"]).unwrap();
+        assert_eq!(input.command, CliCommand::Index);
+        assert!(!input.watch);
+        assert_eq!(input.overrides.allow_background_indexing, None);
+    }
+
+    #[test]
     fn parse_watch_command_sets_watch_mode_and_path() {
         let input = parse_cli_args(["watch", "/tmp/corpus"]).unwrap();
         assert_eq!(input.command, CliCommand::Watch);

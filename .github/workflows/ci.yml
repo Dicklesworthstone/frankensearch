@@ -20,6 +20,112 @@ permissions:
   contents: read
 
 jobs:
+  installer-platform:
+    name: Installer platform proof (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            cargo_args: ""
+            expected_profile: semantic-loaders
+          - os: macos-15
+            target: aarch64-apple-darwin
+            cargo_args: ""
+            expected_profile: semantic-loaders
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            cargo_args: "--no-default-features"
+            expected_profile: explicit-lite
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install nightly toolchain
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
+        with:
+          toolchain: nightly-2026-07-20
+
+      - name: Prepare path dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          deps_dir="$(cd "$GITHUB_WORKSPACE/.." && pwd)"
+          asupersync_ref="15e6b6920fa0ad3e6d843ea55186eed754389ad2"
+          frankensqlite_ref="5c99eeb93d789c1309d5c46a540289369ff39535"
+          fast_cmaes_ref="17f633e2c24bdd0c358310949066e5922b9e17b5"
+
+          clone_or_update() {
+            local repo_url="$1"
+            local dest_path="$2"
+            local ref="$3"
+            if [[ -d "${dest_path}/.git" ]]; then
+              git -C "${dest_path}" fetch --depth 1 origin "${ref}"
+            else
+              git clone --no-checkout "${repo_url}" "${dest_path}"
+              git -C "${dest_path}" fetch --depth 1 origin "${ref}"
+            fi
+            git -C "${dest_path}" checkout --detach FETCH_HEAD
+          }
+
+          clone_or_update "https://github.com/Dicklesworthstone/asupersync.git" "${deps_dir}/asupersync" "${asupersync_ref}"
+          clone_or_update "https://github.com/Dicklesworthstone/frankensqlite.git" "${deps_dir}/frankensqlite" "${frankensqlite_ref}"
+          clone_or_update "https://github.com/Dicklesworthstone/fast_cmaes.git" "${deps_dir}/fast_cmaes" "${fast_cmaes_ref}"
+
+          while IFS= read -r -d '' manifest; do
+            if [[ "$RUNNER_OS" == "macOS" ]]; then
+              sed -i '' -e "s|/data/projects/|${deps_dir}/|g" "$manifest"
+            else
+              sed -i -e "s|/data/projects/|${deps_dir}/|g" "$manifest"
+            fi
+          done < <(find "$GITHUB_WORKSPACE" -name Cargo.toml -print0)
+
+      - name: Exercise installer with the platform system Bash
+        env:
+          FSFS_INSTALL_TEST_BASH: /bin/bash
+        run: |
+          /bin/bash --version | head -n 1
+          /bin/bash -n install.sh
+          /bin/bash -n scripts/check_fsfs_packaging_release_install_contract.sh
+          /bin/bash scripts/check_fsfs_packaging_release_install_contract.sh --mode installer
+
+      - name: Build declared installer profile
+        run: cargo build --locked --release -p frankensearch-fsfs ${{ matrix.cargo_args }}
+
+      - name: Install built binary through installer production primitive
+        env:
+          FSFS_INSTALL_CONTRACT_TEST: "1"
+        run: |
+          set -euo pipefail
+          proof_dir="${RUNNER_TEMP}/fsfs-installer-platform"
+          bin_dir="${proof_dir}/bin"
+          mkdir -p "${bin_dir}"
+          /bin/bash install.sh install-built target/release/fsfs "${bin_dir}/fsfs"
+          "${bin_dir}/fsfs" version >"${proof_dir}/version.log" 2>&1
+          {
+            printf 'target=%s\n' '${{ matrix.target }}'
+            printf 'profile=%s\n' '${{ matrix.expected_profile }}'
+            printf 'system_bash=%s\n' "$(/bin/bash --version | head -n 1)"
+            printf 'revision=%s\n' "${GITHUB_SHA}"
+          } >"${proof_dir}/receipt.txt"
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "${bin_dir}/fsfs" >"${proof_dir}/binary.sha256"
+          else
+            shasum -a 256 "${bin_dir}/fsfs" >"${proof_dir}/binary.sha256"
+          fi
+
+      - name: Upload installer platform proof
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: fsfs-installer-${{ matrix.target }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/fsfs-installer-platform/**
+          if-no-files-found: error
+          retention-days: 14
+
   quality:
     name: Quality (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
@@ -184,6 +290,60 @@ jobs:
           set -euo pipefail
           scripts/rch-ensure-deps.sh --models-only
           scripts/rch-ensure-deps.sh --models-only --check
+
+      - name: Stock-default fsfs semantic quickstart proof
+        if: matrix.os == 'ubuntu-latest'
+        timeout-minutes: 30
+        shell: bash
+        env:
+          FRANKENSEARCH_REQUIRE_SEMANTIC_E2E: "1"
+        run: |
+          set -euo pipefail
+          artifact_dir="${RUNNER_TEMP}/fsfs-default-semantic-e2e"
+          mkdir -p "${artifact_dir}"
+          export FRANKENSEARCH_MODEL_DIR="${HOME}/.local/share/frankensearch/models"
+
+          cargo test --locked -p frankensearch-fsfs --test default_build_quickstart \
+            loader_only::default_build_without_models_fails_closed_with_actionable_guidance \
+            -- --exact --nocapture 2>&1 | tee "${artifact_dir}/missing-corrupt.log"
+          cargo test --locked -p frankensearch-fsfs --test default_build_quickstart \
+            loader_only::default_build_indexes_and_returns_a_real_hybrid_result \
+            -- --ignored --exact --nocapture 2>&1 | tee "${artifact_dir}/real-model.log"
+
+          sha256sum "${artifact_dir}/missing-corrupt.log" "${artifact_dir}/real-model.log" \
+            >"${artifact_dir}/SHA256SUMS"
+          python3 - "${artifact_dir}/receipt.json" <<'PY'
+          import json
+          import os
+          import pathlib
+          import sys
+
+          receipt = {
+              "schema": "fsfs-default-semantic-e2e-v1",
+              "revision": os.environ["GITHUB_SHA"],
+              "profile": "stock-default-semantic-loaders",
+              "model_root": os.environ["FRANKENSEARCH_MODEL_DIR"],
+              "lanes": [
+                  "missing-corrupt",
+                  "real-model-semantic-only",
+                  "real-model-hybrid",
+              ],
+              "status": "pass",
+          }
+          pathlib.Path(sys.argv[1]).write_text(
+              json.dumps(receipt, indent=2, sort_keys=True) + "\n",
+              encoding="utf-8",
+          )
+          PY
+
+      - name: Upload stock-default fsfs semantic quickstart proof
+        if: always() && matrix.os == 'ubuntu-latest'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: fsfs-default-semantic-e2e-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/fsfs-default-semantic-e2e/**
+          if-no-files-found: error
+          retention-days: 14
 
       - name: cargo check (fsfs explicit embedded-models lane)
         run: cargo check -p frankensearch-fsfs --no-default-features --features embedded-models
@@ -1447,7 +1607,10 @@ jobs:
             "target": "${TARGET_TRIPLE}",
             "binary": "${binary_name}",
             "build_timestamp_utc": "${build_timestamp}",
-            "rustc": "${rustc_version}"
+            "rustc": "${rustc_version}",
+            "profile": "embedded",
+            "semantic_loaders": true,
+            "embedded_models": true
           }
           EOF
           rm -f "dist/${binary_name}"
@@ -1605,6 +1768,21 @@ jobs:
           else
             shasum -a 256 "${archive_path}" > "${archive_path}.sha256"
           fi
+
+          build_timestamp="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          rustc_version="$(rustc -V)"
+          cat > "dist/${archive_base}.metadata.json" <<EOF
+          {
+            "tag": "${TAG_NAME}",
+            "target": "${TARGET_TRIPLE}",
+            "binary": "${binary_name}",
+            "build_timestamp_utc": "${build_timestamp}",
+            "rustc": "${rustc_version}",
+            "profile": "lite",
+            "semantic_loaders": false,
+            "embedded_models": false
+          }
+          EOF
           rm -f "dist/${binary_name}"
 
       - name: Upload lite release artifacts
@@ -1617,7 +1795,8 @@ jobs:
     name: Publish GitHub Release
     if: >-
       startsWith(github.ref, 'refs/tags/v') && !cancelled()
-      && (needs.release-build.result == 'success' || needs.release-build-lite.result == 'success')
+      && needs.release-build.result == 'success'
+      && needs.release-build-lite.result == 'success'
       && needs.fsfs-executable-quickstart.result == 'success'
     needs: [release-build, release-build-lite, fsfs-executable-quickstart]
     runs-on: ubuntu-latest
@@ -1629,6 +1808,98 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           path: dist
+
+      - name: Validate exact six-profile release inventory
+        shell: bash
+        env:
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          python3 - "${TAG_NAME}" <<'PY'
+          import hashlib
+          import json
+          import pathlib
+          import re
+          import sys
+
+          tag = sys.argv[1]
+          version = tag.removeprefix("v")
+          root = pathlib.Path("dist")
+          expected = {
+              ("embedded", "aarch64-apple-darwin"): ("tar.xz", "fsfs", True, True),
+              ("embedded", "x86_64-pc-windows-msvc"): ("zip", "fsfs.exe", True, True),
+              ("lite", "x86_64-unknown-linux-musl"): ("tar.xz", "fsfs", False, False),
+              ("lite", "aarch64-unknown-linux-musl"): ("tar.xz", "fsfs", False, False),
+              ("lite", "x86_64-apple-darwin"): ("tar.xz", "fsfs", False, False),
+              ("lite", "aarch64-apple-darwin"): ("tar.xz", "fsfs", False, False),
+          }
+          metadata_files = sorted(root.rglob("fsfs*.metadata.json"))
+          if len(metadata_files) != len(expected):
+              raise SystemExit(
+                  f"release.inventory.metadata_count: expected 6, found {len(metadata_files)}: {metadata_files}"
+              )
+
+          seen = set()
+          expected_archives = set()
+          for metadata_path in metadata_files:
+              metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+              key = (metadata.get("profile"), metadata.get("target"))
+              if key not in expected or key in seen:
+                  raise SystemExit(f"release.inventory.unexpected_or_duplicate_pair: {key}")
+              seen.add(key)
+              extension, binary, semantic_loaders, embedded_models = expected[key]
+              prefix = "fsfs" if key[0] == "embedded" else "fsfs-lite"
+              base = f"{prefix}-{version}-{key[1]}"
+              expected_metadata_name = f"{base}.metadata.json"
+              if metadata_path.name != expected_metadata_name:
+                  raise SystemExit(
+                      f"release.inventory.metadata_name: expected {expected_metadata_name}, found {metadata_path.name}"
+                  )
+              expected_fields = {
+                  "tag": tag,
+                  "target": key[1],
+                  "binary": binary,
+                  "profile": key[0],
+                  "semantic_loaders": semantic_loaders,
+                  "embedded_models": embedded_models,
+              }
+              for field, value in expected_fields.items():
+                  if metadata.get(field) != value:
+                      raise SystemExit(
+                          f"release.inventory.metadata_field: {metadata_path} {field}={metadata.get(field)!r}, expected {value!r}"
+                      )
+
+              archive_path = metadata_path.with_name(f"{base}.{extension}")
+              checksum_path = archive_path.with_name(f"{archive_path.name}.sha256")
+              if not archive_path.is_file() or not checksum_path.is_file():
+                  raise SystemExit(
+                      f"release.inventory.missing_archive_pair: archive={archive_path} checksum={checksum_path}"
+                  )
+              checksum_text = checksum_path.read_text(encoding="utf-8").strip()
+              checksum_match = re.match(r"^([0-9a-fA-F]{64})(?:\s|$)", checksum_text)
+              if checksum_match is None:
+                  raise SystemExit(f"release.inventory.malformed_checksum: {checksum_path}")
+              actual_digest = hashlib.sha256(archive_path.read_bytes()).hexdigest()
+              if checksum_match.group(1).lower() != actual_digest:
+                  raise SystemExit(f"release.inventory.checksum_mismatch: {archive_path}")
+              expected_archives.add(archive_path.resolve())
+
+          if seen != set(expected):
+              raise SystemExit(f"release.inventory.missing_pairs: {sorted(set(expected) - seen)}")
+          versioned_archives = {
+              path.resolve()
+              for path in root.rglob("fsfs*")
+              if path.is_file()
+              and re.match(r"^fsfs(?:-lite)?-[0-9].*\.(?:tar\.xz|zip)$", path.name)
+          }
+          if versioned_archives != expected_archives:
+              raise SystemExit(
+                  "release.inventory.archive_set_mismatch: "
+                  f"missing={sorted(expected_archives - versioned_archives)} "
+                  f"unexpected={sorted(versioned_archives - expected_archives)}"
+              )
+          print("release.inventory.exact_six: PASS")
+          PY
 
       - name: Publish release
         uses: softprops/action-gh-release@v2

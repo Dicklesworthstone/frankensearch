@@ -1811,6 +1811,12 @@ fn resolve_pressure_profile(
     cli_overrides: ProfileSourceOverrides,
     warnings: &mut Vec<ConfigWarning>,
 ) -> PressureProfileResolution {
+    // A pressure profile grants or denies the capability to run background
+    // indexing; it does not itself request a long-lived watcher. Preserve the
+    // command/config intent that was resolved before applying the capability
+    // contract, then clamp that intent below when the selected profile or a
+    // hard pause forbids background work.
+    let requested_watch_mode = config.indexing.watch_mode;
     let contract = config.pressure.profile.contract();
     let mut effective = contract.to_effective_settings();
     let mut overrides = Vec::new();
@@ -1905,17 +1911,7 @@ fn resolve_pressure_profile(
     }
 
     config.search.fast_only = !effective.quality_enabled;
-    // `allow_background_indexing` is a PERMISSION ("may this host afford
-    // background work?"), while `watch_mode` is a user INTENT ("did the caller
-    // ask to keep watching this tree?"). A profile may only ever CLAMP the
-    // intent off; it must never manufacture it. Assigning the permission
-    // directly turned every one-shot `fsfs index` on a capable host into a
-    // watch-mode run: the command spawned a filesystem watcher, took the
-    // `run_with_shutdown` path in `main`, and then waited forever for a signal
-    // that a non-interactive caller never sends — the index completed and
-    // durably published (sentinel `generation_complete: true`) yet the process
-    // never exited, hanging every script, CI step and agent harness.
-    config.indexing.watch_mode = config.indexing.watch_mode && effective.allow_background_indexing;
+    config.indexing.watch_mode = requested_watch_mode && effective.allow_background_indexing;
 
     let diagnostics_reason_code = if conflict_detected {
         "profile.resolution.conflict"
@@ -3406,74 +3402,66 @@ mod tests {
         );
     }
 
-    /// A permissive pressure profile must NOT manufacture watch-mode intent.
-    ///
-    /// `allow_background_indexing` answers "may this host afford background
-    /// work?"; `watch_mode` answers "did the caller ask to keep watching?".
-    /// Assigning the former to the latter turned every one-shot `fsfs index`
-    /// on a capable host into a watch run: it spawned a filesystem watcher,
-    /// took `main`'s `run_with_shutdown` path, and then waited forever for a
-    /// signal no non-interactive caller sends — the index completed and
-    /// published durably, yet the process never exited.
-    ///
-    /// RED before the fix at the `config.indexing.watch_mode` assignment:
-    /// `watch_mode` came back `true` here.
     #[test]
-    fn permissive_profile_does_not_manufacture_watch_mode_intent() {
-        // Performance profile => allow_background_indexing = true, and the
-        // caller has NOT asked for watch mode anywhere (no file, no env, no CLI).
-        let cli = CliOverrides {
-            profile: Some(super::PressureProfile::Performance),
-            ..CliOverrides::default()
-        };
-
-        let result = load_from_str(None, None, &HashMap::new(), &cli, home()).expect("load");
+    fn performance_profile_grants_background_capability_without_requesting_watch_mode() {
+        let result = load_from_str(
+            None,
+            None,
+            &HashMap::new(),
+            &CliOverrides::default(),
+            home(),
+        )
+        .expect("load default performance profile");
 
         assert!(
+            result
+                .pressure_profile_resolution
+                .effective
+                .allow_background_indexing,
+            "the performance profile should retain the capability for explicit watch commands"
+        );
+        assert!(
             !result.config.indexing.watch_mode,
-            "a permissive profile must not turn a one-shot index into a watch run; \
-             watch_mode is caller intent, allow_background_indexing is only a permission"
+            "profile capability alone must not turn a one-shot index request into a watcher"
         );
     }
 
-    /// The permission still CLAMPS the intent: a caller who explicitly asks for
-    /// watch mode on a host whose profile forbids background work gets it off.
-    /// This is the half of the contract the original assignment got right, and
-    /// the fix must preserve it.
     #[test]
-    fn restrictive_profile_still_clamps_explicit_watch_mode_intent() {
-        let file = "[indexing]\nwatch_mode = true\n";
+    fn performance_profile_honors_an_explicit_watch_request() {
         let cli = CliOverrides {
-            allow_background_indexing: Some(false),
+            allow_background_indexing: Some(true),
             ..CliOverrides::default()
         };
+        let result = load_from_str(None, None, &HashMap::new(), &cli, home())
+            .expect("load explicit performance watch request");
 
-        let result =
-            load_from_str(Some(file), None, &HashMap::new(), &cli, home()).expect("load config");
-
+        assert!(result.config.indexing.watch_mode);
         assert!(
-            !result.config.indexing.watch_mode,
-            "a profile that forbids background indexing must clamp explicit watch intent off"
+            result
+                .pressure_profile_resolution
+                .effective
+                .allow_background_indexing
         );
     }
 
-    /// And explicit intent survives on a host that permits it — otherwise the
-    /// fix would have silently broken `fsfs index --watch`.
     #[test]
-    fn explicit_watch_mode_intent_survives_a_permissive_profile() {
-        let file = "[indexing]\nwatch_mode = true\n";
+    fn strict_profile_clamps_an_explicit_watch_request() {
         let cli = CliOverrides {
-            profile: Some(super::PressureProfile::Performance),
+            profile: Some(super::PressureProfile::Strict),
+            allow_background_indexing: Some(true),
             ..CliOverrides::default()
         };
+        let result = load_from_str(None, None, &HashMap::new(), &cli, home())
+            .expect("load strict watch request");
 
-        let result =
-            load_from_str(Some(file), None, &HashMap::new(), &cli, home()).expect("load config");
-
+        assert!(!result.config.indexing.watch_mode);
         assert!(
-            result.config.indexing.watch_mode,
-            "an explicit watch request must survive a profile that permits background work"
+            !result
+                .pressure_profile_resolution
+                .effective
+                .allow_background_indexing
         );
+        assert!(result.pressure_profile_resolution.conflict_detected);
     }
 
     #[test]

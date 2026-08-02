@@ -25,6 +25,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
 sha2 = { workspace = true }
+tempfile = "3"
 rayon = { workspace = true, optional = true }
 
 # Feature-gated embedder dependencies
@@ -35,7 +36,6 @@ fastembed = { workspace = true, optional = true }
 [dev-dependencies]
 # test-internals: asupersync::test_utils for #[cfg(test)] (workspace dep is default-features=false)
 asupersync = { workspace = true, features = ["test-internals"] }
-tempfile = "3"
 safetensors = { workspace = true }
 tokenizers = { workspace = true }
 criterion = { workspace = true }

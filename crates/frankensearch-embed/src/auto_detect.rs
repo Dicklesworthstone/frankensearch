@@ -54,8 +54,6 @@ use frankensearch_core::traits::{Embedder, SearchFuture};
 ))]
 use frankensearch_core::traits::{ModelCategory, ModelTier};
 
-#[cfg(feature = "bundled-default-models")]
-use crate::bundled_default_models::ensure_default_semantic_models;
 #[cfg(all(feature = "download", feature = "fastembed"))]
 use crate::fastembed_embedder::DEFAULT_DIMENSION as MINILM_DIMENSION;
 #[cfg(feature = "fastembed")]
@@ -369,7 +367,6 @@ impl EmbedderStack {
         policy: DownloadPolicy,
         remote: Option<Arc<dyn Embedder>>,
     ) -> SearchResult<Self> {
-        materialize_bundled_default_models(model_root);
         let quality = detect_quality_embedder(model_root)
             .or_else(|| maybe_lazy_quality_embedder(model_root, policy))
             .or(remote);
@@ -394,7 +391,6 @@ impl EmbedderStack {
         model_root: Option<&Path>,
         remote: Option<Arc<dyn Embedder>>,
     ) -> SearchResult<Self> {
-        materialize_bundled_default_models(model_root);
         let quality = detect_quality_embedder(model_root).or(remote);
         let fast = detect_fast_embedder(model_root)
             .or_else(hash_fallback_embedder)
@@ -1951,30 +1947,6 @@ fn resolve_remote_intent_online(env: &RemoteIntentEnv) -> SearchResult<Option<Ar
     Ok(None)
 }
 
-#[cfg(feature = "bundled-default-models")]
-fn materialize_bundled_default_models(model_root: Option<&Path>) {
-    match ensure_default_semantic_models(model_root) {
-        Ok(summary) => {
-            if summary.models_written > 0 {
-                info!(
-                    models_written = summary.models_written,
-                    bytes_written = summary.bytes_written,
-                    "materialized bundled default semantic models"
-                );
-            }
-        }
-        Err(_error) => {
-            warn!(
-                reason = "bundled-model-materialization-failed",
-                "failed to materialize bundled default semantic models; continuing with normal detection"
-            );
-        }
-    }
-}
-
-#[cfg(not(feature = "bundled-default-models"))]
-const fn materialize_bundled_default_models(_model_root: Option<&Path>) {}
-
 /// Manifest-required files that are absent from `model_dir`.
 ///
 /// Returns the names rather than a bool so a candidate that exists but is
@@ -2015,7 +1987,10 @@ fn candidate_directories(
 
 #[cfg(test)]
 mod tests {
-    #[cfg(all(feature = "model2vec", not(feature = "bundled-default-models")))]
+    #[cfg(any(
+        feature = "bundled-default-models",
+        all(feature = "model2vec", not(feature = "bundled-default-models"))
+    ))]
     use std::fs;
 
     #[cfg(all(feature = "download", feature = "model2vec"))]
@@ -2023,6 +1998,152 @@ mod tests {
 
     use super::*;
     use frankensearch_core::traits::ModelCategory;
+
+    #[cfg(feature = "bundled-default-models")]
+    #[derive(Debug, PartialEq, Eq)]
+    struct ObservedModelEntry {
+        file_kind: u8,
+        len: u64,
+        modified: std::time::SystemTime,
+        created: Option<std::time::SystemTime>,
+        changed: Option<(i64, i64)>,
+        permission_key: u64,
+        bytes: Option<Vec<u8>>,
+    }
+
+    #[cfg(feature = "bundled-default-models")]
+    fn snapshot_model_tree(root: &Path) -> Vec<(PathBuf, ObservedModelEntry)> {
+        fn visit(root: &Path, path: &Path, entries: &mut Vec<(PathBuf, ObservedModelEntry)>) {
+            let mut children = fs::read_dir(path)
+                .expect("read model tree")
+                .map(|entry| entry.expect("read model tree entry").path())
+                .collect::<Vec<_>>();
+            children.sort();
+            for child in children {
+                let relative = child
+                    .strip_prefix(root)
+                    .expect("model tree entry under root")
+                    .to_path_buf();
+                let metadata = fs::symlink_metadata(&child).expect("read model tree metadata");
+                let file_type = metadata.file_type();
+                let file_kind = if file_type.is_dir() {
+                    1
+                } else if file_type.is_file() {
+                    2
+                } else if file_type.is_symlink() {
+                    3
+                } else {
+                    4
+                };
+                #[cfg(unix)]
+                let (permission_key, changed) = {
+                    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+                    (
+                        u64::from(metadata.permissions().mode()),
+                        Some((metadata.ctime(), metadata.ctime_nsec())),
+                    )
+                };
+                #[cfg(not(unix))]
+                let permission_key = u64::from(metadata.permissions().readonly());
+                #[cfg(not(unix))]
+                let changed = None;
+                entries.push((
+                    relative,
+                    ObservedModelEntry {
+                        file_kind,
+                        len: metadata.len(),
+                        modified: metadata.modified().expect("read model tree mtime"),
+                        created: metadata.created().ok(),
+                        changed,
+                        permission_key,
+                        bytes: file_type
+                            .is_file()
+                            .then(|| fs::read(&child).expect("read model tree file")),
+                    },
+                ));
+                if file_type.is_dir() {
+                    visit(root, &child, entries);
+                }
+            }
+        }
+
+        if !root.exists() {
+            return Vec::new();
+        }
+        let mut entries = Vec::new();
+        visit(root, root, &mut entries);
+        entries
+    }
+
+    #[cfg(feature = "bundled-default-models")]
+    fn detect_observationally(model_root: &Path) -> SearchResult<EmbedderStack> {
+        #[cfg(all(
+            feature = "download",
+            any(feature = "model2vec", feature = "fastembed")
+        ))]
+        {
+            EmbedderStack::auto_detect_with_policy(
+                Some(model_root),
+                DownloadPolicy::for_tests(
+                    DownloadConsent::denied(Some(ConsentSource::Programmatic)),
+                    false,
+                    false,
+                ),
+                None,
+            )
+        }
+        #[cfg(not(all(
+            feature = "download",
+            any(feature = "model2vec", feature = "fastembed")
+        )))]
+        {
+            EmbedderStack::auto_detect_with(Some(model_root))
+        }
+    }
+
+    #[cfg(all(feature = "bundled-default-models", feature = "hash"))]
+    #[test]
+    fn auto_detect_does_not_materialize_an_absent_bundled_cache() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let model_root = temp.path().join("absent-model-root");
+
+        let stack = detect_observationally(&model_root).expect("observational detection");
+
+        assert_eq!(stack.availability(), TwoTierAvailability::HashOnly);
+        assert!(
+            !model_root.exists(),
+            "auto-detection must not create an absent bundled-model cache"
+        );
+    }
+
+    #[cfg(all(feature = "bundled-default-models", feature = "hash"))]
+    #[test]
+    fn auto_detect_leaves_corrupt_bundled_bytes_and_receipts_unchanged() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let model_root = temp.path().join("models");
+        let fast_dir = model_root.join(POTION_MODEL_NAME);
+        let quality_dir = model_root.join(MINILM_MODEL_NAME);
+        fs::create_dir_all(&fast_dir).expect("create corrupt fast model dir");
+        fs::create_dir_all(&quality_dir).expect("create corrupt quality model dir");
+        fs::write(fast_dir.join("tokenizer.json"), b"corrupt-fast-tokenizer")
+            .expect("write corrupt fast bytes");
+        fs::write(fast_dir.join(".verified"), b"stale-fast-receipt")
+            .expect("write stale fast receipt");
+        fs::write(quality_dir.join("model.onnx"), b"corrupt-quality-model")
+            .expect("write corrupt quality bytes");
+        fs::write(quality_dir.join(".verified"), b"stale-quality-receipt")
+            .expect("write stale quality receipt");
+        let before = snapshot_model_tree(&model_root);
+
+        let stack = detect_observationally(&model_root).expect("observational detection");
+
+        assert_eq!(stack.availability(), TwoTierAvailability::HashOnly);
+        assert_eq!(
+            snapshot_model_tree(&model_root),
+            before,
+            "auto-detection must not repair model bytes or mint receipts"
+        );
+    }
 
     struct MrlFixtureEmbedder {
         identity: EmbeddingIdentityBundleV1,
@@ -2115,17 +2236,11 @@ mod tests {
         not(feature = "bundled-default-models")
     ))]
     #[test]
-    fn auto_detect_fast_only_when_model2vec_is_available() {
+    fn auto_detect_rejects_unverified_model2vec_layout() {
         let temp = tempfile::tempdir().unwrap();
         let model_dir = temp.path().join(POTION_MODEL_NAME);
         fs::create_dir_all(&model_dir).unwrap();
         create_test_model2vec_layout(&model_dir, 16, 8);
-        // Plant a verification marker so auto-detect skips SHA-256 checks
-        // against the real manifest (test files have dummy content).
-        crate::model_manifest::write_verification_marker(
-            &crate::model_manifest::ModelManifest::potion_128m(),
-            &model_dir,
-        );
 
         #[cfg(all(
             feature = "download",
@@ -2146,8 +2261,9 @@ mod tests {
             any(feature = "model2vec", feature = "fastembed")
         )))]
         let stack = EmbedderStack::auto_detect_with(Some(temp.path())).unwrap();
-        assert_eq!(stack.availability(), TwoTierAvailability::FastOnly);
-        assert_eq!(stack.fast().id(), POTION_MODEL_NAME);
+        assert_eq!(stack.availability(), TwoTierAvailability::HashOnly);
+        assert_eq!(stack.fast().category(), ModelCategory::HashEmbedder);
+        assert!(stack.quality().is_none());
     }
 
     #[cfg(all(

@@ -16,6 +16,9 @@ cd /path/to/your/rust-repo
 fsfs index .
 ```
 
+This plain command performs one complete pass, seals the index, and exits. It
+does not silently enter watch mode.
+
 Use JSON when you want to capture machine-readable stats:
 
 ```bash
