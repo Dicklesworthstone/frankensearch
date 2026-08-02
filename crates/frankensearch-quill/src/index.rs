@@ -1117,7 +1117,14 @@ fn clone_delta_arcs(
 struct PendingIdentity {
     doc_ord: u32,
     document_id: String,
-    canonical_content: Vec<u8>,
+    /// Unseeded xxh3-64 witness of this document's canonical preimage.
+    ///
+    /// The preimage bytes themselves are deliberately not retained. Their only
+    /// consumers were this witness and the shard's batch digest, and both are
+    /// folded at accumulation time by `retain_identity`, so keeping the bytes
+    /// meant holding a second copy of every document until the seal and then
+    /// walking all of them again.
+    content_hash: u64,
 }
 
 struct StagedFlush {
@@ -1132,6 +1139,17 @@ struct ScribeShardState {
     accumulator: ColumnarAccumulator,
     identities: Vec<PendingIdentity>,
     current_lease_base: Option<u64>,
+    /// Running xxh3 over `len || canonical_preimage` for every retained
+    /// identity, in `identities` order. `derive_segment_id` used to build this
+    /// by walking the retained preimages at seal time; folding it here makes
+    /// the seal independent of how much text the batch carried. Reset in
+    /// lockstep with `identities`.
+    batch_hasher: Xxh3,
+    /// Reused canonicalization buffers. Both live on the shard rather than in
+    /// `accumulate_shard_run` so the fan-out's parallel region does not hand
+    /// the allocator two fresh buffers per document on every worker thread.
+    scratch_metadata: Vec<u8>,
+    scratch_preimage: Vec<u8>,
 }
 
 #[derive(Default)]
@@ -1976,6 +1994,9 @@ impl QuillWriterState {
                 accumulator: ColumnarAccumulator::new(schema)?,
                 identities: Vec::new(),
                 current_lease_base: None,
+                batch_hasher: Xxh3::new(),
+                scratch_metadata: Vec::new(),
+                scratch_preimage: Vec::new(),
             });
         }
         let next_seal_seq = manifest
@@ -2417,7 +2438,9 @@ impl QuillWriterState {
             for identity in &shard.identities {
                 hasher.update(identity.doc_ord.to_be_bytes());
                 conformance_hash_bytes(&mut hasher, identity.document_id.as_bytes());
-                conformance_hash_bytes(&mut hasher, &identity.canonical_content);
+                // The preimage bytes are no longer retained; the witness that
+                // is actually persisted stands in for them here.
+                hasher.update(identity.content_hash.to_be_bytes());
             }
         }
 
@@ -2675,28 +2698,38 @@ impl QuillWriterState {
                     .filter(|docid| *docid < MAX_GLOBAL_DOCID_EXCLUSIVE)
                     .ok_or_else(|| invalid_state("global Q1 document-id space exhausted"))?;
 
-                let metadata = canonical_metadata(&document.metadata)?;
-                let title = document.title.as_deref().unwrap_or("");
-                let indexed = [
-                    IndexedFieldValue::new(ID_FIELD, &document.id),
-                    IndexedFieldValue::new(CONTENT_FIELD, &document.content),
-                    IndexedFieldValue::new(TITLE_FIELD, title),
-                ];
-                let numeric = [IndexedNumericValue::u64(ORD_FIELD, global_docid)];
-                let stored = [StoredFieldValue::new(METADATA_FIELD, &metadata)];
-                let accumulated = self.shards[shard_id]
-                    .accumulator
-                    .add_document_with_values(doc_ord, &indexed, &numeric, &stored)?;
+                let accumulated = {
+                    let shard = &mut self.shards[shard_id];
+                    shard.scratch_metadata.clear();
+                    write_canonical_metadata(&mut shard.scratch_metadata, &document.metadata)?;
+                    let title = document.title.as_deref().unwrap_or("");
+                    let indexed = [
+                        IndexedFieldValue::new(ID_FIELD, &document.id),
+                        IndexedFieldValue::new(CONTENT_FIELD, &document.content),
+                        IndexedFieldValue::new(TITLE_FIELD, title),
+                    ];
+                    let numeric = [IndexedNumericValue::u64(ORD_FIELD, global_docid)];
+                    let stored = [StoredFieldValue::new(METADATA_FIELD, &shard.scratch_metadata)];
+                    let accumulated = shard.accumulator.add_document_with_values(
+                        doc_ord,
+                        &indexed,
+                        &numeric,
+                        &stored,
+                    )?;
+                    retain_identity(
+                        &mut shard.identities,
+                        &mut shard.batch_hasher,
+                        &mut shard.scratch_preimage,
+                        doc_ord,
+                        document,
+                        &shard.scratch_metadata,
+                    )?;
+                    accumulated
+                };
                 arena_bytes_used_high_water =
                     arena_bytes_used_high_water.max(accumulated.bytes_used);
                 arena_bytes_reserved_high_water =
                     arena_bytes_reserved_high_water.max(accumulated.bytes_reserved);
-                let canonical_content = canonical_document_preimage(document, &metadata)?;
-                self.shards[shard_id].identities.push(PendingIdentity {
-                    doc_ord,
-                    document_id: document.id.clone(),
-                    canonical_content,
-                });
                 self.uncommitted_ids.insert(document.id.clone());
                 self.unpublished_since.get_or_insert_with(Instant::now);
 
@@ -3608,10 +3641,10 @@ impl QuillWriterState {
             .identities
             .iter()
             .map(|identity| {
-                FlushDocumentInput::from_canonical_content(
+                FlushDocumentInput::new(
                     identity.doc_ord,
                     &identity.document_id,
-                    &identity.canonical_content,
+                    identity.content_hash,
                 )
             })
             .collect::<Vec<_>>();
@@ -3695,6 +3728,9 @@ impl QuillWriterState {
         self.next_seal_seq = next_seal_seq;
         self.shards[shard].accumulator.reset();
         self.shards[shard].identities.clear();
+        // Must stay in lockstep with `identities`: the digest describes exactly
+        // the identities still retained, so a cleared log means a fresh hasher.
+        self.shards[shard].batch_hasher.reset();
         self.shards[shard].current_lease_base = None;
         Ok(())
     }
@@ -3714,15 +3750,11 @@ impl QuillWriterState {
             .checked_add(1)
             .ok_or_else(|| invalid_state("manifest generation exhausted"))?;
         let schema_id = self.schema.schema_id()?;
-        let mut batch_hasher = Xxh3::new();
-        for identity in &self.shards[shard].identities {
-            let len = u64::try_from(identity.canonical_content.len()).map_err(|_| {
-                invalid_state("canonical document preimage length does not fit u64")
-            })?;
-            batch_hasher.update(&len.to_le_bytes());
-            batch_hasher.update(&identity.canonical_content);
-        }
-        let batch_digest = batch_hasher.digest();
+        // Folded per document by `retain_identity` as the batch accumulated,
+        // over the same `len || preimage` sequence in the same order this used
+        // to walk. `digest` does not consume the state, so a retried seal
+        // (staged flush already present) reads the same value.
+        let batch_digest = self.shards[shard].batch_hasher.digest();
         for salt in 0_u64..=u64::from(u16::MAX) {
             let mut preimage = [0_u8; 52];
             preimage[..8].copy_from_slice(&schema_id.to_le_bytes());
@@ -6130,6 +6162,17 @@ fn accumulate_shard_run(
     documents: &[IndexableDocument],
     span: DocIdSpan,
 ) -> Result<(usize, usize), QuillIndexError> {
+    // Disjoint field borrows: the accumulator, the identity log, the digest
+    // and both scratch buffers are all touched per document, so they are
+    // split out once instead of being re-borrowed through `state` each time.
+    let ScribeShardState {
+        accumulator,
+        identities,
+        batch_hasher,
+        scratch_metadata,
+        scratch_preimage,
+        ..
+    } = state;
     let mut bytes_used_high_water = 0_usize;
     let mut bytes_reserved_high_water = 0_usize;
     for (offset, document) in documents.iter().enumerate() {
@@ -6144,7 +6187,8 @@ fn accumulate_shard_run(
             .checked_add(u64::from(doc_ord))
             .filter(|docid| *docid < MAX_GLOBAL_DOCID_EXCLUSIVE)
             .ok_or_else(|| invalid_state("global Q1 document-id space exhausted"))?;
-        let metadata = canonical_metadata(&document.metadata)?;
+        scratch_metadata.clear();
+        write_canonical_metadata(scratch_metadata, &document.metadata)?;
         let title = document.title.as_deref().unwrap_or("");
         let indexed = [
             IndexedFieldValue::new(ID_FIELD, &document.id),
@@ -6152,39 +6196,98 @@ fn accumulate_shard_run(
             IndexedFieldValue::new(TITLE_FIELD, title),
         ];
         let numeric = [IndexedNumericValue::u64(ORD_FIELD, global_docid)];
-        let stored = [StoredFieldValue::new(METADATA_FIELD, &metadata)];
-        let accumulated = state
-            .accumulator
-            .add_document_with_values(doc_ord, &indexed, &numeric, &stored)?;
+        let stored = [StoredFieldValue::new(METADATA_FIELD, scratch_metadata)];
+        let accumulated =
+            accumulator.add_document_with_values(doc_ord, &indexed, &numeric, &stored)?;
         bytes_used_high_water = bytes_used_high_water.max(accumulated.bytes_used);
         bytes_reserved_high_water = bytes_reserved_high_water.max(accumulated.bytes_reserved);
-        let canonical_content = canonical_document_preimage(document, &metadata)?;
-        state.identities.push(PendingIdentity {
+        retain_identity(
+            identities,
+            batch_hasher,
+            scratch_preimage,
             doc_ord,
-            document_id: document.id.clone(),
-            canonical_content,
-        });
+            document,
+            scratch_metadata,
+        )?;
     }
     Ok((bytes_used_high_water, bytes_reserved_high_water))
+}
+
+/// Append canonical metadata JSON to `out`.
+///
+/// `serde_json::to_vec` is exactly `to_writer` into a fresh `Vec`, so this
+/// emits the same bytes the allocating form did; writing into a caller-owned
+/// buffer is what lets the ingest path reuse one allocation per shard.
+fn write_canonical_metadata(
+    out: &mut Vec<u8>,
+    metadata: &std::collections::HashMap<String, String>,
+) -> Result<(), serde_json::Error> {
+    let ordered = metadata.iter().collect::<BTreeMap<_, _>>();
+    serde_json::to_writer(out, &ordered)
+}
+
+/// Append a document's canonical identity preimage to `out`.
+fn write_canonical_document_preimage(
+    out: &mut Vec<u8>,
+    document: &IndexableDocument,
+    metadata: &[u8],
+) -> Result<(), serde_json::Error> {
+    serde_json::to_writer(
+        out,
+        &(
+            document.id.as_str(),
+            document.content.as_str(),
+            document.title.as_deref().unwrap_or(""),
+            metadata,
+        ),
+    )
 }
 
 fn canonical_metadata(
     metadata: &std::collections::HashMap<String, String>,
 ) -> Result<Vec<u8>, serde_json::Error> {
-    let ordered = metadata.iter().collect::<BTreeMap<_, _>>();
-    serde_json::to_vec(&ordered)
+    let mut out = Vec::new();
+    write_canonical_metadata(&mut out, metadata)?;
+    Ok(out)
 }
 
 fn canonical_document_preimage(
     document: &IndexableDocument,
     metadata: &[u8],
 ) -> Result<Vec<u8>, serde_json::Error> {
-    serde_json::to_vec(&(
-        document.id.as_str(),
-        document.content.as_str(),
-        document.title.as_deref().unwrap_or(""),
-        metadata,
-    ))
+    let mut out = Vec::new();
+    write_canonical_document_preimage(&mut out, document, metadata)?;
+    Ok(out)
+}
+
+/// Canonicalize one document's identity into `scratch`, fold it into the
+/// shard's running batch digest, and retain only the resulting witness.
+///
+/// Persisted bytes are unchanged. `scratch` ends up holding exactly the bytes
+/// `canonical_document_preimage` used to return, the IDMAP witness is the same
+/// `xxh3_64` of those bytes, and the digest folds the same `len || preimage`
+/// sequence, in the same `identities` order, that `derive_segment_id` used to
+/// walk at seal time.
+fn retain_identity(
+    identities: &mut Vec<PendingIdentity>,
+    batch_hasher: &mut Xxh3,
+    scratch: &mut Vec<u8>,
+    doc_ord: u32,
+    document: &IndexableDocument,
+    metadata: &[u8],
+) -> Result<(), QuillIndexError> {
+    scratch.clear();
+    write_canonical_document_preimage(scratch, document, metadata)?;
+    let len = u64::try_from(scratch.len())
+        .map_err(|_| invalid_state("canonical document preimage length does not fit u64"))?;
+    batch_hasher.update(&len.to_le_bytes());
+    batch_hasher.update(scratch);
+    identities.push(PendingIdentity {
+        doc_ord,
+        document_id: document.id.clone(),
+        content_hash: xxh3_64(scratch),
+    });
+    Ok(())
 }
 
 /// Compute the exact IDMAP content witness Quill will persist for a document.
