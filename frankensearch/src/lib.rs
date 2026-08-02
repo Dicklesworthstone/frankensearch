@@ -335,10 +335,10 @@ pub use frankensearch_index::{AnnSearchStats, HnswConfig, HnswIndex, HnswLoadDis
 
 pub use frankensearch_fusion::{
     AssumedDaemonClient, AssumedDaemonEmbeddingBatchV1, DaemonFallbackEmbedder,
-    DaemonFallbackReranker, DaemonTrustLevelV1, FederatedConfig, FederatedFusion, FederatedHit,
-    FederatedSearcher, NoopDaemonClient, PinnedDaemonVerifierV1, RrfConfig, SyncLexicalSearch,
-    SyncSearchIterator, SyncTwoTierSearcher, TwoTierSearcher, blend_two_tier, candidate_count,
-    rrf_fuse,
+    DaemonFallbackReranker, DaemonTrustLevelV1, FederatedConfig, FederatedCoverage,
+    FederatedFusion, FederatedHit, FederatedResponse, FederatedSearcher, FederatedShardError,
+    NoopDaemonClient, PinnedDaemonVerifierV1, RrfConfig, SyncLexicalSearch, SyncSearchIterator,
+    SyncTwoTierSearcher, TwoTierSearcher, blend_two_tier, candidate_count, rrf_fuse,
 };
 
 #[cfg(feature = "graph")]
