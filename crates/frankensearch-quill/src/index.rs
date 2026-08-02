@@ -16539,15 +16539,24 @@ mod tests {
         });
     }
 
-    /// A REAL publisher failure: the MANIFEST write itself returns a typed
-    /// permission error after the segment was already installed. The
-    /// retained seal must survive the failed publication attempt, and a
-    /// retry must publish losslessly once the directory is writable again.
-    #[cfg(unix)]
+    /// A REAL publisher failure: an exact MANIFEST temp-file collision returns
+    /// a typed error after the segment was already installed. The retained seal
+    /// must survive the failed publication attempt, and a retry must publish
+    /// losslessly once the conflicting artifact is preserved aside.
+    #[cfg(all(
+        unix,
+        not(any(
+            target_os = "espidf",
+            target_os = "horizon",
+            target_os = "solaris",
+            target_os = "vita",
+            target_os = "wasi"
+        ))
+    ))]
     #[test]
     fn durable_delta_seal_retains_pending_on_manifest_write_failure_then_retries() {
         run_with_cx(|cx| async move {
-            use std::os::unix::fs::PermissionsExt;
+            const INJECTED_MANIFEST_TEMP_BYTES: &[u8] = b"injected conflicting MANIFEST bytes";
 
             let directory = tempfile::tempdir().expect("temporary Keeper directory");
             let mut index = QuillIndex::create(&cx, directory.path(), deterministic_config())
@@ -16634,33 +16643,35 @@ mod tests {
                     .expect("install segment before the injected MANIFEST failure");
             }
 
-            // Injected REAL publisher failure: with the Keeper directory
-            // read-only, resume reconciles the already-installed segment
-            // without a new temp, then the MANIFEST publication itself
-            // returns a typed permission error.
-            let writable = std::fs::metadata(directory.path())
-                .expect("read Keeper directory permissions")
-                .permissions();
-            let mut read_only = writable.clone();
-            read_only.set_mode(0o555);
-            std::fs::set_permissions(directory.path(), read_only)
-                .expect("revoke Keeper directory write permission");
-            let failure = index.resume_pending_delta_seal(&cx).await;
-            std::fs::set_permissions(directory.path(), writable)
-                .expect("restore Keeper directory write permission");
-
-            let failure = failure
+            // Injected REAL publisher failure: a mismatched file at the exact
+            // temp path cannot be reused as the pending generation's MANIFEST.
+            // Unlike permission bits, this remains effective when the worker
+            // has root or another write-bypassing capability, and unlike a
+            // directory collision it has the same typed result cross-platform.
+            let pending_generation = generation
+                .checked_add(1)
+                .expect("fixture generation has a successor");
+            let collision_path = directory
+                .path()
+                .join(format!(".tmp-manifest-{pending_generation}"));
+            std::fs::write(&collision_path, INJECTED_MANIFEST_TEMP_BYTES)
+                .expect("create exact MANIFEST temp-file collision");
+            let failure = index
+                .resume_pending_delta_seal(&cx)
+                .await
                 .err()
-                .expect("read-only MANIFEST target must fail publication");
-            let rendered = format!("{failure:?}");
+                .expect("MANIFEST temp-path collision must fail publication");
             assert!(
-                rendered.contains("ermission") || rendered.contains("denied"),
-                "failure must be the injected permission error, got: {rendered}"
+                matches!(
+                    &failure,
+                    QuillIndexError::Keeper(KeeperError::TempConflict { .. })
+                ),
+                "failure must be the injected typed temp conflict, got: {failure:?}"
             );
-            assert!(
-                !rendered.to_lowercase().contains("cancel"),
-                "failure must be a publisher error, not a cancellation, got: {rendered}"
-            );
+            if let QuillIndexError::Keeper(KeeperError::TempConflict { path }) = &failure {
+                // ubs:ignore -- these are public temporary filesystem paths, not secrets.
+                assert_eq!(path, &collision_path);
+            }
             assert_eq!(
                 index.snapshot().loaded_manifest().manifest.generation,
                 generation,
@@ -16684,6 +16695,22 @@ mod tests {
                     "the retained seal must still reference the exact encoded bytes"
                 );
             }
+            let preserved_collision = directory.path().join(format!(
+                ".injected-manifest-temp-conflict-{pending_generation}"
+            ));
+            std::fs::rename(&collision_path, &preserved_collision)
+                .expect("preserve injected collision aside before retry");
+            assert!(
+                preserved_collision.is_file(),
+                "the injected failure artifact must remain preserved for diagnosis"
+            );
+            // ubs:ignore -- this public test sentinel is not credential material.
+            assert_eq!(
+                std::fs::read(&preserved_collision)
+                    .expect("read preserved MANIFEST temp-file collision"),
+                INJECTED_MANIFEST_TEMP_BYTES,
+                "the failed reusable-temp probe must not overwrite the collision"
+            );
             assert_eq!(
                 Arc::strong_count(&encoded),
                 2,
@@ -17373,7 +17400,14 @@ mod tests {
     fn mixed_snapshot_disjunction_count_free_matches_exhaustive_at_pinned_k() {
         const DOCS_PER_RESIDENCY: u32 = 5_000;
         run_with_cx(|cx| async move {
-            let mixed = QuillIndex::in_memory(deterministic_config()).expect("mixed index");
+            let mixed = QuillIndex::in_memory(QuillConfig {
+                // This fixture requires one segment spanning more than the
+                // 4,096-document union horizon. A wall-clock visibility
+                // barrier would make its shape depend on concurrent test load.
+                max_visibility_lag_ms: u64::MAX,
+                ..deterministic_config()
+            })
+            .expect("mixed index");
             let mut sealed_documents = Vec::with_capacity(
                 usize::try_from(DOCS_PER_RESIDENCY).expect("fixture count fits usize"),
             );
@@ -17404,6 +17438,20 @@ mod tests {
             }
             mixed.commit(&cx).await.expect("seal large fixture");
             let keeper = mixed.snapshot();
+            assert_eq!(
+                keeper.segments().len(),
+                1,
+                "mixed-snapshot pruning fixture must remain one monolithic sealed segment"
+            );
+            assert_eq!(
+                keeper
+                    .segments()
+                    .first()
+                    .expect("mixed-snapshot fixture has its asserted segment")
+                    .at_seal_doc_count(),
+                DOCS_PER_RESIDENCY,
+                "sealed pruning leaf must span the complete 5,000-document residency"
+            );
             let sealed_snapshot = QuillSearchSnapshot::compose(0, Arc::clone(&keeper), Vec::new())
                 .expect("sealed-only statistics snapshot");
             let sealed_stats = sealed_snapshot
