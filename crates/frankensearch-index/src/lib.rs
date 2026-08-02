@@ -2859,6 +2859,12 @@ impl VectorIndex {
         // So we need to update self.wal_entries from reloaded.
         self.wal_entries = reloaded.wal_entries;
         self.wal_config = config;
+        // The lazy int8/4-bit slabs quantized the PRE-rewrite vector region;
+        // carrying them across the swap scores pass-1 candidates from rows
+        // that no longer exist (or reads past a shrunken slab). Reset so the
+        // next two-pass search re-quantizes the new region (bd-0ho5p).
+        self.vectors_i8 = OnceLock::new();
+        self.vectors_nibbles = OnceLock::new();
 
         Ok(())
     }
@@ -7930,6 +7936,95 @@ mod tests {
             .expect("post-vacuum search");
         assert_eq!(post_hits.len(), 2);
         assert!(post_hits.iter().all(|hit| hit.doc_id != "doc-b"));
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// The lazy int8/4-bit slabs quantize the main-vector region at first
+    /// two-pass search. `vacuum()`/`compact()` swap that region via
+    /// `rewrite_index`; a slab surviving the swap scores pass-1 candidates
+    /// from rows that no longer exist (bd-0ho5p). One-hot vectors on unique
+    /// axes make the misalignment loud: pass-1 over a stale slab can never
+    /// surface the probe target after rows shift.
+    #[test]
+    fn vacuum_and_compact_invalidate_lazy_quantization_slabs() {
+        let dim = 16;
+        let path = temp_index_path("quant-slab-invalidate");
+        let mut writer = VectorIndex::create(&path, "fnv1a-384", dim).expect("writer");
+        for i in 0..12 {
+            let mut vector = vec![0.0f32; dim];
+            vector[i] = 1.0;
+            writer
+                .write_record(&format!("doc-{i:02}"), &vector)
+                .expect("write");
+        }
+        writer.finish().expect("finish");
+
+        let mut index = VectorIndex::open(&path).expect("open");
+        let first = index.doc_id_at(0).expect("row 0").to_string();
+        let target = index.doc_id_at(11).expect("row 11").to_string();
+        let target_axis: usize = target
+            .strip_prefix("doc-")
+            .expect("doc prefix")
+            .parse()
+            .expect("axis");
+        let mut probe = vec![0.0f32; dim];
+        probe[target_axis] = 1.0;
+
+        let pre_i8 = index
+            .search_top_k_int8_two_pass(&probe, 1, 1)
+            .expect("pre-vacuum int8");
+        assert_eq!(pre_i8[0].doc_id, target);
+        let pre_4bit = index
+            .search_top_k_4bit_two_pass(&probe, 1, 1)
+            .expect("pre-vacuum 4bit");
+        assert_eq!(pre_4bit[0].doc_id, target);
+
+        index.soft_delete(&first).expect("delete row 0");
+        index.vacuum().expect("vacuum");
+
+        let post_i8 = index
+            .search_top_k_int8_two_pass(&probe, 1, 1)
+            .expect("post-vacuum int8");
+        assert_eq!(
+            post_i8[0].doc_id, target,
+            "int8 slab served stale pre-vacuum rows"
+        );
+        assert!(post_i8[0].score > 0.9);
+        let post_4bit = index
+            .search_top_k_4bit_two_pass(&probe, 1, 1)
+            .expect("post-vacuum 4bit");
+        assert_eq!(
+            post_4bit[0].doc_id, target,
+            "4-bit slab served stale pre-vacuum rows"
+        );
+        assert!(post_4bit[0].score > 0.9);
+
+        // Same class through compact(): grow the index by one WAL resident so
+        // the rewritten region is larger than the cached slabs.
+        let mut extra = vec![0.0f32; dim];
+        extra[12] = 1.0;
+        index.append("doc-zz", &extra).expect("append doc-zz");
+        index.compact().expect("compact");
+
+        let target_after = index
+            .search_top_k_int8_two_pass(&probe, 1, 1)
+            .expect("post-compact int8");
+        assert_eq!(
+            target_after[0].doc_id, target,
+            "int8 slab survived compact()"
+        );
+        assert!(target_after[0].score > 0.9);
+        let mut zz_probe = vec![0.0f32; dim];
+        zz_probe[12] = 1.0;
+        let zz_hits = index
+            .search_top_k_4bit_two_pass(&zz_probe, 1, 1)
+            .expect("post-compact 4bit");
+        assert_eq!(
+            zz_hits[0].doc_id, "doc-zz",
+            "4-bit slab survived compact() and cannot see the merged WAL resident"
+        );
+        assert!(zz_hits[0].score > 0.9);
 
         std::fs::remove_file(&path).ok();
     }
