@@ -25175,6 +25175,15 @@ mod tests {
             let potion_dir = model_root.join("potion-multilingual-128M");
             fs::create_dir_all(&potion_dir).expect("create model dir");
             fs::write(potion_dir.join("tokenizer.json"), b"broken").expect("write model file");
+            // The registered potion manifest lists tokenizer.json THEN
+            // model.safetensors. The fixture must be complete: with the
+            // weights file absent, per-file resolution fell through to the
+            // HOST cache on provisioned machines (mismatch reported, test
+            // green) but yielded ModelNotFound on bare CI runners. Writing
+            // both files pins the typed HashMismatch on tokenizer.json in
+            // every environment.
+            fs::write(potion_dir.join("model.safetensors"), b"also-broken")
+                .expect("write weights file");
 
             let mut config = FsfsConfig::default();
             config.indexing.model_dir = model_root.display().to_string();
