@@ -5777,6 +5777,7 @@ impl FsfsRuntime {
 
     #[cfg(unix)]
     fn spawn_search_daemon(&self, socket_path: &Path) -> SearchResult<()> {
+        #[cfg(any(target_os = "linux", target_os = "android"))]
         use std::os::unix::process::CommandExt;
 
         if let Some(parent) = socket_path.parent()
@@ -5845,6 +5846,7 @@ impl FsfsRuntime {
         // async-signal-safety of whatever the caller puts in there; the
         // two calls we make — `prctl` and `getppid` — are both on the
         // signal-safe list (see signal-safety(7)).
+        #[cfg(any(target_os = "linux", target_os = "android"))]
         #[allow(unsafe_code)]
         unsafe {
             command.pre_exec(|| {
