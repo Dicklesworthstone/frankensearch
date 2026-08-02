@@ -1120,6 +1120,31 @@ impl DaemonFallbackReranker {
             backoff: false,
         })
     }
+
+    /// Reject a structurally invalid daemon rerank response before any score
+    /// is attributed to a document.
+    ///
+    /// `Vec<f32>` carries no length invariant on the wire: a daemon that caps
+    /// its batch or truncates on a partial read returns a score prefix, and a
+    /// positional zip would assign `0.0` to every document past it — sinking
+    /// them to the bottom of a "successful" rerank with no error. Non-finite
+    /// scores poison downstream ordering the same way. Both are daemon
+    /// contract violations, so they take the existing failed-call fallback
+    /// path as `InvalidInput`.
+    fn validate_rerank_shape(scores: &[f32], expected: usize) -> Result<(), DaemonError> {
+        if scores.len() != expected {
+            return Err(DaemonError::InvalidInput(format!(
+                "daemon rerank returned {} scores for {expected} documents",
+                scores.len()
+            )));
+        }
+        if let Some(index) = scores.iter().position(|score| !score.is_finite()) {
+            return Err(DaemonError::InvalidInput(format!(
+                "daemon rerank returned a non-finite score at index {index}"
+            )));
+        }
+        Ok(())
+    }
 }
 
 impl SyncRerank for DaemonFallbackReranker {
@@ -1131,13 +1156,26 @@ impl SyncRerank for DaemonFallbackReranker {
         let texts: Vec<&str> = documents.iter().map(|doc| doc.text.as_str()).collect();
         let request_id = next_request_id();
 
-        match self.try_rerank(&request_id, query, &texts) {
+        let outcome = self
+            .try_rerank(&request_id, query, &texts)
+            .and_then(
+                |scores| match Self::validate_rerank_shape(&scores, documents.len()) {
+                    Ok(()) => Ok(scores),
+                    Err(error) => Err(DaemonFailure {
+                        error,
+                        attempts: 1,
+                        backoff: false,
+                    }),
+                },
+            );
+        match outcome {
             Ok(scores) => Ok(documents
                 .iter()
+                .zip(scores)
                 .enumerate()
-                .map(|(index, doc)| RerankScore {
+                .map(|(index, (doc, score))| RerankScore {
                     doc_id: doc.doc_id.clone(),
-                    score: scores.get(index).copied().unwrap_or(0.0),
+                    score,
                     original_rank: index,
                     raw_logit: None,
                 })
@@ -1280,6 +1318,59 @@ mod tests {
 
         fn model_name(&self) -> &str {
             self.id
+        }
+    }
+
+    /// Daemon fixture whose rerank call succeeds with a caller-chosen score
+    /// vector, so tests can exercise arity/finiteness violations on the Ok
+    /// path.
+    struct ShapedRerankDaemon {
+        scores: Vec<f32>,
+        raw_calls: AtomicUsize,
+    }
+
+    impl ShapedRerankDaemon {
+        fn new(scores: Vec<f32>) -> Self {
+            Self {
+                scores,
+                raw_calls: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl DaemonClient for ShapedRerankDaemon {
+        fn id(&self) -> &str {
+            "shaped-rerank-daemon"
+        }
+
+        fn is_available(&self) -> bool {
+            true
+        }
+
+        fn embed(&self, _text: &str, _request_id: &str) -> Result<Vec<f32>, DaemonError> {
+            Err(DaemonError::Unavailable(
+                "shaped rerank fixture has no embedder".to_string(),
+            ))
+        }
+
+        fn embed_batch(
+            &self,
+            _texts: &[&str],
+            _request_id: &str,
+        ) -> Result<Vec<Vec<f32>>, DaemonError> {
+            Err(DaemonError::Unavailable(
+                "shaped rerank fixture has no embedder".to_string(),
+            ))
+        }
+
+        fn rerank(
+            &self,
+            _query: &str,
+            _documents: &[&str],
+            _request_id: &str,
+        ) -> Result<Vec<f32>, DaemonError> {
+            self.raw_calls.fetch_add(1, Ordering::Relaxed);
+            Ok(self.scores.clone())
         }
     }
 
@@ -2114,6 +2205,99 @@ mod tests {
         assert_eq!(result[0].doc_id, "a");
         assert_eq!(result[0].score, 10.0);
         assert_eq!(daemon.raw_calls.load(Ordering::Relaxed), 1);
+    }
+
+    fn rerank_docs() -> Vec<RerankDocument> {
+        vec![
+            RerankDocument {
+                doc_id: "a".to_string(),
+                text: "doc a".to_string(),
+            },
+            RerankDocument {
+                doc_id: "b".to_string(),
+                text: "doc b".to_string(),
+            },
+        ]
+    }
+
+    fn shaped_reranker(
+        scores: Vec<f32>,
+        fallback: Option<Arc<dyn SyncRerank>>,
+    ) -> (Arc<ShapedRerankDaemon>, DaemonFallbackReranker) {
+        let daemon = Arc::new(ShapedRerankDaemon::new(scores));
+        let reranker = DaemonFallbackReranker::new(
+            daemon.clone(),
+            fallback,
+            DaemonRetryConfig {
+                max_attempts: 1,
+                ..DaemonRetryConfig::default()
+            },
+        );
+        (daemon, reranker)
+    }
+
+    #[test]
+    fn reranker_uses_daemon_scores_when_shape_is_valid() {
+        let fallback: Arc<dyn SyncRerank> = Arc::new(ConstReranker {
+            id: "fallback-reranker",
+        });
+        let (daemon, reranker) = shaped_reranker(vec![0.25, 0.75], Some(fallback));
+        let result = reranker.rerank_sync("query", &rerank_docs()).unwrap();
+        assert_eq!(result.len(), 2);
+        assert_eq!(result[0].score, 0.25);
+        assert_eq!(result[1].score, 0.75);
+        assert_eq!(daemon.raw_calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn reranker_falls_back_when_daemon_returns_score_prefix() {
+        let fallback: Arc<dyn SyncRerank> = Arc::new(ConstReranker {
+            id: "fallback-reranker",
+        });
+        let (daemon, reranker) = shaped_reranker(vec![0.9], Some(fallback));
+        let result = reranker.rerank_sync("query", &rerank_docs()).unwrap();
+        assert_eq!(result.len(), 2);
+        assert_eq!(
+            result[0].score, 10.0,
+            "fallback scores expected, not the daemon prefix"
+        );
+        assert_eq!(
+            result[1].score, 9.0,
+            "fallback scores expected, not a silent 0.0 pad"
+        );
+        assert_eq!(daemon.raw_calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn reranker_falls_back_when_daemon_returns_extra_scores() {
+        let fallback: Arc<dyn SyncRerank> = Arc::new(ConstReranker {
+            id: "fallback-reranker",
+        });
+        let (_daemon, reranker) = shaped_reranker(vec![0.1, 0.2, 0.3], Some(fallback));
+        let result = reranker.rerank_sync("query", &rerank_docs()).unwrap();
+        assert_eq!(result[0].score, 10.0);
+        assert_eq!(result[1].score, 9.0);
+    }
+
+    #[test]
+    fn reranker_falls_back_when_daemon_returns_non_finite_score() {
+        let fallback: Arc<dyn SyncRerank> = Arc::new(ConstReranker {
+            id: "fallback-reranker",
+        });
+        let (_daemon, reranker) = shaped_reranker(vec![0.5, f32::NAN], Some(fallback));
+        let result = reranker.rerank_sync("query", &rerank_docs()).unwrap();
+        assert_eq!(result[0].score, 10.0);
+        assert_eq!(result[1].score, 9.0);
+    }
+
+    #[test]
+    fn reranker_surfaces_shape_violation_when_no_fallback_exists() {
+        let (_daemon, reranker) = shaped_reranker(vec![0.9], None);
+        let result = reranker.rerank_sync("query", &rerank_docs());
+        assert!(
+            result.is_err(),
+            "a short daemon response must never zero-pad into a successful rerank"
+        );
     }
 
     #[test]
