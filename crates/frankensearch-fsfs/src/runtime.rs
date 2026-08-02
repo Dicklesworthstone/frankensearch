@@ -18536,7 +18536,7 @@ mod tests {
     use std::collections::{BTreeMap, HashMap};
     use std::fs;
     use std::future::{Future, poll_fn};
-    use std::io::Write as _;
+    use std::io::{ErrorKind, Write as _};
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
@@ -19355,12 +19355,29 @@ mod tests {
         );
     }
 
+    static NEXT_UNIQUE_TEST_DIR: AtomicUsize = AtomicUsize::new(0);
+
     fn unique_test_dir(label: &str) -> PathBuf {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos();
-        std::env::temp_dir().join(format!("fsfs_test_{label}_{nanos}"))
+        let sequence = NEXT_UNIQUE_TEST_DIR.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "fsfs_test_{label}_{}_{nanos}_{sequence}",
+            std::process::id()
+        ))
+    }
+
+    fn reserve_unique_test_dir(label: &str) -> std::io::Result<PathBuf> {
+        loop {
+            let path = unique_test_dir(label);
+            match fs::create_dir(&path) {
+                Ok(()) => return Ok(path),
+                Err(error) if error.kind() == ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(error),
+            }
+        }
     }
 
     fn with_test_backup_dir<F, T>(label: &str, f: F) -> T
@@ -27855,9 +27872,8 @@ mod tests {
     fn verify_new_binary_uses_version_subcommand_not_flag() {
         // Create a fake binary that succeeds on `version` subcommand
         // but fails on `--version` flag, proving we use the subcommand.
-        let dir =
-            std::env::temp_dir().join(format!("fsfs_test_version_subcmd_{}", std::process::id()));
-        let _ = fs::create_dir_all(&dir);
+        let dir = reserve_unique_test_dir("version_subcmd")
+            .expect("version-subcommand fixture directory should be atomically reservable");
         let binary = dir.join("fsfs-verify-subcmd");
         fs::write(
             &binary,
@@ -27882,16 +27898,13 @@ mod tests {
             version_out.contains("fsfs"),
             "version output should contain binary name"
         );
-
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[cfg(unix)]
     #[test]
     fn verify_binary_returning_valid_version_output_passes() {
-        let dir =
-            std::env::temp_dir().join(format!("fsfs_test_valid_version_{}", std::process::id()));
-        let _ = fs::create_dir_all(&dir);
+        let dir = reserve_unique_test_dir("valid_version")
+            .expect("valid-version fixture directory should be atomically reservable");
         let binary = dir.join("fsfs-valid");
         fs::write(&binary, b"#!/bin/sh\necho \"fsfs 1.2.3\"\n").unwrap();
 
@@ -27905,16 +27918,13 @@ mod tests {
         assert!(verify.status.success());
         let stdout = String::from_utf8_lossy(&verify.stdout);
         assert!(stdout.contains("1.2.3"));
-
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[cfg(unix)]
     #[test]
     fn verify_binary_returning_error_fails_gracefully() {
-        let dir =
-            std::env::temp_dir().join(format!("fsfs_test_error_version_{}", std::process::id()));
-        let _ = fs::create_dir_all(&dir);
+        let dir = reserve_unique_test_dir("error_version")
+            .expect("error-version fixture directory should be atomically reservable");
         let binary = dir.join("fsfs-broken");
         fs::write(&binary, b"#!/bin/sh\necho \"segfault\" >&2\nexit 139\n").unwrap();
 
@@ -27934,8 +27944,6 @@ mod tests {
             stderr.contains("segfault"),
             "error output should be captured: got {stderr}"
         );
-
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
