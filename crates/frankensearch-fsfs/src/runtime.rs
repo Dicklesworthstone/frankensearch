@@ -10366,21 +10366,36 @@ impl FsfsRuntime {
         )?;
 
         let mut vector_generation_compatible = false;
-        #[allow(
-            clippy::suspicious_operation_groupings,
-            reason = "VectorIndex and Embedder intentionally expose different identifier method names"
-        )]
+        let embedder_revision = embedder
+            .identity()
+            .map(frankensearch_core::EmbeddingIdentityBundleV1::fingerprint)
+            .unwrap_or_default();
         let mut vector_index = if checkpoint_manifests.is_some() && vector_path.exists() {
             match VectorIndex::open(&vector_path) {
                 Ok(index)
-                    if index.embedder_id() == embedder.id()
-                        && index.dimension() == embedder.dimension()
-                        && index.wal_record_count() == 0 =>
+                    if vector_checkpoint_reusable(
+                        &index,
+                        embedder.id(),
+                        &embedder_revision,
+                        embedder.dimension(),
+                    ) =>
                 {
                     vector_generation_compatible = true;
                     Some(index)
                 }
-                Ok(_) => None,
+                Ok(index) => {
+                    warn!(
+                        stored_embedder_id = index.embedder_id(),
+                        active_embedder_id = embedder.id(),
+                        stored_revision = index.embedder_revision(),
+                        active_revision = %embedder_revision,
+                        stored_dimension = index.dimension(),
+                        active_dimension = embedder.dimension(),
+                        wal_records = index.wal_record_count(),
+                        "checkpoint FSVI does not match the active embedder identity; rebuilding vectors"
+                    );
+                    None
+                }
                 Err(error) => {
                     warn!(error = %error, "checkpoint FSVI is unavailable; rebuilding vectors");
                     None
@@ -10393,6 +10408,7 @@ impl FsfsRuntime {
             vector_index = Some(VectorIndex::replace_with_empty(
                 &vector_path,
                 embedder.id(),
+                &embedder_revision,
                 embedder.dimension(),
             )?);
         }
@@ -18038,6 +18054,25 @@ fn content_sha256_hex(bytes: &[u8]) -> String {
     sha256_digest_hex(Sha256::digest(bytes))
 }
 
+/// A checkpointed FSVI generation is reusable only when its embedding
+/// identity matches the ACTIVE embedder completely: producer id, immutable
+/// identity revision, and dimension, with no unreplayed WAL. The revision is
+/// the embedder's identity-bundle fingerprint, so a same-id same-dimension
+/// model retrain (new weights shipped under the old name) invalidates the
+/// checkpoint instead of silently serving vectors from the previous embedding
+/// space (bd-qj7h5).
+fn vector_checkpoint_reusable(
+    index: &VectorIndex,
+    embedder_id: &str,
+    embedder_revision: &str,
+    dimension: usize,
+) -> bool {
+    index.embedder_id() == embedder_id
+        && index.embedder_revision() == embedder_revision
+        && index.dimension() == dimension
+        && index.wal_record_count() == 0
+}
+
 fn vector_live_doc_ids(index: &VectorIndex) -> SearchResult<HashSet<String>> {
     index.live_doc_ids()
 }
@@ -19654,6 +19689,57 @@ mod tests {
         assert!(!response.cached);
         assert!(response.payloads.is_empty());
         assert_eq!(response.error.as_deref(), Some("parse failure"));
+    }
+
+    #[test]
+    fn vector_checkpoint_rejects_same_id_same_dimension_revision_change() {
+        let temp = tempfile::tempdir().expect("index root");
+        let vector_path = temp.path().join(super::FSFS_VECTOR_INDEX_FILE);
+        if let Some(parent) = vector_path.parent() {
+            fs::create_dir_all(parent).expect("vector parent dir");
+        }
+        let writer = VectorIndex::create_with_revision(
+            &vector_path,
+            "potion-multilingual-128",
+            "identity-rev-a",
+            4,
+            frankensearch_index::Quantization::F32,
+        )
+        .expect("create checkpoint index");
+        writer.finish().expect("finish checkpoint index");
+        let index = VectorIndex::open(&vector_path).expect("open checkpoint index");
+
+        assert!(
+            super::vector_checkpoint_reusable(
+                &index,
+                "potion-multilingual-128",
+                "identity-rev-a",
+                4
+            ),
+            "an identical embedder identity must reuse the checkpoint"
+        );
+        assert!(
+            !super::vector_checkpoint_reusable(&index, "other-model", "identity-rev-a", 4),
+            "an embedder id change must invalidate the checkpoint"
+        );
+        assert!(
+            !super::vector_checkpoint_reusable(
+                &index,
+                "potion-multilingual-128",
+                "identity-rev-a",
+                8
+            ),
+            "a dimension change must invalidate the checkpoint"
+        );
+        assert!(
+            !super::vector_checkpoint_reusable(
+                &index,
+                "potion-multilingual-128",
+                "identity-rev-b",
+                4
+            ),
+            "a same-id same-dimension REVISION change (model retrain) must invalidate the checkpoint"
+        );
     }
 
     #[test]

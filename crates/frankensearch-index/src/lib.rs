@@ -1855,10 +1855,17 @@ impl VectorIndex {
     pub fn replace_with_empty(
         path: &Path,
         embedder_id: &str,
+        embedder_revision: &str,
         dimension: usize,
     ) -> SearchResult<Self> {
         let replacement_path = temporary_output_path(path);
-        let writer = Self::create(&replacement_path, embedder_id, dimension)?;
+        let writer = Self::create_with_revision(
+            &replacement_path,
+            embedder_id,
+            embedder_revision,
+            dimension,
+            Quantization::F16,
+        )?;
         writer.finish()?;
         Self::install_replacement(path, &replacement_path)
     }
@@ -8462,7 +8469,7 @@ mod tests {
         drop(old);
 
         assert!(
-            VectorIndex::replace_with_empty(&path, "invalid", 0).is_err(),
+            VectorIndex::replace_with_empty(&path, "invalid", "", 0).is_err(),
             "replacement validation must fail before touching the old generation"
         );
         let intact = VectorIndex::open(&path).expect("reopen generation after rejected replace");
@@ -8470,9 +8477,10 @@ mod tests {
         assert_eq!(intact.wal_record_count(), 1);
         drop(intact);
 
-        let replacement =
-            VectorIndex::replace_with_empty(&path, "new", 4).expect("replace generation");
+        let replacement = VectorIndex::replace_with_empty(&path, "new", "rev-next", 4)
+            .expect("replace generation");
         assert_eq!(replacement.embedder_id(), "new");
+        assert_eq!(replacement.embedder_revision(), "rev-next");
         assert_eq!(replacement.record_count(), 0);
         assert_eq!(replacement.wal_record_count(), 0);
         assert!(!wal::wal_path_for(&path).exists());
