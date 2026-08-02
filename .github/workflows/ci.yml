@@ -83,6 +83,11 @@ jobs:
             fi
           done < <(find "$GITHUB_WORKSPACE" -name Cargo.toml -print0)
 
+      - name: Install jsonschema validator module
+        # The standalone `jsonschema` CLI was removed in python-jsonschema 4.x;
+        # the contract scripts fall back to the python3 module, which must exist.
+        run: python3 -m pip install --user --upgrade jsonschema
+
       - name: Exercise installer with the platform system Bash
         env:
           FSFS_INSTALL_TEST_BASH: /bin/bash

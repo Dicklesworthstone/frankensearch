@@ -19914,8 +19914,29 @@ mod tests {
                 .await
                 .expect("publish first expansion witness");
 
+            // Full-mode execution requires a complete generation: the vector
+            // arm must exist alongside the lexical arm (fail-closed semantic
+            // generation contract). The cross-generation rejection under test
+            // is still driven by the lexical successor commit below.
+            let vector_path = temp.path().join(super::FSFS_VECTOR_INDEX_FILE);
+            fs::create_dir_all(vector_path.parent().expect("vector parent"))
+                .expect("create vector parent");
+            // cfg(test) resolves the fast embedder to HashEmbedder::default_256
+            // (id fnv1a-256), so the stored generation must carry that identity.
+            let vector = vec![0.125_f32; 256];
+            let mut vector_writer = VectorIndex::create(&vector_path, "fnv1a-256", vector.len())
+                .expect("create expansion vector index");
+            vector_writer
+                .write_record("alpha.md", &vector)
+                .expect("write expansion vector");
+            vector_writer.finish().expect("finish expansion vector arm");
+
             let mut config = FsfsConfig::default();
             config.storage.index_dir = temp.path().display().to_string();
+            // Hermetic embedder resolution: an empty model_dir forces the hash
+            // fallback so the active identity matches the hash-384 generation
+            // regardless of models cached on the host.
+            config.indexing.model_dir = temp.path().join("models").display().to_string();
             let runtime = FsfsRuntime::new(config).with_cli_input(CliInput {
                 index_dir: Some(temp.path().to_path_buf()),
                 ..CliInput::default()
@@ -25174,6 +25195,9 @@ mod tests {
             let model_root = temp.path().join("models");
             let potion_dir = model_root.join("potion-multilingual-128M");
             fs::create_dir_all(&potion_dir).expect("create model dir");
+            // The verifier requires the complete file set before checksumming;
+            // an absent member reports ModelNotFound instead of the checksum
+            // error this test pins. Corrupt every required file.
             fs::write(potion_dir.join("tokenizer.json"), b"broken").expect("write model file");
             // The registered potion manifest lists tokenizer.json THEN
             // model.safetensors. The fixture must be complete: with the
