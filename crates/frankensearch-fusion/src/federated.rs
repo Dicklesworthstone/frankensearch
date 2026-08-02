@@ -662,7 +662,9 @@ fn into_ranked_hits(
 #[cfg(test)]
 mod tests {
     use std::io;
+    use std::path::PathBuf;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
     use std::time::{Duration, Instant};
 
     use frankensearch_core::traits::{Embedder, ModelCategory, SearchFuture};
@@ -672,6 +674,27 @@ mod tests {
     use super::{FederatedConfig, FederatedFusion, FederatedSearcher};
     use crate::normalize::NormalizationMethod;
     use crate::searcher::TwoTierSearcher;
+
+    static NEXT_INDEX_FIXTURE: AtomicU64 = AtomicU64::new(0);
+
+    // Reserve the directory atomically: parallel tests share both PID and
+    // TMPDIR, and a wall-clock timestamp is not a uniqueness primitive.
+    // Retained directories from an earlier process incarnation are skipped,
+    // never reopened as a writable fixture for the current test.
+    fn reserve_index_fixture_dir() -> io::Result<PathBuf> {
+        loop {
+            let sequence = NEXT_INDEX_FIXTURE.fetch_add(1, Ordering::Relaxed);
+            let candidate = std::env::temp_dir().join(format!(
+                "frankensearch-federated-test-{}-{sequence}",
+                std::process::id()
+            ));
+            match std::fs::create_dir(&candidate) {
+                Ok(()) => return Ok(candidate),
+                Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(error),
+            }
+        }
+    }
 
     struct StubEmbedder {
         id: &'static str,
@@ -886,14 +909,7 @@ mod tests {
     }
 
     fn build_index(records: &[(&str, &[f32])]) -> Arc<TwoTierIndex> {
-        let dir = std::env::temp_dir().join(format!(
-            "frankensearch-federated-test-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_nanos()
-        ));
+        let dir = reserve_index_fixture_dir().expect("reserve federated test fixture");
         let mut builder =
             TwoTierIndex::create(&dir, TwoTierConfig::default()).expect("create index");
         builder.set_fast_embedder_id("stub-fast");
