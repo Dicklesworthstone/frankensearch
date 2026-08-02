@@ -313,6 +313,45 @@ fn collector_invocations() -> (u64, u64) {
 }
 
 /// Execute a pre-built Tantivy query with offset pagination.
+/// Execute a Tantivy collector search behind a panic guard.
+///
+/// The pinned Tantivy 0.26.1 scorer stack contains at least one panic
+/// reachable from ordinary user input: a negated phrase whose exact sequence
+/// is absent seeks a terminated docset in `PhraseScorer` (bd-nqeb4, found by
+/// the bd-bsjw structure-aware campaign). A search engine must degrade, not
+/// abort the host process, so the execution boundary converts an engine
+/// panic into the same typed error surface as an engine `Err`. The searcher
+/// is an immutable snapshot, so the unwind leaves no poisoned state behind.
+fn search_guarded<C: tantivy::collector::Collector>(
+    searcher: &Searcher,
+    query: &dyn tantivy::query::Query,
+    collector: &C,
+) -> SearchResult<C::Fruit> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        searcher.search(query, collector)
+    })) {
+        Ok(result) => result.map_err(|error| SearchError::SubsystemError {
+            subsystem: "tantivy",
+            source: Box::new(error),
+        }),
+        Err(panic) => {
+            let detail = panic
+                .downcast_ref::<String>()
+                .map(String::as_str)
+                .or_else(|| panic.downcast_ref::<&str>().copied())
+                .unwrap_or("non-string panic payload");
+            warn!(
+                panic = detail,
+                "tantivy panicked during query execution; degrading to a typed error (bd-nqeb4)"
+            );
+            Err(SearchError::SubsystemError {
+                subsystem: "tantivy",
+                source: format!("tantivy panicked during query execution: {detail}").into(),
+            })
+        }
+    }
+}
+
 ///
 /// This helper centralizes error mapping and result-shape normalization so
 /// downstream callers can keep custom query construction while reusing the
@@ -332,33 +371,23 @@ pub fn execute_query_with_offset(
     COUNTED_COLLECTOR_INVOCATIONS.set(COUNTED_COLLECTOR_INVOCATIONS.get().saturating_add(1));
 
     if limit == 0 {
-        let total_count =
-            searcher
-                .search(query, &Count)
-                .map_err(|e| SearchError::SubsystemError {
-                    subsystem: "tantivy",
-                    source: Box::new(e),
-                })?;
+        let total_count = search_guarded(searcher, query, &Count)?;
         return Ok(LexicalSearchResult {
             hits: Vec::new(),
             total_count,
         });
     }
 
-    let (top_docs, total_count) = searcher
-        .search(
-            query,
-            &(
-                TopDocs::with_limit(limit)
-                    .and_offset(offset)
-                    .order_by_score(),
-                Count,
-            ),
-        )
-        .map_err(|e| SearchError::SubsystemError {
-            subsystem: "tantivy",
-            source: Box::new(e),
-        })?;
+    let (top_docs, total_count) = search_guarded(
+        searcher,
+        query,
+        &(
+            TopDocs::with_limit(limit)
+                .and_offset(offset)
+                .order_by_score(),
+            Count,
+        ),
+    )?;
 
     let hits = top_docs
         .into_iter()
@@ -396,17 +425,13 @@ pub fn execute_top_k(
     #[cfg(test)]
     TOP_K_COLLECTOR_INVOCATIONS.set(TOP_K_COLLECTOR_INVOCATIONS.get().saturating_add(1));
 
-    let top_docs = searcher
-        .search(
-            query,
-            &TopDocs::with_limit(limit)
-                .and_offset(offset)
-                .order_by_score(),
-        )
-        .map_err(|e| SearchError::SubsystemError {
-            subsystem: "tantivy",
-            source: Box::new(e),
-        })?;
+    let top_docs = search_guarded(
+        searcher,
+        query,
+        &TopDocs::with_limit(limit)
+            .and_offset(offset)
+            .order_by_score(),
+    )?;
 
     Ok(top_docs
         .into_iter()
@@ -2087,24 +2112,18 @@ impl TantivyIndex {
             // Every clause is an exact lookup on the unique `id` field. Hydration
             // consumes neither BM25 scores nor hit order, so asking Tantivy to
             // score and heap-sort these documents is pure overhead.
-            searcher
-                .search(&query, &DocSetCollector)
-                .map_err(|error| SearchError::SubsystemError {
-                    subsystem: "tantivy",
-                    source: Box::new(error),
-                })?
+            search_guarded(&searcher, &query, &DocSetCollector)?
                 .into_iter()
                 .collect()
         } else {
-            searcher
-                .search(&query, &TopDocs::with_limit(limit).order_by_score())
-                .map_err(|error| SearchError::SubsystemError {
-                    subsystem: "tantivy",
-                    source: Box::new(error),
-                })?
-                .into_iter()
-                .map(|(_, doc_address)| doc_address)
-                .collect()
+            search_guarded(
+                &searcher,
+                &query,
+                &TopDocs::with_limit(limit).order_by_score(),
+            )?
+            .into_iter()
+            .map(|(_, doc_address)| doc_address)
+            .collect()
         };
 
         for doc_address in doc_addresses {
@@ -2169,12 +2188,11 @@ impl LexicalSearch for TantivyIndex {
             let parsed = self.parse_query_lenient(query);
 
             let searcher = self.reader.searcher();
-            let top_docs = searcher
-                .search(&*parsed, &TopDocs::with_limit(limit).order_by_score())
-                .map_err(|e| SearchError::SubsystemError {
-                    subsystem: "tantivy",
-                    source: Box::new(e),
-                })?;
+            let top_docs = search_guarded(
+                &searcher,
+                &*parsed,
+                &TopDocs::with_limit(limit).order_by_score(),
+            )?;
 
             debug!(hits = top_docs.len(), "tantivy BM25 search completed");
 
@@ -2767,12 +2785,14 @@ mod tests {
     /// Tantivy 0.26.1's `PhraseScorer` panics on an illegal post-termination
     /// seek when a NEGATED PHRASE rides beside a positive term — found by the
     /// bd-bsjw structure-aware campaign (`generic NOT "indexes Parser or
-    /// minimal"`). Pinned as `should_panic` so an oracle upgrade that fixes the
-    /// upstream defect becomes visible instead of silently changing the
-    /// conformance target. Quill executes the same shape without incident.
+    /// minimal"`). Quill executes the same shape without incident. The
+    /// shipping execution boundary converts the upstream panic into a typed
+    /// degradation instead of aborting the host process, and the index stays
+    /// fully usable afterwards (bd-nqeb4). When the pinned oracle is upgraded
+    /// past the upstream defect, the typed-error assertion here fails —
+    /// making the fix visible instead of silently shifting the target.
     #[test]
-    #[should_panic(expected = "should be greater than or equal to doc")]
-    fn oracle_negated_phrase_beside_term_panics_in_phrase_scorer() {
+    fn oracle_negated_phrase_beside_term_degrades_typed_instead_of_panicking() {
         run_with_cx(|cx| async move {
             let docs = vec![
                 IndexableDocument::new("doc-a", "alpha need only"),
@@ -2785,7 +2805,22 @@ mod tests {
             // The phrase's terms exist but the SEQUENCE does not, so the
             // phrase docset terminates immediately — the precondition for the
             // upstream illegal seek.
-            let _ = idx.search_doc_ids(&cx, "alpha NOT \"only need\"", 10);
+            let error = idx
+                .search_doc_ids(&cx, "alpha NOT \"only need\"", 10)
+                .expect_err("upstream PhraseScorer defect must surface as a typed error");
+            assert!(
+                error
+                    .to_string()
+                    .contains("panicked during query execution"),
+                "degradation must name the panic boundary: {error}"
+            );
+
+            // The availability property: the same index keeps serving ordinary
+            // queries after the guarded failure.
+            let survivors = idx
+                .search_doc_ids(&cx, "alpha", 10)
+                .expect("index must remain fully usable after a guarded panic");
+            assert_eq!(survivors.len(), 2);
         });
     }
 
