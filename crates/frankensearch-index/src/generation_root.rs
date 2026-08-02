@@ -813,7 +813,7 @@ impl QualifiedGenerationDirectory {
     ///
     /// Returns [`GenerationRootErrorKind::ObjectChanged`] or the precise
     /// qualification failure when the route no longer resolves identically.
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "linux"))]
     fn revalidate_route(&self) -> GenerationRootResult<()> {
         platform::revalidate_root(&self.inner)
     }
@@ -835,6 +835,10 @@ impl QualifiedGenerationDirectory {
     /// On Apple Silicon this path-only API always returns
     /// [`GenerationRootErrorKind::PreopenedDescriptorRequired`]; use
     /// [`Self::admit_preopened_file`].
+    #[cfg_attr(
+        all(target_os = "macos", target_arch = "aarch64"),
+        allow(clippy::unused_self)
+    )]
     fn admit_file(
         &self,
         path: &ConfinedGenerationPath,
@@ -933,6 +937,10 @@ impl QualifiedGenerationDirectory {
     /// path-only API always returns
     /// [`GenerationRootErrorKind::PreopenedDescriptorRequired`]; use
     /// [`Self::admit_preopened_control_file`].
+    #[cfg_attr(
+        all(target_os = "macos", target_arch = "aarch64"),
+        allow(clippy::unused_self)
+    )]
     fn admit_control_file(
         &self,
         path: &ConfinedGenerationPath,
@@ -1256,6 +1264,10 @@ impl QualifiedGenerationRoot {
 
     // This deliberately lands one bead before the writer-lease consumer.
     #[allow(dead_code)]
+    #[cfg_attr(
+        all(target_os = "macos", target_arch = "aarch64"),
+        allow(clippy::unused_self)
+    )]
     pub(crate) fn try_exclusive_anchor_guard(
         &self,
     ) -> GenerationRootResult<GenerationRootExclusiveAnchorGuard<'_>> {
@@ -1760,15 +1772,18 @@ mod platform {
         AfterRelativeDirectoryOpen {
             index: usize,
         },
+        #[cfg(target_os = "linux")]
         BeforeRegularFileOpen {
             index: usize,
         },
+        #[cfg(target_os = "linux")]
         AfterRegularFileOpen {
             index: usize,
             cloexec: bool,
         },
         BeforeRootDescriptorDuplicate,
         AfterRootDescriptorDuplicate,
+        #[cfg(target_os = "linux")]
         AfterQualifiedFileOpen,
         BeforeRead {
             offset: u64,
@@ -1782,8 +1797,11 @@ mod platform {
             byte_count: usize,
         },
         AfterExactRead,
+        #[cfg(target_os = "linux")]
         BeforeFileRouteReopen,
+        #[cfg(target_os = "linux")]
         AfterFileRouteReopen,
+        #[cfg(target_os = "linux")]
         BeforeFinalRootRevalidation,
         BeforeFilesystemQualification,
         AfterFilesystemQualification,
@@ -3288,7 +3306,7 @@ mod platform {
         revalidate_root(&control.root)
     }
 
-    #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+    #[cfg(all(test, target_os = "macos", target_arch = "aarch64"))]
     fn revalidate_control_route(control: &ControlHandle) -> GenerationRootResult<()> {
         revalidate_preopened_file_route(
             &control.root,
@@ -3947,7 +3965,7 @@ mod platform {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "linux"))]
     pub(super) fn validate_bound_control_content_for_test(
         observed: [u8; 32],
         expected: [u8; 32],
@@ -4043,8 +4061,11 @@ mod platform {
         stage: GenerationRootStage,
     ) -> GenerationRootResult<AbsoluteAncestorSecurityWitness> {
         let stat = fstat(descriptor).map_err(|error| os_error(stage, error))?;
+        #[cfg(target_os = "linux")]
         let changed_nanoseconds = i64::try_from(stat.st_ctime_nsec)
             .map_err(|_| GenerationRootError::new(GenerationRootErrorKind::ObjectChanged, stage))?;
+        #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
+        let changed_nanoseconds = stat.st_ctime_nsec;
         Ok(AbsoluteAncestorSecurityWitness {
             identity: basic_identity(descriptor, stage)?,
             changed_seconds: stat_seconds_as_i64(stat.st_ctime),
@@ -4074,7 +4095,7 @@ mod platform {
         Ok(())
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "linux"))]
     pub(super) fn validate_absolute_ancestor_owner_mode_for_test(
         uid: u32,
         mode: u32,
@@ -6057,7 +6078,7 @@ mod platform {
         Ok(())
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "linux"))]
     pub(super) fn validate_directory_scan_counts_for_test(
         entry_count: usize,
         name_bytes: usize,
