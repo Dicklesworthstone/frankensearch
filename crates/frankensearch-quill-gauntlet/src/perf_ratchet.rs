@@ -5596,17 +5596,26 @@ mod tests {
 
     #[test]
     fn qg6_reproduction_uses_hierarchical_grouping_not_equal_flat_multisets() {
+        // Two ratio values with log-spread 0.0445: inside the window where the
+        // hierarchical median-of-group-medians delta (spread/2 = 0.02225)
+        // exceeds max_reproduction_delta_log (ln 1.02) while every half or
+        // order-subset median stays within the bd-yo5by effect drift and
+        // order-effect bounds (ln 1.05) no matter how blocks land — the
+        // previous 0.95/1.10 fixture drifted between halves and now correctly
+        // classifies InvalidExperiment before reproduction is evaluated. Both
+        // runs share one flat multiset (7 low, 5 high), so the former flat
+        // estimator still calls them reproductions of each other.
         let candidate_groups = [
-            [0.95, 0.95, 0.95],
-            [0.95, 0.95, 0.95],
-            [0.95, 1.10, 1.10],
-            [1.10, 1.10, 1.10],
+            [0.978, 0.978, 0.978],
+            [0.978, 0.978, 0.978],
+            [0.978, 1.0225, 1.0225],
+            [1.0225, 1.0225, 1.0225],
         ];
         let rerun_groups = [
-            [0.95, 0.95, 1.10],
-            [0.95, 0.95, 1.10],
-            [0.95, 0.95, 1.10],
-            [0.95, 1.10, 1.10],
+            [0.978, 0.978, 1.0225],
+            [0.978, 0.978, 1.0225],
+            [0.978, 0.978, 1.0225],
+            [0.978, 1.0225, 1.0225],
         ];
         let (_, candidate) = qg6_current_pair("candidate", candidate_groups);
         let (_, rerun) = qg6_current_pair("rerun", rerun_groups);

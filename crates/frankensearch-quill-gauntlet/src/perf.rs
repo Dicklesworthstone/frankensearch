@@ -2470,6 +2470,43 @@ pub fn estimate_paired_experiment(
             ),
         );
     }
+    // bd-yo5by: drift and order-effect were computed for the effect stream but
+    // never bounded, so a quiet null phase followed by a drifting or
+    // carryover-asymmetric effect phase was admissible. Gate both with the same
+    // predeclared bounds the null already answers to.
+    match effect.order_effect_log {
+        Some(order_effect) if order_effect.abs() <= config.max_null_order_effect_log => {}
+        Some(order_effect) => {
+            experiment_invalid = true;
+            push_reason(
+                &mut reasons,
+                "paired.effect_order_effect",
+                format!(
+                    "A/B order effect {order_effect:.6} exceeds {:.6}",
+                    config.max_null_order_effect_log
+                ),
+            );
+        }
+        None => {
+            experiment_invalid = true;
+            push_reason(
+                &mut reasons,
+                "paired.effect_order_unobserved",
+                "A/B stream did not execute both randomized orders",
+            );
+        }
+    }
+    if effect.drift_log.abs() > config.max_null_drift_log {
+        experiment_invalid = true;
+        push_reason(
+            &mut reasons,
+            "paired.effect_drift",
+            format!(
+                "A/B first/second-half drift {:.6} exceeds {:.6}",
+                effect.drift_log, config.max_null_drift_log
+            ),
+        );
+    }
     if direction_conflicts(&effect, config.summary_direction_dead_band_log) {
         contradictory = true;
         push_reason(
@@ -4146,6 +4183,65 @@ mod tests {
     }
 
     #[test]
+    fn drifting_effect_stream_is_invalid_even_when_null_is_quiet() {
+        // bd-yo5by: a quiet null must not bless a drifting effect stream.
+        let scope = operation_scope(PerfMetricSemantics::Throughput);
+        let provenance = provenance("drifting-effect");
+        let controls = [1_000_000; PERF_MIN_RUNS];
+        let mut effect_treatments = [500_000; PERF_MIN_RUNS];
+        effect_treatments[PERF_MIN_RUNS / 2..].fill(900_000);
+        let effect = duration_stream(&scope, &provenance, &controls, &effect_treatments, 0);
+        let null = stable_null(&scope, &provenance);
+        let result =
+            estimate_paired_experiment(&effect, &null, &estimator_config()).expect("diagnostic");
+        assert_eq!(result.status, PairedEvidenceStatus::InvalidExperiment);
+        assert_eq!(result.claim_state, PairedClaimState::NoDecision);
+        assert!(
+            result
+                .reasons
+                .iter()
+                .any(|reason| reason.code == "paired.effect_drift")
+        );
+        result
+            .verify_recomputed()
+            .expect("invalid diagnostics still recompute");
+    }
+
+    #[test]
+    fn effect_order_effect_beyond_bound_is_invalid() {
+        // bd-yo5by: carryover asymmetry in the A/B stream is gated with the
+        // same predeclared bound as the A/A stream.
+        let scope = operation_scope(PerfMetricSemantics::Throughput);
+        let provenance = provenance("effect-order-effect");
+        let controls = [1_000_000; PERF_MIN_RUNS];
+        let treatments = [800_000; PERF_MIN_RUNS];
+        let mut effect = duration_stream(&scope, &provenance, &controls, &treatments, 0);
+        // Bias every sample by execution order: first-position samples run 4x
+        // faster than second-position samples, an order effect far beyond
+        // ln(1.05) while per-arm medians stay balanced across orders.
+        for sample in &mut effect {
+            let duration = sample.ended_ns - sample.started_ns;
+            let biased = if sample.order == PerfSampleOrder::First {
+                duration / 4
+            } else {
+                duration * 4
+            };
+            sample.ended_ns = sample.started_ns + biased;
+        }
+        let null = stable_null(&scope, &provenance);
+        let result =
+            estimate_paired_experiment(&effect, &null, &estimator_config()).expect("diagnostic");
+        assert_eq!(result.status, PairedEvidenceStatus::InvalidExperiment);
+        assert_eq!(result.claim_state, PairedClaimState::NoDecision);
+        assert!(
+            result
+                .reasons
+                .iter()
+                .any(|reason| reason.code == "paired.effect_order_effect")
+        );
+    }
+
+    #[test]
     fn same_seed_bootstrap_and_json_round_trip_are_exact() {
         let scope = operation_scope(PerfMetricSemantics::Throughput);
         let provenance = provenance("deterministic");
@@ -4247,9 +4343,20 @@ mod tests {
     fn contradictory_paired_and_marginal_directions_yield_no_decision() {
         let scope = operation_scope(PerfMetricSemantics::GaugeHigherIsBetter);
         let provenance = provenance("contradictory");
-        let controls = [100.0, 1_000.0, 10_000.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0];
+        // Eight blocks at an identical 0.9 per-block ratio plus two extreme
+        // blocks (tiny control, enormous treatment). The paired median stays
+        // 0.9 (negative log) while the marginal arm-median ratio flips above
+        // 1.0 — the direction conflict this test exists for. Because a median
+        // over any 5-block half or order subset contains at most two extreme
+        // blocks, every drift/order-effect median stays at 0.9, keeping the
+        // bd-yo5by effect-stream drift and order-effect gates quiet (the
+        // previous fixture drifted between halves and now correctly
+        // classifies as InvalidExperiment before the contradiction check).
+        let controls = [
+            100.0, 110.0, 120.0, 130.0, 140.0, 150.0, 160.0, 170.0, 1.0, 2.0,
+        ];
         let treatments = [
-            99.0, 999.0, 9_999.0, 100_000.0, 200_000.0, 2.0, 3.0, 4.0, 5.0, 6.0,
+            90.0, 99.0, 108.0, 117.0, 126.0, 135.0, 144.0, 153.0, 100_000.0, 200_000.0,
         ];
         let effect = gauge_stream(&scope, &provenance, &controls, &treatments, 0);
         let null = gauge_stream(&scope, &provenance, &controls, &controls, 10_000);

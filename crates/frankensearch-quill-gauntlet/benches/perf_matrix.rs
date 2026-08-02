@@ -32,7 +32,7 @@ use frankensearch_lexical::{BenchmarkWriterJoinReceipt, SnippetConfig, TantivyIn
 use frankensearch_quill::scribe::{FrankensearchTokenizer, TokenAnalyzer};
 use frankensearch_quill::{
     Analyzer, CompactionPolicy, DEFAULT_SCHEMA, FieldDescriptor, FieldKind, QuillConfig,
-    QuillIndex, SchemaDescriptor, SegmentStatsProvider,
+    QuillIndex, SchemaDescriptor,
 };
 use frankensearch_quill_gauntlet::{
     BuildIdentity, ColdCacheEvidence, ComparatorConfig, ComparisonStatus, CorpusIdentity,
@@ -2839,100 +2839,205 @@ struct StreamPlan<'a> {
     query_override: Option<&'a str>,
 }
 
-/// Measure one paired raw-sample stream with a seeded balanced randomized
-/// first-arm schedule, warmup separation, and monotonic per-sample intervals.
-fn paired_raw_stream(
-    context: &BenchContext,
-    spec: &PerfCellSpec,
-    evidence: &EvidenceContext,
-    scope: &PerfOperationScope,
+/// Round-stepping executor for one paired raw-sample stream with a seeded
+/// balanced randomized first-arm schedule, warmup separation, and monotonic
+/// per-sample intervals.
+///
+/// bd-yo5by: the A/A null floor bounds the A/B effect, so both must sample the
+/// same time window. Construction runs the warmup; `run_round` executes exactly
+/// one seeded block, letting `collect_cell` interleave several streams in time
+/// while every per-stream schedule, block id, and sample id stays identical to
+/// the previous serial layout.
+struct PairedStreamRunner<'a> {
+    context: &'a BenchContext,
+    spec: &'a PerfCellSpec,
+    evidence: &'a EvidenceContext,
+    scope: &'a PerfOperationScope,
     origin: Instant,
-    plan: &StreamPlan<'_>,
-) -> Vec<PerfRawSample> {
-    let order = seeded_balanced_pair_order(plan.rounds, plan.seed).expect("paired order schedule");
-    let (work_units, byte_count) = raw_sample_work(context, spec);
-    for _ in 0..evidence.policy.warmup_rounds {
-        let _ = black_box(measure_metric_with_query(
-            context,
-            spec,
-            plan.control,
-            plan.query_override,
-        ));
-        let _ = black_box(measure_metric_with_query(
-            context,
-            spec,
-            plan.treatment,
-            plan.query_override,
-        ));
-    }
-    let mut samples = Vec::with_capacity(plan.rounds * 2);
-    for (round, first_arm) in order.into_iter().enumerate() {
-        let round_index = u64::try_from(round).expect("round fits u64");
-        let block_id = plan.block_id_base + round_index;
-        let control_sample_id = plan.sample_id_base + round_index * 2;
-        let treatment_sample_id = control_sample_id + 1;
-        let control_first = first_arm == PerfSampleArm::Control;
-        let run_arm = |engine: EngineArm,
-                       sample_arm: PerfSampleArm,
-                       sample_order: PerfSampleOrder,
-                       sample_id: u64| {
-            let started_ns = u64::try_from(origin.elapsed().as_nanos()).expect("monotonic ns");
-            let value = black_box(measure_metric_with_query(
+    plan: StreamPlan<'a>,
+    order: Vec<PerfSampleArm>,
+    work_units: Option<u64>,
+    byte_count: Option<u64>,
+    samples: Vec<PerfRawSample>,
+}
+
+impl<'a> PairedStreamRunner<'a> {
+    fn new(
+        context: &'a BenchContext,
+        spec: &'a PerfCellSpec,
+        evidence: &'a EvidenceContext,
+        scope: &'a PerfOperationScope,
+        origin: Instant,
+        plan: StreamPlan<'a>,
+    ) -> Self {
+        let order =
+            seeded_balanced_pair_order(plan.rounds, plan.seed).expect("paired order schedule");
+        let (work_units, byte_count) = raw_sample_work(context, spec);
+        for _ in 0..evidence.policy.warmup_rounds {
+            let _ = black_box(measure_metric_with_query(
                 context,
                 spec,
-                engine,
+                plan.control,
                 plan.query_override,
             ));
-            let mut ended_ns = u64::try_from(origin.elapsed().as_nanos()).expect("monotonic ns");
-            if ended_ns <= started_ns {
-                ended_ns = started_ns + 1;
-            }
-            PerfRawSample {
-                block_id,
-                sample_id,
-                arm: sample_arm,
-                order: sample_order,
-                phase: PerfSamplePhase::Measurement,
-                scope: scope.clone(),
-                provenance: evidence.sample_provenance.clone(),
-                started_ns,
-                ended_ns,
-                work_units,
-                byte_count,
-                observed_value: Some(value),
-                group_id: plan.group_id,
-                qg6_sample_binding: None,
-            }
-        };
-        if control_first {
-            samples.push(run_arm(
-                plan.control,
-                PerfSampleArm::Control,
-                PerfSampleOrder::First,
-                control_sample_id,
-            ));
-            samples.push(run_arm(
+            let _ = black_box(measure_metric_with_query(
+                context,
+                spec,
                 plan.treatment,
-                PerfSampleArm::Treatment,
-                PerfSampleOrder::Second,
-                treatment_sample_id,
-            ));
-        } else {
-            samples.push(run_arm(
-                plan.treatment,
-                PerfSampleArm::Treatment,
-                PerfSampleOrder::First,
-                treatment_sample_id,
-            ));
-            samples.push(run_arm(
-                plan.control,
-                PerfSampleArm::Control,
-                PerfSampleOrder::Second,
-                control_sample_id,
+                plan.query_override,
             ));
         }
+        let samples = Vec::with_capacity(plan.rounds * 2);
+        Self {
+            context,
+            spec,
+            evidence,
+            scope,
+            origin,
+            plan,
+            order,
+            work_units,
+            byte_count,
+            samples,
+        }
     }
-    samples
+
+    fn run_round(&mut self, round: usize) {
+        let round_index = u64::try_from(round).expect("round fits u64");
+        let block_id = self.plan.block_id_base + round_index;
+        let control_sample_id = self.plan.sample_id_base + round_index * 2;
+        let treatment_sample_id = control_sample_id + 1;
+        if self.order[round] == PerfSampleArm::Control {
+            let first = self.execute(
+                self.plan.control,
+                PerfSampleArm::Control,
+                PerfSampleOrder::First,
+                block_id,
+                control_sample_id,
+            );
+            self.samples.push(first);
+            let second = self.execute(
+                self.plan.treatment,
+                PerfSampleArm::Treatment,
+                PerfSampleOrder::Second,
+                block_id,
+                treatment_sample_id,
+            );
+            self.samples.push(second);
+        } else {
+            let first = self.execute(
+                self.plan.treatment,
+                PerfSampleArm::Treatment,
+                PerfSampleOrder::First,
+                block_id,
+                treatment_sample_id,
+            );
+            self.samples.push(first);
+            let second = self.execute(
+                self.plan.control,
+                PerfSampleArm::Control,
+                PerfSampleOrder::Second,
+                block_id,
+                control_sample_id,
+            );
+            self.samples.push(second);
+        }
+    }
+
+    fn execute(
+        &self,
+        engine: EngineArm,
+        sample_arm: PerfSampleArm,
+        sample_order: PerfSampleOrder,
+        block_id: u64,
+        sample_id: u64,
+    ) -> PerfRawSample {
+        let started_ns = u64::try_from(self.origin.elapsed().as_nanos()).expect("monotonic ns");
+        let value = black_box(measure_metric_with_query(
+            self.context,
+            self.spec,
+            engine,
+            self.plan.query_override,
+        ));
+        let mut ended_ns = u64::try_from(self.origin.elapsed().as_nanos()).expect("monotonic ns");
+        if ended_ns <= started_ns {
+            ended_ns = started_ns + 1;
+        }
+        PerfRawSample {
+            block_id,
+            sample_id,
+            arm: sample_arm,
+            order: sample_order,
+            phase: PerfSamplePhase::Measurement,
+            scope: self.scope.clone(),
+            provenance: self.evidence.sample_provenance.clone(),
+            started_ns,
+            ended_ns,
+            work_units: self.work_units,
+            byte_count: self.byte_count,
+            observed_value: Some(value),
+            group_id: self.plan.group_id,
+            qg6_sample_binding: None,
+        }
+    }
+
+    fn into_samples(self) -> Vec<PerfRawSample> {
+        self.samples
+    }
+}
+
+/// Which stream executes its next block, in seeded per-round order (bd-yo5by).
+#[derive(Clone, Copy)]
+enum StreamSlot {
+    OracleNull,
+    TreatmentNull,
+    Effect,
+}
+
+/// Deterministic per-round permutation of the three stream slots so no stream
+/// systematically runs first or last within a round (a fixed intra-round order
+/// would reintroduce the carryover asymmetry the interleave exists to spread).
+fn interleaved_stream_order(seed: u64, round: usize) -> [StreamSlot; 3] {
+    const PERMUTATIONS: [[StreamSlot; 3]; 6] = [
+        [
+            StreamSlot::OracleNull,
+            StreamSlot::TreatmentNull,
+            StreamSlot::Effect,
+        ],
+        [
+            StreamSlot::OracleNull,
+            StreamSlot::Effect,
+            StreamSlot::TreatmentNull,
+        ],
+        [
+            StreamSlot::TreatmentNull,
+            StreamSlot::OracleNull,
+            StreamSlot::Effect,
+        ],
+        [
+            StreamSlot::TreatmentNull,
+            StreamSlot::Effect,
+            StreamSlot::OracleNull,
+        ],
+        [
+            StreamSlot::Effect,
+            StreamSlot::OracleNull,
+            StreamSlot::TreatmentNull,
+        ],
+        [
+            StreamSlot::Effect,
+            StreamSlot::TreatmentNull,
+            StreamSlot::OracleNull,
+        ],
+    ];
+    let round_index = u64::try_from(round).expect("round fits u64");
+    let mut mixed = seed ^ 0x9e37_79b9_7f4a_7c15 ^ round_index.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    mixed ^= mixed >> 30;
+    mixed = mixed.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    mixed ^= mixed >> 27;
+    mixed = mixed.wrapping_mul(0x94d0_49bb_1331_11eb);
+    mixed ^= mixed >> 31;
+    PERMUTATIONS[usize::try_from(mixed % 6).expect("permutation index")]
 }
 
 fn arm_values(samples: &[PerfRawSample], arm: PerfSampleArm) -> Vec<f64> {
@@ -3698,9 +3803,12 @@ fn collect_cell(
     let cell_seed = evidence.config.bootstrap_seed ^ fixture_seed(&spec.fixture);
 
     // Every non-query gate establishes its A/A floor through the exact paired
-    // routine before measuring the Quill/Tantivy claim. QG-6 uses the prepared
-    // four-arm runner so setup is impossible inside timed samples and null/
-    // effect blocks are interleaved.
+    // routine. QG-6 uses the prepared four-arm runner so setup is impossible
+    // inside timed samples. For every other gate the null and effect streams
+    // are interleaved round-by-round under one seeded schedule (bd-yo5by): a
+    // null band sampled in an earlier, quieter phase says nothing about the
+    // noise DURING the effect measurement, so the streams must share the
+    // measurement window.
     let (
         oracle_null_samples,
         treatment_null_samples,
@@ -3718,13 +3826,13 @@ fn collect_cell(
             Some(semantic_contract),
         )
     } else {
-        let oracle_null = paired_raw_stream(
+        let mut oracle_null = PairedStreamRunner::new(
             context,
             spec,
             evidence,
             &scope,
             origin,
-            &StreamPlan {
+            StreamPlan {
                 control: EngineArm::Tantivy,
                 treatment: EngineArm::Tantivy,
                 rounds: runs,
@@ -3735,14 +3843,14 @@ fn collect_cell(
                 query_override: None,
             },
         );
-        let treatment_null = (spec.gate == PerfGate::Qg1).then(|| {
-            paired_raw_stream(
+        let mut treatment_null = (spec.gate == PerfGate::Qg1).then(|| {
+            PairedStreamRunner::new(
                 context,
                 spec,
                 evidence,
                 &scope,
                 origin,
-                &StreamPlan {
+                StreamPlan {
                     control: EngineArm::Quill,
                     treatment: EngineArm::Quill,
                     rounds: runs,
@@ -3754,13 +3862,13 @@ fn collect_cell(
                 },
             )
         });
-        let effect = paired_raw_stream(
+        let mut effect = PairedStreamRunner::new(
             context,
             spec,
             evidence,
             &scope,
             origin,
-            &StreamPlan {
+            StreamPlan {
                 control: EngineArm::Tantivy,
                 treatment: EngineArm::Quill,
                 rounds: runs,
@@ -3771,7 +3879,26 @@ fn collect_cell(
                 query_override: None,
             },
         );
-        (oracle_null, treatment_null, effect, None, None)
+        for round in 0..runs {
+            for slot in interleaved_stream_order(cell_seed, round) {
+                match slot {
+                    StreamSlot::OracleNull => oracle_null.run_round(round),
+                    StreamSlot::TreatmentNull => {
+                        if let Some(runner) = treatment_null.as_mut() {
+                            runner.run_round(round);
+                        }
+                    }
+                    StreamSlot::Effect => effect.run_round(round),
+                }
+            }
+        }
+        (
+            oracle_null.into_samples(),
+            treatment_null.map(PairedStreamRunner::into_samples),
+            effect.into_samples(),
+            None,
+            None,
+        )
     };
 
     let quill_distribution =

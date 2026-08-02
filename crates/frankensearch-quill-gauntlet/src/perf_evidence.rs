@@ -4114,13 +4114,25 @@ mod tests {
 
     #[test]
     fn absolute_relative_contradiction_is_no_decision() {
-        let mut pairs = Vec::new();
-        for _ in 0..6 {
-            pairs.push((1.0, 1.2));
-        }
-        for _ in 0..6 {
-            pairs.push((100.0, 90.0));
-        }
+        // Eight blocks at an identical 0.9 per-block ratio plus two extreme
+        // blocks (tiny control, enormous treatment): the paired median stays
+        // 0.9 while the marginal arm-median ratio flips above 1.0. Any
+        // half/order-subset median contains at most two extreme blocks and
+        // stays at 0.9, so the bd-yo5by effect drift/order-effect gates stay
+        // quiet (the previous half-split fixture drifted between halves and
+        // now correctly classifies as InvalidExperiment first).
+        let pairs = vec![
+            (100.0, 90.0),
+            (110.0, 99.0),
+            (120.0, 108.0),
+            (130.0, 117.0),
+            (140.0, 126.0),
+            (150.0, 135.0),
+            (160.0, 144.0),
+            (170.0, 153.0),
+            (1.0, 100_000.0),
+            (2.0, 200_000.0),
+        ];
         let effect = gauge_stream(&pairs, 0, 0, None);
         let null = gauge_stream(&quiet_null_pairs(12), 10_000, 0, None);
         let experiment = estimate_paired_experiment(&effect, &null, &config()).expect("estimate");
