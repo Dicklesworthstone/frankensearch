@@ -45,6 +45,7 @@
 #[cfg(unix)]
 pub mod fd_acl;
 pub mod file_identity;
+pub mod generation_root;
 #[cfg(feature = "ann")]
 pub mod hnsw;
 pub mod in_memory;
