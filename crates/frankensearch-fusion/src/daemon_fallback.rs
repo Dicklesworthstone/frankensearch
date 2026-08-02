@@ -231,6 +231,8 @@ impl DaemonFallbackEmbedder {
             DaemonError::Overloaded { .. } => "overloaded",
             DaemonError::Failed(_) => "error",
             DaemonError::InvalidInput(_) => "invalid",
+            DaemonError::Cancelled => "cancelled",
+            DaemonError::UnverifiableRemoteSpace => "unverifiable_space",
         }
     }
 

@@ -27,6 +27,8 @@ use tracing::instrument;
 use frankensearch_core::config::TwoTierConfig;
 use frankensearch_core::error::{SearchError, SearchResult};
 use frankensearch_core::traits::LexicalRead;
+#[cfg(all(feature = "lexical", not(feature = "quill")))]
+use frankensearch_core::traits::LexicalWrite;
 use frankensearch_core::traits::{Embedder, MetricsExporter};
 use frankensearch_core::types::{EmbeddingMetrics, IndexMetrics, IndexableDocument};
 #[cfg(all(feature = "durability", feature = "quill"))]
