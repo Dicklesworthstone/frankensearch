@@ -77,13 +77,43 @@ verbatim in CI, which is the enforcement the reality check found missing. The cu
 installer path ships prebuilt embedded binaries (release-build provisions models
 before building).
 
-**Verdict: RESOLVED via documented-explicit-feature boundary + executable
-enforcement.** Exit 78 with an actionable message remains the correct typed behavior
-for a model-free binary asked to do semantic indexing.
+**Verdict at the time (2026-08-01): RESOLVED via documented-explicit-feature
+boundary + executable enforcement.** Superseded the next day by the stronger
+resolution in §3b. Exit 78 with an actionable message remains the correct typed
+behavior for a model-free binary asked to do semantic indexing.
+
+## 3b. D2 final resolution — loader-capable stock default (2026-08-02)
+
+WhiteGrove's A4 candidate (byte-frozen patch `5a65d524…`, base `d4164fb2`,
+hostile reviews: GrayThrush hash-audit + CreamCoast executed PASS in mail 9311)
+lands the durable design: `default = ["semantic-loaders"]` compiles the
+Model2Vec/FastEmbed loader backends with model bytes outside the crate, so the
+plain documented build indexes for real once `fsfs download-models` installs
+the revision-pinned, SHA-verified artifacts. `embedded-models` remains the
+zero-download release profile. Silent lexical fallback was removed in favor of
+typed fail-closed errors.
+
+Integration receipts (executed on the integration host, stock default):
+
+| Proof | Result |
+|---|---|
+| Frozen patch forward+reverse apply vs committed tree | byte-exact |
+| Frozen E2E command without consent env | fails closed on consent gate (by design) |
+| Frozen E2E with `FRANKENSEARCH_REQUIRE_SEMANTIC_E2E=1` | **2 passed; 0 failed; 0 ignored** — one-shot index exit 0 (`watch_requested=false`), FSVI identity `potion-multilingual-128m`, doctor loaders green, 2 zero-term-overlap paraphrases at semantic rank 0, hybrid control `in_both_sources=true` |
+| Executable quick-start gate vs stock-default binary | **full PASS** (repeat-index, CURRENT/MANIFEST/sentinel, ranked hybrid, non-hash attestation, no leaks) — same gate red-flags pre-A4 main |
+| `cargo tree` stock default | 0 Tokio-family crates / 1,041 nodes |
+| Workspace `cargo check --all-targets` post-rebase | green (see landing commit) |
+
+The gate script now exercises the documented **stock default** by default
+(`--profile embedded` covers the release profile), closing A4 self-audit gap 2.
 
 ## 4. Replay
 
 ```bash
 scripts/rch-ensure-deps.sh --models-only
-scripts/check_fsfs_executable_quickstart.sh        # builds + runs the whole gate
+scripts/check_fsfs_executable_quickstart.sh                    # documented stock default
+scripts/check_fsfs_executable_quickstart.sh --profile embedded # release profile
+FSFS_DEFAULT_E2E_MODEL_DIR="$HOME/.local/share/frankensearch/models" \
+FRANKENSEARCH_REQUIRE_SEMANTIC_E2E=1 \
+  cargo test -p frankensearch-fsfs --test default_build_quickstart -- --include-ignored --nocapture
 ```

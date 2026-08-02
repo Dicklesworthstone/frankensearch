@@ -32,15 +32,20 @@ Options:
   --skip-build        Alias for requiring --binary (fail if binary missing).
   --keep-artifacts    Do not delete the work directory on success.
   --index-deadline N  Seconds allowed for one bounded index run (default ${INDEX_DEADLINE_SECS}).
+  --profile default|embedded
+                      Which documented build to exercise (default: default).
   -h|--help           Show this help.
 
-The gate builds the binary with the README's documented source-install
-feature set (cargo build -p frankensearch-fsfs --features embedded-models),
-so it exercises exactly what the README tells a user to run — the feature is
-explicit in the documentation, never hidden. Model inputs must already be
+The gate builds the binary exactly as the README documents. Since the
+loader-capable stock default landed (bd-fsfs-default-build-usable-6mtid),
+the documented source path is the PLAIN default build — no feature flags —
+with model artifacts provisioned at runtime; --profile embedded exercises
+the zero-download release profile instead. Model inputs must already be
 provisioned and SHA-verified via: scripts/rch-ensure-deps.sh --models-only
 USAGE
 }
+
+BUILD_PROFILE="default"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -48,10 +53,16 @@ while [[ $# -gt 0 ]]; do
     --skip-build) SKIP_BUILD=1; shift ;;
     --keep-artifacts) KEEP_ARTIFACTS=1; shift ;;
     --index-deadline) INDEX_DEADLINE_SECS="${2:?}"; shift 2 ;;
+    --profile) BUILD_PROFILE="${2:?}"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "Unknown argument: $1" >&2; usage >&2; exit 2 ;;
   esac
 done
+
+case "${BUILD_PROFILE}" in
+  default|embedded) ;;
+  *) echo "ERROR: invalid --profile '${BUILD_PROFILE}' (expected default|embedded)" >&2; exit 2 ;;
+esac
 
 fail() {
   local class="$1"; shift
@@ -92,8 +103,13 @@ if [[ -n "${BINARY_OVERRIDE}" ]]; then
   [[ -x "${FSFS_BIN}" ]] || fail "SETUP" "--binary ${FSFS_BIN} is not executable"
 else
   [[ "${SKIP_BUILD}" -eq 1 ]] && fail "SETUP" "--skip-build requires --binary"
-  echo "[gate] building: cargo build -p frankensearch-fsfs --bin fsfs --features embedded-models (documented source install)"
-  cargo build -p frankensearch-fsfs --bin fsfs --features embedded-models
+  if [[ "${BUILD_PROFILE}" == "embedded" ]]; then
+    echo "[gate] building: cargo build -p frankensearch-fsfs --bin fsfs --features embedded-models (release profile)"
+    cargo build -p frankensearch-fsfs --bin fsfs --features embedded-models
+  else
+    echo "[gate] building: cargo build -p frankensearch-fsfs --bin fsfs (documented stock default, loader-capable)"
+    cargo build -p frankensearch-fsfs --bin fsfs
+  fi
   FSFS_BIN="${CARGO_TARGET_DIR:-target}/debug/fsfs"
   [[ -x "${FSFS_BIN}" ]] || fail "SETUP" "build produced no binary at ${FSFS_BIN}"
 fi
@@ -102,8 +118,10 @@ BIN_SHA256="$(sha256sum "${FSFS_BIN}" | cut -d' ' -f1)"
 GIT_REV="$(git -C "${ROOT_DIR}" rev-parse HEAD 2>/dev/null || echo unknown)"
 
 # ── 1b. Forbidden-runtime graph proof (AGENTS.md: asupersync only, no tokio) ──
-echo "[gate] dependency-graph check: Tokio-family crates must be absent"
-cargo tree -p frankensearch-fsfs --features embedded-models --edges normal \
+echo "[gate] dependency-graph check: Tokio-family crates must be absent (${BUILD_PROFILE} profile)"
+tree_args=(-p frankensearch-fsfs --edges normal)
+[[ "${BUILD_PROFILE}" == "embedded" ]] && tree_args+=(--features embedded-models)
+cargo tree "${tree_args[@]}" \
   >"${WORK_DIR}/fsfs-dep-tree.txt" 2>"${WORK_DIR}/fsfs-dep-tree.err" \
   || fail "SETUP" "cargo tree failed for the shipped feature graph"
 if grep -nE '(^|[^a-z-])(tokio|hyper|reqwest|axum|tower|async-std|smol) v[0-9]' \
