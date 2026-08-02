@@ -2530,6 +2530,163 @@ const fn epoch_days_to_ymd(days: u64) -> (u64, u64, u64) {
     (y, m, d)
 }
 
+// ─── Cross-process publication lease (bd-jr74s) ─────────────────────────────
+
+/// File name of the index-root publication lock.
+pub const PUBLICATION_LOCK_FILE_NAME: &str = "fsfs.publication.lock";
+
+/// Refusal detail when another process holds the publication lease.
+#[derive(Debug)]
+pub struct PublicationLeaseBusy {
+    /// Path of the contended lock file.
+    pub lock_path: PathBuf,
+    /// PID recorded by the current holder, when readable.
+    pub owner_pid: Option<u32>,
+}
+
+impl std::fmt::Display for PublicationLeaseBusy {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.owner_pid {
+            Some(pid) => write!(
+                formatter,
+                "another fsfs process (pid {pid}) holds the publication lease at {}; wait for it to finish or stop the daemon",
+                self.lock_path.display()
+            ),
+            None => write!(
+                formatter,
+                "another fsfs process holds the publication lease at {}; wait for it to finish or stop the daemon",
+                self.lock_path.display()
+            ),
+        }
+    }
+}
+
+impl std::error::Error for PublicationLeaseBusy {}
+
+/// Cross-process publication lease for one fsfs index root (bd-jr74s).
+///
+/// Every mutating fsfs surface (one-shot index scaffold + watch mode, delete,
+/// compact, append-batch, daemon) must hold this lease before touching shared
+/// index state — checkpoint, FSVI main + WAL, sentinel. Without it, a daemon
+/// compaction can run concurrently with another process's WAL appends and
+/// silently discard acknowledged vectors inside a generation whose sentinel
+/// still reads `generation_complete: true`.
+///
+/// The authority is an exclusive non-blocking `flock(2)` on
+/// `<index_root>/fsfs.publication.lock` — the same primitive the Quill keeper
+/// uses one layer down for its engine directory. The kernel releases the lock
+/// when the holder dies, so there is no stale-lease recovery protocol. The
+/// PID record inside the file is diagnostic only and written best-effort.
+/// Non-flock platforms fail closed rather than pretending exclusion.
+#[derive(Debug)]
+pub struct PublicationLease {
+    lock_path: PathBuf,
+    lock_file: std::fs::File,
+}
+
+impl PublicationLease {
+    /// Acquire the exclusive publication lease for `index_root`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `SearchError::SubsystemError` (subsystem `publication-lease`)
+    /// carrying [`PublicationLeaseBusy`] when another process holds the lease,
+    /// and `SearchError::Io` for filesystem failures.
+    #[cfg(unix)]
+    pub fn acquire(index_root: &Path) -> frankensearch_core::SearchResult<Self> {
+        use rustix::fs::{FlockOperation, OFlags, flock};
+        use std::io::{Read, Seek, SeekFrom, Write};
+        use std::os::unix::fs::OpenOptionsExt;
+
+        std::fs::create_dir_all(index_root)?;
+        let lock_path = index_root.join(PUBLICATION_LOCK_FILE_NAME);
+        let no_follow = i32::try_from(OFlags::NOFOLLOW.bits()).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "O_NOFOLLOW does not fit the open(2) flag word on this target",
+            )
+        })?;
+        let mut lock_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .custom_flags(no_follow)
+            .open(&lock_path)?;
+        if !lock_file.metadata()?.file_type().is_file() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("{} must be a regular file", lock_path.display()),
+            )
+            .into());
+        }
+        if let Err(errno) = flock(&lock_file, FlockOperation::NonBlockingLockExclusive) {
+            if errno == rustix::io::Errno::AGAIN {
+                let mut recorded = String::new();
+                let owner_pid = lock_file
+                    .read_to_string(&mut recorded)
+                    .ok()
+                    .and_then(|_| recorded.split_whitespace().next()?.parse::<u32>().ok());
+                return Err(frankensearch_core::SearchError::SubsystemError {
+                    subsystem: "publication-lease",
+                    source: Box::new(PublicationLeaseBusy {
+                        lock_path,
+                        owner_pid,
+                    }),
+                });
+            }
+            return Err(std::io::Error::from(errno).into());
+        }
+        // Diagnostic record only; the flock above is the authority.
+        let record = format!(
+            "{} {}\n",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .map_or(0, |elapsed| elapsed.as_secs())
+        );
+        let _ = lock_file.set_len(0);
+        let _ = lock_file.seek(SeekFrom::Start(0));
+        let _ = lock_file.write_all(record.as_bytes());
+        let _ = lock_file.sync_all();
+        Ok(Self {
+            lock_path,
+            lock_file,
+        })
+    }
+
+    /// Non-Unix targets cannot provide flock exclusion semantics; fail closed.
+    ///
+    /// # Errors
+    ///
+    /// Always returns `SearchError::Io` with `ErrorKind::Unsupported`.
+    #[cfg(not(unix))]
+    pub fn acquire(index_root: &Path) -> frankensearch_core::SearchResult<Self> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            format!(
+                "cross-process fsfs publication exclusion requires flock semantics (index root {})",
+                index_root.display()
+            ),
+        )
+        .into())
+    }
+
+    /// Path of the held lock file.
+    #[must_use]
+    pub fn lock_path(&self) -> &Path {
+        &self.lock_path
+    }
+}
+
+impl Drop for PublicationLease {
+    fn drop(&mut self) {
+        // Clear the diagnostic record; closing the descriptor releases the
+        // flock itself.
+        let _ = self.lock_file.set_len(0);
+    }
+}
+
 // ─── Tests ──────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -2537,6 +2694,39 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+
+    #[test]
+    fn publication_lease_excludes_second_holder_and_releases_on_drop() {
+        let root = tempfile::tempdir().expect("index root");
+        let first = PublicationLease::acquire(root.path()).expect("first acquire");
+        assert!(first.lock_path().ends_with(PUBLICATION_LOCK_FILE_NAME));
+
+        let busy = PublicationLease::acquire(root.path())
+            .expect_err("second acquire must refuse while the lease is held");
+        match busy {
+            frankensearch_core::SearchError::SubsystemError { subsystem, source } => {
+                assert_eq!(subsystem, "publication-lease");
+                let detail = source
+                    .downcast_ref::<PublicationLeaseBusy>()
+                    .expect("busy detail carries the typed refusal");
+                assert_eq!(detail.owner_pid, Some(std::process::id()));
+            }
+            other => panic!("expected publication-lease busy error, got {other:?}"),
+        }
+
+        drop(first);
+        let reacquired = PublicationLease::acquire(root.path())
+            .expect("lease must be reacquirable after the holder releases");
+        drop(reacquired);
+    }
+
+    #[test]
+    fn publication_lease_rejects_directory_lock_path() {
+        let root = tempfile::tempdir().expect("index root");
+        std::fs::create_dir_all(root.path().join(PUBLICATION_LOCK_FILE_NAME))
+            .expect("occupy the lock path with a directory");
+        assert!(PublicationLease::acquire(root.path()).is_err());
+    }
 
     // ── DaemonPhase ──
 

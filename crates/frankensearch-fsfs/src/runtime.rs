@@ -8067,6 +8067,7 @@ impl FsfsRuntime {
         if !vector_path.exists() {
             return Err(SearchError::IndexNotFound { path: vector_path });
         }
+        let _publication_lease = crate::lifecycle::PublicationLease::acquire(&index_root)?;
 
         let embedder = self.resolve_fast_embedder()?;
         let dimension = embedder.dimension();
@@ -8331,6 +8332,7 @@ impl FsfsRuntime {
         if !vector_path.exists() {
             return Err(SearchError::IndexNotFound { path: vector_path });
         }
+        let _publication_lease = crate::lifecycle::PublicationLease::acquire(&index_root)?;
 
         let mut index = VectorIndex::open(&vector_path)?;
         let ids = &self.cli_input.delete_ids;
@@ -8425,6 +8427,7 @@ impl FsfsRuntime {
         if !vector_path.exists() {
             return Err(SearchError::IndexNotFound { path: vector_path });
         }
+        let _publication_lease = crate::lifecycle::PublicationLease::acquire(&index_root)?;
 
         let mut index = VectorIndex::open(&vector_path)?;
 
@@ -8499,6 +8502,9 @@ impl FsfsRuntime {
                 path: vector_path.clone(),
             });
         }
+        // Held for the daemon's whole lifetime: its WAL-triggered compactions
+        // are mutually exclusive with every other mutating fsfs process.
+        let _publication_lease = crate::lifecycle::PublicationLease::acquire(&index_root)?;
 
         let poll_ms = self.cli_input.daemon_poll_ms.unwrap_or(1000);
         let wal_sidecar = frankensearch_index::wal_path_for(&vector_path);
@@ -10126,6 +10132,9 @@ impl FsfsRuntime {
         let total_start = Instant::now();
         let target_root = self.resolve_target_root()?;
         let index_root = self.resolve_index_root(&target_root)?;
+        // One-shot and watch-mode indexing mutate checkpoint + FSVI + sentinel
+        // state; exclude every other mutating fsfs process for the duration.
+        let _publication_lease = crate::lifecycle::PublicationLease::acquire(&index_root)?;
 
         let root_decision = self.config.discovery.evaluate_root(&target_root, None);
         if !root_decision.include() {
