@@ -9442,20 +9442,23 @@ if not close_only_contended or not explicit_unlock_released:
                 GenerationRootErrorKind::WriteRestrictedObject
             );
             assert_eq!(append_error.stage(), GenerationRootStage::OpenRegularFile);
+            let observed = boundaries.lock().expect("boundary log should lock");
+            // Root revalidation legitimately opens the verified procfs root
+            // to bind task-scoped mountinfo before inspecting the attributed
+            // component. `BeforeProcFdReopen` is the distinct boundary that
+            // would derive a data descriptor from the qualified `O_PATH`
+            // probe.
             assert!(
-                !boundaries
-                    .lock()
-                    .expect("boundary log should lock")
-                    .iter()
-                    .any(|boundary| matches!(
-                        boundary,
-                        TestBoundary::BeforeProcCapabilityRootOpen
-                            | TestBoundary::BeforeProcFdReopen { .. }
-                            | TestBoundary::BeforeRead { .. }
-                            | TestBoundary::BeforeLock
-                    )),
-                "physical immutable/append rejection must precede data-fd derivation, reads, and flock"
+                !observed.iter().any(|boundary| matches!(
+                    boundary,
+                    TestBoundary::BeforeProcFdReopen { .. }
+                        | TestBoundary::BeforeRead { .. }
+                        | TestBoundary::BeforeLock
+                )),
+                "physical immutable/append rejection must precede data-fd derivation, reads, and \
+                 flock; observed={observed:?}"
             );
+            drop(observed);
             drop(guard);
 
             immutable_reset.clear();
