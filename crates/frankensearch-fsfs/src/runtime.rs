@@ -3023,6 +3023,13 @@ fn release_checksum_url(tag: &str) -> String {
 }
 
 /// Construct the asset filename for a given version and target triple.
+///
+/// The release pipeline ships two archive families: full builds (embedded
+/// models; aarch64 macOS and Windows) named `fsfs-VERSION-TRIPLE`, and lite
+/// builds (loader-capable, no embedded models; both musl Linux targets and
+/// Intel macOS) named `fsfs-lite-VERSION-TRIPLE`. This constructor previously
+/// always produced the full-build name, so Linux self-update requested an
+/// asset that no release has ever contained and 404ed unconditionally.
 fn release_asset_filename(tag: &str, triple: &str) -> String {
     let version = tag.strip_prefix('v').unwrap_or(tag);
     let ext = if triple.contains("windows") {
@@ -3030,7 +3037,15 @@ fn release_asset_filename(tag: &str, triple: &str) -> String {
     } else {
         "tar.xz"
     };
-    format!("fsfs-{version}-{triple}.{ext}")
+    let family = if matches!(
+        triple,
+        "x86_64-unknown-linux-musl" | "aarch64-unknown-linux-musl" | "x86_64-apple-darwin"
+    ) {
+        "fsfs-lite"
+    } else {
+        "fsfs"
+    };
+    format!("{family}-{version}-{triple}.{ext}")
 }
 
 /// Extract the expected SHA-256 hash for a given asset filename from a
@@ -26115,9 +26130,12 @@ mod tests {
 
     #[test]
     fn release_asset_url_format() {
+        // Linux ships lite archives only; the URL must use the fsfs-lite
+        // family or self-update 404s against every real release (the previous
+        // pin of the full-build name froze exactly that defect).
         let url = super::release_asset_url("v0.2.0", "x86_64-unknown-linux-musl");
         assert!(url.contains("v0.2.0"));
-        assert!(url.contains("fsfs-0.2.0-x86_64-unknown-linux-musl.tar.xz"));
+        assert!(url.contains("fsfs-lite-0.2.0-x86_64-unknown-linux-musl.tar.xz"));
         assert!(url.starts_with("https://github.com/"));
     }
 
@@ -26125,6 +26143,28 @@ mod tests {
     fn release_asset_url_windows_uses_zip() {
         let url = super::release_asset_url("v1.1.2", "x86_64-pc-windows-msvc");
         assert!(url.contains("fsfs-1.1.2-x86_64-pc-windows-msvc.zip"));
+    }
+
+    #[test]
+    fn release_asset_url_families_match_release_matrix() {
+        // Lite family: both musl targets and Intel macOS.
+        for triple in [
+            "x86_64-unknown-linux-musl",
+            "aarch64-unknown-linux-musl",
+            "x86_64-apple-darwin",
+        ] {
+            let name = super::release_asset_filename("v1.4.2", triple);
+            assert_eq!(name, format!("fsfs-lite-1.4.2-{triple}.tar.xz"));
+        }
+        // Full family: aarch64 macOS tarball and the Windows zip.
+        assert_eq!(
+            super::release_asset_filename("v1.4.2", "aarch64-apple-darwin"),
+            "fsfs-1.4.2-aarch64-apple-darwin.tar.xz"
+        );
+        assert_eq!(
+            super::release_asset_filename("v1.4.2", "x86_64-pc-windows-msvc"),
+            "fsfs-1.4.2-x86_64-pc-windows-msvc.zip"
+        );
     }
 
     #[test]
