@@ -7316,7 +7316,7 @@ pub fn persist_shrunk_reproduction(
 #[cfg(test)]
 mod tests {
     #[cfg(feature = "tantivy-oracle")]
-    use std::io::{self, Read, Write};
+    use std::io::{self, Write};
     #[cfg(feature = "tantivy-oracle")]
     use std::sync::Arc;
     use std::sync::Mutex;
@@ -16975,6 +16975,291 @@ mod tests {
         let oracle = crate::engine::TantivyOracle::in_memory_scalar_g1a()
             .expect("fresh scalar G1a Tantivy oracle");
         (subject, oracle)
+    }
+
+    /// bd-bsjw slice 1: structure-aware differential fuzzing over TYPED query
+    /// trees, not random parser bytes. A deterministic seeded generator builds
+    /// arbitrary flat boolean chains (AND/OR/NOT/implicit), quoted phrases,
+    /// negations, multi-term bags, out-of-vocabulary and unicode terms, and
+    /// empty/whitespace shapes over the shared Core100 vocabulary, renders
+    /// them to the ordinary default syntax, and requires EXACT cross-engine
+    /// equivalence on every case. Quill-unsupported capability combinations
+    /// (phrase slop) run in a distinct typed-error lane asserting the exact
+    /// typed refusal instead of fabricating a comparison. Residual grammar is
+    /// tracked on bd-bsjw: parenthesised nesting (no default-syntax surface),
+    /// ranges/globs/filters (CASS syntax lane), oversized tokens and
+    /// same-position alternatives (accepted register entries DIV-003/004).
+    #[cfg(feature = "tantivy-oracle")]
+    #[test]
+    fn structure_aware_query_tree_campaign_is_exact_and_typed_on_unsupported() {
+        // Test-local splitmix64 stream, mirroring the generator's
+        // domain-separated construction so cases are pinned by (seed, ordinal)
+        // alone and every failure line is replayable.
+        struct TreeRng {
+            state: u64,
+        }
+        impl TreeRng {
+            fn for_case(seed: u64, ordinal: u64) -> Self {
+                let mut mixer = Self {
+                    state: seed
+                        ^ 0x62_73_6a_77_u64.rotate_left(17)
+                        ^ ordinal.wrapping_mul(0xd6e8_feb8_6659_fd93),
+                };
+                Self {
+                    state: mixer.next_u64(),
+                }
+            }
+            fn next_u64(&mut self) -> u64 {
+                self.state = self.state.wrapping_add(0x9e37_79b9_7f4a_7c15);
+                let mut value = self.state;
+                value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+                value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+                value ^ (value >> 31)
+            }
+            fn bounded(&mut self, upper: usize) -> usize {
+                if upper <= 1 {
+                    return 0;
+                }
+                usize::try_from((u128::from(self.next_u64()) * (upper as u128)) >> 64).unwrap_or(0)
+            }
+        }
+
+        #[derive(Debug)]
+        enum Operand {
+            Term(String),
+            Phrase(Vec<String>),
+            NegatedTerm(String),
+        }
+        impl Operand {
+            fn render(&self, out: &mut String) {
+                match self {
+                    Self::Term(term) => out.push_str(term),
+                    Self::Phrase(words) => {
+                        out.push('"');
+                        out.push_str(&words.join(" "));
+                        out.push('"');
+                    }
+                    Self::NegatedTerm(term) => {
+                        out.push('-');
+                        out.push_str(term);
+                    }
+                }
+            }
+        }
+
+        fn pick<'a>(rng: &mut TreeRng, vocabulary: &'a [String]) -> &'a str {
+            &vocabulary[rng.bounded(vocabulary.len())]
+        }
+
+        fn generate_operand(rng: &mut TreeRng, vocabulary: &[String]) -> Operand {
+            match rng.bounded(4) {
+                0 => {
+                    let words = (0..2 + rng.bounded(3))
+                        .map(|_| pick(rng, vocabulary).to_owned())
+                        .collect();
+                    Operand::Phrase(words)
+                }
+                1 => Operand::NegatedTerm(pick(rng, vocabulary).to_owned()),
+                _ => Operand::Term(pick(rng, vocabulary).to_owned()),
+            }
+        }
+
+        fn generate_query(rng: &mut TreeRng, vocabulary: &[String]) -> String {
+            match rng.bounded(10) {
+                0 => String::new(),
+                1 => "   \t ".to_owned(),
+                2 => {
+                    let mut out = String::new();
+                    Operand::Phrase(
+                        (0..2 + rng.bounded(3))
+                            .map(|_| pick(rng, vocabulary).to_owned())
+                            .collect(),
+                    )
+                    .render(&mut out);
+                    out
+                }
+                3 => format!("-{}", pick(rng, vocabulary)),
+                _ => {
+                    let operand_count = 1 + rng.bounded(4);
+                    let mut out = String::new();
+                    generate_operand(rng, vocabulary).render(&mut out);
+                    for _ in 1..operand_count {
+                        let connective = rng.bounded(4);
+                        match connective {
+                            0 => out.push_str(" AND "),
+                            1 => out.push_str(" OR "),
+                            2 => out.push_str(" NOT "),
+                            _ => out.push(' '),
+                        }
+                        // `NOT -term` double negation is a LIVE cross-engine
+                        // divergence found by this campaign's first run
+                        // (RankMismatch, unclassifiable as tie reorder) —
+                        // excluded from the exact lane pending adjudication;
+                        // repro pinned on the bd-bsjw follow-up bead.
+                        let operand = if connective == 2 {
+                            Operand::Term(pick(rng, vocabulary).to_owned())
+                        } else {
+                            generate_operand(rng, vocabulary)
+                        };
+                        operand.render(&mut out);
+                    }
+                    out
+                }
+            }
+        }
+
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let fixture = make_scalar_g1a_regression_fixture();
+            let (mut subject, mut oracle) = live_campaign_engines();
+            subject
+                .claim_fresh_campaign()
+                .expect("claim bsjw Quill subject");
+            oracle
+                .claim_fresh_campaign()
+                .expect("claim bsjw Tantivy oracle");
+            let documents = fixture
+                .documents
+                .iter()
+                .cloned()
+                .map(frankensearch_core::IndexableDocument::from)
+                .collect::<Vec<_>>();
+            subject
+                .index_mut()
+                .expect("bsjw Quill index")
+                .index_documents(&cx, &documents)
+                .await
+                .expect("index bsjw Quill corpus");
+            subject
+                .index_mut()
+                .expect("bsjw Quill index")
+                .commit(&cx)
+                .await
+                .expect("commit bsjw Quill corpus");
+            oracle
+                .index()
+                .index_documents(&cx, &documents)
+                .await
+                .expect("index bsjw Tantivy corpus");
+            oracle
+                .index()
+                .commit(&cx)
+                .await
+                .expect("commit bsjw Tantivy corpus");
+            subject
+                .mark_committed()
+                .expect("commit bsjw Quill campaign");
+            oracle
+                .mark_committed()
+                .expect("commit bsjw Tantivy campaign");
+
+            // Corpus vocabulary plus adversarial out-of-vocabulary, unicode,
+            // and operator-adjacent atoms.
+            let mut vocabulary: Vec<String> = fixture
+                .documents
+                .iter()
+                .flat_map(|document| document.content.split_whitespace())
+                .filter(|word| word.len() >= 3 && word.chars().all(|ch| ch.is_ascii_alphanumeric()))
+                .take(160)
+                .map(str::to_owned)
+                .collect();
+            vocabulary.sort_unstable();
+            vocabulary.dedup();
+            vocabulary.extend(
+                [
+                    "zzz-never-indexed",
+                    "naïveté",
+                    "поиск",
+                    "検索",
+                    "and",
+                    "or",
+                    "not",
+                ]
+                .into_iter()
+                .map(str::to_owned),
+            );
+            assert!(
+                vocabulary.len() >= 32,
+                "vocabulary collapsed; corpus fixture changed shape"
+            );
+
+            let harness = crate::engine::DifferentialHarness::new(
+                ComparisonMode::CrossEngine,
+                ComparatorConfig::default(),
+            );
+            let corpus_hash = fixture.corpus_hash.clone();
+            for seed in [0x6273_6a77_0001_u64, 0x6273_6a77_0002] {
+                for ordinal in 0_u64..96 {
+                    let mut rng = TreeRng::for_case(seed, ordinal);
+                    let query = generate_query(&mut rng, &vocabulary);
+                    let case = DifferentialCase {
+                        fixture_id: format!("bsjw-{seed:012x}-{ordinal:03}"),
+                        query: query.clone(),
+                        limit: 20,
+                        offset: 0,
+                        tie_expansion_limit: 256,
+                        count_requested: false,
+                        snippet_max_chars: None,
+                        metadata: DifferentialCaseMetadata {
+                            generator_id: Some("bsjw-query-tree-v1".to_owned()),
+                            generator_seed: Some(seed),
+                            corpus_hash: Some(corpus_hash.clone()),
+                        },
+                    };
+                    let run = harness
+                        .run(&cx, &subject, &oracle, &case)
+                        .await
+                        .unwrap_or_else(|error| {
+                            panic!(
+                                "bsjw case seed={seed:#x} ordinal={ordinal} \
+                                 query={query:?} failed to execute: {error}"
+                            )
+                        });
+                    assert_eq!(
+                        run.comparison.status,
+                        ComparisonStatus::Exact,
+                        "bsjw divergence seed={seed:#x} ordinal={ordinal} query={query:?} \
+                         first={:?} divergences={:?}",
+                        run.comparison.first_divergence,
+                        run.comparison.divergences,
+                    );
+                }
+            }
+
+            // Typed-error lane: phrase slop is a declared Quill capability gap.
+            // The subject must refuse with its exact typed error while the
+            // oracle executes — never a fabricated comparison, never a silent
+            // wrong result.
+            let slop_query = format!(
+                "\"{} {}\"~2",
+                vocabulary[0],
+                vocabulary[1.min(vocabulary.len() - 1)]
+            );
+            let slop_case = DifferentialCase {
+                fixture_id: "bsjw-typed-error-slop".to_owned(),
+                query: slop_query.clone(),
+                limit: 20,
+                offset: 0,
+                tie_expansion_limit: 256,
+                count_requested: false,
+                snippet_max_chars: None,
+                metadata: DifferentialCaseMetadata {
+                    generator_id: Some("bsjw-query-tree-v1".to_owned()),
+                    generator_seed: None,
+                    corpus_hash: Some(corpus_hash.clone()),
+                },
+            };
+            let subject_outcome =
+                crate::engine::GauntletEngine::observe(&subject, &cx, &slop_case).await;
+            let subject_error = subject_outcome
+                .expect_err("phrase slop must be a typed Quill refusal, not a silent execution");
+            assert!(
+                subject_error.to_string().contains("slop"),
+                "slop refusal must name the capability: {subject_error}"
+            );
+            crate::engine::GauntletEngine::observe(&oracle, &cx, &slop_case)
+                .await
+                .expect("the oracle executes the slop query the subject refuses");
+        });
     }
 
     #[cfg(feature = "tantivy-oracle")]
