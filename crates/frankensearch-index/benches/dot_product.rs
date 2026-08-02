@@ -84,7 +84,7 @@ fn dot_i8_i8_baseline(stored: &[i8], query: &[i8]) -> i32 {
             i16::from(q[6]),
             i16::from(q[7]),
         ]);
-        sum += sv.mul_widen(qv);
+        sum += sv.widening_mul(qv);
     }
     let mut result = sum.reduce_add();
     for (s, q) in stored_chunks

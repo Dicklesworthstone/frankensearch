@@ -215,7 +215,8 @@ fn write_embedded_workspace_source_receipt(receipt: &WorkspaceSourceReceipt) {
     .expect("writing generated receipt cannot fail");
     writeln!(
         generated,
-        "const EMBEDDED_WORKSPACE_SOURCE_INPUTS: &[(&str, u64, &str)] = &["
+        "#[allow(clippy::unreadable_literal)]\n\
+         const EMBEDDED_WORKSPACE_SOURCE_INPUTS: &[(&str, u64, &str)] = &["
     )
     .expect("writing generated receipt cannot fail");
     for input in &receipt.inputs {

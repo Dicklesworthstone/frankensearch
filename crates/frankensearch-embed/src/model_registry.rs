@@ -312,18 +312,18 @@ pub(crate) fn model_storage_root() -> PathBuf {
     }
     #[cfg(target_os = "macos")]
     {
-        if let Some(path) = dirs::data_local_dir() {
+        if let Some(path) = frankensearch_core::platform_dirs::data_local_dir() {
             return path.join("frankensearch").join("models");
         }
     }
-    if let Some(home) = dirs::home_dir() {
+    if let Some(home) = frankensearch_core::platform_dirs::home_dir() {
         return home
             .join(".local")
             .join("share")
             .join("frankensearch")
             .join("models");
     }
-    if let Some(path) = dirs::data_local_dir() {
+    if let Some(path) = frankensearch_core::platform_dirs::data_local_dir() {
         return path.join("frankensearch").join("models");
     }
     PathBuf::from("models")

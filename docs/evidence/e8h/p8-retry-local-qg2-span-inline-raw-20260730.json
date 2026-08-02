@@ -1,0 +1,100 @@
+{
+  "schema_version": 1,
+  "lever_id": "bd-e8h-w2-interner-arena-x9s38",
+  "comparison_class": "self_speedup",
+  "decision": "keep",
+  "measurement_base_git_sha": "d5ad5d59e3ca7a4000f97867d06f7ecc5fc59baa",
+  "landing_parent_git_sha": "6c70c86f7c852fb5e650fe44ff1b4939bb019fcc",
+  "workload": {
+    "child_mode": "memory",
+    "engine": "quill",
+    "document_count": 200000,
+    "writer_heap_bytes": 50000000,
+    "threads": 1,
+    "positions": true,
+    "scale": "smoke",
+    "taskset_cpu": 8,
+    "pair_order": "odd=A_then_B; even=B_then_A",
+    "warmup": "one untimed execution per arm before each 16-pair batch"
+  },
+  "arms": {
+    "aa_null": {
+      "a": "pristine measurement base",
+      "b": "same pristine measurement-base ELF"
+    },
+    "ab": {
+      "a": "pristine measurement base",
+      "b": "measurement base plus BucketEntry{id,span} lever"
+    }
+  },
+  "executables_sha256": {
+    "arm_a_perf_matrix": "fdc7c5c7b7b1a0b2c7d107f10f26813bb39d02557534b3bbe8aff26a58120064",
+    "arm_b_perf_matrix": "3246d1b844467e50b83750abf4445e507ec3abcc27370350a2777c1724e68617",
+    "arm_a_ingest_probe": "c8fd2dafdcfc6fe3be3eb14ea37eda904ff2de6a441a338abc92fc901ac48258",
+    "arm_b_ingest_probe": "875f3324a27ab0c4190b96272f985eac9fbbff936f465da501fdaf88fb806b8f"
+  },
+  "source_artifacts_sha256": {
+    "aa_null.tsv": "8c767dcf782490f7c86511b3016f2d28019f5d5ce4c613b695656fa8312223bc",
+    "ab_batch1.tsv": "dc7ef8ea5515a38096173c8e48f31037ef2427cb51474eeb1c74dabe82a9b104",
+    "ab_batch2.tsv": "c68b334dc04e949ddb3b2befecb1c00e397ee0d97ddb9af1fd82e7ae788f0022",
+    "ab_batch3.tsv": "22793942b91026dedf3111da4a410754433e14d9fc5e3a1cff69d27237121fc0",
+    "ab_batch4.tsv": "e969a555e3c244fb1fc28523a3467fd5c19995ecc7a003e0cbfcfac691c10e23",
+    "ab_run.sh": "41d028897846882d59c9177624c975cad1ff06feadfef00707011c95581de0ac",
+    "pooled_stats.py": "dbe3a1e42e2b5389aac322e28de5bed2bf149f621cc33f1b5f97dde28d207616",
+    "pooled-result.txt": "754be346090277f568ef5cb78ffc1d4d6deaabef65d513b2785fcc0f9d35b767"
+  },
+  "sample_columns": [
+    "pair",
+    "a_wall_seconds",
+    "b_wall_seconds",
+    "a_peak_rss_bytes",
+    "b_peak_rss_bytes"
+  ],
+  "samples": {
+    "aa_null": [[1,5.1928,5.1286,523956224,531775488],[2,5.1539,5.2173,524472320,514031616],[3,5.1550,5.1565,518537216,535007232],[4,5.1595,5.1729,516730880,535072768],[5,5.0947,5.2232,532594688,525553664],[6,5.1490,5.1567,516464640,516177920],[7,5.0759,5.0820,533139456,530202624],[8,5.1376,5.1398,519229440,522567680],[9,5.1675,5.1699,516546560,522399744],[10,5.1994,5.1445,511430656,514650112],[11,5.1291,5.1953,524972032,534654976],[12,5.1450,5.1400,534818816,521961472],[13,5.1563,5.1433,535588864,520822784],[14,5.1909,5.1603,535060480,521179136],[15,5.1541,5.1780,521076736,534847488],[16,5.1674,5.1681,510496768,525938688]],
+    "ab_batch1": [[1,5.1616,4.9610,522043392,526979072],[2,5.2240,4.9960,520802304,520589312],[3,5.1918,4.9965,534044672,529133568],[4,5.1658,4.9792,522067968,540266496],[5,5.1298,5.0426,521707520,523558912],[6,5.1598,4.9998,517357568,520671232],[7,5.2107,5.0102,533241856,522481664],[8,5.1869,5.0646,515547136,519831552],[9,5.1368,4.9979,521510912,542666752],[10,5.1252,5.1135,530657280,523907072],[11,5.1640,4.9937,521891840,544772096],[12,5.1770,4.9985,516767744,532701184],[13,5.1422,4.9771,523116544,543645696],[14,5.2198,4.9797,524627968,543416320],[15,5.1611,4.9638,521760768,531914752],[16,5.1243,5.0563,531722240,524234752]],
+    "ab_batch2": [[1,5.1179,4.9928,516558848,512991232],[2,5.1914,4.9960,513495040,537505792],[3,5.1529,5.0514,523677696,522424320],[4,5.1939,5.1274,515100672,534462464],[5,5.1514,5.1213,515051520,515616768],[6,5.1145,4.9938,532340736,522321920],[7,5.1272,4.9769,519786496,534114304],[8,5.2134,5.0456,512393216,525783040],[9,5.1826,5.0434,534814720,521142272],[10,5.1729,4.9467,512516096,511303680],[11,5.8162,5.4916,529350656,533741568],[12,5.1032,5.2304,522539008,527269888],[13,5.1008,4.8929,522792960,542621696],[14,5.0356,4.9373,528171008,527196160],[15,5.1635,4.9591,522444800,538046464],[16,5.0554,4.9594,527585280,516685824]],
+    "ab_batch3": [[1,5.1344,4.9476,522473472,527683584],[2,5.1547,4.9648,519454720,518475776],[3,5.1615,4.9715,519077888,519442432],[4,5.1164,4.9533,521523200,516263936],[5,5.1483,4.9450,520146944,515903488],[6,5.1182,4.9695,532082688,535093248],[7,5.0635,5.0344,541900800,520282112],[8,5.1557,5.0518,537214976,520990720],[9,5.0984,4.9486,525266944,536301568],[10,5.0866,4.9817,510042112,530874368],[11,5.1324,4.9753,509530112,524587008],[12,5.1320,4.9611,523640832,531755008],[13,5.1499,4.9811,522444800,519548928],[14,5.1597,4.9223,524496896,551206912],[15,5.0800,4.9192,515223552,538255360],[16,5.0576,4.9349,529002496,536989696]],
+    "ab_batch4": [[1,5.1113,4.9506,519159808,517304320],[2,5.1307,4.9800,518627328,543350784],[3,5.0901,4.9656,528031744,534343680],[4,5.1079,4.9746,528633856,536965120],[5,5.1556,4.9858,539332608,548306944],[6,5.1404,5.0328,523509760,519983104],[7,5.1787,4.9312,535785472,561410048],[8,5.1198,4.9362,512253952,527912960],[9,5.1288,5.0587,518746112,520581120],[10,5.1196,4.9728,535330816,520478720],[11,5.3494,5.1358,555061248,517922816],[12,5.3049,5.0781,516546560,540254208],[13,5.2413,4.9251,523874304,540295168],[14,5.0781,4.9813,527204352,534028288],[15,5.0991,4.9383,525090816,539574272],[16,5.0377,4.9339,527654912,534163456]]
+  },
+  "reconstruction": {
+    "per_pair_docs_per_second_ratio": "a_wall_seconds / b_wall_seconds",
+    "per_pair_new_over_old_time_ratio": "b_wall_seconds / a_wall_seconds",
+    "pooled_ab_order": "concatenate ab_batch1 through ab_batch4; pair number is scoped to its batch",
+    "p5_p95": "linear interpolation at q*(n-1) over the sorted pooled ratios",
+    "t_confidence_interval": "two-sided 95% Student-t interval around the arithmetic mean of per-pair ratios, df=n-1",
+    "favor_b": "count(per_pair_docs_per_second_ratio > 1.0)"
+  },
+  "published_timing_summary": {
+    "aa_null_n": 16,
+    "aa_null_median": 0.9996,
+    "aa_null_mean": 0.9982,
+    "aa_null_t_ci95": [0.9935,1.0030],
+    "ab_n": 64,
+    "ab_batch_medians": [1.0349,1.0263,1.0328,1.0314],
+    "ab_pooled_median": 1.0325,
+    "ab_pooled_mean": 1.0306,
+    "ab_t_ci95": [1.0271,1.0340],
+    "ab_p5_p95": [1.0069,1.0482],
+    "ab_favor_b": 63,
+    "new_over_old_time_ratio": 0.9705,
+    "new_over_old_time_t_ci95": [0.9672,0.9738]
+  },
+  "rss_diagnostic_no_claim": {
+    "reason": "Peak RSS was not a predeclared decision metric, is noisy in the paired rows, and no QG-7 or high-collision/high-shard memory experiment was run. Bucket remains 24 bytes and the dominant One bucket path retains the pinned 40-byte outer accounting estimate; only rare Many collision-vector capacity uses the larger BucketEntry.",
+    "ab_median_b_over_a": 1.009713276,
+    "ab_median_delta_mib": 4.837891,
+    "ab_mean_delta_mib": 5.344666,
+    "ab_p5_p95_delta_mib": [-13.995312,22.855078],
+    "ab_min_max_delta_mib": [-35.417969,25.472656],
+    "ab_pairs_b_greater_than_a": 42,
+    "ab_arm_a_max_bytes": 555061248,
+    "ab_arm_b_max_bytes": 561410048,
+    "separate_single_sample": {
+      "arm_a_max_rss_mib": 500.3,
+      "arm_b_max_rss_mib": 526.3,
+      "delta_mib": 26.0,
+      "classification": "retained diagnostic observation; not a causal or bounded-memory claim"
+    }
+  }
+}

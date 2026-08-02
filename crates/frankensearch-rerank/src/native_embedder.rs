@@ -332,7 +332,7 @@ mod tests {
         );
     }
 
-    /// Bit-exact producer conformance proof for the frozen native MiniLM
+    /// Bit-exact producer conformance proof for the frozen native `MiniLM`
     /// certificate. This is intentionally fixture-gated because CI does not
     /// provision the 90 MiB model bundle in ordinary unit-test lanes.
     #[test]

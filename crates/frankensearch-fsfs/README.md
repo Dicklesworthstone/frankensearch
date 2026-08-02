@@ -8,14 +8,61 @@ Standalone `fsfs` CLI and runtime for two-tier hybrid local search.
 
 The crate is split into a library (`src/lib.rs`) for reusable runtime, configuration, and adapter logic, and a binary (`src/main.rs`) for the `fsfs` CLI entrypoint.
 
-## Build Prerequisite
+## Build Profiles
 
-The default `embedded-models` feature packages exact, pinned Potion and MiniLM
-artifacts. From the workspace root, provision their verified source files
-before a default-feature build:
+The default feature set is loader-capable: ordinary builds compile Model2Vec
+and FastEmbed, while crates.io packaging remains independent of the large
+Potion and MiniLM artifact bytes. Provision the registered models after a
+plain build—no feature flags are needed:
+
+```bash
+cargo build -p frankensearch-fsfs
+fsfs download-models potion-multilingual-128m
+fsfs download-models all-minilm-l6-v2
+fsfs download-models potion-multilingual-128m --verify
+fsfs download-models all-minilm-l6-v2 --verify
+fsfs status --format json
+fsfs doctor --format json
+```
+
+Downloads are revision-pinned, SHA-verified, and atomically promoted. Explicit
+verification refreshes the durable receipt and returns a typed nonzero error for
+a missing, incomplete, or corrupt registered cache. Status is observational: it
+may full-hash an uncached installation for that invocation but never mints a
+receipt. Doctor additionally
+opens verified caches through the compiled loaders, so a directory that merely
+exists is never reported as semantic-ready. A hard doctor verdict emits one
+`subsystem_error` report with the failing checks in its context and exits nonzero, while warning-only diagnostics remain
+successful. A missing or offline cache is a typed, actionable failure; the
+production indexing path never admits the hash control embedder. The explicit
+`--no-default-features` profile is the model-free lite binary, and downloaded
+files cannot add loaders to that deliberately stripped build.
+
+`fsfs index <path>` performs one indexing pass and exits. Continuous indexing is
+opt-in through `fsfs watch <path>` or `fsfs index <path> --watch`; a performance
+profile may permit background indexing, but it never requests a watcher on the
+user's behalf. Full search requires the sealed vector generation and matching
+fast semantic loader. Only the explicit lexical-only mode bypasses that
+readiness check, while quality-only failures preserve Initial results and emit
+an actionable `RefinementFailed` phase.
+
+The installer verifies every downloaded release archive and fails closed if a
+checksum, checksum tool, or matching manifest entry is unavailable. When a full
+artifact is unavailable, ordinary installation builds the loader-capable default
+from source; it never silently substitutes lite. Only `install.sh --lite`
+selects the model-free source profile. Intel macOS currently has no supported
+FastEmbed/ONNX Runtime distribution: ordinary semantic installation returns the
+typed `unsupported_platform` outcome, while an explicit `--lite` installation
+remains available. The installer never pretends the unbuildable default source
+route succeeded on that target.
+
+Full release binaries explicitly select `embedded-models`. From the workspace
+root, provision and verify the exact, pinned source files before building that
+profile:
 
 ```bash
 scripts/rch-ensure-deps.sh --models-only
+cargo build -p frankensearch-fsfs --no-default-features --features embedded-models
 ```
 
 Use `scripts/rch-ensure-deps.sh --all-workers --models-only` to prepare every

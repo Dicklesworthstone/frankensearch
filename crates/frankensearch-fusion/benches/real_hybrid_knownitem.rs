@@ -22,7 +22,7 @@ use criterion::{Criterion, criterion_group, criterion_main};
 fn bench_real_hybrid_knownitem(c: &mut Criterion) {
     use std::hint::black_box;
 
-    use frankensearch_core::traits::LexicalSearch;
+    use frankensearch_core::traits::LexicalWrite;
     use frankensearch_core::types::{IndexableDocument, ScoreSource, ScoredResult};
     use frankensearch_fusion::rrf::{RrfConfig, rrf_fuse};
     use frankensearch_index::InMemoryVectorIndex;

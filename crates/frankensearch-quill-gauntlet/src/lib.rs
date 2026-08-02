@@ -13,9 +13,13 @@ mod artifact;
 mod comparator;
 mod engine;
 mod generator;
+mod local_perf_runner;
+mod machine_class_registry;
 mod perf;
+mod perf_assembly;
 mod perf_evidence;
 mod perf_ratchet;
+mod qg6_prepared;
 mod runner;
 mod version_contract;
 
@@ -24,13 +28,24 @@ use std::path::PathBuf;
 use thiserror::Error;
 
 pub use artifact::{
-    ArtifactLexicalContractEvidence, ArtifactObject, ArtifactStore, CANONICALIZATION_VERSION,
-    CampaignArtifactContext, OBJECT_SCHEMA_VERSION, PreparedArtifact, RUN_MANIFEST_SCHEMA_VERSION,
-    RunManifest,
+    ArtifactExecutionRole, ArtifactLexicalContractEvidence, ArtifactObject,
+    ArtifactOracleDependency, ArtifactStore, ArtifactTrustCeiling, CANONICALIZATION_VERSION,
+    CampaignArtifactContext, GauntletProducerBuildIdentity, GauntletProducerSourceVerification,
+    IntegrityCheckedCampaign, OBJECT_SCHEMA_VERSION, PreparedArtifact, RUN_MANIFEST_SCHEMA_VERSION,
+    RunManifest, SerializedSchemaDisposition, classify_artifact_object_schema,
+    classify_campaign_report_schema,
 };
+#[cfg(feature = "tantivy-oracle")]
+pub use comparator::observe_tantivy_cass_profile;
 pub use comparator::{
-    AstDifference, AstLoweringKind, ComparatorConfig, ComparisonReport, ComparisonStatus,
-    CountState, Divergence, DivergenceClass, EngineObservation,
+    AstDifference, AstLoweringKind, CASS_LEXICAL_PROFILE_OBSERVATION_SCHEMA_VERSION,
+    CassLexicalProfileComparison, CassLexicalProfileContext, CassLexicalProfileObservation,
+    CassLexicalProfileOutcome, CassLexicalProfileProvenance, CassLexicalProfileSuccess,
+    CassProfileAuthority, CassProfileDiagnosticKind, CassProfileDiagnosticObservation,
+    CassProfileField, CassProfileFilters, CassProfileMismatch, CassProfileMismatchClass,
+    CassProfileNotExposedReason, CassProfileRankedHit, CassProfileRequest, CassProfileSourceFilter,
+    CassProfileTieMember, CassProfileTokenKind, CassProfileTokenObservation, ComparatorConfig,
+    ComparisonReport, ComparisonStatus, CountState, Divergence, DivergenceClass, EngineObservation,
     LEXICAL_CONTRACT_BUNDLE_SCHEMA_VERSION, LEXICAL_CONTRACT_COMPARISON_SCHEMA_VERSION,
     LEXICAL_OBSERVATION_SCHEMA_VERSION, LexicalBackendIdentity, LexicalBoundary,
     LexicalComparisonReport, LexicalComparisonStatus, LexicalContractBundle,
@@ -44,11 +59,17 @@ pub use comparator::{
     LexicalObservationContext, LexicalObservationOutcome, LexicalObservationSupplement,
     LexicalObserved, LexicalProbeCoverage, LexicalQueryClass, LexicalScoreSource,
     LexicalSideCoverage, LexicalWaivedDifference, LexicalWaiverTarget, LexicalWinnerOrigin,
-    LexicalWinnerProjection, MAX_LEXICAL_DOC_ID_BYTES, MAX_LEXICAL_ERROR_SOURCE_DEPTH,
-    MAX_LEXICAL_HIGHLIGHT_SPANS_PER_HIT, MAX_LEXICAL_OBSERVATION_HITS, MAX_LEXICAL_QUERY_BYTES,
-    MAX_LEXICAL_SENSITIVE_PAYLOAD_BYTES, NativeTieKey, RankClass, RankedHit, SCORE_EPSILON,
-    ScoreEpsilonReason, SensitiveValueObservation, compare_lexical_contracts,
+    LexicalWinnerProjection, MAX_CASS_PROFILE_DIAGNOSTICS, MAX_CASS_PROFILE_DOCUMENT_ID_BYTES,
+    MAX_CASS_PROFILE_FETCH_HITS, MAX_CASS_PROFILE_FILTER_BYTES,
+    MAX_CASS_PROFILE_FILTER_VALUE_BYTES, MAX_CASS_PROFILE_FILTER_VALUES, MAX_CASS_PROFILE_TOKENS,
+    MAX_LEXICAL_DOC_ID_BYTES, MAX_LEXICAL_ERROR_SOURCE_DEPTH, MAX_LEXICAL_HIGHLIGHT_SPANS_PER_HIT,
+    MAX_LEXICAL_OBSERVATION_HITS, MAX_LEXICAL_QUERY_BYTES, MAX_LEXICAL_SENSITIVE_PAYLOAD_BYTES,
+    NativeTieKey, QUILL_CANCELLATION_RECEIPT_SCHEMA_VERSION, QuillCancellationCheckpoint,
+    QuillCancellationEvidenceOrigin, QuillCancellationObservation, QuillCancellationReceipt,
+    QuillCancellationReceiptBody, RankClass, RankedHit, SCORE_EPSILON, ScoreEpsilonReason,
+    SensitiveValueObservation, compare_cass_lexical_profiles, compare_lexical_contracts,
     compare_lexical_observations, compare_observations, observe_lexical_outcome,
+    observe_live_quill_cancellation_receipt, observe_quill_cass_profile,
 };
 pub use engine::{
     CASS_TANTIVY_ORACLE_CONFIG_HASH, ComparisonMode, DifferentialCase, DifferentialCaseMetadata,
@@ -70,45 +91,100 @@ pub use generator::{
     SourceFileDigest, StructuredFilterClass, SyntheticCorpus, SyntheticCorpusIter,
     SyntheticCorpusSpec, UnicodeLane, XLARGE_DOCUMENT_COUNT, ZipfExponent,
 };
+pub use local_perf_runner::{
+    LOCAL_PERF_ATTEMPT_RECEIPT_SCHEMA_VERSION, LocalPerfAttemptOutcome, LocalPerfAttemptReceipt,
+    LocalPerfInternalLifecycleGaps, LocalPerfInternalLifecycleUnavailable,
+    LocalPerfProcessLifecycle, LocalPerfRetryPredicate, LocalPerfRunConfig, LocalPerfRunError,
+    LocalPerfRunOutput, LocalPerfRunSelection, LocalPerfUnsupportedControl,
+    local_perf_producer_contract_json, run_local_perf_command, run_selected_local_perf_command,
+};
+pub use machine_class_registry::{
+    DefaultFlipDisposition, ExecutionCapacitySemantics, ExecutionProfileId, HardwareClassId,
+    LOCAL_PERF_PRODUCER_CONTRACT_VERSION, MACHINE_CLASS_REGISTRY_GIT_BLOB,
+    MACHINE_CLASS_REGISTRY_SCHEMA_VERSION, MACHINE_CLASS_REGISTRY_SHA256,
+    MACHINE_CLASS_REGISTRY_SPEC_COMMIT, MachineClassAdmissionContext,
+    MachineClassCanonicalizationBinding, MachineClassDecision, MachineClassDerivedHashes,
+    MachineClassError, MachineClassEvidenceBinding, MachineClassLookup, MachineClassReason,
+    MachineClassRegistry, MachineExecutionProfile, MachineProfileAvailability,
+    MachineProfileGatePolicy, MachineProfileKey, RUNNER_ARTIFACT_MANIFEST_SCHEMA_VERSION,
+    RUNNER_RECEIPT_SCHEMA_VERSION, RunnerArtifactManifest, RunnerArtifactManifestBinding,
+    VerifiedRunnerIdentity,
+};
 pub use perf::{
-    DistributionSummary, PAIRED_ESTIMATOR_SCHEMA_VERSION, PERF_ARTIFACT_SCHEMA_VERSION,
-    PERF_MAX_CV_PCT, PERF_MIN_RUNS, PERF_MIN_WRITER_HEAP_PER_THREAD_BYTES, PERF_WRITER_HEAP_BYTES,
-    PairedClaimState, PairedEffectEstimate, PairedEstimatorConfig, PairedEstimatorError,
-    PairedEstimatorReason, PairedEvidenceStatus, PairedExperimentResult, PerfCellResult,
-    PerfCellSpec, PerfCorpus, PerfGate, PerfGateArtifact, PerfMatrixSpec, PerfMetricSemantics,
-    PerfOperationScope, PerfQueryClass, PerfRawSample, PerfSampleArm, PerfSampleOrder,
-    PerfSamplePhase, PerfSampleProvenance, PerfTopology, PositionMode, estimate_paired_experiment,
-    machine_fingerprint, parse_macos_time_max_rss_bytes, peak_rss_bytes, perf_writer_heap_bytes,
+    DistributionSummary, LEGACY_PERF_ARTIFACT_SCHEMA_VERSION_V3, PAIRED_ESTIMATOR_SCHEMA_VERSION,
+    PERF_APPLICABILITY_PLAN_SCHEMA_VERSION, PERF_ARTIFACT_SCHEMA_VERSION, PERF_MAX_CV_PCT,
+    PERF_MIN_RUNS, PERF_MIN_WRITER_HEAP_PER_THREAD_BYTES, PERF_WRITER_HEAP_BYTES, PairedClaimState,
+    PairedEffectEstimate, PairedEstimatorConfig, PairedEstimatorError, PairedEstimatorReason,
+    PairedEvidenceStatus, PairedExperimentResult, PerfApplicabilityPlan,
+    PerfApplicabilityPlanBinding, PerfApplicabilityPlanError, PerfCellApplicability,
+    PerfCellApplicabilityEntry, PerfCellApplicabilityReason, PerfCellResult, PerfCellSpec,
+    PerfCorpus, PerfExecutionProvenance, PerfGate, PerfGateArtifact, PerfInputIdentity,
+    PerfMatrixSpec, PerfMetricSemantics, PerfOperationScope, PerfProducerOs, PerfQueryClass,
+    PerfRawSample, PerfSampleArm, PerfSampleOrder, PerfSamplePhase, PerfSampleProvenance,
+    PerfTopology, PositionMode, QG6_QUERY_GROUP_IDS, QG6_QUERY_GROUPS, Qg6SampleBinding,
+    estimate_paired_experiment, machine_fingerprint, parse_macos_time_max_rss_bytes,
+    peak_rss_bytes, perf_manifest_contract_sha256, perf_writer_heap_bytes,
     seeded_balanced_pair_order, validate_matrix,
+};
+pub use perf_assembly::{
+    PERF_ASSEMBLY_ENGINE_LIFECYCLE_NO_CLAIM_CODE, PERF_ASSEMBLY_MAX_ARTIFACT_BYTES,
+    PERF_ASSEMBLY_MAX_RECEIPT_BYTES, PERF_ASSEMBLY_MAX_RETRY_PREDICATE_BYTES,
+    PERF_ASSEMBLY_MAX_SHARDS, PERF_ASSEMBLY_PARTIAL_SHARD_NO_CLAIM_CODE,
+    PERF_ASSEMBLY_PARTIAL_SHARD_NO_CLAIM_DETAIL, PERF_ASSEMBLY_PROCESS_TREE_NO_CLAIM_CODE,
+    PERF_EVIDENCE_ASSEMBLY_MATRIX_SCHEMA_VERSION, PERF_EVIDENCE_ASSEMBLY_SCHEMA_VERSION,
+    PERF_EVIDENCE_SEMANTIC_CELL_SET_SCHEMA_VERSION, PerfAssemblyMachineIdentity,
+    PerfAssemblyProcessReceipt, PerfEvidenceAssemblyArtifact, PerfEvidenceAssemblyCompatibility,
+    PerfEvidenceAssemblyCompleteness, PerfEvidenceAssemblyCounts, PerfEvidenceAssemblyError,
+    PerfEvidenceAssemblyFailedAttempt, PerfEvidenceAssemblyMatrixCell,
+    PerfEvidenceAssemblyMatrixManifest, PerfEvidenceAssemblyNoClaimCell,
+    PerfEvidenceAssemblyNoClaimSource, PerfEvidenceAssemblyReadiness, PerfEvidenceAssemblySource,
+    PerfEvidenceCellSource, PerfEvidenceSemanticCellSetSeal, VerifiedLocalPerfAttemptBundle,
 };
 pub use perf_evidence::{
     AbsoluteRelativeReconciliation, BuildIdentity, ColdCacheEvidence, CorpusIdentity,
-    EVIDENCE_MAX_REASON_MESSAGE_BYTES, EVIDENCE_MAX_REASONS, EvidenceArtifactError,
-    EvidenceArtifactPaths, EvidenceCell, EvidenceCellBody, EvidenceCellSpec,
+    EVIDENCE_MAX_REASON_MESSAGE_BYTES, EVIDENCE_MAX_REASONS, EngineConcurrencyObservation,
+    EvidenceArtifactError, EvidenceArtifactPaths, EvidenceCell, EvidenceCellBody, EvidenceCellSpec,
     EvidenceDecisionStatus, EvidenceEstimand, EvidencePolicy, EvidenceProvenance, EvidenceReason,
     EvidenceRole, EvidenceSeverity, HIERARCHICAL_LATENCY_SCHEMA_VERSION, HierarchicalGroupSummary,
     HierarchicalLatencyEstimate, MachineIdentity, PERF_EVIDENCE_SCHEMA_VERSION, PeakRssEvidence,
-    PerfEvidenceArtifact, estimate_hierarchical_latency, human_table_from_json,
+    PerfConcurrencyEngine, PerfConcurrencyObserver, PerfConcurrencyWitness, PerfEvidenceArtifact,
+    command_sha256_from_argv, estimate_hierarchical_latency, human_table_from_json,
     load_legacy_gate_artifact_v3, required_estimand,
 };
 pub use perf_ratchet::{
     PERF_MAX_REGRESSION_PCT, PERF_MAX_REPRODUCTION_DELTA_PCT, PERF_RATCHET_SCHEMA_VERSION,
     PERF_REGRESSION_ROBUST_Z, PerfCellComparison, PerfEvidenceFile, PerfGateDecision,
     PerfRatchetEvaluation, PerfRatchetMode, PerfRatchetReason, PerfRatchetRequest,
-    evaluate_perf_ratchet,
+    evaluate_perf_ratchet, is_explicit_bootstrap, is_explicit_bootstrap_for,
+};
+pub use qg6_prepared::{
+    Qg6ArmLifecycle, Qg6ArmRole, Qg6Comparison, Qg6ExperimentIdentity, Qg6FourArmResultReceipts,
+    Qg6HarnessError, Qg6LifecycleReceipt, Qg6Measurement, Qg6PairBlock, Qg6Phase,
+    Qg6PreparedExperiment, Qg6QueryGroupReceipt, Qg6QueryIdentityReceipt, Qg6QuerySpec,
+    Qg6RankedHitReceipt, Qg6ResultReceipt, Qg6SampleOrder, Qg6SearchHit, Qg6SearchResult,
+    Qg6SelectionClaim, Qg6SelectionScope, Qg6SemanticContract, Qg6SetupRecorder, Qg6TimedSample,
+    Qg6ValidatedExperiment, qg6_result_sequence_sha256, seeded_interleaved_four_arm_schedule,
 };
 pub use runner::{
     CAMPAIGN_REPORT_SCHEMA_VERSION, CASS_ANALYZER_CONTRACT_PREIMAGE, CASS_SCHEMA_CONTRACT_PREIMAGE,
-    CampaignCaseResult, CampaignConfig, CampaignContractMode, CampaignDisposition, CampaignFuture,
-    CampaignLexicalCaseSummary, CampaignLexicalCoverageSummary, CampaignProvenance, CampaignReport,
-    CampaignSelection, DEFAULT_ANALYZER_CONTRACT_HASH, DEFAULT_ANALYZER_CONTRACT_PREIMAGE,
+    CampaignCaseReason, CampaignCaseResult, CampaignConfig, CampaignContractMode,
+    CampaignDisposition, CampaignFuture, CampaignLexicalCaseSummary,
+    CampaignLexicalCoverageSummary, CampaignProvenance, CampaignReport, CampaignSelection,
+    DEFAULT_ANALYZER_CONTRACT_HASH, DEFAULT_ANALYZER_CONTRACT_PREIMAGE,
     DEFAULT_SCHEMA_CONTRACT_HASH, DEFAULT_SCHEMA_CONTRACT_PREIMAGE, DEFAULT_SHRINK_FUEL,
-    DifferentialCampaignEngine, DifferentialCampaignRunner, DivergenceRegisterDecision,
-    DivergenceRegisterEntry, DivergenceRegistry, EngineIndexReceipt, GeneratedCorpusReplay,
-    LexicalMismatchGroup, LexicalSideCoverageCounts, MismatchGroup, ProbeCoverageCounts,
-    QueryClassSummary, SCALAR_G1A_SCHEMA_CONTRACT_PREIMAGE, SemanticContract,
-    ShadowDivergenceRecord, ShrinkDriver, ShrinkEngineFactory, ShrinkError, ShrinkRequest,
-    ShrunkReproduction, SuspectedLayer, TriageConfidence, TriageVerdict,
+    DIVERGENCE_PREDICTION_POLICY_PREIMAGE, DIVERGENCE_PREDICTION_POLICY_VERSION,
+    DIVERGENCE_REGISTER_LEDGER_SCHEMA_VERSION, DIVERGENCE_REGISTER_REDACTION_POLICY_VERSION,
+    DifferentialCampaignEngine, DifferentialCampaignRunner, DivergenceArtifactObjectHash,
+    DivergenceArtifactObjectHashScheme, DivergenceDisposition, DivergenceDispositionEvent,
+    DivergenceFixtureContentWitness, DivergenceFixtureEvidence, DivergenceObservationEvent,
+    DivergencePredictionEvent, DivergenceRegisterDecision, DivergenceRegisterEntry,
+    DivergenceRegisterEvent, DivergenceRegisterEventHeader, DivergenceRegisterLedger,
+    DivergenceRegistry, DivergenceRevisionSet, EngineIndexReceipt, GeneratedCorpusReplay,
+    LexicalMismatchGroup, LexicalSideCoverageCounts, MismatchGroup, PredictedDivergenceState,
+    ProbeCoverageCounts, QueryClassSummary, RedactedDivergenceDiagnostic,
+    SCALAR_G1A_SCHEMA_CONTRACT_PREIMAGE, SemanticContract, ShadowDivergenceRecord, ShrinkDriver,
+    ShrinkEngineFactory, ShrinkError, ShrinkRequest, ShrunkReproduction, SuspectedLayer,
+    TriageConfidence, TriageVerdict, divergence_prediction_policy_sha256,
     persist_shrunk_reproduction,
 };
 pub use version_contract::{

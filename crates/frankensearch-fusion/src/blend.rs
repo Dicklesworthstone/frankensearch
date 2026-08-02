@@ -35,7 +35,6 @@ const ALIGNED_UNIQUE_BLEND_MIN_HITS: usize = 10_000;
 struct NormBounds {
     min: f32,
     range: f32,
-    t: f32,
     saw_finite: bool,
 }
 
@@ -55,16 +54,9 @@ impl NormBounds {
         }
 
         let range = max - min;
-        let t = if range > 0.01 {
-            ((range - 0.01) / 0.04).clamp(0.0, 1.0)
-        } else {
-            0.0
-        };
-
         Self {
             min,
             range,
-            t,
             saw_finite,
         }
     }
@@ -75,13 +67,12 @@ impl NormBounds {
         if !self.saw_finite || !score.is_finite() {
             return NON_FINITE_SCORE_FALLBACK;
         }
-        let norm = if self.range > f32::EPSILON {
+        if self.range > f32::EPSILON {
             (score - self.min) / self.range
         } else {
             1.0
-        };
-        let blended = self.t * norm + (1.0 - self.t) * score;
-        blended.clamp(0.0, 1.0)
+        }
+        .clamp(0.0, 1.0)
     }
 }
 
@@ -790,6 +781,36 @@ mod tests {
 
         assert_eq!(blended[0].doc_id, "b");
         assert_eq!(blended[1].doc_id, "a");
+    }
+
+    #[test]
+    fn narrow_out_of_unit_scores_preserve_score_order_across_blend_paths() {
+        for scores in [[-0.88, -0.89, -0.90], [1.02, 1.01, 1.00]] {
+            let fast = vec![
+                hit("z-best", scores[0], 0),
+                hit("a-middle", scores[1], 1),
+                hit("m-worst", scores[2], 2),
+            ];
+            let no_quality = vec![None; fast.len()];
+            let expected = ["z-best", "a-middle", "m-worst"];
+
+            let materialized = blend_two_tier(&fast, &[], 0.7);
+            let aligned = blend_two_tier_aligned(&fast, &no_quality, 0.7);
+            let unique = blend_two_tier_aligned_unique(&fast, &no_quality, 0.7);
+
+            for (path, hits) in [
+                ("materialized", materialized.as_slice()),
+                ("aligned", aligned.as_slice()),
+                ("aligned-unique", unique.as_slice()),
+            ] {
+                let actual: Vec<&str> = hits.iter().map(|hit| hit.doc_id.as_str()).collect();
+                assert_eq!(actual, expected, "{path} reordered {scores:?}");
+                assert!(
+                    hits.windows(2).all(|pair| pair[0].score > pair[1].score),
+                    "{path} flattened distinct scores {scores:?}: {hits:?}"
+                );
+            }
+        }
     }
 
     #[test]

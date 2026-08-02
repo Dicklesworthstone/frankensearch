@@ -202,6 +202,15 @@ pub use frankensearch_index as index;
 /// Pre-flip Tantivy lexical backend.
 pub use frankensearch_lexical as lexical;
 
+#[cfg(feature = "lexical-tantivy")]
+/// Explicit Tantivy-native backend for oracle and foreign-index consumers.
+///
+/// Unlike `lexical`, this namespace is stable across the facade's default
+/// lexical-backend transition. Consumers that read or write Tantivy-native
+/// formats must opt into `lexical-tantivy` (or `cass-compat`) and import this
+/// namespace explicitly.
+pub use frankensearch_lexical as lexical_tantivy;
+
 #[cfg(feature = "quill")]
 /// Native Quill lexical backend.
 pub use frankensearch_quill as quill;
@@ -268,11 +277,22 @@ pub use frankensearch_core::types::{EmbeddingMetrics, IndexMetrics, SearchMetric
 
 // Traits
 pub use frankensearch_core::traits::{
-    Embedder, LexicalSearch, MetricsExporter, ModelCategory, ModelInfo, ModelTier,
+    Embedder, LexicalRead, MetricsExporter, ModelCategory, ModelInfo, ModelTier,
     NoOpMetricsExporter, Reranker, SearchFuture, SharedMetricsExporter, SyncEmbed,
     SyncEmbedderAdapter, SyncRerank, SyncRerankerAdapter,
 };
-pub use frankensearch_core::{DaemonClient, DaemonError, DaemonRetryConfig};
+// The combined read/write contract remains available for explicit legacy
+// consumers until the coordinated bd-8nqz.1 B2 removal. It is intentionally
+// omitted from the prelude so wildcard imports cannot make `LexicalRead`
+// methods ambiguous.
+pub use frankensearch_core::traits::LexicalSearch;
+pub use frankensearch_core::{
+    AttestedDaemonEmbeddingResponseV1, DAEMON_ATTESTATION_SCHEMA_V1, DAEMON_CHALLENGE_SCHEMA_V1,
+    DAEMON_CONNECTION_IDENTITY_SCHEMA_V1, DaemonChallengeV1, DaemonClient,
+    DaemonConnectionIdentityV1, DaemonEmbeddingAttestationV1, DaemonError, DaemonOperationV1,
+    DaemonRetryConfig, MIN_DAEMON_ATTESTATION_KEY_BYTES, daemon_embedding_payload_sha256,
+    daemon_endpoint_fingerprint, daemon_executable_fingerprint, daemon_ordered_request_sha256,
+};
 
 // Reranker support types
 pub use frankensearch_core::traits::{RerankDocument, RerankScore};
@@ -309,13 +329,15 @@ pub use frankensearch_index::{
 };
 
 #[cfg(feature = "ann")]
-pub use frankensearch_index::{AnnFallbackReason, AnnSearchStats, HnswConfig, HnswIndex};
+pub use frankensearch_index::{AnnSearchStats, HnswConfig, HnswIndex, HnswLoadDisposition};
 
 // ─── Fusion and search orchestration (always available) ─────────────────────
 
 pub use frankensearch_fusion::{
-    DaemonFallbackEmbedder, DaemonFallbackReranker, FederatedConfig, FederatedFusion, FederatedHit,
-    FederatedSearcher, NoopDaemonClient, RrfConfig, SyncLexicalSearch, SyncSearchIterator,
+    AssumedDaemonClient, AssumedDaemonEmbeddingBatchV1, DaemonFallbackEmbedder,
+    DaemonFallbackReranker, DaemonTrustLevelV1, FederatedConfig, FederatedCoverage,
+    FederatedFusion, FederatedHit, FederatedResponse, FederatedSearcher, FederatedShardError,
+    NoopDaemonClient, PinnedDaemonVerifierV1, RrfConfig, SyncLexicalSearch, SyncSearchIterator,
     SyncTwoTierSearcher, TwoTierSearcher, blend_two_tier, candidate_count, rrf_fuse,
 };
 
@@ -350,6 +372,9 @@ pub use frankensearch_quill::{
 #[cfg(feature = "quill")]
 pub use frankensearch_quill::{QuillHit as LexicalIdHit, QuillSnippetHit as LexicalHit};
 
+#[cfg(feature = "quill")]
+pub use frankensearch_fusion::QuillSyncLexicalSearch;
+
 // ─── Feature-gated reranker re-exports ──────────────────────────────────────
 
 #[cfg(feature = "rerank")]
@@ -383,7 +408,7 @@ pub mod prelude {
     pub use asupersync::Cx;
 
     pub use crate::{
-        DocumentFingerprint, Embedder, FederatedConfig, FederatedSearcher, LexicalSearch, Reranker,
+        DocumentFingerprint, Embedder, FederatedConfig, FederatedSearcher, LexicalRead, Reranker,
         ScoreSource, ScoredResult, SearchError, SearchPhase, SearchResult, SyncTwoTierSearcher,
         TwoTierConfig, TwoTierMetrics, TwoTierSearcher,
     };
@@ -574,11 +599,11 @@ mod feature_matrix_smoke {
         let dir = tempfile::tempdir().expect("hybrid lexical tempdir");
         let index = frankensearch_lexical::TantivyIndex::create(dir.path())
             .expect("create hybrid lexical index");
-        assert_eq!(index.doc_count(), 0);
+        assert_eq!(LexicalRead::doc_count(&index), 0);
         emit_evidence(
             "hybrid",
             "tantivy_lexical_create",
-            &serde_json::json!({"documents": index.doc_count()}),
+            &serde_json::json!({"documents": LexicalRead::doc_count(&index)}),
         );
     }
 
@@ -618,6 +643,55 @@ mod feature_matrix_smoke {
         );
     }
 
+    #[cfg(feature = "ann")]
+    #[test]
+    fn ann_lane_behavior() {
+        let dir = tempfile::tempdir().expect("ann tempdir");
+        let path = dir.path().join("feature-matrix.fsvi");
+        let mut writer = VectorIndex::create_with_revision(
+            &path,
+            "feature-matrix",
+            "v1",
+            4,
+            frankensearch_index::Quantization::F16,
+        )
+        .expect("create vector index");
+        writer
+            .write_record("doc-axis-x", &[1.0, 0.0, 0.0, 0.0])
+            .expect("write x-axis vector");
+        writer
+            .write_record("doc-axis-y", &[0.0, 1.0, 0.0, 0.0])
+            .expect("write y-axis vector");
+        writer.finish().expect("finish vector index");
+
+        let index = VectorIndex::open(&path).expect("reopen vector index");
+        let ann =
+            HnswIndex::build_from_vector_index(&index, HnswConfig::default()).expect("build ann");
+        let ann_path = dir.path().join("feature-matrix.hnsw");
+        ann.save(&ann_path).expect("save native ann");
+        let (ann, disposition): (HnswIndex, HnswLoadDisposition) =
+            HnswIndex::load_with_disposition(&ann_path, &index)
+                .expect("load native ann through facade");
+        assert_eq!(disposition, HnswLoadDisposition::Native);
+        let (hits, stats): (Vec<VectorHit>, AnnSearchStats) = ann
+            .knn_search_with_stats(&[1.0, 0.0, 0.0, 0.0], 1, 16)
+            .expect("query ann");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].doc_id, "doc-axis-x");
+        assert_eq!(stats.index_size, 2);
+        assert_eq!(stats.k_returned, 1);
+        assert!(stats.is_approximate);
+        emit_evidence(
+            "ann",
+            "real_hnsw_build_query",
+            &serde_json::json!({
+                "dimension": stats.dimension,
+                "documents": stats.index_size,
+                "hits": stats.k_returned,
+            }),
+        );
+    }
+
     #[cfg(feature = "full")]
     #[test]
     fn full_lane_behavior() {
@@ -639,12 +713,10 @@ mod feature_matrix_smoke {
             let adapter = Fts5LexicalSearch::new(Fts5Config::default());
             let document =
                 IndexableDocument::new("doc-fts5", "fts5 feature matrix integration fixture");
-            adapter
-                .index_document(&cx, &document)
+            LexicalSearch::index_document(&adapter, &cx, &document)
                 .await
                 .expect("index FTS5 document");
-            let hits = adapter
-                .search(&cx, "integration", 5)
+            let hits = LexicalRead::search(&adapter, &cx, "integration", 5)
                 .await
                 .expect("search FTS5 document");
             assert_eq!(hits.len(), 1);
@@ -652,7 +724,10 @@ mod feature_matrix_smoke {
             emit_evidence(
                 "full-fts5",
                 "real_fts5_index_search",
-                &serde_json::json!({"documents": adapter.doc_count(), "hits": hits.len()}),
+                &serde_json::json!({
+                    "documents": LexicalRead::doc_count(&adapter),
+                    "hits": hits.len(),
+                }),
             );
         });
     }
@@ -702,6 +777,7 @@ mod feature_matrix_smoke {
     #[cfg(feature = "lexical-tantivy")]
     #[test]
     fn lexical_tantivy_lane_behavior() {
+        let _explicit_tantivy_namespace = lexical_tantivy::CASS_SCHEMA_VERSION;
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             let dir = tempfile::tempdir().expect("Tantivy feature tempdir");
             let index = TantivyIndex::create(dir.path()).expect("create Tantivy index");
@@ -709,13 +785,13 @@ mod feature_matrix_smoke {
                 IndexableDocument::new("doc-alpha", "alpha tantivy oracle matrix"),
                 IndexableDocument::new("doc-beta", "beta consumer integration"),
             ];
-            index
-                .index_documents(&cx, &documents)
+            LexicalSearch::index_documents(&index, &cx, &documents)
                 .await
                 .expect("index Tantivy documents");
-            index.commit(&cx).await.expect("commit Tantivy index");
-            let hits = index
-                .search(&cx, "alpha", 5)
+            LexicalSearch::commit(&index, &cx)
+                .await
+                .expect("commit Tantivy index");
+            let hits = LexicalRead::search(&index, &cx, "alpha", 5)
                 .await
                 .expect("search Tantivy index");
             assert_eq!(hits.len(), 1);
@@ -731,6 +807,10 @@ mod feature_matrix_smoke {
     #[cfg(feature = "cass-compat")]
     #[test]
     fn cass_compat_lane_behavior() {
+        assert_eq!(
+            lexical_tantivy::CASS_SCHEMA_VERSION,
+            cass_compat::CASS_SCHEMA_VERSION
+        );
         let dir = tempfile::tempdir().expect("CASS feature tempdir");
         let mut index =
             cass_compat::CassTantivyIndex::open_or_create(dir.path()).expect("create CASS index");

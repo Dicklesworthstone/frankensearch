@@ -57,6 +57,7 @@
       "fast_model": "potion-multilingual-128M",
       "quality_model": "all-MiniLM-L6-v2",
       "model_dir": "/home/test/.cache/frankensearch/models",
+      "offline": false,
       "embedding_batch_size": 128,
       "reindex_on_change": true,
       "watch_mode": false

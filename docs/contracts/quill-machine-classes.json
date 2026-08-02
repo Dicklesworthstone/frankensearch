@@ -1,0 +1,1962 @@
+{
+  "schema_version": "frankensearch.quill-machine-class-registry.v2",
+  "contract_status": "normative",
+  "owner_bead": "bd-e8h-p0-machine-classes-26os",
+  "unknown_field_policy": "reject",
+  "duplicate_key_policy": "reject",
+  "class_id_semantics": {
+    "identity_model": "Every admissible execution identity is one closed hardware_class_id plus one closed execution_profile_id. Requested widths, CPU counts, affinity, SMT, or scheduler settings never create or relabel hardware classes.",
+    "hardware_class_ids": [
+      "x86-vps-ovh",
+      "trj-zen3-5995wx",
+      "m4-macos",
+      "m5-macos"
+    ],
+    "execution_profile_ids": [
+      "x86-diagnostic",
+      "physical-64",
+      "smt2-128",
+      "scheduler-10",
+      "scheduler-14"
+    ],
+    "execution_identity": "The registered execution profile independently binds capacity semantics, execution capacity, scheduler or affinity facts, forbidden claims, and a per-gate release requirement plus maximum exercised canonical width.",
+    "obsolete_ids": [
+      "trj-zen-128c",
+      "trj-zen3-64c",
+      "trj-zen3-64c-smt2",
+      "trj-zen3-16c",
+      "trj-zen3-16c-smt2",
+      "p-plus-e"
+    ],
+    "cross_profile_policy": "Ratios, null bands, threshold artifacts, evidence, reruns, history pointers, and destinations never cross a canonical hardware/profile key even when measured widths match."
+  },
+  "receipt_contract": {
+    "schema_version": "frankensearch.perf-runner-completion.v6",
+    "required_sections": [
+      "schema_version",
+      "requested_profile",
+      "derived_profile",
+      "registry_sha256",
+      "hardware",
+      "execution",
+      "build",
+      "durability",
+      "completion"
+    ],
+    "required_hardware_fields": [
+      "os",
+      "arch",
+      "cpu_vendor",
+      "cpu_family",
+      "cpu_model",
+      "cpu_stepping",
+      "cpu_model_name",
+      "physical_cores",
+      "logical_cpus",
+      "numa_nodes",
+      "memory_bytes",
+      "page_size_bytes",
+      "performance_cores",
+      "efficiency_cores",
+      "runtime_detected_isa",
+      "topology_sha256",
+      "fingerprint_sha256"
+    ],
+    "required_execution_fields": [
+      "request",
+      "start",
+      "end",
+      "identity_sha256"
+    ],
+    "required_execution_request_fields": [
+      "capacity_semantics",
+      "execution_capacity",
+      "max_exercised_cell_width",
+      "requested_logical_cpu_ids",
+      "requested_physical_core_width",
+      "requested_worker_pool_width",
+      "requested_qos"
+    ],
+    "required_execution_snapshot_fields": [
+      "observed_logical_cpu_ids",
+      "effective_physical_core_ids",
+      "cpu_assignment_observability",
+      "effective_cpuset_sha256",
+      "threads_per_core",
+      "smt_state",
+      "numa_node_ids",
+      "numa_policy",
+      "governor",
+      "thermal_pressure",
+      "exclusive_lease",
+      "exclusive_lease_id",
+      "local_execution",
+      "observed_hardware_fingerprint_sha256",
+      "snapshot_sha256"
+    ],
+    "required_build_fields": [
+      "git_revision",
+      "git_dirty",
+      "worktree_state_sha256",
+      "cargo_lock_sha256",
+      "executable_sha256",
+      "command_sha256",
+      "environment_sha256",
+      "producer"
+    ],
+    "required_producer_fields": [
+      "contract_version",
+      "source_git_revision",
+      "source_git_dirty",
+      "cargo_lock_sha256",
+      "executable_sha256"
+    ],
+    "required_durability_fields": [
+      "adjacent",
+      "control_treatment",
+      "candidate_treatment",
+      "symmetric"
+    ],
+    "required_completion_fields": [
+      "verified",
+      "exit_status",
+      "run_log_sha256",
+      "artifact_manifest_sha256",
+      "artifact_digests_verified",
+      "started_at_utc",
+      "finished_at_utc"
+    ],
+    "sha256_fields_are_lowercase_hex": true,
+    "pre_post_identity_must_match": true,
+    "exclusive_lease_identity": "Every registered Threadripper profile uses trj-zen3-exclusive and every registered M4 profile uses m4-macos-exclusive. The typed producer derives one canonical host-local path shared by every profile; callers cannot supply a path or lease label. Registered performance hosts must use one shared mount namespace and must not unlink or rename the effective-user-owned lease inode while a campaign is active.",
+    "producer_identity": "On the currently promotion-capable Linux lane, the receipt binds the typed finalizer contract version, its build-time Git revision and dirty posture, its build-time Cargo.lock SHA-256, the SHA-256 independently computed from the launcher-held executing finalizer descriptor, and a canonical digest of the cleared-and-rebuilt Cargo plus measurement environment. The exact canonical environment-policy.json preimage is persisted under the held run directory before the child starts and reverified by descriptor before any receipt commit. The producer revision and lock must exactly equal the benchmark build identity. Under the lease, the producer rejects redirecting Git or process-injection state, hidden index flags, and noncanonical roots; pins output/target directory descriptors; constrains, opens, hashes, and executes the Cargo-reported benchmark through a held descriptor; and rechecks all identities before the receipt commit. M4 remains registered as hardware but every M4 gate is promotion-unavailable until a supported O_EXEC or loaded-image mechanism attests the actual executing image. Offline admission verifies the recorded tuple's strict shape, equality laws, and immutability rather than claiming to rediscover the past process image.",
+    "promotion_requires_zero_exit": true
+  },
+  "artifact_manifest_contract": {
+    "schema_version": "frankensearch.perf-runner-artifact-manifest.v3",
+    "unknown_field_policy": "reject",
+    "duplicate_key_policy": "reject",
+    "canonical_encoding": "Exact UTF-8 compact JSON emitted by the typed producer; the receipt hashes these bytes without reparsing or rewriting them.",
+    "required_fields": [
+      "schema_version",
+      "gate",
+      "profile",
+      "capacity_semantics",
+      "execution_capacity",
+      "max_exercised_cell_width",
+      "applicability_plan",
+      "run_id",
+      "run_window",
+      "run_log_sha256",
+      "threshold_artifact_sha256",
+      "prebinding_evidence_artifact_sha256"
+    ],
+    "binding_law": "The completion receipt artifact_manifest_sha256 must hash the exact manifest bytes. The manifest must name the exact canonical threshold artifact, exact pre-binding evidence artifact, exact run log, hardware/profile identity, capacity semantics, execution capacity, maximum exercised cell width, complete applicability-plan binding, gate, run ID, and run window supplied to finalization. The applicability-plan binding must reconstruct exactly from the frozen matrix, normalized performance manifest, machine registry, and profile contract before the manifest is admitted.",
+    "history_law": "A promoted candidate becomes a later baseline without role relabeling. Its bound evidence embeds the exact receipt and manifest and reconstructs the pre-binding evidence digest on every verified load."
+  },
+  "canonical_hash_contract": {
+    "algorithm": "sha256",
+    "hex_encoding": "lowercase",
+    "canonical_json_subset": "UTF-8 compact JSON with object keys sorted lexicographically, arrays in source order, integers in base-10 without leading zeros, and only ASCII strings, booleans, null, arrays, and objects. The bytes are exactly jq -cS output with its trailing newline removed.",
+    "registry_sha256": "SHA-256 of the exact registry file bytes without rewriting whitespace.",
+    "hardware_fingerprint_sha256": "SHA-256 of canonical JSON for the hardware object, including the strictly normalized runtime_detected_isa vector, with fingerprint_sha256 omitted.",
+    "effective_cpuset_sha256": "SHA-256 of canonical JSON containing observed_logical_cpu_ids, effective_physical_core_ids, cpu_assignment_observability, threads_per_core, and smt_state from one execution snapshot.",
+    "execution_snapshot_sha256": "SHA-256 of canonical JSON for one complete execution snapshot with snapshot_sha256 omitted.",
+    "execution_identity_sha256": "After start/end equivalence is proven, SHA-256 of canonical JSON containing requested_profile, derived_profile, execution.request, and the stable execution fields from execution.start except thermal_pressure and snapshot_sha256.",
+    "command_sha256": "SHA-256 over the exact argv byte strings separated and terminated by NUL; shell-joined command text is never hashed as a substitute.",
+    "environment_sha256": "SHA-256 over canonical sorted build and measurement policy entries after both child environments are cleared and rebuilt. Run-instance paths and IDs are represented by typed placeholders, while every workload-affecting value and resolved tool path/digest is bound.",
+    "derived_field_order": [
+      "hardware.fingerprint_sha256 from hardware facts",
+      "execution.start/end.observed_hardware_fingerprint_sha256 from independently recaptured hardware facts",
+      "execution.start/end.effective_cpuset_sha256 from each materialized snapshot",
+      "execution.start/end.snapshot_sha256 from each complete materialized snapshot",
+      "execution.identity_sha256 after start/end equivalence"
+    ],
+    "fixture_materialization_order": [
+      "clone named fact template",
+      "substitute $REGISTRY_SHA256 from exact registry bytes",
+      "apply set, remove, and add_unknown mutations",
+      "derive every field containing a $DERIVE_* placeholder in dependency order",
+      "do not overwrite any derived field explicitly targeted by the vector set mutation",
+      "validate the materialized receipt"
+    ]
+  },
+  "validation_precedence": [
+    "registry syntax, duplicate keys, schema version, and unknown fields",
+    "registry self-consistency, class-rule collision, and source fingerprint provenance",
+    "receipt syntax, duplicate keys, schema version, required fields, and unknown fields",
+    "registry hash and derived-hash integrity",
+    "requested, derived, and externally expected hardware/profile identity",
+    "hardware-class predicates",
+    "execution request and profile-capacity predicates",
+    "start/end snapshot validity and equivalence",
+    "canonical shared-namespace host-global exclusive lock, family-specific attested lease identity, and local execution",
+    "source and executable identity",
+    "durability symmetry",
+    "sealed completion",
+    "gate/profile release requirement, availability, capacity, and exact destination identity",
+    "exact canonical artifact manifest and actual run-log, threshold, and pre-binding-evidence binding"
+  ],
+  "hardware_classes": [
+    {
+      "hardware_class_id": "x86-vps-ovh",
+      "family": "x86-vps-ovh",
+      "availability": "registered",
+      "admission_reason": "admitted",
+      "hardware_predicates": {
+        "os": "linux",
+        "arch": "x86_64"
+      },
+      "source_fingerprints": [],
+      "notes": "The label remains diagnostic-only until bd-9f03f proves worker homogeneity or splits materially different workers into distinct classes."
+    },
+    {
+      "hardware_class_id": "trj-zen3-5995wx",
+      "family": "trj-zen3",
+      "availability": "registered",
+      "admission_reason": "admitted",
+      "hardware_predicates": {
+        "os": "linux",
+        "arch": "x86_64",
+        "cpu_vendor": "AuthenticAMD",
+        "cpu_family": 25,
+        "cpu_model": 8,
+        "cpu_stepping": 2,
+        "cpu_model_name": "AMD Ryzen Threadripper PRO 5995WX 64-Cores",
+        "physical_cores": 64,
+        "logical_cpus": 128,
+        "numa_nodes": 1,
+        "page_size_bytes": 4096,
+        "runtime_detected_isa": [
+          "aes",
+          "avx2",
+          "bmi2",
+          "fma",
+          "vaes"
+        ],
+        "forbidden_runtime_isa": [
+          "avx512f"
+        ]
+      },
+      "source_fingerprints": [
+        {
+          "path": "docs/evidence/e8h/fingerprints/trj-zen-128c-20260728/provenance.json",
+          "sha256": "b9c9966d55756c6bf5d0fdec251bc6642e1b2c5fd7368f6bdc7b567a99009f76"
+        },
+        {
+          "path": "docs/evidence/e8h/fingerprints/trj-zen-128c-20260728/lscpu.txt",
+          "sha256": "faf66c070dc33f697eda30dfde3272aab99e7dbbf23f3c4050a1ac0da32929bd"
+        },
+        {
+          "path": "docs/evidence/e8h/fingerprints/trj-zen-128c-20260728/numactl-H.txt",
+          "sha256": "44995f49fedfbe5ca565770537d1525366e42e45c55b8572c1567ff4542b8f1d"
+        }
+      ]
+    },
+    {
+      "hardware_class_id": "m4-macos",
+      "family": "m4-macos",
+      "availability": "registered",
+      "admission_reason": "admitted",
+      "hardware_predicates": {
+        "os": "macos",
+        "arch": "aarch64",
+        "cpu_vendor": "Apple",
+        "cpu_model_name": "Apple M4 Pro",
+        "physical_cores": 14,
+        "logical_cpus": 14,
+        "numa_nodes": 1,
+        "memory_bytes": 68719476736,
+        "page_size_bytes": 16384,
+        "performance_cores": 10,
+        "efficiency_cores": 4,
+        "runtime_detected_isa": [
+          "aes",
+          "neon",
+          "sha2"
+        ]
+      },
+      "source_fingerprints": [
+        {
+          "path": "docs/evidence/e8h/fingerprints/m4-macos-20260728/provenance.json",
+          "sha256": "a115f937494dfce6e25c74bdf759f26ee5bc82dd0b5b2d527dca5f39ade59569"
+        },
+        {
+          "path": "docs/evidence/e8h/fingerprints/m4-macos-20260728/sysctl.txt",
+          "sha256": "cd91e4ff2d11cf3d4fdd891b075f602b167ca0fb7c9ed801ece6b1b9f9757a1b"
+        }
+      ]
+    },
+    {
+      "hardware_class_id": "m5-macos",
+      "family": "m5-macos",
+      "availability": "unavailable",
+      "admission_reason": "class-unavailable",
+      "hardware_predicates": {},
+      "source_fingerprints": [],
+      "notes": "No M5 fingerprint may be invented. Registration requires a reachable named host, committed raw fingerprint, and an explicit registry revision."
+    }
+  ],
+  "execution_profiles": [
+    {
+      "key": {
+        "hardware_class_id": "x86-vps-ovh",
+        "execution_profile_id": "x86-diagnostic"
+      },
+      "availability": "registered",
+      "capacity_semantics": "diagnostic_worker_budget",
+      "execution_capacity": null,
+      "required_scheduler_or_affinity_facts": [
+        "requested-worker-budget",
+        "observable-worker-activity",
+        "local-execution",
+        "exclusive-lease"
+      ],
+      "forbidden_claims": [
+        "hardware-homogeneity",
+        "default-flip-authority",
+        "cross-worker-pooling"
+      ],
+      "gate_policies": {
+        "QG-1": {
+          "default_flip_disposition": "diagnostic_only",
+          "max_exercised_cell_width": null
+        },
+        "QG-2": {
+          "default_flip_disposition": "diagnostic_only",
+          "max_exercised_cell_width": null
+        },
+        "QG-3": {
+          "default_flip_disposition": "diagnostic_only",
+          "max_exercised_cell_width": null
+        },
+        "QG-4": {
+          "default_flip_disposition": "diagnostic_only",
+          "max_exercised_cell_width": null
+        },
+        "QG-5": {
+          "default_flip_disposition": "diagnostic_only",
+          "max_exercised_cell_width": null
+        },
+        "QG-6": {
+          "default_flip_disposition": "diagnostic_only",
+          "max_exercised_cell_width": null
+        },
+        "QG-7": {
+          "default_flip_disposition": "diagnostic_only",
+          "max_exercised_cell_width": null
+        },
+        "QG-8": {
+          "default_flip_disposition": "diagnostic_only",
+          "max_exercised_cell_width": null
+        },
+        "QG-9": {
+          "default_flip_disposition": "diagnostic_only",
+          "max_exercised_cell_width": null
+        },
+        "QG-10": {
+          "default_flip_disposition": "diagnostic_only",
+          "max_exercised_cell_width": null
+        }
+      },
+      "notes": "Capacity and gate width are derived from one exact local diagnostic receipt. The lane never supplies default-flip authority or cross-worker evidence."
+    },
+    {
+      "key": {
+        "hardware_class_id": "trj-zen3-5995wx",
+        "execution_profile_id": "physical-64"
+      },
+      "availability": "registered",
+      "capacity_semantics": "physical_cores",
+      "execution_capacity": 64,
+      "required_scheduler_or_affinity_facts": [
+        "effective-cpuset",
+        "physical-core-sibling-map",
+        "one-thread-per-core",
+        "smt-state",
+        "numa-policy",
+        "governor",
+        "observable-worker-activity",
+        "local-execution",
+        "exclusive-lease"
+      ],
+      "forbidden_claims": [
+        "logical-thread-capacity-128",
+        "cross-profile-evidence-reuse"
+      ],
+      "gate_policies": {
+        "QG-1": {
+          "default_flip_disposition": "required_for_default_flip",
+          "max_exercised_cell_width": 64
+        },
+        "QG-2": {
+          "default_flip_disposition": "required_for_default_flip",
+          "max_exercised_cell_width": 1
+        },
+        "QG-3": {
+          "default_flip_disposition": "required_for_default_flip",
+          "max_exercised_cell_width": 1
+        },
+        "QG-4": {
+          "default_flip_disposition": "required_for_default_flip",
+          "max_exercised_cell_width": 1
+        },
+        "QG-5": {
+          "default_flip_disposition": "required_for_default_flip",
+          "max_exercised_cell_width": 1
+        },
+        "QG-6": {
+          "default_flip_disposition": "required_for_default_flip",
+          "max_exercised_cell_width": 1
+        },
+        "QG-7": {
+          "default_flip_disposition": "required_for_default_flip",
+          "max_exercised_cell_width": 8
+        },
+        "QG-8": {
+          "default_flip_disposition": "required_for_default_flip",
+          "max_exercised_cell_width": 32
+        },
+        "QG-9": {
+          "default_flip_disposition": "required_for_default_flip",
+          "max_exercised_cell_width": 1
+        },
+        "QG-10": {
+          "default_flip_disposition": "required_for_default_flip",
+          "max_exercised_cell_width": 1
+        }
+      },
+      "notes": "Widths 96 and 128 are outside this profile even though the host exposes 128 logical CPUs."
+    },
+    {
+      "key": {
+        "hardware_class_id": "trj-zen3-5995wx",
+        "execution_profile_id": "smt2-128"
+      },
+      "availability": "registered",
+      "capacity_semantics": "logical_threads",
+      "execution_capacity": 128,
+      "required_scheduler_or_affinity_facts": [
+        "effective-cpuset",
+        "physical-core-sibling-map",
+        "two-threads-per-core",
+        "smt-state",
+        "numa-policy",
+        "governor",
+        "observable-worker-activity",
+        "local-execution",
+        "exclusive-lease"
+      ],
+      "forbidden_claims": [
+        "physical-only-residency",
+        "cross-profile-evidence-reuse"
+      ],
+      "gate_policies": {
+        "QG-1": {
+          "default_flip_disposition": "required_for_default_flip",
+          "max_exercised_cell_width": 128
+        },
+        "QG-2": {
+          "default_flip_disposition": "required_for_default_flip",
+          "max_exercised_cell_width": 1
+        },
+        "QG-3": {
+          "default_flip_disposition": "required_for_default_flip",
+          "max_exercised_cell_width": 1
+        },
+        "QG-4": {
+          "default_flip_disposition": "required_for_default_flip",
+          "max_exercised_cell_width": 1
+        },
+        "QG-5": {
+          "default_flip_disposition": "required_for_default_flip",
+          "max_exercised_cell_width": 1
+        },
+        "QG-6": {
+          "default_flip_disposition": "required_for_default_flip",
+          "max_exercised_cell_width": 1
+        },
+        "QG-7": {
+          "default_flip_disposition": "required_for_default_flip",
+          "max_exercised_cell_width": 8
+        },
+        "QG-8": {
+          "default_flip_disposition": "required_for_default_flip",
+          "max_exercised_cell_width": 32
+        },
+        "QG-9": {
+          "default_flip_disposition": "required_for_default_flip",
+          "max_exercised_cell_width": 1
+        },
+        "QG-10": {
+          "default_flip_disposition": "required_for_default_flip",
+          "max_exercised_cell_width": 1
+        }
+      },
+      "notes": "Lower literal widths are profile-specific and cannot reuse physical-64 baselines or null bands."
+    },
+    {
+      "key": {
+        "hardware_class_id": "m4-macos",
+        "execution_profile_id": "scheduler-10"
+      },
+      "availability": "registered",
+      "capacity_semantics": "scheduler_workers",
+      "execution_capacity": 10,
+      "required_scheduler_or_affinity_facts": [
+        "requested-pool-width",
+        "requested-qos",
+        "observable-worker-activity",
+        "thermal-pressure",
+        "page-size",
+        "local-execution",
+        "exclusive-lease",
+        "executing-image-attestation"
+      ],
+      "forbidden_claims": [
+        "p-core-affinity",
+        "e-core-affinity",
+        "p-core-residency",
+        "e-core-residency",
+        "invented-width-10-cell"
+      ],
+      "gate_policies": {
+        "QG-1": {
+          "default_flip_disposition": "required_for_default_flip",
+          "max_exercised_cell_width": 8
+        },
+        "QG-2": {
+          "default_flip_disposition": "required_for_default_flip",
+          "max_exercised_cell_width": 1
+        },
+        "QG-3": {
+          "default_flip_disposition": "required_for_default_flip",
+          "max_exercised_cell_width": 1
+        },
+        "QG-4": {
+          "default_flip_disposition": "required_for_default_flip",
+          "max_exercised_cell_width": 1
+        },
+        "QG-5": {
+          "default_flip_disposition": "required_for_default_flip",
+          "max_exercised_cell_width": 1
+        },
+        "QG-6": {
+          "default_flip_disposition": "required_for_default_flip",
+          "max_exercised_cell_width": 1
+        },
+        "QG-7": {
+          "default_flip_disposition": "required_for_default_flip",
+          "max_exercised_cell_width": 8
+        },
+        "QG-8": {
+          "default_flip_disposition": "required_for_default_flip",
+          "max_exercised_cell_width": 8
+        },
+        "QG-9": {
+          "default_flip_disposition": "required_for_default_flip",
+          "max_exercised_cell_width": 1
+        },
+        "QG-10": {
+          "default_flip_disposition": "required_for_default_flip",
+          "max_exercised_cell_width": 1
+        }
+      },
+      "notes": "Capacity 10 is scheduler-managed. The widest literal canonical QG-1 cell is 8; no width-10 cell is invented and no P/E affinity or residency is inferred."
+    },
+    {
+      "key": {
+        "hardware_class_id": "m5-macos",
+        "execution_profile_id": "scheduler-14"
+      },
+      "availability": "unavailable",
+      "capacity_semantics": "scheduler_workers",
+      "execution_capacity": null,
+      "required_scheduler_or_affinity_facts": [],
+      "forbidden_claims": [
+        "m4-substitution",
+        "fabricated-hardware-fingerprint",
+        "fabricated-capacity",
+        "all-not-applicable-plan"
+      ],
+      "gate_policies": {
+        "QG-1": {
+          "default_flip_disposition": "required_for_default_flip",
+          "max_exercised_cell_width": null
+        },
+        "QG-2": {
+          "default_flip_disposition": "required_for_default_flip",
+          "max_exercised_cell_width": null
+        },
+        "QG-3": {
+          "default_flip_disposition": "required_for_default_flip",
+          "max_exercised_cell_width": null
+        },
+        "QG-4": {
+          "default_flip_disposition": "required_for_default_flip",
+          "max_exercised_cell_width": null
+        },
+        "QG-5": {
+          "default_flip_disposition": "required_for_default_flip",
+          "max_exercised_cell_width": null
+        },
+        "QG-6": {
+          "default_flip_disposition": "required_for_default_flip",
+          "max_exercised_cell_width": null
+        },
+        "QG-7": {
+          "default_flip_disposition": "required_for_default_flip",
+          "max_exercised_cell_width": null
+        },
+        "QG-8": {
+          "default_flip_disposition": "required_for_default_flip",
+          "max_exercised_cell_width": null
+        },
+        "QG-9": {
+          "default_flip_disposition": "required_for_default_flip",
+          "max_exercised_cell_width": null
+        },
+        "QG-10": {
+          "default_flip_disposition": "required_for_default_flip",
+          "max_exercised_cell_width": null
+        }
+      },
+      "notes": "The profile name reserves the intended lane only. Capacity and maximum width remain absent until a real M5 fingerprint and scheduler receipt are registered."
+    }
+  ],
+  "reason_codes": [
+    "admitted",
+    "class-homogeneity-unproven",
+    "class-unavailable",
+    "unknown-class-id",
+    "obsolete-class-id",
+    "ambiguous-class-id",
+    "unknown-execution-profile",
+    "execution-profile-class-mismatch",
+    "execution-profile-unavailable",
+    "execution-profile-contract-invalid",
+    "duplicate-key",
+    "unknown-field",
+    "missing-field",
+    "hardware-os-mismatch",
+    "hardware-arch-mismatch",
+    "hardware-cpu-vendor-mismatch",
+    "hardware-cpu-family-mismatch",
+    "hardware-cpu-model-mismatch",
+    "hardware-cpu-stepping-mismatch",
+    "hardware-cpu-name-mismatch",
+    "hardware-isa-mismatch",
+    "hardware-topology-mismatch",
+    "hardware-numa-mismatch",
+    "hardware-memory-mismatch",
+    "hardware-page-size-mismatch",
+    "hardware-performance-core-mismatch",
+    "hardware-efficiency-core-mismatch",
+    "execution-width-mismatch",
+    "execution-cpuset-invalid",
+    "execution-thread-budget-invalid",
+    "execution-smt-mismatch",
+    "execution-numa-mismatch",
+    "execution-governor-mismatch",
+    "execution-mode-mismatch",
+    "thermal-pressure",
+    "exclusive-lease-missing",
+    "execution-offloaded",
+    "source-dirty",
+    "source-identity-invalid",
+    "durability-asymmetric",
+    "completion-unverified",
+    "completion-failed",
+    "pre-post-identity-drift",
+    "receipt-class-mismatch",
+    "registry-hash-mismatch",
+    "derived-hash-mismatch",
+    "destination-identity-mismatch"
+  ],
+  "requirements": [
+    {
+      "id": "MC-MUST-001",
+      "level": "MUST",
+      "text": "Consumers load this exact versioned registry and reject duplicate keys plus unknown registry or receipt fields."
+    },
+    {
+      "id": "MC-MUST-002",
+      "level": "MUST",
+      "text": "Hardware and execution-profile resolution use the closed typed IDs in this registry. Every width-encoded Threadripper label and every P/E mode label is obsolete execution syntax, never a hardware class."
+    },
+    {
+      "id": "MC-MUST-003",
+      "level": "MUST",
+      "text": "Every receipt, pre-spawn token, manifest, and admission context binds one canonical hardware/profile key. requested_profile, derived_profile, and the external expected_profile must be exactly equal."
+    },
+    {
+      "id": "MC-MUST-004",
+      "level": "MUST",
+      "text": "Threadripper admission matches the registered 5995WX vendor, family, model, stepping, topology, page size, and NUMA facts."
+    },
+    {
+      "id": "MC-MUST-005",
+      "level": "MUST",
+      "text": "The physical-64 profile binds physical-core capacity 64, one hardware thread per core, the full 64-core affinity envelope, and the exact per-gate canonical maximum widths."
+    },
+    {
+      "id": "MC-MUST-006",
+      "level": "MUST",
+      "text": "The smt2-128 profile binds logical-thread capacity 128, two sibling threads per physical core, the full 128-thread affinity envelope, and an identity distinct from physical-64 at every width."
+    },
+    {
+      "id": "MC-MUST-007",
+      "level": "MUST",
+      "text": "M4 admission matches Apple M4 Pro, 10P+4E, 14 logical CPUs, 64 GiB, and 16384-byte pages."
+    },
+    {
+      "id": "MC-MUST-008",
+      "level": "MUST",
+      "text": "The M4 scheduler-10 profile binds scheduler capacity 10 without CPU affinity or P/E residency claims. Its widest canonical QG-1 and QG-8 cells are 8, so no width-10 cell may be invented. Promotion remains unavailable until actual executing-image attestation is supported."
+    },
+    {
+      "id": "MC-MUST-009",
+      "level": "MUST",
+      "text": "The M5 scheduler-14 profile remains required for every default-flip gate while unavailable. It has no capacity, no executable gate width, no substitutable M4 evidence, and cannot be converted into an all-not-applicable release plan."
+    },
+    {
+      "id": "MC-MUST-010",
+      "level": "MUST",
+      "text": "The x86-diagnostic profile derives its bounded capacity from one exact local receipt, remains diagnostic-only for every gate, and never supplies hardware-homogeneity, cross-worker, or default-flip authority."
+    },
+    {
+      "id": "MC-MUST-011",
+      "level": "MUST",
+      "text": "Each profile's per-gate maximum width is a projection of the immutable canonical gate matrix. A profile may mark cells outside its bound inapplicable, but may not shrink, replace, or invent canonical cells."
+    },
+    {
+      "id": "MC-MUST-012",
+      "level": "MUST",
+      "text": "Timed promotion evidence requires clean exact source state, local execution, a clear thermal state, pinned roots, the actual executing benchmark image, and the canonical host-global exclusive lease."
+    },
+    {
+      "id": "MC-MUST-013",
+      "level": "MUST",
+      "text": "Source, Cargo.lock, executable, NUL-delimited command argv, profile key, capacity policy, topology, hardware, cpuset, snapshots, and execution identity are hash-bound under one canonical byte contract."
+    },
+    {
+      "id": "MC-MUST-014",
+      "level": "MUST",
+      "text": "Durability-adjacent evidence binds identical control and candidate sync treatment. QG-3, QG-4, and QG-5 remain runtime-unavailable until a non-declarative per-arm witness proves the required symmetric treatment; their release requirements do not disappear."
+    },
+    {
+      "id": "MC-MUST-015",
+      "level": "MUST",
+      "text": "Only a zero-exit sealed completion with verified log and artifact digests can support promotion."
+    },
+    {
+      "id": "MC-MUST-016",
+      "level": "MUST",
+      "text": "Start and end snapshots carry recomputable hardware and execution facts; identity drift is fail-closed."
+    },
+    {
+      "id": "MC-MUST-017",
+      "level": "MUST",
+      "text": "Baselines, candidates, reruns, A/A bands, thresholds, evidence, and destination stems match the canonical hardware/profile key plus stable execution identity."
+    },
+    {
+      "id": "MC-MUST-018",
+      "level": "MUST",
+      "text": "Every rejection returns one stable reason code and writes no promotion history."
+    },
+    {
+      "id": "MC-MUST-019",
+      "level": "MUST",
+      "text": "Every registered non-diagnostic hardware class cites immutable raw fingerprint provenance; missing hardware is never fabricated."
+    },
+    {
+      "id": "MC-MUST-020",
+      "level": "MUST",
+      "text": "The receipt hardware fingerprint includes a strictly sorted, duplicate-free runtime ISA vector from a closed capability vocabulary; every required and forbidden ISA predicate is consumed and enforced."
+    },
+    {
+      "id": "MC-MUST-021",
+      "level": "MUST",
+      "text": "Every fresh candidate and rerun binds one exact v3 artifact manifest to the profile key, capacity semantics, execution capacity, maximum exercised width, complete applicability-plan binding, actual run log, canonical threshold bytes, exact pre-binding evidence bytes, gate, run ID, and run window before history opens."
+    },
+    {
+      "id": "MC-MUST-022",
+      "level": "MUST",
+      "text": "Every fresh candidate and rerun binds typed producer contract v4, build-time Git revision and dirty posture, build-time Cargo.lock SHA-256, and independently attested executing finalizer image. Producer revision and lock equal the benchmark build."
+    },
+    {
+      "id": "MC-MUST-023",
+      "level": "MUST",
+      "text": "Release requirement and runtime availability are independent axes: required-but-unavailable profiles remain blockers, diagnostic profiles never satisfy release, and runtime admission never rewrites either policy."
+    },
+    {
+      "id": "MC-SHOULD-001",
+      "level": "SHOULD",
+      "text": "Receipts retain hostname, kernel, microcode, cache topology, and load for diagnosis even when those fields are not class predicates."
+    },
+    {
+      "id": "MC-SHOULD-002",
+      "level": "SHOULD",
+      "text": "Consumers emit bounded structured logs naming requirement ID, hardware/profile key, field, observed value, expected predicate, and reason code."
+    }
+  ],
+  "fact_templates": {
+    "trj-valid-physical-64": {
+      "schema_version": "frankensearch.perf-runner-completion.v6",
+      "requested_profile": {
+        "hardware_class_id": "trj-zen3-5995wx",
+        "execution_profile_id": "physical-64"
+      },
+      "derived_profile": {
+        "hardware_class_id": "trj-zen3-5995wx",
+        "execution_profile_id": "physical-64"
+      },
+      "registry_sha256": "$REGISTRY_SHA256",
+      "hardware": {
+        "os": "linux",
+        "arch": "x86_64",
+        "cpu_vendor": "AuthenticAMD",
+        "cpu_family": 25,
+        "cpu_model": 8,
+        "cpu_stepping": 2,
+        "cpu_model_name": "AMD Ryzen Threadripper PRO 5995WX 64-Cores",
+        "physical_cores": 64,
+        "logical_cpus": 128,
+        "numa_nodes": 1,
+        "memory_bytes": 536069652480,
+        "page_size_bytes": 4096,
+        "performance_cores": null,
+        "efficiency_cores": null,
+        "runtime_detected_isa": ["aes", "avx2", "bmi2", "fma", "vaes"],
+        "topology_sha256": "faf66c070dc33f697eda30dfde3272aab99e7dbbf23f3c4050a1ac0da32929bd",
+        "fingerprint_sha256": "$DERIVE_HARDWARE_FINGERPRINT_SHA256"
+      },
+      "execution": {
+        "request": {
+          "capacity_semantics": "physical_cores",
+          "execution_capacity": 64,
+          "max_exercised_cell_width": 1,
+          "requested_logical_cpu_ids": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63],
+          "requested_physical_core_width": 64,
+          "requested_worker_pool_width": 64,
+          "requested_qos": "not-applicable"
+        },
+        "start": {
+          "observed_logical_cpu_ids": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63],
+          "effective_physical_core_ids": ["0:0", "0:1", "0:2", "0:3", "0:4", "0:5", "0:6", "0:7", "0:8", "0:9", "0:10", "0:11", "0:12", "0:13", "0:14", "0:15", "0:16", "0:17", "0:18", "0:19", "0:20", "0:21", "0:22", "0:23", "0:24", "0:25", "0:26", "0:27", "0:28", "0:29", "0:30", "0:31", "0:32", "0:33", "0:34", "0:35", "0:36", "0:37", "0:38", "0:39", "0:40", "0:41", "0:42", "0:43", "0:44", "0:45", "0:46", "0:47", "0:48", "0:49", "0:50", "0:51", "0:52", "0:53", "0:54", "0:55", "0:56", "0:57", "0:58", "0:59", "0:60", "0:61", "0:62", "0:63"],
+          "cpu_assignment_observability": "affinity-enforced",
+          "effective_cpuset_sha256": "$DERIVE_START_CPUSET_SHA256",
+          "threads_per_core": 1,
+          "smt_state": "off",
+          "numa_node_ids": [0],
+          "numa_policy": "bind:0",
+          "governor": "performance",
+          "thermal_pressure": false,
+          "exclusive_lease": true,
+          "exclusive_lease_id": "trj-zen3-exclusive",
+          "local_execution": true,
+          "observed_hardware_fingerprint_sha256": "$DERIVE_HARDWARE_FINGERPRINT_SHA256",
+          "snapshot_sha256": "$DERIVE_START_SNAPSHOT_SHA256"
+        },
+        "end": {
+          "observed_logical_cpu_ids": [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63],
+          "effective_physical_core_ids": ["0:0", "0:1", "0:2", "0:3", "0:4", "0:5", "0:6", "0:7", "0:8", "0:9", "0:10", "0:11", "0:12", "0:13", "0:14", "0:15", "0:16", "0:17", "0:18", "0:19", "0:20", "0:21", "0:22", "0:23", "0:24", "0:25", "0:26", "0:27", "0:28", "0:29", "0:30", "0:31", "0:32", "0:33", "0:34", "0:35", "0:36", "0:37", "0:38", "0:39", "0:40", "0:41", "0:42", "0:43", "0:44", "0:45", "0:46", "0:47", "0:48", "0:49", "0:50", "0:51", "0:52", "0:53", "0:54", "0:55", "0:56", "0:57", "0:58", "0:59", "0:60", "0:61", "0:62", "0:63"],
+          "cpu_assignment_observability": "affinity-enforced",
+          "effective_cpuset_sha256": "$DERIVE_END_CPUSET_SHA256",
+          "threads_per_core": 1,
+          "smt_state": "off",
+          "numa_node_ids": [0],
+          "numa_policy": "bind:0",
+          "governor": "performance",
+          "thermal_pressure": false,
+          "exclusive_lease": true,
+          "exclusive_lease_id": "trj-zen3-exclusive",
+          "local_execution": true,
+          "observed_hardware_fingerprint_sha256": "$DERIVE_HARDWARE_FINGERPRINT_SHA256",
+          "snapshot_sha256": "$DERIVE_END_SNAPSHOT_SHA256"
+        },
+        "identity_sha256": "$DERIVE_EXECUTION_IDENTITY_SHA256"
+      },
+      "build": {
+        "git_revision": "ebd9175725ef9d97fd02d794394209b4719f8ce7",
+        "git_dirty": false,
+        "worktree_state_sha256": null,
+        "cargo_lock_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+        "executable_sha256": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+        "command_sha256": "1111111111111111111111111111111111111111111111111111111111111111",
+        "environment_sha256": "2222222222222222222222222222222222222222222222222222222222222222",
+        "producer": {
+          "contract_version": "frankensearch.quill-local-perf-producer.v4",
+          "source_git_revision": "ebd9175725ef9d97fd02d794394209b4719f8ce7",
+          "source_git_dirty": false,
+          "cargo_lock_sha256": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+          "executable_sha256": "4444444444444444444444444444444444444444444444444444444444444444"
+        }
+      },
+      "durability": {
+        "adjacent": false,
+        "control_treatment": "not-applicable",
+        "candidate_treatment": "not-applicable",
+        "symmetric": true
+      },
+      "completion": {
+        "verified": true,
+        "exit_status": 0,
+        "run_log_sha256": "2222222222222222222222222222222222222222222222222222222222222222",
+        "artifact_manifest_sha256": "3333333333333333333333333333333333333333333333333333333333333333",
+        "artifact_digests_verified": true,
+        "started_at_utc": "2026-07-30T14:00:00Z",
+        "finished_at_utc": "2026-07-30T14:10:00Z"
+      }
+    },
+    "m4-valid-scheduler-10": {
+      "schema_version": "frankensearch.perf-runner-completion.v6",
+      "requested_profile": {
+        "hardware_class_id": "m4-macos",
+        "execution_profile_id": "scheduler-10"
+      },
+      "derived_profile": {
+        "hardware_class_id": "m4-macos",
+        "execution_profile_id": "scheduler-10"
+      },
+      "registry_sha256": "$REGISTRY_SHA256",
+      "hardware": {
+        "os": "macos",
+        "arch": "aarch64",
+        "cpu_vendor": "Apple",
+        "cpu_family": null,
+        "cpu_model": null,
+        "cpu_stepping": null,
+        "cpu_model_name": "Apple M4 Pro",
+        "physical_cores": 14,
+        "logical_cpus": 14,
+        "numa_nodes": 1,
+        "memory_bytes": 68719476736,
+        "page_size_bytes": 16384,
+        "performance_cores": 10,
+        "efficiency_cores": 4,
+        "runtime_detected_isa": ["aes", "neon", "sha2"],
+        "topology_sha256": "cd91e4ff2d11cf3d4fdd891b075f602b167ca0fb7c9ed801ece6b1b9f9757a1b",
+        "fingerprint_sha256": "$DERIVE_HARDWARE_FINGERPRINT_SHA256"
+      },
+      "execution": {
+        "request": {
+          "capacity_semantics": "scheduler_workers",
+          "execution_capacity": 10,
+          "max_exercised_cell_width": 8,
+          "requested_logical_cpu_ids": [],
+          "requested_physical_core_width": null,
+          "requested_worker_pool_width": 10,
+          "requested_qos": "inherit-process-default"
+        },
+        "start": {
+          "observed_logical_cpu_ids": [],
+          "effective_physical_core_ids": [],
+          "cpu_assignment_observability": "unavailable",
+          "effective_cpuset_sha256": "$DERIVE_START_CPUSET_SHA256",
+          "threads_per_core": 1,
+          "smt_state": "not-applicable",
+          "numa_node_ids": [0],
+          "numa_policy": "system",
+          "governor": "not-applicable",
+          "thermal_pressure": false,
+          "exclusive_lease": true,
+          "exclusive_lease_id": "m4-macos-exclusive",
+          "local_execution": true,
+          "observed_hardware_fingerprint_sha256": "$DERIVE_HARDWARE_FINGERPRINT_SHA256",
+          "snapshot_sha256": "$DERIVE_START_SNAPSHOT_SHA256"
+        },
+        "end": {
+          "observed_logical_cpu_ids": [],
+          "effective_physical_core_ids": [],
+          "cpu_assignment_observability": "unavailable",
+          "effective_cpuset_sha256": "$DERIVE_END_CPUSET_SHA256",
+          "threads_per_core": 1,
+          "smt_state": "not-applicable",
+          "numa_node_ids": [0],
+          "numa_policy": "system",
+          "governor": "not-applicable",
+          "thermal_pressure": false,
+          "exclusive_lease": true,
+          "exclusive_lease_id": "m4-macos-exclusive",
+          "local_execution": true,
+          "observed_hardware_fingerprint_sha256": "$DERIVE_HARDWARE_FINGERPRINT_SHA256",
+          "snapshot_sha256": "$DERIVE_END_SNAPSHOT_SHA256"
+        },
+        "identity_sha256": "$DERIVE_EXECUTION_IDENTITY_SHA256"
+      },
+      "build": {
+        "git_revision": "f9c6c57e44e07313f88b8a7d11c4df956ff44c24",
+        "git_dirty": false,
+        "worktree_state_sha256": null,
+        "cargo_lock_sha256": "7777777777777777777777777777777777777777777777777777777777777777",
+        "executable_sha256": "8888888888888888888888888888888888888888888888888888888888888888",
+        "command_sha256": "9999999999999999999999999999999999999999999999999999999999999999",
+        "environment_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "producer": {
+          "contract_version": "frankensearch.quill-local-perf-producer.v4",
+          "source_git_revision": "f9c6c57e44e07313f88b8a7d11c4df956ff44c24",
+          "source_git_dirty": false,
+          "cargo_lock_sha256": "7777777777777777777777777777777777777777777777777777777777777777",
+          "executable_sha256": "5555555555555555555555555555555555555555555555555555555555555555"
+        }
+      },
+      "durability": {
+        "adjacent": false,
+        "control_treatment": "not-applicable",
+        "candidate_treatment": "not-applicable",
+        "symmetric": true
+      },
+      "completion": {
+        "verified": true,
+        "exit_status": 0,
+        "run_log_sha256": "abababababababababababababababababababababababababababababababab",
+        "artifact_manifest_sha256": "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+        "artifact_digests_verified": true,
+        "started_at_utc": "2026-07-30T14:00:00Z",
+        "finished_at_utc": "2026-07-30T14:10:00Z"
+      }
+    }
+  },
+  "test_vector_mutation_format": {
+    "raw_json": "When non-null, parse these exact bytes instead of a named template; this is used for syntax-level cases such as duplicate receipt keys.",
+    "placeholders": {
+      "$REGISTRY_SHA256": "Substitute the lowercase SHA-256 of the exact registry bytes.",
+      "$DERIVE_HARDWARE_FINGERPRINT_SHA256": "Derive from the materialized hardware object according to canonical_hash_contract.",
+      "$DERIVE_START_CPUSET_SHA256": "Derive from the materialized execution.start CPU-assignment fields.",
+      "$DERIVE_END_CPUSET_SHA256": "Derive from the materialized execution.end CPU-assignment fields.",
+      "$DERIVE_START_SNAPSHOT_SHA256": "Derive from the materialized execution.start object.",
+      "$DERIVE_END_SNAPSHOT_SHA256": "Derive from the materialized execution.end object.",
+      "$DERIVE_EXECUTION_IDENTITY_SHA256": "Derive only after start/end equivalence passes."
+    },
+    "set": "A map from dotted field path to replacement JSON value.",
+    "remove": "A list of dotted field paths removed before validation.",
+    "add_unknown": "A map from dotted field path to a field that strict consumers must reject.",
+    "admission_context": "External ratchet context applied only after strict receipt validation. expected_profile must equal requested_profile and derived_profile. destination_basename must equal QG-<n>.<hardware_class_id>.<execution_profile_id>.latest.json exactly and cannot relabel the receipt."
+  },
+  "test_vector_expected_contract": {
+    "decision": "The terminal admission state: allow, diagnostic_only, reject, or reject_registry.",
+    "profile": "The canonical derived hardware/profile key on allow or diagnostic_only, otherwise null.",
+    "reason": "Exactly one stable member of reason_codes.",
+    "derived_sha256": "When present, consumers recompute all five values independently. Every allow path must recompute and compare its receipt hashes even when a compact corpus omits literal golden digests."
+  },
+  "class_lookup_vectors": [
+    {
+      "id": "MCL-001-trj-stable-hardware",
+      "requested_hardware_class_id": "trj-zen3-5995wx",
+      "covers": ["MC-MUST-002", "MC-MUST-004"],
+      "expected": {
+        "decision": "allow",
+        "hardware_class_id": "trj-zen3-5995wx",
+        "reason": "admitted"
+      }
+    },
+    {
+      "id": "MCL-002-m5-unavailable",
+      "requested_hardware_class_id": "m5-macos",
+      "covers": ["MC-MUST-009", "MC-MUST-018", "MC-MUST-019"],
+      "expected": {
+        "decision": "diagnostic_only",
+        "hardware_class_id": "m5-macos",
+        "reason": "class-unavailable"
+      }
+    },
+    {
+      "id": "MCL-003-obsolete-width-64",
+      "requested_hardware_class_id": "trj-zen3-64c",
+      "covers": ["MC-MUST-002", "MC-MUST-018"],
+      "expected": {
+        "decision": "reject",
+        "hardware_class_id": null,
+        "reason": "obsolete-class-id"
+      }
+    },
+    {
+      "id": "MCL-004-obsolete-width-16-smt",
+      "requested_hardware_class_id": "trj-zen3-16c-smt2",
+      "covers": ["MC-MUST-002", "MC-MUST-018"],
+      "expected": {
+        "decision": "reject",
+        "hardware_class_id": null,
+        "reason": "obsolete-class-id"
+      }
+    },
+    {
+      "id": "MCL-005-obsolete-apple-mode",
+      "requested_hardware_class_id": "p-plus-e",
+      "covers": ["MC-MUST-002", "MC-MUST-018"],
+      "expected": {
+        "decision": "reject",
+        "hardware_class_id": null,
+        "reason": "obsolete-class-id"
+      }
+    },
+    {
+      "id": "MCL-006-unknown-hardware",
+      "requested_hardware_class_id": "generic-linux",
+      "covers": ["MC-MUST-002", "MC-MUST-018"],
+      "expected": {
+        "decision": "reject",
+        "hardware_class_id": null,
+        "reason": "unknown-class-id"
+      }
+    }
+  ],
+  "test_vectors": [
+    {
+      "id": "MCV-001-trj-physical-64-admitted",
+      "template": "trj-valid-physical-64",
+      "set": {},
+      "remove": [],
+      "add_unknown": {},
+      "admission_context": {
+        "gate": "QG-2",
+        "expected_profile": {
+          "hardware_class_id": "trj-zen3-5995wx",
+          "execution_profile_id": "physical-64"
+        },
+        "destination_basename": "QG-2.trj-zen3-5995wx.physical-64.latest.json"
+      },
+      "covers": ["MC-MUST-003", "MC-MUST-004", "MC-MUST-005", "MC-MUST-017"],
+      "expected": {
+        "decision": "allow",
+        "profile": {
+          "hardware_class_id": "trj-zen3-5995wx",
+          "execution_profile_id": "physical-64"
+        },
+        "reason": "admitted"
+      }
+    },
+    {
+      "id": "MCV-002-m4-scheduler-10-runtime-unavailable",
+      "template": "m4-valid-scheduler-10",
+      "set": {},
+      "remove": [],
+      "add_unknown": {},
+      "admission_context": {
+        "gate": "QG-1",
+        "expected_profile": {
+          "hardware_class_id": "m4-macos",
+          "execution_profile_id": "scheduler-10"
+        },
+        "destination_basename": "QG-1.m4-macos.scheduler-10.latest.json"
+      },
+      "covers": ["MC-MUST-008", "MC-MUST-023"],
+      "expected": {
+        "decision": "reject",
+        "profile": null,
+        "reason": "class-unavailable"
+      }
+    },
+    {
+      "id": "MCV-003-derived-profile-mismatch",
+      "template": "trj-valid-physical-64",
+      "set": {
+        "derived_profile.execution_profile_id": "smt2-128"
+      },
+      "remove": [],
+      "add_unknown": {},
+      "admission_context": {
+        "gate": "QG-2",
+        "expected_profile": {
+          "hardware_class_id": "trj-zen3-5995wx",
+          "execution_profile_id": "physical-64"
+        },
+        "destination_basename": "QG-2.trj-zen3-5995wx.physical-64.latest.json"
+      },
+      "covers": ["MC-MUST-003", "MC-MUST-017"],
+      "expected": {
+        "decision": "reject",
+        "profile": null,
+        "reason": "receipt-class-mismatch"
+      }
+    },
+    {
+      "id": "MCV-004-context-profile-mismatch",
+      "template": "trj-valid-physical-64",
+      "set": {},
+      "remove": [],
+      "add_unknown": {},
+      "admission_context": {
+        "gate": "QG-2",
+        "expected_profile": {
+          "hardware_class_id": "trj-zen3-5995wx",
+          "execution_profile_id": "smt2-128"
+        },
+        "destination_basename": "QG-2.trj-zen3-5995wx.smt2-128.latest.json"
+      },
+      "covers": ["MC-MUST-003", "MC-MUST-017"],
+      "expected": {
+        "decision": "reject",
+        "profile": null,
+        "reason": "receipt-class-mismatch"
+      }
+    },
+    {
+      "id": "MCV-005-capacity-semantics-mismatch",
+      "template": "trj-valid-physical-64",
+      "set": {
+        "execution.request.capacity_semantics": "logical_threads"
+      },
+      "remove": [],
+      "add_unknown": {},
+      "admission_context": {
+        "gate": "QG-2",
+        "expected_profile": {
+          "hardware_class_id": "trj-zen3-5995wx",
+          "execution_profile_id": "physical-64"
+        },
+        "destination_basename": "QG-2.trj-zen3-5995wx.physical-64.latest.json"
+      },
+      "covers": ["MC-MUST-005"],
+      "expected": {
+        "decision": "reject",
+        "profile": null,
+        "reason": "execution-thread-budget-invalid"
+      }
+    },
+    {
+      "id": "MCV-006-execution-capacity-mismatch",
+      "template": "trj-valid-physical-64",
+      "set": {
+        "execution.request.execution_capacity": 63
+      },
+      "remove": [],
+      "add_unknown": {},
+      "admission_context": {
+        "gate": "QG-2",
+        "expected_profile": {
+          "hardware_class_id": "trj-zen3-5995wx",
+          "execution_profile_id": "physical-64"
+        },
+        "destination_basename": "QG-2.trj-zen3-5995wx.physical-64.latest.json"
+      },
+      "covers": ["MC-MUST-005"],
+      "expected": {
+        "decision": "reject",
+        "profile": null,
+        "reason": "execution-thread-budget-invalid"
+      }
+    },
+    {
+      "id": "MCV-007-gate-width-mismatch",
+      "template": "trj-valid-physical-64",
+      "set": {
+        "execution.request.max_exercised_cell_width": 2
+      },
+      "remove": [],
+      "add_unknown": {},
+      "admission_context": {
+        "gate": "QG-2",
+        "expected_profile": {
+          "hardware_class_id": "trj-zen3-5995wx",
+          "execution_profile_id": "physical-64"
+        },
+        "destination_basename": "QG-2.trj-zen3-5995wx.physical-64.latest.json"
+      },
+      "covers": ["MC-MUST-005", "MC-MUST-010"],
+      "expected": {
+        "decision": "reject",
+        "profile": null,
+        "reason": "execution-thread-budget-invalid"
+      }
+    },
+    {
+      "id": "MCV-008-physical-profile-smt-claim",
+      "template": "trj-valid-physical-64",
+      "set": {
+        "execution.start.threads_per_core": 2,
+        "execution.start.smt_state": "on",
+        "execution.end.threads_per_core": 2,
+        "execution.end.smt_state": "on"
+      },
+      "remove": [],
+      "add_unknown": {},
+      "admission_context": {
+        "gate": "QG-2",
+        "expected_profile": {
+          "hardware_class_id": "trj-zen3-5995wx",
+          "execution_profile_id": "physical-64"
+        },
+        "destination_basename": "QG-2.trj-zen3-5995wx.physical-64.latest.json"
+      },
+      "covers": ["MC-MUST-005"],
+      "expected": {
+        "decision": "reject",
+        "profile": null,
+        "reason": "execution-smt-mismatch"
+      }
+    },
+    {
+      "id": "MCV-009-hardware-vendor-mismatch",
+      "template": "trj-valid-physical-64",
+      "set": {
+        "hardware.cpu_vendor": "GenuineIntel"
+      },
+      "remove": [],
+      "add_unknown": {},
+      "admission_context": {
+        "gate": "QG-2",
+        "expected_profile": {
+          "hardware_class_id": "trj-zen3-5995wx",
+          "execution_profile_id": "physical-64"
+        },
+        "destination_basename": "QG-2.trj-zen3-5995wx.physical-64.latest.json"
+      },
+      "covers": ["MC-MUST-004"],
+      "expected": {
+        "decision": "reject",
+        "profile": null,
+        "reason": "hardware-cpu-vendor-mismatch"
+      }
+    },
+    {
+      "id": "MCV-010-thermal-pressure",
+      "template": "trj-valid-physical-64",
+      "set": {
+        "execution.start.thermal_pressure": true,
+        "execution.end.thermal_pressure": true
+      },
+      "remove": [],
+      "add_unknown": {},
+      "admission_context": {
+        "gate": "QG-2",
+        "expected_profile": {
+          "hardware_class_id": "trj-zen3-5995wx",
+          "execution_profile_id": "physical-64"
+        },
+        "destination_basename": "QG-2.trj-zen3-5995wx.physical-64.latest.json"
+      },
+      "covers": ["MC-MUST-013", "MC-MUST-016"],
+      "expected": {
+        "decision": "reject",
+        "profile": null,
+        "reason": "thermal-pressure"
+      }
+    },
+    {
+      "id": "MCV-011-exclusive-lease-missing",
+      "template": "trj-valid-physical-64",
+      "set": {
+        "execution.start.exclusive_lease": false,
+        "execution.end.exclusive_lease": false
+      },
+      "remove": [],
+      "add_unknown": {},
+      "admission_context": {
+        "gate": "QG-2",
+        "expected_profile": {
+          "hardware_class_id": "trj-zen3-5995wx",
+          "execution_profile_id": "physical-64"
+        },
+        "destination_basename": "QG-2.trj-zen3-5995wx.physical-64.latest.json"
+      },
+      "covers": ["MC-MUST-013"],
+      "expected": {
+        "decision": "reject",
+        "profile": null,
+        "reason": "exclusive-lease-missing"
+      }
+    },
+    {
+      "id": "MCV-012-local-execution-required",
+      "template": "trj-valid-physical-64",
+      "set": {
+        "execution.start.local_execution": false,
+        "execution.end.local_execution": false
+      },
+      "remove": [],
+      "add_unknown": {},
+      "admission_context": {
+        "gate": "QG-2",
+        "expected_profile": {
+          "hardware_class_id": "trj-zen3-5995wx",
+          "execution_profile_id": "physical-64"
+        },
+        "destination_basename": "QG-2.trj-zen3-5995wx.physical-64.latest.json"
+      },
+      "covers": ["MC-MUST-013"],
+      "expected": {
+        "decision": "reject",
+        "profile": null,
+        "reason": "execution-offloaded"
+      }
+    },
+    {
+      "id": "MCV-013-dirty-source",
+      "template": "trj-valid-physical-64",
+      "set": {
+        "build.git_dirty": true
+      },
+      "remove": [],
+      "add_unknown": {},
+      "admission_context": {
+        "gate": "QG-2",
+        "expected_profile": {
+          "hardware_class_id": "trj-zen3-5995wx",
+          "execution_profile_id": "physical-64"
+        },
+        "destination_basename": "QG-2.trj-zen3-5995wx.physical-64.latest.json"
+      },
+      "covers": ["MC-MUST-013", "MC-MUST-022"],
+      "expected": {
+        "decision": "reject",
+        "profile": null,
+        "reason": "source-dirty"
+      }
+    },
+    {
+      "id": "MCV-014-obsolete-producer-contract",
+      "template": "trj-valid-physical-64",
+      "set": {
+        "build.producer.contract_version": "obsolete-producer-contract"
+      },
+      "remove": [],
+      "add_unknown": {},
+      "admission_context": {
+        "gate": "QG-2",
+        "expected_profile": {
+          "hardware_class_id": "trj-zen3-5995wx",
+          "execution_profile_id": "physical-64"
+        },
+        "destination_basename": "QG-2.trj-zen3-5995wx.physical-64.latest.json"
+      },
+      "covers": ["MC-MUST-022"],
+      "expected": {
+        "decision": "reject",
+        "profile": null,
+        "reason": "source-identity-invalid"
+      }
+    },
+    {
+      "id": "MCV-015-durability-asymmetric",
+      "template": "trj-valid-physical-64",
+      "set": {
+        "durability.adjacent": true,
+        "durability.control_treatment": "fsync",
+        "durability.candidate_treatment": "fullfsync",
+        "durability.symmetric": false
+      },
+      "remove": [],
+      "add_unknown": {},
+      "admission_context": {
+        "gate": "QG-2",
+        "expected_profile": {
+          "hardware_class_id": "trj-zen3-5995wx",
+          "execution_profile_id": "physical-64"
+        },
+        "destination_basename": "QG-2.trj-zen3-5995wx.physical-64.latest.json"
+      },
+      "covers": ["MC-MUST-014"],
+      "expected": {
+        "decision": "reject",
+        "profile": null,
+        "reason": "durability-asymmetric"
+      }
+    },
+    {
+      "id": "MCV-016-completion-failed",
+      "template": "trj-valid-physical-64",
+      "set": {
+        "completion.exit_status": 1
+      },
+      "remove": [],
+      "add_unknown": {},
+      "admission_context": {
+        "gate": "QG-2",
+        "expected_profile": {
+          "hardware_class_id": "trj-zen3-5995wx",
+          "execution_profile_id": "physical-64"
+        },
+        "destination_basename": "QG-2.trj-zen3-5995wx.physical-64.latest.json"
+      },
+      "covers": ["MC-MUST-015"],
+      "expected": {
+        "decision": "reject",
+        "profile": null,
+        "reason": "completion-failed"
+      }
+    },
+    {
+      "id": "MCV-017-completion-unverified",
+      "template": "trj-valid-physical-64",
+      "set": {
+        "completion.verified": false
+      },
+      "remove": [],
+      "add_unknown": {},
+      "admission_context": {
+        "gate": "QG-2",
+        "expected_profile": {
+          "hardware_class_id": "trj-zen3-5995wx",
+          "execution_profile_id": "physical-64"
+        },
+        "destination_basename": "QG-2.trj-zen3-5995wx.physical-64.latest.json"
+      },
+      "covers": ["MC-MUST-015"],
+      "expected": {
+        "decision": "reject",
+        "profile": null,
+        "reason": "completion-unverified"
+      }
+    },
+    {
+      "id": "MCV-018-unknown-receipt-field",
+      "template": "trj-valid-physical-64",
+      "set": {},
+      "remove": [],
+      "add_unknown": {
+        "hardware.unreviewed_cpu_fact": true
+      },
+      "admission_context": {
+        "gate": "QG-2",
+        "expected_profile": {
+          "hardware_class_id": "trj-zen3-5995wx",
+          "execution_profile_id": "physical-64"
+        },
+        "destination_basename": "QG-2.trj-zen3-5995wx.physical-64.latest.json"
+      },
+      "covers": ["MC-MUST-001"],
+      "expected": {
+        "decision": "reject",
+        "profile": null,
+        "reason": "unknown-field"
+      }
+    },
+    {
+      "id": "MCV-019-requested-profile-missing",
+      "template": "trj-valid-physical-64",
+      "set": {},
+      "remove": ["requested_profile"],
+      "add_unknown": {},
+      "admission_context": {
+        "gate": "QG-2",
+        "expected_profile": {
+          "hardware_class_id": "trj-zen3-5995wx",
+          "execution_profile_id": "physical-64"
+        },
+        "destination_basename": "QG-2.trj-zen3-5995wx.physical-64.latest.json"
+      },
+      "covers": ["MC-MUST-001", "MC-MUST-003"],
+      "expected": {
+        "decision": "reject",
+        "profile": null,
+        "reason": "missing-field"
+      }
+    },
+    {
+      "id": "MCV-020-registry-hash-mismatch",
+      "template": "trj-valid-physical-64",
+      "set": {
+        "registry_sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+      },
+      "remove": [],
+      "add_unknown": {},
+      "admission_context": {
+        "gate": "QG-2",
+        "expected_profile": {
+          "hardware_class_id": "trj-zen3-5995wx",
+          "execution_profile_id": "physical-64"
+        },
+        "destination_basename": "QG-2.trj-zen3-5995wx.physical-64.latest.json"
+      },
+      "covers": ["MC-MUST-012"],
+      "expected": {
+        "decision": "reject",
+        "profile": null,
+        "reason": "registry-hash-mismatch"
+      }
+    },
+    {
+      "id": "MCV-021-derived-snapshot-hash-mismatch",
+      "template": "trj-valid-physical-64",
+      "set": {
+        "execution.start.snapshot_sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+      },
+      "remove": [],
+      "add_unknown": {},
+      "admission_context": {
+        "gate": "QG-2",
+        "expected_profile": {
+          "hardware_class_id": "trj-zen3-5995wx",
+          "execution_profile_id": "physical-64"
+        },
+        "destination_basename": "QG-2.trj-zen3-5995wx.physical-64.latest.json"
+      },
+      "covers": ["MC-MUST-012", "MC-MUST-016"],
+      "expected": {
+        "decision": "reject",
+        "profile": null,
+        "reason": "derived-hash-mismatch"
+      }
+    },
+    {
+      "id": "MCV-022-destination-profile-substitution",
+      "template": "trj-valid-physical-64",
+      "set": {},
+      "remove": [],
+      "add_unknown": {},
+      "admission_context": {
+        "gate": "QG-2",
+        "expected_profile": {
+          "hardware_class_id": "trj-zen3-5995wx",
+          "execution_profile_id": "physical-64"
+        },
+        "destination_basename": "QG-2.trj-zen3-5995wx.smt2-128.latest.json"
+      },
+      "covers": ["MC-MUST-017"],
+      "expected": {
+        "decision": "reject",
+        "profile": null,
+        "reason": "destination-identity-mismatch"
+      }
+    },
+    {
+      "id": "MCV-023-qg3-durability-witness-unavailable",
+      "template": "trj-valid-physical-64",
+      "set": {},
+      "remove": [],
+      "add_unknown": {},
+      "admission_context": {
+        "gate": "QG-3",
+        "expected_profile": {
+          "hardware_class_id": "trj-zen3-5995wx",
+          "execution_profile_id": "physical-64"
+        },
+        "destination_basename": "QG-3.trj-zen3-5995wx.physical-64.latest.json"
+      },
+      "covers": ["MC-MUST-014", "MC-MUST-023"],
+      "expected": {
+        "decision": "reject",
+        "profile": null,
+        "reason": "class-unavailable"
+      }
+    },
+    {
+      "id": "MCV-024-m4-gate-width-exceeds-contract",
+      "template": "m4-valid-scheduler-10",
+      "set": {
+        "execution.request.max_exercised_cell_width": 10
+      },
+      "remove": [],
+      "add_unknown": {},
+      "admission_context": {
+        "gate": "QG-1",
+        "expected_profile": {
+          "hardware_class_id": "m4-macos",
+          "execution_profile_id": "scheduler-10"
+        },
+        "destination_basename": "QG-1.m4-macos.scheduler-10.latest.json"
+      },
+      "covers": ["MC-MUST-008", "MC-MUST-010"],
+      "expected": {
+        "decision": "reject",
+        "profile": null,
+        "reason": "execution-thread-budget-invalid"
+      }
+    },
+    {
+      "id": "MCV-025-m4-affinity-claim-forbidden",
+      "template": "m4-valid-scheduler-10",
+      "set": {
+        "execution.start.cpu_assignment_observability": "affinity-enforced",
+        "execution.end.cpu_assignment_observability": "affinity-enforced"
+      },
+      "remove": [],
+      "add_unknown": {},
+      "admission_context": {
+        "gate": "QG-1",
+        "expected_profile": {
+          "hardware_class_id": "m4-macos",
+          "execution_profile_id": "scheduler-10"
+        },
+        "destination_basename": "QG-1.m4-macos.scheduler-10.latest.json"
+      },
+      "covers": ["MC-MUST-008"],
+      "expected": {
+        "decision": "reject",
+        "profile": null,
+        "reason": "execution-mode-mismatch"
+      }
+    },
+    {
+      "id": "MCV-026-duplicate-receipt-profile-key",
+      "template": null,
+      "raw_json": "{\"requested_profile\":{\"hardware_class_id\":\"trj-zen3-5995wx\",\"execution_profile_id\":\"physical-64\"},\"requested_profile\":{\"hardware_class_id\":\"trj-zen3-5995wx\",\"execution_profile_id\":\"smt2-128\"}}",
+      "set": {},
+      "remove": [],
+      "add_unknown": {},
+      "admission_context": {
+        "gate": "QG-2",
+        "expected_profile": {
+          "hardware_class_id": "trj-zen3-5995wx",
+          "execution_profile_id": "physical-64"
+        },
+        "destination_basename": "QG-2.trj-zen3-5995wx.physical-64.latest.json"
+      },
+      "covers": ["MC-MUST-001"],
+      "expected": {
+        "decision": "reject",
+        "profile": null,
+        "reason": "duplicate-key"
+      }
+    },
+    {
+      "id": "MCV-027-obsolete-receipt-schema",
+      "template": "trj-valid-physical-64",
+      "set": {
+        "schema_version": "obsolete-receipt-schema"
+      },
+      "remove": [],
+      "add_unknown": {},
+      "admission_context": {
+        "gate": "QG-2",
+        "expected_profile": {
+          "hardware_class_id": "trj-zen3-5995wx",
+          "execution_profile_id": "physical-64"
+        },
+        "destination_basename": "QG-2.trj-zen3-5995wx.physical-64.latest.json"
+      },
+      "covers": ["MC-MUST-001"],
+      "expected": {
+        "decision": "reject",
+        "profile": null,
+        "reason": "source-identity-invalid"
+      }
+    },
+    {
+      "id": "MCV-028-cpuset-wrong-type",
+      "template": "trj-valid-physical-64",
+      "set": {
+        "execution.request.requested_logical_cpu_ids": "0-63"
+      },
+      "remove": [],
+      "add_unknown": {},
+      "admission_context": {
+        "gate": "QG-2",
+        "expected_profile": {
+          "hardware_class_id": "trj-zen3-5995wx",
+          "execution_profile_id": "physical-64"
+        },
+        "destination_basename": "QG-2.trj-zen3-5995wx.physical-64.latest.json"
+      },
+      "covers": ["MC-MUST-005"],
+      "expected": {
+        "decision": "reject",
+        "profile": null,
+        "reason": "execution-cpuset-invalid"
+      }
+    }
+  ],
+  "registry_test_vector_mutation_format": {
+    "raw_json": "When non-null, parse these exact bytes instead of mutating the canonical registry; this is used for syntax-level cases such as duplicate keys.",
+    "set": "A map from dotted registry field path to replacement JSON value.",
+    "remove": "A list of dotted registry field paths removed before loading.",
+    "add_unknown": "A map from dotted registry field path to a field that strict consumers must reject."
+  },
+  "registry_test_vectors": [
+    {
+      "id": "MCR-001-execution-profile-unknown-field",
+      "raw_json": null,
+      "set": {},
+      "remove": [],
+      "add_unknown": {
+        "execution_profiles.1.unreviewed_profile_fact": true
+      },
+      "covers": ["MC-MUST-001"],
+      "expected": {
+        "decision": "reject_registry",
+        "profile": null,
+        "reason": "unknown-field"
+      }
+    },
+    {
+      "id": "MCR-002-duplicate-top-level-key",
+      "raw_json": "{\"schema_version\":\"frankensearch.quill-machine-class-registry.v2\",\"schema_version\":\"frankensearch.quill-machine-class-registry.v2\"}",
+      "set": {},
+      "remove": [],
+      "add_unknown": {},
+      "covers": ["MC-MUST-001"],
+      "expected": {
+        "decision": "reject_registry",
+        "profile": null,
+        "reason": "duplicate-key"
+      }
+    },
+    {
+      "id": "MCR-003-registered-hardware-without-provenance",
+      "raw_json": null,
+      "set": {
+        "hardware_classes.1.source_fingerprints": []
+      },
+      "remove": [],
+      "add_unknown": {},
+      "covers": ["MC-MUST-019"],
+      "expected": {
+        "decision": "reject_registry",
+        "profile": null,
+        "reason": "source-identity-invalid"
+      }
+    },
+    {
+      "id": "MCR-004-invalid-source-fingerprint-digest",
+      "raw_json": null,
+      "set": {
+        "hardware_classes.2.source_fingerprints.0.sha256": "not-a-sha256"
+      },
+      "remove": [],
+      "add_unknown": {},
+      "covers": ["MC-MUST-019"],
+      "expected": {
+        "decision": "reject_registry",
+        "profile": null,
+        "reason": "source-identity-invalid"
+      }
+    },
+    {
+      "id": "MCR-005-m4-gate-width-fabricated",
+      "raw_json": null,
+      "set": {
+        "execution_profiles.3.gate_policies.QG-1.max_exercised_cell_width": 10
+      },
+      "remove": [],
+      "add_unknown": {},
+      "covers": ["MC-MUST-008", "MC-MUST-010"],
+      "expected": {
+        "decision": "reject_registry",
+        "profile": null,
+        "reason": "execution-profile-contract-invalid"
+      }
+    },
+    {
+      "id": "MCR-006-m5-required-disposition-erased",
+      "raw_json": null,
+      "set": {
+        "execution_profiles.4.gate_policies.QG-1.default_flip_disposition": "diagnostic_only"
+      },
+      "remove": [],
+      "add_unknown": {},
+      "covers": ["MC-MUST-009", "MC-MUST-023"],
+      "expected": {
+        "decision": "reject_registry",
+        "profile": null,
+        "reason": "execution-profile-contract-invalid"
+      }
+    },
+    {
+      "id": "MCR-007-m5-capacity-fabricated",
+      "raw_json": null,
+      "set": {
+        "execution_profiles.4.execution_capacity": 14
+      },
+      "remove": [],
+      "add_unknown": {},
+      "covers": ["MC-MUST-009", "MC-MUST-019"],
+      "expected": {
+        "decision": "reject_registry",
+        "profile": null,
+        "reason": "execution-profile-contract-invalid"
+      }
+    },
+    {
+      "id": "MCR-008-m5-capacity-field-missing",
+      "raw_json": null,
+      "set": {},
+      "remove": ["execution_profiles.4.execution_capacity"],
+      "add_unknown": {},
+      "covers": ["MC-MUST-001", "MC-MUST-009"],
+      "expected": {
+        "decision": "reject_registry",
+        "profile": null,
+        "reason": "missing-field"
+      }
+    },
+    {
+      "id": "MCR-009-cross-hardware-profile-key",
+      "raw_json": null,
+      "set": {
+        "execution_profiles.1.key.hardware_class_id": "m4-macos"
+      },
+      "remove": [],
+      "add_unknown": {},
+      "covers": ["MC-MUST-003"],
+      "expected": {
+        "decision": "reject_registry",
+        "profile": null,
+        "reason": "execution-profile-class-mismatch"
+      }
+    },
+    {
+      "id": "MCR-010-gate-policy-missing",
+      "raw_json": null,
+      "set": {},
+      "remove": ["execution_profiles.1.gate_policies.QG-10"],
+      "add_unknown": {},
+      "covers": ["MC-MUST-010"],
+      "expected": {
+        "decision": "reject_registry",
+        "profile": null,
+        "reason": "execution-profile-contract-invalid"
+      }
+    },
+    {
+      "id": "MCR-011-unknown-gate-policy",
+      "raw_json": null,
+      "set": {},
+      "remove": [],
+      "add_unknown": {
+        "execution_profiles.1.gate_policies.QG-11": {
+          "default_flip_disposition": "required_for_default_flip",
+          "max_exercised_cell_width": 1
+        }
+      },
+      "covers": ["MC-MUST-001", "MC-MUST-010"],
+      "expected": {
+        "decision": "reject_registry",
+        "profile": null,
+        "reason": "unknown-field"
+      }
+    },
+    {
+      "id": "MCR-012-required-profile-fact-removed",
+      "raw_json": null,
+      "set": {},
+      "remove": ["execution_profiles.1.required_scheduler_or_affinity_facts.0"],
+      "add_unknown": {},
+      "covers": ["MC-MUST-005"],
+      "expected": {
+        "decision": "reject_registry",
+        "profile": null,
+        "reason": "execution-profile-contract-invalid"
+      }
+    },
+    {
+      "id": "MCR-013-forbidden-claim-substituted",
+      "raw_json": null,
+      "set": {
+        "execution_profiles.1.forbidden_claims.0": "fabricated-capacity"
+      },
+      "remove": [],
+      "add_unknown": {},
+      "covers": ["MC-MUST-005"],
+      "expected": {
+        "decision": "reject_registry",
+        "profile": null,
+        "reason": "execution-profile-contract-invalid"
+      }
+    },
+    {
+      "id": "MCR-014-duplicate-profile-key",
+      "raw_json": "{\"key\":{\"hardware_class_id\":\"trj-zen3-5995wx\",\"execution_profile_id\":\"physical-64\"},\"key\":{\"hardware_class_id\":\"trj-zen3-5995wx\",\"execution_profile_id\":\"smt2-128\"}}",
+      "set": {},
+      "remove": [],
+      "add_unknown": {},
+      "covers": ["MC-MUST-001", "MC-MUST-003"],
+      "expected": {
+        "decision": "reject_registry",
+        "profile": null,
+        "reason": "duplicate-key"
+      }
+    }
+  ]
+}

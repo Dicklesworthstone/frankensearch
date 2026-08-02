@@ -1,0 +1,63 @@
+{
+  "schema_version": "quill-perf-ratchet-v3",
+  "gate": "Qg2",
+  "mode": "promotion",
+  "gate_activated": false,
+  "decision": "quarantine",
+  "reasons": [
+    {
+      "code": "perf.ratchet.bootstrap_promotion",
+      "message": "an otherwise-Allow promotion will establish the first measured baseline"
+    },
+    {
+      "code": "perf.ratchet.bootstrap_target_missed",
+      "message": "QG-2 single-thread median-ratio CI [0.346379, 0.357508] does not clear 1.5"
+    },
+    {
+      "code": "perf.ratchet.current_reproduction_failed",
+      "message": "current-schema candidate and rerun disagree beyond the predeclared tolerance for QG-2/bulk/medium/1/positions_on/docs_per_second"
+    },
+    {
+      "code": "perf.ratchet.bootstrap_target_missed",
+      "message": "QG-2 single-thread median-ratio CI [0.327940, 0.346834] does not clear 1.5"
+    },
+    {
+      "code": "perf.ratchet.gate_inactive",
+      "message": "QG-2 remains provisional because the normative manifest has activated=false"
+    }
+  ],
+  "comparisons": [],
+  "evidence": [
+    {
+      "role": "manifest",
+      "path": "docs/contracts/quill-perf-gates.toml",
+      "sha256": "68be56bd481ae44433b42b2310fa97352b08483a1f619366be549c20b07ae851"
+    },
+    {
+      "role": "baseline",
+      "path": ".bench-history/QG-2.unmeasured.latest.json",
+      "sha256": "dea65ca784bff9ef47bf2aa2f3bcd511458516a0160a91ab5558081a80c9a85b"
+    },
+    {
+      "role": "candidate",
+      "path": ".bench-history/attempts/2026-07-28/QG-2/qg2-candidate-trj-b083-16c-r30-20260728T1941Z/QG-2.json",
+      "sha256": "31313f507fd9abeaba2bc3232f60264a8a0acf63667b0c07ee7d26373aa5ee56"
+    },
+    {
+      "role": "rerun",
+      "path": ".bench-history/attempts/2026-07-28/QG-2/qg2-rerun-trj-b083-16c-r30-20260728T1944Z/QG-2.json",
+      "sha256": "73742c650aadd18ab0163c5c81ae5ec4947b412d331cd3fb4b6e987ee77b181c"
+    },
+    {
+      "role": "candidate_current",
+      "path": ".bench-history/attempts/2026-07-28/QG-2/qg2-candidate-trj-b083-16c-r30-20260728T1941Z/QG-2.evidence.json",
+      "sha256": "f3c9a28fd3f01805a384c09a15a8f097f4080ba8f991b7026ab71f3ad1b1199a"
+    },
+    {
+      "role": "rerun_current",
+      "path": ".bench-history/attempts/2026-07-28/QG-2/qg2-rerun-trj-b083-16c-r30-20260728T1944Z/QG-2.evidence.json",
+      "sha256": "066778b68d0f45edd4114c2b513a432e69121d2a328d690c5012f40b95b897b6"
+    }
+  ],
+  "history_updates": []
+}

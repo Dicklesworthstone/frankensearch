@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 
 use frankensearch_core::error::{SearchError, SearchResult};
 
-use crate::model_manifest::{ModelManifest, write_verification_marker};
+use crate::model_manifest::{ModelManifest, is_verification_cached, verify_dir_and_record};
 use crate::model_registry::ensure_model_storage_layout_checked;
 
 include!(concat!(
@@ -54,11 +54,10 @@ pub fn ensure_default_semantic_models(
             })?;
         let model_dir = root.join(install_dir);
 
-        if crate::model_manifest::is_verification_cached(&manifest, &model_dir) {
+        if bundled_receipt_allows_materialization_skip(&manifest, &model_dir) {
             continue;
         }
-        if manifest.verify_dir(&model_dir).is_ok() {
-            write_verification_marker(&manifest, &model_dir);
+        if verify_and_record_materialized_model(&manifest, &model_dir).is_ok() {
             continue;
         }
 
@@ -98,8 +97,7 @@ pub fn ensure_default_semantic_models(
             wrote_any_file = true;
         }
 
-        manifest.verify_dir(&model_dir)?;
-        write_verification_marker(&manifest, &model_dir);
+        verify_and_record_materialized_model(&manifest, &model_dir)?;
         if wrote_any_file {
             models_written = models_written.saturating_add(1);
         }
@@ -110,6 +108,22 @@ pub fn ensure_default_semantic_models(
         models_written,
         bytes_written,
     })
+}
+
+fn bundled_receipt_allows_materialization_skip(manifest: &ModelManifest, model_dir: &Path) -> bool {
+    is_verification_cached(manifest, model_dir)
+}
+
+/// Admit a materialized bundle only after full size-and-SHA verification.
+///
+/// Both the pre-existing-cache promotion path and the post-write promotion path route
+/// through this boundary. A lightweight receipt is therefore evidence of a successful
+/// full verification, never a substitute for the verification that creates it.
+fn verify_and_record_materialized_model(
+    manifest: &ModelManifest,
+    model_dir: &Path,
+) -> SearchResult<()> {
+    verify_dir_and_record(manifest, model_dir)
 }
 
 fn resolve_install_root(model_root: Option<&Path>) -> SearchResult<PathBuf> {
@@ -167,6 +181,7 @@ fn write_atomic_file(path: &Path, bytes: &[u8]) -> SearchResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model_manifest::{ModelFile, verify_dir_and_record};
 
     #[test]
     fn bundled_entries_cover_default_manifest_files() {
@@ -192,5 +207,87 @@ mod tests {
             Some("all-MiniLM-L6-v2")
         );
         assert_eq!(install_dir_for_manifest("unknown"), None);
+    }
+
+    #[test]
+    fn bundled_materialization_rejects_same_id_stale_manifest_receipt() {
+        let tmp = tempfile::tempdir().unwrap();
+        let model_dir = tmp.path().join("model");
+        fs::create_dir_all(&model_dir).unwrap();
+        fs::write(model_dir.join("model.bin"), b"abc").unwrap();
+        let manifest = ModelManifest {
+            id: "bundled-receipt-test".to_owned(),
+            version: "v1".to_owned(),
+            display_name: None,
+            description: None,
+            repo: "test/bundled".to_owned(),
+            revision: "a".repeat(40),
+            files: vec![ModelFile {
+                name: "model.bin".to_owned(),
+                sha256: "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+                    .to_owned(),
+                size: 3,
+                url: None,
+            }],
+            license: "MIT".to_owned(),
+            dimension: Some(1),
+            tier: None,
+            download_size_bytes: 3,
+        };
+        verify_dir_and_record(&manifest, &model_dir).unwrap();
+        assert!(bundled_receipt_allows_materialization_skip(
+            &manifest, &model_dir
+        ));
+
+        let mut evolved = manifest;
+        evolved.revision = "b".repeat(40);
+        assert!(
+            !bundled_receipt_allows_materialization_skip(&evolved, &model_dir),
+            "bundled materialization must not skip on a same-ID stale receipt"
+        );
+    }
+
+    #[test]
+    fn bundled_promotion_full_sha_verifies_before_writing_receipt() {
+        let tmp = tempfile::tempdir().unwrap();
+        let model_dir = tmp.path().join("model");
+        fs::create_dir_all(&model_dir).unwrap();
+        fs::write(model_dir.join("model.bin"), b"abd").unwrap();
+        let manifest = ModelManifest {
+            id: "bundled-promotion-test".to_owned(),
+            version: "v1".to_owned(),
+            display_name: None,
+            description: None,
+            repo: "test/bundled".to_owned(),
+            revision: "a".repeat(40),
+            files: vec![ModelFile {
+                name: "model.bin".to_owned(),
+                sha256: "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+                    .to_owned(),
+                size: 3,
+                url: None,
+            }],
+            license: "MIT".to_owned(),
+            dimension: Some(1),
+            tier: None,
+            download_size_bytes: 3,
+        };
+
+        let error = verify_and_record_materialized_model(&manifest, &model_dir).unwrap_err();
+        assert!(
+            matches!(error, SearchError::HashMismatch { .. }),
+            "same-size corrupt bytes must fail full-SHA bundled promotion: {error}"
+        );
+        assert!(
+            !model_dir.join(".verified").exists(),
+            "failed full-SHA promotion must not create a receipt"
+        );
+
+        fs::write(model_dir.join("model.bin"), b"abc").unwrap();
+        verify_and_record_materialized_model(&manifest, &model_dir).unwrap();
+        assert!(
+            bundled_receipt_allows_materialization_skip(&manifest, &model_dir),
+            "successful full-SHA promotion must create a current receipt"
+        );
     }
 }

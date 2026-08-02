@@ -18,7 +18,9 @@ use frankensearch_core::LexicalSearch;
 
 use crate::GauntletError;
 use crate::artifact::{
-    ArtifactLexicalContractEvidence, ArtifactObject, ArtifactStore, CampaignArtifactContext,
+    ArtifactDivergenceBinding, ArtifactExecutionRole, ArtifactLexicalContractEvidence,
+    ArtifactObject, ArtifactOracleDependency, ArtifactStore, ArtifactTrustCeiling,
+    CampaignArtifactContext, GauntletProducerBuildIdentity, OBJECT_HASH_SCHEME_V7_SHA256,
 };
 use crate::comparator::{
     ComparatorConfig, ComparisonReport, ComparisonStatus, Divergence, DivergenceClass,
@@ -27,11 +29,14 @@ use crate::comparator::{
     LexicalProbeCoverage, LexicalSideCoverage, RankClass, compare_lexical_contracts,
     compare_observations, observe_live_lexical_contract,
 };
+#[cfg(any(test, feature = "tantivy-oracle"))]
+use crate::engine::BuiltInEngineProfile;
 #[cfg(feature = "tantivy-oracle")]
 use crate::engine::GauntletEngine;
 use crate::engine::{
-    ComparisonMode, DifferentialCase, DifferentialCaseMetadata, EngineDescriptor,
-    EnginePairIdentity, HarnessRun, MAX_SNIPPET_CHARS,
+    BuiltInEngineProfileReceipt, ComparisonMode, DifferentialCase, DifferentialCaseMetadata,
+    EngineDescriptor, EnginePairIdentity, HARNESS_RUN_SCHEMA_VERSION, HarnessRun,
+    MAX_SNIPPET_CHARS,
 };
 #[cfg(feature = "tantivy-oracle")]
 use crate::generator::GeneratedSourceFilter;
@@ -40,11 +45,22 @@ use crate::generator::{
     GeneratedQueryKind, GeneratedQuerySuite, GlobPatternClass, MAX_DOCUMENT_BYTES, MAX_QUERY_CASES,
     MAX_QUERY_ID_BYTES, QUERY_MANIFEST_SCHEMA_VERSION, QueryManifest, QuerySuiteSource,
     QuerySyntax, RangeClass, StructuredFilterClass, SyntheticCorpus, is_canonical_query_id,
+    validate_stored_query_generator_identity,
 };
 use crate::version_contract::oracle_version_contract;
 
 /// Schema version for deterministic campaign reports.
-pub const CAMPAIGN_REPORT_SCHEMA_VERSION: u32 = 5;
+pub const CAMPAIGN_REPORT_V7_SCHEMA_VERSION: u32 = 7;
+pub const CAMPAIGN_REPORT_SCHEMA_VERSION: u32 = CAMPAIGN_REPORT_V7_SCHEMA_VERSION;
+/// Schema version for the append-only machine-readable Divergence Register.
+pub const DIVERGENCE_REGISTER_LEDGER_SCHEMA_VERSION: u32 = 2;
+const LEGACY_DIVERGENCE_REGISTER_LEDGER_SCHEMA_VERSION_V1: u32 = 1;
+/// Redaction policy required by committed Divergence Register evidence.
+pub const DIVERGENCE_REGISTER_REDACTION_POLICY_VERSION: &str = "quill-divergence-redaction-v1";
+/// Frozen seeded-class policy reserved for the future verified terminal gate.
+pub const DIVERGENCE_PREDICTION_POLICY_VERSION: &str = "quill-divergence-predictions-v1";
+/// Canonical ordered prediction-policy receipt for future verified evidence.
+pub const DIVERGENCE_PREDICTION_POLICY_PREIMAGE: &str = "quill-divergence-predictions-v1;required=score_epsilon,tie_order,snippet_window,glob_expansion_limit,stats_semantics,oversized_query_token";
 /// Canonical preimage for the default shipping lexical analyzer protocol.
 pub const DEFAULT_ANALYZER_CONTRACT_PREIMAGE: &str =
     "v1;tokenizer=frankensearch_default;split=unicode_alphanumeric;lowercase=unicode_to_lowercase";
@@ -67,19 +83,26 @@ const LEXICAL_MISMATCH_SIGNATURE_DOMAIN: &[u8] =
     b"frankensearch/quill/lexical-mismatch-signature/v1\0";
 const LEXICAL_QUERY_CONTRACT_DOMAIN: &[u8] = b"frankensearch/quill/lexical-query-contract/v1\0";
 const LEXICAL_INDEX_IDENTITY_DOMAIN: &[u8] = b"frankensearch/quill/lexical-index-identity/v1\0";
-const CAMPAIGN_REPORT_HASH_DOMAIN: &[u8] = b"frankensearch/quill/campaign-report/v5\0";
+const CAMPAIGN_REPORT_V7_HASH_DOMAIN: &[u8] = b"frankensearch/quill/campaign-report/v7\0";
 const DIVERGENCE_REGISTRY_HASH_DOMAIN: &[u8] = b"frankensearch/quill/divergence-registry/v1\0";
+const DIVERGENCE_REGISTER_LEDGER_HASH_DOMAIN: &[u8] =
+    b"frankensearch/quill/divergence-register-ledger/v2\0";
+const DIVERGENCE_PREDICTION_POLICY_HASH_DOMAIN: &[u8] =
+    b"frankensearch/quill/divergence-prediction-policy/v1\0";
 const MAX_DIVERGENCE_REGISTRY_ENTRIES: usize = 1_024;
+const MAX_DIVERGENCE_REGISTER_EVENTS: usize = 4_096;
 const MAX_DIVERGENCE_REGISTER_PROSE_BYTES: usize = 64 * 1024;
 const MAX_DIVERGENCE_REVIEWER_BYTES: usize = 1_024;
 const MAX_DIVERGENCE_REGISTRY_TEXT_BYTES: usize = 16 * 1024 * 1024;
-const MAX_CAMPAIGN_REASON_BYTES: usize = 4 * 1024;
+const MAX_DIVERGENCE_REGISTER_MARKER_BYTES: usize = 256;
+const DIVERGENCE_ARTIFACT_OBJECT_SCHEMA_VERSION_V7: u32 = 7;
 const MAX_CAMPAIGN_POINTER_BYTES: usize = 1024 * 1024;
 const MAX_MISMATCH_GROUPS: usize = MAX_QUERY_CASES;
 const MAX_MISMATCH_TEXT_BYTES: usize = 64 * 1024 * 1024;
 
 /// Shared analyzer and schema profile that both adapters must acknowledge.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SemanticContract {
     pub analyzer_contract_hash: String,
     pub schema_contract_hash: String,
@@ -144,6 +167,7 @@ impl SemanticContract {
 
 /// Adapter receipt proving what was indexed and under which semantic profile.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct EngineIndexReceipt {
     pub corpus_manifest_hash: String,
     pub document_count: u64,
@@ -290,8 +314,8 @@ impl Drop for IndexSession<'_> {
 }
 
 /// Query subset executed from a fully verified generated suite.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum CampaignSelection {
     /// Execute every query in manifest order.
     #[default]
@@ -304,8 +328,31 @@ pub enum CampaignSelection {
     CaseIds { ids: Vec<String> },
 }
 
+impl<'de> Deserialize<'de> for CampaignSelection {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+        enum StrictWire {
+            All {},
+            DefaultSyntax {},
+            CassSyntax {},
+            CaseIds { ids: Vec<String> },
+        }
+
+        Ok(match StrictWire::deserialize(deserializer)? {
+            StrictWire::All {} => Self::All,
+            StrictWire::DefaultSyntax {} => Self::DefaultSyntax,
+            StrictWire::CassSyntax {} => Self::CassSyntax,
+            StrictWire::CaseIds { ids } => Self::CaseIds { ids },
+        })
+    }
+}
+
 impl CampaignSelection {
-    fn select<'a>(
+    fn select_stored_v7<'a>(
         &self,
         cases: &'a [GeneratedQueryCase],
     ) -> Result<Vec<&'a GeneratedQueryCase>, GauntletError> {
@@ -370,10 +417,20 @@ impl CampaignSelection {
         }
         Ok(selected)
     }
+
+    fn select<'a>(
+        &self,
+        cases: &'a [GeneratedQueryCase],
+    ) -> Result<Vec<&'a GeneratedQueryCase>, GauntletError> {
+        // Current creation is report v7. A future selection policy must add a
+        // new current implementation rather than editing stored v7 semantics.
+        self.select_stored_v7(cases)
+    }
 }
 
 /// One reviewed per-fixture divergence allowlist row.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DivergenceRegisterEntry {
     pub id: String,
     pub class: DivergenceClass,
@@ -462,6 +519,7 @@ impl DivergenceRegisterEntry {
 
 /// Validated machine-facing subset of the Markdown Divergence Register.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DivergenceRegistry {
     entries: Vec<DivergenceRegisterEntry>,
 }
@@ -526,6 +584,10 @@ fn is_bounded_register_text(value: &str, max_bytes: usize) -> bool {
         && !value.chars().any(char::is_control)
 }
 
+fn is_bounded_register_ascii_text(value: &str, max_bytes: usize) -> bool {
+    is_bounded_register_text(value, max_bytes) && value.is_ascii()
+}
+
 fn validate_registry_bounds(entries: &[DivergenceRegisterEntry]) -> Result<(), GauntletError> {
     let aggregate_bytes = entries
         .iter()
@@ -552,6 +614,1486 @@ fn validate_registry_bounds(entries: &[DivergenceRegisterEntry]) -> Result<(), G
     Ok(())
 }
 
+/// Append-only, machine-readable source of truth for divergence review.
+///
+/// The event stream retains every observation, disposition, correction, and
+/// predicted-class decision. Corrections append a new event whose
+/// `supersedes` field names the currently active event for the same logical
+/// record; prior evidence is never rewritten or removed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DivergenceRegisterLedger {
+    pub schema_version: u32,
+    pub register_id: String,
+    pub redaction_policy_version: String,
+    pub events: Vec<DivergenceRegisterEvent>,
+}
+
+/// One immutable event in the Divergence Register ledger.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(
+    tag = "event_type",
+    content = "event",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
+pub enum DivergenceRegisterEvent {
+    Observation(Box<DivergenceObservationEvent>),
+    Disposition(DivergenceDispositionEvent),
+    Prediction(DivergencePredictionEvent),
+}
+
+/// Common append-only ordering and authorship fields for register events.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DivergenceRegisterEventHeader {
+    pub sequence: u64,
+    pub supersedes: Option<u64>,
+    pub recorded_by: String,
+    pub recorded_at: String,
+}
+
+/// Version-routed producer and oracle identity for one observation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged, deny_unknown_fields)]
+pub enum DivergenceRevisionSet {
+    CurrentV2 {
+        producer_build_identity_sha256: String,
+        oracle_dependency_contract_sha256: String,
+        oracle_lexical_contract_audit_revision: String,
+        corpus_manifest_sha256: String,
+        query_manifest_sha256: String,
+        query_suite_source: QuerySuiteSource,
+        query_source_identity_sha256: String,
+    },
+    LegacyV1 {
+        subject_git_revision: String,
+        oracle_git_revision: String,
+        corpus_manifest_sha256: String,
+        query_manifest_sha256: String,
+        generator_revision: String,
+    },
+}
+
+/// Minimized, replayable fixture evidence retained with an observation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DivergenceFixtureEvidence {
+    pub fixture_id: String,
+    pub fixture_sha256: String,
+    pub regression_test: String,
+    pub minimized: bool,
+}
+
+/// Source-sensitive diagnostics represented only by a digest and safe marker.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RedactedDivergenceDiagnostic {
+    pub payload_sha256: String,
+    pub marker: String,
+}
+
+/// Exact domain-separated hash scheme admitted by Divergence Register v2.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DivergenceArtifactObjectHashScheme {
+    #[serde(rename = "frankensearch-quill-gauntlet/artifact-object/v7/sha256")]
+    ArtifactObjectV7Sha256,
+}
+
+/// Typed content address of the exact first-recorded gauntlet witness object.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DivergenceArtifactObjectHash {
+    pub scheme: DivergenceArtifactObjectHashScheme,
+    pub object_schema_version: u32,
+    pub digest: String,
+}
+
+/// One observed mismatch, including its first-recorded witness evidence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DivergenceObservationEvent {
+    pub header: DivergenceRegisterEventHeader,
+    pub divergence_id: String,
+    pub class: DivergenceClass,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_recorded_witness_case_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_recorded_witness_artifact_object: Option<DivergenceArtifactObjectHash>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_seen_artifact_object_hash: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_seen_artifact_sha256: Option<String>,
+    pub revisions: DivergenceRevisionSet,
+    pub fixture: DivergenceFixtureEvidence,
+    pub mismatch_signatures: Vec<String>,
+    pub observed_behavior: String,
+    pub expected_behavior: String,
+    pub root_cause: String,
+    pub consumer_impact: String,
+    pub diagnostic: RedactedDivergenceDiagnostic,
+}
+
+/// Current reviewed outcome for an observed divergence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum DivergenceDisposition {
+    Accepted {
+        equivalence_law: String,
+        rationale: String,
+        reviewer: String,
+        reviewed_at: String,
+    },
+    Fixed {
+        fixing_commit: String,
+        regression_test: String,
+        reviewer: String,
+        reviewed_at: String,
+    },
+    Blocking {
+        bead_id: String,
+        rationale: String,
+        reviewer: String,
+        reviewed_at: String,
+    },
+}
+
+/// Append-only disposition revision for one observed divergence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DivergenceDispositionEvent {
+    pub header: DivergenceRegisterEventHeader,
+    pub divergence_id: String,
+    pub disposition: DivergenceDisposition,
+}
+
+/// Lifecycle state for a divergence class predicted before live evidence.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum PredictedDivergenceState {
+    Declared {
+        rationale: String,
+        owner: String,
+        bead_id: String,
+    },
+    Observed {
+        divergence_id: String,
+        reviewer: String,
+        reviewed_at: String,
+    },
+    Retired {
+        proof_sha256: String,
+        rationale: String,
+        reviewer: String,
+        reviewed_at: String,
+    },
+}
+
+/// Append-only lifecycle revision for one predicted divergence class.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DivergencePredictionEvent {
+    pub header: DivergenceRegisterEventHeader,
+    pub prediction_id: String,
+    pub class: DivergenceClass,
+    pub state: PredictedDivergenceState,
+}
+
+/// Test-only per-class structural counts derived from the ledger shape.
+#[cfg(test)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DivergenceClassCensus {
+    pub(crate) class: DivergenceClass,
+    pub(crate) active_entries: u64,
+    pub(crate) observed_mismatches: u64,
+    pub(crate) accepted_entries: u64,
+    pub(crate) fixed_entries: u64,
+    pub(crate) blocking_entries: u64,
+}
+
+/// Test-only, nonadmissible join of caller-supplied signatures against the register.
+#[cfg(test)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DivergenceCensus {
+    pub(crate) schema_version: u32,
+    pub(crate) prediction_policy_version: String,
+    pub(crate) prediction_policy_sha256: String,
+    pub(crate) required_prediction_classes: Vec<DivergenceClass>,
+    pub(crate) register_hash: String,
+    pub(crate) mismatch_count: u64,
+    pub(crate) registered_mismatch_count: u64,
+    pub(crate) class_census: Vec<DivergenceClassCensus>,
+    pub(crate) unclassified_signatures: Vec<String>,
+    pub(crate) fixed_regression_divergence_ids: Vec<String>,
+    pub(crate) blocking_divergence_ids: Vec<String>,
+    pub(crate) unresolved_prediction_ids: Vec<String>,
+    pub(crate) missing_prediction_classes: Vec<DivergenceClass>,
+    pub(crate) unresolved_lexical_mismatch_signatures: Vec<String>,
+    pub(crate) flip_ready: bool,
+}
+
+/// Hash-bound content for one minimized fixture.
+///
+/// This proves byte availability and digest equality only. It is not a replay
+/// receipt and cannot make a terminal census admissible.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DivergenceFixtureContentWitness {
+    fixture_id: String,
+    fixture_sha256: String,
+}
+
+impl DivergenceFixtureContentWitness {
+    /// Seal caller-supplied fixture bytes under their canonical fixture ID.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the fixture ID violates the v2 identifier bound.
+    pub fn from_bytes(
+        fixture_id: impl Into<String>,
+        fixture_bytes: &[u8],
+    ) -> Result<Self, GauntletError> {
+        let fixture_id = fixture_id.into();
+        if !is_bounded_register_ascii_text(&fixture_id, MAX_QUERY_ID_BYTES) {
+            return Err(campaign_error(
+                "divergence fixture witness has a noncanonical fixture ID",
+            ));
+        }
+        Ok(Self {
+            fixture_id,
+            fixture_sha256: sha256_bytes(fixture_bytes),
+        })
+    }
+}
+
+struct DivergenceRegisterProjection<'a> {
+    observations: BTreeMap<String, &'a DivergenceObservationEvent>,
+    dispositions: BTreeMap<String, &'a DivergenceDispositionEvent>,
+    predictions: BTreeMap<String, &'a DivergencePredictionEvent>,
+}
+
+impl DivergenceRegisterEvent {
+    const fn header(&self) -> &DivergenceRegisterEventHeader {
+        match self {
+            Self::Observation(event) => &event.header,
+            Self::Disposition(event) => &event.header,
+            Self::Prediction(event) => &event.header,
+        }
+    }
+}
+
+impl DivergenceRegisterEventHeader {
+    fn validate(&self, expected_sequence: u64) -> Result<(), GauntletError> {
+        if self.sequence != expected_sequence
+            || self
+                .supersedes
+                .is_some_and(|sequence| sequence == 0 || sequence >= self.sequence)
+            || !is_bounded_register_text(&self.recorded_by, MAX_DIVERGENCE_REVIEWER_BYTES)
+            || !is_utc_timestamp(&self.recorded_at)
+        {
+            return Err(campaign_error(
+                "divergence register event header is not canonical or sequential",
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl DivergenceRevisionSet {
+    fn validate(&self, schema_version: u32) -> Result<(), GauntletError> {
+        let is_valid = match (schema_version, self) {
+            (
+                DIVERGENCE_REGISTER_LEDGER_SCHEMA_VERSION,
+                Self::CurrentV2 {
+                    producer_build_identity_sha256,
+                    oracle_dependency_contract_sha256,
+                    oracle_lexical_contract_audit_revision,
+                    corpus_manifest_sha256,
+                    query_manifest_sha256,
+                    query_suite_source: _,
+                    query_source_identity_sha256,
+                },
+            ) => {
+                is_lower_sha256(producer_build_identity_sha256)
+                    && is_lower_sha256(oracle_dependency_contract_sha256)
+                    && is_git_revision_40(oracle_lexical_contract_audit_revision)
+                    && is_lower_sha256(corpus_manifest_sha256)
+                    && is_lower_sha256(query_manifest_sha256)
+                    && is_lower_sha256(query_source_identity_sha256)
+            }
+            (
+                LEGACY_DIVERGENCE_REGISTER_LEDGER_SCHEMA_VERSION_V1,
+                Self::LegacyV1 {
+                    subject_git_revision,
+                    oracle_git_revision,
+                    corpus_manifest_sha256,
+                    query_manifest_sha256,
+                    generator_revision,
+                },
+            ) => {
+                is_git_revision(subject_git_revision)
+                    && is_git_revision(oracle_git_revision)
+                    && is_lower_sha256(corpus_manifest_sha256)
+                    && is_lower_sha256(query_manifest_sha256)
+                    && is_bounded_register_text(generator_revision, MAX_QUERY_ID_BYTES)
+            }
+            _ => false,
+        };
+        if !is_valid {
+            return Err(campaign_error(
+                "divergence observation revisions are incomplete or noncanonical",
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl DivergenceFixtureEvidence {
+    fn validate(&self, schema_version: u32) -> Result<(), GauntletError> {
+        let fixture_id_is_valid = match schema_version {
+            DIVERGENCE_REGISTER_LEDGER_SCHEMA_VERSION => {
+                is_bounded_register_ascii_text(&self.fixture_id, MAX_QUERY_ID_BYTES)
+            }
+            LEGACY_DIVERGENCE_REGISTER_LEDGER_SCHEMA_VERSION_V1 => {
+                is_bounded_register_text(&self.fixture_id, MAX_QUERY_ID_BYTES)
+            }
+            _ => false,
+        };
+        if !fixture_id_is_valid
+            || !is_lower_sha256(&self.fixture_sha256)
+            || !is_bounded_register_text(&self.regression_test, MAX_DIVERGENCE_REGISTER_PROSE_BYTES)
+            || !self.minimized
+        {
+            return Err(campaign_error(
+                "divergence evidence requires a minimized hashed fixture and replay test",
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl RedactedDivergenceDiagnostic {
+    fn validate(&self) -> Result<(), GauntletError> {
+        let safe_marker = self
+            .marker
+            .strip_prefix("<redacted:")
+            .and_then(|value| value.strip_suffix('>'))
+            .is_some_and(|value| {
+                !value.is_empty()
+                    && value.bytes().all(|byte| {
+                        byte.is_ascii_lowercase()
+                            || byte.is_ascii_digit()
+                            || matches!(byte, b'-' | b'_')
+                    })
+            });
+        if !is_lower_sha256(&self.payload_sha256)
+            || self.marker.len() > MAX_DIVERGENCE_REGISTER_MARKER_BYTES
+            || !safe_marker
+        {
+            return Err(campaign_error(
+                "divergence diagnostic must contain only a digest and canonical redaction marker",
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl DivergenceArtifactObjectHashScheme {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::ArtifactObjectV7Sha256 => OBJECT_HASH_SCHEME_V7_SHA256,
+        }
+    }
+}
+
+impl DivergenceArtifactObjectHash {
+    /// Construct a v7 artifact identity from a lowercase SHA-256 digest.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when `digest` is not exactly 64 lowercase hexadecimal
+    /// characters.
+    pub fn v7_sha256(digest: impl Into<String>) -> Result<Self, GauntletError> {
+        let identity = Self {
+            scheme: DivergenceArtifactObjectHashScheme::ArtifactObjectV7Sha256,
+            object_schema_version: DIVERGENCE_ARTIFACT_OBJECT_SCHEMA_VERSION_V7,
+            digest: digest.into(),
+        };
+        identity.validate()?;
+        Ok(identity)
+    }
+
+    fn validate(&self) -> Result<(), GauntletError> {
+        if self.scheme.as_str() != OBJECT_HASH_SCHEME_V7_SHA256
+            || self.object_schema_version != DIVERGENCE_ARTIFACT_OBJECT_SCHEMA_VERSION_V7
+            || !is_lower_sha256(&self.digest)
+        {
+            return Err(campaign_error(
+                "divergence artifact identity must be an exact v7 object-domain SHA-256 address",
+            ));
+        }
+        Ok(())
+    }
+
+    fn matches_binding(&self, binding: &ArtifactDivergenceBinding) -> bool {
+        self.object_schema_version == binding.object_schema_version
+            && self.scheme.as_str() == binding.object_hash_scheme
+            && self.digest == binding.object_hash
+    }
+}
+
+impl DivergenceObservationEvent {
+    fn validate(&self, schema_version: u32) -> Result<(), GauntletError> {
+        self.revisions.validate(schema_version)?;
+        self.fixture.validate(schema_version)?;
+        self.diagnostic.validate()?;
+        let witness_identity_is_valid = match (
+            schema_version,
+            &self.first_recorded_witness_case_id,
+            &self.first_recorded_witness_artifact_object,
+            self.first_seen_artifact_object_hash.as_deref(),
+            self.first_seen_artifact_sha256.as_deref(),
+        ) {
+            (
+                DIVERGENCE_REGISTER_LEDGER_SCHEMA_VERSION,
+                Some(case_id),
+                Some(artifact_object),
+                None,
+                None,
+            ) => {
+                is_bounded_register_ascii_text(case_id, MAX_QUERY_ID_BYTES)
+                    && artifact_object.validate().is_ok()
+            }
+            (
+                LEGACY_DIVERGENCE_REGISTER_LEDGER_SCHEMA_VERSION_V1,
+                None,
+                None,
+                Some(first_seen_artifact_object_hash),
+                Some(first_seen_artifact_sha256),
+            ) => {
+                is_lower_xxh3(first_seen_artifact_object_hash)
+                    && is_lower_sha256(first_seen_artifact_sha256)
+            }
+            _ => false,
+        };
+        let invalid_signatures = self.mismatch_signatures.is_empty()
+            || self.mismatch_signatures.len() > 64
+            || self
+                .mismatch_signatures
+                .iter()
+                .any(|signature| !is_lower_sha256(signature))
+            || self
+                .mismatch_signatures
+                .windows(2)
+                .any(|pair| pair[0] >= pair[1]);
+        if !is_register_id(&self.divergence_id)
+            || !witness_identity_is_valid
+            || invalid_signatures
+            || !is_bounded_register_text(
+                &self.observed_behavior,
+                MAX_DIVERGENCE_REGISTER_PROSE_BYTES,
+            )
+            || !is_bounded_register_text(
+                &self.expected_behavior,
+                MAX_DIVERGENCE_REGISTER_PROSE_BYTES,
+            )
+            || !is_bounded_register_text(&self.root_cause, MAX_DIVERGENCE_REGISTER_PROSE_BYTES)
+            || !is_bounded_register_text(&self.consumer_impact, MAX_DIVERGENCE_REGISTER_PROSE_BYTES)
+        {
+            return Err(campaign_error(
+                "divergence observation is missing bounded classified evidence",
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_against_artifact_binding(
+        &self,
+        binding: &ArtifactDivergenceBinding,
+    ) -> Result<(), GauntletError> {
+        let address = self
+            .first_recorded_witness_artifact_object
+            .as_ref()
+            .ok_or_else(|| {
+                campaign_error(
+                    "current relational-integrity divergence evidence requires a recorded artifact-object witness",
+                )
+            })?;
+        let DivergenceRevisionSet::CurrentV2 {
+            producer_build_identity_sha256,
+            oracle_dependency_contract_sha256,
+            oracle_lexical_contract_audit_revision,
+            corpus_manifest_sha256,
+            query_manifest_sha256,
+            query_suite_source,
+            query_source_identity_sha256,
+            ..
+        } = &self.revisions
+        else {
+            return Err(campaign_error(
+                "current relational-integrity divergence evidence requires producer and oracle identities",
+            ));
+        };
+        let mut artifact_signatures = binding
+            .divergences
+            .iter()
+            .filter(|divergence| !is_auto_class(divergence.class) && divergence.class == self.class)
+            .map(|divergence| mismatch_signature(binding.rank_class, divergence))
+            .collect::<Vec<_>>();
+        artifact_signatures.sort();
+        let artifact_divergence_is_exact =
+            !artifact_signatures.is_empty() && artifact_signatures == self.mismatch_signatures;
+        if !address.matches_binding(binding)
+            || producer_build_identity_sha256 != &binding.producer_identity_sha256
+            || oracle_dependency_contract_sha256 != &binding.oracle_dependency_identity_sha256
+            || oracle_lexical_contract_audit_revision
+                != &binding.oracle_lexical_contract_audit_revision
+            || corpus_manifest_sha256 != &binding.corpus_manifest_sha256
+            || query_manifest_sha256 != &binding.query_manifest_sha256
+            || query_suite_source != &binding.query_suite_source
+            || query_source_identity_sha256 != &binding.query_source_identity_sha256
+            || self.first_recorded_witness_case_id.as_deref() != Some(binding.fixture_id.as_str())
+            || !artifact_divergence_is_exact
+        {
+            return Err(campaign_error(
+                "divergence observation does not match its integrity-checked ArtifactObject evidence",
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl DivergenceDisposition {
+    fn validate(&self, observation: &DivergenceObservationEvent) -> Result<(), GauntletError> {
+        match self {
+            Self::Accepted {
+                equivalence_law,
+                rationale,
+                reviewer,
+                reviewed_at,
+            } => {
+                let raw_failure_class = matches!(
+                    observation.class,
+                    DivergenceClass::RankMismatch
+                        | DivergenceClass::SnippetMismatch
+                        | DivergenceClass::CountMismatch
+                        | DivergenceClass::DocumentCountMismatch
+                        | DivergenceClass::PostingRecordSemantics
+                );
+                if raw_failure_class
+                    || !is_bounded_register_text(
+                        equivalence_law,
+                        MAX_DIVERGENCE_REGISTER_PROSE_BYTES,
+                    )
+                    || !is_bounded_register_text(rationale, MAX_DIVERGENCE_REGISTER_PROSE_BYTES)
+                    || !is_bounded_register_text(reviewer, MAX_DIVERGENCE_REVIEWER_BYTES)
+                    || reviewer == &observation.header.recorded_by
+                    || !is_utc_timestamp(reviewed_at)
+                {
+                    return Err(campaign_error(
+                        "accepted divergence requires a semantic class, law, rationale, and independent review",
+                    ));
+                }
+            }
+            Self::Fixed {
+                fixing_commit,
+                regression_test,
+                reviewer,
+                reviewed_at,
+            } => {
+                if !is_git_revision(fixing_commit)
+                    || !is_bounded_register_text(
+                        regression_test,
+                        MAX_DIVERGENCE_REGISTER_PROSE_BYTES,
+                    )
+                    || !is_bounded_register_text(reviewer, MAX_DIVERGENCE_REVIEWER_BYTES)
+                    || !is_utc_timestamp(reviewed_at)
+                {
+                    return Err(campaign_error(
+                        "fixed divergence requires a commit, regression test, and review",
+                    ));
+                }
+            }
+            Self::Blocking {
+                bead_id,
+                rationale,
+                reviewer,
+                reviewed_at,
+            } => {
+                if !is_bead_id(bead_id)
+                    || !is_bounded_register_text(rationale, MAX_DIVERGENCE_REGISTER_PROSE_BYTES)
+                    || !is_bounded_register_text(reviewer, MAX_DIVERGENCE_REVIEWER_BYTES)
+                    || !is_utc_timestamp(reviewed_at)
+                {
+                    return Err(campaign_error(
+                        "blocking divergence requires an owned bead, rationale, and review",
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+impl DivergencePredictionEvent {
+    fn validate(
+        &self,
+        observations: &BTreeMap<String, &DivergenceObservationEvent>,
+        previous: Option<&Self>,
+    ) -> Result<(), GauntletError> {
+        if !is_prediction_id(&self.prediction_id) {
+            return Err(campaign_error(
+                "predicted divergence ID must use canonical PRED-NNN form",
+            ));
+        }
+        if previous.is_some_and(|event| {
+            matches!(
+                (&event.state, &self.state),
+                (_, PredictedDivergenceState::Declared { .. })
+            )
+        }) {
+            return Err(campaign_error(
+                "predicted divergence lifecycle cannot return to declared",
+            ));
+        }
+        match &self.state {
+            PredictedDivergenceState::Declared {
+                rationale,
+                owner,
+                bead_id,
+            } => {
+                if previous.is_some()
+                    || !is_bounded_register_text(rationale, MAX_DIVERGENCE_REGISTER_PROSE_BYTES)
+                    || !is_bounded_register_text(owner, MAX_DIVERGENCE_REVIEWER_BYTES)
+                    || !is_bead_id(bead_id)
+                {
+                    return Err(campaign_error(
+                        "declared prediction requires a rationale, owner, and bead",
+                    ));
+                }
+            }
+            PredictedDivergenceState::Observed {
+                divergence_id,
+                reviewer,
+                reviewed_at,
+            } => {
+                let matching_observation = observations
+                    .get(divergence_id)
+                    .is_some_and(|observation| observation.class == self.class);
+                if previous.is_none()
+                    || !matching_observation
+                    || !is_bounded_register_text(reviewer, MAX_DIVERGENCE_REVIEWER_BYTES)
+                    || !is_utc_timestamp(reviewed_at)
+                {
+                    return Err(campaign_error(
+                        "observed prediction must name a same-class registered divergence and review",
+                    ));
+                }
+            }
+            PredictedDivergenceState::Retired {
+                proof_sha256,
+                rationale,
+                reviewer,
+                reviewed_at,
+            } => {
+                if previous.is_none()
+                    || !is_lower_sha256(proof_sha256)
+                    || !is_bounded_register_text(rationale, MAX_DIVERGENCE_REGISTER_PROSE_BYTES)
+                    || !is_bounded_register_text(reviewer, MAX_DIVERGENCE_REVIEWER_BYTES)
+                    || !is_utc_timestamp(reviewed_at)
+                {
+                    return Err(campaign_error(
+                        "retired prediction requires hashed proof, rationale, and review",
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+impl DivergenceRegisterLedger {
+    /// Construct and validate an append-only register ledger.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when any event, revision link, evidence field, or
+    /// active projection violates the current v2 contract.
+    pub fn new(
+        register_id: impl Into<String>,
+        events: Vec<DivergenceRegisterEvent>,
+    ) -> Result<Self, GauntletError> {
+        let ledger = Self {
+            schema_version: DIVERGENCE_REGISTER_LEDGER_SCHEMA_VERSION,
+            register_id: register_id.into(),
+            redaction_policy_version: DIVERGENCE_REGISTER_REDACTION_POLICY_VERSION.to_owned(),
+            events,
+        };
+        ledger.validate()?;
+        Ok(ledger)
+    }
+
+    /// Decode and structurally validate a current v2 or archived v1 ledger.
+    ///
+    /// Archived v1 ledgers remain readable for historical inspection, but
+    /// every evidence-producing method calls [`Self::validate`] and therefore
+    /// rejects them as nonadmissible.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for malformed JSON, an unsupported schema version, or
+    /// a document whose artifact address does not match its schema version.
+    pub fn decode_json(bytes: &[u8]) -> Result<Self, GauntletError> {
+        let ledger = serde_json::from_slice::<Self>(bytes).map_err(|error| {
+            campaign_error(format!("failed to decode divergence register: {error}"))
+        })?;
+        match ledger.schema_version {
+            LEGACY_DIVERGENCE_REGISTER_LEDGER_SCHEMA_VERSION_V1 => {
+                ledger.validate_for_schema(LEGACY_DIVERGENCE_REGISTER_LEDGER_SCHEMA_VERSION_V1)?;
+            }
+            DIVERGENCE_REGISTER_LEDGER_SCHEMA_VERSION => {
+                ledger.validate_for_schema(DIVERGENCE_REGISTER_LEDGER_SCHEMA_VERSION)?;
+            }
+            _ => {
+                return Err(campaign_error(
+                    "divergence register schema version is unsupported",
+                ));
+            }
+        }
+        Ok(ledger)
+    }
+
+    /// Validate self-contained schema, ordering, supersession, and active state.
+    ///
+    /// This proves the ledger's canonical shape, but cannot prove that an
+    /// externally named artifact exists or that its co-located producer and
+    /// oracle identities are authentic. The crate-internal integrity join is
+    /// necessary but not sufficient for any F0 terminal decision.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for malformed evidence, history rewrites, orphan
+    /// dispositions, duplicate active signatures, or incomplete reviews.
+    pub fn validate(&self) -> Result<(), GauntletError> {
+        if self.schema_version != DIVERGENCE_REGISTER_LEDGER_SCHEMA_VERSION {
+            return Err(campaign_error(
+                "only divergence register schema v2 satisfies the current structural contract",
+            ));
+        }
+        self.validate_for_schema(DIVERGENCE_REGISTER_LEDGER_SCHEMA_VERSION)
+    }
+
+    /// Check relational integrity between every observation and its built-in
+    /// gauntlet object witness.
+    ///
+    /// Each supplied [`ArtifactObject`] is validated by its owning artifact
+    /// contract before this method compares the exact object schema/hash
+    /// domain, digest, producer-build identity, oracle dependency identity,
+    /// and lexical-contract audit revision. Every observation event,
+    /// including superseded history, must have a matching artifact witness.
+    /// Call [`Self::validate`] alone only for structural inspection.
+    ///
+    /// # Errors
+    ///
+    /// This is an integrity-only join. Raw objects can reproduce their own
+    /// claims, so this method never authenticates a producer, admits evidence,
+    /// or authorizes a replacement. F0 must instead consume an externally
+    /// authenticated receipt chain built from [`crate::IntegrityCheckedCampaign`].
+    ///
+    /// Returns an error for a structurally invalid ledger, an invalid or
+    /// duplicate artifact, a missing first-recorded artifact, or any well-formed
+    /// but substituted artifact/producer/oracle identity.
+    pub fn validate_relational_integrity_against_artifact_objects(
+        &self,
+        artifacts: &[ArtifactObject],
+    ) -> Result<(), GauntletError> {
+        self.validate()?;
+        let mut bindings = BTreeMap::<String, ArtifactDivergenceBinding>::new();
+        for artifact in artifacts {
+            let binding = artifact.divergence_binding()?;
+            if bindings
+                .insert(binding.object_hash.clone(), binding)
+                .is_some()
+            {
+                return Err(campaign_error(
+                    "divergence artifact witness set contains a duplicate object hash",
+                ));
+            }
+        }
+
+        for event in &self.events {
+            let DivergenceRegisterEvent::Observation(observation) = event else {
+                continue;
+            };
+            let object_hash = observation
+                .first_recorded_witness_artifact_object
+                .as_ref()
+                .map(|address| address.digest.as_str())
+                .ok_or_else(|| {
+                    campaign_error(
+                        "current relational-integrity divergence evidence requires a recorded artifact-object witness",
+                    )
+                })?;
+            let binding = bindings.get(object_hash).ok_or_else(|| {
+                campaign_error(format!(
+                    "divergence observation {} has no integrity-checked ArtifactObject witness",
+                    observation.divergence_id
+                ))
+            })?;
+            observation.validate_against_artifact_binding(binding)?;
+        }
+        let claimed_by_object = self.artifact_claims_from_all_observations()?;
+        let mut expected_by_object = BTreeMap::<String, Vec<(String, String)>>::new();
+        for (object_hash, binding) in &bindings {
+            let mut expected = binding
+                .divergences
+                .iter()
+                .filter(|divergence| !is_auto_class(divergence.class))
+                .map(|divergence| {
+                    (
+                        divergence_class_name(divergence.class).to_owned(),
+                        mismatch_signature(binding.rank_class, divergence),
+                    )
+                })
+                .collect::<Vec<_>>();
+            expected.sort();
+            expected_by_object.insert(object_hash.clone(), expected);
+        }
+        validate_exact_artifact_claim_coverage(&claimed_by_object, &expected_by_object)
+    }
+
+    /// Verify the exact minimized-fixture bytes named by every observation.
+    ///
+    /// This is content-integrity validation only. It does not prove that the
+    /// regression test exists or passed, and therefore is not a terminal
+    /// release admission API.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid ledger or a missing, extra, duplicate,
+    /// or hash-mismatched fixture-content witness.
+    pub fn validate_fixture_content_witnesses(
+        &self,
+        witnesses: &[DivergenceFixtureContentWitness],
+    ) -> Result<(), GauntletError> {
+        self.validate()?;
+        let mut fixtures = BTreeMap::<String, String>::new();
+        for witness in witnesses {
+            if fixtures
+                .insert(witness.fixture_id.clone(), witness.fixture_sha256.clone())
+                .is_some()
+            {
+                return Err(campaign_error(
+                    "divergence fixture witnesses contain a duplicate fixture ID",
+                ));
+            }
+        }
+        let mut required_fixtures = BTreeMap::<String, String>::new();
+        for event in &self.events {
+            let DivergenceRegisterEvent::Observation(observation) = event else {
+                continue;
+            };
+            if let Some(previous_hash) = required_fixtures.insert(
+                observation.fixture.fixture_id.clone(),
+                observation.fixture.fixture_sha256.clone(),
+            ) && previous_hash != observation.fixture.fixture_sha256
+            {
+                return Err(campaign_error(
+                    "one divergence fixture ID cannot name multiple content hashes",
+                ));
+            }
+        }
+        if fixtures != required_fixtures {
+            return Err(campaign_error(
+                "divergence fixture content witnesses do not exactly cover ledger evidence",
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_for_schema(&self, schema_version: u32) -> Result<(), GauntletError> {
+        if self.schema_version != schema_version
+            || !matches!(
+                schema_version,
+                LEGACY_DIVERGENCE_REGISTER_LEDGER_SCHEMA_VERSION_V1
+                    | DIVERGENCE_REGISTER_LEDGER_SCHEMA_VERSION
+            )
+            || !is_register_name(&self.register_id)
+            || self.redaction_policy_version != DIVERGENCE_REGISTER_REDACTION_POLICY_VERSION
+            || self.events.len() > MAX_DIVERGENCE_REGISTER_EVENTS
+        {
+            return Err(campaign_error(
+                "divergence register schema, identity, policy, or event budget is invalid",
+            ));
+        }
+        let serialized = serde_json::to_vec(self).map_err(|error| {
+            campaign_error(format!("failed to serialize divergence register: {error}"))
+        })?;
+        if serialized.len() > MAX_DIVERGENCE_REGISTRY_TEXT_BYTES {
+            return Err(campaign_error(
+                "divergence register exceeds its aggregate byte budget",
+            ));
+        }
+
+        let mut observations = BTreeMap::<String, &DivergenceObservationEvent>::new();
+        let mut dispositions = BTreeMap::<String, &DivergenceDispositionEvent>::new();
+        let mut predictions = BTreeMap::<String, &DivergencePredictionEvent>::new();
+        for (index, event) in self.events.iter().enumerate() {
+            let expected_sequence = u64::try_from(index)
+                .ok()
+                .and_then(|value| value.checked_add(1))
+                .ok_or_else(|| campaign_error("divergence register sequence overflow"))?;
+            event.header().validate(expected_sequence)?;
+            match event {
+                DivergenceRegisterEvent::Observation(observation) => {
+                    observation.validate(schema_version)?;
+                    if observations
+                        .get(&observation.divergence_id)
+                        .is_some_and(|previous| previous.class != observation.class)
+                    {
+                        return Err(campaign_error(
+                            "divergence observation correction cannot change its class",
+                        ));
+                    }
+                    validate_revision_link(
+                        &observation.header,
+                        observations
+                            .get(&observation.divergence_id)
+                            .map(|event| event.header.sequence),
+                        "observation",
+                    )?;
+                    observations.insert(observation.divergence_id.clone(), observation);
+                }
+                DivergenceRegisterEvent::Disposition(disposition) => {
+                    if !is_register_id(&disposition.divergence_id) {
+                        return Err(campaign_error(
+                            "divergence disposition has a malformed register ID",
+                        ));
+                    }
+                    let observation =
+                        observations
+                            .get(&disposition.divergence_id)
+                            .ok_or_else(|| {
+                                campaign_error(
+                                    "divergence disposition precedes its observed evidence",
+                                )
+                            })?;
+                    validate_revision_link(
+                        &disposition.header,
+                        dispositions
+                            .get(&disposition.divergence_id)
+                            .map(|event| event.header.sequence),
+                        "disposition",
+                    )?;
+                    disposition.disposition.validate(observation)?;
+                    dispositions.insert(disposition.divergence_id.clone(), disposition);
+                }
+                DivergenceRegisterEvent::Prediction(prediction) => {
+                    validate_revision_link(
+                        &prediction.header,
+                        predictions
+                            .get(&prediction.prediction_id)
+                            .map(|event| event.header.sequence),
+                        "prediction",
+                    )?;
+                    prediction.validate(
+                        &observations,
+                        predictions.get(&prediction.prediction_id).copied(),
+                    )?;
+                    predictions.insert(prediction.prediction_id.clone(), prediction);
+                }
+            }
+        }
+
+        let mut active_signatures = BTreeMap::<&str, &str>::new();
+        for (divergence_id, observation) in &observations {
+            let disposition = dispositions.get(divergence_id).ok_or_else(|| {
+                campaign_error("every active divergence observation requires a disposition")
+            })?;
+            if disposition.header.sequence <= observation.header.sequence {
+                return Err(campaign_error(
+                    "corrected divergence evidence requires a later disposition review",
+                ));
+            }
+            disposition.disposition.validate(observation)?;
+            for signature in &observation.mismatch_signatures {
+                if active_signatures.insert(signature, divergence_id).is_some() {
+                    return Err(campaign_error(
+                        "one active mismatch signature cannot belong to multiple divergences",
+                    ));
+                }
+            }
+        }
+        for prediction in predictions.values() {
+            if let PredictedDivergenceState::Observed { divergence_id, .. } = &prediction.state
+                && !observations
+                    .get(divergence_id)
+                    .is_some_and(|observation| observation.class == prediction.class)
+            {
+                return Err(campaign_error(
+                    "active observed prediction no longer names a same-class divergence",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Domain-separated structural identity of the immutable event stream.
+    ///
+    /// This hash commits to the ledger bytes; it is not proof that referenced
+    /// artifact objects were supplied or authenticated. It is never terminal
+    /// evidence by itself.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the ledger is invalid or cannot be serialized.
+    pub fn ledger_hash(&self) -> Result<String, GauntletError> {
+        self.validate()?;
+        let mut hasher = Sha256::new();
+        hasher.update(DIVERGENCE_REGISTER_LEDGER_HASH_DOMAIN);
+        hasher.update(serde_json::to_vec(self).map_err(|error| {
+            campaign_error(format!("failed to serialize divergence register: {error}"))
+        })?);
+        Ok(lower_hex(&hasher.finalize()))
+    }
+
+    /// Prove that this snapshot only appends to a prior valid snapshot.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if schema identity changed or any prior event was
+    /// removed, reordered, or edited.
+    pub fn validate_append_only_successor(&self, previous: &Self) -> Result<(), GauntletError> {
+        previous.validate()?;
+        self.validate()?;
+        if self.schema_version != previous.schema_version
+            || self.register_id != previous.register_id
+            || self.redaction_policy_version != previous.redaction_policy_version
+            || self.events.len() < previous.events.len()
+            || self.events[..previous.events.len()] != previous.events
+        {
+            return Err(campaign_error(
+                "divergence register successor rewrites prior history",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Reject caller-supplied sensitive canaries anywhere in committed bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid ledger, malformed canary, or leak.
+    pub fn validate_redaction_canaries(
+        &self,
+        forbidden_canaries: &[&str],
+    ) -> Result<(), GauntletError> {
+        self.validate()?;
+        let serialized = serde_json::to_string(self).map_err(|error| {
+            campaign_error(format!("failed to serialize divergence register: {error}"))
+        })?;
+        for canary in forbidden_canaries {
+            if canary.is_empty() || canary.chars().any(char::is_control) {
+                return Err(campaign_error(
+                    "divergence register redaction canary is empty or malformed",
+                ));
+            }
+            if serialized.contains(canary) {
+                return Err(campaign_error(
+                    "divergence register contains a forbidden source-sensitive canary",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    // Deliberately test-only and nonadmissible. A public terminal census must
+    // derive both signature sets from a frozen, store-integrity-checked complete
+    // campaign matrix; raw caller slices permit omission and cherry-picking.
+    #[cfg(test)]
+    fn nonadmissible_structural_census(
+        &self,
+        mismatch_signatures: &[String],
+        lexical_mismatch_signatures: &[String],
+    ) -> Result<DivergenceCensus, GauntletError> {
+        self.validate()?;
+        let invalid_signatures = |signatures: &[String]| {
+            signatures
+                .iter()
+                .any(|signature| !is_lower_sha256(signature))
+                || signatures.windows(2).any(|pair| pair[0] >= pair[1])
+        };
+        if invalid_signatures(mismatch_signatures)
+            || invalid_signatures(lexical_mismatch_signatures)
+        {
+            return Err(campaign_error(
+                "structural census signatures must be unique sorted SHA-256 values",
+            ));
+        }
+        let projection = self.projection();
+        let mut signature_owners =
+            BTreeMap::<&str, (&DivergenceObservationEvent, &DivergenceDispositionEvent)>::new();
+        for (divergence_id, observation) in &projection.observations {
+            let disposition = projection
+                .dispositions
+                .get(divergence_id)
+                .ok_or_else(|| campaign_error("active divergence is missing a disposition"))?;
+            for signature in &observation.mismatch_signatures {
+                signature_owners.insert(signature, (observation, disposition));
+            }
+        }
+
+        let mut unclassified_signatures = Vec::new();
+        let mut fixed_regressions = BTreeSet::new();
+        for signature in mismatch_signatures {
+            match signature_owners.get(signature.as_str()) {
+                None => unclassified_signatures.push(signature.clone()),
+                Some((observation, disposition)) => {
+                    if matches!(
+                        &disposition.disposition,
+                        DivergenceDisposition::Fixed { .. }
+                    ) {
+                        fixed_regressions.insert(observation.divergence_id.clone());
+                    }
+                }
+            }
+        }
+        let blocking_divergence_ids = projection
+            .dispositions
+            .iter()
+            .filter(|(_, event)| {
+                matches!(&event.disposition, DivergenceDisposition::Blocking { .. })
+            })
+            .map(|(divergence_id, _)| divergence_id.clone())
+            .collect::<Vec<_>>();
+        let unresolved_prediction_ids = projection
+            .predictions
+            .iter()
+            .filter(|(_, event)| {
+                matches!(
+                    &event.state,
+                    PredictedDivergenceState::Declared { .. }
+                        | PredictedDivergenceState::Retired { .. }
+                )
+            })
+            .map(|(prediction_id, _)| prediction_id.clone())
+            .collect::<Vec<_>>();
+        let missing_prediction_classes = REQUIRED_DIVERGENCE_PREDICTION_CLASSES
+            .iter()
+            .copied()
+            .filter(|required_class| {
+                !projection
+                    .predictions
+                    .values()
+                    .any(|prediction| prediction.class == *required_class)
+            })
+            .collect::<Vec<_>>();
+
+        let mut class_census = Vec::with_capacity(DIVERGENCE_CLASSES.len());
+        for class in DIVERGENCE_CLASSES {
+            let active = projection
+                .observations
+                .values()
+                .filter(|observation| observation.class == class)
+                .count();
+            let observed = mismatch_signatures
+                .iter()
+                .filter(|signature| {
+                    signature_owners
+                        .get(signature.as_str())
+                        .is_some_and(|(observation, _)| observation.class == class)
+                })
+                .count();
+            let accepted = projection
+                .dispositions
+                .iter()
+                .filter(|(divergence_id, disposition)| {
+                    projection
+                        .observations
+                        .get(*divergence_id)
+                        .is_some_and(|observation| observation.class == class)
+                        && matches!(
+                            &disposition.disposition,
+                            DivergenceDisposition::Accepted { .. }
+                        )
+                })
+                .count();
+            let fixed = projection
+                .dispositions
+                .iter()
+                .filter(|(divergence_id, disposition)| {
+                    projection
+                        .observations
+                        .get(*divergence_id)
+                        .is_some_and(|observation| observation.class == class)
+                        && matches!(
+                            &disposition.disposition,
+                            DivergenceDisposition::Fixed { .. }
+                        )
+                })
+                .count();
+            let blocking = projection
+                .dispositions
+                .iter()
+                .filter(|(divergence_id, disposition)| {
+                    projection
+                        .observations
+                        .get(*divergence_id)
+                        .is_some_and(|observation| observation.class == class)
+                        && matches!(
+                            &disposition.disposition,
+                            DivergenceDisposition::Blocking { .. }
+                        )
+                })
+                .count();
+            class_census.push(DivergenceClassCensus {
+                class,
+                active_entries: count_to_u64(active)?,
+                observed_mismatches: count_to_u64(observed)?,
+                accepted_entries: count_to_u64(accepted)?,
+                fixed_entries: count_to_u64(fixed)?,
+                blocking_entries: count_to_u64(blocking)?,
+            });
+        }
+
+        let fixed_regression_divergence_ids = fixed_regressions.into_iter().collect::<Vec<_>>();
+        let flip_ready = unclassified_signatures.is_empty()
+            && fixed_regression_divergence_ids.is_empty()
+            && blocking_divergence_ids.is_empty()
+            && unresolved_prediction_ids.is_empty()
+            && missing_prediction_classes.is_empty()
+            && lexical_mismatch_signatures.is_empty();
+        let mismatch_count = count_to_u64(mismatch_signatures.len())?;
+        let registered_mismatch_count =
+            mismatch_count.saturating_sub(count_to_u64(unclassified_signatures.len())?);
+        Ok(DivergenceCensus {
+            schema_version: DIVERGENCE_REGISTER_LEDGER_SCHEMA_VERSION,
+            prediction_policy_version: DIVERGENCE_PREDICTION_POLICY_VERSION.to_owned(),
+            prediction_policy_sha256: divergence_prediction_policy_sha256(),
+            required_prediction_classes: REQUIRED_DIVERGENCE_PREDICTION_CLASSES.to_vec(),
+            register_hash: self.ledger_hash()?,
+            mismatch_count,
+            registered_mismatch_count,
+            class_census,
+            unclassified_signatures,
+            fixed_regression_divergence_ids,
+            blocking_divergence_ids,
+            unresolved_prediction_ids,
+            missing_prediction_classes,
+            unresolved_lexical_mismatch_signatures: lexical_mismatch_signatures.to_vec(),
+            flip_ready,
+        })
+    }
+
+    /// Render a deterministic, redacted active-entry review table.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the authoritative ledger is invalid.
+    pub fn review_table(&self) -> Result<String, GauntletError> {
+        use std::fmt::Write as _;
+
+        self.validate()?;
+        let projection = self.projection();
+        let mut output = String::from(
+            "| ID | Class | Fixture | Disposition | Reviewer |\n|---|---|---|---|---|\n",
+        );
+        for (divergence_id, observation) in &projection.observations {
+            let disposition = projection
+                .dispositions
+                .get(divergence_id)
+                .ok_or_else(|| campaign_error("active divergence is missing a disposition"))?;
+            let (label, reviewer) = disposition_label_and_reviewer(&disposition.disposition);
+            writeln!(
+                output,
+                "| {divergence_id} | {} | {} | {label} | {reviewer} |",
+                divergence_class_name(observation.class),
+                observation.fixture.fixture_id,
+            )
+            .map_err(|error| {
+                campaign_error(format!("failed to render divergence review table: {error}"))
+            })?;
+        }
+        Ok(output)
+    }
+
+    fn projection(&self) -> DivergenceRegisterProjection<'_> {
+        let mut projection = DivergenceRegisterProjection {
+            observations: BTreeMap::new(),
+            dispositions: BTreeMap::new(),
+            predictions: BTreeMap::new(),
+        };
+        for event in &self.events {
+            match event {
+                DivergenceRegisterEvent::Observation(observation) => {
+                    projection
+                        .observations
+                        .insert(observation.divergence_id.clone(), observation);
+                }
+                DivergenceRegisterEvent::Disposition(disposition) => {
+                    projection
+                        .dispositions
+                        .insert(disposition.divergence_id.clone(), disposition);
+                }
+                DivergenceRegisterEvent::Prediction(prediction) => {
+                    projection
+                        .predictions
+                        .insert(prediction.prediction_id.clone(), prediction);
+                }
+            }
+        }
+        projection
+    }
+
+    fn artifact_claims_from_all_observations(
+        &self,
+    ) -> Result<DivergenceArtifactClaims, GauntletError> {
+        let mut claims_by_object = DivergenceArtifactClaims::new();
+        for event in &self.events {
+            let DivergenceRegisterEvent::Observation(observation) = event else {
+                continue;
+            };
+            let object_hash = observation
+                .first_recorded_witness_artifact_object
+                .as_ref()
+                .map(|address| address.digest.clone())
+                .ok_or_else(|| {
+                    campaign_error(
+                        "current relational-integrity divergence evidence requires a recorded artifact-object witness",
+                    )
+                })?;
+            let object_claims = claims_by_object.entry(object_hash).or_default();
+            for signature in &observation.mismatch_signatures {
+                let claim = (
+                    divergence_class_name(observation.class).to_owned(),
+                    signature.clone(),
+                );
+                if let Some(existing_divergence_id) =
+                    object_claims.insert(claim, observation.divergence_id.clone())
+                    && existing_divergence_id != observation.divergence_id
+                {
+                    return Err(campaign_error(
+                        "different divergence IDs cannot claim one artifact mismatch",
+                    ));
+                }
+            }
+        }
+        Ok(claims_by_object)
+    }
+}
+
+type DivergenceArtifactClaims = BTreeMap<String, BTreeMap<(String, String), String>>;
+
+fn validate_exact_artifact_claim_coverage(
+    claimed_by_object: &DivergenceArtifactClaims,
+    expected_by_object: &BTreeMap<String, Vec<(String, String)>>,
+) -> Result<(), GauntletError> {
+    if claimed_by_object.len() != expected_by_object.len() {
+        return Err(campaign_error(
+            "divergence artifact witness set contains a missing or unreferenced object",
+        ));
+    }
+    for (object_hash, expected) in expected_by_object {
+        let claimed = claimed_by_object
+            .get(object_hash)
+            .map(|claims| claims.keys().cloned().collect::<Vec<_>>())
+            .unwrap_or_default();
+        if &claimed != expected {
+            return Err(campaign_error(
+                "divergence observations do not exactly cover their artifact mismatches",
+            ));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+const DIVERGENCE_CLASSES: [DivergenceClass; 14] = [
+    DivergenceClass::TieOrder,
+    DivergenceClass::ScoreEpsilon,
+    DivergenceClass::RankMismatch,
+    DivergenceClass::SnippetMismatch,
+    DivergenceClass::SnippetWindow,
+    DivergenceClass::CountMismatch,
+    DivergenceClass::DocumentCountMismatch,
+    DivergenceClass::GlobExpansionLimit,
+    DivergenceClass::QueryCanonicalization,
+    DivergenceClass::OracleBug,
+    DivergenceClass::StatsSemantics,
+    DivergenceClass::PostingRecordSemantics,
+    DivergenceClass::UnicodeEdge,
+    DivergenceClass::OversizedQueryToken,
+];
+
+// This frozen set includes every still-predicted class, including pending
+// StatsSemantics, plus the oversized-token prediction already advanced to
+// observed. Removing a seeded class would otherwise let an empty ledger
+// manufacture a structurally clean projection.
+#[cfg(test)]
+const REQUIRED_DIVERGENCE_PREDICTION_CLASSES: [DivergenceClass; 6] = [
+    DivergenceClass::ScoreEpsilon,
+    DivergenceClass::TieOrder,
+    DivergenceClass::SnippetWindow,
+    DivergenceClass::GlobExpansionLimit,
+    DivergenceClass::StatsSemantics,
+    DivergenceClass::OversizedQueryToken,
+];
+
+/// Domain-separated identity of the frozen ordered prediction policy.
+#[must_use]
+pub fn divergence_prediction_policy_sha256() -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(DIVERGENCE_PREDICTION_POLICY_HASH_DOMAIN);
+    hasher.update(DIVERGENCE_PREDICTION_POLICY_PREIMAGE.as_bytes());
+    lower_hex(&hasher.finalize())
+}
+
+fn validate_revision_link(
+    header: &DivergenceRegisterEventHeader,
+    active_sequence: Option<u64>,
+    event_kind: &str,
+) -> Result<(), GauntletError> {
+    if header.supersedes != active_sequence {
+        return Err(campaign_error(format!(
+            "divergence register {event_kind} must supersede its current active revision"
+        )));
+    }
+    Ok(())
+}
+
+fn disposition_label_and_reviewer(disposition: &DivergenceDisposition) -> (&'static str, &str) {
+    match disposition {
+        DivergenceDisposition::Accepted { reviewer, .. } => ("accepted", reviewer),
+        DivergenceDisposition::Fixed { reviewer, .. } => ("fixed", reviewer),
+        DivergenceDisposition::Blocking { reviewer, .. } => ("blocking", reviewer),
+    }
+}
+
+const fn divergence_class_name(class: DivergenceClass) -> &'static str {
+    match class {
+        DivergenceClass::TieOrder => "tie_order",
+        DivergenceClass::ScoreEpsilon => "score_epsilon",
+        DivergenceClass::RankMismatch => "rank_mismatch",
+        DivergenceClass::SnippetMismatch => "snippet_mismatch",
+        DivergenceClass::SnippetWindow => "snippet_window",
+        DivergenceClass::CountMismatch => "count_mismatch",
+        DivergenceClass::DocumentCountMismatch => "document_count_mismatch",
+        DivergenceClass::GlobExpansionLimit => "glob_expansion_limit",
+        DivergenceClass::QueryCanonicalization => "query_canonicalization",
+        DivergenceClass::OracleBug => "oracle_bug",
+        DivergenceClass::StatsSemantics => "stats_semantics",
+        DivergenceClass::PostingRecordSemantics => "posting_record_semantics",
+        DivergenceClass::UnicodeEdge => "unicode_edge",
+        DivergenceClass::OversizedQueryToken => "oversized_query_token",
+    }
+}
+
+#[cfg(test)]
+fn count_to_u64(value: usize) -> Result<u64, GauntletError> {
+    u64::try_from(value).map_err(|_| campaign_error("divergence census count overflow"))
+}
+
 /// Public-contract evidence required from each selected campaign case.
 ///
 /// The value is part of [`CampaignConfig`] and therefore covered by both the
@@ -568,6 +2110,7 @@ pub enum CampaignContractMode {
 
 /// Deterministic runner policy included in the report hash.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CampaignConfig {
     pub selection: CampaignSelection,
     pub comparator_config: ComparatorConfig,
@@ -612,16 +2155,31 @@ impl Default for CampaignConfig {
 
 impl CampaignConfig {
     fn validate(&self) -> Result<(), GauntletError> {
+        self.validate_stored_v7()?;
         self.comparator_config.validate_contract()?;
+        if u64::from(MAX_DOCUMENT_BYTES) != 2 * 1024 * 1024 || MAX_SNIPPET_CHARS != 1_000_000 {
+            return Err(campaign_error(
+                "current campaign limits changed without a report schema-version bump",
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_stored_v7(&self) -> Result<(), GauntletError> {
+        const V7_MAX_DOCUMENT_BYTES: u64 = 2 * 1024 * 1024;
+        const V7_MAX_INDEX_BATCH_BYTES: u64 = V7_MAX_DOCUMENT_BYTES * 512;
+        const V7_MAX_SNIPPET_CHARS: u64 = 1_000_000;
+
+        self.comparator_config.validate_stored_v7()?;
         let confidence = f64::from_bits(self.posterior_confidence_bits);
         if self.index_batch_size == 0
             || self.index_batch_size > 100_000
             || self.index_batch_max_bytes == 0
-            || self.index_batch_max_bytes > u64::from(MAX_DOCUMENT_BYTES) * 512
+            || self.index_batch_max_bytes > V7_MAX_INDEX_BATCH_BYTES
             || self.tie_expansion_limit > 100_000
             || self
                 .snippet_max_chars
-                .is_some_and(|value| value > MAX_SNIPPET_CHARS)
+                .is_some_and(|value| value > V7_MAX_SNIPPET_CHARS)
             || !confidence.is_finite()
             || !(0.0 < confidence && confidence < 1.0)
         {
@@ -644,6 +2202,154 @@ pub enum CampaignDisposition {
     InfrastructureError,
 }
 
+/// Frozen, machine-facing reason for a non-passing campaign case.
+///
+/// Backend and operating-system details belong in the noncanonical
+/// [`CampaignCaseResult::diagnostic`] field. Keeping the canonical reason as a
+/// closed enum prevents an infrastructure-only report from accepting arbitrary
+/// replacement text while retaining the same disposition.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "code", rename_all = "snake_case", deny_unknown_fields)]
+pub enum CampaignCaseReason {
+    ComparatorUnclassified,
+    MissingDivergenceRegistration,
+    ExpectedDivergenceNotRegistered { divergence_id: String },
+    ExpectedDivergenceMismatch { divergence_id: String },
+    LexicalContractMismatch,
+    ObservationDocumentCountDrift,
+    ComparisonFailed,
+    MismatchBudgetExceeded,
+    LexicalMismatchBudgetExceeded,
+    LexicalSummaryFailed,
+    ArtifactValidationFailed,
+    ArtifactPrepareFailed,
+    ArtifactPersistFailed,
+    LexicalContractObservationFailed,
+    BothEngineExecutionsFailed,
+    SubjectExecutionFailed,
+    OracleExecutionFailed,
+    MultipleObservationLanesFailed,
+    InvalidEngineErrorState,
+}
+
+impl<'de> Deserialize<'de> for CampaignCaseReason {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(tag = "code", rename_all = "snake_case", deny_unknown_fields)]
+        enum StrictWire {
+            ComparatorUnclassified {},
+            MissingDivergenceRegistration {},
+            ExpectedDivergenceNotRegistered { divergence_id: String },
+            ExpectedDivergenceMismatch { divergence_id: String },
+            LexicalContractMismatch {},
+            ObservationDocumentCountDrift {},
+            ComparisonFailed {},
+            MismatchBudgetExceeded {},
+            LexicalMismatchBudgetExceeded {},
+            LexicalSummaryFailed {},
+            ArtifactValidationFailed {},
+            ArtifactPrepareFailed {},
+            ArtifactPersistFailed {},
+            LexicalContractObservationFailed {},
+            BothEngineExecutionsFailed {},
+            SubjectExecutionFailed {},
+            OracleExecutionFailed {},
+            MultipleObservationLanesFailed {},
+            InvalidEngineErrorState {},
+        }
+
+        Ok(match StrictWire::deserialize(deserializer)? {
+            StrictWire::ComparatorUnclassified {} => Self::ComparatorUnclassified,
+            StrictWire::MissingDivergenceRegistration {} => Self::MissingDivergenceRegistration,
+            StrictWire::ExpectedDivergenceNotRegistered { divergence_id } => {
+                Self::ExpectedDivergenceNotRegistered { divergence_id }
+            }
+            StrictWire::ExpectedDivergenceMismatch { divergence_id } => {
+                Self::ExpectedDivergenceMismatch { divergence_id }
+            }
+            StrictWire::LexicalContractMismatch {} => Self::LexicalContractMismatch,
+            StrictWire::ObservationDocumentCountDrift {} => Self::ObservationDocumentCountDrift,
+            StrictWire::ComparisonFailed {} => Self::ComparisonFailed,
+            StrictWire::MismatchBudgetExceeded {} => Self::MismatchBudgetExceeded,
+            StrictWire::LexicalMismatchBudgetExceeded {} => Self::LexicalMismatchBudgetExceeded,
+            StrictWire::LexicalSummaryFailed {} => Self::LexicalSummaryFailed,
+            StrictWire::ArtifactValidationFailed {} => Self::ArtifactValidationFailed,
+            StrictWire::ArtifactPrepareFailed {} => Self::ArtifactPrepareFailed,
+            StrictWire::ArtifactPersistFailed {} => Self::ArtifactPersistFailed,
+            StrictWire::LexicalContractObservationFailed {} => {
+                Self::LexicalContractObservationFailed
+            }
+            StrictWire::BothEngineExecutionsFailed {} => Self::BothEngineExecutionsFailed,
+            StrictWire::SubjectExecutionFailed {} => Self::SubjectExecutionFailed,
+            StrictWire::OracleExecutionFailed {} => Self::OracleExecutionFailed,
+            StrictWire::MultipleObservationLanesFailed {} => Self::MultipleObservationLanesFailed,
+            StrictWire::InvalidEngineErrorState {} => Self::InvalidEngineErrorState,
+        })
+    }
+}
+
+impl CampaignCaseReason {
+    const fn disposition(&self) -> CampaignDisposition {
+        match self {
+            Self::ComparatorUnclassified
+            | Self::MissingDivergenceRegistration
+            | Self::ExpectedDivergenceNotRegistered { .. }
+            | Self::ExpectedDivergenceMismatch { .. }
+            | Self::LexicalContractMismatch => CampaignDisposition::Unclassified,
+            Self::ObservationDocumentCountDrift
+            | Self::ComparisonFailed
+            | Self::MismatchBudgetExceeded
+            | Self::LexicalMismatchBudgetExceeded
+            | Self::LexicalSummaryFailed
+            | Self::ArtifactValidationFailed
+            | Self::ArtifactPrepareFailed
+            | Self::ArtifactPersistFailed
+            | Self::LexicalContractObservationFailed
+            | Self::BothEngineExecutionsFailed
+            | Self::SubjectExecutionFailed
+            | Self::OracleExecutionFailed
+            | Self::MultipleObservationLanesFailed
+            | Self::InvalidEngineErrorState => CampaignDisposition::InfrastructureError,
+        }
+    }
+
+    fn validate_for_query(&self, query: &GeneratedQueryCase) -> Result<(), GauntletError> {
+        match self {
+            Self::ExpectedDivergenceNotRegistered { divergence_id }
+            | Self::ExpectedDivergenceMismatch { divergence_id } => {
+                if !is_canonical_query_id(divergence_id)
+                    || query.expected_divergence.as_deref() != Some(divergence_id)
+                {
+                    return Err(campaign_error(
+                        "campaign case reason does not bind the query's expected divergence",
+                    ));
+                }
+            }
+            Self::ComparatorUnclassified
+            | Self::MissingDivergenceRegistration
+            | Self::LexicalContractMismatch
+            | Self::ObservationDocumentCountDrift
+            | Self::ComparisonFailed
+            | Self::MismatchBudgetExceeded
+            | Self::LexicalMismatchBudgetExceeded
+            | Self::LexicalSummaryFailed
+            | Self::ArtifactValidationFailed
+            | Self::ArtifactPrepareFailed
+            | Self::ArtifactPersistFailed
+            | Self::LexicalContractObservationFailed
+            | Self::BothEngineExecutionsFailed
+            | Self::SubjectExecutionFailed
+            | Self::OracleExecutionFailed
+            | Self::MultipleObservationLanesFailed
+            | Self::InvalidEngineErrorState => {}
+        }
+        Ok(())
+    }
+}
+
 impl CampaignDisposition {
     const fn passes(self) -> bool {
         matches!(
@@ -654,7 +2360,7 @@ impl CampaignDisposition {
 }
 
 /// Total-lexical evidence retained for one submitted query.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 #[serde(tag = "scope", rename_all = "snake_case", deny_unknown_fields)]
 pub enum CampaignLexicalCaseSummary {
     /// Decode-only marker for pre-v5 campaign reports.
@@ -674,8 +2380,47 @@ pub enum CampaignLexicalCaseSummary {
     },
 }
 
+impl<'de> Deserialize<'de> for CampaignLexicalCaseSummary {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(tag = "scope", rename_all = "snake_case", deny_unknown_fields)]
+        enum StrictWire {
+            LegacyMissing {},
+            RankEnvelopeOnly {},
+            CoreLexicalV3Unavailable {},
+            CoreLexicalV3 {
+                status: LexicalComparisonStatus,
+                first_mismatch: Option<LexicalFieldMismatch>,
+                mismatch_count: u64,
+                waived_difference_count: u64,
+            },
+        }
+
+        Ok(match StrictWire::deserialize(deserializer)? {
+            StrictWire::LegacyMissing {} => Self::LegacyMissing,
+            StrictWire::RankEnvelopeOnly {} => Self::RankEnvelopeOnly,
+            StrictWire::CoreLexicalV3Unavailable {} => Self::CoreLexicalV3Unavailable,
+            StrictWire::CoreLexicalV3 {
+                status,
+                first_mismatch,
+                mismatch_count,
+                waived_difference_count,
+            } => Self::CoreLexicalV3 {
+                status,
+                first_mismatch,
+                mismatch_count,
+                waived_difference_count,
+            },
+        })
+    }
+}
+
 /// Stable evidence row for one campaign query.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CampaignCaseResult {
     pub case_id: String,
     pub query_class: String,
@@ -693,7 +2438,7 @@ pub struct CampaignCaseResult {
     pub registered_divergence: Option<DivergenceRegisterEntry>,
     pub first_divergence: Option<String>,
     /// Stable machine-facing outcome reason included in canonical reports.
-    pub reason: Option<String>,
+    pub reason: Option<CampaignCaseReason>,
     /// Noncanonical backend/OS diagnostic retained in memory for triage.
     #[serde(default, skip)]
     pub diagnostic: Option<String>,
@@ -701,6 +2446,7 @@ pub struct CampaignCaseResult {
 
 /// Per-query-class raw counts and an informational Beta(1,1) posterior bound.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct QueryClassSummary {
     pub query_class: String,
     pub total: u64,
@@ -744,6 +2490,7 @@ impl QueryClassSummary {
 
 /// Deduplicated mismatch descriptor with every affected fixture retained.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct MismatchGroup {
     pub signature: String,
     pub divergence: Divergence,
@@ -753,6 +2500,7 @@ pub struct MismatchGroup {
 
 /// Deduplicated total-lexical mismatch descriptor.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LexicalMismatchGroup {
     pub signature: String,
     pub mismatch: LexicalFieldMismatch,
@@ -785,7 +2533,7 @@ pub struct LexicalSideCoverageCounts {
 }
 
 /// Campaign-level total-contract coverage, kept separate from equivalence.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 #[serde(tag = "scope", rename_all = "snake_case", deny_unknown_fields)]
 pub enum CampaignLexicalCoverageSummary {
     /// Decode-only marker for pre-v5 campaign reports.
@@ -801,11 +2549,60 @@ pub enum CampaignLexicalCoverageSummary {
     },
 }
 
+impl<'de> Deserialize<'de> for CampaignLexicalCoverageSummary {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(tag = "scope", rename_all = "snake_case", deny_unknown_fields)]
+        enum StrictWire {
+            LegacyMissing {},
+            RankEnvelopeOnly {},
+            CoreLexicalV3 {
+                subject: Box<LexicalSideCoverageCounts>,
+                oracle: Box<LexicalSideCoverageCounts>,
+                admissible: bool,
+            },
+        }
+
+        Ok(match StrictWire::deserialize(deserializer)? {
+            StrictWire::LegacyMissing {} => Self::LegacyMissing,
+            StrictWire::RankEnvelopeOnly {} => Self::RankEnvelopeOnly,
+            StrictWire::CoreLexicalV3 {
+                subject,
+                oracle,
+                admissible,
+            } => Self::CoreLexicalV3 {
+                subject,
+                oracle,
+                admissible,
+            },
+        })
+    }
+}
+
 /// Deterministic campaign report; wall-clock data deliberately lives outside it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CampaignReport {
     pub schema_version: u32,
     pub run_id: String,
+    /// Maximum trust permitted by this schema after validation. Serialized
+    /// bytes cannot prove that the validation occurred.
+    #[serde(default)]
+    pub trust_ceiling: ArtifactTrustCeiling,
+    /// Durable execution role. It is independently bound into the run
+    /// reservation so archived diagnostics cannot be promoted after creation.
+    #[serde(default)]
+    pub execution_role: ArtifactExecutionRole,
+    #[serde(default)]
+    pub producer_build_identity: GauntletProducerBuildIdentity,
+    /// Exact dependency role sealed into the reservation, report, and every
+    /// immutable case object, including campaigns with only infrastructure
+    /// failures and therefore no case objects.
+    #[serde(default)]
+    pub oracle_dependency: ArtifactOracleDependency,
     pub engines: EnginePairIdentity,
     pub semantic_contract: SemanticContract,
     pub config: CampaignConfig,
@@ -837,6 +2634,10 @@ pub struct CampaignReport {
 struct CampaignRunReservation<'a> {
     schema_version: u32,
     run_id: &'a str,
+    trust_ceiling: ArtifactTrustCeiling,
+    execution_role: ArtifactExecutionRole,
+    producer_build_identity: &'a GauntletProducerBuildIdentity,
+    oracle_dependency: &'a ArtifactOracleDependency,
     engines: &'a EnginePairIdentity,
     semantic_contract: &'a SemanticContract,
     config: &'a CampaignConfig,
@@ -852,25 +2653,21 @@ struct CampaignRunReservation<'a> {
 /// Immutable source and semantic provenance stamped into every production
 /// campaign (bd-quill-e6-gauntlet-scale-rm3q.9).
 ///
-/// A campaign is admissible evidence only with the full environment pinned:
-/// engine commits and dirty state, lockfile, exact toolchain, Unicode tables,
-/// and the query profile identity. Missing or mismatched provenance fails
-/// closed; the reservation equality check inside
-/// [`ArtifactStore::load_verified_campaign`] replays these bytes verbatim.
+/// A campaign can satisfy the built-in integrity contract only with the full
+/// environment pinned: engine commits and dirty state, lockfile, exact
+/// toolchain, Unicode tables, and query profile identity. This remains
+/// necessary but not sufficient for terminal admission. Missing or mismatched
+/// provenance fails closed; the reservation equality check inside
+/// [`ArtifactStore::load_integrity_checked_campaign`] replays these bytes verbatim.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CampaignProvenance {
-    /// Subject engine source commit.
-    pub subject_git_revision: String,
-    /// Whether the subject source tree had uncommitted changes.
-    pub subject_source_dirty: bool,
-    /// Oracle engine source commit.
-    pub oracle_git_revision: String,
-    /// Whether the oracle source tree had uncommitted changes.
-    pub oracle_source_dirty: bool,
-    /// SHA-256 of the workspace `Cargo.lock`.
+    /// Domain-separated hash of the complete producer binary identity carried
+    /// by the report, reservation, and every case object.
+    pub producer_build_identity_sha256: String,
+    /// Build-script-captured SHA-256 of the producer's `Cargo.lock`.
     pub cargo_lock_sha256: String,
-    /// Full `rustc -Vv` output (release, commit, date, host).
+    /// Build-script-captured full `rustc -Vv` output.
     pub rustc_version_verbose: String,
     /// Exact dated channel from `rust-toolchain.toml`, cross-checked against
     /// `rustup`'s active toolchain.
@@ -915,11 +2712,10 @@ where
 impl CampaignProvenance {
     /// Collect the full immutable provenance for one campaign execution.
     ///
-    /// Subject Git state is read from the invoking checkout unless explicitly
-    /// overridden. Oracle state defaults to the committed oracle version
-    /// contract and may likewise be overridden by a complete revision/dirty
-    /// pair. The CI path supplies both pairs explicitly. Toolchain facts come
-    /// from the executing `rustc` and workspace `Cargo.lock`.
+    /// Producer source, toolchain, features, lockfile, and executable facts are
+    /// copied from the build-script-sealed identity of the exact executing
+    /// binary. Runtime-only Unicode/toolchain facts are captured alongside it
+    /// and checked again at creation admission, never during archival replay.
     ///
     /// # Errors
     ///
@@ -945,19 +2741,15 @@ impl CampaignProvenance {
             CorpusSourceManifest::SharedFixtures { .. }
             | CorpusSourceManifest::Repository { .. } => None,
         };
-        let (subject_git_revision, subject_source_dirty) =
-            collect_git_state("GAUNTLET_SUBJECT_REVISION", "GAUNTLET_SUBJECT_DIRTY")?;
-        let (oracle_git_revision, oracle_source_dirty) = collect_oracle_git_state()?;
-        let cargo_lock_sha256 = hash_workspace_lockfile()?;
-        let rustc_version_verbose = collect_rustc_verbose()?;
+        let producer_build_identity = GauntletProducerBuildIdentity::compiled()?;
+        let producer_build_identity_sha256 = producer_build_identity.identity_hash()?;
+        let cargo_lock_sha256 = producer_build_identity.cargo_lock_sha256.clone();
+        let rustc_version_verbose = producer_build_identity.rustc_version_verbose()?;
         let unicode_normalization_version = locked_crate_version("unicode-normalization")?;
         let query_profile_sha256 =
             query_profile_sha256(query_manifest, selection, semantic_contract)?;
         Ok(Self {
-            subject_git_revision,
-            subject_source_dirty,
-            oracle_git_revision,
-            oracle_source_dirty,
+            producer_build_identity_sha256,
             cargo_lock_sha256,
             rustc_version_verbose,
             rust_toolchain_channel: collect_dated_toolchain_channel()?,
@@ -982,8 +2774,9 @@ impl CampaignProvenance {
         })
     }
 
-    fn validate_for_campaign(
+    fn validate_stored(
         &self,
+        producer_build_identity: &GauntletProducerBuildIdentity,
         engines: &EnginePairIdentity,
         semantic_contract: &SemanticContract,
         config: &CampaignConfig,
@@ -995,12 +2788,6 @@ impl CampaignProvenance {
             CorpusSourceManifest::SharedFixtures { .. }
             | CorpusSourceManifest::Repository { .. } => None,
         };
-        let expected_unicode_version = format!(
-            "{}.{}.{}",
-            char::UNICODE_VERSION.0,
-            char::UNICODE_VERSION.1,
-            char::UNICODE_VERSION.2
-        );
         let expected_query_profile =
             query_profile_sha256(query_manifest, &config.selection, semantic_contract)?;
         let expected_corpus_manifest_hash = corpus_manifest.manifest_hash()?;
@@ -1015,23 +2802,26 @@ impl CampaignProvenance {
                         .any(|line| line.starts_with(label))
                 });
 
-        if !is_git_revision(&self.subject_git_revision)
-            || !is_git_revision(&self.oracle_git_revision)
-            || self.subject_git_revision != engines.subject.source_revision
-            || self.subject_source_dirty != engines.subject.source_dirty
-            || self.oracle_git_revision != engines.oracle.source_revision
-            || self.oracle_source_dirty != engines.oracle.source_dirty
+        producer_build_identity.validate_stored_v2()?;
+        producer_build_identity.validate_builtin_engines(engines)?;
+        let producer_hash = producer_build_identity.identity_hash()?;
+        let producer_rustc = producer_build_identity.rustc_version_verbose()?;
+        if !is_lower_sha256(&self.producer_build_identity_sha256)
+            || self.producer_build_identity_sha256 != producer_hash
             || !is_lower_sha256(&self.cargo_lock_sha256)
-            || self.cargo_lock_sha256 != hash_workspace_lockfile()?
+            || self.cargo_lock_sha256 != producer_build_identity.cargo_lock_sha256
             || !rustc_is_complete
-            || self.rustc_version_verbose != collect_rustc_verbose()?
-            || self.rust_toolchain_channel != collect_dated_toolchain_channel()?
-            || self.unicode_version != expected_unicode_version
-            || self.unicode_normalization_version != locked_crate_version("unicode-normalization")?
-            || self.unicode_normalization_table_version != unicode_normalization_table_version()
-            || self.query_generator_id != GENERATOR_ID
+            || self.rustc_version_verbose != producer_rustc
+            || !is_bounded_text(&self.rust_toolchain_channel, 256)
+            || !is_numeric_version(&self.unicode_version)
+            || !is_bounded_text(&self.unicode_normalization_version, 256)
+            || !is_bounded_text(&self.unicode_normalization_table_version, 256)
+            || validate_stored_query_generator_identity(
+                self.query_generator_schema_version,
+                &self.query_generator_id,
+            )
+            .is_err()
             || self.query_generator_id != query_manifest.generator_id
-            || self.query_generator_schema_version != QUERY_MANIFEST_SCHEMA_VERSION
             || self.query_generator_schema_version != query_manifest.schema_version
             || self.query_seed != query_manifest.spec.seed
             || !is_lower_sha256(&self.query_source_identity_sha256)
@@ -1045,11 +2835,79 @@ impl CampaignProvenance {
             || self.corpus_seed != expected_corpus_seed
         {
             return Err(campaign_error(
-                "campaign provenance is missing, malformed, or does not match the exact engines, toolchain, Unicode tables, corpus, and query profile",
+                "stored campaign provenance is missing, malformed, or does not match its producer, engines, corpus, and query profile",
             ));
         }
         Ok(())
     }
+
+    fn validate_for_creation(
+        &self,
+        producer_build_identity: &GauntletProducerBuildIdentity,
+        engines: &EnginePairIdentity,
+        semantic_contract: &SemanticContract,
+        config: &CampaignConfig,
+        corpus_manifest: &CorpusManifest,
+        query_manifest: &QueryManifest,
+    ) -> Result<(), GauntletError> {
+        self.validate_stored(
+            producer_build_identity,
+            engines,
+            semantic_contract,
+            config,
+            corpus_manifest,
+            query_manifest,
+        )?;
+        if self.query_generator_id != GENERATOR_ID
+            || self.query_generator_schema_version != QUERY_MANIFEST_SCHEMA_VERSION
+        {
+            return Err(campaign_error(
+                "campaign creation provenance does not use the current query generator",
+            ));
+        }
+        producer_build_identity.validate_matches_compiled()?;
+        producer_build_identity.validate_stored_sealed_v2()?;
+        self.validate_creation_environment()
+    }
+
+    // Compare the independently re-resolved environment pins without granting
+    // source or executable authority. Evidence admission must continue to use
+    // `validate_for_creation`, which applies the sealed-producer gates first.
+    fn validate_creation_environment(&self) -> Result<(), GauntletError> {
+        let expected_unicode_version = format!(
+            "{}.{}.{}",
+            char::UNICODE_VERSION.0,
+            char::UNICODE_VERSION.1,
+            char::UNICODE_VERSION.2
+        );
+        if self.cargo_lock_sha256 != hash_workspace_lockfile()?
+            || self.rustc_version_verbose != collect_rustc_verbose()?
+            || self.rust_toolchain_channel != collect_dated_toolchain_channel()?
+            || self.unicode_version != expected_unicode_version
+            || self.unicode_normalization_version != locked_crate_version("unicode-normalization")?
+            || self.unicode_normalization_table_version != unicode_normalization_table_version()
+        {
+            return Err(campaign_error(
+                "campaign creation environment does not match its sealed producer and provenance",
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn is_bounded_text(value: &str, max_bytes: usize) -> bool {
+    !value.is_empty() && value.len() <= max_bytes && value.trim() == value && !value.contains('\0')
+}
+
+fn is_numeric_version(value: &str) -> bool {
+    let mut parts = value.split('.');
+    let valid_part =
+        |part: &str| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit());
+    matches!(
+        (parts.next(), parts.next(), parts.next(), parts.next()),
+        (Some(major), Some(minor), Some(patch), None)
+            if valid_part(major) && valid_part(minor) && valid_part(patch)
+    )
 }
 
 #[derive(Serialize)]
@@ -1094,57 +2952,8 @@ fn unicode_normalization_table_version() -> String {
     )
 }
 
-fn collect_git_state(revision_env: &str, dirty_env: &str) -> Result<(String, bool), GauntletError> {
-    match (std::env::var(revision_env), std::env::var(dirty_env)) {
-        (Ok(revision), Ok(dirty)) => {
-            return Ok((revision, parse_dirty_state(&dirty, dirty_env)?));
-        }
-        (Err(std::env::VarError::NotPresent), Err(std::env::VarError::NotPresent)) => {}
-        _ => {
-            return Err(campaign_error(format!(
-                "provenance overrides {revision_env} and {dirty_env} must be supplied together as valid UTF-8"
-            )));
-        }
-    }
-    let revision = run_capture(ProvenanceProgram::Git, &["rev-parse", "HEAD"], revision_env)?;
-    let porcelain = run_capture(
-        ProvenanceProgram::Git,
-        &["status", "--porcelain"],
-        dirty_env,
-    )?;
-    Ok((revision.trim().to_owned(), !porcelain.trim().is_empty()))
-}
-
-fn collect_oracle_git_state() -> Result<(String, bool), GauntletError> {
-    const REVISION_ENV: &str = "GAUNTLET_ORACLE_REVISION";
-    const DIRTY_ENV: &str = "GAUNTLET_ORACLE_DIRTY";
-    match (std::env::var(REVISION_ENV), std::env::var(DIRTY_ENV)) {
-        (Ok(revision), Ok(dirty)) => Ok((revision, parse_dirty_state(&dirty, DIRTY_ENV)?)),
-        (Err(std::env::VarError::NotPresent), Err(std::env::VarError::NotPresent)) => {
-            let contract = oracle_version_contract()?;
-            Ok((contract.lexical_git_revision, false))
-        }
-        _ => Err(campaign_error(format!(
-            "provenance overrides {REVISION_ENV} and {DIRTY_ENV} must be supplied together as valid UTF-8"
-        ))),
-    }
-}
-
-fn parse_dirty_state(value: &str, label: &str) -> Result<bool, GauntletError> {
-    match value {
-        "1" => Ok(true),
-        "0" => Ok(false),
-        _ if value.eq_ignore_ascii_case("true") => Ok(true),
-        _ if value.eq_ignore_ascii_case("false") => Ok(false),
-        _ => Err(campaign_error(format!(
-            "provenance dirty-state override {label} must be true, false, 1, or 0"
-        ))),
-    }
-}
-
 #[derive(Clone, Copy)]
 enum ProvenanceProgram {
-    Git,
     Rustc,
     Rustup,
 }
@@ -1152,7 +2961,6 @@ enum ProvenanceProgram {
 impl ProvenanceProgram {
     fn command(self) -> std::process::Command {
         match self {
-            Self::Git => std::process::Command::new("git"),
             Self::Rustc => std::process::Command::new("rustc"),
             Self::Rustup => std::process::Command::new("rustup"),
         }
@@ -1344,6 +3152,29 @@ pub fn lexical_backend_identity(
 }
 
 impl CampaignReport {
+    /// Return the maximum trust permitted by this report's schema version.
+    ///
+    /// This does not validate the DTO or establish durable relational
+    /// integrity. The opaque [`crate::IntegrityCheckedCampaign`] capability,
+    /// not a scalar value from these bytes, represents completed store replay.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the report names a reserved or unsupported schema
+    /// version that has no defined trust ceiling.
+    pub fn schema_trust_ceiling(&self) -> Result<ArtifactTrustCeiling, GauntletError> {
+        match self.schema_version {
+            1 | 2 | 3 | 5 => Ok(ArtifactTrustCeiling::UnauthenticatedLegacy),
+            4 => Err(campaign_error(
+                "reserved pre-policy campaign report v4 has no trust classification",
+            )),
+            6 | CAMPAIGN_REPORT_V7_SCHEMA_VERSION => Ok(ArtifactTrustCeiling::IntegrityOnly),
+            schema_version => Err(campaign_error(format!(
+                "campaign report schema version {schema_version} has no trust classification"
+            ))),
+        }
+    }
+
     /// Validate every self-contained report invariant before structural hashing.
     ///
     /// This does not trust stored summary fields: manifest identities,
@@ -1351,45 +3182,100 @@ impl CampaignReport {
     /// structure, and the final pass bit are all recomputed. This deliberately
     /// does not prove that referenced immutable artifacts exist or agree with
     /// the reported classifications. Use
-    /// [`crate::ArtifactStore::load_verified_campaign`] when evidence-backed
-    /// replay verification is required.
+    /// [`crate::ArtifactStore::load_integrity_checked_campaign`] when durable
+    /// relational replay checks are required. Neither method authenticates the
+    /// bytes or grants admission authority.
     ///
     /// # Errors
     ///
     /// Returns an error when any report field is malformed or inconsistent.
     pub fn validate_contract(&self) -> Result<(), GauntletError> {
         validate_campaign_run_id(&self.run_id)?;
-        self.semantic_contract.validate()?;
-        self.config.validate()?;
-        self.divergence_registry.validate()?;
-        if matches!(self.schema_version, 3 | 4) {
+        if matches!(self.schema_version, 1 | 2 | 3 | 5) {
+            return Err(campaign_error(format!(
+                "unauthenticated legacy campaign report v{} is decode-only and non-admissible; rerun the campaign",
+                self.schema_version
+            )));
+        }
+        if self.schema_version == 4 {
             return Err(campaign_error(
-                "legacy campaign report schema lacks the current total lexical contract and is non-admissible; rerun the campaign",
+                "reserved pre-policy campaign report v4 is rejected and cannot be promoted; rerun the campaign",
             ));
         }
-        if self.schema_version != CAMPAIGN_REPORT_SCHEMA_VERSION {
+        if self.schema_version == 6 {
+            return Err(campaign_error(
+                "campaign report v6 provides self-consistency integrity only, not admission authority; rerun under the current contract",
+            ));
+        }
+        if self.schema_version != CAMPAIGN_REPORT_V7_SCHEMA_VERSION {
             return Err(campaign_error("campaign report schema version is invalid"));
         }
-
-        let mut rebuilt_engines = EnginePairIdentity::new(
-            self.engines.comparison_mode,
-            self.engines.subject.clone(),
-            self.engines.oracle.clone(),
-        )?;
-        rebuilt_engines.bind_semantic_contract(self.semantic_contract.clone())?;
-        self.engines.validate_gauntlet_contract()?;
-        if rebuilt_engines != self.engines {
+        if self.trust_ceiling != self.schema_trust_ceiling()? {
             return Err(campaign_error(
-                "campaign report engine and semantic identities are inconsistent",
+                "campaign report trust ceiling does not match its schema",
             ));
         }
-        self.corpus_manifest.validate_contract()?;
+        if self.execution_role == ArtifactExecutionRole::LegacyMissing {
+            return Err(campaign_error(
+                "campaign report is missing its durable execution role",
+            ));
+        }
+        self.semantic_contract.validate()?;
+        self.config.validate_stored_v7()?;
+        self.divergence_registry.validate()?;
+        self.producer_build_identity.validate_stored_v2()?;
+        self.engines.validate_stored_contract()?;
+        if self.engines.semantic_contract.as_ref() != Some(&self.semantic_contract) {
+            return Err(campaign_error(
+                "campaign report semantic contract does not match its engine-pair receipt",
+            ));
+        }
+        match (self.execution_role, &self.oracle_dependency) {
+            (ArtifactExecutionRole::LegacyMissing, _) => unreachable!("rejected above"),
+            (
+                ArtifactExecutionRole::Diagnostic,
+                ArtifactOracleDependency::DiagnosticUnspecified,
+            ) => {
+                if self.config.require_provenance
+                    || self.provenance.is_some()
+                    || self.engines.has_builtin_profile()
+                {
+                    return Err(campaign_error(
+                        "diagnostic campaign role forbids provenance, provenance policy, and built-in profile receipts",
+                    ));
+                }
+            }
+            (
+                ArtifactExecutionRole::BuiltInExecution,
+                ArtifactOracleDependency::BuiltInTantivy { contract },
+            ) => {
+                contract.validate_stored_structure()?;
+                if !self.config.require_provenance || !self.engines.has_builtin_profile() {
+                    return Err(campaign_error(
+                        "built-in evidence role requires provenance policy and a typed engine profile receipt",
+                    ));
+                }
+                self.producer_build_identity.validate_stored_sealed_v2()?;
+                self.producer_build_identity
+                    .require_features(&["tantivy_oracle"])?;
+                self.producer_build_identity
+                    .validate_builtin_engines(&self.engines)?;
+            }
+            (ArtifactExecutionRole::Diagnostic | ArtifactExecutionRole::BuiltInExecution, _) => {
+                return Err(campaign_error(
+                    "campaign report execution role does not match its oracle dependency role",
+                ));
+            }
+        }
+        self.corpus_manifest.validate_stored_contract()?;
         if self.corpus_manifest.manifest_hash()? != self.corpus_manifest_hash {
             return Err(campaign_error(
                 "campaign report corpus manifest hash is inconsistent",
             ));
         }
-        self.query_suite.manifest.verify(&self.query_suite.cases)?;
+        self.query_suite
+            .manifest
+            .verify_stored(&self.query_suite.cases)?;
         if self.query_suite.manifest.corpus_manifest_hash != self.corpus_manifest_hash
             || self.query_suite.manifest.manifest_hash()? != self.query_manifest_hash
         {
@@ -1397,23 +3283,45 @@ impl CampaignReport {
                 "campaign report query suite is not bound to its manifest and corpus",
             ));
         }
-        match (&self.provenance, self.config.require_provenance) {
-            (Some(provenance), _) => provenance.validate_for_campaign(
+        if self.execution_role == ArtifactExecutionRole::BuiltInExecution {
+            let provenance = self.provenance.as_ref().ok_or_else(|| {
+                campaign_error("built-in evidence campaign report is missing required provenance")
+            })?;
+            provenance.validate_stored(
+                &self.producer_build_identity,
                 &self.engines,
                 &self.semantic_contract,
                 &self.config,
                 &self.corpus_manifest,
                 &self.query_suite.manifest,
-            )?,
-            (None, true) => {
-                return Err(campaign_error(
-                    "production campaign report is missing required provenance",
-                ));
-            }
-            (None, false) => {}
+            )?;
         }
 
-        let selected = self.config.selection.select(&self.query_suite.cases)?;
+        let selected = self
+            .config
+            .selection
+            .select_stored_v7(&self.query_suite.cases)?;
+        if self.execution_role == ArtifactExecutionRole::BuiltInExecution {
+            let selected_default_query = selected
+                .iter()
+                .any(|query| query.syntax == QuerySyntax::Default);
+            let selected_non_default_query = selected
+                .iter()
+                .any(|query| query.syntax != QuerySyntax::Default);
+            match self.config.contract_mode {
+                CampaignContractMode::CoreLexicalV3 if selected_non_default_query => {
+                    return Err(campaign_error(
+                        "stored core lexical v3 evidence cannot contain CASS or other non-default query syntax",
+                    ));
+                }
+                CampaignContractMode::RankEnvelopeOnly if selected_default_query => {
+                    return Err(campaign_error(
+                        "stored built-in default evidence requires core lexical v3 coverage",
+                    ));
+                }
+                CampaignContractMode::RankEnvelopeOnly | CampaignContractMode::CoreLexicalV3 => {}
+            }
+        }
         let submitted_count = u64::try_from(self.query_suite.cases.len()).unwrap_or(u64::MAX);
         let selected_count = u64::try_from(selected.len()).unwrap_or(u64::MAX);
         if self.submitted_query_count != submitted_count
@@ -1445,7 +3353,7 @@ impl CampaignReport {
             )?;
         }
         let confidence = f64::from_bits(self.config.posterior_confidence_bits);
-        if summarize_query_classes(&self.cases, confidence) != self.query_classes {
+        if summarize_query_classes_stored_v7(&self.cases, confidence) != self.query_classes {
             return Err(campaign_error(
                 "campaign report query-class summaries are inconsistent",
             ));
@@ -1475,12 +3383,68 @@ impl CampaignReport {
         Ok(())
     }
 
+    pub(crate) fn validate_creation_environment(&self) -> Result<(), GauntletError> {
+        self.validate_contract()?;
+        if self.schema_version != CAMPAIGN_REPORT_SCHEMA_VERSION {
+            return Err(campaign_error(
+                "new campaign completion requires the current report schema",
+            ));
+        }
+        self.config.validate()?;
+        self.producer_build_identity.validate_matches_compiled()?;
+        self.corpus_manifest.validate_creation_contract()?;
+        self.query_suite
+            .manifest
+            .validate_creation_contract(&self.query_suite.cases)?;
+        match self.execution_role {
+            ArtifactExecutionRole::LegacyMissing => Err(campaign_error(
+                "campaign report is missing its durable execution role",
+            )),
+            ArtifactExecutionRole::Diagnostic => Ok(()),
+            ArtifactExecutionRole::BuiltInExecution => {
+                match &self.oracle_dependency {
+                    ArtifactOracleDependency::BuiltInTantivy { contract }
+                        if contract == &oracle_version_contract()? => {}
+                    _ => {
+                        return Err(campaign_error(
+                            "new built-in campaign report requires the exact current oracle dependency contract",
+                        ));
+                    }
+                }
+                self.producer_build_identity.validate_stored_sealed_v2()?;
+                self.engines.validate_builtin_contract()?;
+                self.provenance
+                    .as_ref()
+                    .ok_or_else(|| {
+                        campaign_error(
+                            "built-in evidence campaign report is missing required provenance",
+                        )
+                    })?
+                    .validate_for_creation(
+                        &self.producer_build_identity,
+                        &self.engines,
+                        &self.semantic_contract,
+                        &self.config,
+                        &self.corpus_manifest,
+                        &self.query_suite.manifest,
+                    )
+            }
+        }
+    }
+
     pub(crate) fn reservation_bytes_unchecked(&self) -> Result<Vec<u8>, GauntletError> {
-        let selected = self.config.selection.select(&self.query_suite.cases)?;
+        let selected = self
+            .config
+            .selection
+            .select_stored_v7(&self.query_suite.cases)?;
         let divergence_registry_hash = self.divergence_registry.registry_hash()?;
         let reservation = CampaignRunReservation {
             schema_version: self.schema_version,
             run_id: &self.run_id,
+            trust_ceiling: self.trust_ceiling,
+            execution_role: self.execution_role,
+            producer_build_identity: &self.producer_build_identity,
+            oracle_dependency: &self.oracle_dependency,
             engines: &self.engines,
             semantic_contract: &self.semantic_contract,
             config: &self.config,
@@ -1495,7 +3459,9 @@ impl CampaignReport {
     }
 
     pub(crate) fn selected_queries(&self) -> Result<Vec<&GeneratedQueryCase>, GauntletError> {
-        self.config.selection.select(&self.query_suite.cases)
+        self.config
+            .selection
+            .select_stored_v7(&self.query_suite.cases)
     }
 
     pub(crate) fn begin_evidence_validation(
@@ -1525,8 +3491,17 @@ impl CampaignReport {
     /// Returns an error if validation or serialization fails.
     pub fn report_hash(&self) -> Result<String, GauntletError> {
         let mut hasher = Sha256::new();
-        hasher.update(CAMPAIGN_REPORT_HASH_DOMAIN);
+        hasher.update(CAMPAIGN_REPORT_V7_HASH_DOMAIN);
         hasher.update(self.canonical_bytes()?);
+        Ok(lower_hex(&hasher.finalize()))
+    }
+
+    /// Hash test-owned hostile bytes without granting them report validity.
+    #[cfg(all(test, feature = "tantivy-oracle"))]
+    pub(crate) fn report_hash_unchecked_fixture(&self) -> Result<String, GauntletError> {
+        let mut hasher = Sha256::new();
+        hasher.update(CAMPAIGN_REPORT_V7_HASH_DOMAIN);
+        hasher.update(self.canonical_bytes_unchecked()?);
         Ok(lower_hex(&hasher.finalize()))
     }
 }
@@ -1548,7 +3523,10 @@ pub struct CampaignEvidenceValidator<'a> {
 
 impl<'a> CampaignEvidenceValidator<'a> {
     fn new(report: &'a CampaignReport) -> Result<Self, GauntletError> {
-        let selected = report.config.selection.select(&report.query_suite.cases)?;
+        let selected = report
+            .config
+            .selection
+            .select_stored_v7(&report.query_suite.cases)?;
         if selected.len() != report.cases.len() {
             return Err(campaign_error(
                 "campaign evidence count does not match the final report",
@@ -1595,6 +3573,7 @@ impl<'a> CampaignEvidenceValidator<'a> {
             query,
             self.report.query_suite.manifest.spec.seed,
             self.report.query_suite.manifest.source,
+            &self.report.query_suite.manifest.generator_id,
             &self.report.corpus_manifest_hash,
         );
         let (disposition, reason, registered_divergence) = classify_case_with_lexical(
@@ -1607,6 +3586,8 @@ impl<'a> CampaignEvidenceValidator<'a> {
         let expected_context = CampaignArtifactContext {
             corpus_manifest_hash: self.report.corpus_manifest_hash.clone(),
             query_manifest_hash: self.report.query_manifest_hash.clone(),
+            query_generator_schema_version: self.report.query_suite.manifest.schema_version,
+            query_generator_id: self.report.query_suite.manifest.generator_id.clone(),
             query_suite_source: self.report.query_suite.manifest.source,
             query_source_identity_sha256: self
                 .report
@@ -1620,7 +3601,8 @@ impl<'a> CampaignEvidenceValidator<'a> {
             query: (*query).clone(),
             registered_divergence: registered_divergence.clone(),
         };
-        if object.engines != self.report.engines
+        if object.oracle_dependency() != &self.report.oracle_dependency
+            || object.engines != self.report.engines
             || object.case != expected_case
             || object.comparator_config != self.report.config.comparator_config
             || object.campaign.as_ref() != Some(&expected_context)
@@ -1687,18 +3669,16 @@ fn validate_campaign_case_result(
             "campaign case ID, order, or query class is inconsistent",
         ));
     }
-    if result.reason.as_ref().is_some_and(|reason| {
-        reason.is_empty()
-            || reason.len() > MAX_CAMPAIGN_REASON_BYTES
-            || reason.trim() != reason
-            || reason.chars().any(char::is_control)
-    }) || result.first_divergence.as_ref().is_some_and(|pointer| {
+    if let Some(reason) = &result.reason {
+        reason.validate_for_query(query)?;
+    }
+    if result.first_divergence.as_ref().is_some_and(|pointer| {
         !pointer.starts_with('/')
             || pointer.len() > MAX_CAMPAIGN_POINTER_BYTES
             || pointer.chars().any(char::is_control)
     }) {
         return Err(campaign_error(
-            "campaign case reason or divergence pointer is not bounded canonical text",
+            "campaign case divergence pointer is not bounded canonical text",
         ));
     }
 
@@ -1765,7 +3745,10 @@ fn validate_campaign_case_result(
         CampaignDisposition::Unclassified => {
             non_infrastructure_fields
                 && result.registered_divergence.is_none()
-                && result.reason.is_some()
+                && result
+                    .reason
+                    .as_ref()
+                    .is_some_and(|reason| reason.disposition() == CampaignDisposition::Unclassified)
         }
         CampaignDisposition::InfrastructureError => {
             result.comparison_status.is_none()
@@ -1773,7 +3756,9 @@ fn validate_campaign_case_result(
                 && result.artifact_hash.is_none()
                 && result.registered_divergence.is_none()
                 && result.first_divergence.is_none()
-                && result.reason.is_some()
+                && result.reason.as_ref().is_some_and(|reason| {
+                    reason.disposition() == CampaignDisposition::InfrastructureError
+                })
         }
     };
     let lexical_disposition_matches = match &result.lexical_contract {
@@ -1782,7 +3767,7 @@ fn validate_campaign_case_result(
             ..
         } => {
             result.disposition == CampaignDisposition::Unclassified
-                && result.reason.as_deref() == Some("lexical_contract_mismatch")
+                && result.reason == Some(CampaignCaseReason::LexicalContractMismatch)
                 && result.registered_divergence.is_none()
         }
         CampaignLexicalCaseSummary::CoreLexicalV3 {
@@ -2008,6 +3993,28 @@ pub struct DifferentialCampaignRunner {
     provenance: Option<CampaignProvenance>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum CampaignAdmission {
+    Diagnostic,
+    #[cfg_attr(
+        not(any(test, feature = "tantivy-oracle")),
+        expect(
+            dead_code,
+            reason = "typed built-in admission is entered only by oracle-backed or test lanes"
+        )
+    )]
+    BuiltInEvidence(BuiltInEngineProfileReceipt),
+}
+
+impl CampaignAdmission {
+    const fn durable_role(&self) -> ArtifactExecutionRole {
+        match self {
+            Self::Diagnostic => ArtifactExecutionRole::Diagnostic,
+            Self::BuiltInEvidence(_) => ArtifactExecutionRole::BuiltInExecution,
+        }
+    }
+}
+
 impl DifferentialCampaignRunner {
     /// Construct a runner after validating every fail-closed policy input.
     ///
@@ -2036,9 +4043,32 @@ impl DifferentialCampaignRunner {
     /// Every production campaign run stamps it into the reservation and the
     /// report; regression fixtures deliberately leave it absent.
     #[must_use]
-    pub fn with_provenance(mut self, provenance: CampaignProvenance) -> Self {
+    #[cfg(test)]
+    pub(crate) fn with_provenance(mut self, provenance: CampaignProvenance) -> Self {
         self.provenance = Some(provenance);
         self
+    }
+
+    /// Collect and attach provenance from the exact executing producer and the
+    /// runner's already-validated campaign policy. This is the public path for
+    /// typed built-in evidence; callers cannot inject a replacement identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when any producer, corpus, query, toolchain, or Unicode
+    /// fact cannot be captured exactly.
+    pub fn with_collected_provenance(
+        mut self,
+        corpus_manifest: &CorpusManifest,
+        query_manifest: &QueryManifest,
+    ) -> Result<Self, GauntletError> {
+        self.provenance = Some(CampaignProvenance::collect(
+            corpus_manifest,
+            query_manifest,
+            &self.config.selection,
+            &self.semantic_contract,
+        )?);
+        Ok(self)
     }
 
     /// Verify, index, execute, compare, and persist one differential campaign.
@@ -2096,10 +4126,206 @@ impl DifferentialCampaignRunner {
         corpus_manifest: &CorpusManifest,
         query_suite: &GeneratedQuerySuite,
     ) -> Result<CampaignReport, GauntletError> {
+        self.run_replay_internal(
+            cx,
+            run_id,
+            subject,
+            oracle,
+            documents,
+            corpus_manifest,
+            query_suite,
+            CampaignAdmission::Diagnostic,
+        )
+        .await
+    }
+
+    /// Run a provenance-bearing built-in execution through the concrete
+    /// Quill subject and pinned Tantivy oracle. Custom trait implementations
+    /// intentionally cannot call this typed execution path. The resulting raw
+    /// report remains integrity-only until store replay and F0 authentication.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the configured semantic contract is not supported
+    /// by this typed path, or when replay, ingest, querying, comparison,
+    /// provenance capture, or report construction fails.
+    #[cfg(feature = "tantivy-oracle")]
+    #[allow(clippy::too_many_arguments)]
+    pub async fn run_quill_tantivy_evidence_replay(
+        &self,
+        cx: &Cx,
+        run_id: &str,
+        subject: &mut crate::engine::QuillSubject,
+        oracle: &mut crate::engine::TantivyOracle,
+        documents: &dyn GeneratedCorpusReplay,
+        corpus_manifest: &CorpusManifest,
+        query_suite: &GeneratedQuerySuite,
+    ) -> Result<CampaignReport, GauntletError> {
+        let profile = if self.semantic_contract == SemanticContract::shipping_default() {
+            BuiltInEngineProfile::ScalarShipping
+        } else if self.semantic_contract == SemanticContract::scalar_g1a() {
+            BuiltInEngineProfile::ScalarG1a
+        } else {
+            return Err(campaign_error(
+                "the typed scalar evidence entrypoint requires the shipping or scalar G1a semantic contract",
+            ));
+        };
+        let admission = CampaignAdmission::BuiltInEvidence(BuiltInEngineProfileReceipt::new(
+            profile,
+            subject.config(),
+        ));
+        self.run_replay_internal(
+            cx,
+            run_id,
+            subject,
+            oracle,
+            documents,
+            corpus_manifest,
+            query_suite,
+            admission,
+        )
+        .await
+    }
+
+    /// Slice-backed variant of [`Self::run_quill_tantivy_evidence_replay`].
+    ///
+    /// # Errors
+    ///
+    /// Returns the same typed replay, engine, comparison, provenance, and
+    /// report-construction errors as [`Self::run_quill_tantivy_evidence_replay`].
+    #[cfg(feature = "tantivy-oracle")]
+    #[allow(clippy::too_many_arguments)]
+    pub async fn run_quill_tantivy_evidence(
+        &self,
+        cx: &Cx,
+        run_id: &str,
+        subject: &mut crate::engine::QuillSubject,
+        oracle: &mut crate::engine::TantivyOracle,
+        documents: &[GeneratedDocument],
+        corpus_manifest: &CorpusManifest,
+        query_suite: &GeneratedQuerySuite,
+    ) -> Result<CampaignReport, GauntletError> {
+        let replay = BorrowedCorpus(documents);
+        self.run_quill_tantivy_evidence_replay(
+            cx,
+            run_id,
+            subject,
+            oracle,
+            &replay,
+            corpus_manifest,
+            query_suite,
+        )
+        .await
+    }
+
+    /// Run provenance-bearing CASS-profile evidence through the concrete
+    /// Quill and pinned Tantivy adapters.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when replay, CASS-profile ingest or querying,
+    /// comparison, provenance capture, or report construction fails.
+    #[cfg(feature = "tantivy-oracle")]
+    #[allow(clippy::too_many_arguments)]
+    pub async fn run_cass_quill_tantivy_evidence(
+        &self,
+        cx: &Cx,
+        run_id: &str,
+        subject: &mut crate::engine::CassQuillSubject,
+        oracle: &mut crate::engine::CassTantivyOracle,
+        documents: &[GeneratedDocument],
+        corpus_manifest: &CorpusManifest,
+        query_suite: &GeneratedQuerySuite,
+    ) -> Result<CampaignReport, GauntletError> {
+        let replay = BorrowedCorpus(documents);
+        let admission = CampaignAdmission::BuiltInEvidence(BuiltInEngineProfileReceipt::new(
+            BuiltInEngineProfile::Cass,
+            subject.config(),
+        ));
+        self.run_replay_internal(
+            cx,
+            run_id,
+            subject,
+            oracle,
+            &replay,
+            corpus_manifest,
+            query_suite,
+            admission,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn run_replay_internal(
+        &self,
+        cx: &Cx,
+        run_id: &str,
+        subject: &mut dyn DifferentialCampaignEngine,
+        oracle: &mut dyn DifferentialCampaignEngine,
+        documents: &dyn GeneratedCorpusReplay,
+        corpus_manifest: &CorpusManifest,
+        query_suite: &GeneratedQuerySuite,
+        admission: CampaignAdmission,
+    ) -> Result<CampaignReport, GauntletError> {
         self.config.validate()?;
         self.registry.validate()?;
         validate_campaign_run_id(run_id)?;
-        corpus_manifest.verify_documents(documents.replay())?;
+        match (
+            &admission,
+            self.config.require_provenance,
+            self.provenance.as_ref(),
+        ) {
+            (CampaignAdmission::Diagnostic, false, None)
+            | (CampaignAdmission::BuiltInEvidence(_), true, Some(_)) => {}
+            (CampaignAdmission::Diagnostic, _, _) => {
+                return Err(campaign_error(
+                    "open custom-engine campaigns are diagnostic-only and require provenance policy off with no attached provenance",
+                ));
+            }
+            (CampaignAdmission::BuiltInEvidence(_), false, _) => {
+                return Err(campaign_error(
+                    "typed built-in evidence requires provenance policy to be enabled",
+                ));
+            }
+            (CampaignAdmission::BuiltInEvidence(_), true, None) => {
+                return Err(campaign_error(
+                    "production campaign is missing required provenance",
+                ));
+            }
+        }
+        let producer_build_identity = GauntletProducerBuildIdentity::compiled()?;
+        let mut engines = EnginePairIdentity::new(
+            ComparisonMode::CrossEngine,
+            subject.descriptor(),
+            oracle.descriptor(),
+        )?;
+        let subject_semantics = subject.semantic_contract();
+        let oracle_semantics = oracle.semantic_contract();
+        subject_semantics.validate()?;
+        oracle_semantics.validate()?;
+        if subject_semantics != self.semantic_contract || oracle_semantics != self.semantic_contract
+        {
+            return Err(campaign_error(
+                "engine-declared semantic contracts do not match the campaign contract",
+            ));
+        }
+        engines.bind_semantic_contract(self.semantic_contract.clone())?;
+        let oracle_dependency = match &admission {
+            CampaignAdmission::Diagnostic => {
+                engines.validate_stored_contract()?;
+                ArtifactOracleDependency::DiagnosticUnspecified
+            }
+            CampaignAdmission::BuiltInEvidence(profile) => {
+                engines.bind_builtin_profile(profile.clone())?;
+                producer_build_identity.validate_builtin_engines(&engines)?;
+                engines.validate_builtin_contract()?;
+                self.store
+                    .validate_live_source_checkout_for_creation(&producer_build_identity)?;
+                ArtifactOracleDependency::BuiltInTantivy {
+                    contract: oracle_version_contract()?,
+                }
+            }
+        };
         let corpus_manifest_hash = corpus_manifest.manifest_hash()?;
         query_suite.manifest.verify(&query_suite.cases)?;
         if query_suite.manifest.corpus_manifest_hash != corpus_manifest_hash {
@@ -2111,12 +4337,8 @@ impl DifferentialCampaignRunner {
         let selected = self.config.selection.select(&query_suite.cases)?;
         let mut prepared_cases = Vec::with_capacity(selected.len());
         for query in selected {
-            let evidence_case = self.evidence_case(
-                query,
-                query_suite.manifest.spec.seed,
-                query_suite.manifest.source,
-                &corpus_manifest_hash,
-            );
+            let evidence_case =
+                self.evidence_case(query, &query_suite.manifest, &corpus_manifest_hash);
             evidence_case.validate_shape()?;
             prepared_cases.push((query, query_class(query), evidence_case));
         }
@@ -2141,25 +4363,9 @@ impl DifferentialCampaignRunner {
             }
             CampaignContractMode::RankEnvelopeOnly | CampaignContractMode::CoreLexicalV3 => {}
         }
-        let mut engines = EnginePairIdentity::new(
-            ComparisonMode::CrossEngine,
-            subject.descriptor(),
-            oracle.descriptor(),
-        )?;
-        let subject_semantics = subject.semantic_contract();
-        let oracle_semantics = oracle.semantic_contract();
-        subject_semantics.validate()?;
-        oracle_semantics.validate()?;
-        if subject_semantics != self.semantic_contract || oracle_semantics != self.semantic_contract
-        {
-            return Err(campaign_error(
-                "engine-declared semantic contracts do not match the campaign contract",
-            ));
-        }
-        engines.bind_semantic_contract(self.semantic_contract.clone())?;
-        engines.validate_gauntlet_contract()?;
         match (&self.provenance, self.config.require_provenance) {
-            (Some(provenance), _) => provenance.validate_for_campaign(
+            (Some(provenance), _) => provenance.validate_for_creation(
+                &producer_build_identity,
                 &engines,
                 &self.semantic_contract,
                 &self.config,
@@ -2173,11 +4379,26 @@ impl DifferentialCampaignRunner {
             }
             (None, false) => {}
         }
+        corpus_manifest.verify_documents(documents.replay())?;
+        if matches!(&admission, CampaignAdmission::BuiltInEvidence(_)) {
+            // The manifest replay can be long. Re-resolve the checkout after
+            // it and immediately before reservation/indexing so ordinary
+            // source drift cannot start an evidence run on stale build-time
+            // state. A malicious change-and-revert adversary remains the F0
+            // external-supervisor threat model.
+            self.store
+                .validate_live_source_checkout_for_creation(&producer_build_identity)?;
+        }
 
+        let durable_admission = admission.durable_role();
         let divergence_registry_hash = self.registry.registry_hash()?;
         let reservation = CampaignRunReservation {
             schema_version: CAMPAIGN_REPORT_SCHEMA_VERSION,
             run_id,
+            trust_ceiling: ArtifactTrustCeiling::IntegrityOnly,
+            execution_role: durable_admission,
+            producer_build_identity: &producer_build_identity,
+            oracle_dependency: &oracle_dependency,
             engines: &engines,
             semantic_contract: &self.semantic_contract,
             config: &self.config,
@@ -2348,9 +4569,12 @@ impl DifferentialCampaignRunner {
                         query,
                         query_class,
                         &query_manifest_hash,
+                        query_suite.manifest.schema_version,
+                        &query_suite.manifest.generator_id,
                         query_suite.manifest.source,
                         &query_suite.manifest.source_identity_sha256,
                         query_suite.manifest.spec.seed,
+                        &producer_build_identity,
                         &engines,
                         corpus_manifest.document_count,
                         evidence_case,
@@ -2360,6 +4584,7 @@ impl DifferentialCampaignRunner {
                         &mut lexical_mismatches,
                         &mut lexical_coverage,
                         lexical_contract,
+                        &admission,
                     ),
                 (subject_result, oracle_result, lexical_result) => {
                     let (reason, diagnostic) =
@@ -2392,6 +4617,10 @@ impl DifferentialCampaignRunner {
         let report = CampaignReport {
             schema_version: CAMPAIGN_REPORT_SCHEMA_VERSION,
             run_id: run_id.to_owned(),
+            trust_ceiling: ArtifactTrustCeiling::IntegrityOnly,
+            execution_role: durable_admission,
+            producer_build_identity,
+            oracle_dependency,
             engines,
             semantic_contract: self.semantic_contract.clone(),
             config: self.config.clone(),
@@ -2419,15 +4648,15 @@ impl DifferentialCampaignRunner {
     fn evidence_case(
         &self,
         query: &GeneratedQueryCase,
-        query_seed: u64,
-        query_suite_source: QuerySuiteSource,
+        query_manifest: &QueryManifest,
         corpus_manifest_hash: &str,
     ) -> DifferentialCase {
         evidence_case_for(
             &self.config,
             query,
-            query_seed,
-            query_suite_source,
+            query_manifest.spec.seed,
+            query_manifest.source,
+            &query_manifest.generator_id,
             corpus_manifest_hash,
         )
     }
@@ -2440,9 +4669,12 @@ impl DifferentialCampaignRunner {
         query: &GeneratedQueryCase,
         query_class: String,
         query_manifest_hash: &str,
+        query_generator_schema_version: u32,
+        query_generator_id: &str,
         query_suite_source: QuerySuiteSource,
         query_source_identity_sha256: &str,
         query_seed: u64,
+        producer_build_identity: &GauntletProducerBuildIdentity,
         engines: &EnginePairIdentity,
         expected_doc_count: u64,
         evidence_case: DifferentialCase,
@@ -2452,13 +4684,14 @@ impl DifferentialCampaignRunner {
         lexical_mismatches: &mut LexicalMismatchCollection,
         lexical_coverage: &mut CampaignLexicalCoverageAccumulator,
         lexical_contract: ArtifactLexicalContractEvidence,
+        admission: &CampaignAdmission,
     ) -> CampaignCaseResult {
         if subject.doc_count != expected_doc_count || oracle.doc_count != expected_doc_count {
             return infrastructure_case(
                 query,
                 query_class,
                 self.config.contract_mode,
-                "observation_document_count_drift",
+                CampaignCaseReason::ObservationDocumentCountDrift,
                 format!(
                     "expected {expected_doc_count}; subject {}; oracle {}",
                     subject.doc_count, oracle.doc_count
@@ -2475,7 +4708,7 @@ impl DifferentialCampaignRunner {
                     query,
                     query_class,
                     self.config.contract_mode,
-                    "comparison_failed",
+                    CampaignCaseReason::ComparisonFailed,
                     error.to_string(),
                 );
             }
@@ -2487,7 +4720,7 @@ impl DifferentialCampaignRunner {
                     query,
                     query_class,
                     self.config.contract_mode,
-                    "mismatch_budget_exceeded",
+                    CampaignCaseReason::MismatchBudgetExceeded,
                     error.to_string(),
                 );
             }
@@ -2500,7 +4733,7 @@ impl DifferentialCampaignRunner {
                         query,
                         query_class,
                         self.config.contract_mode,
-                        "lexical_mismatch_budget_exceeded",
+                        CampaignCaseReason::LexicalMismatchBudgetExceeded,
                         error.to_string(),
                     );
                 }
@@ -2517,12 +4750,14 @@ impl DifferentialCampaignRunner {
                     query,
                     query_class,
                     self.config.contract_mode,
-                    "lexical_summary_failed",
+                    CampaignCaseReason::LexicalSummaryFailed,
                     error.to_string(),
                 );
             }
         };
         let run = HarnessRun {
+            schema_version: HARNESS_RUN_SCHEMA_VERSION,
+            producer_build_identity: producer_build_identity.clone(),
             engines: engines.clone(),
             case: evidence_case,
             comparator_config: self.config.comparator_config,
@@ -2531,6 +4766,8 @@ impl DifferentialCampaignRunner {
         let context = CampaignArtifactContext {
             corpus_manifest_hash: run.case.metadata.corpus_hash.clone().unwrap_or_default(),
             query_manifest_hash: query_manifest_hash.to_owned(),
+            query_generator_schema_version,
+            query_generator_id: query_generator_id.to_owned(),
             query_suite_source,
             query_source_identity_sha256: query_source_identity_sha256.to_owned(),
             semantic_contract: self.semantic_contract.clone(),
@@ -2539,14 +4776,22 @@ impl DifferentialCampaignRunner {
             query: query.clone(),
             registered_divergence: registered_divergence.clone(),
         };
-        let object = match ArtifactObject::from_campaign_run(run, context, lexical_contract) {
+        let object = match admission {
+            CampaignAdmission::Diagnostic => {
+                ArtifactObject::from_diagnostic_campaign_run(run, context, lexical_contract)
+            }
+            CampaignAdmission::BuiltInEvidence(_) => {
+                ArtifactObject::from_builtin_campaign_execution(run, context, lexical_contract)
+            }
+        };
+        let object = match object {
             Ok(object) => object,
             Err(error) => {
                 return infrastructure_case(
                     query,
                     query_class,
                     self.config.contract_mode,
-                    "artifact_validation_failed",
+                    CampaignCaseReason::ArtifactValidationFailed,
                     error.to_string(),
                 );
             }
@@ -2556,28 +4801,30 @@ impl DifferentialCampaignRunner {
             ("query_class".to_owned(), query_class.clone()),
             ("query_source".to_owned(), query.source.clone()),
         ]);
-        let prepared =
-            match self
-                .store
-                .prepare_campaign_case(campaign_run_id, ordinal, &object, provenance)
-            {
-                Ok(prepared) => prepared,
-                Err(error) => {
-                    return infrastructure_case(
-                        query,
-                        query_class,
-                        self.config.contract_mode,
-                        "artifact_prepare_failed",
-                        error.to_string(),
-                    );
-                }
-            };
+        let prepared = match self.store.prepare_campaign_case(
+            campaign_run_id,
+            ordinal,
+            admission.durable_role(),
+            &object,
+            provenance,
+        ) {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                return infrastructure_case(
+                    query,
+                    query_class,
+                    self.config.contract_mode,
+                    CampaignCaseReason::ArtifactPrepareFailed,
+                    error.to_string(),
+                );
+            }
+        };
         if let Err(error) = self.store.persist(&prepared) {
             return infrastructure_case(
                 query,
                 query_class,
                 self.config.contract_mode,
-                "artifact_persist_failed",
+                CampaignCaseReason::ArtifactPersistFailed,
                 error.to_string(),
             );
         }
@@ -2609,6 +4856,7 @@ fn evidence_case_for(
     query: &GeneratedQueryCase,
     query_seed: u64,
     query_suite_source: QuerySuiteSource,
+    query_generator_id: &str,
     corpus_manifest_hash: &str,
 ) -> DifferentialCase {
     let mut case = DifferentialCase::new(&query.id, &query.query, query.limit);
@@ -2618,7 +4866,7 @@ fn evidence_case_for(
     case.snippet_max_chars = config.snippet_max_chars;
     case.metadata = DifferentialCaseMetadata {
         generator_id: (query_suite_source == QuerySuiteSource::Generated)
-            .then(|| GENERATOR_ID.to_owned()),
+            .then(|| query_generator_id.to_owned()),
         generator_seed: (query_suite_source == QuerySuiteSource::Generated).then_some(query_seed),
         corpus_hash: Some(corpus_manifest_hash.to_owned()),
     };
@@ -2629,7 +4877,7 @@ fn infrastructure_case(
     query: &GeneratedQueryCase,
     query_class: String,
     contract_mode: CampaignContractMode,
-    reason: &'static str,
+    reason: CampaignCaseReason,
     diagnostic: String,
 ) -> CampaignCaseResult {
     CampaignCaseResult {
@@ -2642,7 +4890,7 @@ fn infrastructure_case(
         artifact_hash: None,
         registered_divergence: None,
         first_divergence: None,
-        reason: Some(reason.to_owned()),
+        reason: Some(reason),
         diagnostic: Some(diagnostic),
     }
 }
@@ -2659,7 +4907,7 @@ fn lexical_case_summary(
 ) -> Result<CampaignLexicalCaseSummary, GauntletError> {
     match evidence {
         ArtifactLexicalContractEvidence::LegacyPreV3Missing => Err(campaign_error(
-            "legacy lexical evidence cannot produce a v5 case summary",
+            "legacy lexical evidence cannot produce a current case summary",
         )),
         ArtifactLexicalContractEvidence::RankEnvelopeOnly => {
             Ok(CampaignLexicalCaseSummary::RankEnvelopeOnly)
@@ -2686,13 +4934,13 @@ fn classify_case(
     registry: &DivergenceRegistry,
 ) -> (
     CampaignDisposition,
-    Option<String>,
+    Option<CampaignCaseReason>,
     Option<DivergenceRegisterEntry>,
 ) {
     if comparison.status == ComparisonStatus::Failed {
         return (
             CampaignDisposition::Unclassified,
-            Some("comparator reported an unclassified result-level failure".to_owned()),
+            Some(CampaignCaseReason::ComparatorUnclassified),
             None,
         );
     }
@@ -2710,16 +4958,16 @@ fn classify_case(
         }
         None => (
             CampaignDisposition::Unclassified,
-            Some("classified divergence has no reviewed register entry".to_owned()),
+            Some(CampaignCaseReason::MissingDivergenceRegistration),
             None,
         ),
         Some(expected_id) => {
             let Some(entry) = registry.find(expected_id) else {
                 return (
                     CampaignDisposition::Unclassified,
-                    Some(format!(
-                        "expected divergence {expected_id} is not registered"
-                    )),
+                    Some(CampaignCaseReason::ExpectedDivergenceNotRegistered {
+                        divergence_id: expected_id.to_owned(),
+                    }),
                     None,
                 );
             };
@@ -2733,9 +4981,9 @@ fn classify_case(
             } else {
                 (
                     CampaignDisposition::Unclassified,
-                    Some(format!(
-                        "expected divergence {expected_id} did not match this fixture and comparator class"
-                    )),
+                    Some(CampaignCaseReason::ExpectedDivergenceMismatch {
+                        divergence_id: expected_id.to_owned(),
+                    }),
                     None,
                 )
             }
@@ -2750,7 +4998,7 @@ fn classify_case_with_lexical(
     registry: &DivergenceRegistry,
 ) -> (
     CampaignDisposition,
-    Option<String>,
+    Option<CampaignCaseReason>,
     Option<DivergenceRegisterEntry>,
 ) {
     if let ArtifactLexicalContractEvidence::CoreLexicalV3 {
@@ -2760,7 +5008,7 @@ fn classify_case_with_lexical(
     {
         return (
             CampaignDisposition::Unclassified,
-            Some("lexical_contract_mismatch".to_owned()),
+            Some(CampaignCaseReason::LexicalContractMismatch),
             None,
         );
     }
@@ -2779,6 +5027,7 @@ fn is_auto_class(class: DivergenceClass) -> bool {
         | DivergenceClass::QueryCanonicalization
         | DivergenceClass::OracleBug
         | DivergenceClass::StatsSemantics
+        | DivergenceClass::PostingRecordSemantics
         | DivergenceClass::UnicodeEdge
         | DivergenceClass::OversizedQueryToken => false,
     }
@@ -2842,7 +5091,7 @@ struct SummaryAccumulator {
     infrastructure_errors: u64,
 }
 
-fn summarize_query_classes(
+fn summarize_query_classes_stored_v7(
     cases: &[CampaignCaseResult],
     confidence: f64,
 ) -> Vec<QueryClassSummary> {
@@ -2879,6 +5128,15 @@ fn summarize_query_classes(
             posterior_confidence_bits: confidence.to_bits(),
         })
         .collect()
+}
+
+fn summarize_query_classes(
+    cases: &[CampaignCaseResult],
+    confidence: f64,
+) -> Vec<QueryClassSummary> {
+    // Current creation is report v7. Preserve the archived implementation
+    // above when a future report schema changes aggregation policy.
+    summarize_query_classes_stored_v7(cases, confidence)
 }
 
 #[derive(Debug)]
@@ -3360,7 +5618,8 @@ fn mismatch_cause_shape(divergence: &Divergence) -> String {
     match divergence.class {
         DivergenceClass::TieOrder
         | DivergenceClass::ScoreEpsilon
-        | DivergenceClass::RankMismatch => format!(
+        | DivergenceClass::RankMismatch
+        | DivergenceClass::PostingRecordSemantics => format!(
             "rank:{}:{}",
             rank_value(&divergence.oracle),
             rank_value(&divergence.subject)
@@ -3426,6 +5685,7 @@ const fn divergence_class_tag(class: DivergenceClass) -> u8 {
         DivergenceClass::OracleBug => 10,
         DivergenceClass::StatsSemantics => 11,
         DivergenceClass::UnicodeEdge => 12,
+        DivergenceClass::PostingRecordSemantics => 13,
     }
 }
 
@@ -3493,43 +5753,43 @@ fn validate_engine_state(
     expected_engines: &EnginePairIdentity,
     expected_semantics: &SemanticContract,
 ) -> Result<(), GauntletError> {
-    let mut observed = EnginePairIdentity::new(
-        ComparisonMode::CrossEngine,
-        subject.descriptor(),
-        oracle.descriptor(),
-    )?;
-    observed.bind_semantic_contract(expected_semantics.clone())?;
-    if &observed != expected_engines
-        || subject.semantic_contract() != *expected_semantics
-        || oracle.semantic_contract() != *expected_semantics
-    {
+    if expected_engines.semantic_contract.as_ref() != Some(expected_semantics) {
         return Err(campaign_error(
-            "engine identity or semantic contract changed during campaign execution",
+            "campaign semantic contract does not match its expected engine identity",
         ));
     }
-    Ok(())
+    expected_engines.validate_runtime_state(
+        subject.descriptor(),
+        oracle.descriptor(),
+        &subject.semantic_contract(),
+        &oracle.semantic_contract(),
+    )
 }
 
 fn observation_error_details(
     subject: &Result<EngineObservation, GauntletError>,
     oracle: &Result<EngineObservation, GauntletError>,
     lexical: &Result<ArtifactLexicalContractEvidence, GauntletError>,
-) -> (String, String) {
+) -> (CampaignCaseReason, String) {
     match (subject, oracle, lexical) {
         (Ok(_), Ok(_), Err(lexical)) => (
-            "lexical_contract_observation_failed".to_owned(),
+            CampaignCaseReason::LexicalContractObservationFailed,
             lexical.to_string(),
         ),
         (Err(subject), Err(oracle), Ok(_)) => (
-            "both_engine_executions_failed".to_owned(),
+            CampaignCaseReason::BothEngineExecutionsFailed,
             format!("subject: {subject}; oracle: {oracle}"),
         ),
-        (Err(subject), Ok(_), Ok(_)) => {
-            ("subject_execution_failed".to_owned(), subject.to_string())
-        }
-        (Ok(_), Err(oracle), Ok(_)) => ("oracle_execution_failed".to_owned(), oracle.to_string()),
+        (Err(subject), Ok(_), Ok(_)) => (
+            CampaignCaseReason::SubjectExecutionFailed,
+            subject.to_string(),
+        ),
+        (Ok(_), Err(oracle), Ok(_)) => (
+            CampaignCaseReason::OracleExecutionFailed,
+            oracle.to_string(),
+        ),
         (Err(subject), oracle, Err(lexical)) => (
-            "multiple_observation_lanes_failed".to_owned(),
+            CampaignCaseReason::MultipleObservationLanesFailed,
             format!(
                 "subject legacy: {subject}; oracle legacy: {}; lexical: {lexical}",
                 oracle
@@ -3539,11 +5799,11 @@ fn observation_error_details(
             ),
         ),
         (Ok(_), Err(oracle), Err(lexical)) => (
-            "multiple_observation_lanes_failed".to_owned(),
+            CampaignCaseReason::MultipleObservationLanesFailed,
             format!("oracle legacy: {oracle}; lexical: {lexical}"),
         ),
         (Ok(_), Ok(_), Ok(_)) => (
-            "invalid_engine_error_state".to_owned(),
+            CampaignCaseReason::InvalidEngineErrorState,
             "all observation results unexpectedly succeeded".to_owned(),
         ),
     }
@@ -3570,6 +5830,49 @@ fn is_register_id(value: &str) -> bool {
     value.len() == 7
         && value.starts_with("DIV-")
         && value[4..].bytes().all(|byte| byte.is_ascii_digit())
+}
+
+fn is_prediction_id(value: &str) -> bool {
+    value.len() == 8
+        && value.starts_with("PRED-")
+        && value[5..].bytes().all(|byte| byte.is_ascii_digit())
+}
+
+fn is_register_name(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 112
+        && value.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'_')
+        })
+}
+
+fn is_bead_id(value: &str) -> bool {
+    value.starts_with("bd-")
+        && value.len() > 3
+        && value.len() <= 160
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+}
+
+fn is_utc_timestamp(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    if bytes.len() != 20
+        || bytes[10] != b'T'
+        || bytes[13] != b':'
+        || bytes[16] != b':'
+        || bytes[19] != b'Z'
+        || !bytes.iter().enumerate().all(|(index, byte)| {
+            matches!(index, 4 | 7 | 10 | 13 | 16 | 19) || byte.is_ascii_digit()
+        })
+        || !is_review_date(&value[..10])
+    {
+        return false;
+    }
+    let hour = u32::from(bytes[11] - b'0') * 10 + u32::from(bytes[12] - b'0');
+    let minute = u32::from(bytes[14] - b'0') * 10 + u32::from(bytes[15] - b'0');
+    let second = u32::from(bytes[17] - b'0') * 10 + u32::from(bytes[18] - b'0');
+    hour < 24 && minute < 60 && second < 60
 }
 
 fn is_review_date(value: &str) -> bool {
@@ -3615,6 +5918,20 @@ fn is_git_revision(value: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
+fn is_git_revision_40(value: &str) -> bool {
+    value.len() == 40
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn is_lower_xxh3(value: &str) -> bool {
+    value.len() == 16
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
 fn campaign_error(reason: impl Into<String>) -> GauntletError {
     GauntletError::InvalidCampaign {
         reason: reason.into(),
@@ -3632,7 +5949,11 @@ fn lower_hex(bytes: &[u8]) -> String {
 }
 
 fn sha256_text(value: &str) -> String {
-    lower_hex(&Sha256::digest(value.as_bytes()))
+    sha256_bytes(value.as_bytes())
+}
+
+fn sha256_bytes(value: &[u8]) -> String {
+    lower_hex(&Sha256::digest(value))
 }
 
 /// One-sided lower quantile of a Beta(successes+1, failures+1) posterior.
@@ -4920,10 +7241,14 @@ fn auto_triage(target: DivergenceClass, report: &ComparisonReport) -> TriageVerd
                 evidence.push("reviewed snapshot-statistics divergence present".to_owned());
                 (SuspectedLayer::FieldNormArithmetic, TriageConfidence::High)
             }
-            DivergenceClass::OversizedQueryToken => {
-                evidence.push("oversized-token AST lowering difference present".to_owned());
-                (SuspectedLayer::ParserLowering, TriageConfidence::High)
+            DivergenceClass::PostingRecordSemantics => {
+                evidence.push(
+                    "posting record option disagrees with scorer or pruning-bound frequency"
+                        .to_owned(),
+                );
+                (SuspectedLayer::FieldNormArithmetic, TriageConfidence::High)
             }
+            DivergenceClass::OversizedQueryToken => unreachable!("covered above"),
         }
     };
     TriageVerdict {
@@ -4991,13 +7316,23 @@ pub fn persist_shrunk_reproduction(
 #[cfg(test)]
 mod tests {
     #[cfg(feature = "tantivy-oracle")]
-    use std::io::{self, Write};
+    use std::io::{self, Read, Write};
     #[cfg(feature = "tantivy-oracle")]
     use std::sync::Arc;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use crate::comparator::{AstDifference, AstLoweringKind, CountState, NativeTieKey, RankedHit};
+    #[cfg(feature = "tantivy-oracle")]
+    use crate::comparator::{
+        LexicalContractBundle, LexicalContractComparison, LexicalCountExposure, LexicalCountState,
+        LexicalEmptyShape, LexicalErrorClass, LexicalErrorObservation, LexicalFieldExposure,
+        LexicalHitObservation, LexicalHydrationExecution, LexicalHydrationResult,
+        LexicalHydrationSelection, LexicalNonLexicalControlKind, LexicalNormalizedQuery,
+        LexicalObservation, LexicalObservationContext, LexicalObservationOutcome, LexicalObserved,
+        LexicalQueryClass, LexicalScoreSource, LexicalWinnerOrigin, LexicalWinnerProjection,
+        SensitiveValueObservation,
+    };
     use crate::engine::{EngineFamily, TANTIVY_ORACLE_CONFIG_HASH};
     use crate::generator::{
         QueryGeneratorSpec, RepositoryEntry, RepositorySnapshot, SharedFixtureSuite,
@@ -5006,6 +7341,26 @@ mod tests {
     use crate::version_contract::oracle_version_contract;
 
     use super::*;
+
+    fn assert_strict_tagged_round_trip<T>(value: &T)
+    where
+        T: Serialize + serde::de::DeserializeOwned + PartialEq + std::fmt::Debug,
+    {
+        let encoded = serde_json::to_value(value).expect("serialize tagged wire value");
+        let decoded: T =
+            serde_json::from_value(encoded.clone()).expect("deserialize tagged wire value");
+        assert_eq!(&decoded, value);
+
+        let mut with_unknown = encoded;
+        with_unknown
+            .as_object_mut()
+            .expect("tagged wire value must be an object")
+            .insert("future_unbound_field".to_owned(), serde_json::json!(true));
+        assert!(
+            serde_json::from_value::<T>(with_unknown).is_err(),
+            "tagged wire variant accepted an unknown field: {value:?}"
+        );
+    }
 
     #[cfg(feature = "tantivy-oracle")]
     #[derive(Clone, Debug)]
@@ -5030,6 +7385,19 @@ mod tests {
 
     #[cfg(feature = "tantivy-oracle")]
     const E410_RANK_GOLDEN_JSON: &str = include_str!("../fixtures/argus-e410-ranks-v1.json");
+    const DIVERGENCE_REGISTER_FIXTURE_JSON: &str =
+        include_str!("../fixtures/divergence-register-v2.json");
+    const DIVERGENCE_REGISTER_SCHEMA_JSON: &str =
+        include_str!("../../../schemas/quill-divergence-register-v2.schema.json");
+    const LEGACY_DIVERGENCE_REGISTER_FIXTURE_V1_JSON: &str =
+        include_str!("../fixtures/divergence-register-v1.json");
+    const LEGACY_DIVERGENCE_REGISTER_SCHEMA_V1_JSON: &str =
+        include_str!("../../../schemas/quill-divergence-register-v1.schema.json");
+
+    fn divergence_ledger_fixture() -> DivergenceRegisterLedger {
+        DivergenceRegisterLedger::decode_json(DIVERGENCE_REGISTER_FIXTURE_JSON.as_bytes())
+            .expect("decode Divergence Register v2 contract fixture")
+    }
 
     #[cfg(feature = "tantivy-oracle")]
     #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -5087,6 +7455,96 @@ mod tests {
     }
 
     #[cfg(feature = "tantivy-oracle")]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum RankedQueryForm {
+        Raw,
+        Preparsed,
+    }
+
+    #[cfg(feature = "tantivy-oracle")]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum RankedQueryCacheLookup {
+        NotChecked,
+        Disabled,
+        Miss,
+        Hit,
+    }
+
+    #[cfg(feature = "tantivy-oracle")]
+    fn trace_ranked_query_contract(
+        line: &str,
+        context: &str,
+    ) -> (RankedQueryForm, RankedQueryCacheLookup) {
+        let observed_query_form = trace_field_text(line, "query_form");
+        assert!(
+            matches!(observed_query_form, Some("raw" | "preparsed")),
+            "{context}: ranked query close has invalid query_form {observed_query_form:?}: {line}",
+        );
+        let query_form = if observed_query_form == Some("raw") {
+            RankedQueryForm::Raw
+        } else {
+            RankedQueryForm::Preparsed
+        };
+        let observed_cache_lookup = trace_field_text(line, "cache_lookup");
+        assert!(
+            matches!(
+                observed_cache_lookup,
+                Some("not_checked" | "disabled" | "miss" | "hit")
+            ),
+            "{context}: ranked query close has invalid cache_lookup {observed_cache_lookup:?}: {line}",
+        );
+        let cache_lookup = if observed_cache_lookup == Some("not_checked") {
+            RankedQueryCacheLookup::NotChecked
+        } else if observed_cache_lookup == Some("disabled") {
+            RankedQueryCacheLookup::Disabled
+        } else if observed_cache_lookup == Some("miss") {
+            RankedQueryCacheLookup::Miss
+        } else {
+            RankedQueryCacheLookup::Hit
+        };
+        (query_form, cache_lookup)
+    }
+
+    #[cfg(feature = "tantivy-oracle")]
+    fn assert_ranked_query_cache_fixture(
+        logs: &str,
+        query_id: &str,
+        expected_form: RankedQueryForm,
+        expected_lookup: RankedQueryCacheLookup,
+    ) {
+        use frankensearch_quill::tracing_conventions::ARGUS_QUERY;
+
+        let context = format!("query_id={query_id}");
+        let query_closes = logs
+            .lines()
+            .filter(|line| {
+                trace_has_text_field(line, "query_id", query_id)
+                    && is_stage_close(line, ARGUS_QUERY)
+                    && trace_field_text(line, "collector") != Some("docset")
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            !query_closes.is_empty(),
+            "{context}: missing ranked query close record",
+        );
+        for close in query_closes {
+            let (query_form, cache_lookup) = trace_ranked_query_contract(close, &context);
+            assert_eq!(
+                query_form, expected_form,
+                "{context}: ranked query form changed: {close}",
+            );
+            assert_eq!(
+                cache_lookup, expected_lookup,
+                "{context}: cache lookup disposition changed: {close}",
+            );
+            assert!(
+                close.contains("duration_us=") && trace_field_u64(close, "result_count").is_some(),
+                "{context}: successful ranked query close lacks timing or result count: {close}",
+            );
+        }
+    }
+
+    #[cfg(feature = "tantivy-oracle")]
     fn assert_score_trace_contract(score: &str, context: &str) {
         let plan = trace_field_text(score, "plan")
             .unwrap_or_else(|| panic!("{context}: score span omitted plan: {score}"));
@@ -5130,7 +7588,9 @@ mod tests {
 
     #[cfg(feature = "tantivy-oracle")]
     fn assert_harvested_query_trace_contract(logs: &str, golden: &E410RankGolden) {
-        use frankensearch_quill::tracing_conventions::{ARGUS_COLLECT, ARGUS_PARSE, ARGUS_SCORE};
+        use frankensearch_quill::tracing_conventions::{
+            ARGUS_COLLECT, ARGUS_PARSE, ARGUS_QUERY, ARGUS_SCORE,
+        };
 
         for case in &golden.cases {
             let query_lines = logs
@@ -5152,7 +7612,64 @@ mod tests {
                 }),
                 "{context}: trace omitted replay provenance",
             );
-            let parse = query_lines
+            let ranked_lines = query_lines
+                .iter()
+                .copied()
+                .filter(|line| trace_field_text(line, "collector") != Some("docset"))
+                .collect::<Vec<_>>();
+            let query_closes = ranked_lines
+                .iter()
+                .copied()
+                .filter(|line| is_stage_close(line, ARGUS_QUERY))
+                .collect::<Vec<_>>();
+            assert!(
+                !query_closes.is_empty(),
+                "{context}: missing ranked query close record",
+            );
+            let query_contracts = query_closes
+                .iter()
+                .map(|close| {
+                    assert!(
+                        close.contains("duration_us=")
+                            && trace_field_u64(close, "result_count").is_some(),
+                        "{context}: successful ranked query close lacks timing or result count: {close}",
+                    );
+                    let contract = trace_ranked_query_contract(close, &context);
+                    assert_eq!(
+                        contract.0,
+                        RankedQueryForm::Raw,
+                        "{context}: harvested string query did not report raw form: {close}",
+                    );
+                    assert!(
+                        matches!(
+                            contract.1,
+                            RankedQueryCacheLookup::Miss | RankedQueryCacheLookup::Hit
+                        ),
+                        "{context}: successful cache-enabled fixture reported {:?}: {close}",
+                        contract.1,
+                    );
+                    contract
+                })
+                .collect::<Vec<_>>();
+            let executed = query_contracts
+                .iter()
+                .any(|(_, lookup)| *lookup == RankedQueryCacheLookup::Miss);
+            if !executed {
+                assert!(
+                    query_contracts
+                        .iter()
+                        .all(|(_, lookup)| *lookup == RankedQueryCacheLookup::Hit),
+                    "{context}: child-stage suppression is valid only for authenticated cache hits",
+                );
+                for stage in [ARGUS_PARSE, ARGUS_SCORE, ARGUS_COLLECT] {
+                    assert!(
+                        !ranked_lines.iter().any(|line| is_stage_close(line, stage)),
+                        "{context}: cache-hit-only execution emitted impossible {stage} work",
+                    );
+                }
+                continue;
+            }
+            let parse = ranked_lines
                 .iter()
                 .copied()
                 .find(|line| is_stage_close(line, ARGUS_PARSE))
@@ -5165,7 +7682,7 @@ mod tests {
                     && parse.contains("duration_us="),
                 "{context}: parse trace lacks tree shape or timing: {parse}",
             );
-            let score_lines = query_lines
+            let score_lines = ranked_lines
                 .iter()
                 .copied()
                 .filter(|line| is_stage_close(line, ARGUS_SCORE))
@@ -5181,7 +7698,7 @@ mod tests {
                     "{context}: score trace omitted timing: {score}",
                 );
             }
-            let collect = query_lines
+            let collect = ranked_lines
                 .iter()
                 .copied()
                 .find(|line| is_stage_close(line, ARGUS_COLLECT))
@@ -5295,20 +7812,57 @@ mod tests {
         assert!(close_position(KEEPER_SEAL) < committed_open);
         assert!(close_position(ARGUS_PARSE) < close_position(ARGUS_SCORE));
         assert!(close_position(ARGUS_SCORE) < close_position(ARGUS_COLLECT));
-        assert!(
-            logs.lines().any(|line| {
+        let paginated_queries = logs
+            .lines()
+            .filter(|line| {
                 is_stage_close(line, ARGUS_QUERY)
-                    && line.contains("offset=17")
-                    && line.contains("exact_count=true")
+                    && trace_has_text_field(line, "query_id", "paginated")
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            paginated_queries.iter().any(|line| {
+                trace_field_u64(line, "limit") == Some(7)
+                    && trace_field_u64(line, "offset") == Some(17)
+                    && line.contains("exact_count=false")
+                    && trace_field_u64(line, "result_count").is_some_and(|count| count > 0)
             }),
-            "live G1a trace did not execute Quill's paginated collector: {logs}",
+            "live G1a trace did not execute Quill's count-free requested page: {logs}",
         );
         assert!(
-            logs.lines().any(|line| {
-                is_stage_close(line, ARGUS_QUERY) && line.contains("exact_count=false")
+            paginated_queries.iter().any(|line| {
+                trace_field_u64(line, "limit") == Some(280)
+                    && trace_field_u64(line, "offset") == Some(0)
+                    && line.contains("exact_count=false")
+                    && trace_field_u64(line, "result_count").is_some_and(|count| count > 0)
             }),
-            "live G1a trace did not execute Quill's count-free collector: {logs}",
+            "live G1a trace did not execute Quill's expanded ranked evidence: {logs}",
         );
+        assert!(
+            paginated_queries.iter().any(|line| {
+                trace_field_u64(line, "limit") == Some(0)
+                    && trace_field_u64(line, "offset") == Some(0)
+                    && line.contains("exact_count=true")
+                    && trace_field_u64(line, "result_count") == Some(0)
+                    && trace_field_u64(line, "total_count").is_some_and(|count| count > 0)
+            }),
+            "live G1a trace did not execute Quill's independent count-only evidence: {logs}",
+        );
+
+        assert_ranked_query_cache_fixture(
+            logs,
+            "multi-term",
+            RankedQueryForm::Raw,
+            RankedQueryCacheLookup::Miss,
+        );
+        // `harvested-00` deliberately replays the identical raw query and
+        // collector shapes executed earlier by `multi-term`.
+        assert_ranked_query_cache_fixture(
+            logs,
+            "harvested-00",
+            RankedQueryForm::Raw,
+            RankedQueryCacheLookup::Hit,
+        );
+
         let golden: E410RankGolden = serde_json::from_str(E410_RANK_GOLDEN_JSON)
             .expect("parse committed E4.10 rank-list golden for trace contract");
         assert_harvested_query_trace_contract(logs, &golden);
@@ -5631,7 +8185,7 @@ mod tests {
             family: EngineFamily::Tantivy,
             implementation: "frankensearch-lexical/tantivy-index".to_owned(),
             crate_version: version.lexical_package_version,
-            source_revision: version.lexical_git_revision,
+            source_revision: version.lexical_contract_audit_revision,
             source_dirty: false,
             config_hash: TANTIVY_ORACLE_CONFIG_HASH.to_owned(),
         }
@@ -5759,54 +8313,21 @@ mod tests {
         fixture: &Fixture,
         config: &CampaignConfig,
         semantic_contract: &SemanticContract,
-        subject: &EngineDescriptor,
-        oracle: &EngineDescriptor,
     ) -> CampaignProvenance {
-        CampaignProvenance {
-            subject_git_revision: subject.source_revision.clone(),
-            subject_source_dirty: subject.source_dirty,
-            oracle_git_revision: oracle.source_revision.clone(),
-            oracle_source_dirty: oracle.source_dirty,
-            cargo_lock_sha256: hash_workspace_lockfile().expect("Cargo.lock hash"),
-            rustc_version_verbose: collect_rustc_verbose().expect("rustc provenance"),
-            rust_toolchain_channel: collect_dated_toolchain_channel()
-                .expect("dated nightly provenance"),
-            unicode_version: format!(
-                "{}.{}.{}",
-                char::UNICODE_VERSION.0,
-                char::UNICODE_VERSION.1,
-                char::UNICODE_VERSION.2
-            ),
-            unicode_normalization_version: locked_crate_version("unicode-normalization")
-                .expect("locked normalization version"),
-            unicode_normalization_table_version: unicode_normalization_table_version(),
-            query_generator_id: fixture.query_suite.manifest.generator_id.clone(),
-            query_generator_schema_version: fixture.query_suite.manifest.schema_version,
-            query_seed: fixture.query_suite.manifest.spec.seed,
-            query_source_identity_sha256: fixture
-                .query_suite
-                .manifest
-                .source_identity_sha256
-                .clone(),
-            query_profile_sha256: query_profile_sha256(
-                &fixture.query_suite.manifest,
-                &config.selection,
-                semantic_contract,
-            )
-            .expect("query profile hash"),
-            analyzer_contract_hash: semantic_contract.analyzer_contract_hash.clone(),
-            schema_contract_hash: semantic_contract.schema_contract_hash.clone(),
-            corpus_manifest_hash: fixture
-                .corpus_manifest
-                .manifest_hash()
-                .expect("corpus manifest hash"),
-            query_manifest_hash: fixture
-                .query_suite
-                .manifest
-                .manifest_hash()
-                .expect("query manifest hash"),
-            corpus_seed: Some(0x6200),
-        }
+        CampaignProvenance::collect(
+            &fixture.corpus_manifest,
+            &fixture.query_suite.manifest,
+            &config.selection,
+            semantic_contract,
+        )
+        .expect("collect fixture provenance from the exact test producer")
+    }
+
+    fn bind_descriptor_to_compiled_producer(mut descriptor: EngineDescriptor) -> EngineDescriptor {
+        let producer = GauntletProducerBuildIdentity::compiled().expect("compiled producer");
+        descriptor.source_revision = producer.source_git_revision;
+        descriptor.source_dirty = producer.source_git_dirty;
+        descriptor
     }
 
     #[test]
@@ -5972,6 +8493,153 @@ mod tests {
     }
 
     #[test]
+    fn campaign_case_reason_has_one_exhaustive_disposition_and_strict_wire_contract() {
+        let reasons = vec![
+            CampaignCaseReason::ComparatorUnclassified,
+            CampaignCaseReason::MissingDivergenceRegistration,
+            CampaignCaseReason::ExpectedDivergenceNotRegistered {
+                divergence_id: "DIV-001".to_owned(),
+            },
+            CampaignCaseReason::ExpectedDivergenceMismatch {
+                divergence_id: "DIV-002".to_owned(),
+            },
+            CampaignCaseReason::LexicalContractMismatch,
+            CampaignCaseReason::ObservationDocumentCountDrift,
+            CampaignCaseReason::ComparisonFailed,
+            CampaignCaseReason::MismatchBudgetExceeded,
+            CampaignCaseReason::LexicalMismatchBudgetExceeded,
+            CampaignCaseReason::LexicalSummaryFailed,
+            CampaignCaseReason::ArtifactValidationFailed,
+            CampaignCaseReason::ArtifactPrepareFailed,
+            CampaignCaseReason::ArtifactPersistFailed,
+            CampaignCaseReason::LexicalContractObservationFailed,
+            CampaignCaseReason::BothEngineExecutionsFailed,
+            CampaignCaseReason::SubjectExecutionFailed,
+            CampaignCaseReason::OracleExecutionFailed,
+            CampaignCaseReason::MultipleObservationLanesFailed,
+            CampaignCaseReason::InvalidEngineErrorState,
+        ];
+
+        let mut unclassified = 0_usize;
+        let mut infrastructure = 0_usize;
+        for reason in &reasons {
+            match reason.disposition() {
+                CampaignDisposition::Unclassified => unclassified += 1,
+                CampaignDisposition::InfrastructureError => infrastructure += 1,
+                CampaignDisposition::Exact
+                | CampaignDisposition::AutoClassified
+                | CampaignDisposition::RegisterClassified => {
+                    panic!("failure reason mapped to a passing disposition: {reason:?}");
+                }
+            }
+
+            let encoded = serde_json::to_value(reason).expect("serialize case reason");
+            let decoded: CampaignCaseReason =
+                serde_json::from_value(encoded.clone()).expect("round-trip case reason");
+            assert_eq!(&decoded, reason);
+
+            let mut with_unknown = encoded;
+            with_unknown
+                .as_object_mut()
+                .expect("reason wire object")
+                .insert("future_unbound_field".to_owned(), serde_json::json!(true));
+            assert!(
+                serde_json::from_value::<CampaignCaseReason>(with_unknown).is_err(),
+                "every current reason variant must reject unknown payload fields: {reason:?}"
+            );
+        }
+        assert_eq!(unclassified, 5);
+        assert_eq!(infrastructure, 14);
+        assert_eq!(reasons.len(), unclassified + infrastructure);
+
+        for malformed in [
+            serde_json::json!({}),
+            serde_json::json!({"code": "future_reason"}),
+            serde_json::json!({"code": "expected_divergence_mismatch"}),
+            serde_json::json!({
+                "code": "expected_divergence_not_registered",
+                "divergence_id": 7
+            }),
+            serde_json::json!({
+                "code": "comparison_failed",
+                "divergence_id": "DIV-003"
+            }),
+        ] {
+            assert!(
+                serde_json::from_value::<CampaignCaseReason>(malformed).is_err(),
+                "unknown, missing, extra, and mistyped reason payloads must fail closed"
+            );
+        }
+    }
+
+    #[test]
+    fn campaign_tagged_variants_reject_unknown_fields_exhaustively() {
+        for selection in [
+            CampaignSelection::All,
+            CampaignSelection::DefaultSyntax,
+            CampaignSelection::CassSyntax,
+            CampaignSelection::CaseIds {
+                ids: vec!["query-1".to_owned(), "query-2".to_owned()],
+            },
+        ] {
+            assert_strict_tagged_round_trip(&selection);
+        }
+
+        for summary in [
+            CampaignLexicalCaseSummary::LegacyMissing,
+            CampaignLexicalCaseSummary::RankEnvelopeOnly,
+            CampaignLexicalCaseSummary::CoreLexicalV3Unavailable,
+            CampaignLexicalCaseSummary::CoreLexicalV3 {
+                status: LexicalComparisonStatus::Equivalent,
+                first_mismatch: None,
+                mismatch_count: 0,
+                waived_difference_count: 0,
+            },
+        ] {
+            assert_strict_tagged_round_trip(&summary);
+        }
+
+        for coverage in [
+            CampaignLexicalCoverageSummary::LegacyMissing,
+            CampaignLexicalCoverageSummary::RankEnvelopeOnly,
+            CampaignLexicalCoverageSummary::CoreLexicalV3 {
+                subject: Box::default(),
+                oracle: Box::default(),
+                admissible: true,
+            },
+        ] {
+            assert_strict_tagged_round_trip(&coverage);
+        }
+
+        assert!(
+            serde_json::from_str::<CampaignSelection>(r#"{"kind":"all","kind":"default_syntax"}"#,)
+                .is_err(),
+            "duplicate campaign-selection kind tags must fail closed"
+        );
+        assert!(
+            serde_json::from_str::<CampaignCaseReason>(
+                r#"{"code":"comparison_failed","code":"artifact_validation_failed"}"#,
+            )
+            .is_err(),
+            "duplicate campaign-reason code tags must fail closed"
+        );
+        assert!(
+            serde_json::from_str::<CampaignLexicalCaseSummary>(
+                r#"{"scope":"legacy_missing","scope":"rank_envelope_only"}"#,
+            )
+            .is_err(),
+            "duplicate case-summary scope tags must fail closed"
+        );
+        assert!(
+            serde_json::from_str::<CampaignLexicalCoverageSummary>(
+                r#"{"scope":"legacy_missing","scope":"rank_envelope_only"}"#,
+            )
+            .is_err(),
+            "duplicate coverage-summary scope tags must fail closed"
+        );
+    }
+
+    #[test]
     fn divergence_register_accepts_only_reviewed_semantic_taxonomy() {
         let entry = |class| DivergenceRegisterEntry {
             id: "DIV-999".to_owned(),
@@ -6000,6 +8668,754 @@ mod tests {
         assert!(
             entry(DivergenceClass::RankMismatch).validate().is_err(),
             "generic result mismatch must never become a register wildcard"
+        );
+        assert!(
+            entry(DivergenceClass::PostingRecordSemantics)
+                .validate()
+                .is_err(),
+            "posting record semantics are fix-only and must never become an accepted wildcard"
+        );
+
+        let valid = entry(DivergenceClass::SnippetWindow);
+        let mut unknown_entry = serde_json::to_value(&valid).expect("serialize register entry");
+        unknown_entry
+            .as_object_mut()
+            .expect("register entry object")
+            .insert("future_unbound_field".to_owned(), serde_json::json!(true));
+        assert!(
+            serde_json::from_value::<DivergenceRegisterEntry>(unknown_entry).is_err(),
+            "registry entries must reject unknown fields",
+        );
+
+        let registry = DivergenceRegistry::new(vec![valid]).expect("strict registry fixture");
+        let mut unknown_registry =
+            serde_json::to_value(&registry).expect("serialize divergence registry");
+        unknown_registry
+            .pointer_mut("/entries/0")
+            .and_then(serde_json::Value::as_object_mut)
+            .expect("nested registry entry")
+            .insert("future_unbound_field".to_owned(), serde_json::json!(true));
+        assert!(
+            serde_json::from_value::<DivergenceRegistry>(unknown_registry).is_err(),
+            "registry decoder must reject unknown nested entry fields",
+        );
+    }
+
+    #[test]
+    fn divergence_ledger_schema_fixture_round_trips() {
+        let schema: serde_json::Value =
+            serde_json::from_str(DIVERGENCE_REGISTER_SCHEMA_JSON).expect("parse register schema");
+        let fixture: serde_json::Value =
+            serde_json::from_str(DIVERGENCE_REGISTER_FIXTURE_JSON).expect("parse register fixture");
+        let validator =
+            jsonschema::draft202012::new(&schema).expect("compile Divergence Register schema");
+        validator
+            .validate(&fixture)
+            .expect("fixture satisfies JSON Schema");
+
+        let ledger = divergence_ledger_fixture();
+        ledger
+            .validate()
+            .expect("fixture satisfies semantic contract");
+        let DivergenceRegisterEvent::Observation(observation) = &ledger.events[0] else {
+            panic!("first fixture event is the observation");
+        };
+        let address = observation
+            .first_recorded_witness_artifact_object
+            .as_ref()
+            .expect("v2 fixture uses a recorded v7 artifact-object witness");
+        assert_eq!(
+            address.digest,
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        );
+        assert_eq!(address.scheme.as_str(), OBJECT_HASH_SCHEME_V7_SHA256);
+        assert_eq!(
+            address.object_schema_version,
+            DIVERGENCE_ARTIFACT_OBJECT_SCHEMA_VERSION_V7
+        );
+        let round_trip =
+            serde_json::to_value(&ledger).expect("serialize typed Divergence Register fixture");
+        assert_eq!(round_trip, fixture);
+        assert!(is_lower_sha256(
+            &ledger.ledger_hash().expect("register ledger hash")
+        ));
+
+        let signature = "e".repeat(64);
+        let census = ledger
+            .nonadmissible_structural_census(std::slice::from_ref(&signature), &[])
+            .expect("synthetic fixture has a structural projection");
+        assert!(!census.flip_ready);
+        assert_eq!(census.mismatch_count, 1);
+        assert_eq!(census.registered_mismatch_count, 1);
+        assert_eq!(census.missing_prediction_classes.len(), 5);
+        assert_eq!(
+            census.prediction_policy_sha256,
+            divergence_prediction_policy_sha256()
+        );
+        assert_eq!(
+            census.prediction_policy_sha256,
+            "ac71c1ed97fcd39fbe8f16ea8fb361c6a702b7f51bacb38dbf0bc5ecf0ba82e8",
+            "the ordered required-class policy is a frozen evidence identity"
+        );
+        assert_eq!(
+            census.required_prediction_classes,
+            REQUIRED_DIVERGENCE_PREDICTION_CLASSES
+        );
+
+        let empty = DivergenceRegisterLedger::new("empty-terminal-policy", Vec::new())
+            .expect("an in-progress empty ledger remains structurally valid");
+        let empty_census = empty
+            .nonadmissible_structural_census(&[], &[])
+            .expect("private structural projection reports an incomplete policy state");
+        assert!(!empty_census.flip_ready);
+        assert_eq!(
+            empty_census.missing_prediction_classes,
+            REQUIRED_DIVERGENCE_PREDICTION_CLASSES
+        );
+        let table = ledger.review_table().expect("render review table");
+        assert!(table.contains(
+            "| DIV-900 | oversized_query_token | divergence-register-contract-fixture | accepted | contract-fixture-reviewer |"
+        ));
+
+        let mut unknown_field = fixture;
+        unknown_field
+            .as_object_mut()
+            .expect("fixture object")
+            .insert("unreviewed".to_owned(), serde_json::Value::Bool(true));
+        assert!(!validator.is_valid(&unknown_field));
+        assert!(
+            serde_json::from_value::<DivergenceRegisterLedger>(unknown_field).is_err(),
+            "typed decoder must also reject unknown fields"
+        );
+    }
+
+    #[test]
+    fn divergence_ledger_v1_is_decode_only_and_cannot_be_admitted() {
+        let schema: serde_json::Value =
+            serde_json::from_str(LEGACY_DIVERGENCE_REGISTER_SCHEMA_V1_JSON)
+                .expect("parse legacy register schema");
+        let fixture: serde_json::Value =
+            serde_json::from_str(LEGACY_DIVERGENCE_REGISTER_FIXTURE_V1_JSON)
+                .expect("parse legacy register fixture");
+        let validator =
+            jsonschema::draft202012::new(&schema).expect("compile legacy register schema");
+        validator
+            .validate(&fixture)
+            .expect("legacy fixture satisfies its historical schema");
+
+        let ledger = DivergenceRegisterLedger::decode_json(
+            LEGACY_DIVERGENCE_REGISTER_FIXTURE_V1_JSON.as_bytes(),
+        )
+        .expect("decode and structurally validate legacy register");
+        assert_eq!(
+            ledger.schema_version,
+            LEGACY_DIVERGENCE_REGISTER_LEDGER_SCHEMA_VERSION_V1
+        );
+        assert_eq!(
+            serde_json::to_value(&ledger).expect("serialize decoded legacy register"),
+            fixture,
+            "archival decoding must not rewrite the historical v1 shape"
+        );
+        assert!(ledger.validate().is_err());
+        assert!(ledger.ledger_hash().is_err());
+        assert!(ledger.nonadmissible_structural_census(&[], &[]).is_err());
+
+        let mut historical_multibyte = fixture.clone();
+        let historical_text = "é".repeat(200);
+        historical_multibyte["events"][0]["event"]["revisions"]["generator_revision"] =
+            serde_json::Value::String(historical_text.clone());
+        historical_multibyte["events"][0]["event"]["fixture"]["fixture_id"] =
+            serde_json::Value::String(historical_text);
+        validator
+            .validate(&historical_multibyte)
+            .expect("historical v1 schema admitted 256-character Unicode identifiers");
+        let decoded_multibyte = DivergenceRegisterLedger::decode_json(
+            &serde_json::to_vec(&historical_multibyte).expect("serialize legacy Unicode fixture"),
+        )
+        .expect("v1 decode preserves its historical 1024-byte Rust bound");
+        assert_eq!(
+            serde_json::to_value(decoded_multibyte).expect("serialize legacy Unicode ledger"),
+            historical_multibyte
+        );
+
+        let mut malformed_legacy = fixture.clone();
+        malformed_legacy["events"][0]["event"]["first_seen_artifact_object_hash"] =
+            serde_json::Value::String("0".repeat(15));
+        assert!(!validator.is_valid(&malformed_legacy));
+        assert!(
+            DivergenceRegisterLedger::decode_json(
+                &serde_json::to_vec(&malformed_legacy).expect("serialize mutation")
+            )
+            .is_err(),
+            "archival decoding still validates the historical v1 address"
+        );
+
+        let mut legacy_identity_under_v2 = fixture.clone();
+        legacy_identity_under_v2["schema_version"] = serde_json::json!(2);
+        assert!(
+            DivergenceRegisterLedger::decode_json(
+                &serde_json::to_vec(&legacy_identity_under_v2).expect("serialize mutation")
+            )
+            .is_err(),
+            "v2 must never admit the legacy XXH3-64 address shape"
+        );
+
+        let mut current_identity_under_v1: serde_json::Value =
+            serde_json::from_str(DIVERGENCE_REGISTER_FIXTURE_JSON).expect("current fixture");
+        current_identity_under_v1["schema_version"] = serde_json::json!(1);
+        assert!(
+            DivergenceRegisterLedger::decode_json(
+                &serde_json::to_vec(&current_identity_under_v1).expect("serialize mutation")
+            )
+            .is_err(),
+            "v1 archival decoding must require the historical identity shape"
+        );
+    }
+
+    #[test]
+    fn divergence_ledger_v2_rejects_wrong_object_domain_version_and_digest() {
+        let schema: serde_json::Value =
+            serde_json::from_str(DIVERGENCE_REGISTER_SCHEMA_JSON).expect("parse register schema");
+        let validator =
+            jsonschema::draft202012::new(&schema).expect("compile Divergence Register schema");
+        let fixture: serde_json::Value =
+            serde_json::from_str(DIVERGENCE_REGISTER_FIXTURE_JSON).expect("parse register fixture");
+
+        for (field, value) in [
+            ("scheme", serde_json::json!("sha256")),
+            ("object_schema_version", serde_json::json!(6)),
+        ] {
+            let mut wrong_domain = fixture.clone();
+            wrong_domain["events"][0]["event"]["first_recorded_witness_artifact_object"][field] =
+                value;
+            assert!(!validator.is_valid(&wrong_domain));
+            assert!(
+                DivergenceRegisterLedger::decode_json(
+                    &serde_json::to_vec(&wrong_domain).expect("serialize mutation")
+                )
+                .is_err(),
+                "v2 must reject a wrong artifact-object {field}"
+            );
+        }
+
+        for invalid_digest in ["a".repeat(63), format!("{}g", "a".repeat(63))] {
+            let mut invalid = fixture.clone();
+            invalid["events"][0]["event"]["first_recorded_witness_artifact_object"]["digest"] =
+                serde_json::Value::String(invalid_digest);
+            assert!(!validator.is_valid(&invalid));
+            assert!(
+                DivergenceRegisterLedger::decode_json(
+                    &serde_json::to_vec(&invalid).expect("serialize mutation")
+                )
+                .is_err()
+            );
+        }
+
+        for (field, invalid_value) in [
+            ("producer_build_identity_sha256", "1".repeat(63)),
+            (
+                "oracle_dependency_contract_sha256",
+                format!("{}g", "2".repeat(63)),
+            ),
+            ("oracle_lexical_contract_audit_revision", "3".repeat(39)),
+        ] {
+            let mut invalid = fixture.clone();
+            invalid["events"][0]["event"]["revisions"][field] =
+                serde_json::Value::String(invalid_value);
+            assert!(!validator.is_valid(&invalid));
+            assert!(
+                DivergenceRegisterLedger::decode_json(
+                    &serde_json::to_vec(&invalid).expect("serialize mutation")
+                )
+                .is_err()
+            );
+        }
+
+        for (field, invalid_value) in [
+            ("query_suite_source", serde_json::json!("caller_supplied")),
+            (
+                "query_source_identity_sha256",
+                serde_json::json!("4".repeat(63)),
+            ),
+        ] {
+            let mut invalid = fixture.clone();
+            invalid["events"][0]["event"]["revisions"][field] = invalid_value;
+            assert!(!validator.is_valid(&invalid));
+            assert!(
+                DivergenceRegisterLedger::decode_json(
+                    &serde_json::to_vec(&invalid).expect("serialize source mutation")
+                )
+                .is_err(),
+                "v2 must reject an invalid query-source field: {field}"
+            );
+        }
+
+        let mut obsolete_generator_revision = fixture.clone();
+        obsolete_generator_revision["events"][0]["event"]["revisions"]["generator_revision"] =
+            serde_json::json!("legacy-generator");
+        assert!(!validator.is_valid(&obsolete_generator_revision));
+        assert!(
+            DivergenceRegisterLedger::decode_json(
+                &serde_json::to_vec(&obsolete_generator_revision)
+                    .expect("serialize obsolete generator field")
+            )
+            .is_err(),
+            "v2 must reject the obsolete unsealed generator revision"
+        );
+
+        let mut obsolete_revision_pair = fixture;
+        let revisions = obsolete_revision_pair["events"][0]["event"]["revisions"]
+            .as_object_mut()
+            .expect("revision object");
+        revisions.remove("producer_build_identity_sha256");
+        revisions.remove("oracle_dependency_contract_sha256");
+        revisions.remove("oracle_lexical_contract_audit_revision");
+        revisions.insert(
+            "subject_git_revision".to_owned(),
+            serde_json::Value::String("1".repeat(40)),
+        );
+        revisions.insert(
+            "oracle_git_revision".to_owned(),
+            serde_json::Value::String("2".repeat(40)),
+        );
+        assert!(!validator.is_valid(&obsolete_revision_pair));
+        assert!(
+            DivergenceRegisterLedger::decode_json(
+                &serde_json::to_vec(&obsolete_revision_pair).expect("serialize mutation")
+            )
+            .is_err(),
+            "v2 must reject v1's unauthenticated subject/oracle revision pair"
+        );
+    }
+
+    #[test]
+    fn divergence_ledger_v2_schema_and_rust_agree_on_identifier_byte_bounds() {
+        let schema: serde_json::Value =
+            serde_json::from_str(DIVERGENCE_REGISTER_SCHEMA_JSON).expect("parse register schema");
+        let validator =
+            jsonschema::draft202012::new(&schema).expect("compile Divergence Register schema");
+        let fixture: serde_json::Value =
+            serde_json::from_str(DIVERGENCE_REGISTER_FIXTURE_JSON).expect("parse register fixture");
+        let assert_contract = |candidate: &serde_json::Value, expected: bool, label: &str| {
+            assert_eq!(
+                validator.is_valid(candidate),
+                expected,
+                "JSON Schema disagrees for {label}"
+            );
+            let encoded = serde_json::to_vec(candidate).expect("serialize boundary mutation");
+            assert_eq!(
+                DivergenceRegisterLedger::decode_json(&encoded).is_ok(),
+                expected,
+                "typed validation disagrees for {label}"
+            );
+        };
+
+        for (length, expected) in [(MAX_QUERY_ID_BYTES, true), (MAX_QUERY_ID_BYTES + 1, false)] {
+            for field in ["fixture_id", "first_recorded_witness_case_id"] {
+                let mut candidate = fixture.clone();
+                if field == "fixture_id" {
+                    candidate["events"][0]["event"]["fixture"][field] =
+                        serde_json::Value::String("f".repeat(length));
+                } else {
+                    candidate["events"][0]["event"][field] =
+                        serde_json::Value::String("f".repeat(length));
+                }
+                assert_contract(&candidate, expected, &format!("{field} length {length}"));
+            }
+        }
+
+        for field in ["fixture_id", "first_recorded_witness_case_id"] {
+            let mut candidate = fixture.clone();
+            let target = if field == "fixture_id" {
+                &mut candidate["events"][0]["event"]["fixture"][field]
+            } else {
+                &mut candidate["events"][0]["event"][field]
+            };
+            *target = serde_json::Value::String("e\u{301}".repeat(128));
+            assert_contract(&candidate, false, &format!("non-ASCII multibyte {field}"));
+        }
+
+        let mut empty_bead_suffix = fixture;
+        empty_bead_suffix["events"][2]["event"]["state"]["bead_id"] = serde_json::json!("bd-");
+        assert_contract(&empty_bead_suffix, false, "empty bead ID suffix");
+    }
+
+    #[test]
+    fn divergence_fixture_content_witnesses_are_exact_but_nonadmissible() {
+        let fixture_bytes = b"minimized divergence fixture bytes";
+        let mut ledger = divergence_ledger_fixture();
+        let fixture_id = {
+            let DivergenceRegisterEvent::Observation(observation) = &mut ledger.events[0] else {
+                panic!("first fixture event is the observation");
+            };
+            assert_ne!(
+                observation
+                    .first_recorded_witness_case_id
+                    .as_deref()
+                    .expect("v2 case identity"),
+                observation.fixture.fixture_id,
+                "a minimized fixture need not retain the first campaign case ID"
+            );
+            observation.fixture.fixture_sha256 = sha256_bytes(fixture_bytes);
+            observation.fixture.fixture_id.clone()
+        };
+        ledger
+            .validate()
+            .expect("updated fixture hash remains valid");
+
+        let witness =
+            DivergenceFixtureContentWitness::from_bytes(fixture_id.clone(), fixture_bytes)
+                .expect("seal exact fixture bytes");
+        ledger
+            .validate_fixture_content_witnesses(std::slice::from_ref(&witness))
+            .expect("exact fixture content is present");
+        assert!(ledger.validate_fixture_content_witnesses(&[]).is_err());
+        assert!(
+            ledger
+                .validate_fixture_content_witnesses(&[witness.clone(), witness.clone()])
+                .is_err(),
+            "duplicate fixture witnesses fail closed"
+        );
+
+        let wrong_bytes =
+            DivergenceFixtureContentWitness::from_bytes(fixture_id, b"different bytes")
+                .expect("seal wrong bytes for negative test");
+        assert!(
+            ledger
+                .validate_fixture_content_witnesses(&[wrong_bytes])
+                .is_err(),
+            "a matching fixture ID cannot substitute different content"
+        );
+        let extra = DivergenceFixtureContentWitness::from_bytes("extra-fixture", b"extra")
+            .expect("seal extra fixture");
+        assert!(
+            ledger
+                .validate_fixture_content_witnesses(&[witness, extra])
+                .is_err(),
+            "unreferenced fixture content is rejected"
+        );
+    }
+
+    #[test]
+    fn divergence_ledger_enforces_append_only_corrections() {
+        let ledger = divergence_ledger_fixture();
+        let mut previous = ledger.clone();
+        previous.events.truncate(2);
+        previous.validate().expect("observation plus disposition");
+        ledger
+            .validate_append_only_successor(&previous)
+            .expect("later prediction events are append-only");
+
+        let mut successor = ledger.clone();
+        let DivergenceRegisterEvent::Observation(corrected_observation) = ledger.events[0].clone()
+        else {
+            panic!("first fixture event is the observation");
+        };
+        let mut corrected_observation = *corrected_observation;
+        corrected_observation.header.sequence = 5;
+        corrected_observation.header.supersedes = Some(1);
+        corrected_observation.header.recorded_at = "2026-07-27T00:04:00Z".to_owned();
+        corrected_observation.root_cause =
+            "The reviewed correction clarifies the symmetric AST admission boundary.".to_owned();
+        successor
+            .events
+            .push(DivergenceRegisterEvent::Observation(Box::new(
+                corrected_observation,
+            )));
+
+        let DivergenceRegisterEvent::Disposition(mut corrected_disposition) =
+            ledger.events[1].clone()
+        else {
+            panic!("second fixture event is the disposition");
+        };
+        corrected_disposition.header.sequence = 6;
+        corrected_disposition.header.supersedes = Some(2);
+        corrected_disposition.header.recorded_at = "2026-07-27T00:05:00Z".to_owned();
+        successor
+            .events
+            .push(DivergenceRegisterEvent::Disposition(corrected_disposition));
+        successor.validate().expect("corrected append-only ledger");
+        successor
+            .validate_append_only_successor(&ledger)
+            .expect("correction appends observation and renewed review");
+
+        let mut rewritten = successor.clone();
+        let DivergenceRegisterEvent::Observation(observation) = &mut rewritten.events[0] else {
+            panic!("first fixture event is the observation");
+        };
+        observation.root_cause = "rewritten history".to_owned();
+        rewritten
+            .validate()
+            .expect("rewritten snapshot remains internally shaped");
+        assert!(
+            rewritten.validate_append_only_successor(&ledger).is_err(),
+            "editing any prior event must fail the append-only proof"
+        );
+
+        let mut missing_review = ledger.clone();
+        let DivergenceRegisterEvent::Observation(observation) = ledger.events[0].clone() else {
+            panic!("first fixture event is the observation");
+        };
+        let mut observation = *observation;
+        observation.header.sequence = 5;
+        observation.header.supersedes = Some(1);
+        observation.header.recorded_at = "2026-07-27T00:04:00Z".to_owned();
+        missing_review
+            .events
+            .push(DivergenceRegisterEvent::Observation(Box::new(observation)));
+        assert!(
+            missing_review.validate().is_err(),
+            "corrected evidence requires a later disposition review"
+        );
+    }
+
+    #[test]
+    fn divergence_artifact_coverage_retains_superseded_object_claims() {
+        let ledger = divergence_ledger_fixture();
+        let mut successor = ledger.clone();
+        let DivergenceRegisterEvent::Observation(observation) = ledger.events[0].clone() else {
+            panic!("first fixture event is the observation");
+        };
+        let mut corrected_observation = *observation;
+        corrected_observation.header.sequence = 5;
+        corrected_observation.header.supersedes = Some(1);
+        corrected_observation.header.recorded_at = "2026-07-27T00:04:00Z".to_owned();
+        corrected_observation.first_recorded_witness_case_id =
+            Some("divergence-register-corrected-case".to_owned());
+        corrected_observation
+            .first_recorded_witness_artifact_object
+            .as_mut()
+            .expect("v2 artifact identity")
+            .digest = "9".repeat(64);
+        corrected_observation.mismatch_signatures = vec!["8".repeat(64)];
+        successor
+            .events
+            .push(DivergenceRegisterEvent::Observation(Box::new(
+                corrected_observation,
+            )));
+
+        let DivergenceRegisterEvent::Disposition(mut corrected_disposition) =
+            ledger.events[1].clone()
+        else {
+            panic!("second fixture event is the disposition");
+        };
+        corrected_disposition.header.sequence = 6;
+        corrected_disposition.header.supersedes = Some(2);
+        corrected_disposition.header.recorded_at = "2026-07-27T00:05:00Z".to_owned();
+        successor
+            .events
+            .push(DivergenceRegisterEvent::Disposition(corrected_disposition));
+        successor
+            .validate()
+            .expect("append-only correction is valid");
+
+        let claims = successor
+            .artifact_claims_from_all_observations()
+            .expect("collect historical and active claims");
+        let expected = BTreeMap::from([
+            (
+                "a".repeat(64),
+                vec![("oversized_query_token".to_owned(), "e".repeat(64))],
+            ),
+            (
+                "9".repeat(64),
+                vec![("oversized_query_token".to_owned(), "8".repeat(64))],
+            ),
+        ]);
+        validate_exact_artifact_claim_coverage(&claims, &expected)
+            .expect("each historical object is covered by its own observation");
+
+        let active_only = BTreeMap::from([(
+            "9".repeat(64),
+            vec![("oversized_query_token".to_owned(), "8".repeat(64))],
+        )]);
+        assert!(
+            validate_exact_artifact_claim_coverage(&claims, &active_only).is_err(),
+            "dropping the superseded object's expected claim must fail"
+        );
+    }
+
+    #[test]
+    fn divergence_ledger_rejects_orphans_duplicate_signatures_and_unsafe_accepts() {
+        let ledger = divergence_ledger_fixture();
+        let mut duplicate = ledger.clone();
+        let DivergenceRegisterEvent::Observation(observation) = ledger.events[0].clone() else {
+            panic!("first fixture event is the observation");
+        };
+        let mut observation = *observation;
+        observation.header.sequence = 5;
+        observation.header.supersedes = None;
+        observation.header.recorded_at = "2026-07-27T00:04:00Z".to_owned();
+        observation.divergence_id = "DIV-901".to_owned();
+        duplicate
+            .events
+            .push(DivergenceRegisterEvent::Observation(Box::new(observation)));
+        let DivergenceRegisterEvent::Disposition(mut disposition) = ledger.events[1].clone() else {
+            panic!("second fixture event is the disposition");
+        };
+        disposition.header.sequence = 6;
+        disposition.header.supersedes = None;
+        disposition.header.recorded_at = "2026-07-27T00:05:00Z".to_owned();
+        disposition.divergence_id = "DIV-901".to_owned();
+        duplicate
+            .events
+            .push(DivergenceRegisterEvent::Disposition(disposition));
+        assert!(
+            duplicate.validate().is_err(),
+            "one mismatch signature cannot resolve to two active entries"
+        );
+
+        let mut unsafe_accept = ledger.clone();
+        unsafe_accept.events.truncate(2);
+        let DivergenceRegisterEvent::Observation(observation) = &mut unsafe_accept.events[0] else {
+            panic!("first fixture event is the observation");
+        };
+        observation.class = DivergenceClass::RankMismatch;
+        assert!(
+            unsafe_accept.validate().is_err(),
+            "raw result failures cannot be accepted as equivalence classes"
+        );
+
+        let mut self_reviewed = ledger;
+        let DivergenceRegisterEvent::Disposition(disposition) = &mut self_reviewed.events[1] else {
+            panic!("second fixture event is the disposition");
+        };
+        let DivergenceDisposition::Accepted { reviewer, .. } = &mut disposition.disposition else {
+            panic!("fixture disposition is accepted");
+        };
+        *reviewer = "contract-fixture-author".to_owned();
+        assert!(
+            self_reviewed.validate().is_err(),
+            "accepted divergences require a fresh-eyes reviewer"
+        );
+    }
+
+    #[test]
+    fn divergence_ledger_census_fails_closed_for_every_unresolved_state() {
+        let ledger = divergence_ledger_fixture();
+        let signature = "e".repeat(64);
+        let unknown = "0".repeat(64);
+        let unclassified = ledger
+            .nonadmissible_structural_census(std::slice::from_ref(&unknown), &[])
+            .expect("census");
+        assert!(!unclassified.flip_ready);
+        assert_eq!(unclassified.unclassified_signatures, vec![unknown.clone()]);
+        assert!(!unclassified.flip_ready);
+
+        let lexical_signature = "9".repeat(64);
+        let lexical_failure = ledger
+            .nonadmissible_structural_census(
+                std::slice::from_ref(&signature),
+                std::slice::from_ref(&lexical_signature),
+            )
+            .expect("lexical fix-only projection");
+        assert_eq!(
+            lexical_failure.unresolved_lexical_mismatch_signatures,
+            vec![lexical_signature]
+        );
+        assert!(!lexical_failure.flip_ready);
+
+        let mut fixed = ledger.clone();
+        let DivergenceRegisterEvent::Disposition(disposition) = &mut fixed.events[1] else {
+            panic!("second fixture event is the disposition");
+        };
+        disposition.disposition = DivergenceDisposition::Fixed {
+            fixing_commit: "3".repeat(40),
+            regression_test: "runner::tests::fixed_divergence_regression".to_owned(),
+            reviewer: "contract-fixture-reviewer".to_owned(),
+            reviewed_at: "2026-07-27T00:00:30Z".to_owned(),
+        };
+        let fixed_census = fixed
+            .nonadmissible_structural_census(std::slice::from_ref(&signature), &[])
+            .expect("fixed census");
+        assert_eq!(
+            fixed_census.fixed_regression_divergence_ids,
+            vec!["DIV-900"]
+        );
+        assert!(!fixed_census.flip_ready);
+
+        let mut blocking = ledger.clone();
+        let DivergenceRegisterEvent::Disposition(disposition) = &mut blocking.events[1] else {
+            panic!("second fixture event is the disposition");
+        };
+        disposition.disposition = DivergenceDisposition::Blocking {
+            bead_id: "bd-quill-e6-gauntlet-scale-rm3q.8".to_owned(),
+            rationale: "The mismatch remains an explicit flip blocker.".to_owned(),
+            reviewer: "contract-fixture-reviewer".to_owned(),
+            reviewed_at: "2026-07-27T00:00:30Z".to_owned(),
+        };
+        let blocking_census = blocking
+            .nonadmissible_structural_census(&[], &[])
+            .expect("blocking census");
+        assert_eq!(blocking_census.blocking_divergence_ids, vec!["DIV-900"]);
+        assert!(!blocking_census.flip_ready);
+
+        let mut unresolved_prediction = ledger;
+        unresolved_prediction.events.truncate(3);
+        unresolved_prediction
+            .validate()
+            .expect("declared prediction is valid during an active campaign");
+        let prediction_census = unresolved_prediction
+            .nonadmissible_structural_census(std::slice::from_ref(&signature), &[])
+            .expect("prediction census");
+        assert_eq!(
+            prediction_census.unresolved_prediction_ids,
+            vec!["PRED-900"]
+        );
+        assert!(!prediction_census.flip_ready);
+
+        let mut unverified_retirement = divergence_ledger_fixture();
+        let DivergenceRegisterEvent::Prediction(prediction) = &mut unverified_retirement.events[3]
+        else {
+            panic!("fourth fixture event is a prediction revision");
+        };
+        prediction.state = PredictedDivergenceState::Retired {
+            proof_sha256: "0".repeat(64),
+            rationale: "A shape-valid hash is not a verified retirement receipt.".to_owned(),
+            reviewer: "contract-fixture-reviewer".to_owned(),
+            reviewed_at: "2026-07-27T00:02:30Z".to_owned(),
+        };
+        unverified_retirement
+            .validate()
+            .expect("retirement remains archival shape-valid state");
+        let retirement_census = unverified_retirement
+            .nonadmissible_structural_census(std::slice::from_ref(&signature), &[])
+            .expect("retirement projection");
+        assert_eq!(
+            retirement_census.unresolved_prediction_ids,
+            vec!["PRED-900"]
+        );
+        assert!(!retirement_census.flip_ready);
+    }
+
+    #[test]
+    fn divergence_ledger_redaction_canaries_reject_plaintext_leaks() {
+        let ledger = divergence_ledger_fixture();
+        ledger
+            .validate_redaction_canaries(&["TOP_SECRET_CANARY"])
+            .expect("safe fixture does not contain the canary");
+
+        let mut leaked = ledger.clone();
+        let DivergenceRegisterEvent::Observation(observation) = &mut leaked.events[0] else {
+            panic!("first fixture event is the observation");
+        };
+        observation.observed_behavior.push_str(" TOP_SECRET_CANARY");
+        assert!(
+            leaked
+                .validate_redaction_canaries(&["TOP_SECRET_CANARY"])
+                .is_err(),
+            "source-sensitive plaintext must not survive committed serialization"
+        );
+
+        let DivergenceRegisterEvent::Observation(observation) = &mut leaked.events[0] else {
+            panic!("first fixture event is the observation");
+        };
+        observation.observed_behavior =
+            "The subject emits only a redacted diagnostic marker.".to_owned();
+        observation.diagnostic.marker = "raw query text".to_owned();
+        assert!(
+            leaked.validate().is_err(),
+            "diagnostic excerpts must use canonical redaction markers"
         );
     }
 
@@ -6033,20 +9449,22 @@ mod tests {
         // Git provenance.
         let lexical_revision = oracle_version_contract()
             .expect("oracle version contract")
-            .lexical_git_revision;
+            .lexical_contract_audit_revision;
         let config = frankensearch_quill::QuillConfig {
             deterministic_ingest: true,
             ..frankensearch_quill::QuillConfig::default()
         };
-        let mut subject = crate::engine::QuillSubject::in_memory(
+        let mut subject = crate::engine::QuillSubject::in_memory_with_source(
             config,
             "g1a-deterministic-regression-not-live-provenance",
             false,
         )
         .expect("fresh scalar Quill subject");
-        let mut oracle =
-            crate::engine::TantivyOracle::in_memory_scalar_g1a(&lexical_revision, false)
-                .expect("fresh scalar G1a Tantivy oracle");
+        let mut oracle = crate::engine::TantivyOracle::in_memory_scalar_g1a_with_source(
+            &lexical_revision,
+            false,
+        )
+        .expect("fresh scalar G1a Tantivy oracle");
         let campaign = DifferentialCampaignRunner::new(
             ArtifactStore::new(root),
             SemanticContract::scalar_g1a(),
@@ -6073,6 +9491,3022 @@ mod tests {
             .await
     }
 
+    #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
+    const UNION_HORIZON_QUERY: &str = "content:alpha OR content:beta OR content:gamma";
+    #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
+    const UNION_HORIZON_DOCUMENT_COUNT: usize = 9_001;
+    #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
+    const UNION_HORIZON_TWO_SEGMENT_SPLIT: usize = 257;
+    #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
+    const UNION_HORIZON_LATE_TIE_EXPANSION: u64 = 1;
+    #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
+    const UNION_HORIZON_MATRIX_TIE_EXPANSION: u64 = 4;
+    #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
+    const UNION_HORIZON_RANKED_DOCUMENT_TOKENS: usize = 128;
+    #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
+    const UNION_HORIZON_TOMBSTONE_ORDINALS: [usize; 6] = [0, 4_095, 4_096, 8_191, 8_192, 8_999];
+
+    #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
+    const UNION_HORIZON_ARTIFACT_SCHEMA_VERSION: &str =
+        "frankensearch.salej-union-horizon-diagnostic.v3";
+    #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
+    const UNION_HORIZON_ARTIFACT_HASH_DOMAIN: &[u8] =
+        b"frankensearch/quill/salej-union-horizon-diagnostic/v3\0";
+    #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
+    const UNION_HORIZON_COMPLETION_SCHEMA_VERSION: &str =
+        "frankensearch.salej-union-horizon-diagnostic-completion.v2";
+    #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
+    const UNION_HORIZON_COMPLETION_HASH_DOMAIN: &[u8] =
+        b"frankensearch/quill/salej-union-horizon-diagnostic-completion/v2\0";
+
+    #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    enum UnionHorizonSegmentLayout {
+        Single,
+        Two,
+        Eight,
+    }
+
+    #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
+    impl UnionHorizonSegmentLayout {
+        const ALL: [Self; 3] = [Self::Single, Self::Two, Self::Eight];
+
+        const fn label(self) -> &'static str {
+            match self {
+                Self::Single => "single",
+                Self::Two => "two",
+                Self::Eight => "eight",
+            }
+        }
+
+        const fn expected_execution_mode(
+            self,
+        ) -> frankensearch_quill::ConformancePruningExecutionMode {
+            match self {
+                Self::Single | Self::Two => {
+                    frankensearch_quill::ConformancePruningExecutionMode::Serial
+                }
+                Self::Eight => frankensearch_quill::ConformancePruningExecutionMode::Rayon,
+            }
+        }
+
+        fn ranges(self) -> Vec<std::ops::Range<usize>> {
+            let boundaries: &[usize] = match self {
+                Self::Single => &[0, UNION_HORIZON_DOCUMENT_COUNT],
+                Self::Two => &[
+                    0,
+                    UNION_HORIZON_TWO_SEGMENT_SPLIT,
+                    UNION_HORIZON_DOCUMENT_COUNT,
+                ],
+                // Seven uniquely sized prefix leaves retain the exact
+                // 257-document prefix and 8,744-document target tail while
+                // crossing the shipping eight-segment fan-out threshold
+                // naturally. Unique cardinalities make every Tantivy native
+                // segment address independently resolvable.
+                Self::Eight => &[
+                    0,
+                    1,
+                    3,
+                    6,
+                    10,
+                    15,
+                    21,
+                    UNION_HORIZON_TWO_SEGMENT_SPLIT,
+                    UNION_HORIZON_DOCUMENT_COUNT,
+                ],
+            };
+            boundaries.windows(2).map(|pair| pair[0]..pair[1]).collect()
+        }
+
+        fn range_for_ordinal(self, ordinal: usize) -> std::ops::Range<usize> {
+            self.ranges()
+                .into_iter()
+                .find(|range| range.contains(&ordinal))
+                .expect("UNION_HORIZON ordinal belongs to one segment")
+        }
+
+        const fn target_segment_start(self) -> usize {
+            match self {
+                Self::Single => 0,
+                Self::Two | Self::Eight => UNION_HORIZON_TWO_SEGMENT_SPLIT,
+            }
+        }
+    }
+
+    #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct UnionHorizonBuildIdentity {
+        source_git_revision: String,
+        source_git_dirty: bool,
+        source_verification: UnionHorizonSourceVerification,
+        cargo_lock_sha256: String,
+        rustc_version_verbose: String,
+        target_triple: String,
+        cargo_profile: String,
+        enabled_features: Vec<String>,
+        enabled_features_sha256: String,
+        test_executable_sha256: String,
+        test_executable_byte_len: u64,
+    }
+
+    #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    enum UnionHorizonSourceVerification {
+        /// `build.rs` rediscovered the exact repository root and verified any
+        /// explicit identity against its live Git revision and dirty state.
+        GitCheckoutVerified,
+        /// A Git-less build accepted caller-supplied revision metadata only
+        /// for diagnostic execution.
+        ExplicitUnverified,
+        /// Neither an exact checkout nor explicit diagnostic identity existed.
+        Unavailable,
+    }
+
+    #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
+    impl UnionHorizonSourceVerification {
+        const fn label(self) -> &'static str {
+            match self {
+                Self::GitCheckoutVerified => "git_checkout_verified",
+                Self::ExplicitUnverified => "explicit_unverified",
+                Self::Unavailable => "unavailable",
+            }
+        }
+    }
+
+    #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct UnionHorizonOracleDependencyIdentity {
+        tantivy_version: String,
+        tantivy_checksum_sha256: String,
+        lexical_package: String,
+        lexical_package_version: String,
+        pinned_lexical_contract_revision: String,
+    }
+
+    #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct UnionHorizonTraceReceipt {
+        limit: u64,
+        segment_doc_start: u32,
+        segment_doc_count: u64,
+        refills: Vec<frankensearch_quill::ConformancePruningRefillReceipt>,
+    }
+
+    #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct UnionHorizonTracedHitReceipt {
+        document_id: String,
+        global_docid: u32,
+        score_bits: u32,
+    }
+
+    #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct UnionHorizonTracedResultReceipt {
+        limit: u64,
+        hits: Vec<UnionHorizonTracedHitReceipt>,
+        total_count: Option<u64>,
+        doc_count: u64,
+        diagnostic_count: u64,
+    }
+
+    #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct UnionHorizonTantivySegmentReceipt {
+        segment_ord: u32,
+        max_doc: u32,
+        num_docs: u32,
+    }
+
+    #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct UnionHorizonTopologyReceipt {
+        quill_segment_doc_counts: Vec<u32>,
+        tantivy_segments: Vec<UnionHorizonTantivySegmentReceipt>,
+    }
+
+    #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct UnionHorizonProof {
+        layout: UnionHorizonSegmentLayout,
+        build_identity: UnionHorizonBuildIdentity,
+        oracle_dependency: UnionHorizonOracleDependencyIdentity,
+        comparisons: Vec<HarnessRun>,
+        traced_results: Vec<UnionHorizonTracedResultReceipt>,
+        target_traces: Vec<UnionHorizonTraceReceipt>,
+        complete_pruning_traces: Vec<frankensearch_quill::ConformancePruningTraceReceipt>,
+        topology: UnionHorizonTopologyReceipt,
+    }
+
+    #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    enum UnionHorizonProofKind {
+        LateWinner,
+        TieMatrix,
+    }
+
+    #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
+    impl UnionHorizonProofKind {
+        const fn label(self) -> &'static str {
+            match self {
+                Self::LateWinner => "late-winner",
+                Self::TieMatrix => "tie-matrix",
+            }
+        }
+    }
+
+    #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
+    fn union_horizon_quill_config() -> frankensearch_quill::QuillConfig {
+        frankensearch_quill::QuillConfig {
+            deterministic_ingest: true,
+            // The proof needs eight independently searchable sealed leaves to
+            // exercise the shipping Rayon query branch. The default fanout of
+            // eight would merge on the eighth commit; nine is the smallest
+            // production-valid value that preserves this exact topology.
+            tier_fanout: 9,
+            ..frankensearch_quill::QuillConfig::default()
+        }
+    }
+
+    #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
+    fn union_horizon_expected_corpus_hash(proof_kind: UnionHorizonProofKind) -> &'static str {
+        static LATE_WINNER: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        static TIE_MATRIX: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        match proof_kind {
+            UnionHorizonProofKind::LateWinner => LATE_WINNER
+                .get_or_init(|| make_union_horizon_fixture().corpus_hash)
+                .as_str(),
+            UnionHorizonProofKind::TieMatrix => TIE_MATRIX
+                .get_or_init(|| make_union_horizon_tie_fixture().corpus_hash)
+                .as_str(),
+        }
+    }
+
+    #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct UnionHorizonDiagnosticArtifact {
+        schema_version: String,
+        run_id: String,
+        proof_kind: UnionHorizonProofKind,
+        proofs: Vec<UnionHorizonProof>,
+        artifact_sha256: String,
+    }
+
+    #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    struct PublishedUnionHorizonDiagnostic {
+        path: std::path::PathBuf,
+        raw_file_sha256: String,
+        byte_len: u64,
+    }
+
+    #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct UnionHorizonDiagnosticCompletionEntry {
+        proof_kind: UnionHorizonProofKind,
+        filename: String,
+        semantic_sha256: String,
+        raw_file_sha256: String,
+        byte_len: u64,
+        artifact: UnionHorizonDiagnosticArtifact,
+    }
+
+    #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
+    #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct UnionHorizonDiagnosticCompletionManifest {
+        schema_version: String,
+        run_id: String,
+        build_identity: UnionHorizonBuildIdentity,
+        artifacts: Vec<UnionHorizonDiagnosticCompletionEntry>,
+        manifest_sha256: String,
+    }
+
+    #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
+    impl UnionHorizonDiagnosticCompletionManifest {
+        fn seal(run_id: String, mut artifacts: Vec<UnionHorizonDiagnosticCompletionEntry>) -> Self {
+            artifacts.sort_by_key(|entry| entry.proof_kind);
+            let mut manifest = Self {
+                schema_version: UNION_HORIZON_COMPLETION_SCHEMA_VERSION.to_owned(),
+                run_id,
+                build_identity: union_horizon_build_identity(),
+                artifacts,
+                manifest_sha256: String::new(),
+            };
+            manifest.validate_structure();
+            manifest.manifest_sha256 = manifest.preimage_sha256();
+            manifest.verify();
+            manifest
+        }
+
+        fn preimage_sha256(&self) -> String {
+            let mut preimage = self.clone();
+            preimage.manifest_sha256.clear();
+            let bytes = serde_json::to_vec(&preimage)
+                .expect("serialize canonical UNION_HORIZON completion preimage");
+            let mut hasher = Sha256::new();
+            hasher.update(UNION_HORIZON_COMPLETION_HASH_DOMAIN);
+            hasher.update(bytes);
+            lower_hex(&hasher.finalize())
+        }
+
+        fn validate_structure(&self) {
+            assert_eq!(
+                self.schema_version, UNION_HORIZON_COMPLETION_SCHEMA_VERSION,
+                "UNION_HORIZON completion schema drifted",
+            );
+            assert!(
+                !self.run_id.is_empty()
+                    && self.run_id.len() <= 128
+                    && self.run_id.bytes().all(|byte| {
+                        byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_')
+                    }),
+                "UNION_HORIZON diagnostic completion run ID must be bounded and path-safe",
+            );
+            assert_eq!(
+                self.build_identity,
+                union_horizon_build_identity(),
+                "UNION_HORIZON completion must bind the executing test binary",
+            );
+            assert!(
+                union_horizon_diagnostic_source_identity_is_well_formed(&self.build_identity),
+                "UNION_HORIZON diagnostic completion source identity is malformed",
+            );
+            assert_eq!(
+                self.artifacts
+                    .iter()
+                    .map(|entry| entry.proof_kind)
+                    .collect::<Vec<_>>(),
+                vec![
+                    UnionHorizonProofKind::LateWinner,
+                    UnionHorizonProofKind::TieMatrix,
+                ],
+                "UNION_HORIZON completion requires exactly both proof kinds",
+            );
+            for entry in &self.artifacts {
+                assert!(
+                    !entry.filename.is_empty()
+                        && entry.filename.bytes().all(|byte| {
+                            byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.')
+                        })
+                        && std::path::Path::new(&entry.filename)
+                            .extension()
+                            .is_some_and(|extension| extension == "json"),
+                    "UNION_HORIZON completion contains an unsafe artifact filename",
+                );
+                assert_lower_hex(
+                    &entry.semantic_sha256,
+                    64,
+                    "UNION_HORIZON completion semantic identity",
+                );
+                assert_lower_hex(
+                    &entry.raw_file_sha256,
+                    64,
+                    "UNION_HORIZON completion raw identity",
+                );
+                assert!(entry.byte_len > 0);
+                entry.artifact.verify();
+                assert_eq!(
+                    entry.artifact.run_id, self.run_id,
+                    "UNION_HORIZON completion cannot embed a proof from another run",
+                );
+                assert_eq!(
+                    entry.artifact.proof_kind, entry.proof_kind,
+                    "UNION_HORIZON completion proof kind does not match its embedded artifact",
+                );
+                assert_eq!(
+                    entry.artifact.artifact_sha256, entry.semantic_sha256,
+                    "UNION_HORIZON completion semantic identity does not match its embedded artifact",
+                );
+                assert!(
+                    entry
+                        .artifact
+                        .proofs
+                        .iter()
+                        .all(|proof| proof.build_identity == self.build_identity),
+                    "UNION_HORIZON completion artifact does not bind the manifest executable",
+                );
+                let canonical_artifact_bytes = serde_json::to_vec_pretty(&entry.artifact)
+                    .expect("serialize embedded UNION_HORIZON artifact");
+                assert_eq!(
+                    u64::try_from(canonical_artifact_bytes.len())
+                        .expect("embedded UNION_HORIZON artifact length fits u64"),
+                    entry.byte_len,
+                    "UNION_HORIZON completion artifact length is not canonical",
+                );
+                assert_eq!(
+                    sha256_hex(&canonical_artifact_bytes),
+                    entry.raw_file_sha256,
+                    "UNION_HORIZON completion raw identity is not canonical",
+                );
+                assert_eq!(
+                    entry.filename,
+                    format!(
+                        "{}-{}-{}-{}.json",
+                        entry.artifact.run_id,
+                        entry.artifact.proof_kind.label(),
+                        entry.artifact.artifact_sha256,
+                        entry.raw_file_sha256,
+                    ),
+                    "UNION_HORIZON completion artifact filename is not canonical",
+                );
+            }
+        }
+
+        fn verify(&self) {
+            self.validate_structure();
+            assert_lower_hex(
+                &self.manifest_sha256,
+                64,
+                "UNION_HORIZON completion manifest identity",
+            );
+            assert_eq!(
+                self.manifest_sha256,
+                self.preimage_sha256(),
+                "UNION_HORIZON completion identity does not match its canonical preimage",
+            );
+        }
+    }
+
+    #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
+    impl UnionHorizonDiagnosticArtifact {
+        fn seal(
+            run_id: String,
+            proof_kind: UnionHorizonProofKind,
+            proofs: Vec<UnionHorizonProof>,
+        ) -> Self {
+            let mut artifact = Self {
+                schema_version: UNION_HORIZON_ARTIFACT_SCHEMA_VERSION.to_owned(),
+                run_id,
+                proof_kind,
+                proofs,
+                artifact_sha256: String::new(),
+            };
+            artifact.validate_structure();
+            artifact.artifact_sha256 = artifact.preimage_sha256();
+            artifact.verify();
+            artifact
+        }
+
+        fn preimage_sha256(&self) -> String {
+            let mut preimage = self.clone();
+            // `run_id` identifies one diagnostic publication, not semantic
+            // content. Two invocations that prove the same layouts against
+            // the same binary must therefore have the same content identity.
+            preimage.run_id.clear();
+            preimage.artifact_sha256.clear();
+            let bytes = serde_json::to_vec(&preimage)
+                .expect("serialize canonical UNION_HORIZON artifact preimage");
+            let mut hasher = Sha256::new();
+            hasher.update(UNION_HORIZON_ARTIFACT_HASH_DOMAIN);
+            hasher.update(bytes);
+            lower_hex(&hasher.finalize())
+        }
+
+        fn validate_structure(&self) {
+            assert_eq!(
+                self.schema_version, UNION_HORIZON_ARTIFACT_SCHEMA_VERSION,
+                "UNION_HORIZON artifact schema drifted",
+            );
+            assert!(
+                !self.run_id.is_empty()
+                    && self.run_id.len() <= 128
+                    && self.run_id.bytes().all(|byte| {
+                        byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_')
+                    }),
+                "UNION_HORIZON run ID must be a non-empty bounded path-safe ASCII token",
+            );
+            assert_eq!(
+                self.proofs.len(),
+                UnionHorizonSegmentLayout::ALL.len(),
+                "UNION_HORIZON artifact must contain every segment layout",
+            );
+            let expected_limits = [1_u64, 20, 100];
+            let expected_seed = match self.proof_kind {
+                UnionHorizonProofKind::LateWinner => 0x6202_4096,
+                UnionHorizonProofKind::TieMatrix => 0x6202_71E5,
+            };
+            let expected_fixture_prefix = match self.proof_kind {
+                UnionHorizonProofKind::LateWinner => "union-horizon-k",
+                UnionHorizonProofKind::TieMatrix => "union-horizon-ties-k",
+            };
+            let expected_corpus_hash = union_horizon_expected_corpus_hash(self.proof_kind);
+            let expected_subject_config_hash =
+                crate::engine::quill_config_hash(&union_horizon_quill_config());
+            for (proof, expected_layout) in self.proofs.iter().zip(UnionHorizonSegmentLayout::ALL) {
+                assert_eq!(
+                    proof.layout, expected_layout,
+                    "UNION_HORIZON artifact layouts must be complete and canonical",
+                );
+                let expected_doc_counts = proof
+                    .layout
+                    .ranges()
+                    .iter()
+                    .map(|range| {
+                        u32::try_from(range.len())
+                            .expect("UNION_HORIZON expected segment count fits u32")
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    proof.topology.quill_segment_doc_counts, expected_doc_counts,
+                    "UNION_HORIZON Quill topology must equal the declared layout",
+                );
+                let mut expected_tantivy_doc_counts = expected_doc_counts.clone();
+                expected_tantivy_doc_counts.sort_unstable_by(|left, right| right.cmp(left));
+                assert!(
+                    proof
+                        .topology
+                        .tantivy_segments
+                        .iter()
+                        .enumerate()
+                        .all(|(ordinal, segment)| {
+                            u32::try_from(ordinal).is_ok_and(|expected_ordinal| {
+                                segment.segment_ord == expected_ordinal
+                                    && segment.max_doc == segment.num_docs
+                            })
+                        }),
+                    "UNION_HORIZON Tantivy topology must retain dense native ordinals with no deletes",
+                );
+                assert_eq!(
+                    proof
+                        .topology
+                        .tantivy_segments
+                        .iter()
+                        .map(|segment| segment.num_docs)
+                        .collect::<Vec<_>>(),
+                    expected_tantivy_doc_counts,
+                    "UNION_HORIZON Tantivy topology must equal the declared layout",
+                );
+                assert_eq!(
+                    proof.comparisons.len(),
+                    expected_limits.len(),
+                    "UNION_HORIZON comparison matrix must contain every canonical limit",
+                );
+                assert_eq!(
+                    proof.traced_results.len(),
+                    expected_limits.len(),
+                    "UNION_HORIZON traced-result matrix must contain every canonical limit",
+                );
+                assert_eq!(
+                    proof.target_traces.len(),
+                    expected_limits.len(),
+                    "UNION_HORIZON target trace matrix must contain every canonical limit",
+                );
+                assert_eq!(
+                    proof.complete_pruning_traces.len(),
+                    expected_limits.len(),
+                    "UNION_HORIZON complete trace matrix must contain every canonical limit",
+                );
+                for ((((run, traced_result), target_trace), trace), expected_limit) in proof
+                    .comparisons
+                    .iter()
+                    .zip(&proof.traced_results)
+                    .zip(&proof.target_traces)
+                    .zip(&proof.complete_pruning_traces)
+                    .zip(expected_limits)
+                {
+                    run.engines
+                        .validate_stored_contract()
+                        .expect("UNION_HORIZON diagnostic engine identity contract");
+                    assert_eq!(run.engines.comparison_mode, ComparisonMode::CrossEngine);
+                    assert_eq!(
+                        run.engines.semantic_contract.as_ref(),
+                        Some(&SemanticContract::scalar_g1a()),
+                        "UNION_HORIZON engines must bind the scalar G1a semantic contract",
+                    );
+                    assert_eq!(
+                        run.engines.subject.family,
+                        EngineFamily::Quill,
+                        "UNION_HORIZON subject must be Quill",
+                    );
+                    assert_eq!(
+                        run.engines.subject.implementation,
+                        "frankensearch-quill/scalar-index",
+                    );
+                    assert_eq!(
+                        run.engines.subject.crate_version,
+                        frankensearch_quill::FRANKENSEARCH_QUILL_CRATE_VERSION,
+                        "UNION_HORIZON subject wrapper package version drifted",
+                    );
+                    assert_eq!(
+                        run.engines.subject.config_hash, expected_subject_config_hash,
+                        "UNION_HORIZON subject configuration drifted from deterministic fanout nine",
+                    );
+                    assert_eq!(
+                        run.engines.oracle.family,
+                        EngineFamily::Tantivy,
+                        "UNION_HORIZON oracle must be Tantivy",
+                    );
+                    assert_eq!(
+                        run.engines.oracle.implementation,
+                        "frankensearch-lexical/tantivy-index",
+                    );
+                    assert_eq!(
+                        run.engines.oracle.crate_version,
+                        proof.oracle_dependency.lexical_package_version,
+                        "UNION_HORIZON oracle wrapper package version drifted",
+                    );
+                    assert_eq!(
+                        run.engines.oracle.config_hash, TANTIVY_ORACLE_CONFIG_HASH,
+                        "UNION_HORIZON oracle configuration drifted",
+                    );
+                    assert_eq!(
+                        run.engines.subject.source_revision,
+                        proof.build_identity.source_git_revision,
+                        "UNION_HORIZON subject descriptor must identify the compiled wrapper build",
+                    );
+                    assert_eq!(
+                        run.engines.subject.source_dirty, proof.build_identity.source_git_dirty,
+                        "UNION_HORIZON subject dirty state must identify the compiled wrapper build",
+                    );
+                    assert_eq!(
+                        run.engines.oracle.source_revision,
+                        proof.oracle_dependency.pinned_lexical_contract_revision,
+                        "UNION_HORIZON oracle descriptor must retain the committed lexical baseline",
+                    );
+                    assert!(
+                        !run.engines.oracle.source_dirty,
+                        "UNION_HORIZON committed oracle baseline cannot be dirty",
+                    );
+                    assert_eq!(run.case.limit, expected_limit);
+                    assert_eq!(
+                        run.case.fixture_id,
+                        format!("{expected_fixture_prefix}{expected_limit}"),
+                    );
+                    assert_eq!(run.case.query, UNION_HORIZON_QUERY);
+                    assert_eq!(run.case.offset, 0);
+                    assert_eq!(
+                        run.case.tie_expansion_limit,
+                        match self.proof_kind {
+                            UnionHorizonProofKind::LateWinner => {
+                                UNION_HORIZON_LATE_TIE_EXPANSION
+                            }
+                            UnionHorizonProofKind::TieMatrix => {
+                                UNION_HORIZON_MATRIX_TIE_EXPANSION
+                            }
+                        },
+                    );
+                    assert!(!run.case.count_requested);
+                    assert_eq!(run.case.snippet_max_chars, None);
+                    assert_eq!(
+                        run.case.metadata.generator_id.as_deref(),
+                        Some(GENERATOR_ID),
+                    );
+                    assert_eq!(run.case.metadata.generator_seed, Some(expected_seed));
+                    assert_eq!(
+                        run.case.metadata.corpus_hash.as_deref(),
+                        Some(expected_corpus_hash),
+                        "UNION_HORIZON case must bind the exact deterministic 9,001-document fixture",
+                    );
+                    assert_eq!(run.comparator_config, ComparatorConfig::default());
+                    run.case
+                        .validate_observations(
+                            &run.engines,
+                            &run.comparison.subject,
+                            &run.comparison.oracle,
+                        )
+                        .expect("UNION_HORIZON observation contract");
+                    assert_eq!(
+                        compare_observations(
+                            run.comparison.subject.clone(),
+                            run.comparison.oracle.clone(),
+                            run.comparator_config,
+                        )
+                        .expect("recompute UNION_HORIZON comparison"),
+                        run.comparison,
+                        "UNION_HORIZON comparison must equal its sealed observations",
+                    );
+                    match self.proof_kind {
+                        UnionHorizonProofKind::LateWinner => {
+                            assert_union_horizon_late_comparison(
+                                run,
+                                expected_limit,
+                                proof.layout,
+                                &proof.topology.tantivy_segments,
+                            );
+                        }
+                        UnionHorizonProofKind::TieMatrix => {
+                            assert_union_horizon_tie_comparison(
+                                run,
+                                expected_limit,
+                                proof.layout,
+                                &proof.topology.tantivy_segments,
+                            );
+                        }
+                    }
+                    assert_union_horizon_traced_result(run, expected_limit, traced_result);
+                    assert_union_horizon_complete_trace_semantics(proof.layout, trace);
+                    assert_eq!(
+                        trace.execution_mode(),
+                        proof.layout.expected_execution_mode(),
+                        "UNION_HORIZON artifact recorded the wrong shipping execution branch",
+                    );
+                    assert_eq!(
+                        trace
+                            .segments()
+                            .iter()
+                            .map(|segment| {
+                                u32::try_from(segment.segment_doc_count())
+                                    .expect("UNION_HORIZON segment count fits u32")
+                            })
+                            .collect::<Vec<_>>(),
+                        proof.topology.quill_segment_doc_counts,
+                        "UNION_HORIZON artifact trace is not a complete topology receipt",
+                    );
+                    assert!(
+                        trace
+                            .segments()
+                            .iter()
+                            .enumerate()
+                            .all(|(ordinal, segment)| {
+                                u64::try_from(ordinal)
+                                    .is_ok_and(|expected| expected == segment.segment_ordinal())
+                            }),
+                        "UNION_HORIZON complete trace segment ordinals must be dense and ordered",
+                    );
+                    let target_segment = trace
+                        .segments()
+                        .last()
+                        .expect("UNION_HORIZON trace contains the target segment");
+                    assert_eq!(target_trace.limit, expected_limit);
+                    assert_eq!(
+                        target_trace.segment_doc_start,
+                        u32::try_from(proof.layout.target_segment_start())
+                            .expect("UNION_HORIZON target start fits u32"),
+                    );
+                    assert_eq!(
+                        target_trace.segment_doc_count,
+                        target_segment.segment_doc_count(),
+                    );
+                    assert_eq!(
+                        target_trace.refills,
+                        target_segment.refills(),
+                        "UNION_HORIZON target trace must be an exact projection of the complete receipt",
+                    );
+                    let revalidated_target = match self.proof_kind {
+                        UnionHorizonProofKind::LateWinner => union_horizon_late_trace_receipt(
+                            expected_limit,
+                            target_trace.segment_doc_start,
+                            target_trace.segment_doc_count,
+                            trace.segments(),
+                        ),
+                        UnionHorizonProofKind::TieMatrix => union_horizon_tie_trace_receipt(
+                            expected_limit,
+                            target_trace.segment_doc_start,
+                            target_trace.segment_doc_count,
+                            trace.segments(),
+                        ),
+                    };
+                    assert_eq!(
+                        *target_trace, revalidated_target,
+                        "UNION_HORIZON target receipt failed semantic revalidation",
+                    );
+                }
+            }
+            let first = self
+                .proofs
+                .first()
+                .expect("UNION_HORIZON artifact contains proofs");
+            assert_eq!(
+                first.build_identity,
+                union_horizon_build_identity(),
+                "UNION_HORIZON artifact must identify the verifier's compiled producer build",
+            );
+            assert_eq!(
+                first.oracle_dependency,
+                union_horizon_oracle_dependency_identity(),
+                "UNION_HORIZON artifact must bind the compiled oracle dependency contract",
+            );
+            assert!(
+                self.proofs.iter().all(|proof| {
+                    proof.build_identity == first.build_identity
+                        && proof.oracle_dependency == first.oracle_dependency
+                }),
+                "UNION_HORIZON artifact must bind one subject binary and one oracle dependency",
+            );
+            let first_engines = &first
+                .comparisons
+                .first()
+                .expect("UNION_HORIZON proof contains comparisons")
+                .engines;
+            assert!(
+                self.proofs.iter().all(|proof| {
+                    proof
+                        .comparisons
+                        .iter()
+                        .all(|run| run.engines == *first_engines)
+                }),
+                "UNION_HORIZON artifact must bind one exact engine pair across every layout and query",
+            );
+        }
+
+        fn verify(&self) {
+            self.validate_structure();
+            assert!(
+                self.artifact_sha256.len() == 64
+                    && self
+                        .artifact_sha256
+                        .bytes()
+                        .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+                "UNION_HORIZON artifact identity must be lowercase SHA-256",
+            );
+            assert_eq!(
+                self.artifact_sha256,
+                self.preimage_sha256(),
+                "UNION_HORIZON artifact identity does not match its canonical preimage",
+            );
+        }
+    }
+
+    #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
+    fn union_horizon_ranked_content(gamma_frequency: usize) -> Vec<u8> {
+        assert!(
+            gamma_frequency < UNION_HORIZON_RANKED_DOCUMENT_TOKENS,
+            "UNION_HORIZON ranked-document frequency must leave room for alpha",
+        );
+        let mut tokens = Vec::with_capacity(UNION_HORIZON_RANKED_DOCUMENT_TOKENS);
+        tokens.push("alpha");
+        tokens.extend(std::iter::repeat_n("gamma", gamma_frequency));
+        tokens.extend(std::iter::repeat_n(
+            "padding",
+            UNION_HORIZON_RANKED_DOCUMENT_TOKENS - gamma_frequency - 1,
+        ));
+        assert_eq!(tokens.len(), UNION_HORIZON_RANKED_DOCUMENT_TOKENS);
+        tokens.join(" ").into_bytes()
+    }
+
+    #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
+    fn make_union_horizon_fixture() -> Fixture {
+        let snapshot = RepositorySnapshot::from_entries(
+            "union-horizon-late-winner",
+            (0..UNION_HORIZON_DOCUMENT_COUNT).map(|ordinal| {
+                let bytes = match ordinal {
+                    // These 99 documents give the public top-100 comparison a
+                    // strictly ordered prefix. Their fixed field length makes
+                    // increasing gamma frequency the only score-changing
+                    // variable, so a segment split cannot expose Tantivy's
+                    // native DocAddress tie order against Quill's global
+                    // document-id tie order.
+                    0..=98 => union_horizon_ranked_content(ordinal + 10),
+                    99..=4_095 => b"alpha beta".to_vec(),
+                    4_096..=8_999 => b"alpha".to_vec(),
+                    // The late winner retains the same fixed field length as
+                    // the ranked prefix and has the unique largest gamma
+                    // frequency. It remains beyond the first empty
+                    // competitive window in both segment layouts.
+                    9_000 => union_horizon_ranked_content(120),
+                    _ => unreachable!("UNION_HORIZON fixture ordinal is bounded"),
+                };
+                RepositoryEntry {
+                    relative_path: std::path::PathBuf::from(format!("docs/{ordinal:05}.txt")),
+                    bytes,
+                }
+            }),
+        )
+        .expect("UNION_HORIZON repository snapshot");
+        let corpus_hash = snapshot
+            .manifest
+            .manifest_hash()
+            .expect("UNION_HORIZON corpus hash");
+        let query_suite = GeneratedQuerySuite::from_cases(
+            QueryGeneratorSpec {
+                seed: 0x6202_4096,
+                default_limit: 100,
+                include_shared_relevance_queries: false,
+            },
+            &corpus_hash,
+            [1_u64, 20, 100]
+                .into_iter()
+                .map(|limit| GeneratedQueryCase {
+                    id: format!("union-horizon-k{limit}"),
+                    syntax: QuerySyntax::Default,
+                    query_kind: GeneratedQueryKind::Boolean,
+                    query: UNION_HORIZON_QUERY.to_owned(),
+                    limit,
+                    offset: 0,
+                    count_requested: false,
+                    filters: crate::generator::GeneratedQueryFilters::default(),
+                    expected_divergence: None,
+                    source: "runner.rs UNION_HORIZON late-winner regression".to_owned(),
+                })
+                .collect(),
+        )
+        .expect("UNION_HORIZON query suite");
+        Fixture {
+            documents: snapshot.documents,
+            corpus_manifest: snapshot.manifest,
+            corpus_hash,
+            query_suite,
+        }
+    }
+
+    #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
+    fn union_horizon_tie_frequency(ordinal: usize) -> Option<usize> {
+        match ordinal {
+            0 | 9_000 => Some(120),
+            1..=17 | 19..=95 => Some(120 - ordinal),
+            18 | 8_500 | 8_501 => Some(102),
+            96 | 8_502 | 8_503 => Some(24),
+            97 => Some(23),
+            _ => None,
+        }
+    }
+
+    #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
+    fn make_union_horizon_tie_fixture() -> Fixture {
+        let snapshot = RepositorySnapshot::from_entries(
+            "union-horizon-tie-matrix",
+            (0..UNION_HORIZON_DOCUMENT_COUNT).map(|ordinal| {
+                let bytes = union_horizon_tie_frequency(ordinal).map_or_else(
+                    || {
+                        if ordinal < 4_096 {
+                            b"alpha beta".to_vec()
+                        } else {
+                            b"alpha".to_vec()
+                        }
+                    },
+                    union_horizon_ranked_content,
+                );
+                RepositoryEntry {
+                    relative_path: std::path::PathBuf::from(format!("docs/{ordinal:05}.txt")),
+                    bytes,
+                }
+            }),
+        )
+        .expect("UNION_HORIZON tie repository snapshot");
+        let corpus_hash = snapshot
+            .manifest
+            .manifest_hash()
+            .expect("UNION_HORIZON tie corpus hash");
+        let query_suite = GeneratedQuerySuite::from_cases(
+            QueryGeneratorSpec {
+                seed: 0x6202_71E5,
+                default_limit: 100,
+                include_shared_relevance_queries: false,
+            },
+            &corpus_hash,
+            [1_u64, 20, 100]
+                .into_iter()
+                .map(|limit| GeneratedQueryCase {
+                    id: format!("union-horizon-ties-k{limit}"),
+                    syntax: QuerySyntax::Default,
+                    query_kind: GeneratedQueryKind::Boolean,
+                    query: UNION_HORIZON_QUERY.to_owned(),
+                    limit,
+                    offset: 0,
+                    count_requested: false,
+                    filters: crate::generator::GeneratedQueryFilters::default(),
+                    expected_divergence: None,
+                    source: "runner.rs UNION_HORIZON cutoff-tie matrix".to_owned(),
+                })
+                .collect(),
+        )
+        .expect("UNION_HORIZON tie query suite");
+        Fixture {
+            documents: snapshot.documents,
+            corpus_manifest: snapshot.manifest,
+            corpus_hash,
+            query_suite,
+        }
+    }
+
+    #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
+    fn union_horizon_target_refills(
+        limit: u64,
+        segment_doc_count: u64,
+        segments: &[frankensearch_quill::ConformanceSegmentPruningReceipt],
+    ) -> Vec<frankensearch_quill::ConformancePruningRefillReceipt> {
+        let matching = segments
+            .iter()
+            .filter(|receipt| receipt.segment_doc_count().eq(&segment_doc_count))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            matching.len(),
+            1,
+            "UNION_HORIZON limit={limit} must expose exactly one target-segment receipt: \
+             segment_doc_count={segment_doc_count} receipts={segments:#?}",
+        );
+        matching[0].refills().to_vec()
+    }
+
+    #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
+    fn assert_union_horizon_refill_geometry(
+        limit: u64,
+        segment_doc_start: u32,
+        refills: &[frankensearch_quill::ConformancePruningRefillReceipt],
+    ) {
+        assert_eq!(
+            refills.len(),
+            3,
+            "UNION_HORIZON limit={limit} target segment must execute one exhaustive and two \
+             competitive refills: {refills:#?}",
+        );
+        for (index, refill) in refills.iter().enumerate() {
+            let expected_start = u64::from(segment_doc_start)
+                + u64::try_from(index).expect("refill index fits u64") * 4_096;
+            assert_eq!(u64::from(refill.window_start()), expected_start);
+            assert_eq!(
+                refill.ordinal(),
+                u64::try_from(index).expect("refill index fits u64") + 1,
+            );
+            assert_eq!(
+                refill.horizon_end(),
+                u64::from(refill.window_start()) + 4_096,
+            );
+        }
+        let late = refills[2];
+        assert!(
+            u64::from(late.window_start()) <= 9_000 && 9_000 < late.horizon_end(),
+            "UNION_HORIZON final refill must contain global document 9000: {late:?}",
+        );
+    }
+
+    #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
+    fn union_horizon_late_trace_receipt(
+        limit: u64,
+        segment_doc_start: u32,
+        segment_doc_count: u64,
+        segments: &[frankensearch_quill::ConformanceSegmentPruningReceipt],
+    ) -> UnionHorizonTraceReceipt {
+        use frankensearch_quill::ConformancePruningStrategy;
+
+        let refills = union_horizon_target_refills(limit, segment_doc_count, segments);
+        assert_union_horizon_refill_geometry(limit, segment_doc_start, &refills);
+        let initial = refills[0];
+        assert_eq!(initial.strategy(), ConformancePruningStrategy::Exhaustive);
+        assert_eq!(initial.cutoff_bits(), None);
+        assert!(!initial.buffer_empty());
+        assert!(initial.live_work_remains());
+
+        let empty_competitive = refills[1];
+        let late_competitive = refills[2];
+        for refill in [empty_competitive, late_competitive] {
+            assert_eq!(refill.strategy(), ConformancePruningStrategy::MaxScore);
+            let cutoff = f32::from_bits(
+                refill
+                    .cutoff_bits()
+                    .expect("competitive refill must bind cutoff bits"),
+            );
+            assert!(cutoff.is_finite() && cutoff > 0.0);
+        }
+        assert_eq!(empty_competitive.candidate_docs(), 0);
+        assert!(empty_competitive.buffer_empty());
+        assert!(empty_competitive.live_work_remains());
+        assert_eq!(late_competitive.candidate_docs(), 1);
+        assert!(!late_competitive.buffer_empty());
+        assert!(!late_competitive.live_work_remains());
+        let empty_cutoff =
+            f32::from_bits(empty_competitive.cutoff_bits().expect("empty cutoff bits"));
+        let late_cutoff = f32::from_bits(late_competitive.cutoff_bits().expect("late cutoff bits"));
+        assert!(
+            !matches!(
+                late_cutoff.total_cmp(&empty_cutoff),
+                std::cmp::Ordering::Less
+            ),
+            "UNION_HORIZON competitive cutoff regressed from {empty_cutoff:?} to {late_cutoff:?}",
+        );
+
+        UnionHorizonTraceReceipt {
+            limit,
+            segment_doc_start,
+            segment_doc_count,
+            refills,
+        }
+    }
+
+    #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
+    fn union_horizon_tie_trace_receipt(
+        limit: u64,
+        segment_doc_start: u32,
+        segment_doc_count: u64,
+        segments: &[frankensearch_quill::ConformanceSegmentPruningReceipt],
+    ) -> UnionHorizonTraceReceipt {
+        use frankensearch_quill::ConformancePruningStrategy;
+
+        let refills = union_horizon_target_refills(limit, segment_doc_count, segments);
+        assert_union_horizon_refill_geometry(limit, segment_doc_start, &refills);
+        let initial = refills[0];
+        assert_eq!(initial.strategy(), ConformancePruningStrategy::Exhaustive);
+        assert_eq!(initial.cutoff_bits(), None);
+        assert!(!initial.buffer_empty());
+        assert!(initial.live_work_remains());
+
+        let competitive = &refills[1..];
+        let cutoffs = competitive
+            .iter()
+            .map(|refill| {
+                assert_eq!(refill.strategy(), ConformancePruningStrategy::MaxScore);
+                let cutoff = f32::from_bits(
+                    refill
+                        .cutoff_bits()
+                        .expect("tie-matrix competitive refill must bind cutoff bits"),
+                );
+                assert!(cutoff.is_finite() && cutoff > 0.0);
+                cutoff
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            cutoffs
+                .windows(2)
+                .all(|pair| !matches!(pair[1].total_cmp(&pair[0]), std::cmp::Ordering::Less)),
+            "UNION_HORIZON tie-matrix cutoff regressed: {cutoffs:?}",
+        );
+        assert!(competitive[0].live_work_remains());
+        let late = competitive[1];
+        assert!(u64::from(late.window_start()) >= 2 * 4_096);
+        assert!(
+            late.candidate_docs() > 0,
+            "UNION_HORIZON tie-matrix final horizon must emit a competitive candidate",
+        );
+        assert!(!late.buffer_empty());
+        assert!(!late.live_work_remains());
+
+        UnionHorizonTraceReceipt {
+            limit,
+            segment_doc_start,
+            segment_doc_count,
+            refills,
+        }
+    }
+
+    #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
+    fn assert_union_horizon_complete_trace_semantics(
+        layout: UnionHorizonSegmentLayout,
+        trace: &frankensearch_quill::ConformancePruningTraceReceipt,
+    ) {
+        use frankensearch_quill::ConformancePruningStrategy;
+
+        assert_eq!(trace.execution_mode(), layout.expected_execution_mode());
+        let ranges = layout.ranges();
+        assert_eq!(trace.segments().len(), ranges.len());
+        for (segment_ordinal, (segment, range)) in trace.segments().iter().zip(ranges).enumerate() {
+            assert_eq!(
+                segment.segment_ordinal(),
+                u64::try_from(segment_ordinal).expect("UNION_HORIZON segment ordinal fits u64"),
+            );
+            assert_eq!(
+                segment.segment_doc_count(),
+                u64::try_from(range.len()).expect("UNION_HORIZON segment length fits u64"),
+            );
+            let expected_refill_count = range.len().div_ceil(4_096);
+            assert_eq!(
+                segment.refills().len(),
+                expected_refill_count,
+                "UNION_HORIZON segment {segment_ordinal} must witness every union horizon",
+            );
+            for (refill_ordinal, refill) in segment.refills().iter().enumerate() {
+                let window_start = range.start + refill_ordinal * 4_096;
+                let window_doc_count = (range.end - window_start).min(4_096);
+                assert_eq!(
+                    refill.ordinal(),
+                    u64::try_from(refill_ordinal + 1)
+                        .expect("UNION_HORIZON refill ordinal fits u64"),
+                );
+                assert_eq!(
+                    refill.window_start(),
+                    u32::try_from(window_start).expect("UNION_HORIZON window start fits u32"),
+                );
+                assert_eq!(
+                    refill.horizon_end(),
+                    u64::try_from(window_start + 4_096)
+                        .expect("UNION_HORIZON horizon end fits u64"),
+                );
+                assert!(
+                    refill.candidate_docs()
+                        <= u64::try_from(window_doc_count)
+                            .expect("UNION_HORIZON window count fits u64"),
+                    "UNION_HORIZON refill returned more candidates than its physical window",
+                );
+                assert_eq!(
+                    refill.buffer_empty(),
+                    refill.candidate_docs() == 0,
+                    "UNION_HORIZON direct-term fixture must bind candidate and buffer emptiness",
+                );
+                assert_eq!(
+                    refill.live_work_remains(),
+                    refill_ordinal + 1 < expected_refill_count,
+                    "UNION_HORIZON refill liveness must end exactly with the segment",
+                );
+                if refill_ordinal == 0 {
+                    assert_eq!(refill.strategy(), ConformancePruningStrategy::Exhaustive);
+                    assert_eq!(refill.cutoff_bits(), None);
+                    assert_eq!(
+                        refill.candidate_docs(),
+                        u64::try_from(window_doc_count)
+                            .expect("UNION_HORIZON initial window count fits u64"),
+                    );
+                } else {
+                    assert_eq!(refill.strategy(), ConformancePruningStrategy::MaxScore);
+                    let cutoff = f32::from_bits(
+                        refill
+                            .cutoff_bits()
+                            .expect("UNION_HORIZON competitive refill binds cutoff bits"),
+                    );
+                    assert!(cutoff.is_finite() && cutoff > 0.0);
+                }
+            }
+        }
+    }
+
+    #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
+    fn union_horizon_traced_result_receipt(
+        limit: u64,
+        traced: &frankensearch_quill::QuillSearchResult,
+    ) -> UnionHorizonTracedResultReceipt {
+        UnionHorizonTracedResultReceipt {
+            limit,
+            hits: traced
+                .hits
+                .iter()
+                .map(|hit| UnionHorizonTracedHitReceipt {
+                    document_id: hit.document_id.clone(),
+                    global_docid: hit.global_docid,
+                    score_bits: hit.score.to_bits(),
+                })
+                .collect(),
+            total_count: traced.total_count,
+            doc_count: traced.doc_count,
+            diagnostic_count: u64::try_from(traced.diagnostics.len())
+                .expect("UNION_HORIZON diagnostic count fits u64"),
+        }
+    }
+
+    #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
+    fn assert_union_horizon_traced_result(
+        run: &HarnessRun,
+        expected_limit: u64,
+        traced: &UnionHorizonTracedResultReceipt,
+    ) {
+        assert_eq!(traced.limit, expected_limit);
+        assert_eq!(traced.total_count, None);
+        assert_eq!(
+            traced.doc_count,
+            u64::try_from(UNION_HORIZON_DOCUMENT_COUNT)
+                .expect("UNION_HORIZON document count fits u64"),
+        );
+        assert_eq!(traced.diagnostic_count, 0);
+        assert_eq!(
+            traced.hits.len(),
+            usize::try_from(expected_limit).expect("UNION_HORIZON limit fits usize"),
+        );
+        assert_eq!(traced.hits.len(), run.comparison.subject.hits.len());
+        for (traced_hit, observed_hit) in traced.hits.iter().zip(&run.comparison.subject.hits) {
+            assert_eq!(traced_hit.document_id, observed_hit.doc_id);
+            assert_eq!(traced_hit.score_bits, observed_hit.score_bits);
+            assert_eq!(
+                observed_hit.native_tie_key,
+                NativeTieKey::QuillDocId {
+                    doc_id: traced_hit.global_docid,
+                },
+                "UNION_HORIZON traced global document ID must equal the sealed subject tie key",
+            );
+        }
+    }
+
+    #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
+    fn union_horizon_document_ordinal(document_id: &str) -> usize {
+        document_id
+            .strip_prefix("repo:docs/")
+            .and_then(|value| value.strip_suffix(".txt"))
+            .expect("UNION_HORIZON document identity shape")
+            .parse()
+            .expect("UNION_HORIZON document ordinal")
+    }
+
+    #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
+    fn union_horizon_tombstone_document_ids(fixture: &Fixture) -> Vec<String> {
+        UNION_HORIZON_TOMBSTONE_ORDINALS
+            .iter()
+            .map(|&ordinal| fixture.documents[ordinal].id.clone())
+            .collect()
+    }
+
+    #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
+    async fn build_tombstoned_union_horizon_single_segment_pair(
+        cx: &Cx,
+        fixture: &Fixture,
+    ) -> (crate::engine::QuillSubject, crate::engine::TantivyOracle) {
+        let mut subject = crate::engine::QuillSubject::in_memory(union_horizon_quill_config())
+            .expect("fresh tombstoned UNION_HORIZON Quill subject");
+        let mut oracle = crate::engine::TantivyOracle::in_memory_scalar_g1a()
+            .expect("fresh tombstoned UNION_HORIZON Tantivy oracle");
+        oracle
+            .index()
+            .oracle_disable_auto_merge(cx)
+            .await
+            .expect("disable tombstoned UNION_HORIZON Tantivy auto-merge");
+        subject
+            .claim_fresh_campaign()
+            .expect("claim tombstoned UNION_HORIZON Quill subject");
+        oracle
+            .claim_fresh_campaign()
+            .expect("claim tombstoned UNION_HORIZON Tantivy oracle");
+
+        let documents = fixture
+            .documents
+            .iter()
+            .cloned()
+            .map(frankensearch_core::IndexableDocument::from)
+            .collect::<Vec<_>>();
+        subject
+            .index_mut()
+            .expect("tombstoned UNION_HORIZON Quill index")
+            .index_documents_with_scalar_topology_conformance(cx, &documents)
+            .await
+            .expect("index tombstoned UNION_HORIZON Quill segment");
+        subject
+            .index_mut()
+            .expect("tombstoned UNION_HORIZON Quill index")
+            .commit(cx)
+            .await
+            .expect("commit tombstoned UNION_HORIZON Quill segment");
+        oracle
+            .index()
+            .index_documents(cx, &documents)
+            .await
+            .expect("index tombstoned UNION_HORIZON Tantivy segment");
+        oracle
+            .index()
+            .commit(cx)
+            .await
+            .expect("commit tombstoned UNION_HORIZON Tantivy segment");
+
+        let tombstone_document_ids = union_horizon_tombstone_document_ids(fixture);
+        let tombstone_document_id_refs = tombstone_document_ids
+            .iter()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            subject
+                .index()
+                .expect("tombstoned UNION_HORIZON Quill index")
+                .delete_documents(cx, &tombstone_document_id_refs)
+                .await
+                .expect("publish tombstoned UNION_HORIZON Quill successor"),
+            UNION_HORIZON_TOMBSTONE_ORDINALS.len(),
+        );
+        for document_id in &tombstone_document_ids {
+            oracle
+                .index()
+                .delete_document(cx, document_id)
+                .await
+                .expect("stage tombstoned UNION_HORIZON Tantivy delete");
+        }
+        oracle
+            .index()
+            .commit(cx)
+            .await
+            .expect("commit tombstoned UNION_HORIZON Tantivy deletes");
+        subject
+            .mark_committed()
+            .expect("commit tombstoned UNION_HORIZON Quill campaign");
+        oracle
+            .mark_committed()
+            .expect("commit tombstoned UNION_HORIZON Tantivy campaign");
+
+        let expected_live_documents = UNION_HORIZON_DOCUMENT_COUNT
+            .checked_sub(UNION_HORIZON_TOMBSTONE_ORDINALS.len())
+            .expect("UNION_HORIZON tombstones fit the fixture");
+        let snapshot = subject
+            .index()
+            .expect("tombstoned UNION_HORIZON Quill index")
+            .snapshot();
+        assert_eq!(snapshot.segments().len(), 1);
+        assert_eq!(snapshot.segments()[0].at_seal_doc_count(), 9_001);
+        assert_eq!(snapshot.segments()[0].tombstone_count(), 6);
+        assert_eq!(snapshot.segments()[0].doc_count(), 8_995);
+        assert_eq!(snapshot.at_seal_doc_count(), 9_001);
+        assert_eq!(snapshot.tombstone_count(), 6);
+        assert_eq!(snapshot.doc_count(), 8_995);
+        assert_eq!(
+            subject
+                .index()
+                .expect("tombstoned UNION_HORIZON Quill index")
+                .doc_count(),
+            8_995,
+        );
+        assert!(
+            !subject
+                .index()
+                .expect("tombstoned UNION_HORIZON Quill index")
+                .has_uncommitted_changes(),
+        );
+
+        let oracle_segments = oracle
+            .index()
+            .oracle_segment_layout()
+            .expect("tombstoned UNION_HORIZON Tantivy segment layout");
+        assert_eq!(oracle_segments.len(), 1);
+        assert_eq!(oracle_segments[0].max_doc, 9_001);
+        assert_eq!(oracle_segments[0].num_docs, 8_995);
+        assert_eq!(oracle.index().doc_count(), expected_live_documents);
+        (subject, oracle)
+    }
+
+    #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
+    fn tombstoned_union_horizon_case(
+        fixture: &Fixture,
+        fixture_id: &str,
+        limit: u64,
+        offset: u64,
+    ) -> DifferentialCase {
+        DifferentialCase {
+            fixture_id: fixture_id.to_owned(),
+            query: UNION_HORIZON_QUERY.to_owned(),
+            limit,
+            offset,
+            tie_expansion_limit: 1,
+            count_requested: false,
+            snippet_max_chars: None,
+            metadata: DifferentialCaseMetadata {
+                generator_id: Some(GENERATOR_ID.to_owned()),
+                generator_seed: Some(fixture.query_suite.manifest.spec.seed),
+                corpus_hash: Some(fixture.corpus_hash.clone()),
+            },
+        }
+    }
+
+    #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
+    fn union_horizon_fuel_diagnostics(
+        error: &frankensearch_quill::QuillIndexError,
+    ) -> (u64, u64, u64, u64, u64, u64) {
+        let frankensearch_quill::QuillIndexError::QueryFuelExhausted {
+            budget,
+            consumed,
+            segments_touched,
+            dictionary_blocks,
+            posting_blocks,
+            position_docs,
+        } = error
+        else {
+            panic!("expected typed UNION_HORIZON fuel exhaustion, got {error:?}");
+        };
+        (
+            *budget,
+            *consumed,
+            *segments_touched,
+            *dictionary_blocks,
+            *posting_blocks,
+            *position_docs,
+        )
+    }
+
+    #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
+    fn run_tombstoned_union_horizon_with_fuel(
+        cx: &Cx,
+        snapshot: &frankensearch_quill::KeeperSnapshot,
+        budget: u64,
+    ) -> Result<
+        (
+            frankensearch_quill::QuillSearchResult,
+            frankensearch_quill::ConformancePruningTraceReceipt,
+        ),
+        frankensearch_quill::QuillIndexError,
+    > {
+        let mut config = union_horizon_quill_config();
+        config.query_fuel_budget = budget;
+        frankensearch_quill::QuillIndex::from_in_memory_snapshot(snapshot.clone(), config)?
+            .search_paginated_with_conformance_pruning_trace(cx, UNION_HORIZON_QUERY, 1, 0, false)
+    }
+
+    #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
+    fn union_horizon_build_identity() -> UnionHorizonBuildIdentity {
+        static IDENTITY: std::sync::OnceLock<UnionHorizonBuildIdentity> =
+            std::sync::OnceLock::new();
+        IDENTITY
+            .get_or_init(|| {
+                let source_git_revision = env!("QUILL_PERF_PRODUCER_GIT_REVISION").to_owned();
+                let source_git_dirty = match env!("QUILL_PERF_PRODUCER_GIT_DIRTY") {
+                    "true" => true,
+                    "false" => false,
+                    other => {
+                        assert!(
+                            matches!(other, "true" | "false"),
+                            "embedded UNION_HORIZON dirty state must be true or false",
+                        );
+                        true
+                    }
+                };
+                let source_verification = match env!("QUILL_PERF_PRODUCER_SOURCE_VERIFICATION") {
+                    "git_checkout_verified" => UnionHorizonSourceVerification::GitCheckoutVerified,
+                    "explicit_unverified" => UnionHorizonSourceVerification::ExplicitUnverified,
+                    "unavailable" => UnionHorizonSourceVerification::Unavailable,
+                    other => {
+                        panic!("unknown embedded UNION_HORIZON source verification mode {other:?}")
+                    }
+                };
+                let cargo_lock_sha256 = env!("QUILL_PERF_PRODUCER_CARGO_LOCK_SHA256").to_owned();
+                let rustc_version_verbose = String::from_utf8(decode_lower_hex(
+                    env!("QUILL_PERF_PRODUCER_RUSTC_VV_HEX"),
+                    "embedded rustc -Vv",
+                ))
+                .expect("embedded rustc -Vv identity must be UTF-8");
+                let target_triple = env!("QUILL_PERF_PRODUCER_TARGET_TRIPLE").to_owned();
+                let cargo_profile = env!("QUILL_PERF_PRODUCER_CARGO_PROFILE").to_owned();
+                let enabled_features = env!("QUILL_PERF_PRODUCER_ENABLED_FEATURES")
+                    .split(',')
+                    .filter(|feature| !feature.is_empty())
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>();
+                let enabled_features_sha256 =
+                    env!("QUILL_PERF_PRODUCER_ENABLED_FEATURES_SHA256").to_owned();
+                let (test_executable_sha256, test_executable_byte_len) =
+                    union_horizon_current_executable_identity();
+
+                assert_lower_hex(
+                    &cargo_lock_sha256,
+                    64,
+                    "embedded UNION_HORIZON Cargo.lock identity",
+                );
+                assert_lower_hex(
+                    &enabled_features_sha256,
+                    64,
+                    "embedded UNION_HORIZON feature-set identity",
+                );
+                assert_eq!(
+                    enabled_features_sha256,
+                    sha256_hex(enabled_features.join("\n").as_bytes()),
+                    "embedded UNION_HORIZON feature set does not match its digest",
+                );
+                assert!(
+                    enabled_features
+                        .windows(2)
+                        .all(|pair| pair[0].as_str() < pair[1].as_str()),
+                    "embedded UNION_HORIZON feature set must be sorted and unique",
+                );
+                assert!(
+                    enabled_features
+                        .iter()
+                        .any(|feature| feature == "pruning_conformance")
+                        && enabled_features
+                            .iter()
+                            .any(|feature| feature == "tantivy_oracle"),
+                    "UNION_HORIZON executable must enable both proof features",
+                );
+                assert!(
+                    !rustc_version_verbose.is_empty()
+                        && rustc_version_verbose.len() <= 16 * 1024
+                        && rustc_version_verbose.contains("release:")
+                        && rustc_version_verbose.contains("host:"),
+                    "embedded UNION_HORIZON rustc identity is incomplete",
+                );
+                assert!(
+                    !target_triple.is_empty() && !cargo_profile.is_empty(),
+                    "embedded UNION_HORIZON target and Cargo profile must be present",
+                );
+                assert_lower_hex(
+                    &test_executable_sha256,
+                    64,
+                    "UNION_HORIZON test executable identity",
+                );
+                assert!(
+                    test_executable_byte_len > 0,
+                    "UNION_HORIZON test executable must be nonempty",
+                );
+
+                let identity = UnionHorizonBuildIdentity {
+                    source_git_revision,
+                    source_git_dirty,
+                    source_verification,
+                    cargo_lock_sha256,
+                    rustc_version_verbose,
+                    target_triple,
+                    cargo_profile,
+                    enabled_features,
+                    enabled_features_sha256,
+                    test_executable_sha256,
+                    test_executable_byte_len,
+                };
+                assert!(
+                    union_horizon_diagnostic_source_identity_is_well_formed(&identity),
+                    "embedded UNION_HORIZON diagnostic source identity is malformed",
+                );
+                identity
+            })
+            .clone()
+    }
+
+    #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
+    fn is_lower_hex(value: &str, expected_len: usize) -> bool {
+        value.len() == expected_len
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    }
+
+    #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
+    fn assert_lower_hex(value: &str, expected_len: usize, label: &str) {
+        assert!(
+            is_lower_hex(value, expected_len),
+            "{label} must be {expected_len} lowercase hexadecimal characters",
+        );
+    }
+
+    #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
+    fn decode_lower_hex(value: &str, label: &str) -> Vec<u8> {
+        assert!(
+            value.len().is_multiple_of(2)
+                && value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+            "{label} must be canonical lowercase hexadecimal",
+        );
+        value
+            .as_bytes()
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|pair| {
+                let high = char::from(pair[0])
+                    .to_digit(16)
+                    .expect("validated hexadecimal nibble");
+                let low = char::from(pair[1])
+                    .to_digit(16)
+                    .expect("validated hexadecimal nibble");
+                u8::try_from(high * 16 + low).expect("two hexadecimal nibbles fit u8")
+            })
+            .collect()
+    }
+
+    #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
+    fn union_horizon_current_executable_identity() -> (String, u64) {
+        #[cfg(target_os = "linux")]
+        let path = std::path::PathBuf::from("/proc/self/exe");
+        #[cfg(not(target_os = "linux"))]
+        let path =
+            std::env::current_exe().expect("resolve current UNION_HORIZON test executable path");
+        let mut file = std::fs::File::open(&path)
+            .unwrap_or_else(|error| panic!("open current UNION_HORIZON test executable: {error}"));
+        let metadata = file
+            .metadata()
+            .expect("stat current UNION_HORIZON test executable");
+        assert!(
+            metadata.is_file(),
+            "current UNION_HORIZON test executable must be a regular file",
+        );
+        let mut hasher = Sha256::new();
+        let mut byte_len = 0_u64;
+        let mut buffer = vec![0_u8; 64 * 1024].into_boxed_slice();
+        loop {
+            let read = file
+                .read(&mut buffer)
+                .expect("stream current UNION_HORIZON test executable");
+            if read == 0 {
+                break;
+            }
+            hasher.update(&buffer[..read]);
+            byte_len = byte_len
+                .checked_add(u64::try_from(read).expect("read length fits u64"))
+                .expect("UNION_HORIZON executable length cannot overflow u64");
+        }
+        assert_eq!(
+            byte_len,
+            metadata.len(),
+            "UNION_HORIZON executable changed while its identity was captured",
+        );
+        (lower_hex(&hasher.finalize()), byte_len)
+    }
+
+    #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
+    fn assert_union_horizon_executable_still_matches(identity: &UnionHorizonBuildIdentity) {
+        let (sha256, byte_len) = union_horizon_current_executable_identity();
+        assert_eq!(
+            (sha256, byte_len),
+            (
+                identity.test_executable_sha256.clone(),
+                identity.test_executable_byte_len,
+            ),
+            "the executing UNION_HORIZON binary changed after its build identity was sealed",
+        );
+    }
+
+    #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
+    fn union_horizon_diagnostic_source_identity_is_well_formed(
+        identity: &UnionHorizonBuildIdentity,
+    ) -> bool {
+        match identity.source_verification {
+            UnionHorizonSourceVerification::GitCheckoutVerified
+            | UnionHorizonSourceVerification::ExplicitUnverified => {
+                is_lower_hex(&identity.source_git_revision, 40)
+            }
+            UnionHorizonSourceVerification::Unavailable => {
+                identity.source_git_revision == "unavailable" && identity.source_git_dirty
+            }
+        }
+    }
+
+    #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
+    fn reject_union_horizon_oracle_identity_overrides(
+        revision: Option<&std::ffi::OsStr>,
+        dirty: Option<&std::ffi::OsStr>,
+    ) -> Result<(), GauntletError> {
+        if revision.is_some() || dirty.is_some() {
+            return Err(campaign_error(
+                "Salej UNION_HORIZON uses the committed oracle dependency contract; GAUNTLET_ORACLE_REVISION and GAUNTLET_ORACLE_DIRTY cannot override it",
+            ));
+        }
+        Ok(())
+    }
+
+    #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
+    fn union_horizon_validated_build_identity() -> UnionHorizonBuildIdentity {
+        const REVISION_ENV: &str = "GAUNTLET_SUBJECT_REVISION";
+        const DIRTY_ENV: &str = "GAUNTLET_SUBJECT_DIRTY";
+        reject_union_horizon_oracle_identity_overrides(
+            std::env::var_os("GAUNTLET_ORACLE_REVISION").as_deref(),
+            std::env::var_os("GAUNTLET_ORACLE_DIRTY").as_deref(),
+        )
+        .unwrap_or_else(|error| panic!("invalid UNION_HORIZON legacy identity input: {error}"));
+        let embedded = union_horizon_build_identity();
+        let revision = match std::env::var(REVISION_ENV) {
+            Ok(value) => Some(value),
+            Err(std::env::VarError::NotPresent) => None,
+            Err(std::env::VarError::NotUnicode(_)) => {
+                panic!("{REVISION_ENV} must be valid Unicode")
+            }
+        };
+        let dirty = match std::env::var(DIRTY_ENV) {
+            Ok(value) => Some(value),
+            Err(std::env::VarError::NotPresent) => None,
+            Err(std::env::VarError::NotUnicode(_)) => {
+                panic!("{DIRTY_ENV} must be valid Unicode")
+            }
+        };
+        validate_union_horizon_runtime_identity_override(
+            &embedded,
+            revision.as_deref(),
+            dirty.as_deref(),
+        )
+        .unwrap_or_else(|reason| panic!("invalid UNION_HORIZON runtime identity: {reason}"));
+        embedded
+    }
+
+    #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
+    fn validate_union_horizon_runtime_identity_override(
+        embedded: &UnionHorizonBuildIdentity,
+        revision: Option<&str>,
+        dirty: Option<&str>,
+    ) -> Result<(), String> {
+        match (revision, dirty) {
+            (None, None) => Ok(()),
+            (Some(revision), Some(dirty)) => {
+                let dirty = match dirty {
+                    "true" => true,
+                    "false" => false,
+                    _ => {
+                        return Err(
+                            "GAUNTLET_SUBJECT_DIRTY must be exactly true or false".to_owned()
+                        );
+                    }
+                };
+                if revision != embedded.source_git_revision {
+                    return Err(
+                        "runtime revision does not equal the compiled producer revision".to_owned(),
+                    );
+                }
+                if dirty != embedded.source_git_dirty {
+                    return Err(
+                        "runtime dirty state does not equal the compiled producer dirty state"
+                            .to_owned(),
+                    );
+                }
+                Ok(())
+            }
+            _ => Err(
+                "GAUNTLET_SUBJECT_REVISION and GAUNTLET_SUBJECT_DIRTY must be supplied together"
+                    .to_owned(),
+            ),
+        }
+    }
+
+    #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
+    fn union_horizon_oracle_dependency_identity() -> UnionHorizonOracleDependencyIdentity {
+        let contract = oracle_version_contract().expect("UNION_HORIZON oracle version contract");
+        UnionHorizonOracleDependencyIdentity {
+            tantivy_version: contract.tantivy_version,
+            tantivy_checksum_sha256: contract.tantivy_checksum_sha256,
+            lexical_package: contract.lexical_package,
+            lexical_package_version: contract.lexical_package_version,
+            pinned_lexical_contract_revision: contract.lexical_contract_audit_revision,
+        }
+    }
+
+    #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
+    fn union_horizon_observed_envelope(observation: &EngineObservation) -> BTreeMap<String, u32> {
+        let mut envelope = BTreeMap::new();
+        for hit in observation.hits.iter().chain(&observation.cutoff_tie_group) {
+            if let Some(prior_bits) = envelope.insert(hit.doc_id.clone(), hit.score_bits) {
+                assert_eq!(
+                    prior_bits, hit.score_bits,
+                    "UNION_HORIZON observation changed score bits across ranked and tie receipts",
+                );
+            }
+        }
+        envelope
+    }
+
+    #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
+    fn assert_union_horizon_late_comparison(
+        run: &HarnessRun,
+        limit: u64,
+        layout: UnionHorizonSegmentLayout,
+        tantivy_segments: &[UnionHorizonTantivySegmentReceipt],
+    ) {
+        assert_eq!(run.comparison.status, ComparisonStatus::Exact);
+        assert_eq!(run.comparison.rank_class, RankClass::RankExact);
+        assert!(run.comparison.divergences.is_empty());
+        assert_eq!(run.comparison.subject.match_count, CountState::NotRequested);
+        assert_eq!(run.comparison.oracle.match_count, CountState::NotRequested);
+        assert_eq!(
+            run.comparison.subject.doc_count,
+            u64::try_from(UNION_HORIZON_DOCUMENT_COUNT)
+                .expect("UNION_HORIZON document count fits u64"),
+        );
+        assert_eq!(
+            run.comparison.oracle.doc_count,
+            u64::try_from(UNION_HORIZON_DOCUMENT_COUNT)
+                .expect("UNION_HORIZON document count fits u64"),
+        );
+        assert!(run.comparison.subject.snippets.is_empty());
+        assert!(run.comparison.oracle.snippets.is_empty());
+
+        let subject_rows = run
+            .comparison
+            .subject
+            .hits
+            .iter()
+            .map(|hit| (hit.doc_id.as_str(), hit.score_bits))
+            .collect::<Vec<_>>();
+        let oracle_rows = run
+            .comparison
+            .oracle
+            .hits
+            .iter()
+            .map(|hit| (hit.doc_id.as_str(), hit.score_bits))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            subject_rows.len(),
+            usize::try_from(limit).expect("UNION_HORIZON limit fits usize"),
+        );
+        assert_eq!(subject_rows, oracle_rows);
+        assert_eq!(
+            subject_rows.first().map(|(document_id, _)| *document_id),
+            Some("repo:docs/09000.txt"),
+            "UNION_HORIZON late winner must rank first",
+        );
+        assert!(
+            subject_rows.windows(2).all(|rows| {
+                matches!(
+                    f32::from_bits(rows[0].1).total_cmp(&f32::from_bits(rows[1].1)),
+                    std::cmp::Ordering::Greater
+                )
+            }),
+            "UNION_HORIZON limit={limit} ranked prefix must have strictly descending unique scores",
+        );
+        if limit == 100 {
+            assert_eq!(subject_rows.len(), 100);
+            assert_eq!(subject_rows[0].0, "repo:docs/09000.txt");
+            for (rank, ordinal) in (0..=98).rev().enumerate() {
+                assert_eq!(
+                    subject_rows[rank + 1].0,
+                    format!("repo:docs/{ordinal:05}.txt"),
+                    "UNION_HORIZON ranked-anchor identity drifted at rank {}",
+                    rank + 1,
+                );
+            }
+        }
+
+        let subject_ties = run
+            .comparison
+            .subject
+            .cutoff_tie_group
+            .iter()
+            .map(|hit| (hit.doc_id.as_str(), hit.score_bits))
+            .collect::<Vec<_>>();
+        let oracle_ties = run
+            .comparison
+            .oracle
+            .cutoff_tie_group
+            .iter()
+            .map(|hit| (hit.doc_id.as_str(), hit.score_bits))
+            .collect::<Vec<_>>();
+        assert_eq!(subject_ties, oracle_ties);
+        assert!(
+            run.comparison.subject.cutoff_tie_complete && run.comparison.oracle.cutoff_tie_complete,
+            "UNION_HORIZON limit={limit} requires a complete cutoff-tie receipt",
+        );
+        assert_union_horizon_native_addresses(run, layout, tantivy_segments);
+    }
+
+    #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
+    fn assert_union_horizon_tie_comparison(
+        run: &HarnessRun,
+        limit: u64,
+        layout: UnionHorizonSegmentLayout,
+        tantivy_segments: &[UnionHorizonTantivySegmentReceipt],
+    ) {
+        let expected_tie_count = match limit {
+            1 => 2,
+            _ => 3,
+        };
+        assert_eq!(run.comparison.subject.match_count, CountState::NotRequested,);
+        assert_eq!(run.comparison.oracle.match_count, CountState::NotRequested,);
+        assert_eq!(
+            run.comparison.subject.doc_count,
+            u64::try_from(UNION_HORIZON_DOCUMENT_COUNT)
+                .expect("UNION_HORIZON document count fits u64"),
+        );
+        assert_eq!(
+            run.comparison.oracle.doc_count,
+            u64::try_from(UNION_HORIZON_DOCUMENT_COUNT)
+                .expect("UNION_HORIZON document count fits u64"),
+        );
+        assert!(run.comparison.subject.snippets.is_empty());
+        assert!(run.comparison.oracle.snippets.is_empty());
+        assert_eq!(
+            run.comparison.subject.hits.len(),
+            usize::try_from(limit).expect("UNION_HORIZON limit fits usize"),
+        );
+        assert_eq!(
+            run.comparison.oracle.hits.len(),
+            usize::try_from(limit).expect("UNION_HORIZON limit fits usize"),
+        );
+        if matches!(layout, UnionHorizonSegmentLayout::Single) {
+            assert_eq!(run.comparison.status, ComparisonStatus::Exact);
+            assert_eq!(run.comparison.rank_class, RankClass::RankExact);
+            assert!(run.comparison.divergences.is_empty());
+            let subject_rows = run
+                .comparison
+                .subject
+                .hits
+                .iter()
+                .map(|hit| (hit.doc_id.as_str(), hit.score_bits))
+                .collect::<Vec<_>>();
+            let oracle_rows = run
+                .comparison
+                .oracle
+                .hits
+                .iter()
+                .map(|hit| (hit.doc_id.as_str(), hit.score_bits))
+                .collect::<Vec<_>>();
+            assert_eq!(subject_rows, oracle_rows);
+        } else {
+            assert_eq!(run.comparison.status, ComparisonStatus::Classified);
+            assert_eq!(run.comparison.rank_class, RankClass::TieOrder);
+            assert!(
+                !run.comparison.divergences.is_empty()
+                    && run.comparison.divergences.iter().all(|divergence| {
+                        matches!(divergence.class, DivergenceClass::TieOrder)
+                    }),
+                "UNION_HORIZON two-segment tie proof contained a non-TieOrder divergence: {:#?}",
+                run.comparison,
+            );
+        }
+
+        assert!(
+            run.comparison.subject.cutoff_tie_complete && run.comparison.oracle.cutoff_tie_complete,
+            "UNION_HORIZON tie matrix requires a lower-score completion sentinel",
+        );
+        assert_eq!(
+            run.comparison.subject.cutoff_tie_group.len(),
+            expected_tie_count,
+        );
+        assert_eq!(
+            run.comparison.oracle.cutoff_tie_group.len(),
+            expected_tie_count,
+        );
+        let subject_ties = run
+            .comparison
+            .subject
+            .cutoff_tie_group
+            .iter()
+            .map(|hit| (hit.doc_id.as_str(), hit.score_bits))
+            .collect::<BTreeMap<_, _>>();
+        let oracle_ties = run
+            .comparison
+            .oracle
+            .cutoff_tie_group
+            .iter()
+            .map(|hit| (hit.doc_id.as_str(), hit.score_bits))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(subject_ties, oracle_ties);
+        assert_eq!(
+            subject_ties
+                .values()
+                .copied()
+                .collect::<BTreeSet<_>>()
+                .len(),
+            1,
+            "UNION_HORIZON cutoff group must be an exact-score tie",
+        );
+        let tie_ordinals = subject_ties
+            .keys()
+            .map(|document_id| union_horizon_document_ordinal(document_id))
+            .collect::<Vec<_>>();
+        assert!(
+            [1, 20, 100].contains(&limit),
+            "UNION_HORIZON tie matrix has an unsupported limit {limit}",
+        );
+        let expected_tie_ordinals = match limit {
+            1 => vec![0, 9_000],
+            20 => vec![18, 8_500, 8_501],
+            100 => vec![96, 8_502, 8_503],
+            _ => Vec::new(),
+        };
+        assert_eq!(
+            tie_ordinals, expected_tie_ordinals,
+            "UNION_HORIZON cutoff tie membership drifted",
+        );
+        assert!(
+            tie_ordinals.iter().any(|ordinal| *ordinal < 4_096)
+                && tie_ordinals.iter().any(|ordinal| *ordinal > 4_095),
+            "UNION_HORIZON tie group must cross the refill boundary",
+        );
+        if !matches!(layout, UnionHorizonSegmentLayout::Single) {
+            assert!(
+                tie_ordinals
+                    .iter()
+                    .map(|ordinal| layout.range_for_ordinal(*ordinal).start)
+                    .collect::<BTreeSet<_>>()
+                    .len()
+                    > 1,
+                "UNION_HORIZON tie group must cross the explicit segment split",
+            );
+        }
+        assert_union_horizon_native_addresses(run, layout, tantivy_segments);
+        assert_eq!(
+            union_horizon_observed_envelope(&run.comparison.subject),
+            union_horizon_observed_envelope(&run.comparison.oracle),
+            "UNION_HORIZON ranked plus expanded tie envelope diverged",
+        );
+        let observed_envelope = union_horizon_observed_envelope(&run.comparison.subject);
+        let mut score_cardinality = BTreeMap::<u32, usize>::new();
+        for score_bits in observed_envelope.values() {
+            *score_cardinality.entry(*score_bits).or_default() += 1;
+        }
+        let subject_cutoff_bits = run
+            .comparison
+            .subject
+            .hits
+            .last()
+            .expect("UNION_HORIZON subject cutoff hit")
+            .score_bits;
+        let oracle_cutoff_bits = run
+            .comparison
+            .oracle
+            .hits
+            .last()
+            .expect("UNION_HORIZON oracle cutoff hit")
+            .score_bits;
+        assert_eq!(subject_cutoff_bits, oracle_cutoff_bits);
+        let subject_singleton_strata = run
+            .comparison
+            .subject
+            .hits
+            .iter()
+            .filter(|hit| {
+                score_cardinality
+                    .get(&hit.score_bits)
+                    .is_some_and(|count| matches!(count, &1))
+            })
+            .map(|hit| (&hit.doc_id, hit.score_bits))
+            .collect::<Vec<_>>();
+        let oracle_singleton_strata = run
+            .comparison
+            .oracle
+            .hits
+            .iter()
+            .filter(|hit| {
+                score_cardinality
+                    .get(&hit.score_bits)
+                    .is_some_and(|count| matches!(count, &1))
+            })
+            .map(|hit| (&hit.doc_id, hit.score_bits))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            subject_singleton_strata, oracle_singleton_strata,
+            "UNION_HORIZON every singleton score stratum must remain RankExact",
+        );
+    }
+
+    #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
+    fn assert_union_horizon_native_addresses(
+        run: &HarnessRun,
+        layout: UnionHorizonSegmentLayout,
+        tantivy_segments: &[UnionHorizonTantivySegmentReceipt],
+    ) {
+        for hit in run
+            .comparison
+            .subject
+            .hits
+            .iter()
+            .chain(&run.comparison.subject.cutoff_tie_group)
+        {
+            let ordinal = union_horizon_document_ordinal(&hit.doc_id);
+            let NativeTieKey::QuillDocId { doc_id } = &hit.native_tie_key else {
+                assert!(
+                    matches!(&hit.native_tie_key, NativeTieKey::QuillDocId { .. }),
+                    "UNION_HORIZON subject must preserve its native global document ID",
+                );
+                continue;
+            };
+            assert_eq!(
+                usize::try_from(*doc_id).expect("Quill global document ID fits usize"),
+                ordinal,
+                "UNION_HORIZON Quill global document ID must equal the external ordinal",
+            );
+        }
+
+        for hit in run
+            .comparison
+            .oracle
+            .hits
+            .iter()
+            .chain(&run.comparison.oracle.cutoff_tie_group)
+        {
+            let ordinal = union_horizon_document_ordinal(&hit.doc_id);
+            let expected_range = layout.range_for_ordinal(ordinal);
+            let NativeTieKey::TantivyDocAddress {
+                segment_ord,
+                doc_id,
+            } = &hit.native_tie_key
+            else {
+                assert!(
+                    matches!(&hit.native_tie_key, NativeTieKey::TantivyDocAddress { .. }),
+                    "UNION_HORIZON oracle must preserve native Tantivy DocAddress",
+                );
+                continue;
+            };
+            let matching_segments = tantivy_segments
+                .iter()
+                .filter(|segment| {
+                    usize::try_from(segment.num_docs)
+                        .is_ok_and(|count| count == expected_range.len())
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                matching_segments.len(),
+                1,
+                "UNION_HORIZON explicit ingest range must resolve to exactly one Tantivy segment",
+            );
+            let expected_segment = matching_segments[0];
+            assert_eq!(
+                expected_segment.max_doc, expected_segment.num_docs,
+                "UNION_HORIZON oracle topology must contain no deletes",
+            );
+            assert_eq!(
+                usize::try_from(expected_segment.num_docs)
+                    .expect("segment document count fits usize"),
+                expected_range.len(),
+                "UNION_HORIZON hit resolved through a segment with the wrong cardinality",
+            );
+            assert_eq!(
+                segment_ord, &expected_segment.segment_ord,
+                "UNION_HORIZON Tantivy native segment ordinal must match the explicit ingest range",
+            );
+            assert_eq!(
+                usize::try_from(*doc_id).expect("Tantivy local document ID fits usize"),
+                ordinal - expected_range.start,
+                "UNION_HORIZON Tantivy local document ID must match the explicit ingest range",
+            );
+        }
+    }
+
+    #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
+    async fn run_union_horizon_proof(
+        cx: &Cx,
+        fixture: &Fixture,
+        layout: UnionHorizonSegmentLayout,
+        proof_kind: UnionHorizonProofKind,
+    ) -> UnionHorizonProof {
+        let build_identity = union_horizon_validated_build_identity();
+        let oracle_dependency = union_horizon_oracle_dependency_identity();
+        let config = union_horizon_quill_config();
+        let mut subject = crate::engine::QuillSubject::in_memory(config)
+            .expect("fresh UNION_HORIZON Quill subject");
+        assert_eq!(
+            subject.config().tier_fanout,
+            9,
+            "UNION_HORIZON eight-leaf fixture must not trigger the default eight-way merge",
+        );
+        let mut oracle = crate::engine::TantivyOracle::in_memory_scalar_g1a_with_source(
+            &oracle_dependency.pinned_lexical_contract_revision,
+            false,
+        )
+        .expect("fresh UNION_HORIZON pinned Tantivy oracle");
+        oracle
+            .index()
+            .oracle_disable_auto_merge(cx)
+            .await
+            .expect("disable UNION_HORIZON Tantivy auto-merge");
+        subject
+            .claim_fresh_campaign()
+            .expect("claim UNION_HORIZON Quill subject");
+        oracle
+            .claim_fresh_campaign()
+            .expect("claim UNION_HORIZON Tantivy oracle");
+
+        let ranges = layout.ranges();
+        for range in &ranges {
+            let documents = fixture.documents[range.clone()]
+                .iter()
+                .cloned()
+                .map(frankensearch_core::IndexableDocument::from)
+                .collect::<Vec<_>>();
+            subject
+                .index_mut()
+                .expect("UNION_HORIZON Quill index")
+                .index_documents_with_scalar_topology_conformance(cx, &documents)
+                .await
+                .expect("index UNION_HORIZON Quill segment");
+            subject
+                .index_mut()
+                .expect("UNION_HORIZON Quill index")
+                .commit(cx)
+                .await
+                .expect("commit UNION_HORIZON Quill segment");
+            oracle
+                .index()
+                .index_documents(cx, &documents)
+                .await
+                .expect("index UNION_HORIZON Tantivy segment");
+            oracle
+                .index()
+                .commit(cx)
+                .await
+                .expect("commit UNION_HORIZON Tantivy segment");
+        }
+        subject
+            .mark_committed()
+            .expect("commit UNION_HORIZON Quill campaign");
+        oracle
+            .mark_committed()
+            .expect("commit UNION_HORIZON Tantivy campaign");
+
+        let expected_segment_doc_counts = ranges
+            .iter()
+            .map(|range| u32::try_from(range.len()).expect("UNION_HORIZON segment length fits u32"))
+            .collect::<Vec<_>>();
+        let snapshot = subject
+            .index()
+            .expect("UNION_HORIZON Quill index")
+            .snapshot();
+        let actual_segment_doc_counts = snapshot
+            .segments()
+            .iter()
+            .map(|segment| segment.doc_count())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            actual_segment_doc_counts, expected_segment_doc_counts,
+            "UNION_HORIZON Quill segment shape drifted",
+        );
+        let tantivy_segments = oracle
+            .index()
+            .oracle_segment_layout()
+            .expect("UNION_HORIZON Tantivy segment layout")
+            .into_iter()
+            .map(|segment| UnionHorizonTantivySegmentReceipt {
+                segment_ord: segment.segment_ord,
+                max_doc: segment.max_doc,
+                num_docs: segment.num_docs,
+            })
+            .collect::<Vec<_>>();
+        let mut expected_tantivy_doc_counts = expected_segment_doc_counts.clone();
+        expected_tantivy_doc_counts.sort_unstable_by(|left, right| right.cmp(left));
+        let actual_tantivy_doc_counts = tantivy_segments
+            .iter()
+            .map(|segment| {
+                assert_eq!(
+                    segment.max_doc, segment.num_docs,
+                    "UNION_HORIZON oracle topology must contain no deletes",
+                );
+                segment.num_docs
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            actual_tantivy_doc_counts, expected_tantivy_doc_counts,
+            "UNION_HORIZON Tantivy native searchable-segment order drifted",
+        );
+        assert!(
+            tantivy_segments
+                .iter()
+                .enumerate()
+                .all(|(ordinal, segment)| {
+                    u32::try_from(ordinal).is_ok_and(|observed| observed == segment.segment_ord)
+                }),
+            "UNION_HORIZON Tantivy segment ordinals must be dense and ordered",
+        );
+        let topology = UnionHorizonTopologyReceipt {
+            quill_segment_doc_counts: actual_segment_doc_counts,
+            tantivy_segments: tantivy_segments.clone(),
+        };
+        if !matches!(layout, UnionHorizonSegmentLayout::Single) {
+            assert_eq!(9_000_usize - layout.target_segment_start(), 8_743);
+            assert!(9_000_usize - layout.target_segment_start() >= 2 * 4_096);
+        }
+
+        let target_id = fixture
+            .documents
+            .last()
+            .expect("UNION_HORIZON target document")
+            .id
+            .as_str();
+        let harness = crate::engine::DifferentialHarness::new(
+            ComparisonMode::CrossEngine,
+            ComparatorConfig::default(),
+        );
+        let mut comparisons = Vec::new();
+        for query in &fixture.query_suite.cases {
+            let case = DifferentialCase {
+                fixture_id: query.id.clone(),
+                query: query.query.clone(),
+                limit: query.limit,
+                offset: query.offset,
+                tie_expansion_limit: match proof_kind {
+                    UnionHorizonProofKind::LateWinner => UNION_HORIZON_LATE_TIE_EXPANSION,
+                    UnionHorizonProofKind::TieMatrix => UNION_HORIZON_MATRIX_TIE_EXPANSION,
+                },
+                count_requested: query.count_requested,
+                snippet_max_chars: None,
+                metadata: DifferentialCaseMetadata {
+                    generator_id: Some(GENERATOR_ID.to_owned()),
+                    generator_seed: Some(fixture.query_suite.manifest.spec.seed),
+                    corpus_hash: Some(fixture.corpus_hash.clone()),
+                },
+            };
+            let mut run = harness
+                .run(cx, &subject, &oracle, &case)
+                .await
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "UNION_HORIZON layout={} limit={} failed: {error}",
+                        layout.label(),
+                        query.limit,
+                    )
+                });
+            run.engines
+                .bind_semantic_contract(SemanticContract::scalar_g1a())
+                .expect("bind UNION_HORIZON scalar G1a contract");
+            match proof_kind {
+                UnionHorizonProofKind::LateWinner => {
+                    assert_union_horizon_late_comparison(
+                        &run,
+                        query.limit,
+                        layout,
+                        &tantivy_segments,
+                    );
+                }
+                UnionHorizonProofKind::TieMatrix => {
+                    assert_union_horizon_tie_comparison(
+                        &run,
+                        query.limit,
+                        layout,
+                        &tantivy_segments,
+                    );
+                }
+            }
+            comparisons.push(run);
+        }
+
+        let segment_doc_start = u32::try_from(layout.target_segment_start())
+            .expect("UNION_HORIZON segment start fits u32");
+        let segment_doc_count =
+            u64::try_from(UNION_HORIZON_DOCUMENT_COUNT - layout.target_segment_start())
+                .expect("UNION_HORIZON target segment count fits u64");
+        let mut traced_results = Vec::new();
+        let mut target_traces = Vec::new();
+        let mut complete_pruning_traces = Vec::new();
+        for (query_ordinal, query) in fixture.query_suite.cases.iter().enumerate() {
+            let index = subject.index().expect("UNION_HORIZON Quill index");
+            let (traced, trace_receipt) = index
+                .search_paginated_with_conformance_pruning_trace(
+                    cx,
+                    UNION_HORIZON_QUERY,
+                    usize::try_from(query.limit).expect("UNION_HORIZON limit fits usize"),
+                    0,
+                    false,
+                )
+                .expect("trace UNION_HORIZON Quill search");
+            let traced_result = union_horizon_traced_result_receipt(query.limit, &traced);
+            assert_union_horizon_traced_result(
+                &comparisons[query_ordinal],
+                query.limit,
+                &traced_result,
+            );
+            assert_union_horizon_complete_trace_semantics(layout, &trace_receipt);
+            assert_eq!(
+                trace_receipt.execution_mode(),
+                layout.expected_execution_mode(),
+                "UNION_HORIZON layout={} used the wrong shipping collection branch",
+                layout.label(),
+            );
+            assert_eq!(
+                trace_receipt
+                    .segments()
+                    .iter()
+                    .map(|receipt| {
+                        u32::try_from(receipt.segment_doc_count())
+                            .expect("UNION_HORIZON receipt doc count fits u32")
+                    })
+                    .collect::<Vec<_>>(),
+                topology.quill_segment_doc_counts,
+                "UNION_HORIZON complete pruning receipt must match the full Quill topology",
+            );
+            assert_eq!(
+                traced.hits.len(),
+                usize::try_from(query.limit).expect("UNION_HORIZON limit fits usize"),
+            );
+            assert_eq!(
+                traced.total_count, None,
+                "UNION_HORIZON typed path proof must remain count-free",
+            );
+            if matches!(proof_kind, UnionHorizonProofKind::LateWinner) {
+                assert_eq!(traced.hits[0].document_id, target_id);
+                assert_eq!(traced.hits[0].global_docid, 9_000);
+            }
+            traced_results.push(traced_result);
+            target_traces.push(match proof_kind {
+                UnionHorizonProofKind::LateWinner => union_horizon_late_trace_receipt(
+                    query.limit,
+                    segment_doc_start,
+                    segment_doc_count,
+                    trace_receipt.segments(),
+                ),
+                UnionHorizonProofKind::TieMatrix => union_horizon_tie_trace_receipt(
+                    query.limit,
+                    segment_doc_start,
+                    segment_doc_count,
+                    trace_receipt.segments(),
+                ),
+            });
+            complete_pruning_traces.push(trace_receipt);
+        }
+
+        UnionHorizonProof {
+            layout,
+            build_identity,
+            oracle_dependency,
+            comparisons,
+            traced_results,
+            target_traces,
+            complete_pruning_traces,
+            topology,
+        }
+    }
+
+    #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
+    fn union_horizon_artifact_run_id() -> String {
+        const ARTIFACT_ROOT_ENV: &str = "GAUNTLET_UNION_HORIZON_ARTIFACT_ROOT";
+        const RUN_ID_ENV: &str = "GAUNTLET_UNION_HORIZON_RUN_ID";
+        let artifact_root = std::env::var_os(ARTIFACT_ROOT_ENV);
+        let run_id = std::env::var(RUN_ID_ENV);
+        match (artifact_root, run_id) {
+            (Some(_), Ok(run_id)) => run_id,
+            (None, Err(std::env::VarError::NotPresent)) => {
+                let identity = union_horizon_build_identity();
+                let revision_label = identity
+                    .source_git_revision
+                    .get(..12)
+                    .unwrap_or(&identity.source_git_revision);
+                format!("local-{revision_label}")
+            }
+            (Some(_), Err(error)) => {
+                panic!(
+                    "{RUN_ID_ENV} must be valid Unicode when {ARTIFACT_ROOT_ENV} is configured: {error}",
+                )
+            }
+            (None, Ok(_) | Err(std::env::VarError::NotUnicode(_))) => {
+                panic!("{ARTIFACT_ROOT_ENV} must be configured when {RUN_ID_ENV} is present")
+            }
+        }
+    }
+
+    #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
+    fn decode_union_horizon_artifact_bytes(
+        bytes: &[u8],
+        expected_raw_file_sha256: &str,
+    ) -> UnionHorizonDiagnosticArtifact {
+        assert!(
+            expected_raw_file_sha256.len() == 64
+                && expected_raw_file_sha256
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)),
+            "UNION_HORIZON raw-file identity must be lowercase SHA-256",
+        );
+        assert_eq!(
+            sha256_hex(bytes),
+            expected_raw_file_sha256,
+            "UNION_HORIZON uploaded bytes do not match their publication receipt",
+        );
+        let artifact: UnionHorizonDiagnosticArtifact =
+            serde_json::from_slice(bytes).expect("decode published UNION_HORIZON artifact");
+        let canonical_bytes = serde_json::to_vec_pretty(&artifact)
+            .expect("re-encode canonical UNION_HORIZON artifact bytes");
+        assert_eq!(
+            bytes, canonical_bytes,
+            "UNION_HORIZON strict decoder requires the publisher's exact canonical bytes; unknown, duplicate, reordered, or alternate-spelling JSON is noncanonical",
+        );
+        artifact.verify();
+        artifact
+    }
+
+    #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
+    fn assert_union_horizon_artifact_rejected(
+        artifact: &UnionHorizonDiagnosticArtifact,
+        mutate: impl FnOnce(&mut UnionHorizonDiagnosticArtifact),
+    ) {
+        let mut tampered = artifact.clone();
+        mutate(&mut tampered);
+        assert_ne!(
+            tampered, *artifact,
+            "UNION_HORIZON hostile mutation must change the artifact",
+        );
+        tampered.artifact_sha256 = tampered.preimage_sha256();
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| tampered.verify())).is_err(),
+            "tampered UNION_HORIZON artifact unexpectedly verified",
+        );
+    }
+
+    #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
+    fn persist_union_horizon_artifact(
+        artifact: &UnionHorizonDiagnosticArtifact,
+    ) -> Option<PublishedUnionHorizonDiagnostic> {
+        const ARTIFACT_ROOT_ENV: &str = "GAUNTLET_UNION_HORIZON_ARTIFACT_ROOT";
+        let root = std::env::var_os(ARTIFACT_ROOT_ENV).map(std::path::PathBuf::from)?;
+        assert_union_horizon_executable_still_matches(
+            &artifact
+                .proofs
+                .first()
+                .expect("UNION_HORIZON artifact contains proofs")
+                .build_identity,
+        );
+        assert!(
+            artifact.proofs.first().is_some_and(|proof| {
+                union_horizon_diagnostic_source_identity_is_well_formed(&proof.build_identity)
+            }),
+            "persisted UNION_HORIZON diagnostic requires a well-formed recorded source identity",
+        );
+        assert!(
+            root.is_relative()
+                && root.starts_with("target/coverage")
+                && !root
+                    .components()
+                    .any(|component| component == std::path::Component::ParentDir),
+            "UNION_HORIZON artifacts must use a relative target/coverage path so RCH returns them",
+        );
+        let bytes =
+            serde_json::to_vec_pretty(artifact).expect("serialize sealed UNION_HORIZON artifact");
+        let raw_file_sha256 = sha256_hex(&bytes);
+        let filename = format!(
+            "{}-{}-{}-{}.json",
+            artifact.run_id,
+            artifact.proof_kind.label(),
+            artifact.artifact_sha256,
+            raw_file_sha256,
+        );
+        let target_name = std::ffi::OsString::from(&filename);
+        let temporary_name =
+            std::ffi::OsString::from(format!(".tmp-{}-{filename}", std::process::id()));
+        let target = root.join(&target_name);
+        let directory = crate::artifact::PinnedDirectory::ensure_path(&root)
+            .expect("pin UNION_HORIZON artifact directory without following symlinks");
+        directory
+            .publish_unique_no_clobber(&temporary_name, &target_name, &bytes)
+            .unwrap_or_else(|error| {
+                panic!(
+                    "atomically publish UNION_HORIZON diagnostic {filename} without replacement: {error}",
+                )
+            });
+        let published_bytes = directory
+            .read_regular_bounded(
+                &target_name,
+                u64::try_from(bytes.len()).expect("UNION_HORIZON artifact length fits u64"),
+            )
+            .expect("reload published UNION_HORIZON artifact through its pinned directory");
+        let reloaded = decode_union_horizon_artifact_bytes(&published_bytes, &raw_file_sha256);
+        assert_eq!(
+            &reloaded, artifact,
+            "published UNION_HORIZON artifact changed during durable round-trip",
+        );
+        assert_union_horizon_executable_still_matches(
+            &artifact
+                .proofs
+                .first()
+                .expect("UNION_HORIZON artifact contains proofs")
+                .build_identity,
+        );
+        Some(PublishedUnionHorizonDiagnostic {
+            path: target,
+            raw_file_sha256,
+            byte_len: u64::try_from(published_bytes.len())
+                .expect("UNION_HORIZON artifact byte length fits u64"),
+        })
+    }
+
+    #[cfg(all(
+        feature = "tantivy-oracle",
+        feature = "pruning-conformance",
+        any(
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "tvos",
+            target_os = "watchos"
+        )
+    ))]
+    fn validate_union_horizon_completed_diagnostic_bundle(
+        directory: &crate::artifact::PinnedDirectory,
+        manifest: &UnionHorizonDiagnosticCompletionManifest,
+        completion_name: &std::ffi::OsStr,
+    ) {
+        manifest.verify();
+        assert_union_horizon_executable_still_matches(&manifest.build_identity);
+
+        let canonical_completion_bytes = serde_json::to_vec_pretty(manifest)
+            .expect("serialize canonical UNION_HORIZON completion manifest");
+        let completion_raw_sha256 = sha256_hex(&canonical_completion_bytes);
+        let expected_completion_name = std::ffi::OsString::from(format!(
+            "completion-{}-{}.json",
+            manifest.manifest_sha256, completion_raw_sha256,
+        ));
+        assert_eq!(
+            completion_name, expected_completion_name,
+            "UNION_HORIZON completion filename is not bound to its canonical bytes",
+        );
+
+        let mut expected_names = manifest
+            .artifacts
+            .iter()
+            .map(|entry| std::ffi::OsString::from(&entry.filename))
+            .collect::<std::collections::BTreeSet<_>>();
+        assert!(
+            expected_names.insert(expected_completion_name),
+            "UNION_HORIZON completion filename must be distinct from both proofs",
+        );
+        assert_eq!(
+            directory
+                .entry_names(expected_names.len())
+                .expect("enumerate exact completed UNION_HORIZON bundle"),
+            expected_names,
+            "completed UNION_HORIZON bundle contains a missing, extra, renamed, or substituted entry",
+        );
+
+        let reloaded_completion = directory
+            .read_regular_bounded(
+                completion_name,
+                u64::try_from(canonical_completion_bytes.len())
+                    .expect("completion manifest length fits u64"),
+            )
+            .expect("reread completed manifest through pinned directory");
+        assert_eq!(
+            reloaded_completion, canonical_completion_bytes,
+            "completed UNION_HORIZON manifest changed after sealing",
+        );
+
+        for entry in &manifest.artifacts {
+            let name = std::ffi::OsStr::new(&entry.filename);
+            let bytes = directory
+                .read_regular_bounded(name, entry.byte_len)
+                .expect("reread completed proof through pinned directory");
+            assert_eq!(
+                u64::try_from(bytes.len()).expect("completed proof length fits u64"),
+                entry.byte_len,
+                "completed UNION_HORIZON proof length changed after manifest sealing",
+            );
+            assert_eq!(
+                sha256_hex(&bytes),
+                entry.raw_file_sha256,
+                "completed UNION_HORIZON proof bytes changed after manifest sealing",
+            );
+            let artifact = decode_union_horizon_artifact_bytes(&bytes, &entry.raw_file_sha256);
+            assert_eq!(
+                artifact, entry.artifact,
+                "completed UNION_HORIZON proof does not equal its self-contained manifest copy",
+            );
+        }
+
+        assert_eq!(
+            directory
+                .entry_names(expected_names.len())
+                .expect("re-enumerate exact completed UNION_HORIZON bundle"),
+            expected_names,
+            "completed UNION_HORIZON bundle changed during final verification",
+        );
+        assert_union_horizon_executable_still_matches(&manifest.build_identity);
+    }
+
+    #[cfg(all(
+        feature = "tantivy-oracle",
+        feature = "pruning-conformance",
+        any(
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "tvos",
+            target_os = "watchos"
+        )
+    ))]
+    fn publish_union_horizon_diagnostic_completion_manifest() -> (
+        PublishedUnionHorizonDiagnostic,
+        UnionHorizonDiagnosticCompletionManifest,
+    ) {
+        const ARTIFACT_ROOT_ENV: &str = "GAUNTLET_UNION_HORIZON_ARTIFACT_ROOT";
+        const MAX_ARTIFACT_BYTES: u64 = 16 * 1024 * 1024;
+
+        let root = std::env::var_os(ARTIFACT_ROOT_ENV)
+            .map(std::path::PathBuf::from)
+            .expect("completion requires an explicit UNION_HORIZON artifact root");
+        let run_id = union_horizon_artifact_run_id();
+        let build_identity = union_horizon_build_identity();
+        assert_union_horizon_executable_still_matches(&build_identity);
+        assert!(
+            root.ends_with(&run_id),
+            "UNION_HORIZON diagnostic root must be isolated by exact run ID",
+        );
+        let directory = crate::artifact::PinnedDirectory::ensure_path(&root)
+            .expect("pin UNION_HORIZON completion directory");
+        let names = directory
+            .entry_names(3)
+            .expect("enumerate bounded UNION_HORIZON proof bundle");
+        assert_eq!(
+            names.len(),
+            2,
+            "completion requires exactly the late-winner and tie-matrix artifacts",
+        );
+
+        let mut entries = Vec::with_capacity(2);
+        for name in names {
+            let filename = name
+                .to_str()
+                .expect("UNION_HORIZON artifact filenames must be UTF-8")
+                .to_owned();
+            let raw_file_sha256 = filename
+                .strip_suffix(".json")
+                .and_then(|stem| stem.rsplit_once('-').map(|(_, raw)| raw))
+                .expect("UNION_HORIZON artifact filename carries its raw SHA-256")
+                .to_owned();
+            let bytes = directory
+                .read_regular_bounded(&name, MAX_ARTIFACT_BYTES)
+                .expect("read proof artifact through pinned completion directory");
+            let artifact = decode_union_horizon_artifact_bytes(&bytes, &raw_file_sha256);
+            assert_eq!(
+                artifact.run_id, run_id,
+                "completion cannot combine artifacts from different CI invocations",
+            );
+            assert_eq!(
+                filename,
+                format!(
+                    "{}-{}-{}-{}.json",
+                    artifact.run_id,
+                    artifact.proof_kind.label(),
+                    artifact.artifact_sha256,
+                    raw_file_sha256,
+                ),
+                "UNION_HORIZON artifact filename is not bound to its canonical diagnostic bytes",
+            );
+            let proof_kind = artifact.proof_kind;
+            let semantic_sha256 = artifact.artifact_sha256.clone();
+            entries.push(UnionHorizonDiagnosticCompletionEntry {
+                proof_kind,
+                filename,
+                semantic_sha256,
+                raw_file_sha256,
+                byte_len: u64::try_from(bytes.len())
+                    .expect("UNION_HORIZON proof artifact length fits u64"),
+                artifact,
+            });
+        }
+
+        let manifest = UnionHorizonDiagnosticCompletionManifest::seal(run_id, entries);
+        let bytes = serde_json::to_vec_pretty(&manifest)
+            .expect("serialize sealed UNION_HORIZON completion manifest");
+        let raw_file_sha256 = sha256_hex(&bytes);
+        let filename = format!(
+            "completion-{}-{}.json",
+            manifest.manifest_sha256, raw_file_sha256,
+        );
+        let target_name = std::ffi::OsString::from(&filename);
+        let temporary_name =
+            std::ffi::OsString::from(format!(".tmp-{}-{filename}", std::process::id()));
+        directory
+            .publish_unique_no_clobber(&temporary_name, &target_name, &bytes)
+            .expect("publish no-clobber UNION_HORIZON completion manifest");
+        let reloaded_bytes = directory
+            .read_regular_bounded(
+                &target_name,
+                u64::try_from(bytes.len()).expect("completion manifest length fits u64"),
+            )
+            .expect("reread completion manifest through pinned directory");
+        assert_eq!(sha256_hex(&reloaded_bytes), raw_file_sha256);
+        let reloaded: UnionHorizonDiagnosticCompletionManifest =
+            serde_json::from_slice(&reloaded_bytes)
+                .expect("strictly decode UNION_HORIZON diagnostic completion manifest");
+        assert_eq!(
+            reloaded_bytes,
+            serde_json::to_vec_pretty(&reloaded)
+                .expect("re-encode canonical UNION_HORIZON completion manifest"),
+            "completion manifest must retain its exact canonical bytes",
+        );
+        reloaded.verify();
+        assert_eq!(reloaded, manifest);
+        assert_union_horizon_executable_still_matches(&manifest.build_identity);
+        validate_union_horizon_completed_diagnostic_bundle(&directory, &manifest, &target_name);
+        eprintln!(
+            "{}",
+            serde_json::json!({
+                "event": "salej_union_horizon_diagnostic_completion",
+                "schema_version": manifest.schema_version,
+                "run_id": manifest.run_id,
+                "manifest_sha256": manifest.manifest_sha256,
+                "raw_file_sha256": raw_file_sha256,
+                "artifact_count": manifest.artifacts.len(),
+                "test_executable_sha256": manifest.build_identity.test_executable_sha256,
+                "source_verification": manifest.build_identity.source_verification.label(),
+                "source_git_dirty": manifest.build_identity.source_git_dirty,
+            }),
+        );
+        (
+            PublishedUnionHorizonDiagnostic {
+                path: root.join(target_name),
+                raw_file_sha256,
+                byte_len: u64::try_from(reloaded_bytes.len())
+                    .expect("completion manifest byte length fits u64"),
+            },
+            manifest,
+        )
+    }
+
+    #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
+    fn log_union_horizon_diagnostic(
+        artifact: &UnionHorizonDiagnosticArtifact,
+        publication: Option<&PublishedUnionHorizonDiagnostic>,
+    ) {
+        for proof in &artifact.proofs {
+            let execution_mode = match proof.layout.expected_execution_mode() {
+                frankensearch_quill::ConformancePruningExecutionMode::Serial => "serial",
+                frankensearch_quill::ConformancePruningExecutionMode::Rayon => "rayon",
+            };
+            eprintln!(
+                "{}",
+                serde_json::json!({
+                    "event": "salej_union_horizon_diagnostic_layout_proof",
+                    "schema_version": artifact.schema_version,
+                    "run_id": artifact.run_id,
+                    "proof_kind": artifact.proof_kind.label(),
+                    "layout": proof.layout.label(),
+                    "execution_mode": execution_mode,
+                    "query_count": proof.comparisons.len(),
+                    "quill_segment_doc_counts": proof.topology.quill_segment_doc_counts,
+                    "tantivy_segment_doc_counts": proof
+                        .topology
+                        .tantivy_segments
+                        .iter()
+                        .map(|segment| segment.num_docs)
+                        .collect::<Vec<_>>(),
+                    "complete_trace_count": proof.complete_pruning_traces.len(),
+                    "artifact_sha256": artifact.artifact_sha256,
+                    "source_verification": proof.build_identity.source_verification.label(),
+                    "source_git_dirty": proof.build_identity.source_git_dirty,
+                }),
+            );
+        }
+        let first_proof = artifact
+            .proofs
+            .first()
+            .expect("UNION_HORIZON diagnostic contains proofs");
+        eprintln!(
+            "{}",
+            serde_json::json!({
+                "event": "salej_union_horizon_diagnostic_artifact",
+                "schema_version": artifact.schema_version,
+                "run_id": artifact.run_id,
+                "proof_kind": artifact.proof_kind.label(),
+                "proof_count": artifact.proofs.len(),
+                "artifact_sha256": artifact.artifact_sha256,
+                "raw_file_sha256": publication.map(|receipt| &receipt.raw_file_sha256),
+                "byte_len": publication.map(|receipt| receipt.byte_len),
+                "persisted": publication.is_some(),
+                "filename": publication.and_then(|receipt| receipt.path.file_name())
+                    .and_then(std::ffi::OsStr::to_str),
+                "source_verification": first_proof.build_identity.source_verification.label(),
+                "source_git_dirty": first_proof.build_identity.source_git_dirty,
+            }),
+        );
+    }
+
+    #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
+    fn union_horizon_trace_geometry(
+        trace: &UnionHorizonTraceReceipt,
+    ) -> Vec<(
+        u64,
+        u32,
+        u64,
+        frankensearch_quill::ConformancePruningStrategy,
+        bool,
+        bool,
+    )> {
+        trace
+            .refills
+            .iter()
+            .map(|refill| {
+                (
+                    refill.ordinal(),
+                    refill.window_start(),
+                    refill.horizon_end(),
+                    refill.strategy(),
+                    refill.buffer_empty(),
+                    refill.live_work_remains(),
+                )
+            })
+            .collect()
+    }
+
+    #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
+    async fn run_union_horizon_layout_matrix(
+        cx: &Cx,
+        fixture: &Fixture,
+        proof_kind: UnionHorizonProofKind,
+    ) -> UnionHorizonDiagnosticArtifact {
+        let mut proofs = Vec::with_capacity(UnionHorizonSegmentLayout::ALL.len());
+        for layout in UnionHorizonSegmentLayout::ALL {
+            let first = run_union_horizon_proof(cx, fixture, layout, proof_kind).await;
+            let second = run_union_horizon_proof(cx, fixture, layout, proof_kind).await;
+            assert_eq!(
+                first,
+                second,
+                "UNION_HORIZON proof kind={} layout={} changed across fresh rebuilds",
+                proof_kind.label(),
+                layout.label(),
+            );
+            proofs.push(first);
+        }
+
+        let serial = proofs
+            .iter()
+            .find(|proof| matches!(proof.layout, UnionHorizonSegmentLayout::Two))
+            .expect("UNION_HORIZON matrix contains the two-segment serial proof");
+        let rayon = proofs
+            .iter()
+            .find(|proof| matches!(proof.layout, UnionHorizonSegmentLayout::Eight))
+            .expect("UNION_HORIZON matrix contains the eight-segment Rayon proof");
+        assert_eq!(serial.target_traces.len(), rayon.target_traces.len());
+        for (serial_trace, rayon_trace) in serial.target_traces.iter().zip(&rayon.target_traces) {
+            assert_eq!(serial_trace.limit, rayon_trace.limit);
+            assert_eq!(
+                serial_trace.segment_doc_start,
+                rayon_trace.segment_doc_start
+            );
+            assert_eq!(
+                serial_trace.segment_doc_count,
+                rayon_trace.segment_doc_count
+            );
+            assert_eq!(
+                union_horizon_trace_geometry(serial_trace),
+                union_horizon_trace_geometry(rayon_trace),
+                "UNION_HORIZON refill geometry and liveness must be invariant across serial and Rayon execution",
+            );
+            // The serial collector reaches the target tail with a global heap
+            // populated by prefix segments. Rayon intentionally gives each
+            // segment a fresh local heap before merging. Exact cutoff bits and
+            // selected-candidate counts are therefore branch-local diagnostics,
+            // not a valid cross-branch equality contract.
+        }
+        assert_eq!(
+            serial.comparisons.len(),
+            rayon.comparisons.len(),
+            "UNION_HORIZON serial and Rayon query matrices must have equal cardinality",
+        );
+        for (serial_run, rayon_run) in serial.comparisons.iter().zip(&rayon.comparisons) {
+            assert_eq!(
+                serial_run.comparison.subject, rayon_run.comparison.subject,
+                "UNION_HORIZON subject observation must be invariant across serial and Rayon execution",
+            );
+        }
+
+        let artifact = UnionHorizonDiagnosticArtifact::seal(
+            union_horizon_artifact_run_id(),
+            proof_kind,
+            proofs,
+        );
+        let publication = persist_union_horizon_artifact(&artifact);
+        log_union_horizon_diagnostic(&artifact, publication.as_ref());
+        artifact
+    }
+
     #[test]
     fn quill_subject_rejects_calls_outside_its_one_shot_lifecycle() {
         let fixture = make_fixture();
@@ -6092,7 +12526,7 @@ mod tests {
         };
 
         asupersync::test_utils::run_test_with_cx(|cx| async move {
-            let mut before_begin = crate::engine::QuillSubject::in_memory(
+            let mut before_begin = crate::engine::QuillSubject::in_memory_with_source(
                 deterministic_config.clone(),
                 "lifecycle-before-begin",
                 false,
@@ -6110,7 +12544,7 @@ mod tests {
                 GauntletError::InvalidCampaign { .. }
             ));
 
-            let mut before_commit = crate::engine::QuillSubject::in_memory(
+            let mut before_commit = crate::engine::QuillSubject::in_memory_with_source(
                 deterministic_config.clone(),
                 "lifecycle-before-commit",
                 false,
@@ -6137,7 +12571,7 @@ mod tests {
                 GauntletError::InvalidCampaign { .. }
             ));
 
-            let mut after_commit = crate::engine::QuillSubject::in_memory(
+            let mut after_commit = crate::engine::QuillSubject::in_memory_with_source(
                 deterministic_config,
                 "lifecycle-after-commit",
                 false,
@@ -6238,7 +12672,7 @@ mod tests {
     }
 
     #[test]
-    fn production_campaign_missing_provenance_fails_before_ingest() {
+    fn custom_campaign_cannot_request_production_provenance() {
         let fixture = make_fixture();
         let mut subject = ScriptedEngine::new(subject_descriptor(), BTreeMap::new());
         let mut oracle = ScriptedEngine::new(oracle_descriptor(), BTreeMap::new());
@@ -6267,9 +12701,9 @@ mod tests {
                     &fixture.query_suite,
                 )
                 .await
-                .expect_err("production provenance is mandatory");
+                .expect_err("custom adapters cannot mint production evidence");
             assert!(
-                error.to_string().contains("missing required provenance"),
+                error.to_string().contains("diagnostic-only"),
                 "unexpected fail-closed reason: {error}"
             );
             assert_eq!(subject.index_calls.load(Ordering::Relaxed), 0);
@@ -6278,27 +12712,636 @@ mod tests {
     }
 
     #[test]
-    fn production_default_rank_envelope_is_rejected_before_ingest_with_valid_provenance() {
+    fn admission_tuple_mismatches_fail_before_replay_ingest_or_persistence() {
+        let diagnostic_fixture = make_fixture();
+        let diagnostic_config = CampaignConfig {
+            selection: CampaignSelection::DefaultSyntax,
+            ..CampaignConfig::default()
+        };
+        let diagnostic_provenance = fixture_provenance(
+            &diagnostic_fixture,
+            &diagnostic_config,
+            &semantic_contract(),
+        );
+        let diagnostic_root = tempfile::tempdir().expect("diagnostic tempdir");
+        let diagnostic_replay = DriftingReplay {
+            calls: AtomicUsize::new(0),
+            first: diagnostic_fixture.documents.clone(),
+            second: diagnostic_fixture.documents.clone(),
+        };
+        let mut diagnostic_subject = ScriptedEngine::new(subject_descriptor(), BTreeMap::new());
+        let mut diagnostic_oracle = ScriptedEngine::new(oracle_descriptor(), BTreeMap::new());
+        let diagnostic_campaign = DifferentialCampaignRunner::new(
+            ArtifactStore::new(diagnostic_root.path()),
+            semantic_contract(),
+            diagnostic_config,
+            DivergenceRegistry::default(),
+        )
+        .expect("diagnostic runner")
+        .with_provenance(diagnostic_provenance);
+
+        let built_in_fixture = make_fixture();
+        let built_in_root = tempfile::tempdir().expect("built-in tempdir");
+        let built_in_replay = DriftingReplay {
+            calls: AtomicUsize::new(0),
+            first: built_in_fixture.documents.clone(),
+            second: built_in_fixture.documents.clone(),
+        };
+        let mut built_in_subject = ScriptedEngine::new(subject_descriptor(), BTreeMap::new());
+        let mut built_in_oracle = ScriptedEngine::new(oracle_descriptor(), BTreeMap::new());
+        let built_in_campaign = DifferentialCampaignRunner::new(
+            ArtifactStore::new(built_in_root.path()),
+            semantic_contract(),
+            CampaignConfig {
+                selection: CampaignSelection::DefaultSyntax,
+                require_provenance: false,
+                ..CampaignConfig::default()
+            },
+            DivergenceRegistry::default(),
+        )
+        .expect("built-in runner with intentionally invalid policy tuple");
+
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let diagnostic_error = diagnostic_campaign
+                .run_replay(
+                    &cx,
+                    "diagnostic-with-production-provenance",
+                    &mut diagnostic_subject,
+                    &mut diagnostic_oracle,
+                    &diagnostic_replay,
+                    &diagnostic_fixture.corpus_manifest,
+                    &diagnostic_fixture.query_suite,
+                )
+                .await
+                .expect_err("diagnostic role must reject attached provenance at preflight");
+            assert!(diagnostic_error.to_string().contains("diagnostic-only"));
+            assert_eq!(diagnostic_replay.calls.load(Ordering::Relaxed), 0);
+            assert_eq!(diagnostic_subject.index_calls.load(Ordering::Relaxed), 0);
+            assert_eq!(diagnostic_oracle.index_calls.load(Ordering::Relaxed), 0);
+            assert!(!diagnostic_root.path().join("campaigns").exists());
+
+            let built_in_error = built_in_campaign
+                .run_replay_internal(
+                    &cx,
+                    "built-in-without-production-policy",
+                    &mut built_in_subject,
+                    &mut built_in_oracle,
+                    &built_in_replay,
+                    &built_in_fixture.corpus_manifest,
+                    &built_in_fixture.query_suite,
+                    CampaignAdmission::BuiltInEvidence(BuiltInEngineProfileReceipt::new(
+                        BuiltInEngineProfile::ScalarShipping,
+                        &frankensearch_quill::QuillConfig::default(),
+                    )),
+                )
+                .await
+                .expect_err("built-in role must reject a disabled provenance policy at preflight");
+            assert!(
+                built_in_error
+                    .to_string()
+                    .contains("requires provenance policy")
+            );
+            assert_eq!(built_in_replay.calls.load(Ordering::Relaxed), 0);
+            assert_eq!(built_in_subject.index_calls.load(Ordering::Relaxed), 0);
+            assert_eq!(built_in_oracle.index_calls.load(Ordering::Relaxed), 0);
+            assert!(!built_in_root.path().join("campaigns").exists());
+        });
+    }
+
+    #[cfg(feature = "tantivy-oracle")]
+    #[test]
+    fn semantic_profile_and_dependency_substitutions_fail_before_replay_or_persistence() {
+        let semantic_fixture = make_fixture();
+        let semantic_root = tempfile::tempdir().expect("semantic tempdir");
+        let semantic_replay = DriftingReplay {
+            calls: AtomicUsize::new(0),
+            first: semantic_fixture.documents.clone(),
+            second: semantic_fixture.documents.clone(),
+        };
+        let mut semantic_subject = ScriptedEngine::new(subject_descriptor(), BTreeMap::new())
+            .with_semantic_contract(SemanticContract::scalar_g1a());
+        let mut semantic_oracle = ScriptedEngine::new(oracle_descriptor(), BTreeMap::new());
+        let semantic_campaign = runner(
+            semantic_root.path(),
+            CampaignSelection::DefaultSyntax,
+            DivergenceRegistry::default(),
+        );
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let error = semantic_campaign
+                .run_replay(
+                    &cx,
+                    "semantic-substitution",
+                    &mut semantic_subject,
+                    &mut semantic_oracle,
+                    &semantic_replay,
+                    &semantic_fixture.corpus_manifest,
+                    &semantic_fixture.query_suite,
+                )
+                .await
+                .expect_err("split semantic contracts must fail during admission");
+            assert!(error.to_string().contains("semantic contracts"));
+            assert_eq!(semantic_replay.calls.load(Ordering::Relaxed), 0);
+            assert_eq!(semantic_subject.index_calls.load(Ordering::Relaxed), 0);
+            assert_eq!(semantic_oracle.index_calls.load(Ordering::Relaxed), 0);
+            assert!(!semantic_root.path().join("campaigns").exists());
+        });
+
+        let profile_fixture = make_fixture();
+        let profile_semantics = SemanticContract::shipping_default();
+        let profile_config = CampaignConfig {
+            selection: CampaignSelection::DefaultSyntax,
+            contract_mode: CampaignContractMode::CoreLexicalV3,
+            require_provenance: true,
+            ..CampaignConfig::default()
+        };
+        let profile_provenance =
+            fixture_provenance(&profile_fixture, &profile_config, &profile_semantics);
+        let producer = GauntletProducerBuildIdentity::compiled().expect("compiled producer");
+        let quill_config = frankensearch_quill::QuillConfig::default();
+        let profile_subject_descriptor = EngineDescriptor {
+            family: EngineFamily::Quill,
+            implementation: "frankensearch-quill/scalar-index".to_owned(),
+            crate_version: frankensearch_quill::FRANKENSEARCH_QUILL_CRATE_VERSION.to_owned(),
+            source_revision: producer.source_git_revision.clone(),
+            source_dirty: producer.source_git_dirty,
+            config_hash: crate::engine::quill_config_hash(&quill_config),
+        };
+        let oracle_version = oracle_version_contract().expect("oracle dependency contract");
+        let profile_oracle_descriptor = EngineDescriptor {
+            family: EngineFamily::Tantivy,
+            implementation: "frankensearch-lexical/tantivy-index".to_owned(),
+            crate_version: oracle_version.lexical_package_version.clone(),
+            source_revision: producer.source_git_revision.clone(),
+            source_dirty: producer.source_git_dirty,
+            config_hash: crate::engine::TANTIVY_ORACLE_CONFIG_HASH.to_owned(),
+        };
+        let profile_root = tempfile::tempdir().expect("profile tempdir");
+        let profile_replay = DriftingReplay {
+            calls: AtomicUsize::new(0),
+            first: profile_fixture.documents.clone(),
+            second: profile_fixture.documents.clone(),
+        };
+        let mut profile_subject = ScriptedEngine::new(profile_subject_descriptor, BTreeMap::new())
+            .with_semantic_contract(profile_semantics.clone());
+        let mut profile_oracle =
+            ScriptedEngine::new(profile_oracle_descriptor.clone(), BTreeMap::new())
+                .with_semantic_contract(profile_semantics.clone());
+        let profile_campaign = DifferentialCampaignRunner::new(
+            ArtifactStore::with_test_live_source_bypass(profile_root.path()),
+            profile_semantics.clone(),
+            profile_config,
+            DivergenceRegistry::default(),
+        )
+        .expect("profile substitution runner")
+        .with_provenance(profile_provenance);
+        let mut substituted_config = quill_config.clone();
+        substituted_config.deterministic_ingest = !substituted_config.deterministic_ingest;
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let error = profile_campaign
+                .run_replay_internal(
+                    &cx,
+                    "profile-substitution",
+                    &mut profile_subject,
+                    &mut profile_oracle,
+                    &profile_replay,
+                    &profile_fixture.corpus_manifest,
+                    &profile_fixture.query_suite,
+                    CampaignAdmission::BuiltInEvidence(BuiltInEngineProfileReceipt::new(
+                        BuiltInEngineProfile::ScalarShipping,
+                        &substituted_config,
+                    )),
+                )
+                .await
+                .expect_err("profile/config substitution must fail during admission");
+            assert!(error.to_string().contains("profile receipt"));
+            assert_eq!(profile_replay.calls.load(Ordering::Relaxed), 0);
+            assert_eq!(profile_subject.index_calls.load(Ordering::Relaxed), 0);
+            assert_eq!(profile_oracle.index_calls.load(Ordering::Relaxed), 0);
+            assert!(!profile_root.path().join("campaigns").exists());
+        });
+
+        let dependency_fixture = make_fixture();
+        let dependency_semantics = SemanticContract::shipping_default();
+        let dependency_config = CampaignConfig {
+            selection: CampaignSelection::DefaultSyntax,
+            contract_mode: CampaignContractMode::CoreLexicalV3,
+            require_provenance: true,
+            ..CampaignConfig::default()
+        };
+        let dependency_provenance = fixture_provenance(
+            &dependency_fixture,
+            &dependency_config,
+            &dependency_semantics,
+        );
+        let dependency_root = tempfile::tempdir().expect("dependency tempdir");
+        let dependency_replay = DriftingReplay {
+            calls: AtomicUsize::new(0),
+            first: dependency_fixture.documents.clone(),
+            second: dependency_fixture.documents.clone(),
+        };
+        let mut dependency_subject = ScriptedEngine::new(
+            EngineDescriptor {
+                family: EngineFamily::Quill,
+                implementation: "frankensearch-quill/scalar-index".to_owned(),
+                crate_version: frankensearch_quill::FRANKENSEARCH_QUILL_CRATE_VERSION.to_owned(),
+                source_revision: producer.source_git_revision.clone(),
+                source_dirty: producer.source_git_dirty,
+                config_hash: crate::engine::quill_config_hash(&quill_config),
+            },
+            BTreeMap::new(),
+        )
+        .with_semantic_contract(dependency_semantics.clone());
+        let mut wrong_oracle_descriptor = profile_oracle_descriptor;
+        wrong_oracle_descriptor
+            .crate_version
+            .push_str("-substituted");
+        let mut dependency_oracle = ScriptedEngine::new(wrong_oracle_descriptor, BTreeMap::new())
+            .with_semantic_contract(dependency_semantics.clone());
+        let dependency_campaign = DifferentialCampaignRunner::new(
+            ArtifactStore::with_test_live_source_bypass(dependency_root.path()),
+            dependency_semantics,
+            dependency_config,
+            DivergenceRegistry::default(),
+        )
+        .expect("dependency substitution runner")
+        .with_provenance(dependency_provenance);
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let error = dependency_campaign
+                .run_replay_internal(
+                    &cx,
+                    "dependency-substitution",
+                    &mut dependency_subject,
+                    &mut dependency_oracle,
+                    &dependency_replay,
+                    &dependency_fixture.corpus_manifest,
+                    &dependency_fixture.query_suite,
+                    CampaignAdmission::BuiltInEvidence(BuiltInEngineProfileReceipt::new(
+                        BuiltInEngineProfile::ScalarShipping,
+                        &quill_config,
+                    )),
+                )
+                .await
+                .expect_err("oracle dependency substitution must fail during admission");
+            assert!(error.to_string().contains("profile receipt"));
+            assert_eq!(dependency_replay.calls.load(Ordering::Relaxed), 0);
+            assert_eq!(dependency_subject.index_calls.load(Ordering::Relaxed), 0);
+            assert_eq!(dependency_oracle.index_calls.load(Ordering::Relaxed), 0);
+            assert!(!dependency_root.path().join("campaigns").exists());
+        });
+    }
+
+    #[cfg(feature = "tantivy-oracle")]
+    #[test]
+    fn built_in_all_infrastructure_report_binds_dependency_without_case_objects() {
+        let fixture = make_fixture();
+        let semantic_contract = SemanticContract::shipping_default();
+        let quill_config = frankensearch_quill::QuillConfig::default();
+        let producer = GauntletProducerBuildIdentity::compiled().expect("compiled producer");
+        let oracle_version = oracle_version_contract().expect("oracle dependency contract");
+        let subject_descriptor = EngineDescriptor {
+            family: EngineFamily::Quill,
+            implementation: "frankensearch-quill/scalar-index".to_owned(),
+            crate_version: frankensearch_quill::FRANKENSEARCH_QUILL_CRATE_VERSION.to_owned(),
+            source_revision: producer.source_git_revision.clone(),
+            source_dirty: producer.source_git_dirty,
+            config_hash: crate::engine::quill_config_hash(&quill_config),
+        };
+        let oracle_descriptor = EngineDescriptor {
+            family: EngineFamily::Tantivy,
+            implementation: "frankensearch-lexical/tantivy-index".to_owned(),
+            crate_version: oracle_version.lexical_package_version.clone(),
+            source_revision: producer.source_git_revision.clone(),
+            source_dirty: producer.source_git_dirty,
+            config_hash: crate::engine::TANTIVY_ORACLE_CONFIG_HASH.to_owned(),
+        };
+        let behaviors = fixture
+            .query_suite
+            .cases
+            .iter()
+            .map(|query| (query.id.clone(), ScriptedBehavior::Error))
+            .collect::<BTreeMap<_, _>>();
+        let mut subject = ScriptedEngine::new(subject_descriptor, behaviors.clone())
+            .with_semantic_contract(semantic_contract.clone());
+        let mut oracle = ScriptedEngine::new(oracle_descriptor, behaviors)
+            .with_semantic_contract(semantic_contract.clone());
+        let config = CampaignConfig {
+            selection: CampaignSelection::CaseIds {
+                ids: vec!["term".to_owned(), "counted".to_owned()],
+            },
+            contract_mode: CampaignContractMode::CoreLexicalV3,
+            require_provenance: true,
+            ..CampaignConfig::default()
+        };
+        let provenance = fixture_provenance(&fixture, &config, &semantic_contract);
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().join("gauntlet");
+        let campaign = DifferentialCampaignRunner::new(
+            ArtifactStore::with_test_live_source_bypass(&root),
+            semantic_contract,
+            config,
+            DivergenceRegistry::default(),
+        )
+        .expect("built-in all-infrastructure runner")
+        .with_provenance(provenance);
+
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let report = campaign
+                .run_replay_internal(
+                    &cx,
+                    "built-in-all-infrastructure",
+                    &mut subject,
+                    &mut oracle,
+                    &fixture.documents,
+                    &fixture.corpus_manifest,
+                    &fixture.query_suite,
+                    CampaignAdmission::BuiltInEvidence(BuiltInEngineProfileReceipt::new(
+                        BuiltInEngineProfile::ScalarShipping,
+                        &quill_config,
+                    )),
+                )
+                .await
+                .expect("failed built-in campaign remains durable evidence");
+            assert!(!report.passed);
+            assert_eq!(
+                report.execution_role,
+                ArtifactExecutionRole::BuiltInExecution
+            );
+            assert_eq!(
+                report
+                    .schema_trust_ceiling()
+                    .expect("current trust ceiling"),
+                ArtifactTrustCeiling::IntegrityOnly,
+                "a typed built-in execution remains integrity-only before F0 admission"
+            );
+            assert!(matches!(
+                report.oracle_dependency,
+                ArtifactOracleDependency::BuiltInTantivy { .. }
+            ));
+            assert!(report.cases.iter().all(|case| {
+                case.disposition == CampaignDisposition::InfrastructureError
+                    && case.artifact_hash.is_none()
+            }));
+            assert!(!root.join("objects").exists());
+            assert!(
+                !root
+                    .join("campaigns/built-in-all-infrastructure/cases")
+                    .exists()
+            );
+            let store = ArtifactStore::new(&root);
+            let loaded = store
+                .load_integrity_checked_campaign("built-in-all-infrastructure")
+                .expect("untouched no-object report reloads");
+            assert!(
+                report.cases.iter().any(|case| case.diagnostic.is_some()),
+                "the in-memory fixture must exercise noncanonical backend diagnostics",
+            );
+            let mut expected_durable_report = report.clone();
+            for case in &mut expected_durable_report.cases {
+                case.diagnostic = None;
+            }
+            assert_eq!(loaded.report(), &expected_durable_report);
+            assert_eq!(
+                loaded
+                    .report()
+                    .canonical_bytes_unchecked()
+                    .expect("loaded canonical report"),
+                expected_durable_report
+                    .canonical_bytes_unchecked()
+                    .expect("expected durable canonical report"),
+            );
+            assert!(
+                loaded
+                    .report()
+                    .cases
+                    .iter()
+                    .all(|case| case.diagnostic.is_none()),
+                "noncanonical backend diagnostics must not survive durable reload",
+            );
+
+            let campaign_path = root.join("campaigns/built-in-all-infrastructure");
+            let completion_files = std::fs::read_dir(&campaign_path)
+                .expect("completed campaign directory")
+                .map(|entry| entry.expect("campaign entry").file_name())
+                .filter(|name| name.to_string_lossy().starts_with("completion-"))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                completion_files.len(),
+                1,
+                "exactly one write-last completion receipt is required"
+            );
+            let completion_path = campaign_path.join(&completion_files[0]);
+            let completion_bytes =
+                std::fs::read(&completion_path).expect("stored completion receipt");
+            let report_path = campaign_path.join("report.json");
+            let reservation_path = campaign_path.join("reservation.json");
+            let original_report = std::fs::read(&report_path).expect("stored report");
+            let original_reservation =
+                std::fs::read(&reservation_path).expect("stored reservation");
+            let mut mutations = Vec::new();
+
+            let mut split_semantics = report.clone();
+            split_semantics.semantic_contract = SemanticContract::scalar_g1a();
+            mutations.push(("semantic contract", split_semantics));
+
+            let mut wrong_dependency = report.clone();
+            wrong_dependency.oracle_dependency = ArtifactOracleDependency::DiagnosticUnspecified;
+            mutations.push(("oracle dependency", wrong_dependency));
+
+            let mut profile_value = serde_json::to_value(&report).expect("report value");
+            profile_value["engines"]["built_in_profile"]["profile"] = serde_json::json!("cass");
+            let wrong_profile: CampaignReport =
+                serde_json::from_value(profile_value).expect("mutated profile report");
+            mutations.push(("engine profile", wrong_profile));
+
+            for (label, mutation) in mutations {
+                std::fs::write(
+                    &report_path,
+                    mutation
+                        .canonical_bytes_unchecked()
+                        .expect("tampered report bytes"),
+                )
+                .expect("write tampered report");
+                std::fs::write(
+                    &reservation_path,
+                    mutation
+                        .reservation_bytes_unchecked()
+                        .expect("tampered reservation bytes"),
+                )
+                .expect("write tampered reservation");
+                assert!(
+                    store
+                        .load_integrity_checked_campaign("built-in-all-infrastructure")
+                        .is_err(),
+                    "coherent {label} mutation must fail without relying on case objects"
+                );
+            }
+
+            std::fs::write(&report_path, original_report).expect("restore report");
+            std::fs::write(&reservation_path, original_reservation).expect("restore reservation");
+            store
+                .load_integrity_checked_campaign("built-in-all-infrastructure")
+                .expect("restored no-object report reloads");
+
+            let mut arbitrary_reason: serde_json::Value = serde_json::from_slice(
+                &std::fs::read(&report_path).expect("restored report bytes"),
+            )
+            .expect("decode report for hostile reason mutation");
+            arbitrary_reason["cases"][0]["reason"] =
+                serde_json::json!("arbitrary canonical replacement text");
+            std::fs::write(
+                &report_path,
+                serde_json::to_vec(&arbitrary_reason).expect("hostile reason report bytes"),
+            )
+            .expect("write hostile reason report");
+            assert!(
+                store
+                    .load_integrity_checked_campaign("built-in-all-infrastructure")
+                    .is_err(),
+                "free-form canonical reason replacement must not decode as report v7"
+            );
+            std::fs::write(
+                &report_path,
+                report
+                    .canonical_bytes_unchecked()
+                    .expect("restore canonical report bytes"),
+            )
+            .expect("restore report after hostile reason mutation");
+
+            let incomplete_root = temp.path().join("incomplete-copy");
+            let incomplete_campaign = incomplete_root
+                .join("campaigns")
+                .join("built-in-all-infrastructure");
+            std::fs::create_dir_all(&incomplete_campaign).expect("create incomplete campaign copy");
+            std::fs::write(
+                incomplete_campaign.join("report.json"),
+                report
+                    .canonical_bytes_unchecked()
+                    .expect("incomplete report bytes"),
+            )
+            .expect("write incomplete report");
+            std::fs::write(
+                incomplete_campaign.join("reservation.json"),
+                report
+                    .reservation_bytes_unchecked()
+                    .expect("incomplete reservation bytes"),
+            )
+            .expect("write incomplete reservation");
+            assert!(
+                ArtifactStore::new(&incomplete_root)
+                    .load_integrity_checked_campaign("built-in-all-infrastructure")
+                    .is_err(),
+                "report publication without the write-last completion receipt is incomplete"
+            );
+
+            let mut wrong_completion: serde_json::Value =
+                serde_json::from_slice(&completion_bytes).expect("decode completion receipt");
+            wrong_completion["report_identity_sha256"] = serde_json::json!("0".repeat(64));
+            std::fs::write(
+                &completion_path,
+                serde_json::to_vec(&wrong_completion).expect("hostile completion bytes"),
+            )
+            .expect("write hostile completion receipt");
+            assert!(
+                store
+                    .load_integrity_checked_campaign("built-in-all-infrastructure")
+                    .is_err(),
+                "completion receipt mutation must fail integrity-checked reload"
+            );
+            std::fs::write(&completion_path, completion_bytes).expect("restore completion receipt");
+            store
+                .load_integrity_checked_campaign("built-in-all-infrastructure")
+                .expect("fully restored completed campaign reloads");
+
+            std::fs::write(campaign_path.join("unexpected.json"), b"{}")
+                .expect("write unexpected top-level campaign entry");
+            assert!(
+                store
+                    .load_integrity_checked_campaign("built-in-all-infrastructure")
+                    .is_err(),
+                "unexpected top-level entries invalidate completed campaign closure"
+            );
+        });
+    }
+
+    #[cfg(feature = "tantivy-oracle")]
+    #[test]
+    fn typed_campaign_missing_provenance_fails_before_ingest() {
+        let fixture = make_fixture();
+        let mut subject =
+            crate::engine::QuillSubject::in_memory(frankensearch_quill::QuillConfig::default())
+                .expect("typed subject");
+        let mut oracle = crate::engine::TantivyOracle::in_memory().expect("typed oracle");
+        let temp = tempfile::tempdir().expect("tempdir");
+        let campaign = DifferentialCampaignRunner::new(
+            ArtifactStore::new(temp.path()),
+            semantic_contract(),
+            CampaignConfig {
+                selection: CampaignSelection::DefaultSyntax,
+                contract_mode: CampaignContractMode::CoreLexicalV3,
+                require_provenance: true,
+                ..CampaignConfig::default()
+            },
+            DivergenceRegistry::default(),
+        )
+        .expect("production campaign policy");
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let error = campaign
+                .run_quill_tantivy_evidence(
+                    &cx,
+                    "typed-missing-production-provenance",
+                    &mut subject,
+                    &mut oracle,
+                    &fixture.documents,
+                    &fixture.corpus_manifest,
+                    &fixture.query_suite,
+                )
+                .await
+                .expect_err("typed production evidence requires provenance");
+            assert!(
+                error.to_string().contains("missing required provenance"),
+                "unexpected fail-closed reason: {error}"
+            );
+            subject
+                .claim_fresh_campaign()
+                .expect("subject was not claimed before provenance rejection");
+            oracle
+                .claim_fresh_campaign()
+                .expect("oracle was not claimed before provenance rejection");
+        });
+    }
+
+    #[test]
+    fn production_default_rank_envelope_is_rejected_before_ingest_with_stored_provenance() {
         let fixture = make_fixture();
         let semantic_contract = semantic_contract();
+        let quill_config = frankensearch_quill::QuillConfig::default();
+        let producer = GauntletProducerBuildIdentity::compiled().expect("compiled producer");
+        let oracle_version = oracle_version_contract().expect("oracle dependency contract");
         let subject_descriptor = EngineDescriptor {
-            source_revision: "1".repeat(40),
-            ..subject_descriptor()
+            family: EngineFamily::Quill,
+            implementation: "frankensearch-quill/scalar-index".to_owned(),
+            crate_version: frankensearch_quill::FRANKENSEARCH_QUILL_CRATE_VERSION.to_owned(),
+            source_revision: producer.source_git_revision.clone(),
+            source_dirty: producer.source_git_dirty,
+            config_hash: crate::engine::quill_config_hash(&quill_config),
         };
-        let oracle_descriptor = oracle_descriptor();
+        let oracle_descriptor = EngineDescriptor {
+            family: EngineFamily::Tantivy,
+            implementation: "frankensearch-lexical/tantivy-index".to_owned(),
+            crate_version: oracle_version.lexical_package_version,
+            source_revision: producer.source_git_revision,
+            source_dirty: producer.source_git_dirty,
+            config_hash: crate::engine::TANTIVY_ORACLE_CONFIG_HASH.to_owned(),
+        };
         let config = CampaignConfig {
             selection: CampaignSelection::DefaultSyntax,
             contract_mode: CampaignContractMode::RankEnvelopeOnly,
             require_provenance: true,
             ..CampaignConfig::default()
         };
-        let provenance = fixture_provenance(
-            &fixture,
-            &config,
-            &semantic_contract,
-            &subject_descriptor,
-            &oracle_descriptor,
-        );
+        let provenance = fixture_provenance(&fixture, &config, &semantic_contract);
+        let producer_build_identity =
+            GauntletProducerBuildIdentity::compiled().expect("compiled producer");
         let mut engines = EnginePairIdentity::new(
             ComparisonMode::CrossEngine,
             subject_descriptor.clone(),
@@ -6308,21 +13351,34 @@ mod tests {
         engines
             .bind_semantic_contract(semantic_contract.clone())
             .expect("semantic contract");
+        // This policy-ordering regression is part of the unconditional unit
+        // suite, which also runs from source snapshots that deliberately
+        // cannot claim clean-Git creation authority. Prove that every stored
+        // provenance binding is otherwise valid here; the live default-profile
+        // campaign below separately exercises positive creation admission from
+        // a clean Git-verified checkout.
         provenance
-            .validate_for_campaign(
+            .validate_stored(
+                &producer_build_identity,
                 &engines,
                 &semantic_contract,
                 &config,
                 &fixture.corpus_manifest,
                 &fixture.query_suite.manifest,
             )
-            .expect("the policy regression must carry otherwise-valid provenance");
+            .expect("the policy regression must carry otherwise-valid stored provenance");
 
         let mut subject = ScriptedEngine::new(subject_descriptor, BTreeMap::new());
         let mut oracle = ScriptedEngine::new(oracle_descriptor, BTreeMap::new());
         let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().to_path_buf();
+        let replay = DriftingReplay {
+            calls: AtomicUsize::new(0),
+            first: fixture.documents.clone(),
+            second: fixture.documents.clone(),
+        };
         let campaign = DifferentialCampaignRunner::new(
-            ArtifactStore::new(temp.path()),
+            ArtifactStore::with_test_live_source_bypass(&root),
             semantic_contract,
             config,
             DivergenceRegistry::default(),
@@ -6331,14 +13387,18 @@ mod tests {
         .with_provenance(provenance);
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             let error = campaign
-                .run(
+                .run_replay_internal(
                     &cx,
                     "default-rank-envelope-is-not-replacement-evidence",
                     &mut subject,
                     &mut oracle,
-                    &fixture.documents,
+                    &replay,
                     &fixture.corpus_manifest,
                     &fixture.query_suite,
+                    CampaignAdmission::BuiltInEvidence(BuiltInEngineProfileReceipt::new(
+                        BuiltInEngineProfile::ScalarShipping,
+                        &quill_config,
+                    )),
                 )
                 .await
                 .expect_err("default production evidence requires core lexical v3");
@@ -6348,59 +13408,28 @@ mod tests {
                     .contains("require core lexical v3 evidence"),
                 "unexpected fail-closed reason: {error}"
             );
+            assert_eq!(replay.calls.load(Ordering::Relaxed), 0);
             assert_eq!(subject.index_calls.load(Ordering::Relaxed), 0);
             assert_eq!(oracle.index_calls.load(Ordering::Relaxed), 0);
+            assert!(!root.join("campaigns").exists());
         });
     }
 
+    #[cfg(feature = "tantivy-oracle")]
     #[test]
     fn production_cass_rank_envelope_remains_admissible_with_valid_provenance() {
-        let fixture = make_fixture();
+        let fixture = make_cass_activation_fixture();
         let semantic_contract = SemanticContract::cass();
-        let subject_descriptor = EngineDescriptor {
-            source_revision: "1".repeat(40),
-            ..subject_descriptor()
-        };
-        let oracle_descriptor = EngineDescriptor {
-            config_hash: crate::engine::CASS_TANTIVY_ORACLE_CONFIG_HASH.to_owned(),
-            ..oracle_descriptor()
-        };
         let config = CampaignConfig {
             selection: CampaignSelection::CassSyntax,
             contract_mode: CampaignContractMode::RankEnvelopeOnly,
             require_provenance: true,
             index_batch_size: 5,
+            snippet_max_chars: None,
             ..CampaignConfig::default()
         };
-        let provenance = fixture_provenance(
-            &fixture,
-            &config,
-            &semantic_contract,
-            &subject_descriptor,
-            &oracle_descriptor,
-        );
-        let mut engines = EnginePairIdentity::new(
-            ComparisonMode::CrossEngine,
-            subject_descriptor.clone(),
-            oracle_descriptor.clone(),
-        )
-        .expect("distinct CASS engines");
-        engines
-            .bind_semantic_contract(semantic_contract.clone())
-            .expect("CASS semantic contract");
-        provenance
-            .validate_for_campaign(
-                &engines,
-                &semantic_contract,
-                &config,
-                &fixture.corpus_manifest,
-                &fixture.query_suite.manifest,
-            )
-            .expect("the CASS positive control must carry valid provenance");
-        let mut subject = ScriptedEngine::new(subject_descriptor, BTreeMap::new())
-            .with_semantic_contract(semantic_contract.clone());
-        let mut oracle = ScriptedEngine::new(oracle_descriptor, BTreeMap::new())
-            .with_semantic_contract(semantic_contract.clone());
+        let provenance = fixture_provenance(&fixture, &config, &semantic_contract);
+        let (mut subject, mut oracle) = live_cass_campaign_engines();
         let temp = tempfile::tempdir().expect("tempdir");
         let campaign = DifferentialCampaignRunner::new(
             ArtifactStore::new(temp.path()),
@@ -6412,7 +13441,7 @@ mod tests {
         .with_provenance(provenance);
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             let report = campaign
-                .run(
+                .run_cass_quill_tantivy_evidence(
                     &cx,
                     "cass-rank-envelope-remains-supported",
                     &mut subject,
@@ -6428,13 +13457,20 @@ mod tests {
             assert!(report.cases.iter().all(|case| {
                 case.lexical_contract == CampaignLexicalCaseSummary::RankEnvelopeOnly
             }));
-            assert!(subject.index_calls.load(Ordering::Relaxed) > 0);
-            assert!(oracle.index_calls.load(Ordering::Relaxed) > 0);
+            assert!(report.engines.has_builtin_profile());
+            assert_eq!(
+                report.engines.subject.implementation,
+                "frankensearch-quill/cass-index"
+            );
+            assert_eq!(
+                report.engines.oracle.config_hash,
+                crate::engine::CASS_TANTIVY_ORACLE_CONFIG_HASH
+            );
         });
     }
 
     #[test]
-    fn provenance_matches_every_engine_toolchain_and_query_pin() {
+    fn stored_provenance_matches_every_engine_toolchain_and_query_pin() {
         let fixture = make_fixture();
         let semantic_contract = semantic_contract();
         let config = CampaignConfig {
@@ -6442,65 +13478,23 @@ mod tests {
             require_provenance: true,
             ..CampaignConfig::default()
         };
-        let subject_revision = "1".repeat(40);
-        let subject = EngineDescriptor {
-            source_revision: subject_revision.clone(),
-            ..subject_descriptor()
-        };
-        let oracle = oracle_descriptor();
-        let mut engines =
-            EnginePairIdentity::new(ComparisonMode::CrossEngine, subject, oracle.clone())
-                .expect("engine identity");
+        let producer_build_identity =
+            GauntletProducerBuildIdentity::compiled().expect("compiled producer");
+        let subject = bind_descriptor_to_compiled_producer(subject_descriptor());
+        let oracle = bind_descriptor_to_compiled_producer(oracle_descriptor());
+        let mut engines = EnginePairIdentity::new(ComparisonMode::CrossEngine, subject, oracle)
+            .expect("engine identity");
         engines
             .bind_semantic_contract(semantic_contract.clone())
             .expect("semantic contract");
-        let provenance = CampaignProvenance {
-            subject_git_revision: subject_revision,
-            subject_source_dirty: false,
-            oracle_git_revision: oracle.source_revision,
-            oracle_source_dirty: oracle.source_dirty,
-            cargo_lock_sha256: hash_workspace_lockfile().expect("Cargo.lock hash"),
-            rustc_version_verbose: collect_rustc_verbose().expect("rustc provenance"),
-            rust_toolchain_channel: collect_dated_toolchain_channel()
-                .expect("dated nightly provenance"),
-            unicode_version: format!(
-                "{}.{}.{}",
-                char::UNICODE_VERSION.0,
-                char::UNICODE_VERSION.1,
-                char::UNICODE_VERSION.2
-            ),
-            unicode_normalization_version: locked_crate_version("unicode-normalization")
-                .expect("locked normalization version"),
-            unicode_normalization_table_version: unicode_normalization_table_version(),
-            query_generator_id: fixture.query_suite.manifest.generator_id.clone(),
-            query_generator_schema_version: fixture.query_suite.manifest.schema_version,
-            query_seed: fixture.query_suite.manifest.spec.seed,
-            query_source_identity_sha256: fixture
-                .query_suite
-                .manifest
-                .source_identity_sha256
-                .clone(),
-            query_profile_sha256: query_profile_sha256(
-                &fixture.query_suite.manifest,
-                &config.selection,
-                &semantic_contract,
-            )
-            .expect("query profile hash"),
-            analyzer_contract_hash: semantic_contract.analyzer_contract_hash.clone(),
-            schema_contract_hash: semantic_contract.schema_contract_hash.clone(),
-            corpus_manifest_hash: fixture
-                .corpus_manifest
-                .manifest_hash()
-                .expect("corpus manifest hash"),
-            query_manifest_hash: fixture
-                .query_suite
-                .manifest
-                .manifest_hash()
-                .expect("query manifest hash"),
-            corpus_seed: Some(0x6200),
-        };
+        let provenance = fixture_provenance(&fixture, &config, &semantic_contract);
+        // Stored-field completeness is independent of whether the build
+        // environment is a Git checkout or an unverified source snapshot.
+        // Creation-only environment admission remains covered by the live
+        // default-profile campaign.
         provenance
-            .validate_for_campaign(
+            .validate_stored(
+                &producer_build_identity,
                 &engines,
                 &semantic_contract,
                 &config,
@@ -6508,13 +13502,13 @@ mod tests {
                 &fixture.query_suite.manifest,
             )
             .expect("all exact provenance pins validate");
+        provenance
+            .validate_creation_environment()
+            .expect("all exact creation-environment pins validate");
 
         let serialized = serde_json::to_value(&provenance).expect("serialize provenance");
         for field in [
-            "subject_git_revision",
-            "subject_source_dirty",
-            "oracle_git_revision",
-            "oracle_source_dirty",
+            "producer_build_identity_sha256",
             "cargo_lock_sha256",
             "rustc_version_verbose",
             "rust_toolchain_channel",
@@ -6544,18 +13538,9 @@ mod tests {
         }
 
         type CorruptProvenance = fn(&mut CampaignProvenance);
-        let corruptions: [(&str, CorruptProvenance); 20] = [
-            ("subject_git_revision", |value| {
-                value.subject_git_revision = "2".repeat(40);
-            }),
-            ("subject_source_dirty", |value| {
-                value.subject_source_dirty = !value.subject_source_dirty;
-            }),
-            ("oracle_git_revision", |value| {
-                value.oracle_git_revision = "3".repeat(40);
-            }),
-            ("oracle_source_dirty", |value| {
-                value.oracle_source_dirty = !value.oracle_source_dirty;
+        let corruptions: [(&str, CorruptProvenance); 17] = [
+            ("producer_build_identity_sha256", |value| {
+                value.producer_build_identity_sha256 = "0".repeat(64);
             }),
             ("cargo_lock_sha256", |value| {
                 value.cargo_lock_sha256 = "0".repeat(64);
@@ -6610,16 +13595,19 @@ mod tests {
         for (field, corrupt) in corruptions {
             let mut mismatched = provenance.clone();
             corrupt(&mut mismatched);
+            let stored_rejected = mismatched
+                .validate_stored(
+                    &producer_build_identity,
+                    &engines,
+                    &semantic_contract,
+                    &config,
+                    &fixture.corpus_manifest,
+                    &fixture.query_suite.manifest,
+                )
+                .is_err();
+            let creation_environment_rejected = mismatched.validate_creation_environment().is_err();
             assert!(
-                mismatched
-                    .validate_for_campaign(
-                        &engines,
-                        &semantic_contract,
-                        &config,
-                        &fixture.corpus_manifest,
-                        &fixture.query_suite.manifest,
-                    )
-                    .is_err(),
+                stored_rejected || creation_environment_rejected,
                 "mismatched provenance field {field} must fail closed"
             );
         }
@@ -6972,6 +13960,11 @@ mod tests {
                 .await
                 .expect("campaign report");
             assert!(report.passed);
+            assert_eq!(report.execution_role, ArtifactExecutionRole::Diagnostic);
+            assert_eq!(
+                report.oracle_dependency,
+                ArtifactOracleDependency::DiagnosticUnspecified
+            );
             assert_eq!(report.selected_query_count, 3);
             assert_eq!(report.cases.len(), 3);
             assert_eq!(
@@ -7026,13 +14019,38 @@ mod tests {
             let replayed: CampaignReport =
                 serde_json::from_slice(&canonical).expect("report round-trip");
             assert_eq!(replayed, report);
-            let verified = ArtifactStore::new(&root)
-                .load_verified_campaign("rich-fast")
+            let reservation_path = root.join("campaigns/rich-fast/reservation.json");
+            let reservation_bytes = std::fs::read(&reservation_path).expect("stored reservation");
+            let reservation_value: serde_json::Value =
+                serde_json::from_slice(&reservation_bytes).expect("decode reservation");
+            assert_eq!(reservation_value["trust_ceiling"], "integrity_only");
+            assert_eq!(reservation_value["execution_role"], "diagnostic");
+            assert_eq!(
+                reservation_value["oracle_dependency"]["kind"],
+                "diagnostic_unspecified"
+            );
+            let integrity_checked = ArtifactStore::new(&root)
+                .load_integrity_checked_campaign("rich-fast")
                 .expect("evidence-backed campaign replay");
-            assert_eq!(verified, report);
+            assert_eq!(integrity_checked.report(), &report);
             ArtifactStore::new(&root)
                 .complete_campaign(&replayed)
                 .expect("idempotent campaign completion");
+            let mut changed_reservation = reservation_value.clone();
+            changed_reservation["execution_role"] = serde_json::json!("built_in_execution");
+            std::fs::write(
+                &reservation_path,
+                serde_json::to_vec(&changed_reservation).expect("changed reservation"),
+            )
+            .expect("write changed reservation");
+            assert!(
+                ArtifactStore::new(&root)
+                    .load_integrity_checked_campaign("rich-fast")
+                    .is_err(),
+                "reservation role changes must invalidate integrity-checked replay"
+            );
+            std::fs::write(&reservation_path, &reservation_bytes)
+                .expect("restore reservation bytes");
             let mut with_diagnostic = report.clone();
             with_diagnostic.cases[0].diagnostic = Some("/tmp/host-specific error".to_owned());
             assert_eq!(
@@ -7043,25 +14061,143 @@ mod tests {
             let mut wrong_pass = report.clone();
             wrong_pass.passed = false;
             assert!(wrong_pass.canonical_bytes().is_err());
+            let mut split_semantics = report.clone();
+            split_semantics.engines.semantic_contract = Some(SemanticContract::scalar_g1a());
+            assert!(
+                split_semantics.validate_contract().is_err(),
+                "report and engine-pair semantic contracts must remain identical"
+            );
             let mut wrong_count = report.clone();
             wrong_count.selected_query_count += 1;
             assert!(wrong_count.canonical_bytes().is_err());
             let mut wrong_summary = report.clone();
             wrong_summary.query_classes[0].total += 1;
             assert!(wrong_summary.canonical_bytes().is_err());
-            for legacy_version in [3, 4] {
+            for legacy_version in 1..=6 {
                 let mut legacy = report.clone();
                 legacy.schema_version = legacy_version;
                 let error = legacy
                     .validate_contract()
-                    .expect_err("pre-v5 report must require a campaign rerun");
-                assert!(matches!(
-                    error,
-                    GauntletError::InvalidCampaign { ref reason }
-                        if reason.contains("legacy campaign report")
-                            && reason.contains("non-admissible")
-                            && reason.contains("rerun")
-                ));
+                    .expect_err("pre-v7 report must require a campaign rerun");
+                let GauntletError::InvalidCampaign { reason } = error else {
+                    panic!("historical report must fail as an explicit campaign contract");
+                };
+                match legacy_version {
+                    1 | 2 | 3 | 5 => {
+                        assert!(reason.contains("unauthenticated legacy"));
+                        assert!(reason.contains("non-admissible"));
+                    }
+                    4 => assert!(reason.contains("reserved pre-policy")),
+                    6 => assert!(reason.contains("integrity only")),
+                    _ => unreachable!(),
+                }
+                assert!(reason.contains("rerun"));
+            }
+            let mut missing_role = report.clone();
+            missing_role.execution_role = ArtifactExecutionRole::LegacyMissing;
+            assert!(
+                missing_role.validate_contract().is_err(),
+                "v7 reports must fail closed when the durable role is absent"
+            );
+            let mut promoted_diagnostic = report.clone();
+            promoted_diagnostic.execution_role = ArtifactExecutionRole::BuiltInExecution;
+            assert!(
+                promoted_diagnostic.validate_contract().is_err(),
+                "changing only the report role cannot promote diagnostic artifacts"
+            );
+            let mut diagnostic_with_provenance = report.clone();
+            diagnostic_with_provenance.provenance = Some(fixture_provenance(
+                &fixture,
+                &report.config,
+                &report.semantic_contract,
+            ));
+            assert!(
+                diagnostic_with_provenance.validate_contract().is_err(),
+                "diagnostics cannot borrow a production provenance envelope"
+            );
+            let mut archived_producer = report.clone();
+            let replacement = if archived_producer
+                .producer_build_identity
+                .executable_sha256
+                .starts_with('0')
+            {
+                "1"
+            } else {
+                "0"
+            };
+            archived_producer
+                .producer_build_identity
+                .executable_sha256
+                .replace_range(0..1, replacement);
+            archived_producer
+                .validate_contract()
+                .expect("stored diagnostic validation must not consult the current executable");
+            assert!(
+                archived_producer.validate_creation_environment().is_err(),
+                "new campaign completion must remain bound to the executing producer"
+            );
+            let mut report_with_unknown = serde_json::to_value(&report).expect("report value");
+            report_with_unknown
+                .as_object_mut()
+                .expect("report object")
+                .insert("future_unbound_field".to_owned(), serde_json::json!(true));
+            assert!(
+                serde_json::from_value::<CampaignReport>(report_with_unknown).is_err(),
+                "unknown v7 report fields must fail closed instead of escaping the hash contract"
+            );
+            for path in [
+                "/config",
+                "/config/comparator_config",
+                "/config/selection",
+                "/semantic_contract",
+                "/producer_build_identity",
+                "/oracle_dependency",
+                "/engines",
+                "/engines/subject",
+                "/engines/oracle",
+                "/engines/semantic_contract",
+                "/divergence_registry",
+                "/corpus_manifest",
+                "/corpus_manifest/source",
+                "/corpus_manifest/source/spec",
+                "/query_suite",
+                "/query_suite/manifest",
+                "/query_suite/manifest/spec",
+                "/query_suite/cases/0",
+                "/query_suite/cases/0/query_kind",
+                "/query_suite/cases/0/filters",
+                "/query_suite/cases/0/filters/source_filter",
+                "/subject_index",
+                "/oracle_index",
+                "/cases/0",
+                "/query_classes/0",
+                "/mismatches/0",
+                "/mismatches/0/divergence",
+                "/lexical_coverage",
+            ] {
+                let mut nested_unknown = serde_json::to_value(&report).expect("report value");
+                nested_unknown
+                    .pointer_mut(path)
+                    .and_then(serde_json::Value::as_object_mut)
+                    .expect("nested report object")
+                    .insert("future_unbound_field".to_owned(), serde_json::json!(true));
+                assert!(
+                    serde_json::from_value::<CampaignReport>(nested_unknown).is_err(),
+                    "unknown field at {path} must fail closed"
+                );
+            }
+            for missing_field in ["trust_ceiling", "execution_role", "oracle_dependency"] {
+                let mut missing = serde_json::to_value(&report).expect("report value");
+                missing
+                    .as_object_mut()
+                    .expect("report object")
+                    .remove(missing_field);
+                let decoded: CampaignReport =
+                    serde_json::from_value(missing).expect("legacy default decodes");
+                assert!(
+                    decoded.validate_contract().is_err(),
+                    "missing {missing_field} must never validate as v7"
+                );
             }
             let mut changed_query = report.clone();
             changed_query.query_suite.cases[0]
@@ -7368,6 +14504,1107 @@ mod tests {
         )
         .expect("captured Quill trace is UTF-8");
         assert_scalar_g1a_trace_contract(&logs);
+    }
+
+    #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
+    #[test]
+    fn salej_runtime_identity_rejects_revision_or_dirty_state_rewrites() {
+        assert!(
+            reject_union_horizon_oracle_identity_overrides(
+                Some(std::ffi::OsStr::new(
+                    "062a5e5b2d41653b1c8b07888eda1a765e421f49"
+                )),
+                None,
+            )
+            .is_err(),
+            "Salej must reject obsolete per-oracle provenance inputs before execution",
+        );
+        let compiled = union_horizon_build_identity();
+        #[cfg(target_os = "linux")]
+        let executable_path = std::path::PathBuf::from("/proc/self/exe");
+        #[cfg(not(target_os = "linux"))]
+        let executable_path =
+            std::env::current_exe().expect("resolve independently hashed test executable path");
+        let mut executable = std::fs::File::open(&executable_path)
+            .unwrap_or_else(|error| panic!("open independently hashed test executable: {error}"));
+        let mut independent_hasher = Sha256::new();
+        let mut independent_len = 0_u64;
+        let mut independent_buffer = vec![0_u8; 17 * 1024 + 3].into_boxed_slice();
+        loop {
+            let read = executable
+                .read(&mut independent_buffer)
+                .expect("independently stream test executable");
+            if read == 0 {
+                break;
+            }
+            independent_hasher.update(&independent_buffer[..read]);
+            independent_len = independent_len
+                .checked_add(u64::try_from(read).expect("independent read length fits u64"))
+                .expect("independent executable length cannot overflow u64");
+        }
+        assert_eq!(
+            compiled.test_executable_sha256,
+            lower_hex(&independent_hasher.finalize()),
+            "streamed executable identity must match an independent chunking strategy",
+        );
+        assert_eq!(compiled.test_executable_byte_len, independent_len);
+
+        let mut embedded = compiled.clone();
+        embedded.source_git_revision = "a".repeat(40);
+        embedded.source_git_dirty = true;
+        embedded.source_verification = UnionHorizonSourceVerification::ExplicitUnverified;
+        assert!(validate_union_horizon_runtime_identity_override(&embedded, None, None).is_ok());
+        assert!(
+            validate_union_horizon_runtime_identity_override(
+                &embedded,
+                Some(&embedded.source_git_revision),
+                Some("true"),
+            )
+            .is_ok()
+        );
+        for (revision, dirty) in [
+            (Some(embedded.source_git_revision.as_str()), None),
+            (None, Some("true")),
+            (
+                Some("cccccccccccccccccccccccccccccccccccccccc"),
+                Some("true"),
+            ),
+            (Some(embedded.source_git_revision.as_str()), Some("false")),
+            (Some(embedded.source_git_revision.as_str()), Some("0")),
+        ] {
+            assert!(
+                validate_union_horizon_runtime_identity_override(&embedded, revision, dirty)
+                    .is_err(),
+                "runtime identity rewrite unexpectedly passed: revision={revision:?} dirty={dirty:?}",
+            );
+        }
+    }
+
+    #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
+    #[test]
+    fn salej_diagnostic_source_identity_accepts_degraded_provenance_without_upgrading_it() {
+        let mut identity = union_horizon_build_identity();
+        identity.source_git_revision = "a".repeat(40);
+        for verification in [
+            UnionHorizonSourceVerification::GitCheckoutVerified,
+            UnionHorizonSourceVerification::ExplicitUnverified,
+        ] {
+            identity.source_verification = verification;
+            for dirty in [false, true] {
+                identity.source_git_dirty = dirty;
+                assert!(
+                    union_horizon_diagnostic_source_identity_is_well_formed(&identity),
+                    "{verification:?} dirty={dirty} must remain a recordable diagnostic identity",
+                );
+            }
+        }
+
+        identity.source_verification = UnionHorizonSourceVerification::Unavailable;
+        identity.source_git_revision = "unavailable".to_owned();
+        identity.source_git_dirty = true;
+        assert!(
+            union_horizon_diagnostic_source_identity_is_well_formed(&identity),
+            "the conservative unavailable sentinel must remain recordable as a diagnostic",
+        );
+        identity.source_git_dirty = false;
+        assert!(
+            !union_horizon_diagnostic_source_identity_is_well_formed(&identity),
+            "unavailable source provenance must retain conservative dirty=true",
+        );
+        identity.source_git_dirty = true;
+        identity.source_git_revision = "b".repeat(40);
+        assert!(
+            !union_horizon_diagnostic_source_identity_is_well_formed(&identity),
+            "unavailable verification cannot carry a fabricated revision",
+        );
+        for verification in [
+            UnionHorizonSourceVerification::GitCheckoutVerified,
+            UnionHorizonSourceVerification::ExplicitUnverified,
+        ] {
+            identity.source_verification = verification;
+            identity.source_git_revision = "unavailable".to_owned();
+            assert!(
+                !union_horizon_diagnostic_source_identity_is_well_formed(&identity),
+                "{verification:?} cannot carry the unavailable sentinel",
+            );
+            identity.source_git_revision = "A".repeat(40);
+            assert!(
+                !union_horizon_diagnostic_source_identity_is_well_formed(&identity),
+                "{verification:?} must reject noncanonical uppercase revisions",
+            );
+            identity.source_git_revision = "a".repeat(39);
+            assert!(
+                !union_horizon_diagnostic_source_identity_is_well_formed(&identity),
+                "{verification:?} must reject malformed revision lengths",
+            );
+        }
+    }
+
+    #[cfg(all(
+        feature = "tantivy-oracle",
+        feature = "pruning-conformance",
+        any(
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "tvos",
+            target_os = "watchos"
+        )
+    ))]
+    #[test]
+    fn salej_union_horizon_publication_never_replaces_an_existing_artifact() {
+        let root = tempfile::tempdir()
+            .expect("create UNION_HORIZON no-replace test directory")
+            .keep();
+        let first_temporary = std::ffi::OsStr::new(".tmp-first.json");
+        let second_temporary = std::ffi::OsStr::new(".tmp-second.json");
+        let target_name = std::ffi::OsStr::new("sealed.json");
+        let directory = crate::artifact::PinnedDirectory::ensure_path(&root)
+            .expect("pin no-replace test directory");
+        directory
+            .publish_unique_no_clobber(first_temporary, target_name, b"sealed")
+            .expect("publish initial sealed artifact");
+
+        assert!(
+            directory
+                .publish_unique_no_clobber(second_temporary, target_name, b"candidate")
+                .is_err(),
+            "UNION_HORIZON publication must fail when the destination already exists",
+        );
+        assert_eq!(
+            directory
+                .read_regular_bounded(target_name, 6)
+                .expect("read preserved no-replace target"),
+            b"sealed",
+        );
+        assert_eq!(
+            directory
+                .entry_names(4)
+                .expect("list pinned no-replace directory"),
+            std::iter::once(std::ffi::OsString::from(target_name)).collect(),
+            "failed no-replace publication must not create a staging entry",
+        );
+    }
+
+    #[cfg(all(
+        feature = "tantivy-oracle",
+        feature = "pruning-conformance",
+        any(target_os = "linux", target_os = "macos")
+    ))]
+    #[test]
+    fn salej_union_horizon_publication_rejects_symlinks_and_survives_root_swap() {
+        use std::os::unix::fs::symlink;
+
+        let parent = tempfile::tempdir().expect("create pinned-directory test parent");
+        let real = parent.path().join("real");
+        let decoy = parent.path().join("decoy");
+        std::fs::create_dir(&real).expect("create real diagnostic root");
+        std::fs::create_dir(&decoy).expect("create decoy diagnostic root");
+
+        let ancestor_link = parent.path().join("ancestor-link");
+        symlink(&real, &ancestor_link).expect("create hostile ancestor symlink");
+        assert!(
+            crate::artifact::PinnedDirectory::ensure_path(&ancestor_link.join("child")).is_err(),
+            "artifact roots must reject ancestor symlinks",
+        );
+        let final_target = real.join("final-target");
+        std::fs::create_dir(&final_target).expect("create final symlink target");
+        let final_link = real.join("final-link");
+        symlink(&final_target, &final_link).expect("create hostile final symlink");
+        assert!(
+            crate::artifact::PinnedDirectory::ensure_path(&final_link).is_err(),
+            "artifact roots must reject final-component symlinks",
+        );
+
+        let directory =
+            crate::artifact::PinnedDirectory::ensure_path(&real).expect("pin real diagnostic root");
+        let moved = parent.path().join("moved-real");
+        std::fs::rename(&real, &moved).expect("move pinned root away from ambient path");
+        std::fs::rename(&decoy, &real).expect("replace ambient root with decoy");
+        let temporary_name = std::ffi::OsStr::new(".tmp-root-swap.json");
+        let target_name = std::ffi::OsStr::new("sealed.json");
+        directory
+            .publish_unique_no_clobber(temporary_name, target_name, b"descriptor-bound")
+            .expect("publish through the retained directory descriptor");
+        assert_eq!(
+            directory
+                .read_regular_bounded(target_name, 16)
+                .expect("reread through retained directory descriptor"),
+            b"descriptor-bound",
+        );
+        assert!(
+            !real.join(target_name).exists(),
+            "ambient replacement root must not receive the sealed artifact",
+        );
+        assert_eq!(
+            std::fs::read(moved.join(target_name)).expect("read descriptor-bound path witness"),
+            b"descriptor-bound",
+        );
+
+        let external = parent.path().join("external.json");
+        std::fs::write(&external, b"hostile").expect("write hostile symlink target");
+        let symlink_name = std::ffi::OsStr::new("symlink.json");
+        symlink(&external, moved.join(symlink_name)).expect("create hostile diagnostic symlink");
+        assert!(
+            directory.read_regular_bounded(symlink_name, 16).is_err(),
+            "artifact reread must require a regular no-follow file",
+        );
+    }
+
+    #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
+    #[test]
+    fn salej_union_horizon_offset_page_matches_control_with_real_tombstones() {
+        let fixture = make_union_horizon_fixture();
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let (subject, oracle) =
+                build_tombstoned_union_horizon_single_segment_pair(&cx, &fixture).await;
+            let harness = crate::engine::DifferentialHarness::new(
+                ComparisonMode::CrossEngine,
+                ComparatorConfig::default(),
+            );
+            let control_case =
+                tombstoned_union_horizon_case(&fixture, "union-horizon-tombstones-k27", 27, 0);
+            let page_case = tombstoned_union_horizon_case(
+                &fixture,
+                "union-horizon-tombstones-offset7-k20",
+                20,
+                7,
+            );
+            let mut control = harness
+                .run(&cx, &subject, &oracle, &control_case)
+                .await
+                .expect("run tombstoned UNION_HORIZON control");
+            let mut page = harness
+                .run(&cx, &subject, &oracle, &page_case)
+                .await
+                .expect("run tombstoned UNION_HORIZON offset page");
+            control
+                .engines
+                .bind_semantic_contract(SemanticContract::scalar_g1a())
+                .expect("bind tombstoned UNION_HORIZON control contract");
+            page.engines
+                .bind_semantic_contract(SemanticContract::scalar_g1a())
+                .expect("bind tombstoned UNION_HORIZON page contract");
+
+            for run in [&control, &page] {
+                assert_eq!(run.comparison.status, ComparisonStatus::Exact);
+                assert_eq!(run.comparison.rank_class, RankClass::RankExact);
+                assert!(run.comparison.divergences.is_empty());
+                assert_eq!(run.comparison.subject.match_count, CountState::NotRequested);
+                assert_eq!(run.comparison.oracle.match_count, CountState::NotRequested);
+                assert_eq!(run.comparison.subject.doc_count, 8_995);
+                assert_eq!(run.comparison.oracle.doc_count, 8_995);
+                assert!(run.comparison.subject.snippets.is_empty());
+                assert!(run.comparison.oracle.snippets.is_empty());
+            }
+
+            let control_subject_rows = control
+                .comparison
+                .subject
+                .hits
+                .iter()
+                .map(|hit| (hit.doc_id.clone(), hit.score_bits))
+                .collect::<Vec<_>>();
+            let control_oracle_rows = control
+                .comparison
+                .oracle
+                .hits
+                .iter()
+                .map(|hit| (hit.doc_id.clone(), hit.score_bits))
+                .collect::<Vec<_>>();
+            let page_subject_rows = page
+                .comparison
+                .subject
+                .hits
+                .iter()
+                .map(|hit| (hit.doc_id.clone(), hit.score_bits))
+                .collect::<Vec<_>>();
+            let page_oracle_rows = page
+                .comparison
+                .oracle
+                .hits
+                .iter()
+                .map(|hit| (hit.doc_id.clone(), hit.score_bits))
+                .collect::<Vec<_>>();
+            assert_eq!(control_subject_rows, control_oracle_rows);
+            assert_eq!(page_subject_rows, page_oracle_rows);
+            assert_eq!(control_subject_rows.len(), 27);
+            assert_eq!(page_subject_rows.len(), 20);
+            assert_eq!(page_subject_rows, control_subject_rows[7..27]);
+            assert_eq!(control_subject_rows[0].0, "repo:docs/09000.txt");
+            assert_eq!(
+                page_subject_rows
+                    .iter()
+                    .map(|(document_id, _)| document_id.clone())
+                    .collect::<Vec<_>>(),
+                (73..=92)
+                    .rev()
+                    .map(|ordinal| format!("repo:docs/{ordinal:05}.txt"))
+                    .collect::<Vec<_>>(),
+            );
+
+            let tombstone_document_ids = union_horizon_tombstone_document_ids(&fixture);
+            for rows in [
+                &control_subject_rows,
+                &control_oracle_rows,
+                &page_subject_rows,
+                &page_oracle_rows,
+            ] {
+                assert!(
+                    rows.iter()
+                        .all(|(document_id, _)| { !tombstone_document_ids.contains(document_id) })
+                );
+            }
+
+            let index = subject
+                .index()
+                .expect("tombstoned UNION_HORIZON Quill index");
+            let direct = index
+                .search_paginated(&cx, UNION_HORIZON_QUERY, 20, 7, false)
+                .expect("direct tombstoned UNION_HORIZON offset page");
+            let (traced, trace) = index
+                .search_paginated_with_conformance_pruning_trace(
+                    &cx,
+                    UNION_HORIZON_QUERY,
+                    20,
+                    7,
+                    false,
+                )
+                .expect("traced tombstoned UNION_HORIZON offset page");
+            assert_eq!(direct, traced);
+            assert_eq!(traced.doc_count, 8_995);
+            assert_eq!(traced.total_count, None);
+            assert!(traced.diagnostics.is_empty());
+            assert_eq!(
+                traced
+                    .hits
+                    .iter()
+                    .map(|hit| (hit.document_id.clone(), hit.score.to_bits()))
+                    .collect::<Vec<_>>(),
+                page_subject_rows,
+            );
+            assert_eq!(
+                trace.execution_mode(),
+                frankensearch_quill::ConformancePruningExecutionMode::Serial,
+            );
+            let late_trace = union_horizon_late_trace_receipt(20, 0, 8_995, trace.segments());
+            assert_eq!(late_trace.refills[0].window_start(), 0);
+            assert_eq!(late_trace.refills[1].window_start(), 4_096);
+            assert_eq!(late_trace.refills[2].window_start(), 8_192);
+        });
+    }
+
+    #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
+    #[test]
+    fn salej_union_horizon_cancellation_at_final_collection_checkpoint_is_atomic() {
+        let fixture = make_union_horizon_fixture();
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let (subject, _oracle) =
+                build_tombstoned_union_horizon_single_segment_pair(&cx, &fixture).await;
+            let index = subject
+                .index()
+                .expect("cancellation UNION_HORIZON Quill index");
+            let controller = index.conformance_cancellation_controller();
+            let snapshot_before = index.snapshot();
+            let writer_before = index
+                .conformance_pending_writer_state()
+                .expect("capture cancellation UNION_HORIZON writer state");
+            assert!(!index.has_uncommitted_changes());
+
+            controller
+                .arm(
+                    frankensearch_quill::index::ConformanceCancellationStage::QueryCollection,
+                    u64::MAX,
+                )
+                .expect("arm UNION_HORIZON checkpoint calibration");
+            let (control_result, control_trace) = index
+                .search_paginated_with_conformance_pruning_trace(
+                    &cx,
+                    UNION_HORIZON_QUERY,
+                    1,
+                    0,
+                    false,
+                )
+                .expect("calibrate UNION_HORIZON collection checkpoints");
+            let control_checkpoints = controller.observed_checkpoints();
+            assert!(control_checkpoints > 3);
+            assert!(!controller.fired());
+            assert_eq!(controller.recorded_pruning_receipts_at_fire(), 0);
+            assert_eq!(controller.discarded_pruning_trace_sessions(), 0);
+            assert_eq!(control_result.hits.len(), 1);
+            assert_eq!(control_result.hits[0].document_id, "repo:docs/09000.txt");
+            let control_late_trace =
+                union_horizon_late_trace_receipt(1, 0, 8_995, control_trace.segments());
+            assert_eq!(control_late_trace.refills.len(), 3);
+            assert_eq!(
+                control_late_trace.refills[2].candidate_docs(),
+                1,
+                "the final collection checkpoint belongs to the only admitted candidate in the late refill",
+            );
+            controller.disarm();
+
+            for attempt in 1..=2 {
+                controller
+                    .arm(
+                        frankensearch_quill::index::ConformanceCancellationStage::QueryCollection,
+                        control_checkpoints,
+                    )
+                    .expect("arm final UNION_HORIZON collection checkpoint");
+                let error = index
+                    .search_paginated_with_conformance_pruning_trace(
+                        &cx,
+                        UNION_HORIZON_QUERY,
+                        1,
+                        0,
+                        false,
+                    )
+                    .expect_err("final UNION_HORIZON collection checkpoint must cancel");
+                assert!(matches!(
+                    error,
+                    frankensearch_quill::QuillIndexError::Cancelled { phase: "search" }
+                ));
+                assert!(controller.fired());
+                assert_eq!(controller.observed_checkpoints(), control_checkpoints);
+                assert_eq!(controller.recorded_pruning_receipts_at_fire(), 0);
+                assert_eq!(controller.discarded_pruning_trace_sessions(), 0);
+                assert!(cx.is_cancel_requested());
+                assert!(Arc::ptr_eq(&snapshot_before, &index.snapshot()));
+                assert_eq!(
+                    index
+                        .conformance_pending_writer_state()
+                        .expect("capture cancelled UNION_HORIZON writer state"),
+                    writer_before,
+                );
+                assert!(!index.has_uncommitted_changes());
+                controller.disarm();
+                cx.set_cancel_requested(false);
+                assert!(
+                    !cx.is_cancel_requested(),
+                    "UNION_HORIZON cancellation attempt {attempt} must clear the real Cx before replay",
+                );
+            }
+
+            let (retry_result, retry_trace) = index
+                .search_paginated_with_conformance_pruning_trace(
+                    &cx,
+                    UNION_HORIZON_QUERY,
+                    1,
+                    0,
+                    false,
+                )
+                .expect("clean UNION_HORIZON replay after cancellation");
+            assert_eq!(retry_result, control_result);
+            assert_eq!(retry_trace, control_trace);
+            assert!(Arc::ptr_eq(&snapshot_before, &index.snapshot()));
+            assert_eq!(
+                index
+                    .conformance_pending_writer_state()
+                    .expect("capture replayed UNION_HORIZON writer state"),
+                writer_before,
+            );
+            assert!(!index.has_uncommitted_changes());
+        });
+    }
+
+    #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
+    #[test]
+    fn salej_union_horizon_minimum_fuel_boundary_is_atomic_and_deterministic() {
+        let fixture = make_union_horizon_fixture();
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let (subject, _oracle) =
+                build_tombstoned_union_horizon_single_segment_pair(&cx, &fixture).await;
+            let index = subject.index().expect("fuel UNION_HORIZON Quill index");
+            let source_snapshot = index.snapshot();
+            let (control_result, control_trace) = index
+                .search_paginated_with_conformance_pruning_trace(
+                    &cx,
+                    UNION_HORIZON_QUERY,
+                    1,
+                    0,
+                    false,
+                )
+                .expect("unbounded UNION_HORIZON fuel control");
+            assert_eq!(control_result.hits.len(), 1);
+            assert_eq!(control_result.hits[0].document_id, "repo:docs/09000.txt");
+            union_horizon_late_trace_receipt(1, 0, 8_995, control_trace.segments());
+
+            let mut successful_budget = 1_u64;
+            loop {
+                match run_tombstoned_union_horizon_with_fuel(
+                    &cx,
+                    source_snapshot.as_ref(),
+                    successful_budget,
+                ) {
+                    Ok(_) => break,
+                    Err(
+                        error @ frankensearch_quill::QuillIndexError::QueryFuelExhausted { .. },
+                    ) => {
+                        let diagnostics = union_horizon_fuel_diagnostics(&error);
+                        assert_eq!(diagnostics.0, successful_budget);
+                        assert_eq!(diagnostics.1, successful_budget);
+                        successful_budget = successful_budget
+                            .checked_mul(2)
+                            .expect("UNION_HORIZON fuel calibration budget overflow");
+                    }
+                    Err(error) => panic!(
+                        "unexpected UNION_HORIZON fuel calibration failure at budget {successful_budget}: {error:?}"
+                    ),
+                }
+            }
+            let mut lower = 1_u64;
+            while lower < successful_budget {
+                let midpoint = lower + (successful_budget - lower) / 2;
+                match run_tombstoned_union_horizon_with_fuel(
+                    &cx,
+                    source_snapshot.as_ref(),
+                    midpoint,
+                ) {
+                    Ok(_) => successful_budget = midpoint,
+                    Err(
+                        error @ frankensearch_quill::QuillIndexError::QueryFuelExhausted { .. },
+                    ) => {
+                        let diagnostics = union_horizon_fuel_diagnostics(&error);
+                        assert_eq!(diagnostics.0, midpoint);
+                        assert_eq!(diagnostics.1, midpoint);
+                        lower = midpoint + 1;
+                    }
+                    Err(error) => panic!(
+                        "unexpected UNION_HORIZON fuel bisection failure at budget {midpoint}: {error:?}"
+                    ),
+                }
+            }
+            let minimum_successful_budget = successful_budget;
+            assert_eq!(minimum_successful_budget, lower);
+            assert!(minimum_successful_budget > 1);
+            let failing_budget = minimum_successful_budget - 1;
+
+            let mut failing_config = union_horizon_quill_config();
+            failing_config.query_fuel_budget = failing_budget;
+            let failing_index = frankensearch_quill::QuillIndex::from_in_memory_snapshot(
+                source_snapshot.as_ref().clone(),
+                failing_config,
+            )
+            .expect("bind UNION_HORIZON failing fuel snapshot");
+            let failing_snapshot_before = failing_index.snapshot();
+            let failing_writer_before = failing_index
+                .conformance_pending_writer_state()
+                .expect("capture UNION_HORIZON failing fuel writer state");
+            assert!(!failing_index.has_uncommitted_changes());
+
+            let first_error = failing_index
+                .search_paginated_with_conformance_pruning_trace(
+                    &cx,
+                    UNION_HORIZON_QUERY,
+                    1,
+                    0,
+                    false,
+                )
+                .expect_err("N-1 UNION_HORIZON fuel must fail without a receipt");
+            let first_diagnostics = union_horizon_fuel_diagnostics(&first_error);
+            assert_eq!(first_diagnostics.0, failing_budget);
+            assert_eq!(first_diagnostics.1, failing_budget);
+            assert!(Arc::ptr_eq(
+                &failing_snapshot_before,
+                &failing_index.snapshot(),
+            ));
+            assert_eq!(
+                failing_index
+                    .conformance_pending_writer_state()
+                    .expect("capture first exhausted UNION_HORIZON writer state"),
+                failing_writer_before,
+            );
+            assert!(!failing_index.has_uncommitted_changes());
+
+            let second_error = failing_index
+                .search_paginated_with_conformance_pruning_trace(
+                    &cx,
+                    UNION_HORIZON_QUERY,
+                    1,
+                    0,
+                    false,
+                )
+                .expect_err("repeated N-1 UNION_HORIZON fuel must fail without a receipt");
+            let second_diagnostics = union_horizon_fuel_diagnostics(&second_error);
+            assert_eq!(second_diagnostics, first_diagnostics);
+            assert!(Arc::ptr_eq(
+                &failing_snapshot_before,
+                &failing_index.snapshot(),
+            ));
+            assert_eq!(
+                failing_index
+                    .conformance_pending_writer_state()
+                    .expect("capture repeated exhausted UNION_HORIZON writer state"),
+                failing_writer_before,
+            );
+            assert!(!failing_index.has_uncommitted_changes());
+
+            let (minimum_result, minimum_trace) = run_tombstoned_union_horizon_with_fuel(
+                &cx,
+                source_snapshot.as_ref(),
+                minimum_successful_budget,
+            )
+            .expect("minimum successful UNION_HORIZON fuel replay");
+            assert_eq!(minimum_result, control_result);
+            assert_eq!(minimum_trace, control_trace);
+            union_horizon_late_trace_receipt(1, 0, 8_995, minimum_trace.segments());
+        });
+    }
+
+    #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
+    #[test]
+    fn salej_union_horizon_late_winner_matches_tantivy_across_fresh_segment_shapes() {
+        let fixture = make_union_horizon_fixture();
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let artifact =
+                run_union_horizon_layout_matrix(&cx, &fixture, UnionHorizonProofKind::LateWinner)
+                    .await;
+            artifact.verify();
+
+            let mut stale_seal = artifact.clone();
+            stale_seal.artifact_sha256 = "0".repeat(64);
+            assert!(
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| stale_seal.verify()))
+                    .is_err(),
+                "UNION_HORIZON stale semantic seal must fail on an otherwise valid artifact",
+            );
+
+            assert_union_horizon_artifact_rejected(&artifact, |tampered| {
+                tampered.proofs[0].comparisons[0].engines.semantic_contract = None;
+            });
+            assert_union_horizon_artifact_rejected(&artifact, |tampered| {
+                tampered.proofs[0].comparisons[0]
+                    .engines
+                    .subject
+                    .crate_version = "0.0.0".to_owned();
+            });
+            assert_union_horizon_artifact_rejected(&artifact, |tampered| {
+                tampered.proofs[0].comparisons[0]
+                    .engines
+                    .subject
+                    .config_hash = "alternate-fanout".to_owned();
+            });
+            assert_union_horizon_artifact_rejected(&artifact, |tampered| {
+                tampered.proofs[0].build_identity.test_executable_sha256 = "0".repeat(64);
+            });
+            assert_union_horizon_artifact_rejected(&artifact, |tampered| {
+                tampered.proofs[0].build_identity.test_executable_byte_len += 1;
+            });
+            assert_union_horizon_artifact_rejected(&artifact, |tampered| {
+                tampered.proofs[0]
+                    .build_identity
+                    .rustc_version_verbose
+                    .push_str("hostile compiler rewrite");
+            });
+            assert_union_horizon_artifact_rejected(&artifact, |tampered| {
+                tampered.proofs[0].build_identity.target_triple = "unknown-target".to_owned();
+            });
+            assert_union_horizon_artifact_rejected(&artifact, |tampered| {
+                tampered.proofs[0].build_identity.cargo_profile = "hostile".to_owned();
+            });
+            assert_union_horizon_artifact_rejected(&artifact, |tampered| {
+                let identity = &mut tampered.proofs[0].build_identity;
+                identity.enabled_features.push("hostile_feature".to_owned());
+                identity.enabled_features.sort();
+                identity.enabled_features_sha256 =
+                    sha256_hex(identity.enabled_features.join("\n").as_bytes());
+            });
+            assert_union_horizon_artifact_rejected(&artifact, |tampered| {
+                let source_verification =
+                    &mut tampered.proofs[0].build_identity.source_verification;
+                *source_verification = match source_verification {
+                    UnionHorizonSourceVerification::GitCheckoutVerified => {
+                        UnionHorizonSourceVerification::ExplicitUnverified
+                    }
+                    UnionHorizonSourceVerification::ExplicitUnverified
+                    | UnionHorizonSourceVerification::Unavailable => {
+                        UnionHorizonSourceVerification::GitCheckoutVerified
+                    }
+                };
+            });
+            assert_union_horizon_artifact_rejected(&artifact, |tampered| {
+                tampered.proofs[0].comparisons[0].case.metadata.corpus_hash = Some("d".repeat(64));
+            });
+            assert_union_horizon_artifact_rejected(&artifact, |tampered| {
+                let run = &mut tampered.proofs[0].comparisons[0];
+                run.comparison.subject.doc_count = 42;
+                run.comparison.oracle.doc_count = 42;
+            });
+            assert_union_horizon_artifact_rejected(&artifact, |tampered| {
+                tampered.proofs[0].traced_results[0].hits[0].global_docid = 8_999;
+            });
+            assert_union_horizon_artifact_rejected(&artifact, |tampered| {
+                let run = &mut tampered.proofs[0].comparisons[1];
+                let (first, remaining) = run.comparison.subject.hits.split_at_mut(1);
+                std::mem::swap(&mut first[0].doc_id, &mut remaining[0].doc_id);
+                std::mem::swap(
+                    &mut first[0].native_tie_key,
+                    &mut remaining[0].native_tie_key,
+                );
+                run.comparison = compare_observations(
+                    run.comparison.subject.clone(),
+                    run.comparison.oracle.clone(),
+                    run.comparator_config,
+                )
+                .expect("recompute hostile UNION_HORIZON rank mismatch");
+            });
+            assert_union_horizon_artifact_rejected(&artifact, |tampered| {
+                tampered.proofs[1].topology.tantivy_segments[0].max_doc += 1;
+            });
+            assert_union_horizon_artifact_rejected(&artifact, |tampered| {
+                let NativeTieKey::QuillDocId { doc_id } =
+                    &mut tampered.proofs[0].comparisons[0].comparison.subject.hits[0]
+                        .native_tie_key
+                else {
+                    panic!("UNION_HORIZON hostile fixture lost its Quill native key")
+                };
+                *doc_id += 1;
+            });
+            assert_union_horizon_artifact_rejected(&artifact, |tampered| {
+                let mut trace =
+                    serde_json::to_value(&tampered.proofs[2].complete_pruning_traces[0])
+                        .expect("encode hostile UNION_HORIZON non-target trace");
+                trace["segments"][0]["refills"][0]["candidate_docs"] =
+                    serde_json::Value::from(0_u64);
+                tampered.proofs[2].complete_pruning_traces[0] = serde_json::from_value(trace)
+                    .expect("decode hostile UNION_HORIZON non-target trace");
+            });
+            assert_union_horizon_artifact_rejected(&artifact, |tampered| {
+                let forged_revision = "c".repeat(40);
+                for proof in &mut tampered.proofs {
+                    for run in &mut proof.comparisons {
+                        run.engines
+                            .subject
+                            .source_revision
+                            .clone_from(&forged_revision);
+                        run.engines
+                            .oracle
+                            .source_revision
+                            .clone_from(&forged_revision);
+                    }
+                }
+            });
+            assert_union_horizon_artifact_rejected(&artifact, |tampered| {
+                let producer_revision = tampered.proofs[0]
+                    .build_identity
+                    .source_git_revision
+                    .clone();
+                tampered.proofs[0].comparisons[0]
+                    .engines
+                    .oracle
+                    .source_revision = producer_revision;
+            });
+            assert_union_horizon_artifact_rejected(&artifact, |tampered| {
+                tampered.proofs[0].comparisons[0]
+                    .engines
+                    .oracle
+                    .source_dirty = true;
+            });
+            assert_union_horizon_artifact_rejected(&artifact, |tampered| {
+                tampered.proofs[0].oracle_dependency.tantivy_version = "0.0.0".to_owned();
+            });
+            assert_union_horizon_artifact_rejected(&artifact, |tampered| {
+                tampered.proofs[0].oracle_dependency.tantivy_checksum_sha256 = "0".repeat(64);
+            });
+            assert_union_horizon_artifact_rejected(&artifact, |tampered| {
+                tampered.proofs[0].oracle_dependency.lexical_package = "other".to_owned();
+            });
+            assert_union_horizon_artifact_rejected(&artifact, |tampered| {
+                tampered.proofs[0].oracle_dependency.lexical_package_version = "0.0.0".to_owned();
+            });
+            assert_union_horizon_artifact_rejected(&artifact, |tampered| {
+                tampered.proofs[0]
+                    .oracle_dependency
+                    .pinned_lexical_contract_revision = "0".repeat(40);
+            });
+            assert_union_horizon_artifact_rejected(&artifact, |tampered| {
+                tampered.run_id = "x".repeat(129);
+            });
+
+            let mut republished = artifact.clone();
+            republished.run_id = "independent-publication".to_owned();
+            assert_eq!(
+                republished.preimage_sha256(),
+                artifact.artifact_sha256,
+                "UNION_HORIZON semantic identity must not depend on CI run metadata",
+            );
+            republished.artifact_sha256 = republished.preimage_sha256();
+            republished.verify();
+
+            let raw_bytes =
+                serde_json::to_vec_pretty(&artifact).expect("serialize UNION_HORIZON seal test");
+            let raw_file_sha256 = sha256_hex(&raw_bytes);
+            assert_eq!(
+                decode_union_horizon_artifact_bytes(&raw_bytes, &raw_file_sha256),
+                artifact,
+            );
+            let mut tampered: serde_json::Value =
+                serde_json::from_slice(&raw_bytes).expect("decode UNION_HORIZON tamper fixture");
+            tampered["proofs"][0]["comparisons"][0]["engines"]["oracle"]["unsealed_extension"] =
+                serde_json::Value::Bool(true);
+            let tampered_bytes =
+                serde_json::to_vec_pretty(&tampered).expect("encode UNION_HORIZON tamper fixture");
+            assert!(
+                std::panic::catch_unwind(|| {
+                    decode_union_horizon_artifact_bytes(&tampered_bytes, &raw_file_sha256);
+                })
+                .is_err(),
+                "UNION_HORIZON raw-file receipt must reject even a semantically ignored nested field",
+            );
+            let tampered_raw_file_sha256 = sha256_hex(&tampered_bytes);
+            assert!(
+                std::panic::catch_unwind(|| {
+                    decode_union_horizon_artifact_bytes(&tampered_bytes, &tampered_raw_file_sha256);
+                })
+                .is_err(),
+                "UNION_HORIZON strict typed reload must reject an unknown nested field even when its raw-file hash is recomputed",
+            );
+            let canonical = String::from_utf8(raw_bytes.clone())
+                .expect("UNION_HORIZON canonical artifact is UTF-8");
+            let encoded_run_id =
+                serde_json::to_string(&artifact.run_id).expect("encode UNION_HORIZON run ID");
+            let run_id_field = format!("\"run_id\": {encoded_run_id},");
+            let duplicate_run_id = canonical.replacen(
+                &run_id_field,
+                &format!("{run_id_field}\n  {run_id_field}"),
+                1,
+            );
+            assert_ne!(duplicate_run_id, canonical);
+            let duplicate_run_id_bytes = duplicate_run_id.into_bytes();
+            let duplicate_run_id_sha256 = sha256_hex(&duplicate_run_id_bytes);
+            assert!(
+                std::panic::catch_unwind(|| {
+                    decode_union_horizon_artifact_bytes(
+                        &duplicate_run_id_bytes,
+                        &duplicate_run_id_sha256,
+                    );
+                })
+                .is_err(),
+                "UNION_HORIZON exact-byte reload must reject duplicate known JSON fields",
+            );
+            let compact_bytes =
+                serde_json::to_vec(&artifact).expect("serialize compact UNION_HORIZON artifact");
+            let compact_sha256 = sha256_hex(&compact_bytes);
+            assert!(
+                std::panic::catch_unwind(|| {
+                    decode_union_horizon_artifact_bytes(&compact_bytes, &compact_sha256);
+                })
+                .is_err(),
+                "UNION_HORIZON exact-byte reload must reject alternate JSON formatting",
+            );
+        });
+    }
+
+    #[cfg(all(feature = "tantivy-oracle", feature = "pruning-conformance"))]
+    #[test]
+    fn salej_union_horizon_cutoff_ties_are_exact_or_registered_across_fresh_segment_shapes() {
+        let fixture = make_union_horizon_tie_fixture();
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let artifact =
+                run_union_horizon_layout_matrix(&cx, &fixture, UnionHorizonProofKind::TieMatrix)
+                    .await;
+            artifact.verify();
+            assert_union_horizon_artifact_rejected(&artifact, |tampered| {
+                let run = &mut tampered.proofs[1].comparisons[1];
+                let original_score_bits = run.comparison.subject.hits[0].score_bits;
+                let original_score = f32::from_bits(original_score_bits);
+                assert!(
+                    original_score.is_finite() && original_score.is_sign_positive(),
+                    "UNION_HORIZON hostile tie-score fixture must be positive and finite",
+                );
+                run.comparison.subject.hits[0].score_bits = original_score_bits
+                    .checked_add(1)
+                    .expect("positive finite score bits have one higher finite encoding");
+                run.comparison = compare_observations(
+                    run.comparison.subject.clone(),
+                    run.comparison.oracle.clone(),
+                    run.comparator_config,
+                )
+                .expect("recompute hostile UNION_HORIZON tie-matrix score mismatch");
+            });
+        });
+    }
+
+    #[cfg(all(
+        feature = "tantivy-oracle",
+        feature = "pruning-conformance",
+        any(target_os = "linux", target_os = "macos")
+    ))]
+    fn assert_union_horizon_diagnostic_completion_rejected(
+        manifest: &UnionHorizonDiagnosticCompletionManifest,
+        mutate: impl FnOnce(&mut UnionHorizonDiagnosticCompletionManifest),
+    ) {
+        let mut tampered = manifest.clone();
+        mutate(&mut tampered);
+        tampered.manifest_sha256 = tampered.preimage_sha256();
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| tampered.verify())).is_err(),
+            "tampered UNION_HORIZON completion manifest unexpectedly verified",
+        );
+    }
+
+    #[cfg(all(
+        feature = "tantivy-oracle",
+        feature = "pruning-conformance",
+        any(target_os = "linux", target_os = "macos")
+    ))]
+    fn write_union_horizon_diagnostic_bundle_fixture(
+        root: &std::path::Path,
+        manifest: &UnionHorizonDiagnosticCompletionManifest,
+    ) -> std::ffi::OsString {
+        std::fs::create_dir(root).expect("create hostile completion-bundle fixture root");
+        for entry in &manifest.artifacts {
+            let bytes = serde_json::to_vec_pretty(&entry.artifact)
+                .expect("serialize hostile completion-bundle proof fixture");
+            assert_eq!(sha256_hex(&bytes), entry.raw_file_sha256);
+            std::fs::write(root.join(&entry.filename), bytes)
+                .expect("write hostile completion-bundle proof fixture");
+        }
+        let completion_bytes = serde_json::to_vec_pretty(manifest)
+            .expect("serialize hostile completion-bundle manifest fixture");
+        let completion_name = std::ffi::OsString::from(format!(
+            "completion-{}-{}.json",
+            manifest.manifest_sha256,
+            sha256_hex(&completion_bytes),
+        ));
+        std::fs::write(root.join(&completion_name), completion_bytes)
+            .expect("write hostile completion-bundle manifest fixture");
+        completion_name
+    }
+
+    #[cfg(all(
+        feature = "tantivy-oracle",
+        feature = "pruning-conformance",
+        any(target_os = "linux", target_os = "macos")
+    ))]
+    fn assert_union_horizon_diagnostic_bundle_validation_panics(
+        directory: &crate::artifact::PinnedDirectory,
+        manifest: &UnionHorizonDiagnosticCompletionManifest,
+        completion_name: &std::ffi::OsStr,
+        context: &str,
+    ) {
+        assert!(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                validate_union_horizon_completed_diagnostic_bundle(
+                    directory,
+                    manifest,
+                    completion_name,
+                );
+            }))
+            .is_err(),
+            "hostile UNION_HORIZON bundle unexpectedly verified: {context}",
+        );
+    }
+
+    #[cfg(all(
+        feature = "tantivy-oracle",
+        feature = "pruning-conformance",
+        any(target_os = "linux", target_os = "macos")
+    ))]
+    #[test]
+    #[ignore = "requires an isolated diagnostic publication directory"]
+    fn salej_complete_union_horizon_diagnostic_bundle() {
+        let build_identity = union_horizon_validated_build_identity();
+        assert!(
+            union_horizon_diagnostic_source_identity_is_well_formed(&build_identity),
+            "Salej diagnostic completion requires a structurally valid recorded source identity",
+        );
+        salej_runtime_identity_rejects_revision_or_dirty_state_rewrites();
+        salej_union_horizon_publication_never_replaces_an_existing_artifact();
+        salej_union_horizon_publication_rejects_symlinks_and_survives_root_swap();
+        salej_union_horizon_late_winner_matches_tantivy_across_fresh_segment_shapes();
+        salej_union_horizon_cutoff_ties_are_exact_or_registered_across_fresh_segment_shapes();
+        let (completion, manifest) = publish_union_horizon_diagnostic_completion_manifest();
+        assert_eq!(
+            completion.path.extension(),
+            Some(std::ffi::OsStr::new("json")),
+            "UNION_HORIZON completion receipt must use a JSON filename",
+        );
+        assert_lower_hex(
+            &completion.raw_file_sha256,
+            64,
+            "UNION_HORIZON completion raw identity",
+        );
+        assert!(completion.byte_len > 0);
+        manifest.verify();
+
+        assert_union_horizon_diagnostic_completion_rejected(&manifest, |tampered| {
+            tampered.build_identity.test_executable_sha256 = "0".repeat(64);
+        });
+        assert_union_horizon_diagnostic_completion_rejected(&manifest, |tampered| {
+            tampered.artifacts[0].raw_file_sha256 = "0".repeat(64);
+        });
+        assert_union_horizon_diagnostic_completion_rejected(&manifest, |tampered| {
+            tampered.artifacts[1].proof_kind = UnionHorizonProofKind::LateWinner;
+        });
+        assert_union_horizon_diagnostic_completion_rejected(&manifest, |tampered| {
+            tampered.run_id = "x".repeat(129);
+        });
+
+        let wrong_name_parent = tempfile::tempdir().expect("wrong-name bundle parent");
+        let wrong_name_root = wrong_name_parent.path().join("bundle");
+        let wrong_name_completion =
+            write_union_horizon_diagnostic_bundle_fixture(&wrong_name_root, &manifest);
+        let wrong_name_directory = crate::artifact::PinnedDirectory::ensure_path(&wrong_name_root)
+            .expect("pin wrong-name bundle fixture");
+        std::fs::rename(
+            wrong_name_root.join(&manifest.artifacts[0].filename),
+            wrong_name_root.join("same-count-substitution.json"),
+        )
+        .expect("rename one proof without changing bundle cardinality");
+        assert_union_horizon_diagnostic_bundle_validation_panics(
+            &wrong_name_directory,
+            &manifest,
+            &wrong_name_completion,
+            "same-count filename substitution",
+        );
+
+        let mutated_parent = tempfile::tempdir().expect("mutated bundle parent");
+        let mutated_root = mutated_parent.path().join("bundle");
+        let mutated_completion =
+            write_union_horizon_diagnostic_bundle_fixture(&mutated_root, &manifest);
+        let mutated_directory = crate::artifact::PinnedDirectory::ensure_path(&mutated_root)
+            .expect("pin mutated bundle fixture");
+        std::fs::write(mutated_root.join(&manifest.artifacts[0].filename), b"{}")
+            .expect("mutate proof bytes after pinning");
+        assert_union_horizon_diagnostic_bundle_validation_panics(
+            &mutated_directory,
+            &manifest,
+            &mutated_completion,
+            "proof content mutation",
+        );
+
+        let missing_parent = tempfile::tempdir().expect("missing bundle parent");
+        let missing_root = missing_parent.path().join("bundle");
+        let missing_completion =
+            write_union_horizon_diagnostic_bundle_fixture(&missing_root, &manifest);
+        let missing_directory = crate::artifact::PinnedDirectory::ensure_path(&missing_root)
+            .expect("pin missing-entry bundle fixture");
+        std::fs::rename(
+            missing_root.join(&manifest.artifacts[0].filename),
+            missing_parent.path().join("moved-proof.json"),
+        )
+        .expect("move proof outside the completed bundle");
+        assert_union_horizon_diagnostic_bundle_validation_panics(
+            &missing_directory,
+            &manifest,
+            &missing_completion,
+            "missing proof",
+        );
+
+        let extra_parent = tempfile::tempdir().expect("extra bundle parent");
+        let extra_root = extra_parent.path().join("bundle");
+        let extra_completion =
+            write_union_horizon_diagnostic_bundle_fixture(&extra_root, &manifest);
+        let extra_directory = crate::artifact::PinnedDirectory::ensure_path(&extra_root)
+            .expect("pin extra-entry bundle fixture");
+        std::fs::write(extra_root.join("extra.json"), b"diagnostic")
+            .expect("add extra completed-bundle entry");
+        assert_union_horizon_diagnostic_bundle_validation_panics(
+            &extra_directory,
+            &manifest,
+            &extra_completion,
+            "extra entry",
+        );
     }
 
     #[cfg(feature = "tantivy-oracle")]
@@ -7903,8 +16140,8 @@ mod tests {
                 CampaignDisposition::InfrastructureError
             );
             assert_eq!(
-                report.cases[0].reason.as_deref(),
-                Some("observation_document_count_drift")
+                report.cases[0].reason,
+                Some(CampaignCaseReason::ObservationDocumentCountDrift)
             );
             assert!(report.cases[0].artifact_hash.is_none());
             let report_path = root.join("campaigns/asymmetric-doc-count/report.json");
@@ -7918,8 +16155,8 @@ mod tests {
                 CampaignDisposition::InfrastructureError
             );
             assert_eq!(
-                stored.cases[0].reason.as_deref(),
-                Some("observation_document_count_drift")
+                stored.cases[0].reason,
+                Some(CampaignCaseReason::ObservationDocumentCountDrift)
             );
         });
 
@@ -7950,8 +16187,8 @@ mod tests {
                 CampaignDisposition::InfrastructureError
             );
             assert_eq!(
-                report.cases[0].reason.as_deref(),
-                Some("observation_document_count_drift")
+                report.cases[0].reason,
+                Some(CampaignCaseReason::ObservationDocumentCountDrift)
             );
             assert!(report.cases[0].artifact_hash.is_none());
         });
@@ -7989,8 +16226,9 @@ mod tests {
     #[test]
     fn tantivy_campaign_adapter_enforces_the_one_shot_lifecycle() {
         let fixture = make_fixture();
-        let version = oracle_version_contract().expect("oracle version");
-        let revision = version.lexical_git_revision;
+        let lexical_revision = oracle_version_contract()
+            .expect("oracle version contract")
+            .lexical_contract_audit_revision;
         let contract = SemanticContract::shipping_default();
         let query = fixture
             .query_suite
@@ -8005,7 +16243,8 @@ mod tests {
         evidence_case.count_requested = query.count_requested;
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             let mut before_begin =
-                crate::TantivyOracle::in_memory(&revision, false).expect("oracle before begin");
+                crate::TantivyOracle::in_memory_with_source(&lexical_revision, false)
+                    .expect("oracle before begin");
             assert!(matches!(
                 before_begin.index_batch(&cx, &fixture.documents[..1]).await,
                 Err(GauntletError::InvalidCampaign { .. })
@@ -8024,7 +16263,8 @@ mod tests {
             ));
 
             let mut before_commit =
-                crate::TantivyOracle::in_memory(&revision, false).expect("oracle before commit");
+                crate::TantivyOracle::in_memory_with_source(&lexical_revision, false)
+                    .expect("oracle before commit");
             before_commit
                 .begin_corpus(&cx, &fixture.corpus_manifest, &contract)
                 .await
@@ -8056,7 +16296,7 @@ mod tests {
                 Err(GauntletError::InvalidCampaign { .. })
             ));
 
-            let mut oracle = crate::TantivyOracle::in_memory(&revision, false)
+            let mut oracle = crate::TantivyOracle::in_memory_with_source(&lexical_revision, false)
                 .expect("committed in-memory oracle");
             oracle
                 .begin_corpus(&cx, &fixture.corpus_manifest, &contract)
@@ -8098,10 +16338,12 @@ mod tests {
         use frankensearch_core::LexicalSearch;
 
         let fixture = make_fixture();
-        let version = oracle_version_contract().expect("oracle version");
+        let lexical_revision = oracle_version_contract()
+            .expect("oracle version contract")
+            .lexical_contract_audit_revision;
         let contract = SemanticContract::shipping_default();
         asupersync::test_utils::run_test_with_cx(|cx| async move {
-            let mut oracle = crate::TantivyOracle::in_memory(&version.lexical_git_revision, false)
+            let mut oracle = crate::TantivyOracle::in_memory_with_source(&lexical_revision, false)
                 .expect("fresh oracle");
             oracle
                 .index_documents(
@@ -8677,6 +16919,17 @@ mod tests {
         let verdict = auto_triage(DivergenceClass::TieOrder, &report);
         assert_eq!(verdict.suspected_layer, SuspectedLayer::TieOrder);
         assert_eq!(verdict.confidence, TriageConfidence::High);
+
+        let verdict = auto_triage(DivergenceClass::PostingRecordSemantics, &report);
+        assert_eq!(verdict.suspected_layer, SuspectedLayer::FieldNormArithmetic);
+        assert_eq!(verdict.confidence, TriageConfidence::High);
+        assert!(
+            verdict
+                .evidence
+                .iter()
+                .any(|line| line.contains("record option")),
+            "posting-record triage must retain the fix-only root-cause hint"
+        );
     }
 
     #[test]
@@ -8712,56 +16965,32 @@ mod tests {
     // ==== Live oracle campaign activation (bd-quill-e6-gauntlet-scale-rm3q.9) ====
 
     #[cfg(feature = "tantivy-oracle")]
-    fn live_campaign_engines(
-        provenance: &CampaignProvenance,
-    ) -> (crate::engine::QuillSubject, crate::engine::TantivyOracle) {
-        let lexical_revision = oracle_version_contract()
-            .expect("oracle version contract")
-            .lexical_git_revision;
+    fn live_campaign_engines() -> (crate::engine::QuillSubject, crate::engine::TantivyOracle) {
         let config = frankensearch_quill::QuillConfig {
             deterministic_ingest: true,
             ..frankensearch_quill::QuillConfig::default()
         };
-        let subject = crate::engine::QuillSubject::in_memory(
-            config,
-            &provenance.subject_git_revision,
-            provenance.subject_source_dirty,
-        )
-        .expect("fresh scalar Quill subject");
-        let oracle = crate::engine::TantivyOracle::in_memory_scalar_g1a(
-            &lexical_revision,
-            provenance.oracle_source_dirty,
-        )
-        .expect("fresh scalar G1a Tantivy oracle");
+        let subject =
+            crate::engine::QuillSubject::in_memory(config).expect("fresh scalar Quill subject");
+        let oracle = crate::engine::TantivyOracle::in_memory_scalar_g1a()
+            .expect("fresh scalar G1a Tantivy oracle");
         (subject, oracle)
     }
 
     #[cfg(feature = "tantivy-oracle")]
-    fn live_cass_campaign_engines(
-        provenance: &CampaignProvenance,
-    ) -> (
+    fn live_cass_campaign_engines() -> (
         crate::engine::CassQuillSubject,
         crate::engine::CassTantivyOracle,
     ) {
-        let lexical_revision = oracle_version_contract()
-            .expect("oracle version contract")
-            .lexical_git_revision;
         let config = frankensearch_quill::QuillConfig {
             deterministic_ingest: true,
             glob_expansion_limit: 4_096,
             ..frankensearch_quill::QuillConfig::default()
         };
-        let subject = crate::engine::CassQuillSubject::in_memory(
-            config,
-            &provenance.subject_git_revision,
-            provenance.subject_source_dirty,
-        )
-        .expect("fresh CASS Quill subject");
-        let oracle = crate::engine::CassTantivyOracle::in_memory(
-            &lexical_revision,
-            provenance.oracle_source_dirty,
-        )
-        .expect("fresh CASS Tantivy oracle");
+        let subject =
+            crate::engine::CassQuillSubject::in_memory(config).expect("fresh CASS Quill subject");
+        let oracle =
+            crate::engine::CassTantivyOracle::in_memory().expect("fresh CASS Tantivy oracle");
         (subject, oracle)
     }
 
@@ -8791,7 +17020,7 @@ mod tests {
             &semantic_contract,
         )
         .expect("collect provenance");
-        let (mut subject, mut oracle) = live_campaign_engines(&provenance);
+        let (mut subject, mut oracle) = live_campaign_engines();
         let campaign = DifferentialCampaignRunner::new(
             ArtifactStore::new(root),
             semantic_contract,
@@ -8808,7 +17037,7 @@ mod tests {
         .expect("live campaign runner")
         .with_provenance(provenance);
         campaign
-            .run(
+            .run_quill_tantivy_evidence(
                 cx,
                 run_id,
                 &mut subject,
@@ -8836,7 +17065,7 @@ mod tests {
             &semantic_contract,
         )
         .expect("collect CASS provenance");
-        let (mut subject, mut oracle) = live_cass_campaign_engines(&provenance);
+        let (mut subject, mut oracle) = live_cass_campaign_engines();
         let campaign = DifferentialCampaignRunner::new(
             ArtifactStore::new(root),
             semantic_contract,
@@ -8852,7 +17081,7 @@ mod tests {
         .expect("live CASS campaign runner")
         .with_provenance(provenance);
         campaign
-            .run(
+            .run_cass_quill_tantivy_evidence(
                 cx,
                 run_id,
                 &mut subject,
@@ -8885,6 +17114,200 @@ mod tests {
         source_root: &std::path::Path,
         report: &CampaignReport,
     ) {
+        fn core_comparison(object: &mut ArtifactObject) -> &mut LexicalContractComparison {
+            let ArtifactLexicalContractEvidence::CoreLexicalV3 { comparison } =
+                &mut object.lexical_contract
+            else {
+                unreachable!("mutation target must retain Core Lexical V3 evidence")
+            };
+            comparison
+        }
+
+        fn subject_bundle(object: &mut ArtifactObject) -> &mut LexicalContractBundle {
+            &mut core_comparison(object).subject
+        }
+
+        fn subject_full_context(object: &mut ArtifactObject) -> &mut LexicalObservationContext {
+            &mut subject_bundle(object).full_search.context
+        }
+
+        fn success_fields(
+            observation: &mut LexicalObservation,
+        ) -> (
+            &mut Vec<LexicalHitObservation>,
+            &mut u64,
+            &mut LexicalEmptyShape,
+            &mut LexicalCountState,
+        ) {
+            let LexicalObservationOutcome::Success {
+                hits,
+                returned_count,
+                empty_shape,
+                total_count,
+            } = &mut observation.outcome
+            else {
+                unreachable!("selected mutation target must be a successful observation")
+            };
+            (hits, returned_count, empty_shape, total_count)
+        }
+
+        fn first_subject_full_hit(object: &mut ArtifactObject) -> &mut LexicalHitObservation {
+            success_fields(&mut subject_bundle(object).full_search)
+                .0
+                .first_mut()
+                .expect("selected mutation target must retain a full-search hit")
+        }
+
+        fn attempted_hydration(
+            execution: &mut LexicalHydrationExecution,
+        ) -> (
+            &mut LexicalObservation,
+            &mut LexicalObservation,
+            &mut LexicalHydrationResult,
+        ) {
+            let LexicalHydrationExecution::Attempted {
+                input,
+                post_state,
+                result,
+            } = execution
+            else {
+                unreachable!("selected mutation target must retain attempted hydration")
+            };
+            (input, post_state, result)
+        }
+
+        fn flip_sha256_nibble(value: &mut String) {
+            assert_eq!(value.len(), 64, "mutation target must be a SHA-256");
+            let replacement = if value.starts_with('0') { "1" } else { "0" };
+            value.replace_range(0..1, replacement);
+        }
+
+        fn mutate_sensitive_digest(value: &mut SensitiveValueObservation) {
+            let sha256 = match value {
+                SensitiveValueObservation::PresentEmpty { sha256, .. }
+                | SensitiveValueObservation::Present { sha256, .. } => sha256,
+                SensitiveValueObservation::NotExposed | SensitiveValueObservation::Absent => {
+                    unreachable!("mutation target must retain a digest-bearing sensitive value")
+                }
+            };
+            flip_sha256_nibble(sha256);
+        }
+
+        fn mutate_sensitive_length(value: &mut SensitiveValueObservation) {
+            let byte_len = match value {
+                SensitiveValueObservation::PresentEmpty { byte_len, .. }
+                | SensitiveValueObservation::Present { byte_len, .. } => byte_len,
+                SensitiveValueObservation::NotExposed | SensitiveValueObservation::Absent => {
+                    unreachable!("mutation target must retain a length-bearing sensitive value")
+                }
+            };
+            *byte_len = byte_len.saturating_add(1);
+        }
+
+        fn digest_bearing_metadata_hit(
+            observation: &mut LexicalObservation,
+        ) -> &mut LexicalHitObservation {
+            success_fields(observation)
+                .0
+                .iter_mut()
+                .find(|hit| {
+                    matches!(
+                        &hit.metadata,
+                        SensitiveValueObservation::PresentEmpty { .. }
+                            | SensitiveValueObservation::Present { .. }
+                    )
+                })
+                .expect("selected mutation target must retain metadata digest evidence")
+        }
+
+        fn digest_bearing_explanation_hit(
+            observation: &mut LexicalObservation,
+        ) -> &mut LexicalHitObservation {
+            success_fields(observation)
+                .0
+                .iter_mut()
+                .find(|hit| {
+                    matches!(
+                        &hit.explanation,
+                        SensitiveValueObservation::PresentEmpty { .. }
+                            | SensitiveValueObservation::Present { .. }
+                    )
+                })
+                .expect("selected mutation target must retain explanation digest evidence")
+        }
+
+        fn query_error_observation() -> LexicalErrorObservation {
+            let error = frankensearch_core::SearchError::QueryParseError {
+                query: "redacted by persisted mutation test".to_owned(),
+                detail: "typed failure replacement".to_owned(),
+            };
+            crate::comparator::observe_lexical_search_error(&error)
+                .expect("observe typed mutation error")
+        }
+
+        fn replace_with_query_error(outcome: &mut LexicalObservationOutcome) {
+            *outcome = LexicalObservationOutcome::Error(query_error_observation());
+        }
+
+        fn mutate_one_full_score_bit(object: &mut ArtifactObject) {
+            let hits = success_fields(&mut subject_bundle(object).full_search).0;
+            for index in 0..hits.len() {
+                let candidate_bits = hits[index].normalized_score_bits ^ 1;
+                let candidate = f32::from_bits(candidate_bits);
+                let previous_allows = index == 0
+                    || f32::from_bits(hits[index - 1].normalized_score_bits) >= candidate;
+                let next_allows = index + 1 == hits.len()
+                    || candidate >= f32::from_bits(hits[index + 1].normalized_score_bits);
+                if candidate.is_finite() && previous_allows && next_allows {
+                    hits[index].normalized_score_bits = candidate_bits;
+                    hits[index].raw_lexical_score_bits = Some(candidate_bits);
+                    return;
+                }
+            }
+            unreachable!("selected mutation target must admit a finite one-bit score mutation");
+        }
+
+        fn swap_tied_full_hits(object: &mut ArtifactObject) {
+            let hits = success_fields(&mut subject_bundle(object).full_search).0;
+            let index = hits
+                .windows(2)
+                .position(|pair| pair[0].normalized_score_bits == pair[1].normalized_score_bits)
+                .expect("selected mutation target must retain an adjacent score tie");
+            hits.swap(index, index + 1);
+            hits[index].rank = u64::try_from(index).expect("persisted hit ordinal must fit in u64");
+            hits[index + 1].rank =
+                u64::try_from(index + 1).expect("persisted hit ordinal must fit in u64");
+        }
+
+        fn install_matching_completion_receipt(
+            campaign: &std::path::Path,
+            current_name: &std::ffi::OsStr,
+            report: &CampaignReport,
+        ) -> std::ffi::OsString {
+            let (next_name, next_bytes) =
+                crate::artifact::campaign_completion_receipt_fixture(report)
+                    .expect("construct exact test completion receipt");
+            let current_path = campaign.join(current_name);
+            let next_path = campaign.join(&next_name);
+            if current_name != next_name.as_os_str() {
+                std::fs::rename(&current_path, &next_path)
+                    .expect("move sole test completion receipt to its new content address");
+            }
+            std::fs::write(&next_path, next_bytes)
+                .expect("write exact test completion receipt bytes");
+            next_name
+        }
+
+        fn assert_reached_past_completion(label: &str, error: &GauntletError) {
+            let error_text = error.to_string();
+            assert!(
+                !matches!(error, GauntletError::Io(_))
+                    && !error_text.contains("completion receipt")
+                    && !error_text.contains("completed campaign directory"),
+                "{label} failed at campaign completion closure instead of the intended deeper validation: {error}",
+            );
+        }
+
         let scratch = tempfile::tempdir().expect("isolated mutation store");
         let scratch_root = scratch.path();
         let source_campaign = source_root.join("campaigns").join(&report.run_id);
@@ -8897,6 +17320,25 @@ mod tests {
             std::fs::copy(source_campaign.join(name), scratch_campaign.join(name))
                 .expect("copy campaign control file");
         }
+        let completion_files = std::fs::read_dir(&source_campaign)
+            .expect("read completed source campaign")
+            .map(|entry| entry.expect("source campaign entry").file_name())
+            .filter(|name| name.to_string_lossy().starts_with("completion-"))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            completion_files.len(),
+            1,
+            "source campaign must have exactly one write-last completion receipt"
+        );
+        let original_completion_name = completion_files
+            .into_iter()
+            .next()
+            .expect("source completion receipt");
+        std::fs::copy(
+            source_campaign.join(&original_completion_name),
+            scratch_campaign.join(&original_completion_name),
+        )
+        .expect("copy write-last completion receipt");
         for (ordinal, result) in report.cases.iter().enumerate() {
             let Some(hash) = result.artifact_hash.as_deref() else {
                 continue;
@@ -8918,9 +17360,10 @@ mod tests {
         let store = ArtifactStore::new(scratch_root);
         assert_eq!(
             store
-                .load_verified_campaign(&report.run_id)
-                .expect("copied campaign starts verified"),
-            *report
+                .load_integrity_checked_campaign(&report.run_id)
+                .expect("copied campaign starts integrity-checked")
+                .report(),
+            report
         );
 
         let (target_ordinal, target_hash, target_object) = report
@@ -8940,22 +17383,66 @@ mod tests {
                 else {
                     return None;
                 };
-                if hits.is_empty()
-                    || !matches!(
-                        &comparison.subject.all_lexical_winners_hydration.execution,
-                        crate::comparator::LexicalHydrationExecution::Attempted { .. }
+                let has_adjacent_score_tie = hits
+                    .windows(2)
+                    .any(|pair| pair[0].normalized_score_bits == pair[1].normalized_score_bits);
+                let has_metadata_digest = hits.iter().any(|hit| {
+                    matches!(
+                        &hit.metadata,
+                        SensitiveValueObservation::PresentEmpty { .. }
+                            | SensitiveValueObservation::Present { .. }
                     )
+                });
+                let all_hydrations_attempted = [
+                    &comparison.subject.all_lexical_winners_hydration,
+                    &comparison.subject.strict_hybrid_winners_hydration,
+                    &comparison.subject.semantic_only_hydration,
+                    &comparison.subject.mixed_winners_hydration,
+                ]
+                .into_iter()
+                .all(|transition| {
+                    matches!(
+                        &transition.execution,
+                        LexicalHydrationExecution::Attempted { .. }
+                    )
+                });
+                let strict_has_explanation_digest = match &comparison
+                    .subject
+                    .strict_hybrid_winners_hydration
+                    .execution
+                {
+                    LexicalHydrationExecution::Attempted { input, .. } => match &input.outcome {
+                        LexicalObservationOutcome::Success { hits, .. } => hits.iter().any(|hit| {
+                            matches!(
+                                &hit.explanation,
+                                SensitiveValueObservation::PresentEmpty { .. }
+                                    | SensitiveValueObservation::Present { .. }
+                            )
+                        }),
+                        LexicalObservationOutcome::Error(_) => false,
+                    },
+                    LexicalHydrationExecution::NotRun { .. } => false,
+                };
+                if !has_adjacent_score_tie
+                    || !has_metadata_digest
+                    || !all_hydrations_attempted
+                    || !strict_has_explanation_digest
                 {
                     return None;
                 }
                 Some((ordinal, hash.clone(), object))
             })
-            .expect("live Core V3 campaign has a nonempty, hydrated persisted case");
+            .expect(
+                "live Core V3 campaign has a tied, metadata-bearing, fully hydrated persisted case",
+            );
         let target_path = scratch_objects.join(format!("{target_hash}.json"));
         let original_bytes = std::fs::read(&target_path).expect("read scratch target object");
         let target_case_path = scratch_cases.join(format!("q{target_ordinal:06}.json"));
         let original_case_bytes =
             std::fs::read(&target_case_path).expect("read scratch target run manifest");
+        let reservation_path = scratch_campaign.join("reservation.json");
+        let original_reservation_bytes =
+            std::fs::read(&reservation_path).expect("read scratch campaign reservation");
         let report_path = scratch_campaign.join("report.json");
         let original_report_bytes =
             std::fs::read(&report_path).expect("read scratch campaign report");
@@ -8964,18 +17451,22 @@ mod tests {
             assert_ne!(bytes, original_bytes, "{label} must alter persisted bytes");
             std::fs::write(&target_path, bytes).expect("write scratch mutation");
             assert!(
-                store.load_verified_campaign(&report.run_id).is_err(),
-                "verified campaign reload accepted persisted mutation {label}"
+                store
+                    .load_integrity_checked_campaign(&report.run_id)
+                    .is_err(),
+                "integrity-checked campaign reload accepted persisted mutation {label}"
             );
             std::fs::write(&target_path, &original_bytes).expect("restore scratch object");
             store
-                .load_verified_campaign(&report.run_id)
+                .load_integrity_checked_campaign(&report.run_id)
                 .unwrap_or_else(|error| panic!("restored campaign failed after {label}: {error}"));
         };
 
         let mut raw_content_tamper = original_bytes.clone();
         raw_content_tamper.push(b' ');
+        let mut existing_mutation_count = 0;
         assert_stale_address_rejected("raw_content_byte", &raw_content_tamper);
+        existing_mutation_count += 1;
 
         let original_value: serde_json::Value =
             serde_json::from_slice(&original_bytes).expect("object JSON");
@@ -9000,71 +17491,360 @@ mod tests {
                 &format!("missing_lane_{lane}"),
                 &serde_json::to_vec(&missing_lane).expect("encode missing-lane mutation"),
             );
+            existing_mutation_count += 1;
         }
 
         type TypedMutation = fn(&mut ArtifactObject);
-        let typed_mutations: [(&str, TypedMutation); 6] = [
-            ("schema", |object| {
+        let typed_mutations: &[(&str, TypedMutation)] = &[
+            ("object_canonicalization_schema", |object| {
                 object.canonicalization_version = object.canonicalization_version.saturating_add(1);
             }),
-            ("context", |object| {
-                let ArtifactLexicalContractEvidence::CoreLexicalV3 { comparison } =
-                    &mut object.lexical_contract
-                else {
-                    unreachable!()
-                };
-                comparison.subject.full_search.context.seed ^= 1;
+            ("comparison_schema", |object| {
+                core_comparison(object).schema_version.push_str("-tampered");
             }),
-            ("hit", |object| {
-                let ArtifactLexicalContractEvidence::CoreLexicalV3 { comparison } =
-                    &mut object.lexical_contract
-                else {
-                    unreachable!()
-                };
-                let crate::comparator::LexicalObservationOutcome::Success { hits, .. } =
-                    &mut comparison.subject.full_search.outcome
-                else {
-                    unreachable!()
-                };
-                hits[0].doc_id.push_str("-tampered");
+            ("bundle_schema", |object| {
+                subject_bundle(object).schema_version.push_str("-tampered");
             }),
-            ("error", |object| {
-                let ArtifactLexicalContractEvidence::CoreLexicalV3 { comparison } =
-                    &mut object.lexical_contract
-                else {
-                    unreachable!()
-                };
-                let error = frankensearch_core::SearchError::QueryParseError {
-                    query: "redacted by persisted mutation test".to_owned(),
-                    detail: "typed failure replacement".to_owned(),
-                };
-                comparison.subject.full_search.outcome =
-                    crate::comparator::LexicalObservationOutcome::Error(
-                        crate::comparator::observe_lexical_search_error(&error)
-                            .expect("observe typed mutation error"),
-                    );
+            ("bundle_engine_role", |object| {
+                subject_bundle(object).engine_role = LexicalEngineRole::Oracle;
             }),
-            ("hydration", |object| {
-                let ArtifactLexicalContractEvidence::CoreLexicalV3 { comparison } =
-                    &mut object.lexical_contract
-                else {
-                    unreachable!()
+            ("bundle_snapshot_sha256", |object| {
+                flip_sha256_nibble(&mut subject_bundle(object).snapshot_sha256);
+            }),
+            ("bundle_capability", |object| {
+                let bundle = subject_bundle(object);
+                bundle.fusion_metadata_deferred = !bundle.fusion_metadata_deferred;
+            }),
+            ("context_schema", |object| {
+                subject_full_context(object)
+                    .schema_version
+                    .push_str("-tampered");
+            }),
+            ("context_boundary", |object| {
+                subject_full_context(object).boundary =
+                    crate::comparator::LexicalBoundary::FusionCandidates;
+            }),
+            ("context_backend_engine", |object| {
+                subject_full_context(object)
+                    .backend
+                    .engine
+                    .push_str("-tampered");
+            }),
+            ("context_backend_revision", |object| {
+                subject_full_context(object)
+                    .backend
+                    .revision
+                    .push_str("-tampered");
+            }),
+            ("context_backend_index_identity", |object| {
+                flip_sha256_nibble(&mut subject_full_context(object).backend.index_identity);
+            }),
+            ("context_corpus_sha256", |object| {
+                flip_sha256_nibble(&mut subject_full_context(object).corpus_sha256);
+            }),
+            ("context_query_contract_sha256", |object| {
+                flip_sha256_nibble(&mut subject_full_context(object).query_contract_sha256);
+            }),
+            ("context_query_sha256", |object| {
+                flip_sha256_nibble(&mut subject_full_context(object).query_sha256);
+            }),
+            ("context_query_bytes", |object| {
+                let context = subject_full_context(object);
+                context.query_bytes = context.query_bytes.saturating_add(1);
+            }),
+            ("context_normalized_query", |object| {
+                subject_full_context(object).normalized_query = LexicalNormalizedQuery::Value {
+                    transform_id: "persisted-mutation-transform".to_owned(),
+                    sha256: "0".repeat(64),
+                    byte_len: 0,
                 };
-                comparison.subject.all_lexical_winners_hydration.selection =
-                    crate::comparator::LexicalHydrationSelection::SemanticOnlyControl {
-                        control_id: u32::MAX,
-                    };
+            }),
+            ("context_query_class", |object| {
+                let context = subject_full_context(object);
+                context.query_class = match context.query_class {
+                    LexicalQueryClass::Empty => LexicalQueryClass::Identifier,
+                    LexicalQueryClass::Identifier => LexicalQueryClass::ShortKeyword,
+                    LexicalQueryClass::ShortKeyword => LexicalQueryClass::NaturalLanguage,
+                    LexicalQueryClass::NaturalLanguage => LexicalQueryClass::ShortKeyword,
+                };
+            }),
+            ("context_seed", |object| {
+                subject_full_context(object).seed ^= 1;
+            }),
+            ("context_limit", |object| {
+                let context = subject_full_context(object);
+                context.limit = context.limit.saturating_add(1);
+            }),
+            ("context_metadata_exposure", |object| {
+                subject_full_context(object).exposure.metadata = LexicalFieldExposure::NotExposed;
+            }),
+            ("context_explanation_exposure", |object| {
+                subject_full_context(object).exposure.explanation =
+                    LexicalFieldExposure::NotExposed;
+            }),
+            ("context_count_exposure", |object| {
+                subject_full_context(object).exposure.total_count =
+                    LexicalCountExposure::NotRequested;
+            }),
+            ("context_snippet_exposure", |object| {
+                subject_full_context(object).exposure.snippet = LexicalFieldExposure::Exposed;
+            }),
+            ("context_highlight_exposure", |object| {
+                subject_full_context(object).exposure.highlight_spans =
+                    LexicalFieldExposure::Exposed;
+            }),
+            ("hit_rank", |object| {
+                let hit = first_subject_full_hit(object);
+                hit.rank = hit.rank.saturating_add(1);
+            }),
+            ("hit_order", swap_tied_full_hits),
+            ("hit_doc_id", |object| {
+                first_subject_full_hit(object).doc_id.push_str("-tampered");
+            }),
+            ("hit_one_bit_score", mutate_one_full_score_bit),
+            ("hit_raw_lexical_component", |object| {
+                let bundle = subject_bundle(object);
+                let (input, _, _) =
+                    attempted_hydration(&mut bundle.all_lexical_winners_hydration.execution);
+                let hit = success_fields(input)
+                    .0
+                    .first_mut()
+                    .expect("all-winner hydration input must retain a hit");
+                hit.raw_lexical_score_bits = hit.raw_lexical_score_bits.map(|bits| bits ^ 1);
+            }),
+            ("hit_source", |object| {
+                first_subject_full_hit(object).source = LexicalScoreSource::Hybrid;
+            }),
+            ("hit_index_component", |object| {
+                let bundle = subject_bundle(object);
+                let (input, _, _) =
+                    attempted_hydration(&mut bundle.strict_hybrid_winners_hydration.execution);
+                let hit = success_fields(input)
+                    .0
+                    .first_mut()
+                    .expect("strict hydration input must retain a hit");
+                hit.index = hit.index.map(|index| index.saturating_add(1));
+            }),
+            ("hit_fast_component", |object| {
+                let bundle = subject_bundle(object);
+                let (input, _, _) =
+                    attempted_hydration(&mut bundle.strict_hybrid_winners_hydration.execution);
+                let hit = success_fields(input)
+                    .0
+                    .first_mut()
+                    .expect("strict hydration input must retain a hit");
+                hit.fast_score_bits = hit.fast_score_bits.map(|bits| bits ^ 1);
+            }),
+            ("hit_quality_component", |object| {
+                first_subject_full_hit(object).quality_score_bits = Some(0.125_f32.to_bits());
+            }),
+            ("hit_rerank_component", |object| {
+                first_subject_full_hit(object).rerank_score_bits = Some(0.25_f32.to_bits());
+            }),
+            ("hit_metadata_presence", |object| {
+                digest_bearing_metadata_hit(&mut subject_bundle(object).full_search).metadata =
+                    SensitiveValueObservation::Absent;
+            }),
+            ("hit_metadata_digest", |object| {
+                mutate_sensitive_digest(
+                    &mut digest_bearing_metadata_hit(&mut subject_bundle(object).full_search)
+                        .metadata,
+                );
+            }),
+            ("hit_metadata_length", |object| {
+                mutate_sensitive_length(
+                    &mut digest_bearing_metadata_hit(&mut subject_bundle(object).full_search)
+                        .metadata,
+                );
+            }),
+            ("hit_explanation_presence", |object| {
+                let explanation = &mut first_subject_full_hit(object).explanation;
+                *explanation = if matches!(explanation, SensitiveValueObservation::Absent) {
+                    SensitiveValueObservation::Present {
+                        sha256: "0".repeat(64),
+                        byte_len: 1,
+                    }
+                } else {
+                    SensitiveValueObservation::Absent
+                };
+            }),
+            ("hit_explanation_digest", |object| {
+                let bundle = subject_bundle(object);
+                let (input, _, _) =
+                    attempted_hydration(&mut bundle.strict_hybrid_winners_hydration.execution);
+                mutate_sensitive_digest(&mut digest_bearing_explanation_hit(input).explanation);
+            }),
+            ("hit_snippet_state", |object| {
+                first_subject_full_hit(object).snippet = SensitiveValueObservation::Absent;
+            }),
+            ("hit_highlight_state", |object| {
+                first_subject_full_hit(object).highlight_spans = LexicalObserved::Absent;
+            }),
+            ("success_returned_count", |object| {
+                let (_, returned_count, _, _) =
+                    success_fields(&mut subject_bundle(object).full_search);
+                *returned_count = returned_count.saturating_add(1);
+            }),
+            ("success_empty_shape", |object| {
+                let (_, _, empty_shape, _) =
+                    success_fields(&mut subject_bundle(object).full_search);
+                *empty_shape = LexicalEmptyShape::Empty;
+            }),
+            ("success_count_state", |object| {
+                let (_, _, _, total_count) =
+                    success_fields(&mut subject_bundle(object).full_search);
+                *total_count = LexicalCountState::NotRequested;
+            }),
+            ("error_outcome_kind", |object| {
+                replace_with_query_error(&mut subject_bundle(object).full_search.outcome);
+            }),
+            ("error_class", |object| {
+                let mut error = query_error_observation();
+                error.class = LexicalErrorClass::Index;
+                subject_bundle(object).full_search.outcome =
+                    LexicalObservationOutcome::Error(error);
+            }),
+            ("error_code", |object| {
+                let mut error = query_error_observation();
+                error.code.push_str("-tampered");
+                subject_bundle(object).full_search.outcome =
+                    LexicalObservationOutcome::Error(error);
+            }),
+            ("error_contract_payload", |object| {
+                let mut error = query_error_observation();
+                mutate_sensitive_digest(&mut error.contract_payload);
+                subject_bundle(object).full_search.outcome =
+                    LexicalObservationOutcome::Error(error);
+            }),
+            ("hydration_all_selection", |object| {
+                subject_bundle(object)
+                    .all_lexical_winners_hydration
+                    .selection = LexicalHydrationSelection::SemanticOnlyControl {
+                    control_id: u32::MAX,
+                };
+            }),
+            ("hydration_strict_candidate_rank", |object| {
+                let selection = &mut subject_bundle(object)
+                    .strict_hybrid_winners_hydration
+                    .selection;
+                let LexicalHydrationSelection::StrictHybridWinnerSubset { candidate_ranks } =
+                    selection
+                else {
+                    unreachable!("strict hydration must retain strict-rank selection")
+                };
+                candidate_ranks[0] = u64::MAX;
+            }),
+            ("hydration_semantic_control_id", |object| {
+                let selection = &mut subject_bundle(object).semantic_only_hydration.selection;
+                let LexicalHydrationSelection::SemanticOnlyControl { control_id } = selection
+                else {
+                    unreachable!("semantic hydration must retain its control selection")
+                };
+                *control_id ^= 1;
+            }),
+            ("hydration_mixed_lexical_origin_rank", |object| {
+                let selection = &mut subject_bundle(object).mixed_winners_hydration.selection;
+                let LexicalHydrationSelection::MixedFinalWinners { origins } = selection else {
+                    unreachable!("mixed hydration must retain mixed origins")
+                };
+                let rank = origins
+                    .iter_mut()
+                    .find_map(|origin| match origin {
+                        LexicalWinnerOrigin::Lexical { candidate_rank, .. } => Some(candidate_rank),
+                        LexicalWinnerOrigin::NonLexicalControl { .. } => None,
+                    })
+                    .expect("mixed hydration must retain a lexical origin");
+                *rank = rank.saturating_add(1);
+            }),
+            ("hydration_mixed_lexical_projection", |object| {
+                let selection = &mut subject_bundle(object).mixed_winners_hydration.selection;
+                let LexicalHydrationSelection::MixedFinalWinners { origins } = selection else {
+                    unreachable!("mixed hydration must retain mixed origins")
+                };
+                let projection = origins
+                    .iter_mut()
+                    .find_map(|origin| match origin {
+                        LexicalWinnerOrigin::Lexical { projection, .. } => Some(projection),
+                        LexicalWinnerOrigin::NonLexicalControl { .. } => None,
+                    })
+                    .expect("mixed hydration must retain a lexical origin");
+                *projection = match projection {
+                    LexicalWinnerProjection::LexicalOnly => LexicalWinnerProjection::HybridFast,
+                    LexicalWinnerProjection::HybridFast => LexicalWinnerProjection::LexicalOnly,
+                };
+            }),
+            ("hydration_mixed_nonlexical_control_id", |object| {
+                let selection = &mut subject_bundle(object).mixed_winners_hydration.selection;
+                let LexicalHydrationSelection::MixedFinalWinners { origins } = selection else {
+                    unreachable!("mixed hydration must retain mixed origins")
+                };
+                let control_id = origins
+                    .iter_mut()
+                    .find_map(|origin| match origin {
+                        LexicalWinnerOrigin::NonLexicalControl { control_id, .. } => {
+                            Some(control_id)
+                        }
+                        LexicalWinnerOrigin::Lexical { .. } => None,
+                    })
+                    .expect("mixed hydration must retain a non-lexical origin");
+                *control_id ^= 1;
+            }),
+            ("hydration_mixed_nonlexical_kind", |object| {
+                let selection = &mut subject_bundle(object).mixed_winners_hydration.selection;
+                let LexicalHydrationSelection::MixedFinalWinners { origins } = selection else {
+                    unreachable!("mixed hydration must retain mixed origins")
+                };
+                let kind = origins
+                    .iter_mut()
+                    .find_map(|origin| match origin {
+                        LexicalWinnerOrigin::NonLexicalControl { kind, .. } => Some(kind),
+                        LexicalWinnerOrigin::Lexical { .. } => None,
+                    })
+                    .expect("mixed hydration must retain a non-lexical origin");
+                *kind = match kind {
+                    LexicalNonLexicalControlKind::SemanticFast => {
+                        LexicalNonLexicalControlKind::GraphOnlyHybrid
+                    }
+                    LexicalNonLexicalControlKind::GraphOnlyHybrid => {
+                        LexicalNonLexicalControlKind::SemanticFast
+                    }
+                };
+            }),
+            ("hydration_mixed_origin_order", |object| {
+                let selection = &mut subject_bundle(object).mixed_winners_hydration.selection;
+                let LexicalHydrationSelection::MixedFinalWinners { origins } = selection else {
+                    unreachable!("mixed hydration must retain mixed origins")
+                };
+                origins.swap(0, 1);
+            }),
+            ("hydration_input", |object| {
+                let bundle = subject_bundle(object);
+                let (input, _, _) =
+                    attempted_hydration(&mut bundle.all_lexical_winners_hydration.execution);
+                success_fields(input).0[0].doc_id.push_str("-tampered");
+            }),
+            ("hydration_post_state", |object| {
+                let bundle = subject_bundle(object);
+                let (_, post_state, _) =
+                    attempted_hydration(&mut bundle.all_lexical_winners_hydration.execution);
+                success_fields(post_state).0[0].doc_id.push_str("-tampered");
+            }),
+            ("hydration_result", |object| {
+                let bundle = subject_bundle(object);
+                let (_, _, result) =
+                    attempted_hydration(&mut bundle.all_lexical_winners_hydration.execution);
+                *result = LexicalHydrationResult::Error(query_error_observation());
             }),
             ("derived", |object| {
-                let ArtifactLexicalContractEvidence::CoreLexicalV3 { comparison } =
-                    &mut object.lexical_contract
-                else {
-                    unreachable!()
-                };
-                comparison.status = LexicalComparisonStatus::Mismatch;
+                core_comparison(object).status = LexicalComparisonStatus::Mismatch;
             }),
         ];
-        for (label, mutate) in typed_mutations {
+        assert_eq!(
+            typed_mutations.len(),
+            60,
+            "Core V3 must keep one typed mutation for every admitted comparison field family"
+        );
+        for &(label, mutate) in typed_mutations {
             let mut mutated = target_object.clone();
             mutate(&mut mutated);
             let object_bytes = mutated
@@ -9096,15 +17876,27 @@ mod tests {
                     .expect("encode coherently referenced campaign report"),
             )
             .expect("write coherently referenced campaign report");
+            let mutated_completion_name = install_matching_completion_receipt(
+                &scratch_campaign,
+                &original_completion_name,
+                &mutated_report,
+            );
 
             let error = store
-                .load_verified_campaign(&report.run_id)
+                .load_integrity_checked_campaign(&report.run_id)
                 .expect_err("semantic replay must reject canonical typed mutation");
+            assert_reached_past_completion(label, &error);
             std::fs::write(&target_case_path, &original_case_bytes)
                 .expect("restore target run manifest");
             std::fs::write(&report_path, &original_report_bytes).expect("restore campaign report");
+            let restored_completion_name = install_matching_completion_receipt(
+                &scratch_campaign,
+                &mutated_completion_name,
+                report,
+            );
+            assert_eq!(restored_completion_name, original_completion_name);
             store
-                .load_verified_campaign(&report.run_id)
+                .load_integrity_checked_campaign(&report.run_id)
                 .unwrap_or_else(|error| panic!("restored campaign failed after {label}: {error}"));
             assert!(
                 matches!(
@@ -9122,6 +17914,128 @@ mod tests {
                     && !error_text.contains("run manifest")
                     && !error_text.contains("noncanonical"),
                 "{label} was rejected before semantic contract or replay validation: {error_text}"
+            );
+        }
+
+        type ProvenanceMutation = fn(&mut CampaignProvenance);
+        // Stored v7 replay proves relational integrity, not external
+        // authentication. Facts duplicated elsewhere in the report retain
+        // well-formed-but-inconsistent mutations below. The toolchain channel
+        // and Unicode-version facts have no independent stored witness, so
+        // their mutations must exercise the frozen stored-shape contract.
+        // `provenance_matches_every_engine_toolchain_and_query_pin` separately
+        // proves that well-formed alternatives fail creation against the exact
+        // live producer; the authenticated F0 chain, not this integrity-only
+        // loader, rejects a coherent rewrite of every stored byte.
+        let provenance_mutations: &[(&str, ProvenanceMutation)] = &[
+            ("producer_build_identity_sha256", |value| {
+                value.producer_build_identity_sha256 = "0".repeat(64);
+            }),
+            ("cargo_lock_sha256", |value| {
+                value.cargo_lock_sha256 = "0".repeat(64);
+            }),
+            ("rustc_version_verbose", |value| {
+                value.rustc_version_verbose.push_str("mismatch");
+            }),
+            ("rust_toolchain_channel", |value| {
+                value.rust_toolchain_channel.clear();
+            }),
+            ("unicode_version", |value| {
+                value.unicode_version = "0.0".to_owned();
+            }),
+            ("unicode_normalization_version", |value| {
+                value.unicode_normalization_version.clear();
+            }),
+            ("unicode_normalization_table_version", |value| {
+                value.unicode_normalization_table_version.clear();
+            }),
+            ("query_generator_id", |value| {
+                value.query_generator_id = "wrong-generator".to_owned();
+            }),
+            ("query_generator_schema_version", |value| {
+                value.query_generator_schema_version =
+                    value.query_generator_schema_version.saturating_add(1);
+            }),
+            ("query_seed", |value| {
+                value.query_seed ^= 1;
+            }),
+            ("query_source_identity_sha256", |value| {
+                value.query_source_identity_sha256 = "0".repeat(64);
+            }),
+            ("query_profile_sha256", |value| {
+                value.query_profile_sha256 = "0".repeat(64);
+            }),
+            ("analyzer_contract_hash", |value| {
+                value.analyzer_contract_hash = "0".repeat(64);
+            }),
+            ("schema_contract_hash", |value| {
+                value.schema_contract_hash = "0".repeat(64);
+            }),
+            ("corpus_manifest_hash", |value| {
+                value.corpus_manifest_hash = "0".repeat(64);
+            }),
+            ("query_manifest_hash", |value| {
+                value.query_manifest_hash = "0".repeat(64);
+            }),
+            ("corpus_seed", |value| {
+                value.corpus_seed = Some(value.corpus_seed.map_or(0, |seed| seed ^ 1));
+            }),
+        ];
+        assert_eq!(
+            provenance_mutations.len(),
+            17,
+            "campaign provenance mutation coverage must remain field-complete"
+        );
+        for &(field, mutate) in provenance_mutations {
+            let mut mutated_report = report.clone();
+            mutate(
+                mutated_report
+                    .provenance
+                    .as_mut()
+                    .expect("live mutation campaign must retain provenance"),
+            );
+            std::fs::write(
+                &reservation_path,
+                mutated_report
+                    .reservation_bytes_unchecked()
+                    .expect("encode coherently mutated campaign reservation"),
+            )
+            .expect("write coherently mutated campaign reservation");
+            std::fs::write(
+                &report_path,
+                mutated_report
+                    .canonical_bytes_unchecked()
+                    .expect("encode coherently mutated campaign report"),
+            )
+            .expect("write coherently mutated campaign report");
+            let mutated_completion_name = install_matching_completion_receipt(
+                &scratch_campaign,
+                &original_completion_name,
+                &mutated_report,
+            );
+
+            let error = store
+                .load_integrity_checked_campaign(&report.run_id)
+                .expect_err("integrity-checked campaign reload must reject mutated provenance");
+            assert_reached_past_completion(field, &error);
+            std::fs::write(&reservation_path, &original_reservation_bytes)
+                .expect("restore campaign reservation");
+            std::fs::write(&report_path, &original_report_bytes)
+                .expect("restore campaign report after provenance mutation");
+            let restored_completion_name = install_matching_completion_receipt(
+                &scratch_campaign,
+                &mutated_completion_name,
+                report,
+            );
+            assert_eq!(restored_completion_name, original_completion_name);
+            store
+                .load_integrity_checked_campaign(&report.run_id)
+                .unwrap_or_else(|error| {
+                    panic!("restored campaign failed after provenance {field}: {error}")
+                });
+            assert!(
+                matches!(&error, GauntletError::InvalidCampaign { .. }),
+                "provenance {field} must reach campaign provenance validation, got: {error}"
             );
         }
 
@@ -9153,15 +18067,29 @@ mod tests {
                 .expect("encode ordinal-swapped campaign report"),
         )
         .expect("write ordinal-swapped campaign report");
-        let error = store.load_verified_campaign(&report.run_id).expect_err(
-            "campaign evidence validator must reject a valid object at the wrong ordinal",
+        let swapped_completion_name = install_matching_completion_receipt(
+            &scratch_campaign,
+            &original_completion_name,
+            &swapped_report,
         );
+        let error = store
+            .load_integrity_checked_campaign(&report.run_id)
+            .expect_err(
+                "campaign evidence validator must reject a valid object at the wrong ordinal",
+            );
+        assert_reached_past_completion("ordinal swap", &error);
         std::fs::write(&target_case_path, &original_case_bytes)
             .expect("restore target run manifest after ordinal swap");
         std::fs::write(&report_path, &original_report_bytes)
             .expect("restore campaign report after ordinal swap");
+        let restored_completion_name = install_matching_completion_receipt(
+            &scratch_campaign,
+            &swapped_completion_name,
+            report,
+        );
+        assert_eq!(restored_completion_name, original_completion_name);
         store
-            .load_verified_campaign(&report.run_id)
+            .load_integrity_checked_campaign(&report.run_id)
             .unwrap_or_else(|error| panic!("restored campaign failed after ordinal swap: {error}"));
         assert!(
             matches!(&error, GauntletError::InvalidCampaign { .. })
@@ -9169,6 +18097,18 @@ mod tests {
                     .to_string()
                     .contains("campaign case result does not match its immutable artifact"),
             "valid but ordinal-mismatched object must reach campaign evidence validation: {error}"
+        );
+        existing_mutation_count += 1;
+        assert_eq!(
+            existing_mutation_count, 8,
+            "the pre-V3 mutation corpus must execute one raw-byte case, six missing-lane cases, \
+             and one wrong-ordinal case"
+        );
+        assert_eq!(
+            existing_mutation_count + typed_mutations.len() + provenance_mutations.len(),
+            85,
+            "the persisted Core V3 replay corpus must execute all 8 pre-V3, 60 typed, and 17 \
+             provenance mutations"
         );
     }
 
@@ -9217,13 +18157,205 @@ mod tests {
 
     #[cfg(feature = "tantivy-oracle")]
     #[test]
-    fn live_default_profile_campaign_stamps_provenance_and_reloads_verified() {
+    fn harvested_14_score_bits_preserve_ranked_and_counted_orders() {
+        let fixture = make_scalar_g1a_regression_fixture();
+        let lexical_revision = oracle_version_contract()
+            .expect("oracle version contract")
+            .lexical_contract_audit_revision;
+        let config = frankensearch_quill::QuillConfig {
+            deterministic_ingest: true,
+            ..frankensearch_quill::QuillConfig::default()
+        };
+        let mut subject = crate::engine::QuillSubject::in_memory_with_source(
+            config,
+            "harvested-14-score-regression",
+            false,
+        )
+        .expect("fresh scalar Quill subject");
+        let mut oracle = crate::engine::TantivyOracle::in_memory_scalar_g1a_with_source(
+            &lexical_revision,
+            false,
+        )
+        .expect("fresh scalar G1a Tantivy oracle");
+        let semantic_contract = SemanticContract::scalar_g1a();
+
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            DifferentialCampaignEngine::begin_corpus(
+                &mut subject,
+                &cx,
+                &fixture.corpus_manifest,
+                &semantic_contract,
+            )
+            .await
+            .expect("begin Quill corpus");
+            DifferentialCampaignEngine::begin_corpus(
+                &mut oracle,
+                &cx,
+                &fixture.corpus_manifest,
+                &semantic_contract,
+            )
+            .await
+            .expect("begin Tantivy corpus");
+            for batch in fixture.documents.chunks(5) {
+                DifferentialCampaignEngine::index_batch(&mut subject, &cx, batch)
+                    .await
+                    .expect("index Quill batch");
+                DifferentialCampaignEngine::index_batch(&mut oracle, &cx, batch)
+                    .await
+                    .expect("index Tantivy batch");
+            }
+            DifferentialCampaignEngine::commit_corpus(
+                &mut subject,
+                &cx,
+                &fixture.corpus_manifest,
+                &semantic_contract,
+            )
+            .await
+            .expect("commit Quill corpus");
+            DifferentialCampaignEngine::commit_corpus(
+                &mut oracle,
+                &cx,
+                &fixture.corpus_manifest,
+                &semantic_contract,
+            )
+            .await
+            .expect("commit Tantivy corpus");
+
+            const TARGET: &str = "test-cooking-015";
+            const FULL_QUERY: &str = "how to sear a steak properly";
+            let mut term_scores = Vec::new();
+            for query in ["how", "to", "sear", "a", "steak", "properly"] {
+                let quill = subject
+                    .index()
+                    .expect("committed Quill index")
+                    .search_paginated(&cx, query, 100, 0, false)
+                    .expect("search ranked Quill");
+                let tantivy = oracle
+                    .index()
+                    .search_doc_ids(&cx, query, 100)
+                    .expect("search ranked Tantivy");
+                let quill_score = quill
+                    .hits
+                    .iter()
+                    .find(|hit| hit.document_id == TARGET)
+                    .map(|hit| hit.score);
+                let tantivy_score = tantivy
+                    .iter()
+                    .find(|hit| hit.doc_id.as_str() == TARGET)
+                    .map(|hit| hit.bm25_score);
+                eprintln!(
+                    "harvested-14 query={query:?} quill={:?} tantivy={:?}",
+                    quill_score.map(f32::to_bits),
+                    tantivy_score.map(f32::to_bits)
+                );
+                assert_eq!(
+                    quill_score.map(f32::to_bits),
+                    tantivy_score.map(f32::to_bits),
+                    "single-term score drift for {query:?}"
+                );
+                if let Some(score) = quill_score {
+                    term_scores.push((query, score));
+                }
+            }
+            let parse_order_sum = term_scores
+                .iter()
+                .fold(0.0_f32, |sum, (_, score)| sum + score);
+            eprintln!(
+                "harvested-14 term_scores={:?} parse_order_sum={:#010x}",
+                term_scores
+                    .iter()
+                    .map(|(term, score)| (*term, score.to_bits()))
+                    .collect::<Vec<_>>(),
+                parse_order_sum.to_bits()
+            );
+
+            let quill_ranked = subject
+                .index()
+                .expect("committed Quill index")
+                .search_paginated(&cx, FULL_QUERY, 100, 0, false)
+                .expect("search ranked Quill aggregate");
+            let tantivy_ranked = oracle
+                .index()
+                .search_doc_ids(&cx, FULL_QUERY, 100)
+                .expect("search ranked Tantivy aggregate");
+            let quill_ranked_score = quill_ranked
+                .hits
+                .iter()
+                .find(|hit| hit.document_id == TARGET)
+                .expect("ranked Quill aggregate contains target")
+                .score;
+            let tantivy_ranked_score = tantivy_ranked
+                .iter()
+                .find(|hit| hit.doc_id.as_str() == TARGET)
+                .expect("ranked Tantivy aggregate contains target")
+                .bm25_score;
+            assert_eq!(
+                quill_ranked_score.to_bits(),
+                tantivy_ranked_score.to_bits(),
+                "ranked aggregate must preserve Tantivy TopDocs f32 accumulation order"
+            );
+            assert_eq!(
+                quill_ranked_score.to_bits(),
+                0x4005_5fc7,
+                "fixture must keep exercising the ranked TopDocs order"
+            );
+            assert_eq!(
+                parse_order_sum.to_bits(),
+                quill_ranked_score.to_bits(),
+                "ranked root must retain analyzed term order as children exhaust"
+            );
+
+            let quill_counted = subject
+                .index()
+                .expect("committed Quill index")
+                .search_paginated(&cx, FULL_QUERY, 100, 0, true)
+                .expect("search counted Quill aggregate");
+            let tantivy_counted = oracle
+                .index()
+                .search_doc_ids_counted(&cx, FULL_QUERY, 100)
+                .expect("search counted Tantivy aggregate");
+            let quill_counted_score = quill_counted
+                .hits
+                .iter()
+                .find(|hit| hit.document_id == TARGET)
+                .expect("counted Quill aggregate contains target")
+                .score;
+            let tantivy_counted_score = tantivy_counted
+                .iter()
+                .find(|hit| hit.doc_id.as_str() == TARGET)
+                .expect("counted Tantivy aggregate contains target")
+                .bm25_score;
+            assert_eq!(
+                quill_counted_score.to_bits(),
+                tantivy_counted_score.to_bits(),
+                "counted aggregate must preserve Tantivy exhaustive f32 accumulation order"
+            );
+            assert_eq!(
+                quill_counted_score.to_bits(),
+                0x4005_5fc8,
+                "fixture must keep exercising the exhaustive swap-remove order"
+            );
+            assert_ne!(
+                quill_ranked_score.to_bits(),
+                quill_counted_score.to_bits(),
+                "fixture must distinguish Tantivy's ranked and counted collector contracts"
+            );
+        });
+    }
+
+    #[cfg(feature = "tantivy-oracle")]
+    #[test]
+    fn live_default_profile_campaign_stamps_provenance_and_reloads_integrity_checked() {
         let temp = tempfile::tempdir().expect("tempdir");
         let root = live_pr_artifact_root(temp.path(), "default");
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             let report = run_live_default_profile_campaign(&cx, &root, "e6.9-default-pr-lane")
                 .await
                 .expect("live default-profile campaign must complete and pass");
+            assert_eq!(
+                report.execution_role,
+                ArtifactExecutionRole::BuiltInExecution
+            );
             assert!(
                 report.passed,
                 "default profile must be admissible: rank_mismatches={:?} lexical_mismatches={:?} coverage={:?} cases={:?}",
@@ -9382,7 +18514,7 @@ mod tests {
                 .provenance
                 .as_ref()
                 .expect("production campaign stamps provenance");
-            assert!(!provenance.subject_git_revision.is_empty());
+            assert!(is_lower_sha256(&provenance.producer_build_identity_sha256));
             assert!(!provenance.cargo_lock_sha256.is_empty());
             assert!(provenance.rustc_version_verbose.contains("release:"));
             assert!(provenance.rust_toolchain_channel.starts_with("nightly-"));
@@ -9420,19 +18552,39 @@ mod tests {
             assert_eq!(provenance.query_manifest_hash, report.query_manifest_hash);
             assert_eq!(provenance.corpus_seed, None);
 
-            // CI-grade acceptance: ONLY a verified reload counts as evidence.
+            let mut demoted = report.clone();
+            demoted.execution_role = ArtifactExecutionRole::Diagnostic;
+            assert!(
+                demoted.validate_contract().is_err(),
+                "a provenance-bearing built-in report cannot be relabeled diagnostic"
+            );
+            let mut without_provenance = report.clone();
+            without_provenance.provenance = None;
+            assert!(
+                without_provenance.validate_contract().is_err(),
+                "the built-in evidence role cannot survive removal of provenance"
+            );
+            let mut without_provenance_policy = report.clone();
+            without_provenance_policy.config.require_provenance = false;
+            assert!(
+                without_provenance_policy.validate_contract().is_err(),
+                "the built-in evidence role cannot survive removal of its provenance policy"
+            );
+
+            // This establishes durable relational integrity only. Terminal CI
+            // acceptance still requires the externally authenticated F0 chain.
             let reloaded = ArtifactStore::new(&root)
-                .load_verified_campaign("e6.9-default-pr-lane")
-                .expect("verified reload accepts the completed campaign");
-            assert_eq!(reloaded, report);
-            assert_eq!(reloaded.provenance, report.provenance);
+                .load_integrity_checked_campaign("e6.9-default-pr-lane")
+                .expect("integrity-checked reload accepts the completed campaign");
+            assert_eq!(reloaded.report(), &report);
+            assert_eq!(reloaded.report().provenance, report.provenance);
             assert_persisted_core_object_mutation_matrix_fails(&root, &report);
         });
     }
 
     #[cfg(feature = "tantivy-oracle")]
     #[test]
-    fn live_cass_profile_campaign_covers_contract_and_reloads_verified() {
+    fn live_cass_profile_campaign_covers_contract_and_reloads_integrity_checked() {
         let temp = tempfile::tempdir().expect("tempdir");
         let root = live_pr_artifact_root(temp.path(), "cass");
         asupersync::test_utils::run_test_with_cx(|cx| async move {
@@ -9440,6 +18592,10 @@ mod tests {
             let report = run_live_cass_profile_fixture(&cx, &root, "e6.9-cass-pr-lane", &fixture)
                 .await
                 .expect("live CASS campaign must complete");
+            assert_eq!(
+                report.execution_role,
+                ArtifactExecutionRole::BuiltInExecution
+            );
             assert!(
                 report.passed,
                 "CASS profile is green: {:?}",
@@ -9456,9 +18612,9 @@ mod tests {
             );
             assert_cass_campaign_is_nonvacuous(&root, &report);
             let reloaded = ArtifactStore::new(&root)
-                .load_verified_campaign("e6.9-cass-pr-lane")
-                .expect("verified reload accepts the CASS campaign");
-            assert_eq!(reloaded, report);
+                .load_integrity_checked_campaign("e6.9-cass-pr-lane")
+                .expect("integrity-checked reload accepts the CASS campaign");
+            assert_eq!(reloaded.report(), &report);
         });
     }
 
@@ -9470,7 +18626,7 @@ mod tests {
             run_live_default_profile_campaign(&cx, temp.path(), "e6.9-provenance-tamper")
                 .await
                 .expect("campaign completes");
-            // Tamper with the reservation's provenance block: the verified reload
+            // Tamper with the reservation's provenance block: relational replay
             // must reject the campaign instead of trusting it.
             let reservation_path = temp
                 .path()
@@ -9487,8 +18643,8 @@ mod tests {
                 serde_json::to_vec(&reservation).expect("serialize tampered"),
             )
             .expect("write tampered");
-            let rejected =
-                ArtifactStore::new(temp.path()).load_verified_campaign("e6.9-provenance-tamper");
+            let rejected = ArtifactStore::new(temp.path())
+                .load_integrity_checked_campaign("e6.9-provenance-tamper");
             assert!(rejected.is_err(), "tampered provenance fails closed");
         });
     }
@@ -9635,10 +18791,10 @@ mod tests {
             .expect("nightly full lane completes");
         assert!(report.passed, "nightly lane green: {:?}", report.mismatches);
         let reloaded = ArtifactStore::new(root)
-            .load_verified_campaign(run_id)
-            .expect("verified reload accepts the nightly campaign");
-        assert_eq!(reloaded, report);
-        reloaded
+            .load_integrity_checked_campaign(run_id)
+            .expect("integrity-checked reload accepts the nightly campaign");
+        assert_eq!(reloaded.report(), &report);
+        reloaded.report().clone()
     }
 
     #[cfg(feature = "tantivy-oracle")]
@@ -9658,10 +18814,10 @@ mod tests {
             report.mismatches
         );
         let reloaded = ArtifactStore::new(root)
-            .load_verified_campaign(run_id)
-            .expect("verified reload accepts the CASS nightly campaign");
-        assert_eq!(reloaded, report);
-        reloaded
+            .load_integrity_checked_campaign(run_id)
+            .expect("integrity-checked reload accepts the CASS nightly campaign");
+        assert_eq!(reloaded.report(), &report);
+        reloaded.report().clone()
     }
 
     #[cfg(feature = "tantivy-oracle")]

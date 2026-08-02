@@ -1,0 +1,10 @@
+{"harness":"w13_alloc_census","scale":"hundredk","docs":100000,"commits":20,"doc_count":100000,"warmup":50,"measured":200,"rows":[
+{"class":"term1","k":10,"allocs_per_query":1049.08,"reallocs_per_query":989.48,"bytes_per_query":18226569.6},
+{"class":"term1","k":100,"allocs_per_query":1060.91,"reallocs_per_query":989.16,"bytes_per_query":18032724.1},
+{"class":"union3","k":10,"allocs_per_query":2763.39,"reallocs_per_query":2967.05,"bytes_per_query":54151900.6},
+{"class":"union3","k":100,"allocs_per_query":2853.39,"reallocs_per_query":2967.05,"bytes_per_query":54162250.6},
+{"class":"phrase2","k":10,"allocs_per_query":11714.34,"reallocs_per_query":2034.10,"bytes_per_query":36309232.7},
+{"class":"phrase2","k":100,"allocs_per_query":11715.79,"reallocs_per_query":2034.10,"bytes_per_query":36315066.4},
+{"class":"mixed5","k":10,"allocs_per_query":4565.93,"reallocs_per_query":4947.93,"bytes_per_query":90121447.4},
+{"class":"mixed5","k":100,"allocs_per_query":4655.93,"reallocs_per_query":4947.93,"bytes_per_query":90131797.4}
+]}

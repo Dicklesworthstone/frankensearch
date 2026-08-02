@@ -25,7 +25,7 @@ use asupersync::Cx;
 use tracing::{debug, error, info, warn};
 
 use frankensearch_core::config::TwoTierConfig;
-use frankensearch_core::error::SearchResult;
+use frankensearch_core::error::{SearchError, SearchResult};
 use frankensearch_core::traits::Embedder;
 use frankensearch_index::{
     TwoTierIndex, VECTOR_INDEX_FALLBACK_FILENAME, VECTOR_INDEX_FAST_FILENAME,
@@ -157,6 +157,49 @@ struct EmbeddedRecord {
     content_hash: String,
 }
 
+/// Explain why the current refresh writer must not merge an existing generation.
+///
+/// Legacy FSVI v1 carries only a display id, revision string, and dimension.
+/// None proves vector-space compatibility, so even equal values must fail
+/// closed. FSVI v2 carries the required identity, but this refresh path still
+/// consumes raw embeddings and publishes through the legacy two-tier writer;
+/// allowing it to merge would discard that identity on the replacement. A
+/// future identity-bound writer can replace this refusal with exact typed
+/// identity comparison and v2 republication.
+fn incremental_merge_refusal(
+    fast_index: &VectorIndex,
+    quality_index: Option<&VectorIndex>,
+) -> SearchError {
+    let legacy_tier = if fast_index.identity_v2().is_none() {
+        Some("fast")
+    } else if quality_index.is_some_and(|index| index.identity_v2().is_none()) {
+        Some("quality")
+    } else {
+        None
+    };
+
+    if let Some(tier) = legacy_tier {
+        return SearchError::InvalidConfig {
+            field: format!("refresh.{tier}_index_identity"),
+            value: "identityless-fsvi-v1".to_owned(),
+            reason: "refusing incremental vector merge because the existing generation has no complete immutable embedding identity; a full identity-bound rebuild is required"
+                .to_owned(),
+        };
+    }
+
+    SearchError::InvalidConfig {
+        field: "refresh.index_publication".to_owned(),
+        value: "identity-bound-republication-unavailable".to_owned(),
+        reason: "refusing incremental vector merge because this refresh writer cannot preserve and republish FSVI v2 identity; a full identity-bound rebuild is required"
+            .to_owned(),
+    }
+}
+
+fn index_has_live_vectors(index: &VectorIndex) -> bool {
+    index.wal_records().next().is_some()
+        || (0..index.record_count()).any(|record_index| !index.is_deleted(record_index))
+}
+
 // ---------------------------------------------------------------------------
 // Refresh worker
 // ---------------------------------------------------------------------------
@@ -178,6 +221,14 @@ struct EmbeddedRecord {
 /// 2. Batch-embeds via the fast-tier [`Embedder`] (and optionally quality-tier)
 /// 3. Rebuilds the full `TwoTierIndex` from scratch
 /// 4. Atomically replaces the cached index via [`IndexCache::replace`]
+///
+/// # Legacy incremental safety boundary
+///
+/// The current two-tier writer emits identityless FSVI v1 artifacts. It may
+/// publish the initial generation, but a later non-empty cycle refuses to merge
+/// that generation before draining, leaving queued jobs and retry counts
+/// untouched. Operators must run a full identity-bound rebuild until this path
+/// consumes bound embeddings and republishes complete FSVI v2 identity.
 ///
 /// # Cancellation
 ///
@@ -298,10 +349,18 @@ impl RefreshWorker {
     ///
     /// # Errors
     ///
-    /// Returns errors from index creation/writing. Embedding failures for
-    /// individual documents are handled via retry (requeue) and do not
-    /// cause the cycle to fail.
+    /// Returns identity-admission and index creation/writing errors. Embedding
+    /// failures for individual documents are handled via retry (requeue) and
+    /// do not cause the cycle to fail.
     pub async fn run_cycle(&self, cx: &Cx) -> SearchResult<usize> {
+        // Avoid opening the index on idle polls, but refuse any unsafe merge
+        // before draining work. A permanent identity-admission failure must not
+        // consume retry budget or eventually drop the queued documents.
+        if self.queue.is_empty() {
+            return Ok(0);
+        }
+        self.ensure_no_existing_generation_for_merge()?;
+
         // Drain at most `max_docs_per_cycle` jobs from the queue.
         let mut all_jobs = Vec::new();
         let batch_limit = self.config.max_docs_per_cycle;
@@ -535,8 +594,55 @@ impl RefreshWorker {
         }
     }
 
+    /// Refuse to merge any active generation until refresh publication is
+    /// identity-bound end to end.
+    fn ensure_no_existing_generation_for_merge(&self) -> SearchResult<()> {
+        let fast_path = self.config.index_dir.join(VECTOR_INDEX_FAST_FILENAME);
+        let fallback_path = self.config.index_dir.join(VECTOR_INDEX_FALLBACK_FILENAME);
+        let existing_fast_path = if fast_path.exists() {
+            Some(fast_path)
+        } else if fallback_path.exists() {
+            Some(fallback_path)
+        } else {
+            None
+        };
+
+        let Some(existing_fast_path) = existing_fast_path else {
+            return Ok(());
+        };
+
+        let fast_index = VectorIndex::open(&existing_fast_path)?;
+        let quality_path = self.config.index_dir.join(VECTOR_INDEX_QUALITY_FILENAME);
+        let quality_index = if quality_path.exists() {
+            Some(VectorIndex::open(&quality_path)?)
+        } else {
+            None
+        };
+
+        // Replacing an empty bootstrap artifact cannot mix vector spaces. The
+        // cache requires such a seed before the first real refresh, so admit it
+        // only when neither tier has a live main-slab or WAL-resident vector.
+        let fast_is_empty = !index_has_live_vectors(&fast_index);
+        let quality_is_empty = quality_index
+            .as_ref()
+            .is_none_or(|index| !index_has_live_vectors(index));
+        if fast_is_empty && quality_is_empty {
+            return Ok(());
+        }
+
+        Err(incremental_merge_refusal(
+            &fast_index,
+            quality_index.as_ref(),
+        ))
+    }
+
     /// Rebuild the `TwoTierIndex` from embedded records.
     fn rebuild_index(&self, records: &[EmbeddedRecord]) -> SearchResult<TwoTierIndex> {
+        // Repeat the admission check after embedding to close the race where
+        // another publisher installs a generation between the pre-drain check
+        // and this rebuild. Only this race fallback consumes one retry.
+        self.ensure_no_existing_generation_for_merge()?;
+
         let mut builder =
             TwoTierIndex::create(&self.config.index_dir, self.config.index_config.clone())?;
 
@@ -551,79 +657,6 @@ impl RefreshWorker {
         for (idx, record) in records.iter().enumerate() {
             if let Some(previous) = latest_by_doc_id.insert(record.doc_id.as_str(), idx) {
                 consumed[previous] = true;
-            }
-        }
-
-        // Merge with the previously built index so incremental cycles don't
-        // drop documents that were not part of this queue drain.
-        let fast_path = self.config.index_dir.join(VECTOR_INDEX_FAST_FILENAME);
-        let fallback_path = self.config.index_dir.join(VECTOR_INDEX_FALLBACK_FILENAME);
-        let existing_fast_path = if fast_path.exists() {
-            Some(fast_path)
-        } else if fallback_path.exists() {
-            Some(fallback_path)
-        } else {
-            None
-        };
-
-        if let Some(existing_fast_path) = existing_fast_path {
-            let fast_index = VectorIndex::open(&existing_fast_path)?;
-
-            let quality_path = self.config.index_dir.join(VECTOR_INDEX_QUALITY_FILENAME);
-            let existing_quality = if quality_path.exists() {
-                Some(VectorIndex::open(&quality_path)?)
-            } else {
-                None
-            };
-
-            // Preserve prior quality embedder metadata when the current worker
-            // is not configured with a quality embedder but a quality tier exists.
-            if self.quality_embedder.is_none()
-                && let Some(ref quality_index) = existing_quality
-            {
-                builder.set_quality_embedder_id(quality_index.embedder_id());
-            }
-
-            let mut quality_index_by_doc_id = HashMap::new();
-            if let Some(ref quality_index) = existing_quality {
-                quality_index_by_doc_id.reserve(quality_index.record_count());
-                for quality_idx in 0..quality_index.record_count() {
-                    let doc_id = quality_index.doc_id_at(quality_idx)?;
-                    quality_index_by_doc_id
-                        .entry(doc_id.to_owned())
-                        .or_insert(quality_idx);
-                }
-            }
-
-            for fast_idx in 0..fast_index.record_count() {
-                let doc_id = fast_index.doc_id_at(fast_idx)?;
-                if let Some(&record_idx) = latest_by_doc_id.get(doc_id) {
-                    let record = &records[record_idx];
-                    builder.add_record(
-                        record.doc_id.clone(),
-                        &record.fast_embedding,
-                        record.quality_embedding.as_deref(),
-                    )?;
-                    consumed[record_idx] = true;
-                    continue;
-                }
-
-                let fast_embedding = fast_index.vector_at_f32(fast_idx)?;
-                let quality_embedding = if let Some(ref quality_index) = existing_quality {
-                    if let Some(&quality_idx) = quality_index_by_doc_id.get(doc_id) {
-                        Some(quality_index.vector_at_f32(quality_idx)?)
-                    } else {
-                        None
-                    }
-                } else {
-                    None
-                };
-
-                builder.add_record(
-                    doc_id.to_owned(),
-                    &fast_embedding,
-                    quality_embedding.as_deref(),
-                )?;
             }
         }
 
@@ -673,18 +706,27 @@ mod tests {
     struct StubEmbedder {
         id: &'static str,
         dimension: usize,
+        space_offset: f32,
     }
 
     impl StubEmbedder {
         const fn new(id: &'static str, dimension: usize) -> Self {
-            Self { id, dimension }
+            Self::in_space(id, dimension, 0.0)
+        }
+
+        const fn in_space(id: &'static str, dimension: usize, space_offset: f32) -> Self {
+            Self {
+                id,
+                dimension,
+                space_offset,
+            }
         }
     }
 
     impl Embedder for StubEmbedder {
         fn embed<'a>(&'a self, _cx: &'a Cx, text: &'a str) -> SearchFuture<'a, Vec<f32>> {
             let dim = self.dimension;
-            let seed = text.len() as f32;
+            let seed = text.len() as f32 + self.space_offset;
             Box::pin(async move { Ok((0..dim).map(|i| (seed + i as f32).sin()).collect()) })
         }
 
@@ -929,7 +971,7 @@ mod tests {
     }
 
     #[test]
-    fn multiple_cycles_accumulate_metrics() {
+    fn pre_drain_refusal_does_not_charge_embedding_or_rebuild_metrics() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             let dir = temp_index_dir("multi");
             let queue = make_queue(100);
@@ -940,13 +982,18 @@ mod tests {
             submit(&queue, "doc-2", "Second");
             worker.run_cycle(&cx).await.unwrap();
 
-            // Cycle 2: 1 doc.
+            // Cycle 2 refuses before draining or embedding the pending job.
             submit(&queue, "doc-3", "Third");
-            worker.run_cycle(&cx).await.unwrap();
+            worker
+                .run_cycle(&cx)
+                .await
+                .expect_err("legacy incremental merge must fail closed");
 
             let snap = worker.metrics().snapshot();
-            assert_eq!(snap.docs_embedded, 3);
-            assert_eq!(snap.index_rebuilds, 2);
+            assert_eq!(snap.docs_embedded, 2);
+            assert_eq!(snap.index_rebuilds, 1);
+            assert_eq!(snap.rebuild_failures, 0);
+            assert_eq!(queue.pending_count(), 1);
         });
     }
 
@@ -973,7 +1020,7 @@ mod tests {
     }
 
     #[test]
-    fn incremental_rebuild_preserves_docs_not_in_current_batch() {
+    fn identityless_incremental_refusal_preserves_active_generation() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             let dir = temp_index_dir("preserve-existing");
             let queue = make_queue(100);
@@ -983,19 +1030,173 @@ mod tests {
             submit(&queue, "doc-2", "Second");
             worker.run_cycle(&cx).await.expect("first cycle");
 
+            let fast_path = dir.join(VECTOR_INDEX_FAST_FILENAME);
+            let original_bytes = std::fs::read(&fast_path).expect("read active generation");
+
             submit(&queue, "doc-3", "Third");
-            worker.run_cycle(&cx).await.expect("second cycle");
+            let error = worker
+                .run_cycle(&cx)
+                .await
+                .expect_err("identityless incremental merge must fail closed");
+            assert!(matches!(
+                error,
+                SearchError::InvalidConfig { ref field, ref value, .. }
+                    if field == "refresh.fast_index_identity"
+                        && value == "identityless-fsvi-v1"
+            ));
+            assert_eq!(queue.pending_count(), 1, "failed job must be requeued");
+            assert_eq!(
+                std::fs::read(&fast_path).expect("reread active generation"),
+                original_bytes,
+                "refusal must not mutate or replace the active generation"
+            );
 
             let current = cache.current();
             assert_eq!(
                 current.doc_count(),
-                3,
-                "second incremental cycle must preserve previously indexed docs"
+                2,
+                "cache must continue serving the prior active generation"
             );
             let doc_ids: Vec<String> = current.iter_doc_ids().filter_map(Result::ok).collect();
             assert!(doc_ids.iter().any(|id| id == "doc-1"));
             assert!(doc_ids.iter().any(|id| id == "doc-2"));
-            assert!(doc_ids.iter().any(|id| id == "doc-3"));
+            assert!(!doc_ids.iter().any(|id| id == "doc-3"));
+        });
+    }
+
+    #[test]
+    fn same_id_same_dimension_changed_space_cannot_bypass_identityless_refusal() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let dir = temp_index_dir("fast-id-change");
+            let queue = make_queue(100);
+            let cache = make_cache(&dir, 256);
+            let config = RefreshWorkerConfig::new(&dir);
+            let original_embedder = Arc::new(StubEmbedder::in_space("stub-fast", 256, 0.0));
+            let changed_embedder = Arc::new(StubEmbedder::in_space("stub-fast", 256, 100.0));
+            assert_eq!(original_embedder.id(), changed_embedder.id());
+            assert_eq!(original_embedder.dimension(), changed_embedder.dimension());
+            let original_probe = original_embedder
+                .embed(&cx, "space probe")
+                .await
+                .expect("original probe");
+            let changed_probe = changed_embedder
+                .embed(&cx, "space probe")
+                .await
+                .expect("changed probe");
+            assert!(
+                original_probe
+                    .iter()
+                    .zip(&changed_probe)
+                    .any(|(original, changed)| original.to_bits() != changed.to_bits()),
+                "fixture must represent a real same-id, same-dimension space change"
+            );
+            let original = RefreshWorker::new(
+                config.clone(),
+                queue.clone(),
+                original_embedder,
+                cache.clone(),
+            );
+
+            submit(&queue, "doc-old", "old generation");
+            original.run_cycle(&cx).await.expect("initial generation");
+
+            let fast_path = dir.join(VECTOR_INDEX_FAST_FILENAME);
+            let original_bytes = std::fs::read(&fast_path).expect("read original fast index");
+            let changed = RefreshWorker::new(config, queue.clone(), changed_embedder, cache);
+
+            submit(&queue, "doc-new", "new generation");
+            let error = changed
+                .run_cycle(&cx)
+                .await
+                .expect_err("identityless generation must fail closed before vector merge");
+
+            assert!(matches!(
+                error,
+                SearchError::InvalidConfig { ref field, ref value, .. }
+                    if field == "refresh.fast_index_identity"
+                        && value == "identityless-fsvi-v1"
+            ));
+            assert_eq!(queue.pending_count(), 1, "failed job must be requeued");
+            assert_eq!(
+                std::fs::read(&fast_path).expect("reread fast index"),
+                original_bytes,
+                "failed refresh must not re-stamp the existing generation"
+            );
+            let reopened = VectorIndex::open(&fast_path).expect("reopen original fast index");
+            assert_eq!(reopened.embedder_id(), "stub-fast");
+            let live_ids = reopened.live_doc_ids().expect("live ids");
+            assert_eq!(live_ids.len(), 1);
+            assert!(live_ids.contains("doc-old"));
+        });
+    }
+
+    #[test]
+    fn unchanged_ids_cannot_exhaust_retry_budget_while_legacy_generation_is_blocked() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let dir = temp_index_dir("unchanged-tier-ids");
+            let queue = make_queue(100);
+            let cache = make_cache(&dir, 256);
+            let worker = RefreshWorker::new(
+                RefreshWorkerConfig::new(&dir),
+                queue.clone(),
+                Arc::new(StubEmbedder::new("stub-fast", 256)),
+                cache.clone(),
+            )
+            .with_quality_embedder(Arc::new(StubEmbedder::new("stub-quality", 384)));
+
+            submit(&queue, "doc-old", "old generation");
+            worker.run_cycle(&cx).await.expect("initial generation");
+
+            let fast_path = dir.join(VECTOR_INDEX_FAST_FILENAME);
+            let quality_path = dir.join(VECTOR_INDEX_QUALITY_FILENAME);
+            let original_fast_bytes = std::fs::read(&fast_path).expect("read original fast index");
+            let original_quality_bytes =
+                std::fs::read(&quality_path).expect("read original quality index");
+
+            submit(&queue, "doc-new", "new generation");
+            let refusal_cycles = queue.config().max_retries + 2;
+            for _ in 0..refusal_cycles {
+                let error = worker
+                    .run_cycle(&cx)
+                    .await
+                    .expect_err("matching display ids must not admit a legacy merge");
+                assert!(matches!(
+                    error,
+                    SearchError::InvalidConfig { ref field, ref value, .. }
+                        if field == "refresh.fast_index_identity"
+                            && value == "identityless-fsvi-v1"
+                ));
+            }
+            assert_eq!(
+                queue.pending_count(),
+                1,
+                "permanent refusal must leave the job queued beyond max_retries"
+            );
+            assert_eq!(
+                std::fs::read(&fast_path).expect("reread fast index"),
+                original_fast_bytes,
+                "refusal must not replace the fast generation"
+            );
+            assert_eq!(
+                std::fs::read(&quality_path).expect("reread quality index"),
+                original_quality_bytes,
+                "refusal must not replace the quality generation"
+            );
+            assert_eq!(cache.current().doc_count(), 1);
+            let fast = VectorIndex::open(&fast_path).expect("open fast index");
+            let quality = VectorIndex::open(&quality_path).expect("open quality index");
+            assert_eq!(fast.embedder_id(), "stub-fast");
+            assert_eq!(quality.embedder_id(), "stub-quality");
+            assert_eq!(fast.live_doc_ids().expect("fast live ids").len(), 1);
+            assert_eq!(quality.live_doc_ids().expect("quality live ids").len(), 1);
+
+            let pending = queue.drain_batch();
+            assert_eq!(pending.len(), 1);
+            assert_eq!(pending[0].doc_id, "doc-new");
+            assert_eq!(
+                pending[0].retry_count, 0,
+                "pre-drain refusal must not consume retry budget"
+            );
         });
     }
 
@@ -1297,7 +1498,7 @@ mod tests {
     }
 
     #[test]
-    fn incremental_rebuild_updates_existing_doc() {
+    fn identityless_incremental_refusal_does_not_overwrite_existing_doc() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             let dir = temp_index_dir("update-doc");
             let queue = make_queue(100);
@@ -1318,19 +1519,78 @@ mod tests {
                     submitted_at: Instant::now(),
                 })
                 .unwrap();
-            worker.run_cycle(&cx).await.unwrap();
+            worker
+                .run_cycle(&cx)
+                .await
+                .expect_err("legacy update must require an identity-bound rebuild");
 
-            // Should still have exactly 1 doc (updated, not duplicated).
+            // The active generation remains available, and the update remains
+            // queued for a later full identity-bound rebuild.
             let current = cache.current();
             assert_eq!(current.doc_count(), 1);
             let doc_ids: Vec<String> = current.iter_doc_ids().filter_map(Result::ok).collect();
             assert_eq!(doc_ids.len(), 1);
             assert_eq!(doc_ids[0], "doc-1");
+            assert_eq!(queue.pending_count(), 1);
+        });
+    }
+
+    /// Fleet-review regression pin: refusing an identityless generation must
+    /// neither resurrect soft-deleted documents nor drop WAL-resident appends.
+    #[test]
+    fn identityless_rebuild_refusal_preserves_tombstones_and_wal_residents() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let dir = temp_index_dir("tombstone-wal-rebuild");
+            let queue = make_queue(100);
+            let cache = make_cache(&dir, 256);
+            let config =
+                RefreshWorkerConfig::new(&dir).with_poll_interval(Duration::from_millis(10));
+            let fast = Arc::new(StubEmbedder::new("stub-fast", 256));
+            let worker = RefreshWorker::new(config, queue.clone(), fast.clone(), cache.clone());
+
+            submit(&queue, "doc-keep", "kept document");
+            submit(&queue, "doc-delete", "doomed document");
+            worker.run_cycle(&cx).await.unwrap();
+            assert_eq!(cache.current().doc_count(), 2);
+
+            // Out-of-band mutations through the public index API, exactly
+            // as an application deleting/appending between cycles does.
+            let fast_path = dir.join(VECTOR_INDEX_FAST_FILENAME);
+            {
+                let mut index =
+                    frankensearch_index::VectorIndex::open(&fast_path).expect("open fast tier");
+                assert!(index.soft_delete("doc-delete").expect("soft delete"));
+                let dim = index.dimension();
+                index
+                    .append("doc-wal", &vec![0.25_f32; dim])
+                    .expect("wal append");
+            }
+
+            submit(&queue, "doc-new", "new document");
+            worker
+                .run_cycle(&cx)
+                .await
+                .expect_err("legacy WAL-bearing generation must not be republished");
+
+            let preserved =
+                frankensearch_index::VectorIndex::open(&fast_path).expect("reopen fast tier");
+            let live = preserved.live_doc_ids().expect("live ids");
+            assert!(
+                !live.contains("doc-delete"),
+                "refusal must not resurrect the soft-deleted document: {live:?}"
+            );
+            assert!(
+                live.contains("doc-wal"),
+                "refusal must preserve the WAL-resident append: {live:?}"
+            );
+            assert!(live.contains("doc-keep"), "{live:?}");
+            assert!(!live.contains("doc-new"), "{live:?}");
+            assert_eq!(queue.pending_count(), 1);
         });
     }
 
     #[test]
-    fn rebuild_preserves_quality_tier_from_prior_cycle() {
+    fn identityless_refusal_preserves_prior_quality_tier() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             let dir = temp_index_dir("quality-preserve");
             let queue = make_queue(100);
@@ -1355,11 +1615,17 @@ mod tests {
             let worker_fast_only = RefreshWorker::new(config2, queue.clone(), fast, cache.clone());
 
             submit(&queue, "doc-2", "Another document");
-            worker_fast_only.run_cycle(&cx).await.unwrap();
+            worker_fast_only
+                .run_cycle(&cx)
+                .await
+                .expect_err("legacy two-tier generation must fail closed");
 
-            // Should still have both docs.
+            // The prior quality generation remains active and the new work is
+            // requeued for a full identity-bound rebuild.
             let current = cache.current();
-            assert_eq!(current.doc_count(), 2);
+            assert_eq!(current.doc_count(), 1);
+            assert!(current.has_quality_index());
+            assert_eq!(queue.pending_count(), 1);
         });
     }
 

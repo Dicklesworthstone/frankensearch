@@ -10,11 +10,13 @@ use std::ops::{Bound, Deref};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 #[cfg(feature = "conformance-internals")]
+use std::sync::Mutex as StdMutex;
+#[cfg(feature = "conformance-internals")]
 use std::sync::atomic::{AtomicBool, AtomicU8};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use arc_swap::ArcSwap;
+use arc_swap::{ArcSwap, ArcSwapOption};
 use asupersync::Cx;
 use asupersync::runtime::spawn_blocking;
 use asupersync::sync::{LockError, Mutex, OwnedMutexGuard, TryLockError};
@@ -25,6 +27,8 @@ use frankensearch_core::{
 #[cfg(feature = "durability")]
 use frankensearch_durability::FileProtector;
 use rayon::prelude::*;
+#[cfg(feature = "pruning-conformance")]
+use serde::{Deserialize, Serialize};
 #[cfg(feature = "conformance-internals")]
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -38,11 +42,13 @@ use crate::argus::{
     QueryWorkCheckpoint, QueryWorkKind, ReferenceScorer, ScorerClause, SealedPostingCursor,
     TermRecordOption, TermScorer, TopDocsCollector,
 };
+#[cfg(feature = "pruning-conformance")]
+use crate::argus::{ConformanceUnionRefill, ConformanceUnionRefillStrategy};
 use crate::config::QuillConfig;
 use crate::delta::DeltaSnapshot;
 use crate::error::QuillError;
 use crate::grimoire::{
-    ByteSpan, TermDictionary, TermDictionaryError, TermSectionLengths, star_glob_matches,
+    ByteSpan, MAX_TERM_BYTES, TermDictionary, TermDictionaryError, star_glob_matches,
     trailing_star_prefix, validate_bound_term, validate_query_term,
 };
 #[cfg(feature = "durability")]
@@ -64,13 +70,13 @@ use crate::quiver::{
     PositionCodecError, PositionList, Posting, PostingCodecError, PostingList, SnapshotFieldStats,
     StoredMetaCodecError, StoredMetaSection,
 };
-use crate::schema::{DEFAULT_SCHEMA, FieldKind, SchemaDescriptor};
+use crate::schema::{Analyzer, DEFAULT_SCHEMA, FieldKind, SchemaDescriptor};
 use crate::scribe::{
-    AccumulatorError, ColumnarAccumulator, DOC_ORDS_PER_LEASE, DeltaFlushInput, DocIdAllocator,
-    DocIdSpan,
-    FlushDocumentInput, FlushError, FlushMode, FlushSegmentInput, IndexedFieldValue,
-    IndexedNumericValue, ShardRouter, StoredFieldValue, flush_accumulator_with_mode,
-    flush_delta_snapshot,
+    AccumulatorError, ArenaSpan, ColumnarAccumulator, DEFAULT_ARENA_CHUNK_BYTES,
+    DOC_ORDS_PER_LEASE, DeltaFlushInput, DocIdAllocator, DocIdSpan, FIELD_PREFIX_BYTES,
+    FlushDocumentInput, FlushError, FlushMode, FlushSegmentInput, FrankensearchTokenizer,
+    IndexedFieldValue, IndexedNumericValue, ShardRouter, StoredFieldValue,
+    TERM_BUCKET_BYTES_ESTIMATE, TokenAnalyzer, flush_accumulator_with_mode, flush_delta_snapshot,
 };
 use crate::segment::{EncodedSegment, SectionKind};
 use crate::snippet::{SnippetConfig, SnippetGenerator, SnippetTerm};
@@ -82,6 +88,12 @@ const TITLE_FIELD: u16 = 2;
 const METADATA_FIELD: u16 = 3;
 const ORD_FIELD: u16 = 4;
 const MAX_GLOBAL_DOCID_EXCLUSIVE: u64 = 1_u64 << 32;
+const PARALLEL_INGEST_MIN_DOCS_PER_SHARD: usize = 64;
+const PARALLEL_INGEST_PLANNER_VERSION: u8 = 1;
+const PARALLEL_ARENA_BUDGET_DIVISOR: usize = 2;
+const MIN_ARENA_CHUNK_BYTES: usize = 4096;
+const INTERNAL_PARALLEL_INGEST_SHARDS: usize = 4;
+const CONTENT_HASH_DOMAIN: &[u8] = b"frankensearch.quill.idmap-content.v2\0";
 
 /// Typed failure from the scalar shipping facade.
 #[derive(Debug, Error)]
@@ -241,6 +253,344 @@ pub struct QuillSearchResult {
     pub doc_count: u64,
     /// Lenient parser recovery diagnostics.
     pub diagnostics: Vec<QueryDiagnostic>,
+}
+
+const RANKED_QUERY_CACHE_SETS: usize = 64;
+const RANKED_QUERY_CACHE_WAYS: usize = 4;
+const RANKED_QUERY_CACHE_SLOTS: usize = RANKED_QUERY_CACHE_SETS * RANKED_QUERY_CACHE_WAYS;
+
+enum RankedQueryCacheKey {
+    Raw(Arc<str>),
+    #[cfg(any(test, feature = "bench-internals"))]
+    Preparsed(Arc<Query>),
+}
+
+struct CachedRankedQuery {
+    fingerprint: u64,
+    snapshot_epoch: u64,
+    limit: usize,
+    offset: usize,
+    exact_count: bool,
+    key: RankedQueryCacheKey,
+    result: Arc<QuillSearchResult>,
+}
+
+/// Small lock-free memo table for immutable-snapshot searches.
+///
+/// Exact keys are retained alongside their fingerprints, so collisions only
+/// cost a miss. Snapshot epochs make publication the invalidation boundary.
+/// The fixed four-way table bounds memory without adding reader coordination.
+struct RankedQueryCache {
+    slots: [ArcSwapOption<CachedRankedQuery>; RANKED_QUERY_CACHE_SLOTS],
+}
+
+impl Default for RankedQueryCache {
+    fn default() -> Self {
+        Self {
+            slots: std::array::from_fn(|_| ArcSwapOption::empty()),
+        }
+    }
+}
+
+impl RankedQueryCache {
+    fn get_raw(
+        &self,
+        snapshot_epoch: u64,
+        query: &str,
+        limit: usize,
+        offset: usize,
+        exact_count: bool,
+    ) -> Option<QuillSearchResult> {
+        let fingerprint =
+            raw_query_cache_fingerprint(snapshot_epoch, query, limit, offset, exact_count);
+        self.find(fingerprint, |cached| {
+            cached.snapshot_epoch == snapshot_epoch
+                && cached.limit == limit
+                && cached.offset == offset
+                && cached.exact_count == exact_count
+                && matches!(&cached.key, RankedQueryCacheKey::Raw(key) if key.as_ref() == query)
+        })
+    }
+
+    #[cfg(any(test, feature = "bench-internals"))]
+    fn get_preparsed(
+        &self,
+        snapshot_epoch: u64,
+        query: &Query,
+        limit: usize,
+        offset: usize,
+        exact_count: bool,
+    ) -> Option<QuillSearchResult> {
+        let fingerprint =
+            preparsed_query_cache_fingerprint(snapshot_epoch, query, limit, offset, exact_count);
+        self.find(fingerprint, |cached| {
+            cached.snapshot_epoch == snapshot_epoch
+                && cached.limit == limit
+                && cached.offset == offset
+                && cached.exact_count == exact_count
+                && matches!(&cached.key, RankedQueryCacheKey::Preparsed(key) if key.as_ref() == query)
+        })
+    }
+
+    fn find(
+        &self,
+        fingerprint: u64,
+        exact_match: impl Fn(&CachedRankedQuery) -> bool,
+    ) -> Option<QuillSearchResult> {
+        let start = ranked_query_cache_set_start(fingerprint);
+        let set = self
+            .slots
+            .get(start..start.checked_add(RANKED_QUERY_CACHE_WAYS)?)?;
+        for slot in set {
+            let Some(cached) = slot.load_full() else {
+                continue;
+            };
+            if cached.fingerprint == fingerprint && exact_match(cached.as_ref()) {
+                return Some(cached.result.as_ref().clone());
+            }
+        }
+        None
+    }
+
+    fn insert_raw(
+        &self,
+        snapshot_epoch: u64,
+        query: &str,
+        limit: usize,
+        offset: usize,
+        exact_count: bool,
+        result: &QuillSearchResult,
+    ) {
+        let fingerprint =
+            raw_query_cache_fingerprint(snapshot_epoch, query, limit, offset, exact_count);
+        self.insert(Arc::new(CachedRankedQuery {
+            fingerprint,
+            snapshot_epoch,
+            limit,
+            offset,
+            exact_count,
+            key: RankedQueryCacheKey::Raw(Arc::from(query)),
+            result: Arc::new(result.clone()),
+        }));
+    }
+
+    #[cfg(any(test, feature = "bench-internals"))]
+    fn insert_preparsed(
+        &self,
+        snapshot_epoch: u64,
+        query: &Query,
+        limit: usize,
+        offset: usize,
+        exact_count: bool,
+        result: &QuillSearchResult,
+    ) {
+        let fingerprint =
+            preparsed_query_cache_fingerprint(snapshot_epoch, query, limit, offset, exact_count);
+        self.insert(Arc::new(CachedRankedQuery {
+            fingerprint,
+            snapshot_epoch,
+            limit,
+            offset,
+            exact_count,
+            key: RankedQueryCacheKey::Preparsed(Arc::new(query.clone())),
+            result: Arc::new(result.clone()),
+        }));
+    }
+
+    fn insert(&self, cached: Arc<CachedRankedQuery>) {
+        let start = ranked_query_cache_set_start(cached.fingerprint);
+        let Some(end) = start.checked_add(RANKED_QUERY_CACHE_WAYS) else {
+            return;
+        };
+        let Some(set) = self.slots.get(start..end) else {
+            return;
+        };
+        if let Some(slot) = set.iter().find(|slot| slot.load().is_none()) {
+            slot.store(Some(cached));
+            return;
+        }
+        let [_, replacement_byte, ..] = cached.fingerprint.to_le_bytes();
+        let replacement = usize::from(replacement_byte) & (RANKED_QUERY_CACHE_WAYS - 1);
+        if let Some(slot) = set.get(replacement) {
+            slot.store(Some(cached));
+        }
+    }
+}
+
+fn ranked_query_cache_set_start(fingerprint: u64) -> usize {
+    let [set_byte, ..] = fingerprint.to_le_bytes();
+    let set = usize::from(set_byte) & (RANKED_QUERY_CACHE_SETS - 1);
+    set * RANKED_QUERY_CACHE_WAYS
+}
+
+fn raw_query_cache_fingerprint(
+    snapshot_epoch: u64,
+    query: &str,
+    limit: usize,
+    offset: usize,
+    exact_count: bool,
+) -> u64 {
+    let mut hasher = ranked_query_cache_hasher(snapshot_epoch, limit, offset, exact_count);
+    hasher.update(&[0]);
+    hash_query_cache_bytes(&mut hasher, query.as_bytes());
+    hasher.digest()
+}
+
+#[cfg(any(test, feature = "bench-internals"))]
+fn preparsed_query_cache_fingerprint(
+    snapshot_epoch: u64,
+    query: &Query,
+    limit: usize,
+    offset: usize,
+    exact_count: bool,
+) -> u64 {
+    let mut hasher = ranked_query_cache_hasher(snapshot_epoch, limit, offset, exact_count);
+    hasher.update(&[1]);
+    hash_exact_query(&mut hasher, query);
+    hasher.digest()
+}
+
+fn ranked_query_cache_hasher(
+    snapshot_epoch: u64,
+    limit: usize,
+    offset: usize,
+    exact_count: bool,
+) -> Xxh3 {
+    let mut hasher = Xxh3::new();
+    hasher.update(b"frankensearch.quill.ranked-query-cache.v1\0");
+    hasher.update(&snapshot_epoch.to_le_bytes());
+    hasher.update(&u64::try_from(limit).unwrap_or(u64::MAX).to_le_bytes());
+    hasher.update(&u64::try_from(offset).unwrap_or(u64::MAX).to_le_bytes());
+    hasher.update(&[u8::from(exact_count)]);
+    hasher
+}
+
+fn hash_query_cache_bytes(hasher: &mut Xxh3, bytes: &[u8]) {
+    hasher.update(&u64::try_from(bytes.len()).unwrap_or(u64::MAX).to_le_bytes());
+    hasher.update(bytes);
+}
+
+#[cfg(any(test, feature = "bench-internals"))]
+fn hash_query_cache_len(hasher: &mut Xxh3, len: usize) {
+    hasher.update(&u64::try_from(len).unwrap_or(u64::MAX).to_le_bytes());
+}
+
+#[cfg(any(test, feature = "bench-internals"))]
+fn hash_query_cache_value(hasher: &mut Xxh3, value: &QueryValue) {
+    match value {
+        QueryValue::I64(value) => {
+            hasher.update(&[0]);
+            hasher.update(&value.to_le_bytes());
+        }
+        QueryValue::U64(value) => {
+            hasher.update(&[1]);
+            hasher.update(&value.to_le_bytes());
+        }
+        QueryValue::Str(value) => {
+            hasher.update(&[2]);
+            hash_query_cache_bytes(hasher, value.as_bytes());
+        }
+    }
+}
+
+#[cfg(any(test, feature = "bench-internals"))]
+fn hash_query_cache_bound(hasher: &mut Xxh3, bound: &Bound<QueryValue>) {
+    match bound {
+        Bound::Included(value) => {
+            hasher.update(&[0]);
+            hash_query_cache_value(hasher, value);
+        }
+        Bound::Excluded(value) => {
+            hasher.update(&[1]);
+            hash_query_cache_value(hasher, value);
+        }
+        Bound::Unbounded => hasher.update(&[2]),
+    }
+}
+
+#[cfg(any(test, feature = "bench-internals"))]
+fn hash_exact_query(hasher: &mut Xxh3, query: &Query) {
+    match query {
+        Query::Empty => hasher.update(&[0]),
+        Query::All => hasher.update(&[1]),
+        Query::Term { fields, text } => {
+            hasher.update(&[2]);
+            hash_query_cache_len(hasher, fields.len());
+            for field in fields {
+                hasher.update(&field.field_id.to_le_bytes());
+                hasher.update(&field.boost.to_bits().to_le_bytes());
+            }
+            hash_query_cache_bytes(hasher, text.as_bytes());
+        }
+        Query::Phrase {
+            fields,
+            terms,
+            slop,
+            prefix,
+        } => {
+            hasher.update(&[3]);
+            hash_query_cache_len(hasher, fields.len());
+            for field in fields {
+                hasher.update(&field.field_id.to_le_bytes());
+                hasher.update(&field.boost.to_bits().to_le_bytes());
+            }
+            hash_query_cache_len(hasher, terms.len());
+            for term in terms {
+                hasher.update(&term.position.to_le_bytes());
+                hash_query_cache_bytes(hasher, term.text.as_bytes());
+            }
+            hasher.update(&slop.to_le_bytes());
+            hasher.update(&[u8::from(*prefix)]);
+        }
+        Query::Boolean { clauses, operator } => {
+            hasher.update(&[4]);
+            hasher.update(&[match operator {
+                None => 0,
+                Some(BooleanOperator::And) => 1,
+                Some(BooleanOperator::Or) => 2,
+            }]);
+            hash_query_cache_len(hasher, clauses.len());
+            for clause in clauses {
+                hasher.update(&[match clause.occur {
+                    Occur::Must => 0,
+                    Occur::Should => 1,
+                    Occur::MustNot => 2,
+                }]);
+                hash_exact_query(hasher, &clause.query);
+            }
+        }
+        Query::Range {
+            field_id,
+            lower,
+            upper,
+        } => {
+            hasher.update(&[5]);
+            hasher.update(&field_id.to_le_bytes());
+            hash_query_cache_bound(hasher, lower);
+            hash_query_cache_bound(hasher, upper);
+        }
+        Query::Set { field_id, values } => {
+            hasher.update(&[6]);
+            hasher.update(&field_id.to_le_bytes());
+            hash_query_cache_len(hasher, values.len());
+            for value in values {
+                hash_query_cache_value(hasher, value);
+            }
+        }
+        Query::Glob { field_ids, pattern } => {
+            hasher.update(&[7]);
+            hash_query_cache_len(hasher, field_ids.len());
+            for field_id in field_ids {
+                hasher.update(&field_id.to_le_bytes());
+            }
+            hash_query_cache_bytes(hasher, pattern.as_bytes());
+        }
+        Query::Boost { query, factor } => {
+            hasher.update(&[8]);
+            hasher.update(&factor.to_bits().to_le_bytes());
+            hash_exact_query(hasher, query);
+        }
+    }
 }
 
 /// Typed failure from process-local Keeper plus Delta snapshot composition.
@@ -821,6 +1171,7 @@ struct PreparedSealedPublication {
 /// [`Self::publish_complete`] to replace Keeper and every Delta in one swap.
 pub struct SnapshotPublisher {
     current: ArcSwap<QuillSearchSnapshot>,
+    ranked_query_cache: RankedQueryCache,
 }
 
 impl SnapshotPublisher {
@@ -837,6 +1188,7 @@ impl SnapshotPublisher {
         let initial = Arc::new(QuillSearchSnapshot::compose(0, keeper, deltas)?);
         Ok(Self {
             current: ArcSwap::new(initial),
+            ranked_query_cache: RankedQueryCache::default(),
         })
     }
 
@@ -1117,13 +1469,14 @@ fn clone_delta_arcs(
 struct PendingIdentity {
     doc_ord: u32,
     document_id: String,
-    /// Unseeded xxh3-64 witness of this document's canonical preimage.
+    /// Domain-separated xxh3-64 witness of this document's canonical content.
     ///
-    /// The preimage bytes themselves are deliberately not retained. Their only
-    /// consumers were this witness and the shard's batch digest, and both are
-    /// folded at accumulation time by `retain_identity`, so keeping the bytes
-    /// meant holding a second copy of every document until the seal and then
-    /// walking all of them again.
+    /// Computed field-wise by `canonical_document_content_hash` at accumulation
+    /// time; no canonical-JSON preimage buffer is ever materialized for it.
+    /// This `u64` is the only per-document identity state retained until the
+    /// seal, where `derive_segment_id` folds it into the batch digest — so a
+    /// batch costs 8 bytes per document here, not a second copy of every
+    /// document's bytes.
     content_hash: u64,
 }
 
@@ -1135,21 +1488,413 @@ struct StagedFlush {
     next_seal_seq: u64,
 }
 
+struct BuiltShardFlush {
+    shard: usize,
+    encoded: EncodedSegment,
+    manifest_segment: ManifestSegment,
+    next_seal_seq: u64,
+}
+
+struct ShardFlushPlan<'a> {
+    shard: usize,
+    state: &'a ScribeShardState,
+    segment_id: u64,
+    lease_docid_base: u64,
+    created_unix_s: i64,
+    seal_seq: u64,
+}
+
 struct ScribeShardState {
     accumulator: ColumnarAccumulator,
     identities: Vec<PendingIdentity>,
     current_lease_base: Option<u64>,
-    /// Running xxh3 over `len || canonical_preimage` for every retained
-    /// identity, in `identities` order. `derive_segment_id` used to build this
-    /// by walking the retained preimages at seal time; folding it here makes
-    /// the seal independent of how much text the batch carried. Reset in
-    /// lockstep with `identities`.
-    batch_hasher: Xxh3,
-    /// Reused canonicalization buffers. Both live on the shard rather than in
+    /// Reused canonicalization buffer. It lives on the shard rather than in
     /// `accumulate_shard_run` so the fan-out's parallel region does not hand
-    /// the allocator two fresh buffers per document on every worker thread.
+    /// the allocator a fresh buffer per document on every worker thread.
     scratch_metadata: Vec<u8>,
-    scratch_preimage: Vec<u8>,
+}
+
+struct ParallelShardWork {
+    shard: usize,
+    assignment: ParallelShardAssignment,
+    state: ScribeShardState,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ParallelShardAssignment {
+    document_start: usize,
+    document_end: usize,
+    span: DocIdSpan,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ParallelIngestReceipt {
+    planner_version: u8,
+    route: ParallelIngestRoute,
+    configured_width: usize,
+    verified_pool_capacity: usize,
+    eligible_shards: usize,
+    active_shards: usize,
+    logical_budget_bytes: usize,
+    initial_logical_bytes: usize,
+    batch_logical_upper_bound: usize,
+    projected_logical_upper_bound: usize,
+    arena_chunk_bytes: usize,
+    arena_bytes_used_high_water: usize,
+    arena_bytes_reserved_high_water: usize,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ParallelBudgetAdmission {
+    logical_budget_bytes: usize,
+    initial_logical_bytes: usize,
+    initial_reserved_bytes: usize,
+    batch_logical_upper_bound: usize,
+    projected_logical_upper_bound: usize,
+    arena_chunk_bytes: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ParallelDocumentBudgetBound {
+    Within(usize),
+    ReachesCeiling,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ParallelIngestRoute {
+    Serial,
+    SharedNothing,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IngestParallelismPolicy {
+    Adaptive,
+    #[cfg(feature = "pruning-conformance")]
+    ScalarTopologyConformance,
+}
+
+#[derive(Clone)]
+struct ParallelIngestCheckpoint {
+    #[cfg(feature = "conformance-internals")]
+    controller: Arc<ConformanceCancellationController>,
+}
+
+impl ParallelIngestCheckpoint {
+    #[cfg(not(feature = "conformance-internals"))]
+    const fn new(_: &QuillReader) -> Self {
+        Self {}
+    }
+
+    #[cfg(feature = "conformance-internals")]
+    fn new(reader: &QuillReader) -> Self {
+        Self {
+            controller: Arc::clone(&reader.conformance_controller),
+        }
+    }
+
+    #[allow(
+        clippy::unused_self,
+        reason = "keeps worker checkpoint call sites cfg-symmetric with the controller-backed variant"
+    )]
+    fn check(&self, cx: &Cx) -> Result<(), QuillIndexError> {
+        #[cfg(feature = "conformance-internals")]
+        self.controller
+            .checkpoint(ConformanceCancellationStage::ParallelIngest, cx);
+        check_cancel(cx, "parallel index worker")
+    }
+}
+
+impl ParallelIngestRoute {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Serial => "serial",
+            Self::SharedNothing => "shared_nothing",
+        }
+    }
+}
+
+fn catch_parallel_ingest_worker<T>(
+    shard: usize,
+    operation: impl FnOnce() -> Result<T, QuillIndexError>,
+) -> Result<T, QuillIndexError> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(operation)).unwrap_or_else(|_| {
+        Err(invalid_state(format!(
+            "parallel ingest worker {shard} panicked before transactional commit"
+        )))
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ParallelDocumentRange {
+    start: usize,
+    end: usize,
+}
+
+impl ParallelDocumentRange {
+    const fn len(self) -> usize {
+        self.end - self.start
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ParallelIngestPlan {
+    planner_version: u8,
+    route: ParallelIngestRoute,
+    configured_width: usize,
+    verified_pool_capacity: usize,
+    eligible_shards: usize,
+    active_shards: usize,
+    ranges: Vec<ParallelDocumentRange>,
+}
+
+fn plan_parallel_ingest(
+    document_count: usize,
+    configured_width: usize,
+    verified_pool_capacity: usize,
+) -> Result<ParallelIngestPlan, QuillIndexError> {
+    let eligible_shards = configured_width.min(verified_pool_capacity);
+    let active_shards = eligible_shards.min(document_count / PARALLEL_INGEST_MIN_DOCS_PER_SHARD);
+    let route = if active_shards < 2 {
+        ParallelIngestRoute::Serial
+    } else {
+        ParallelIngestRoute::SharedNothing
+    };
+    let mut ranges = Vec::new();
+    if route == ParallelIngestRoute::SharedNothing {
+        ranges
+            .try_reserve_exact(active_shards)
+            .map_err(|_| invalid_state("could not reserve parallel ingest plan ranges"))?;
+        let documents_per_shard = document_count / active_shards;
+        let remainder = document_count % active_shards;
+        let mut start = 0_usize;
+        for position in 0..active_shards {
+            let count = documents_per_shard + usize::from(position < remainder);
+            let end = start
+                .checked_add(count)
+                .ok_or_else(|| invalid_state("parallel ingest plan range overflow"))?;
+            ranges.push(ParallelDocumentRange { start, end });
+            start = end;
+        }
+        if start != document_count {
+            return Err(invalid_state(
+                "parallel ingest plan did not cover the complete document batch",
+            ));
+        }
+    }
+    Ok(ParallelIngestPlan {
+        planner_version: PARALLEL_INGEST_PLANNER_VERSION,
+        route,
+        configured_width,
+        verified_pool_capacity,
+        eligible_shards,
+        active_shards,
+        ranges,
+    })
+}
+
+fn checked_budget_charge(total: &mut usize, additional: usize) -> bool {
+    let Some(charged) = total.checked_add(additional) else {
+        return false;
+    };
+    *total = charged;
+    true
+}
+
+fn charge_parallel_budget_token(total: &mut usize, term_bytes: usize, row_bytes: usize) -> bool {
+    let Some(additional) = term_bytes
+        .checked_add(FIELD_PREFIX_BYTES)
+        .and_then(|value| value.checked_add(std::mem::size_of::<ArenaSpan>()))
+        .and_then(|value| value.checked_add(TERM_BUCKET_BYTES_ESTIMATE))
+        .and_then(|value| value.checked_add(row_bytes))
+    else {
+        return false;
+    };
+    checked_budget_charge(total, additional)
+}
+
+fn validate_parallel_source_len(field_ord: u16, bytes: usize) -> Result<(), QuillIndexError> {
+    if u32::try_from(bytes).is_err() {
+        return Err(AccumulatorError::SourceTooLarge { field_ord, bytes }.into());
+    }
+    Ok(())
+}
+
+/// Return a conservative increment to `ColumnarAccumulator::bytes_used` for
+/// one shipping-shaped document.
+///
+/// Every admitted token occurrence is charged as though it were a distinct
+/// term. That deliberately overstates interner use for repeated terms while
+/// retaining the exact configured analyzer, normalized term bytes, positions
+/// width, stored bytes, and per-document column rows. `None` means the schema
+/// is not the five-field shipping shape or an arithmetic bound overflowed, so
+/// the caller must retain the scalar route.
+fn parallel_document_logical_upper_bound(
+    schema: SchemaDescriptor,
+    analyzer: &mut FrankensearchTokenizer,
+    document: &IndexableDocument,
+    exclusive_ceiling: usize,
+) -> Result<Option<ParallelDocumentBudgetBound>, QuillIndexError> {
+    let [
+        id_field,
+        content_field,
+        title_field,
+        metadata_field,
+        ord_field,
+    ] = schema.fields
+    else {
+        return Ok(None);
+    };
+    if !matches!(id_field.kind, FieldKind::Keyword)
+        || !id_field.stored
+        || !matches!(
+            content_field.kind,
+            FieldKind::Text {
+                analyzer: Analyzer::FrankensearchDefault,
+                ..
+            }
+        )
+        || !content_field.stored
+        || !matches!(
+            title_field.kind,
+            FieldKind::Text {
+                analyzer: Analyzer::FrankensearchDefault,
+                ..
+            }
+        )
+        || !title_field.stored
+        || !matches!(metadata_field.kind, FieldKind::StoredOnly)
+        || !metadata_field.stored
+        || !matches!(ord_field.kind, FieldKind::U64 { fast: true, .. })
+        || !ord_field.stored
+    {
+        return Ok(None);
+    }
+
+    validate_parallel_source_len(ID_FIELD, document.id.len())?;
+    validate_parallel_source_len(CONTENT_FIELD, document.content.len())?;
+    validate_parallel_source_len(TITLE_FIELD, document.title.as_deref().unwrap_or("").len())?;
+
+    let mut upper_bound = std::mem::size_of::<u32>();
+    for field in schema.fields {
+        if matches!(field.kind, FieldKind::Keyword | FieldKind::Text { .. })
+            && !checked_budget_charge(
+                &mut upper_bound,
+                std::mem::size_of::<u32>() + std::mem::size_of::<u8>(),
+            )
+        {
+            return Ok(None);
+        }
+        if field.kind.has_numeric_column()
+            && !checked_budget_charge(
+                &mut upper_bound,
+                std::mem::size_of::<Option<NumericValue>>(),
+            )
+        {
+            return Ok(None);
+        }
+        if field.stored
+            && !checked_budget_charge(
+                &mut upper_bound,
+                std::mem::size_of::<u32>() + std::mem::size_of::<u8>(),
+            )
+        {
+            return Ok(None);
+        }
+    }
+
+    let metadata = canonical_metadata(&document.metadata)?;
+    if u32::try_from(metadata.len()).is_err() {
+        return Err(AccumulatorError::StoredValueTooLarge {
+            field_ord: METADATA_FIELD,
+            bytes: metadata.len(),
+        }
+        .into());
+    }
+    for stored_bytes in [
+        document.id.len(),
+        document.content.len(),
+        document.title.as_deref().unwrap_or("").len(),
+        metadata.len(),
+        std::mem::size_of::<u64>(),
+    ] {
+        if !checked_budget_charge(&mut upper_bound, stored_bytes) {
+            return Ok(None);
+        }
+    }
+
+    // Stored bytes and fixed rows are a cheap lower bound. Once they alone
+    // reach the caller's remaining admission budget, do not scan either text
+    // field merely to prove a rejection already established without
+    // tokenization. This also bounds the count-only double scan to source
+    // sizes below the configured logical ceiling.
+    if upper_bound >= exclusive_ceiling {
+        return Ok(Some(ParallelDocumentBudgetBound::ReachesCeiling));
+    }
+
+    if document.id.len() <= MAX_TERM_BYTES
+        && !charge_parallel_budget_token(
+            &mut upper_bound,
+            document.id.len(),
+            2 * std::mem::size_of::<u32>(),
+        )
+    {
+        return Ok(None);
+    }
+    if upper_bound >= exclusive_ceiling {
+        return Ok(Some(ParallelDocumentBudgetBound::ReachesCeiling));
+    }
+
+    for (field, text) in [
+        (content_field, document.content.as_str()),
+        (title_field, document.title.as_deref().unwrap_or("")),
+    ] {
+        let FieldKind::Text {
+            analyzer: analyzer_kind,
+            positions,
+        } = field.kind
+        else {
+            unreachable!("shipping-shape validation accepted a non-text field");
+        };
+        let row_bytes =
+            2 * std::mem::size_of::<u32>() + usize::from(positions) * std::mem::size_of::<u32>();
+        let mut overflowed = false;
+        let mut reached_ceiling = false;
+        analyzer.analyze(analyzer_kind, text, &mut |token| {
+            if token.text.len() <= MAX_TERM_BYTES
+                && !overflowed
+                && !reached_ceiling
+                && !charge_parallel_budget_token(&mut upper_bound, token.text.len(), row_bytes)
+            {
+                overflowed = true;
+            }
+            reached_ceiling = upper_bound >= exclusive_ceiling;
+        });
+        if overflowed {
+            return Ok(None);
+        }
+        if reached_ceiling {
+            return Ok(Some(ParallelDocumentBudgetBound::ReachesCeiling));
+        }
+    }
+
+    debug_assert!(upper_bound < exclusive_ceiling);
+    Ok(Some(ParallelDocumentBudgetBound::Within(upper_bound)))
+}
+
+fn parallel_arena_chunk_bytes(batch_logical_upper_bound: usize, active_shards: usize) -> usize {
+    // Size speculative term arenas from the admitted work, not from the
+    // configuration ceiling. With the 64 MiB default, deriving this from the
+    // ceiling would clamp every supported width back to the scalar 1 MiB
+    // chunk and multiply idle reservation by the worker count. The second cap
+    // shares one scalar chunk of aggregate slack across workers; above 256
+    // workers, ByteArena's 4 KiB hard floor is the irreducible bound.
+    let active_shards = active_shards.max(1);
+    let per_shard_share = batch_logical_upper_bound / active_shards;
+    let per_shard_slack_cap =
+        (DEFAULT_ARENA_CHUNK_BYTES / active_shards).max(MIN_ARENA_CHUNK_BYTES);
+    per_shard_share
+        .saturating_div(PARALLEL_ARENA_BUDGET_DIVISOR)
+        .clamp(MIN_ARENA_CHUNK_BYTES, per_shard_slack_cap)
 }
 
 #[derive(Default)]
@@ -1159,6 +1904,477 @@ struct QueryFuelState {
     dictionary_blocks: AtomicU64,
     posting_blocks: AtomicU64,
     position_docs: AtomicU64,
+}
+
+/// Refill strategy observed by the exact pruning-conformance witness.
+#[cfg(feature = "pruning-conformance")]
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ConformancePruningStrategy {
+    /// Full window scoring without a competitive cutoff.
+    Exhaustive,
+    /// Direct-term `MaxScore` candidate selection.
+    MaxScore,
+    /// Block-Max WAND candidate selection.
+    BlockMaxWand,
+}
+
+/// One exact direct-term union refill from a conformance-only search.
+#[cfg(feature = "pruning-conformance")]
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConformancePruningRefillReceipt {
+    ordinal: u64,
+    window_start: u32,
+    horizon_end: u64,
+    cutoff_bits: Option<u32>,
+    strategy: ConformancePruningStrategy,
+    candidate_docs: u64,
+    buffer_empty: bool,
+    live_work_remains: bool,
+}
+
+#[cfg(feature = "pruning-conformance")]
+impl ConformancePruningRefillReceipt {
+    /// One-based refill ordinal within the segment scorer.
+    #[must_use]
+    pub const fn ordinal(&self) -> u64 {
+        self.ordinal
+    }
+
+    /// Inclusive global document identifier that starts this window.
+    #[must_use]
+    pub const fn window_start(&self) -> u32 {
+        self.window_start
+    }
+
+    /// Exclusive global document bound for this window.
+    #[must_use]
+    pub const fn horizon_end(&self) -> u64 {
+        self.horizon_end
+    }
+
+    /// Exact competitive cutoff bits, or `None` before the heap is full.
+    #[must_use]
+    pub const fn cutoff_bits(&self) -> Option<u32> {
+        self.cutoff_bits
+    }
+
+    /// Scoring strategy used for this refill.
+    #[must_use]
+    pub const fn strategy(&self) -> ConformancePruningStrategy {
+        self.strategy
+    }
+
+    /// Number of documents admitted by the selected strategy.
+    #[must_use]
+    pub const fn candidate_docs(&self) -> u64 {
+        self.candidate_docs
+    }
+
+    /// Whether the refill produced no buffered scored document.
+    #[must_use]
+    pub const fn buffer_empty(&self) -> bool {
+        self.buffer_empty
+    }
+
+    /// Whether at least one posting cursor remains beyond this window.
+    #[must_use]
+    pub const fn live_work_remains(&self) -> bool {
+        self.live_work_remains
+    }
+}
+
+/// Ordered refill receipts for one immutable Quill segment.
+#[cfg(feature = "pruning-conformance")]
+#[doc(hidden)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConformanceSegmentPruningReceipt {
+    segment_ordinal: u64,
+    segment_doc_count: u64,
+    refills: Vec<ConformancePruningRefillReceipt>,
+}
+
+#[cfg(feature = "pruning-conformance")]
+impl ConformanceSegmentPruningReceipt {
+    /// Stable ordinal in the committed Quill snapshot.
+    #[must_use]
+    pub const fn segment_ordinal(&self) -> u64 {
+        self.segment_ordinal
+    }
+
+    /// Physical document cardinality of the scored segment.
+    #[must_use]
+    pub const fn segment_doc_count(&self) -> u64 {
+        self.segment_doc_count
+    }
+
+    /// Ordered refill events observed while collecting this segment.
+    #[must_use]
+    pub fn refills(&self) -> &[ConformancePruningRefillReceipt] {
+        &self.refills
+    }
+}
+
+#[cfg(feature = "pruning-conformance")]
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ConformancePruningExecutionMode {
+    /// The shipping collector scored sealed segments in snapshot order.
+    Serial,
+    /// The shipping collector scored sealed segments through Rayon fan-out.
+    Rayon,
+}
+
+#[cfg(feature = "pruning-conformance")]
+impl ConformancePruningExecutionMode {
+    const SERIAL_CODE: u8 = 1;
+    const RAYON_CODE: u8 = 2;
+
+    const fn code(self) -> u8 {
+        match self {
+            Self::Serial => Self::SERIAL_CODE,
+            Self::Rayon => Self::RAYON_CODE,
+        }
+    }
+
+    const fn from_code(code: u8) -> Option<Self> {
+        match code {
+            Self::SERIAL_CODE => Some(Self::Serial),
+            Self::RAYON_CODE => Some(Self::Rayon),
+            _ => None,
+        }
+    }
+}
+
+#[cfg(feature = "pruning-conformance")]
+#[doc(hidden)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ConformancePruningTraceReceipt {
+    execution_mode: ConformancePruningExecutionMode,
+    segments: Vec<ConformanceSegmentPruningReceipt>,
+}
+
+#[cfg(feature = "pruning-conformance")]
+impl ConformancePruningTraceReceipt {
+    /// Actual shipping collection branch used by this exact search invocation.
+    #[must_use]
+    pub const fn execution_mode(&self) -> ConformancePruningExecutionMode {
+        self.execution_mode
+    }
+
+    /// Complete receipts in dense Quill segment order.
+    #[must_use]
+    pub fn segments(&self) -> &[ConformanceSegmentPruningReceipt] {
+        &self.segments
+    }
+}
+
+#[cfg(feature = "pruning-conformance")]
+#[derive(Debug)]
+enum ConformancePruningTraceState {
+    Collecting {
+        expected_segments: usize,
+        execution_mode: Option<ConformancePruningExecutionMode>,
+        receipts: Vec<ConformanceSegmentPruningReceipt>,
+    },
+    Completed,
+    Failed,
+}
+
+#[cfg(feature = "pruning-conformance")]
+#[derive(Debug)]
+struct ConformancePruningTraceSession {
+    state: StdMutex<ConformancePruningTraceState>,
+    cancellation_arm_generation: Option<u64>,
+}
+
+#[cfg(feature = "pruning-conformance")]
+impl ConformancePruningTraceSession {
+    #[cfg(test)]
+    fn new(expected_segments: usize) -> Self {
+        Self::new_for_cancellation_arm(expected_segments, None)
+    }
+
+    fn new_for_cancellation_arm(
+        expected_segments: usize,
+        cancellation_arm_generation: Option<u64>,
+    ) -> Self {
+        Self {
+            state: StdMutex::new(ConformancePruningTraceState::Collecting {
+                expected_segments,
+                execution_mode: None,
+                receipts: Vec::new(),
+            }),
+            cancellation_arm_generation,
+        }
+    }
+
+    const fn cancellation_arm_generation(&self) -> Option<u64> {
+        self.cancellation_arm_generation
+    }
+
+    fn bind_execution_mode(
+        &self,
+        execution_mode: ConformancePruningExecutionMode,
+    ) -> Result<(), QuillIndexError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| invalid_state("pruning-conformance receipt lock is poisoned"))?;
+        let result = match &mut *state {
+            ConformancePruningTraceState::Collecting {
+                execution_mode: slot,
+                ..
+            } if slot.is_none() => {
+                *slot = Some(execution_mode);
+                Ok(())
+            }
+            ConformancePruningTraceState::Collecting { .. } => {
+                *state = ConformancePruningTraceState::Failed;
+                Err(invalid_state(
+                    "pruning-conformance execution mode was already bound",
+                ))
+            }
+            ConformancePruningTraceState::Completed => Err(invalid_state(
+                "pruning-conformance trace session is already completed",
+            )),
+            ConformancePruningTraceState::Failed => Err(invalid_state(
+                "pruning-conformance trace session has failed",
+            )),
+        };
+        drop(state);
+        result
+    }
+
+    #[cfg(test)]
+    fn record(
+        &self,
+        segment_ordinal: u64,
+        segment_doc_count: u64,
+        refills: &[ConformanceUnionRefill],
+    ) -> Result<u64, QuillIndexError> {
+        self.record_inner(segment_ordinal, segment_doc_count, refills, None)
+    }
+
+    fn record_and_checkpoint(
+        &self,
+        segment_ordinal: u64,
+        segment_doc_count: u64,
+        refills: &[ConformanceUnionRefill],
+        controller: &ConformanceCancellationController,
+        cx: &Cx,
+    ) -> Result<u64, QuillIndexError> {
+        self.record_inner(
+            segment_ordinal,
+            segment_doc_count,
+            refills,
+            Some((controller, cx)),
+        )
+    }
+
+    fn record_inner(
+        &self,
+        segment_ordinal: u64,
+        segment_doc_count: u64,
+        refills: &[ConformanceUnionRefill],
+        checkpoint: Option<(&ConformanceCancellationController, &Cx)>,
+    ) -> Result<u64, QuillIndexError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| invalid_state("pruning-conformance receipt lock is poisoned"))?;
+        let ConformancePruningTraceState::Collecting {
+            expected_segments,
+            execution_mode,
+            receipts,
+        } = &mut *state
+        else {
+            return match &*state {
+                ConformancePruningTraceState::Completed => Err(invalid_state(
+                    "pruning-conformance trace session is already completed",
+                )),
+                ConformancePruningTraceState::Failed => Err(invalid_state(
+                    "pruning-conformance trace session has failed",
+                )),
+                ConformancePruningTraceState::Collecting { .. } => {
+                    Err(invalid_state("pruning-conformance trace state is invalid"))
+                }
+            };
+        };
+        let Some(execution_mode) = *execution_mode else {
+            *state = ConformancePruningTraceState::Failed;
+            return Err(invalid_state(
+                "pruning-conformance execution mode was not bound before recording",
+            ));
+        };
+        let expected_segments = u64::try_from(*expected_segments)
+            .map_err(|_| invalid_state("pruning-conformance segment count does not fit u64"))?;
+        if segment_ordinal >= expected_segments {
+            *state = ConformancePruningTraceState::Failed;
+            return Err(invalid_state(format!(
+                "pruning-conformance segment ordinal {segment_ordinal} exceeds expected count \
+                 {expected_segments}",
+            )));
+        }
+        if receipts
+            .iter()
+            .any(|receipt| receipt.segment_ordinal == segment_ordinal)
+        {
+            *state = ConformancePruningTraceState::Failed;
+            return Err(invalid_state(format!(
+                "pruning-conformance segment ordinal {segment_ordinal} was recorded twice",
+            )));
+        }
+        let refills = refills
+            .iter()
+            .map(|refill| ConformancePruningRefillReceipt {
+                ordinal: refill.ordinal,
+                window_start: refill.window_start,
+                horizon_end: refill.horizon_end,
+                cutoff_bits: refill.cutoff_bits,
+                strategy: match refill.strategy {
+                    ConformanceUnionRefillStrategy::Exhaustive => {
+                        ConformancePruningStrategy::Exhaustive
+                    }
+                    ConformanceUnionRefillStrategy::MaxScore => {
+                        ConformancePruningStrategy::MaxScore
+                    }
+                    ConformanceUnionRefillStrategy::BlockMaxWand => {
+                        ConformancePruningStrategy::BlockMaxWand
+                    }
+                },
+                candidate_docs: refill.candidate_docs,
+                buffer_empty: refill.buffer_empty,
+                live_work_remains: refill.live_work_remains,
+            })
+            .collect();
+        receipts.push(ConformanceSegmentPruningReceipt {
+            segment_ordinal,
+            segment_doc_count,
+            refills,
+        });
+        let Ok(recorded_receipts) = u64::try_from(receipts.len()) else {
+            *state = ConformancePruningTraceState::Failed;
+            return Err(invalid_state(
+                "pruning-conformance recorded receipt count does not fit u64",
+            ));
+        };
+        if let Some((controller, cx)) = checkpoint
+            && let Err(error) = controller.checkpoint_pruning_trace_segment_recorded(
+                cx,
+                recorded_receipts,
+                self.cancellation_arm_generation,
+                execution_mode,
+            )
+        {
+            *state = ConformancePruningTraceState::Failed;
+            return Err(error);
+        }
+        drop(state);
+        Ok(recorded_receipts)
+    }
+
+    fn complete(&self) -> Result<ConformancePruningTraceReceipt, QuillIndexError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| invalid_state("pruning-conformance receipt lock is poisoned"))?;
+        let collecting = std::mem::replace(&mut *state, ConformancePruningTraceState::Failed);
+        let ConformancePruningTraceState::Collecting {
+            expected_segments,
+            execution_mode,
+            mut receipts,
+        } = collecting
+        else {
+            return match collecting {
+                ConformancePruningTraceState::Completed => Err(invalid_state(
+                    "pruning-conformance trace session is already completed",
+                )),
+                ConformancePruningTraceState::Failed => Err(invalid_state(
+                    "pruning-conformance trace session has failed",
+                )),
+                ConformancePruningTraceState::Collecting { .. } => {
+                    Err(invalid_state("pruning-conformance trace state is invalid"))
+                }
+            };
+        };
+        let execution_mode = execution_mode
+            .ok_or_else(|| invalid_state("pruning-conformance execution mode was never bound"))?;
+        receipts.sort_by_key(|receipt| receipt.segment_ordinal);
+        if receipts.len() != expected_segments
+            || !receipts.iter().enumerate().all(|(ordinal, receipt)| {
+                u64::try_from(ordinal).is_ok_and(|ordinal| ordinal == receipt.segment_ordinal)
+            })
+        {
+            return Err(invalid_state(format!(
+                "pruning-conformance trace is incomplete: expected {expected_segments} dense \
+                 segment receipts, observed {}",
+                receipts.len(),
+            )));
+        }
+        *state = ConformancePruningTraceState::Completed;
+        drop(state);
+        Ok(ConformancePruningTraceReceipt {
+            execution_mode,
+            segments: receipts,
+        })
+    }
+
+    fn fail(&self) {
+        if let Ok(mut state) = self.state.lock() {
+            *state = ConformancePruningTraceState::Failed;
+        }
+    }
+}
+
+#[cfg(feature = "pruning-conformance")]
+#[derive(Debug)]
+struct ConformancePruningTraceGuard {
+    session: Arc<ConformancePruningTraceSession>,
+    controller: Arc<ConformanceCancellationController>,
+    finished: bool,
+}
+
+#[cfg(feature = "pruning-conformance")]
+impl ConformancePruningTraceGuard {
+    fn new(expected_segments: usize, controller: Arc<ConformanceCancellationController>) -> Self {
+        let cancellation_arm_generation = controller.active_pruning_trace_arm_generation();
+        Self {
+            session: Arc::new(ConformancePruningTraceSession::new_for_cancellation_arm(
+                expected_segments,
+                cancellation_arm_generation,
+            )),
+            controller,
+            finished: false,
+        }
+    }
+
+    fn session(&self) -> &ConformancePruningTraceSession {
+        self.session.as_ref()
+    }
+
+    fn complete(mut self) -> Result<ConformancePruningTraceReceipt, QuillIndexError> {
+        let receipt = self.session.complete()?;
+        self.finished = true;
+        Ok(receipt)
+    }
+}
+
+#[cfg(feature = "pruning-conformance")]
+impl Drop for ConformancePruningTraceGuard {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.session.fail();
+            if let Some(arm_generation) = self.session.cancellation_arm_generation() {
+                self.controller
+                    .note_discarded_pruning_trace_session(arm_generation);
+            }
+        }
+    }
 }
 
 /// Deterministic request-cancellation checkpoints exposed only to the
@@ -1179,6 +2395,12 @@ pub enum ConformanceCancellationStage {
     FusionHydration = 2,
     /// The retained commit transaction immediately before publication.
     CommitPublication = 3,
+    /// One document boundary inside a shared-nothing ingest worker.
+    ParallelIngest = 4,
+    /// One document boundary in the read-only parallel budget preflight.
+    ParallelBudgetAdmission = 5,
+    /// One sealed-segment pruning receipt has been recorded successfully.
+    PruningTraceSegmentRecorded = 6,
 }
 
 /// Fixed-size conformance receipt for the complete retained scalar writer
@@ -1301,6 +2523,9 @@ impl ConformanceCancellationStage {
             Self::QueryCollection => 1,
             Self::FusionHydration => 2,
             Self::CommitPublication => 3,
+            Self::ParallelIngest => 4,
+            Self::ParallelBudgetAdmission => 5,
+            Self::PruningTraceSegmentRecorded => 6,
         }
     }
 }
@@ -1314,8 +2539,14 @@ impl ConformanceCancellationStage {
 #[derive(Debug, Default)]
 pub struct ConformanceCancellationController {
     stage: AtomicU8,
+    arm_generation: AtomicU64,
+    arm_transition_lock: StdMutex<()>,
     trigger_ordinal: AtomicU64,
     observed_checkpoints: AtomicU64,
+    recorded_pruning_receipts_at_fire: AtomicU64,
+    #[cfg(feature = "pruning-conformance")]
+    pruning_trace_execution_mode_at_fire: AtomicU8,
+    discarded_pruning_trace_sessions: AtomicU64,
     fired: AtomicBool,
 }
 
@@ -1340,6 +2571,9 @@ impl ConformanceCancellationController {
                 "conformance cancellation trigger ordinal must be nonzero",
             ));
         }
+        let arm_transition = self.arm_transition_lock.lock().map_err(|_| {
+            invalid_state("conformance cancellation arm transition lock is poisoned")
+        })?;
         self.stage
             .compare_exchange(
                 Self::DISARMED,
@@ -1348,11 +2582,27 @@ impl ConformanceCancellationController {
                 Ordering::Acquire,
             )
             .map_err(|_| invalid_state("conformance cancellation controller is already armed"))?;
+        let Some(arm_generation) = self.arm_generation.load(Ordering::Relaxed).checked_add(1)
+        else {
+            self.stage.store(Self::DISARMED, Ordering::Release);
+            return Err(invalid_state(
+                "conformance cancellation arm generation is exhausted",
+            ));
+        };
+        self.arm_generation.store(arm_generation, Ordering::Relaxed);
         self.trigger_ordinal
             .store(trigger_ordinal, Ordering::Relaxed);
         self.observed_checkpoints.store(0, Ordering::Relaxed);
+        self.recorded_pruning_receipts_at_fire
+            .store(0, Ordering::Relaxed);
+        #[cfg(feature = "pruning-conformance")]
+        self.pruning_trace_execution_mode_at_fire
+            .store(0, Ordering::Relaxed);
+        self.discarded_pruning_trace_sessions
+            .store(0, Ordering::Relaxed);
         self.fired.store(false, Ordering::Relaxed);
         self.stage.store(stage.code(), Ordering::Release);
+        drop(arm_transition);
         Ok(())
     }
 
@@ -1361,6 +2611,7 @@ impl ConformanceCancellationController {
     /// The caller must clear the real [`Cx`] explicitly. Keeping those actions
     /// separate proves the request context remains the cancellation authority.
     pub fn disarm(&self) {
+        let _arm_transition = self.arm_transition_lock.lock().ok();
         self.stage.store(Self::DISARMED, Ordering::Release);
     }
 
@@ -1370,13 +2621,89 @@ impl ConformanceCancellationController {
         self.observed_checkpoints.load(Ordering::Acquire)
     }
 
+    /// Successfully recorded pruning receipts at the exact firing boundary.
+    ///
+    /// This stays zero for every non-pruning cancellation stage. A nonzero
+    /// value proves the pruning checkpoint ran only after receipt mutation
+    /// succeeded; it does not infer how much unrecorded scorer work remained.
+    #[must_use]
+    pub fn recorded_pruning_receipts_at_fire(&self) -> u64 {
+        self.recorded_pruning_receipts_at_fire
+            .load(Ordering::Acquire)
+    }
+
+    /// Shipping sealed-segment execution branch at the pruning fire boundary.
+    #[cfg(feature = "pruning-conformance")]
+    #[must_use]
+    pub fn pruning_trace_execution_mode_at_fire(&self) -> Option<ConformancePruningExecutionMode> {
+        ConformancePruningExecutionMode::from_code(
+            self.pruning_trace_execution_mode_at_fire
+                .load(Ordering::Acquire),
+        )
+    }
+
+    /// Invocation-bound pruning trace sessions failed and discarded since arm.
+    #[must_use]
+    pub fn discarded_pruning_trace_sessions(&self) -> u64 {
+        self.discarded_pruning_trace_sessions
+            .load(Ordering::Acquire)
+    }
+
     /// Whether the current arm requested cancellation on its real [`Cx`].
     #[must_use]
     pub fn fired(&self) -> bool {
         self.fired.load(Ordering::Acquire)
     }
 
+    fn is_armed(&self) -> bool {
+        self.stage.load(Ordering::Acquire) != Self::DISARMED
+    }
+
     fn checkpoint(&self, stage: ConformanceCancellationStage, cx: &Cx) {
+        self.checkpoint_with_pruning_receipts(stage, cx, None, None);
+    }
+
+    #[cfg(feature = "pruning-conformance")]
+    fn checkpoint_pruning_trace_segment_recorded(
+        &self,
+        cx: &Cx,
+        recorded_receipts: u64,
+        expected_arm_generation: Option<u64>,
+        execution_mode: ConformancePruningExecutionMode,
+    ) -> Result<(), QuillIndexError> {
+        if recorded_receipts == 0 {
+            return Err(invalid_state(
+                "pruning-trace cancellation checkpoint requires a successful receipt",
+            ));
+        }
+        let Some(expected_arm_generation) = expected_arm_generation else {
+            return Ok(());
+        };
+        let _arm_transition = self.arm_transition_lock.lock().map_err(|_| {
+            invalid_state("conformance cancellation arm transition lock is poisoned")
+        })?;
+        if self.stage.load(Ordering::Acquire)
+            != ConformanceCancellationStage::PruningTraceSegmentRecorded.code()
+            || self.arm_generation.load(Ordering::Acquire) != expected_arm_generation
+        {
+            return Ok(());
+        }
+        self.checkpoint_with_pruning_receipts(
+            ConformanceCancellationStage::PruningTraceSegmentRecorded,
+            cx,
+            Some(recorded_receipts),
+            Some(execution_mode.code()),
+        );
+        Ok(())
+    }
+
+    fn checkpoint_with_pruning_receipts(
+        &self,
+        stage: ConformanceCancellationStage,
+        cx: &Cx,
+        recorded_receipts: Option<u64>,
+        pruning_execution_mode_code: Option<u8>,
+    ) {
         if self.stage.load(Ordering::Acquire) != stage.code() {
             return;
         }
@@ -1387,6 +2714,17 @@ impl ConformanceCancellationController {
         if ordinal != self.trigger_ordinal.load(Ordering::Acquire) {
             return;
         }
+        if let Some(recorded_receipts) = recorded_receipts {
+            self.recorded_pruning_receipts_at_fire
+                .store(recorded_receipts, Ordering::Release);
+        }
+        #[cfg(feature = "pruning-conformance")]
+        if let Some(execution_mode_code) = pruning_execution_mode_code {
+            self.pruning_trace_execution_mode_at_fire
+                .store(execution_mode_code, Ordering::Release);
+        }
+        #[cfg(not(feature = "pruning-conformance"))]
+        let _ = pruning_execution_mode_code;
         self.fired.store(true, Ordering::Release);
         tracing::info!(
             target: crate::tracing_conventions::TARGET,
@@ -1396,6 +2734,28 @@ impl ConformanceCancellationController {
             "deterministic conformance checkpoint requested cancellation on the real Cx"
         );
         cx.set_cancel_requested(true);
+    }
+
+    #[cfg(feature = "pruning-conformance")]
+    fn active_pruning_trace_arm_generation(&self) -> Option<u64> {
+        let _arm_transition = self.arm_transition_lock.lock().ok()?;
+        (self.stage.load(Ordering::Acquire)
+            == ConformanceCancellationStage::PruningTraceSegmentRecorded.code())
+        .then(|| self.arm_generation.load(Ordering::Acquire))
+    }
+
+    #[cfg(feature = "pruning-conformance")]
+    fn note_discarded_pruning_trace_session(&self, expected_arm_generation: u64) {
+        let Ok(_arm_transition) = self.arm_transition_lock.lock() else {
+            return;
+        };
+        if self.stage.load(Ordering::Acquire)
+            == ConformanceCancellationStage::PruningTraceSegmentRecorded.code()
+            && self.arm_generation.load(Ordering::Acquire) == expected_arm_generation
+        {
+            self.discarded_pruning_trace_sessions
+                .fetch_add(1, Ordering::AcqRel);
+        }
     }
 }
 
@@ -1600,6 +2960,13 @@ impl LifecycleTrigger {
 }
 
 struct PendingDeltaSeal {
+    /// Retained encoded segment shared with the in-flight publication task.
+    ///
+    /// The outer [`Arc`] shares the whole segment (header plus section
+    /// table) with `KeeperWriter::publish_encoded_segment_retryable`, which
+    /// needs `'static` ownership on the blocking lane. The segment's byte
+    /// payload is additionally backing-shared, so the memory-backend
+    /// republication copies stay O(1) in the payload.
     encoded: Option<Arc<EncodedSegment>>,
     segment_installed: bool,
     manifest: Manifest,
@@ -1994,9 +3361,7 @@ impl QuillWriterState {
                 accumulator: ColumnarAccumulator::new(schema)?,
                 identities: Vec::new(),
                 current_lease_base: None,
-                batch_hasher: Xxh3::new(),
                 scratch_metadata: Vec::new(),
-                scratch_preimage: Vec::new(),
             });
         }
         let next_seal_seq = manifest
@@ -2500,6 +3865,97 @@ impl QuillWriterState {
         !self.published_snapshot.load().delta_snapshots().is_empty()
     }
 
+    fn parallel_budget_admission(
+        &self,
+        cx: &Cx,
+        documents: &[IndexableDocument],
+        active_shards: usize,
+    ) -> Result<Option<ParallelBudgetAdmission>, QuillIndexError> {
+        // The first budget-safe activation accepts only a pristine Scribe
+        // generation. Retained leases or logical rows from an earlier routed
+        // batch would make the scalar counterfactual depend on prior shard
+        // selection, so those cases deliberately keep the scalar path.
+        if self.shards.iter().any(|shard| {
+            shard.accumulator.document_count() != 0
+                || !shard.identities.is_empty()
+                || shard.current_lease_base.is_some()
+        }) {
+            return Ok(None);
+        }
+
+        let Some(initial_logical_bytes) = self.shards.iter().try_fold(0_usize, |total, shard| {
+            total.checked_add(shard.accumulator.bytes_used())
+        }) else {
+            return Ok(None);
+        };
+        let Some(initial_reserved_bytes) = self.shards.iter().try_fold(0_usize, |total, shard| {
+            total.checked_add(shard.accumulator.bytes_reserved())
+        }) else {
+            return Ok(None);
+        };
+
+        let logical_budget_bytes = self.config.scribe_shard_budget_bytes;
+        if initial_logical_bytes >= logical_budget_bytes {
+            return Ok(None);
+        }
+
+        let mut analyzer = FrankensearchTokenizer::default();
+        let mut batch_logical_upper_bound = 0_usize;
+        for document in documents {
+            #[cfg(feature = "conformance-internals")]
+            self.reader
+                .conformance_controller
+                .checkpoint(ConformanceCancellationStage::ParallelBudgetAdmission, cx);
+            check_cancel(cx, "parallel budget admission")?;
+            let Some(consumed_before_document) =
+                initial_logical_bytes.checked_add(batch_logical_upper_bound)
+            else {
+                return Ok(None);
+            };
+            let Some(remaining_budget) = logical_budget_bytes.checked_sub(consumed_before_document)
+            else {
+                return Ok(None);
+            };
+            let Some(document_bound) = parallel_document_logical_upper_bound(
+                self.schema,
+                &mut analyzer,
+                document,
+                remaining_budget,
+            )?
+            else {
+                return Ok(None);
+            };
+            let ParallelDocumentBudgetBound::Within(document_upper_bound) = document_bound else {
+                return Ok(None);
+            };
+            let Some(charged) = batch_logical_upper_bound.checked_add(document_upper_bound) else {
+                return Ok(None);
+            };
+            batch_logical_upper_bound = charged;
+            if initial_logical_bytes
+                .checked_add(batch_logical_upper_bound)
+                .is_none_or(|projected| projected >= logical_budget_bytes)
+            {
+                return Ok(None);
+            }
+        }
+        let Some(projected_logical_upper_bound) =
+            initial_logical_bytes.checked_add(batch_logical_upper_bound)
+        else {
+            return Ok(None);
+        };
+        debug_assert!(projected_logical_upper_bound < logical_budget_bytes);
+
+        Ok(Some(ParallelBudgetAdmission {
+            logical_budget_bytes,
+            initial_logical_bytes,
+            initial_reserved_bytes,
+            batch_logical_upper_bound,
+            projected_logical_upper_bound,
+            arena_chunk_bytes: parallel_arena_chunk_bytes(batch_logical_upper_bound, active_shards),
+        }))
+    }
+
     /// Route and accumulate one bounded batch into the production Scribe shard set.
     ///
     /// A budget or lease boundary seals an immutable segment, but no newly
@@ -2517,8 +3973,597 @@ impl QuillWriterState {
         documents: &[IndexableDocument],
     ) -> Result<(), QuillIndexError> {
         let replacement_ids = BTreeSet::new();
-        self.index_documents_with_replacements(cx, documents, &replacement_ids, true)
-            .await
+        self.index_documents_with_replacements(
+            cx,
+            documents,
+            &replacement_ids,
+            true,
+            IngestParallelismPolicy::Adaptive,
+        )
+        .await
+    }
+
+    /// Index through the production scalar accumulator without parallel-planner
+    /// fanout so pruning conformance can request a specific leaf geometry.
+    ///
+    /// Shipping ingest keeps its adaptive shared-nothing and fixed-width
+    /// internal fanout. This feature-gated seam exists only because Salej
+    /// treats the number and size of sealed leaves as evidence. Scalar lease,
+    /// arena-budget, visibility-publication, and tier-merge rules remain live,
+    /// so proof callers must validate the realized topology before using it as
+    /// evidence.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same typed cancellation, duplicate-ID, accumulation,
+    /// flush, or publication failures as [`Self::index_documents`].
+    #[cfg(feature = "pruning-conformance")]
+    async fn index_documents_with_scalar_topology_conformance(
+        &mut self,
+        cx: &Cx,
+        documents: &[IndexableDocument],
+    ) -> Result<(), QuillIndexError> {
+        let replacement_ids = BTreeSet::new();
+        self.index_documents_with_replacements(
+            cx,
+            documents,
+            &replacement_ids,
+            true,
+            IngestParallelismPolicy::ScalarTopologyConformance,
+        )
+        .await
+    }
+
+    async fn try_index_documents_internal_parallel(
+        &mut self,
+        cx: &Cx,
+        documents: &[IndexableDocument],
+        replacement_ids: &BTreeSet<&str>,
+        allow_automatic_publication: bool,
+    ) -> Result<Option<ParallelIngestReceipt>, QuillIndexError> {
+        if !replacement_ids.is_empty()
+            || !self.shard_router.is_deterministic()
+            || !matches!(&self.backend, IndexBackend::Memory(_))
+            || self.shards.iter().any(|state| {
+                state.accumulator.document_count() != 0 || !state.identities.is_empty()
+            })
+        {
+            return Ok(None);
+        }
+
+        // Use a fixed logical width so deterministic-ingest output does not
+        // change with the host's available parallelism. Rayon executes the
+        // same independent jobs serially when installed on a one-thread pool.
+        let plan = plan_parallel_ingest(
+            documents.len(),
+            INTERNAL_PARALLEL_INGEST_SHARDS,
+            INTERNAL_PARALLEL_INGEST_SHARDS,
+        )?;
+        if plan.route == ParallelIngestRoute::Serial {
+            return Ok(None);
+        }
+        let Some(initial_logical_bytes) = self.shards.iter().try_fold(0_usize, |total, shard| {
+            total.checked_add(shard.accumulator.bytes_used())
+        }) else {
+            return Ok(None);
+        };
+        let Some(initial_reserved_bytes) = self.shards.iter().try_fold(0_usize, |total, shard| {
+            total.checked_add(shard.accumulator.bytes_reserved())
+        }) else {
+            return Ok(None);
+        };
+        let logical_budget_bytes = self.config.scribe_shard_budget_bytes;
+        let Some(available_logical_bytes) = logical_budget_bytes.checked_sub(initial_logical_bytes)
+        else {
+            return Ok(None);
+        };
+        if available_logical_bytes == 0 {
+            return Ok(None);
+        }
+        let arena_chunk_bytes = available_logical_bytes
+            .saturating_div(plan.active_shards.max(1))
+            .saturating_div(PARALLEL_ARENA_BUDGET_DIVISOR)
+            .clamp(MIN_ARENA_CHUNK_BYTES, DEFAULT_ARENA_CHUNK_BYTES);
+
+        let mut batch_ids = BTreeSet::new();
+        for document in documents {
+            check_cancel(cx, "internal parallel index validation")?;
+            if document.id.is_empty() {
+                return Err(invalid_state("document id must be nonempty"));
+            }
+            if !batch_ids.insert(document.id.as_str())
+                || self.uncommitted_ids.contains(&document.id)
+                || self
+                    .backend
+                    .snapshot()
+                    .resolve_document_id(&document.id)?
+                    .is_some()
+            {
+                return Err(invalid_state(format!(
+                    "duplicate live document id {:?}",
+                    document.id
+                )));
+            }
+        }
+
+        let document_count = u32::try_from(documents.len())
+            .map_err(|_| invalid_state("ingest batch document count does not fit u32"))?;
+        let prior_grant_count = self.docid_allocator.lease_grants().len();
+        let mut planned_allocator = self.docid_allocator.speculative_clone();
+        let allocated = planned_allocator
+            .alloc_batch(0, document_count)
+            .map_err(|error| invalid_state(error.to_string()))?;
+        let [batch_span] = allocated.spans() else {
+            // The scalar path already owns exact lease-boundary cuts. Keep it
+            // as the fallback for the infrequent batch that crosses one.
+            return Ok(None);
+        };
+
+        let mut work = Vec::new();
+        work.try_reserve_exact(plan.active_shards)
+            .map_err(|_| invalid_state("could not reserve internal parallel ingest work"))?;
+        for (shard, range) in plan.ranges.iter().copied().enumerate() {
+            let range_start = u32::try_from(range.start)
+                .map_err(|_| invalid_state("parallel range start does not fit u32"))?;
+            let range_len = u32::try_from(range.len())
+                .map_err(|_| invalid_state("parallel range length does not fit u32"))?;
+            let ord_start = batch_span
+                .ord_start
+                .checked_add(range_start)
+                .ok_or_else(|| invalid_state("parallel range document ordinal overflow"))?;
+            work.push(ParallelShardWork {
+                shard,
+                assignment: ParallelShardAssignment {
+                    document_start: range.start,
+                    document_end: range.end,
+                    span: DocIdSpan {
+                        lease_base: batch_span.lease_base,
+                        ord_start,
+                        len: range_len,
+                    },
+                },
+                state: ScribeShardState {
+                    accumulator: ColumnarAccumulator::with_arena_chunk_size(
+                        self.schema,
+                        arena_chunk_bytes,
+                    )?,
+                    identities: Vec::new(),
+                    current_lease_base: Some(batch_span.lease_base),
+                    scratch_metadata: Vec::new(),
+                },
+            });
+        }
+
+        let checkpoint = ParallelIngestCheckpoint::new(&self.reader);
+        let completed = work
+            .into_par_iter()
+            .map(|mut work| {
+                catch_parallel_ingest_worker(work.shard, || {
+                    Self::accumulate_parallel_shard(
+                        &mut work.state,
+                        documents,
+                        work.assignment,
+                        cx,
+                        &checkpoint,
+                    )
+                })?;
+                Ok(work)
+            })
+            .collect::<Result<Vec<_>, QuillIndexError>>()?;
+        checkpoint.check(cx)?;
+
+        let created_unix_s = self.created_unix_s()?;
+        let mut reserved_segment_ids = BTreeSet::new();
+        let mut flush_plans = Vec::new();
+        flush_plans
+            .try_reserve_exact(completed.len())
+            .map_err(|_| invalid_state("could not reserve internal parallel flush plans"))?;
+        for (offset, completed_shard) in completed.iter().enumerate() {
+            let segment_id = self.derive_segment_id_for_state_avoiding(
+                &completed_shard.state,
+                batch_span.lease_base,
+                created_unix_s,
+                &reserved_segment_ids,
+            )?;
+            reserved_segment_ids.insert(segment_id);
+            let offset = u64::try_from(offset)
+                .map_err(|_| invalid_state("parallel shard count does not fit u64"))?;
+            let seal_seq = self
+                .next_seal_seq
+                .checked_add(offset)
+                .ok_or_else(|| invalid_state("seal sequence exhausted"))?;
+            flush_plans.push(ShardFlushPlan {
+                shard: completed_shard.shard,
+                state: &completed_shard.state,
+                segment_id,
+                lease_docid_base: batch_span.lease_base,
+                created_unix_s,
+                seal_seq,
+            });
+        }
+        let built = flush_plans
+            .par_iter()
+            .map(Self::build_planned_shard_flush)
+            .collect::<Result<Vec<_>, _>>()?;
+        checkpoint.check(cx)?;
+
+        let mut pending_field_stats = self.pending_field_stats.clone();
+        for completed_shard in &completed {
+            let shard_document_count =
+                u32::try_from(completed_shard.state.accumulator.document_count())
+                    .map_err(|_| invalid_state("segment document count does not fit u32"))?;
+            for field in completed_shard.state.accumulator.fields() {
+                let entry = pending_field_stats
+                    .entry(field.field_ord())
+                    .or_insert((0, 0));
+                entry.0 = entry
+                    .0
+                    .checked_add(field.total_tokens())
+                    .ok_or_else(|| invalid_state("pending field token count overflow"))?;
+                entry.1 = entry
+                    .1
+                    .checked_add(shard_document_count)
+                    .ok_or_else(|| invalid_state("pending field document count overflow"))?;
+            }
+        }
+        let batch_logical_bytes = completed.iter().fold(0_usize, |total, shard| {
+            total.saturating_add(shard.state.accumulator.bytes_used())
+        });
+        let Some(projected_logical_bytes) = initial_logical_bytes.checked_add(batch_logical_bytes)
+        else {
+            return Ok(None);
+        };
+        if projected_logical_bytes >= logical_budget_bytes {
+            // The workers mutated only local accumulators. Discarding them and
+            // taking the scalar path preserves the exclusive logical ceiling
+            // without tokenizing every document twice on the admitted path.
+            return Ok(None);
+        }
+        let arena_bytes_used_high_water = projected_logical_bytes;
+        let arena_bytes_reserved_high_water = completed
+            .iter()
+            .fold(initial_reserved_bytes, |total, shard| {
+                total.saturating_add(shard.state.accumulator.bytes_reserved())
+            });
+        let next_seal_seq = built
+            .last()
+            .map_or(self.next_seal_seq, |flush| flush.next_seal_seq);
+        self.pending_segments
+            .try_reserve(built.len())
+            .map_err(|_| invalid_state("could not reserve pending segment bookkeeping"))?;
+        self.pending_owned_segments
+            .try_reserve(built.len())
+            .map_err(|_| invalid_state("could not reserve owned segment bookkeeping"))?;
+
+        // All fallible accumulation, encoding, accounting, and reservations
+        // finished against local state. Install the generation as one writer
+        // mutation so a failed worker leaves the original batch retryable.
+        planned_allocator.commit_speculative_grants(prior_grant_count);
+        self.ingest_retry_required = true;
+        self.docid_allocator = planned_allocator;
+        self.next_lease_base = self.docid_allocator.watermark();
+        for flush in built {
+            self.pending_segments.push(flush.manifest_segment);
+            self.pending_owned_segments.push(flush.encoded);
+        }
+        self.pending_field_stats = pending_field_stats;
+        self.next_seal_seq = next_seal_seq;
+        self.uncommitted_ids
+            .extend(documents.iter().map(|document| document.id.clone()));
+        self.unpublished_since.get_or_insert_with(Instant::now);
+
+        if allow_automatic_publication {
+            self.publish_bulk_cadence_if_due(cx).await?;
+        }
+        let visibility_due = self.unpublished_since.is_some_and(|started| {
+            started.elapsed() >= Duration::from_millis(self.config.max_visibility_lag_ms)
+        });
+        if allow_automatic_publication && visibility_due {
+            self.commit_with_trigger(cx, LifecycleTrigger::VisibilityLag)
+                .await?;
+        }
+
+        Ok(Some(ParallelIngestReceipt {
+            planner_version: plan.planner_version,
+            route: plan.route,
+            configured_width: plan.configured_width,
+            verified_pool_capacity: rayon::current_num_threads(),
+            eligible_shards: plan.eligible_shards,
+            active_shards: plan.active_shards,
+            logical_budget_bytes,
+            initial_logical_bytes,
+            batch_logical_upper_bound: batch_logical_bytes,
+            projected_logical_upper_bound: projected_logical_bytes,
+            arena_chunk_bytes,
+            arena_bytes_used_high_water,
+            arena_bytes_reserved_high_water,
+        }))
+    }
+
+    async fn try_index_documents_parallel(
+        &mut self,
+        cx: &Cx,
+        documents: &[IndexableDocument],
+        replacement_ids: &BTreeSet<&str>,
+        allow_automatic_publication: bool,
+    ) -> Result<Option<ParallelIngestReceipt>, QuillIndexError> {
+        let shard_count = self.shards.len();
+        let verified_pool_capacity = rayon::current_num_threads();
+        let plan = plan_parallel_ingest(documents.len(), shard_count, verified_pool_capacity)?;
+        if !replacement_ids.is_empty()
+            || self.shard_router.is_deterministic()
+            || plan.route == ParallelIngestRoute::Serial
+        {
+            return Ok(None);
+        }
+
+        let mut batch_ids = BTreeSet::new();
+        for document in documents {
+            check_cancel(cx, "parallel index validation")?;
+            if document.id.is_empty() {
+                return Err(invalid_state("document id must be nonempty"));
+            }
+            if !batch_ids.insert(document.id.as_str())
+                || self.uncommitted_ids.contains(&document.id)
+                || self
+                    .backend
+                    .snapshot()
+                    .resolve_document_id(&document.id)?
+                    .is_some()
+            {
+                return Err(invalid_state(format!(
+                    "duplicate live document id {:?}",
+                    document.id
+                )));
+            }
+        }
+
+        let active_shard_count = plan.active_shards;
+        let Some(budget_admission) =
+            self.parallel_budget_admission(cx, documents, active_shard_count)?
+        else {
+            return Ok(None);
+        };
+        let mut planned_router = self.shard_router.clone();
+        let prior_grant_count = self.docid_allocator.lease_grants().len();
+        let mut planned_allocator = self.docid_allocator.speculative_clone();
+        let mut selected_shards = vec![false; shard_count];
+        let mut work = Vec::new();
+        work.try_reserve_exact(active_shard_count)
+            .map_err(|_| invalid_state("could not reserve parallel ingest worker plans"))?;
+        for range in &plan.ranges {
+            let shard = planned_router.route_batch();
+            let selected = selected_shards.get_mut(shard).ok_or_else(|| {
+                invalid_state("parallel ingest planner selected an unknown shard")
+            })?;
+            if std::mem::replace(selected, true) {
+                return Err(invalid_state(
+                    "parallel ingest planner selected one shard more than once",
+                ));
+            }
+            let state = self
+                .shards
+                .get(shard)
+                .ok_or_else(|| invalid_state("parallel ingest shard state is missing"))?;
+            if state.accumulator.document_count() != 0 || !state.identities.is_empty() {
+                return Ok(None);
+            }
+            let live_lease = planned_allocator.live_lease(shard);
+            if let (Some(current), Some((live, _))) = (state.current_lease_base, live_lease)
+                && current != live
+            {
+                return Ok(None);
+            }
+            let count = range.len();
+            let count_u32 = u32::try_from(count)
+                .map_err(|_| invalid_state("parallel shard document count does not fit u32"))?;
+            let remaining = live_lease.map_or(DOC_ORDS_PER_LEASE, |(_, next_ord)| {
+                DOC_ORDS_PER_LEASE - next_ord
+            });
+            if count_u32 > remaining {
+                return Ok(None);
+            }
+            let allocated = planned_allocator
+                .alloc_batch(shard, count_u32)
+                .map_err(|error| invalid_state(error.to_string()))?;
+            let [span] = allocated.spans() else {
+                return Err(invalid_state(
+                    "parallel shard allocation unexpectedly crossed a Q1 lease",
+                ));
+            };
+            work.push(ParallelShardWork {
+                shard,
+                assignment: ParallelShardAssignment {
+                    document_start: range.start,
+                    document_end: range.end,
+                    span: *span,
+                },
+                state: ScribeShardState {
+                    accumulator: ColumnarAccumulator::with_arena_chunk_size(
+                        self.schema,
+                        budget_admission.arena_chunk_bytes,
+                    )?,
+                    identities: Vec::new(),
+                    current_lease_base: Some(span.lease_base),
+                    scratch_metadata: Vec::new(),
+                },
+            });
+        }
+
+        let checkpoint = ParallelIngestCheckpoint::new(&self.reader);
+        let completed = work
+            .into_par_iter()
+            .map(|mut work| {
+                catch_parallel_ingest_worker(work.shard, || {
+                    Self::accumulate_parallel_shard(
+                        &mut work.state,
+                        documents,
+                        work.assignment,
+                        cx,
+                        &checkpoint,
+                    )
+                })?;
+                Ok(work)
+            })
+            .collect::<Result<Vec<_>, QuillIndexError>>()?;
+        checkpoint.check(cx)?;
+
+        let mut replacements = Vec::new();
+        replacements
+            .try_reserve_exact(shard_count)
+            .map_err(|_| invalid_state("could not reserve parallel ingest commit table"))?;
+        replacements.resize_with(shard_count, || None);
+        for completed_shard in completed {
+            let slot = replacements
+                .get_mut(completed_shard.shard)
+                .ok_or_else(|| invalid_state("parallel ingest completed an unknown shard"))?;
+            if slot.replace(completed_shard.state).is_some() {
+                return Err(invalid_state(
+                    "parallel ingest completed one shard more than once",
+                ));
+            }
+        }
+
+        let Some(arena_bytes_used_high_water) = self.shards.iter().zip(&replacements).try_fold(
+            0_usize,
+            |total, (current, replacement)| {
+                total.checked_add(replacement.as_ref().map_or_else(
+                    || current.accumulator.bytes_used(),
+                    |state| state.accumulator.bytes_used(),
+                ))
+            },
+        ) else {
+            return Err(invalid_state(
+                "parallel ingest aggregate logical accounting overflowed",
+            ));
+        };
+        if arena_bytes_used_high_water > budget_admission.projected_logical_upper_bound
+            || arena_bytes_used_high_water >= budget_admission.logical_budget_bytes
+        {
+            return Err(invalid_state(
+                "parallel ingest exceeded its pre-worker logical budget proof",
+            ));
+        }
+        let Some(speculative_reserved_bytes) =
+            replacements.iter().try_fold(0_usize, |total, replacement| {
+                replacement.as_ref().map_or(Some(total), |state| {
+                    total.checked_add(state.accumulator.bytes_reserved())
+                })
+            })
+        else {
+            return Err(invalid_state(
+                "parallel ingest speculative reserve accounting overflowed",
+            ));
+        };
+        let Some(arena_bytes_reserved_high_water) = budget_admission
+            .initial_reserved_bytes
+            .checked_add(speculative_reserved_bytes)
+        else {
+            return Err(invalid_state(
+                "parallel ingest aggregate reserve accounting overflowed",
+            ));
+        };
+
+        // This is the first mutation of writer-owned state. Every fallible
+        // validation, allocation, worker, cancellation, and panic boundary
+        // above operates only on local plans, so a failure remains exactly
+        // retryable without committing allocator, router, or shard progress.
+        planned_allocator.commit_speculative_grants(prior_grant_count);
+        self.ingest_retry_required = true;
+        for (state, replacement) in self.shards.iter_mut().zip(replacements) {
+            if let Some(replacement) = replacement {
+                *state = replacement;
+            }
+        }
+        self.shard_router = planned_router;
+        self.docid_allocator = planned_allocator;
+        self.next_lease_base = self.docid_allocator.watermark();
+
+        self.uncommitted_ids
+            .extend(documents.iter().map(|document| document.id.clone()));
+        self.unpublished_since.get_or_insert_with(Instant::now);
+        let visibility_due = self.unpublished_since.is_some_and(|started| {
+            started.elapsed() >= Duration::from_millis(self.config.max_visibility_lag_ms)
+        });
+        if allow_automatic_publication && visibility_due {
+            self.commit_with_trigger(cx, LifecycleTrigger::VisibilityLag)
+                .await?;
+        }
+        Ok(Some(ParallelIngestReceipt {
+            planner_version: plan.planner_version,
+            route: plan.route,
+            configured_width: plan.configured_width,
+            verified_pool_capacity: plan.verified_pool_capacity,
+            eligible_shards: plan.eligible_shards,
+            active_shards: active_shard_count,
+            logical_budget_bytes: budget_admission.logical_budget_bytes,
+            initial_logical_bytes: budget_admission.initial_logical_bytes,
+            batch_logical_upper_bound: budget_admission.batch_logical_upper_bound,
+            projected_logical_upper_bound: budget_admission.projected_logical_upper_bound,
+            arena_chunk_bytes: budget_admission.arena_chunk_bytes,
+            arena_bytes_used_high_water,
+            arena_bytes_reserved_high_water,
+        }))
+    }
+
+    fn accumulate_parallel_shard(
+        state: &mut ScribeShardState,
+        documents: &[IndexableDocument],
+        assignment: ParallelShardAssignment,
+        cx: &Cx,
+        checkpoint: &ParallelIngestCheckpoint,
+    ) -> Result<(), QuillIndexError> {
+        checkpoint.check(cx)?;
+        let shard_documents = documents
+            .get(assignment.document_start..assignment.document_end)
+            .ok_or_else(|| invalid_state("parallel shard document range is outside the batch"))?;
+        if shard_documents.len()
+            != usize::try_from(assignment.span.len)
+                .map_err(|_| invalid_state("parallel shard span length does not fit usize"))?
+        {
+            return Err(invalid_state(
+                "parallel shard document range differs from its Q1 span",
+            ));
+        }
+        state
+            .identities
+            .try_reserve(shard_documents.len())
+            .map_err(|_| invalid_state("could not reserve parallel shard identities"))?;
+        for (offset, document) in shard_documents.iter().enumerate() {
+            checkpoint.check(cx)?;
+            let offset = u32::try_from(offset)
+                .map_err(|_| invalid_state("parallel shard offset does not fit u32"))?;
+            let doc_ord = assignment
+                .span
+                .ord_start
+                .checked_add(offset)
+                .ok_or_else(|| invalid_state("lease-relative document ordinal overflow"))?;
+            let global_docid = assignment
+                .span
+                .lease_base
+                .checked_add(u64::from(doc_ord))
+                .filter(|docid| *docid < MAX_GLOBAL_DOCID_EXCLUSIVE)
+                .ok_or_else(|| invalid_state("global Q1 document-id space exhausted"))?;
+            let metadata = canonical_metadata(&document.metadata)?;
+            let title = document.title.as_deref().unwrap_or("");
+            let indexed = [
+                IndexedFieldValue::new(ID_FIELD, &document.id),
+                IndexedFieldValue::new(CONTENT_FIELD, &document.content),
+                IndexedFieldValue::new(TITLE_FIELD, title),
+            ];
+            let numeric = [IndexedNumericValue::u64(ORD_FIELD, global_docid)];
+            let stored = [StoredFieldValue::new(METADATA_FIELD, &metadata)];
+            state
+                .accumulator
+                .add_document_with_values(doc_ord, &indexed, &numeric, &stored)?;
+            let content_hash = canonical_document_content_hash(document, &metadata)?;
+            state.identities.push(PendingIdentity {
+                doc_ord,
+                document_id: document.id.clone(),
+                content_hash,
+            });
+        }
+        Ok(())
     }
 
     async fn index_documents_with_replacements(
@@ -2527,6 +4572,7 @@ impl QuillWriterState {
         documents: &[IndexableDocument],
         replacement_ids: &BTreeSet<&str>,
         allow_automatic_publication: bool,
+        parallelism_policy: IngestParallelismPolicy,
     ) -> Result<(), QuillIndexError> {
         let ingest_span = tracing::info_span!(
             target: crate::tracing_conventions::TARGET,
@@ -2534,6 +4580,17 @@ impl QuillWriterState {
             phase = "ingest",
             doc_count = documents.len(),
             result_count = tracing::field::Empty,
+            parallel_planner_version = tracing::field::Empty,
+            parallel_route = tracing::field::Empty,
+            parallel_configured_width = tracing::field::Empty,
+            parallel_verified_pool_capacity = tracing::field::Empty,
+            parallel_eligible_shards = tracing::field::Empty,
+            parallel_active_shards = tracing::field::Empty,
+            parallel_logical_budget_bytes = tracing::field::Empty,
+            parallel_initial_logical_bytes = tracing::field::Empty,
+            parallel_batch_logical_upper_bound = tracing::field::Empty,
+            parallel_projected_logical_upper_bound = tracing::field::Empty,
+            parallel_arena_chunk_bytes = tracing::field::Empty,
             arena_bytes_used_high_water = tracing::field::Empty,
             arena_bytes_reserved_high_water = tracing::field::Empty,
             duration_us = tracing::field::Empty,
@@ -2564,9 +4621,94 @@ impl QuillWriterState {
             if documents.is_empty() {
                 return Ok(());
             }
-            // Arm the fail-closed retry guard before allocation or mutation.
-            // Only the successful return below (or a successful commit)
-            // disarms it.
+            let parallel_receipt = match parallelism_policy {
+                IngestParallelismPolicy::Adaptive => {
+                    if let Some(receipt) = self
+                        .try_index_documents_internal_parallel(
+                            cx,
+                            documents,
+                            replacement_ids,
+                            allow_automatic_publication,
+                        )
+                        .await?
+                    {
+                        Some(receipt)
+                    } else {
+                        self.try_index_documents_parallel(
+                            cx,
+                            documents,
+                            replacement_ids,
+                            allow_automatic_publication,
+                        )
+                        .await?
+                    }
+                }
+                #[cfg(feature = "pruning-conformance")]
+                IngestParallelismPolicy::ScalarTopologyConformance => {
+                    ingest_span.record("parallel_route", "scalar_topology_conformance");
+                    None
+                }
+            };
+            if let Some(receipt) = parallel_receipt {
+                ingest_span.record(
+                    "result_count",
+                    u64::try_from(documents.len()).unwrap_or(u64::MAX),
+                );
+                ingest_span.record(
+                    "parallel_planner_version",
+                    u64::from(receipt.planner_version),
+                );
+                ingest_span.record("parallel_route", receipt.route.as_str());
+                ingest_span.record(
+                    "parallel_configured_width",
+                    u64::try_from(receipt.configured_width).unwrap_or(u64::MAX),
+                );
+                ingest_span.record(
+                    "parallel_verified_pool_capacity",
+                    u64::try_from(receipt.verified_pool_capacity).unwrap_or(u64::MAX),
+                );
+                ingest_span.record(
+                    "parallel_eligible_shards",
+                    u64::try_from(receipt.eligible_shards).unwrap_or(u64::MAX),
+                );
+                ingest_span.record(
+                    "parallel_active_shards",
+                    u64::try_from(receipt.active_shards).unwrap_or(u64::MAX),
+                );
+                ingest_span.record(
+                    "parallel_logical_budget_bytes",
+                    u64::try_from(receipt.logical_budget_bytes).unwrap_or(u64::MAX),
+                );
+                ingest_span.record(
+                    "parallel_initial_logical_bytes",
+                    u64::try_from(receipt.initial_logical_bytes).unwrap_or(u64::MAX),
+                );
+                ingest_span.record(
+                    "parallel_batch_logical_upper_bound",
+                    u64::try_from(receipt.batch_logical_upper_bound).unwrap_or(u64::MAX),
+                );
+                ingest_span.record(
+                    "parallel_projected_logical_upper_bound",
+                    u64::try_from(receipt.projected_logical_upper_bound).unwrap_or(u64::MAX),
+                );
+                ingest_span.record(
+                    "parallel_arena_chunk_bytes",
+                    u64::try_from(receipt.arena_chunk_bytes).unwrap_or(u64::MAX),
+                );
+                ingest_span.record(
+                    "arena_bytes_used_high_water",
+                    u64::try_from(receipt.arena_bytes_used_high_water).unwrap_or(u64::MAX),
+                );
+                ingest_span.record(
+                    "arena_bytes_reserved_high_water",
+                    u64::try_from(receipt.arena_bytes_reserved_high_water).unwrap_or(u64::MAX),
+                );
+                self.ingest_retry_required = false;
+                return Ok(());
+            }
+            // The parallel route arms this guard only at its transactional
+            // commit boundary. The serial route still mutates the live router
+            // and allocator directly, so arm it immediately before doing so.
             self.ingest_retry_required = true;
             // Fan out only when every participating shard gets a segment's
             // worth of documents: each sealed segment carries its own term
@@ -2576,25 +4718,21 @@ impl QuillWriterState {
                 .shard_router
                 .shard_count()
                 .min(documents.len() / FANOUT_MIN_SHARD_DOCUMENTS);
-            let (arena_bytes_used_high_water, arena_bytes_reserved_high_water) =
-                if fanout_shards >= 2 {
-                    self.index_batch_fanout(
-                        cx,
-                        documents,
-                        replacement_ids,
-                        allow_automatic_publication,
-                        fanout_shards,
-                    )
+            let (arena_bytes_used_high_water, arena_bytes_reserved_high_water) = if fanout_shards
+                >= 2
+            {
+                self.index_batch_fanout(
+                    cx,
+                    documents,
+                    replacement_ids,
+                    allow_automatic_publication,
+                    fanout_shards,
+                )
+                .await?
+            } else {
+                self.index_batch_serial(cx, documents, replacement_ids, allow_automatic_publication)
                     .await?
-                } else {
-                    self.index_batch_serial(
-                        cx,
-                        documents,
-                        replacement_ids,
-                        allow_automatic_publication,
-                    )
-                    .await?
-                };
+            };
             let visibility_due = self.unpublished_since.is_some_and(|started| {
                 started.elapsed() >= Duration::from_millis(self.config.max_visibility_lag_ms)
             });
@@ -2709,21 +4847,20 @@ impl QuillWriterState {
                         IndexedFieldValue::new(TITLE_FIELD, title),
                     ];
                     let numeric = [IndexedNumericValue::u64(ORD_FIELD, global_docid)];
-                    let stored = [StoredFieldValue::new(METADATA_FIELD, &shard.scratch_metadata)];
-                    let accumulated = shard.accumulator.add_document_with_values(
-                        doc_ord,
-                        &indexed,
-                        &numeric,
-                        &stored,
-                    )?;
-                    retain_identity(
-                        &mut shard.identities,
-                        &mut shard.batch_hasher,
-                        &mut shard.scratch_preimage,
-                        doc_ord,
-                        document,
+                    let stored = [StoredFieldValue::new(
+                        METADATA_FIELD,
                         &shard.scratch_metadata,
-                    )?;
+                    )];
+                    let accumulated = shard
+                        .accumulator
+                        .add_document_with_values(doc_ord, &indexed, &numeric, &stored)?;
+                    let content_hash =
+                        canonical_document_content_hash(document, &shard.scratch_metadata)?;
+                    shard.identities.push(PendingIdentity {
+                        doc_ord,
+                        document_id: document.id.clone(),
+                        content_hash,
+                    });
                     accumulated
                 };
                 arena_bytes_used_high_water =
@@ -2754,10 +4891,7 @@ impl QuillWriterState {
             }
         }
         debug_assert_eq!(document_index, documents.len());
-        Ok((
-            arena_bytes_used_high_water,
-            arena_bytes_reserved_high_water,
-        ))
+        Ok((arena_bytes_used_high_water, arena_bytes_reserved_high_water))
     }
 
     /// Accumulate one bounded batch across every ingest shard concurrently.
@@ -2959,10 +5093,7 @@ impl QuillWriterState {
             }
         }
 
-        Ok((
-            arena_bytes_used_high_water,
-            arena_bytes_reserved_high_water,
-        ))
+        Ok((arena_bytes_used_high_water, arena_bytes_reserved_high_water))
     }
 
     /// Seal the scalar accumulator and atomically publish the next MANIFEST.
@@ -2993,9 +5124,7 @@ impl QuillWriterState {
                 "scalar commit cannot run while process-local Delta epochs are active",
             ));
         }
-        for shard in 0..self.shards.len() {
-            self.flush_shard(cx, shard, trigger).await?;
-        }
+        self.flush_all_shards(cx, trigger).await?;
         self.publish_pending_segments(cx, trigger).await?;
         if !self.config.bulk_load_mode {
             self.apply_tier_policy(cx).await?;
@@ -3426,12 +5555,16 @@ impl QuillWriterState {
         }
 
         self.pending_replacement_manifest = Some(manifest);
-        self.index_documents_with_replacements(cx, documents, &replacement_ids, false)
+        self.index_documents_with_replacements(
+            cx,
+            documents,
+            &replacement_ids,
+            false,
+            IngestParallelismPolicy::Adaptive,
+        )
+        .await?;
+        self.flush_all_shards(cx, LifecycleTrigger::ExplicitFlush)
             .await?;
-        for shard in 0..self.shards.len() {
-            self.flush_shard(cx, shard, LifecycleTrigger::ExplicitFlush)
-                .await?;
-        }
         self.prepare_pending_manifest()?;
         self.publish_pending_segments(cx, LifecycleTrigger::ExplicitFlush)
             .await?;
@@ -3628,6 +5761,209 @@ impl QuillWriterState {
         }
     }
 
+    async fn flush_all_shards(
+        &mut self,
+        cx: &Cx,
+        trigger: LifecycleTrigger,
+    ) -> Result<(), QuillIndexError> {
+        if let Some(shard) = self.staged_flush.as_ref().map(|staged| staged.shard) {
+            self.flush_shard(cx, shard, trigger).await?;
+        }
+
+        let nonempty = self
+            .shards
+            .iter()
+            .enumerate()
+            .filter_map(|(shard, state)| (state.accumulator.document_count() != 0).then_some(shard))
+            .collect::<Vec<_>>();
+        if nonempty.len() < 2 || rayon::current_num_threads() < 2 {
+            for shard in nonempty {
+                self.flush_shard(cx, shard, trigger).await?;
+            }
+            return Ok(());
+        }
+
+        check_cancel(cx, "parallel flush")?;
+        let built = {
+            let plans = self.plan_parallel_shard_flushes(&nonempty)?;
+            plans
+                .par_iter()
+                .map(Self::build_planned_shard_flush)
+                .collect::<Result<Vec<_>, _>>()?
+        };
+
+        for built in built {
+            check_cancel(cx, "parallel flush install")?;
+            let shard = built.shard;
+            let state = &self.shards[shard];
+            let seal_span = tracing::info_span!(
+                target: crate::tracing_conventions::TARGET,
+                crate::tracing_conventions::KEEPER_LIFECYCLE,
+                phase = "seal",
+                trigger = trigger.as_str(),
+                action = "install_parallel_build",
+                shard_id = shard,
+                segment_id = built.manifest_segment.segment_id,
+                doc_count = state.accumulator.document_count(),
+                token_count = state.accumulator.token_count(),
+                result_count = u64::from(built.manifest_segment.doc_count),
+                output_bytes = built.encoded.file_len(),
+                arena_bytes_used_high_water = state.accumulator.bytes_used(),
+                arena_bytes_reserved_high_water = state.accumulator.bytes_reserved(),
+                duration_us = tracing::field::Empty,
+            );
+            let _seal_timer = crate::tracing_conventions::StageTimer::new(&seal_span);
+            let instrumented = seal_span.clone();
+            async {
+                self.stage_built_shard_flush(built)?;
+                self.install_staged_flush(cx).await
+            }
+            .instrument(instrumented)
+            .await?;
+        }
+        Ok(())
+    }
+
+    fn plan_parallel_shard_flushes<'a>(
+        &'a self,
+        shards: &[usize],
+    ) -> Result<Vec<ShardFlushPlan<'a>>, QuillIndexError> {
+        let mut plans = Vec::new();
+        plans
+            .try_reserve_exact(shards.len())
+            .map_err(|_| invalid_state("could not reserve parallel shard flush plans"))?;
+        let mut reserved_segment_ids = BTreeSet::new();
+        for (offset, &shard) in shards.iter().enumerate() {
+            let state = &self.shards[shard];
+            let lease_docid_base = state
+                .current_lease_base
+                .ok_or_else(|| invalid_state("nonempty accumulator has no Q1 lease"))?;
+            let created_unix_s = self.created_unix_s()?;
+            let segment_id = self.derive_segment_id_avoiding(
+                shard,
+                lease_docid_base,
+                created_unix_s,
+                &reserved_segment_ids,
+            )?;
+            reserved_segment_ids.insert(segment_id);
+            let offset = u64::try_from(offset)
+                .map_err(|_| invalid_state("parallel shard count does not fit u64"))?;
+            let seal_seq = self
+                .next_seal_seq
+                .checked_add(offset)
+                .ok_or_else(|| invalid_state("seal sequence exhausted"))?;
+            plans.push(ShardFlushPlan {
+                shard,
+                state,
+                segment_id,
+                lease_docid_base,
+                created_unix_s,
+                seal_seq,
+            });
+        }
+        Ok(plans)
+    }
+
+    fn build_planned_shard_flush(
+        plan: &ShardFlushPlan<'_>,
+    ) -> Result<BuiltShardFlush, QuillIndexError> {
+        let state = plan.state;
+        let seal_span = tracing::info_span!(
+            target: crate::tracing_conventions::TARGET,
+            crate::tracing_conventions::KEEPER_LIFECYCLE,
+            phase = "seal",
+            trigger = "parallel_batch",
+            action = "build_shared_nothing",
+            shard_id = plan.shard,
+            segment_id = plan.segment_id,
+            doc_count = state.accumulator.document_count(),
+            token_count = state.accumulator.token_count(),
+            result_count = tracing::field::Empty,
+            output_bytes = tracing::field::Empty,
+            arena_bytes_used_high_water = state.accumulator.bytes_used(),
+            arena_bytes_reserved_high_water = state.accumulator.bytes_reserved(),
+            duration_us = tracing::field::Empty,
+        );
+        let _seal_timer = crate::tracing_conventions::StageTimer::new(&seal_span);
+        let _entered = seal_span.enter();
+        let documents = state
+            .identities
+            .iter()
+            .map(|identity| {
+                FlushDocumentInput::new(
+                    identity.doc_ord,
+                    &identity.document_id,
+                    identity.content_hash,
+                )
+            })
+            .collect::<Vec<_>>();
+        let encoded = flush_accumulator_with_mode(
+            &state.accumulator,
+            FlushSegmentInput {
+                segment_id: plan.segment_id,
+                lease_docid_base: plan.lease_docid_base,
+                created_unix_s: plan.created_unix_s,
+                engine_version: CURRENT_ENGINE_VERSION,
+                documents: &documents,
+            },
+            FlushMode::Scalar,
+        )?;
+        let manifest_segment = manifest_segment(&encoded, plan.seal_seq);
+        let next_seal_seq = plan
+            .seal_seq
+            .checked_add(1)
+            .ok_or_else(|| invalid_state("seal sequence exhausted"))?;
+        seal_span.record("result_count", u64::from(manifest_segment.doc_count));
+        seal_span.record("output_bytes", encoded.file_len());
+        Ok(BuiltShardFlush {
+            shard: plan.shard,
+            encoded,
+            manifest_segment,
+            next_seal_seq,
+        })
+    }
+
+    fn stage_built_shard_flush(&mut self, built: BuiltShardFlush) -> Result<(), QuillIndexError> {
+        if self.staged_flush.is_some() {
+            return Err(invalid_state(
+                "cannot stage a parallel shard build while another flush is retained",
+            ));
+        }
+        let shard = built.shard;
+        let document_count = u32::try_from(self.shards[shard].accumulator.document_count())
+            .map_err(|_| invalid_state("segment document count does not fit u32"))?;
+        let mut pending_field_stats = self.pending_field_stats.clone();
+        for field in self.shards[shard].accumulator.fields() {
+            let entry = pending_field_stats
+                .entry(field.field_ord())
+                .or_insert((0, 0));
+            entry.0 = entry
+                .0
+                .checked_add(field.total_tokens())
+                .ok_or_else(|| invalid_state("pending field token count overflow"))?;
+            entry.1 = entry
+                .1
+                .checked_add(document_count)
+                .ok_or_else(|| invalid_state("pending field document count overflow"))?;
+        }
+        self.pending_segments
+            .try_reserve(1)
+            .map_err(|_| invalid_state("could not reserve pending segment bookkeeping"))?;
+        if matches!(&self.backend, IndexBackend::Memory(_)) {
+            self.pending_owned_segments
+                .try_reserve(1)
+                .map_err(|_| invalid_state("could not reserve owned segment bookkeeping"))?;
+        }
+        self.staged_flush = Some(StagedFlush {
+            shard,
+            encoded: built.encoded,
+            manifest_segment: built.manifest_segment,
+            pending_field_stats,
+            next_seal_seq: built.next_seal_seq,
+        });
+        Ok(())
+    }
+
     fn prepare_shard_flush(&mut self, shard: usize) -> Result<(), QuillIndexError> {
         if self.staged_flush.is_some() || self.shards[shard].accumulator.document_count() == 0 {
             return Ok(());
@@ -3728,9 +6064,6 @@ impl QuillWriterState {
         self.next_seal_seq = next_seal_seq;
         self.shards[shard].accumulator.reset();
         self.shards[shard].identities.clear();
-        // Must stay in lockstep with `identities`: the digest describes exactly
-        // the identities still retained, so a cleared log means a fresh hasher.
-        self.shards[shard].batch_hasher.reset();
         self.shards[shard].current_lease_base = None;
         Ok(())
     }
@@ -3741,6 +6074,31 @@ impl QuillWriterState {
         lease_base: u64,
         created_unix_s: i64,
     ) -> Result<u64, QuillIndexError> {
+        self.derive_segment_id_avoiding(shard, lease_base, created_unix_s, &BTreeSet::new())
+    }
+
+    fn derive_segment_id_avoiding(
+        &self,
+        shard: usize,
+        lease_base: u64,
+        created_unix_s: i64,
+        reserved_segment_ids: &BTreeSet<u64>,
+    ) -> Result<u64, QuillIndexError> {
+        self.derive_segment_id_for_state_avoiding(
+            &self.shards[shard],
+            lease_base,
+            created_unix_s,
+            reserved_segment_ids,
+        )
+    }
+
+    fn derive_segment_id_for_state_avoiding(
+        &self,
+        state: &ScribeShardState,
+        lease_base: u64,
+        created_unix_s: i64,
+        reserved_segment_ids: &BTreeSet<u64>,
+    ) -> Result<u64, QuillIndexError> {
         let generation = self
             .backend
             .snapshot()
@@ -3750,11 +6108,11 @@ impl QuillWriterState {
             .checked_add(1)
             .ok_or_else(|| invalid_state("manifest generation exhausted"))?;
         let schema_id = self.schema.schema_id()?;
-        // Folded per document by `retain_identity` as the batch accumulated,
-        // over the same `len || preimage` sequence in the same order this used
-        // to walk. `digest` does not consume the state, so a retried seal
-        // (staged flush already present) reads the same value.
-        let batch_digest = self.shards[shard].batch_hasher.digest();
+        let mut batch_hasher = Xxh3::new();
+        for identity in &state.identities {
+            batch_hasher.update(&identity.content_hash.to_le_bytes());
+        }
+        let batch_digest = batch_hasher.digest();
         for salt in 0_u64..=u64::from(u16::MAX) {
             let mut preimage = [0_u8; 52];
             preimage[..8].copy_from_slice(&schema_id.to_le_bytes());
@@ -3765,15 +6123,16 @@ impl QuillWriterState {
             preimage[36..44].copy_from_slice(&batch_digest.to_le_bytes());
             preimage[44..].copy_from_slice(&salt.to_le_bytes());
             let candidate = xxh3_64(&preimage);
-            let collision = self
-                .backend
-                .snapshot()
-                .loaded_manifest()
-                .manifest
-                .segments
-                .iter()
-                .chain(&self.pending_segments)
-                .any(|segment| segment.segment_id == candidate);
+            let collision = reserved_segment_ids.contains(&candidate)
+                || self
+                    .backend
+                    .snapshot()
+                    .loaded_manifest()
+                    .manifest
+                    .segments
+                    .iter()
+                    .chain(&self.pending_segments)
+                    .any(|segment| segment.segment_id == candidate);
             if !collision {
                 return Ok(candidate);
             }
@@ -3839,6 +6198,26 @@ impl QuillWriterState {
 impl QuillReader {
     #[cfg(not(feature = "conformance-internals"))]
     #[inline]
+    #[allow(
+        clippy::unused_self,
+        reason = "keeps cache call sites cfg-symmetric with the controller-backed variant"
+    )]
+    fn ranked_query_cache_enabled(&self) -> bool {
+        true
+    }
+
+    #[cfg(feature = "conformance-internals")]
+    #[inline]
+    fn ranked_query_cache_enabled(&self) -> bool {
+        !self.conformance_controller.is_armed()
+    }
+
+    #[cfg(not(feature = "conformance-internals"))]
+    #[inline]
+    #[allow(
+        clippy::unused_self,
+        reason = "keeps checkpoint call sites cfg-symmetric with the controller-backed variant"
+    )]
     fn query_checkpoint<'a>(
         &self,
         cx: &'a Cx,
@@ -3894,6 +6273,34 @@ impl QuillReader {
         self.search_paginated_on(cx, query, limit, offset, exact_count, published.as_ref())
     }
 
+    #[cfg(feature = "pruning-conformance")]
+    fn search_paginated_with_conformance_pruning_trace(
+        &self,
+        cx: &Cx,
+        query: &str,
+        limit: usize,
+        offset: usize,
+        exact_count: bool,
+    ) -> Result<(QuillSearchResult, ConformancePruningTraceReceipt), QuillIndexError> {
+        let published = self.published_snapshot.load();
+        let expected_segments = published.keeper_snapshot().segments().len();
+        let guard = ConformancePruningTraceGuard::new(
+            expected_segments,
+            Arc::clone(&self.conformance_controller),
+        );
+        let result = self.search_paginated_on_inner(
+            cx,
+            query,
+            limit,
+            offset,
+            exact_count,
+            Some(guard.session()),
+            published.as_ref(),
+        )?;
+        let receipt = guard.complete()?;
+        Ok((result, receipt))
+    }
+
     fn search_paginated_on(
         &self,
         cx: &Cx,
@@ -3901,6 +6308,30 @@ impl QuillReader {
         limit: usize,
         offset: usize,
         exact_count: bool,
+        snapshot: &QuillSearchSnapshot,
+    ) -> Result<QuillSearchResult, QuillIndexError> {
+        self.search_paginated_on_inner(
+            cx,
+            query,
+            limit,
+            offset,
+            exact_count,
+            #[cfg(feature = "pruning-conformance")]
+            None,
+            snapshot,
+        )
+    }
+
+    fn search_paginated_on_inner(
+        &self,
+        cx: &Cx,
+        query: &str,
+        limit: usize,
+        offset: usize,
+        exact_count: bool,
+        #[cfg(feature = "pruning-conformance")] pruning_trace: Option<
+            &ConformancePruningTraceSession,
+        >,
         snapshot: &QuillSearchSnapshot,
     ) -> Result<QuillSearchResult, QuillIndexError> {
         let keeper = snapshot.keeper_snapshot();
@@ -3912,6 +6343,8 @@ impl QuillReader {
             target: crate::tracing_conventions::TARGET,
             crate::tracing_conventions::ARGUS_QUERY,
             phase = "query",
+            query_form = "raw",
+            cache_lookup = tracing::field::Empty,
             query_len = query.len(),
             segment_count,
             doc_count = snapshot.live_doc_count(),
@@ -3924,7 +6357,35 @@ impl QuillReader {
         );
         let _query_timer = crate::tracing_conventions::StageTimer::new(&query_span);
         let _query_entered = query_span.enter();
-        check_cancel(cx, "search")?;
+        if let Err(error) = check_cancel(cx, "search") {
+            query_span.record("cache_lookup", "not_checked");
+            return Err(error);
+        }
+        let cache_enabled = self.ranked_query_cache_enabled();
+        #[cfg(feature = "pruning-conformance")]
+        let cache_enabled = cache_enabled && pruning_trace.is_none();
+        if cache_enabled {
+            if let Some(result) = self.published_snapshot.ranked_query_cache.get_raw(
+                snapshot.snapshot_epoch(),
+                query,
+                limit,
+                offset,
+                exact_count,
+            ) {
+                query_span.record("cache_lookup", "hit");
+                query_span.record(
+                    "result_count",
+                    u64::try_from(result.hits.len()).unwrap_or(u64::MAX),
+                );
+                if let Some(total_count) = result.total_count {
+                    query_span.record("total_count", total_count);
+                }
+                return Ok(result);
+            }
+            query_span.record("cache_lookup", "miss");
+        } else {
+            query_span.record("cache_lookup", "disabled");
+        }
         let parsed = {
             let parse_span = tracing::info_span!(
                 target: crate::tracing_conventions::TARGET,
@@ -3965,7 +6426,7 @@ impl QuillReader {
             );
             parsed
         };
-        let result = self.execute_ranked_query(
+        let result = self.execute_ranked_query_inner(
             cx,
             &parsed.query,
             snapshot,
@@ -3973,11 +6434,23 @@ impl QuillReader {
             offset,
             exact_count,
             parsed.diagnostics,
+            #[cfg(feature = "pruning-conformance")]
+            pruning_trace,
         )?;
         let result_count = u64::try_from(result.hits.len()).unwrap_or(u64::MAX);
         query_span.record("result_count", result_count);
         if let Some(total_count) = result.total_count {
             query_span.record("total_count", total_count);
+        }
+        if cache_enabled {
+            self.published_snapshot.ranked_query_cache.insert_raw(
+                snapshot.snapshot_epoch(),
+                query,
+                limit,
+                offset,
+                exact_count,
+                &result,
+            );
         }
         Ok(result)
     }
@@ -4121,11 +6594,59 @@ impl QuillReader {
         offset: usize,
         exact_count: bool,
     ) -> Result<QuillSearchResult, QuillIndexError> {
-        check_cancel(cx, "search_preparsed")?;
+        let published = self.published_snapshot.load();
+        let keeper = published.keeper_snapshot();
+        let segment_count = keeper
+            .segments()
+            .len()
+            .saturating_add(published.delta_count());
+        let query_span = tracing::info_span!(
+            target: crate::tracing_conventions::TARGET,
+            crate::tracing_conventions::ARGUS_QUERY,
+            phase = "query",
+            query_form = "preparsed",
+            cache_lookup = tracing::field::Empty,
+            segment_count,
+            doc_count = published.live_doc_count(),
+            limit,
+            offset,
+            exact_count,
+            result_count = tracing::field::Empty,
+            total_count = tracing::field::Empty,
+            duration_us = tracing::field::Empty,
+        );
+        let _query_timer = crate::tracing_conventions::StageTimer::new(&query_span);
+        let _query_entered = query_span.enter();
+        if let Err(error) = check_cancel(cx, "search_preparsed") {
+            query_span.record("cache_lookup", "not_checked");
+            return Err(error);
+        }
+        let cache_enabled = self.ranked_query_cache_enabled();
+        if cache_enabled {
+            if let Some(result) = self.published_snapshot.ranked_query_cache.get_preparsed(
+                published.snapshot_epoch(),
+                query,
+                limit,
+                offset,
+                exact_count,
+            ) {
+                query_span.record("cache_lookup", "hit");
+                query_span.record(
+                    "result_count",
+                    u64::try_from(result.hits.len()).unwrap_or(u64::MAX),
+                );
+                if let Some(total_count) = result.total_count {
+                    query_span.record("total_count", total_count);
+                }
+                return Ok(result);
+            }
+            query_span.record("cache_lookup", "miss");
+        } else {
+            query_span.record("cache_lookup", "disabled");
+        }
         let mut canonical = query.clone();
         let _canonicalization = canonicalize_query(&mut canonical);
-        let published = self.published_snapshot.load();
-        self.execute_ranked_query(
+        let result = self.execute_ranked_query(
             cx,
             &canonical,
             published.as_ref(),
@@ -4133,7 +6654,25 @@ impl QuillReader {
             offset,
             exact_count,
             Vec::new(),
-        )
+        )?;
+        query_span.record(
+            "result_count",
+            u64::try_from(result.hits.len()).unwrap_or(u64::MAX),
+        );
+        if let Some(total_count) = result.total_count {
+            query_span.record("total_count", total_count);
+        }
+        if cache_enabled {
+            self.published_snapshot.ranked_query_cache.insert_preparsed(
+                published.snapshot_epoch(),
+                query,
+                limit,
+                offset,
+                exact_count,
+                &result,
+            );
+        }
+        Ok(result)
     }
 
     /// Execute one already-built query tree through the scoreless id-set path.
@@ -4210,6 +6749,8 @@ impl QuillReader {
             snapshot,
             rank_pruning,
             topdocs_root,
+            #[cfg(feature = "pruning-conformance")]
+            None,
             fan_out && !metering,
         )?;
         let collected = collector.finish()?;
@@ -4220,6 +6761,7 @@ impl QuillReader {
             .collect())
     }
 
+    #[cfg(any(test, feature = "bench-internals"))]
     fn execute_ranked_query(
         &self,
         cx: &Cx,
@@ -4229,6 +6771,32 @@ impl QuillReader {
         offset: usize,
         exact_count: bool,
         diagnostics: Vec<QueryDiagnostic>,
+    ) -> Result<QuillSearchResult, QuillIndexError> {
+        self.execute_ranked_query_inner(
+            cx,
+            query,
+            snapshot,
+            limit,
+            offset,
+            exact_count,
+            diagnostics,
+            #[cfg(feature = "pruning-conformance")]
+            None,
+        )
+    }
+
+    fn execute_ranked_query_inner(
+        &self,
+        cx: &Cx,
+        query: &Query,
+        snapshot: &QuillSearchSnapshot,
+        limit: usize,
+        offset: usize,
+        exact_count: bool,
+        diagnostics: Vec<QueryDiagnostic>,
+        #[cfg(feature = "pruning-conformance")] pruning_trace: Option<
+            &ConformancePruningTraceSession,
+        >,
     ) -> Result<QuillSearchResult, QuillIndexError> {
         validate_query_lowering(query, 1.0, self.schema)?;
         let work_upper_bound =
@@ -4259,6 +6827,9 @@ impl QuillReader {
             .map(|segment| u64::from(segment.doc_count()))
             .sum();
         let fan_out = sealed_segment_fanout(keeper.segments().len(), sealed_docs) && !metering;
+        #[cfg(feature = "pruning-conformance")]
+        let fan_out = fan_out
+            && pruning_trace.is_none_or(|trace| trace.cancellation_arm_generation().is_none());
         self.collect_sealed_segments(
             cx,
             &checkpoint,
@@ -4267,6 +6838,8 @@ impl QuillReader {
             snapshot,
             rank_pruning,
             topdocs_root,
+            #[cfg(feature = "pruning-conformance")]
+            pruning_trace,
             fan_out,
         )?;
         for delta in snapshot.delta_snapshots() {
@@ -4367,18 +6940,32 @@ impl QuillReader {
         snapshot: &QuillSearchSnapshot,
         rank_pruning: bool,
         topdocs_root: bool,
+        #[cfg(feature = "pruning-conformance")] pruning_trace: Option<
+            &ConformancePruningTraceSession,
+        >,
         fan_out: bool,
     ) -> Result<(), QuillIndexError> {
         let keeper = snapshot.keeper_snapshot();
+        #[cfg(feature = "pruning-conformance")]
+        if let Some(trace) = pruning_trace {
+            trace.bind_execution_mode(if fan_out {
+                ConformancePruningExecutionMode::Rayon
+            } else {
+                ConformancePruningExecutionMode::Serial
+            })?;
+        }
         if fan_out {
             check_cancel(cx, "search")?;
             let template = collector.empty_like()?;
             let schema = self.schema;
             let glob_expansion_limit = self.config.glob_expansion_limit;
+            let segment_count = keeper.segments().len();
             let partials = keeper
                 .segments()
                 .par_iter()
-                .map(|segment| {
+                .enumerate()
+                .map(|(segment_ordinal, segment)| {
+                    debug_assert!(segment_ordinal < segment_count);
                     checkpoint.admit(QueryWorkKind::Segment, 1)?;
                     let mut local = template.empty_like()?;
                     let score_span = tracing::info_span!(
@@ -4410,6 +6997,19 @@ impl QuillReader {
                     )?;
                     local.collect(&mut scorer, segment)?;
                     record_pruning_telemetry(&score_span, scorer.pruning_telemetry());
+                    #[cfg(feature = "pruning-conformance")]
+                    if let Some(trace) = pruning_trace {
+                        trace.record_and_checkpoint(
+                            u64::try_from(segment_ordinal).map_err(|_| {
+                                invalid_state("Quill segment ordinal does not fit u64")
+                            })?,
+                            u64::from(segment.doc_count()),
+                            scorer.conformance_union_refills(),
+                            &self.conformance_controller,
+                            cx,
+                        )?;
+                        check_cancel(cx, "search")?;
+                    }
                     Ok(local)
                 })
                 .collect::<Result<Vec<_>, QuillIndexError>>()?;
@@ -4418,7 +7018,9 @@ impl QuillReader {
                 collector.merge(partial)?;
             }
         } else {
-            for segment in keeper.segments() {
+            let segment_count = keeper.segments().len();
+            for (segment_ordinal, segment) in keeper.segments().iter().enumerate() {
+                debug_assert!(segment_ordinal < segment_count);
                 checkpoint.admit(QueryWorkKind::Segment, 1)?;
                 let score_span = tracing::info_span!(
                     target: crate::tracing_conventions::TARGET,
@@ -4449,6 +7051,18 @@ impl QuillReader {
                 )?;
                 collector.collect(&mut scorer, segment)?;
                 record_pruning_telemetry(&score_span, scorer.pruning_telemetry());
+                #[cfg(feature = "pruning-conformance")]
+                if let Some(trace) = pruning_trace {
+                    trace.record_and_checkpoint(
+                        u64::try_from(segment_ordinal)
+                            .map_err(|_| invalid_state("Quill segment ordinal does not fit u64"))?,
+                        u64::from(segment.doc_count()),
+                        scorer.conformance_union_refills(),
+                        &self.conformance_controller,
+                        cx,
+                    )?;
+                    check_cancel(cx, "search")?;
+                }
             }
         }
         Ok(())
@@ -5060,6 +7674,8 @@ impl QuillIndex {
             snapshot,
             rank_pruning,
             topdocs_root,
+            #[cfg(feature = "pruning-conformance")]
+            None,
             fan_out && !metering,
         )
     }
@@ -5189,6 +7805,32 @@ impl QuillIndex {
     #[must_use]
     pub fn conformance_cancellation_controller(&self) -> Arc<ConformanceCancellationController> {
         Arc::clone(&self.reader.conformance_controller)
+    }
+
+    /// Execute one ranked search with an invocation-bound pruning trace.
+    ///
+    /// # Errors
+    ///
+    /// Returns the ordinary typed query failure, or a typed conformance error
+    /// if the exact invocation does not produce one dense receipt per sealed
+    /// segment. Partial receipts are failed and discarded before return.
+    #[cfg(feature = "pruning-conformance")]
+    #[doc(hidden)]
+    pub fn search_paginated_with_conformance_pruning_trace(
+        &self,
+        cx: &Cx,
+        query: &str,
+        limit: usize,
+        offset: usize,
+        exact_count: bool,
+    ) -> Result<(QuillSearchResult, ConformancePruningTraceReceipt), QuillIndexError> {
+        self.reader.search_paginated_with_conformance_pruning_trace(
+            cx,
+            query,
+            limit,
+            offset,
+            exact_count,
+        )
     }
 
     /// Capture a fixed-size digest receipt for the complete retained scalar
@@ -5328,6 +7970,37 @@ impl QuillIndex {
     ) -> Result<(), QuillIndexError> {
         let mut writer = self.lock_writer(cx, "index writer lock").await?;
         writer.index_documents(cx, documents).await
+    }
+
+    /// Accumulate one bounded batch through the scalar writer without
+    /// parallel-planner fanout for a conformance fixture.
+    ///
+    /// This proof-only seam does not alter shipping ingest: ordinary
+    /// [`Self::index_documents`] keeps its adaptive shared-nothing and
+    /// fixed-width internal fanout. The resulting leaf uses the same scalar
+    /// accumulator, segment encoding, commit path, and query execution as a
+    /// production scalar write; only ingest parallelization is suppressed.
+    /// Scalar lease, arena-budget, visibility-publication, and tier-merge
+    /// rules remain live, so callers must validate the realized leaf geometry
+    /// before treating it as proof evidence.
+    ///
+    /// # Errors
+    ///
+    /// Returns typed cancellation, writer-lock, duplicate-ID, accumulation,
+    /// flush, or publication failures.
+    #[cfg(feature = "pruning-conformance")]
+    #[doc(hidden)]
+    pub async fn index_documents_with_scalar_topology_conformance(
+        &self,
+        cx: &Cx,
+        documents: &[IndexableDocument],
+    ) -> Result<(), QuillIndexError> {
+        let mut writer = self
+            .lock_writer(cx, "scalar topology conformance writer lock")
+            .await?;
+        writer
+            .index_documents_with_scalar_topology_conformance(cx, documents)
+            .await
     }
 
     /// Seal pending writes and atomically publish the next MANIFEST.
@@ -6162,15 +8835,13 @@ fn accumulate_shard_run(
     documents: &[IndexableDocument],
     span: DocIdSpan,
 ) -> Result<(usize, usize), QuillIndexError> {
-    // Disjoint field borrows: the accumulator, the identity log, the digest
-    // and both scratch buffers are all touched per document, so they are
+    // Disjoint field borrows: the accumulator, the identity log and the
+    // metadata scratch buffer are all touched per document, so they are
     // split out once instead of being re-borrowed through `state` each time.
     let ScribeShardState {
         accumulator,
         identities,
-        batch_hasher,
         scratch_metadata,
-        scratch_preimage,
         ..
     } = state;
     let mut bytes_used_high_water = 0_usize;
@@ -6201,14 +8872,12 @@ fn accumulate_shard_run(
             accumulator.add_document_with_values(doc_ord, &indexed, &numeric, &stored)?;
         bytes_used_high_water = bytes_used_high_water.max(accumulated.bytes_used);
         bytes_reserved_high_water = bytes_reserved_high_water.max(accumulated.bytes_reserved);
-        retain_identity(
-            identities,
-            batch_hasher,
-            scratch_preimage,
+        let content_hash = canonical_document_content_hash(document, scratch_metadata)?;
+        identities.push(PendingIdentity {
             doc_ord,
-            document,
-            scratch_metadata,
-        )?;
+            document_id: document.id.clone(),
+            content_hash,
+        });
     }
     Ok((bytes_used_high_water, bytes_reserved_high_water))
 }
@@ -6226,23 +8895,6 @@ fn write_canonical_metadata(
     serde_json::to_writer(out, &ordered)
 }
 
-/// Append a document's canonical identity preimage to `out`.
-fn write_canonical_document_preimage(
-    out: &mut Vec<u8>,
-    document: &IndexableDocument,
-    metadata: &[u8],
-) -> Result<(), serde_json::Error> {
-    serde_json::to_writer(
-        out,
-        &(
-            document.id.as_str(),
-            document.content.as_str(),
-            document.title.as_deref().unwrap_or(""),
-            metadata,
-        ),
-    )
-}
-
 fn canonical_metadata(
     metadata: &std::collections::HashMap<String, String>,
 ) -> Result<Vec<u8>, serde_json::Error> {
@@ -6251,43 +8903,24 @@ fn canonical_metadata(
     Ok(out)
 }
 
-fn canonical_document_preimage(
+fn canonical_document_content_hash(
     document: &IndexableDocument,
     metadata: &[u8],
-) -> Result<Vec<u8>, serde_json::Error> {
-    let mut out = Vec::new();
-    write_canonical_document_preimage(&mut out, document, metadata)?;
-    Ok(out)
-}
-
-/// Canonicalize one document's identity into `scratch`, fold it into the
-/// shard's running batch digest, and retain only the resulting witness.
-///
-/// Persisted bytes are unchanged. `scratch` ends up holding exactly the bytes
-/// `canonical_document_preimage` used to return, the IDMAP witness is the same
-/// `xxh3_64` of those bytes, and the digest folds the same `len || preimage`
-/// sequence, in the same `identities` order, that `derive_segment_id` used to
-/// walk at seal time.
-fn retain_identity(
-    identities: &mut Vec<PendingIdentity>,
-    batch_hasher: &mut Xxh3,
-    scratch: &mut Vec<u8>,
-    doc_ord: u32,
-    document: &IndexableDocument,
-    metadata: &[u8],
-) -> Result<(), QuillIndexError> {
-    scratch.clear();
-    write_canonical_document_preimage(scratch, document, metadata)?;
-    let len = u64::try_from(scratch.len())
-        .map_err(|_| invalid_state("canonical document preimage length does not fit u64"))?;
-    batch_hasher.update(&len.to_le_bytes());
-    batch_hasher.update(scratch);
-    identities.push(PendingIdentity {
-        doc_ord,
-        document_id: document.id.clone(),
-        content_hash: xxh3_64(scratch),
-    });
-    Ok(())
+) -> Result<u64, QuillIndexError> {
+    let mut hasher = Xxh3::new();
+    hasher.update(CONTENT_HASH_DOMAIN);
+    for field in [
+        document.id.as_bytes(),
+        document.content.as_bytes(),
+        document.title.as_deref().unwrap_or("").as_bytes(),
+        metadata,
+    ] {
+        let len = u64::try_from(field.len())
+            .map_err(|_| invalid_state("canonical document field length does not fit u64"))?;
+        hasher.update(&len.to_le_bytes());
+        hasher.update(field);
+    }
+    Ok(hasher.digest())
 }
 
 /// Compute the exact IDMAP content witness Quill will persist for a document.
@@ -6299,7 +8932,7 @@ pub fn indexable_document_content_hash(
     document: &IndexableDocument,
 ) -> Result<u64, QuillIndexError> {
     let metadata = canonical_metadata(&document.metadata)?;
-    Ok(xxh3_64(&canonical_document_preimage(document, &metadata)?))
+    canonical_document_content_hash(document, &metadata)
 }
 
 #[cfg(feature = "conformance-internals")]
@@ -8521,22 +11154,16 @@ fn open_owned_cursor(
             count: posting_count,
         }
     })?;
-    let mut posting_cursor = postings.cursor()?;
-    let mut admitted_block = None;
-    while let Some(posting) = posting_cursor.current() {
-        let block = posting_cursor
-            .block_index()
-            .ok_or_else(|| invalid_state("positioned posting cursor has no block index"))?;
-        if admitted_block != Some(block) {
-            if let Some(checkpoint) = checkpoint {
+    let positions = if positioned {
+        // Preserve the historical fuel/cancellation boundary: every validated
+        // POSTINGS block is admitted before POSITIONS parsing begins. The
+        // subsequent paired cursor traverses those same blocks without
+        // charging them a second time.
+        if let Some(checkpoint) = checkpoint {
+            for _ in postings.blocks() {
                 checkpoint.admit(QueryWorkKind::PostingBlock, 1)?;
             }
-            admitted_block = Some(block);
         }
-        rows.push(posting);
-        posting_cursor.next()?;
-    }
-    let positions = if positioned {
         let position_span =
             found
                 .metadata
@@ -8549,16 +11176,62 @@ fn open_owned_cursor(
         let positions = PositionList::parse(position_bytes, &postings)?;
         let mut decoded = Vec::new();
         decoded
-            .try_reserve_exact(rows.len())
+            .try_reserve_exact(posting_count)
             .map_err(|_| invalid_state("could not allocate owned position rows"))?;
-        for ordinal in 0..found.metadata.doc_freq {
-            let row = positions
-                .positions_for_ordinal(ordinal)?
-                .collect::<Result<Vec<_>, _>>()?;
+
+        // Phrase lowering needs owned position rows, but ordinal-at-a-time
+        // lookup restarts at the beginning of each POSITIONS block. Traverse
+        // the paired posting/position streams once so every run is decoded
+        // exactly once before the cursor advances to the next posting.
+        let mut position_cursor = positions.cursor()?;
+        while let Some(posting) = position_cursor.current() {
+            let mut row = Vec::new();
+            if !position_cursor.decode_current_positions_into(&mut row)? {
+                return Err(invalid_state(
+                    "position cursor exhausted before its current posting",
+                ));
+            }
+            let frequency = usize::try_from(posting.freq)
+                .map_err(|_| invalid_state("posting frequency does not fit usize"))?;
+            if row.len() != frequency {
+                return Err(invalid_state(format!(
+                    "position run length {} does not match posting frequency {frequency}",
+                    row.len(),
+                )));
+            }
+            rows.push(posting);
             decoded.push(row);
+            position_cursor.next()?;
+        }
+        if rows.len() != posting_count {
+            return Err(invalid_state(format!(
+                "position cursor materialized {} of {posting_count} postings",
+                rows.len(),
+            )));
         }
         Some(decoded)
     } else {
+        let mut posting_cursor = postings.cursor()?;
+        let mut admitted_block = None;
+        while let Some(posting) = posting_cursor.current() {
+            let block = posting_cursor
+                .block_index()
+                .ok_or_else(|| invalid_state("posting cursor has no block index"))?;
+            if admitted_block != Some(block) {
+                if let Some(checkpoint) = checkpoint {
+                    checkpoint.admit(QueryWorkKind::PostingBlock, 1)?;
+                }
+                admitted_block = Some(block);
+            }
+            rows.push(posting);
+            posting_cursor.next()?;
+        }
+        if rows.len() != posting_count {
+            return Err(invalid_state(format!(
+                "posting cursor materialized {} of {posting_count} postings",
+                rows.len(),
+            )));
+        }
         None
     };
     Ok(OwnedPostingCursor {
@@ -8596,24 +11269,7 @@ fn open_dictionary(
     segment: &RecoveredSegment,
     schema: SchemaDescriptor,
 ) -> Result<TermDictionary<'_>, QuillIndexError> {
-    let postings = required_section(segment, SectionKind::POSTINGS)?;
-    let positions = segment.section(SectionKind::POSITIONS)?;
-    let blockmax = required_section(segment, SectionKind::BLOCKMAX)?;
-    let dictionary = required_section(segment, SectionKind::TERMDICT)?;
-    Ok(TermDictionary::parse(
-        dictionary,
-        schema,
-        TermSectionLengths {
-            postings: u64::try_from(postings.len())
-                .map_err(|_| invalid_state("POSTINGS length does not fit u64"))?,
-            positions: positions
-                .map(|bytes| u64::try_from(bytes.len()))
-                .transpose()
-                .map_err(|_| invalid_state("POSITIONS length does not fit u64"))?,
-            blockmax: u64::try_from(blockmax.len())
-                .map_err(|_| invalid_state("BLOCKMAX length does not fit u64"))?,
-        },
-    )?)
+    Ok(segment.term_dictionary(schema)?)
 }
 
 fn required_section(
@@ -8661,7 +11317,11 @@ fn term_field_ords(schema: SchemaDescriptor) -> Vec<u16> {
 mod tests {
     use std::collections::BTreeMap;
     use std::future::Future;
+    #[cfg(all(feature = "bench-internals", feature = "conformance-internals"))]
+    use std::io::{self, Write};
     use std::sync::Arc;
+    #[cfg(all(feature = "bench-internals", feature = "conformance-internals"))]
+    use std::sync::Mutex as StdMutex;
     use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
     use std::task::{Context, Poll, Waker};
 
@@ -8701,6 +11361,207 @@ mod tests {
         "\"shared left\"",
         "ord:[0 TO 39]",
     ];
+
+    #[cfg(feature = "pruning-conformance")]
+    #[test]
+    fn pruning_conformance_session_is_dense_one_shot_and_fail_closed() {
+        let completed = ConformancePruningTraceSession::new(2);
+        completed
+            .bind_execution_mode(ConformancePruningExecutionMode::Rayon)
+            .expect("bind exact shipping branch");
+        completed
+            .record(1, 7, &[])
+            .expect("record second segment first");
+        completed
+            .record(0, 5, &[])
+            .expect("record first segment second");
+        let receipt = completed.complete().expect("complete dense trace");
+        assert_eq!(
+            receipt.execution_mode(),
+            ConformancePruningExecutionMode::Rayon
+        );
+        assert_eq!(
+            receipt
+                .segments()
+                .iter()
+                .map(ConformanceSegmentPruningReceipt::segment_ordinal)
+                .collect::<Vec<_>>(),
+            vec![0, 1],
+        );
+        assert_eq!(
+            receipt
+                .segments()
+                .iter()
+                .map(ConformanceSegmentPruningReceipt::segment_doc_count)
+                .collect::<Vec<_>>(),
+            vec![5, 7],
+        );
+        assert!(matches!(
+            completed.complete(),
+            Err(QuillIndexError::InvalidState { detail })
+                if detail.contains("already completed")
+        ));
+
+        let record_before_bind = ConformancePruningTraceSession::new(1);
+        assert!(matches!(
+            record_before_bind.record(0, 1, &[]),
+            Err(QuillIndexError::InvalidState { detail })
+                if detail.contains("was not bound before recording")
+        ));
+        assert!(matches!(
+            record_before_bind.bind_execution_mode(ConformancePruningExecutionMode::Serial),
+            Err(QuillIndexError::InvalidState { detail })
+                if detail.contains("has failed")
+        ));
+
+        let double_bind = ConformancePruningTraceSession::new(1);
+        double_bind
+            .bind_execution_mode(ConformancePruningExecutionMode::Serial)
+            .expect("bind one exact execution mode");
+        assert!(matches!(
+            double_bind.bind_execution_mode(ConformancePruningExecutionMode::Rayon),
+            Err(QuillIndexError::InvalidState { detail })
+                if detail.contains("already bound")
+        ));
+        assert!(matches!(
+            double_bind.record(0, 1, &[]),
+            Err(QuillIndexError::InvalidState { detail })
+                if detail.contains("has failed")
+        ));
+
+        let out_of_range = ConformancePruningTraceSession::new(1);
+        out_of_range
+            .bind_execution_mode(ConformancePruningExecutionMode::Serial)
+            .expect("bind out-of-range session");
+        assert!(matches!(
+            out_of_range.record(1, 1, &[]),
+            Err(QuillIndexError::InvalidState { detail })
+                if detail.contains("exceeds expected count")
+        ));
+        assert!(matches!(
+            out_of_range.record(0, 1, &[]),
+            Err(QuillIndexError::InvalidState { detail })
+                if detail.contains("has failed")
+        ));
+
+        let duplicate = ConformancePruningTraceSession::new(1);
+        duplicate
+            .bind_execution_mode(ConformancePruningExecutionMode::Serial)
+            .expect("bind serial path");
+        duplicate.record(0, 1, &[]).expect("first receipt");
+        assert!(matches!(
+            duplicate.record(0, 1, &[]),
+            Err(QuillIndexError::InvalidState { detail })
+                if detail.contains("recorded twice")
+        ));
+        assert!(matches!(
+            duplicate.complete(),
+            Err(QuillIndexError::InvalidState { detail })
+                if detail.contains("has failed")
+        ));
+
+        let incomplete = ConformancePruningTraceSession::new(2);
+        incomplete
+            .bind_execution_mode(ConformancePruningExecutionMode::Serial)
+            .expect("bind incomplete serial path");
+        incomplete
+            .record(0, 1, &[])
+            .expect("record partial receipt");
+        assert!(matches!(
+            incomplete.complete(),
+            Err(QuillIndexError::InvalidState { detail })
+                if detail.contains("trace is incomplete")
+        ));
+        assert!(matches!(
+            incomplete.record(1, 1, &[]),
+            Err(QuillIndexError::InvalidState { detail })
+                if detail.contains("has failed")
+        ));
+
+        let dropped_controller = Arc::new(ConformanceCancellationController::default());
+        dropped_controller
+            .arm(
+                ConformanceCancellationStage::PruningTraceSegmentRecorded,
+                u64::MAX,
+            )
+            .expect("arm dropped-session accounting");
+        let dropped_guard = ConformancePruningTraceGuard::new(1, Arc::clone(&dropped_controller));
+        let dropped_session = Arc::clone(&dropped_guard.session);
+        dropped_session
+            .bind_execution_mode(ConformancePruningExecutionMode::Serial)
+            .expect("bind guard-owned session");
+        dropped_session
+            .record(0, 1, &[])
+            .expect("record partial guard-owned receipt");
+        drop(dropped_guard);
+        assert!(matches!(
+            dropped_session.complete(),
+            Err(QuillIndexError::InvalidState { detail })
+                if detail.contains("has failed")
+        ));
+        assert_eq!(
+            dropped_controller.discarded_pruning_trace_sessions(),
+            1,
+            "dropping an incomplete invocation records one discarded session"
+        );
+
+        let generation_controller = Arc::new(ConformanceCancellationController::default());
+        generation_controller
+            .arm(
+                ConformanceCancellationStage::PruningTraceSegmentRecorded,
+                u64::MAX,
+            )
+            .expect("arm stale generation");
+        let stale_guard = ConformancePruningTraceGuard::new(1, Arc::clone(&generation_controller));
+        stale_guard
+            .session()
+            .bind_execution_mode(ConformancePruningExecutionMode::Serial)
+            .expect("bind stale guard");
+        generation_controller.disarm();
+        generation_controller
+            .arm(
+                ConformanceCancellationStage::PruningTraceSegmentRecorded,
+                u64::MAX,
+            )
+            .expect("arm successor generation");
+        drop(stale_guard);
+        assert_eq!(
+            generation_controller.discarded_pruning_trace_sessions(),
+            0,
+            "a stale guard must not contaminate a later arm generation"
+        );
+        let current_guard =
+            ConformancePruningTraceGuard::new(1, Arc::clone(&generation_controller));
+        current_guard
+            .session()
+            .bind_execution_mode(ConformancePruningExecutionMode::Serial)
+            .expect("bind current guard");
+        drop(current_guard);
+        assert_eq!(
+            generation_controller.discarded_pruning_trace_sessions(),
+            1,
+            "the current arm generation must retain its own discarded-session count"
+        );
+
+        let exhausted_controller = ConformanceCancellationController::default();
+        exhausted_controller
+            .arm_generation
+            .store(u64::MAX, Ordering::Relaxed);
+        assert!(matches!(
+            exhausted_controller.arm(
+                ConformanceCancellationStage::PruningTraceSegmentRecorded,
+                1,
+            ),
+            Err(QuillIndexError::InvalidState { detail })
+                if detail.contains("arm generation is exhausted")
+        ));
+        assert_eq!(
+            exhausted_controller.stage.load(Ordering::Acquire),
+            ConformanceCancellationController::DISARMED,
+            "generation exhaustion must leave the controller disarmed"
+        );
+    }
+
     #[cfg(feature = "bench-internals")]
     const POSITIONLESS_QG_FIELDS: [FieldDescriptor; 5] = [
         FieldDescriptor {
@@ -8747,6 +11608,51 @@ mod tests {
     const POSITIONLESS_QG_SCHEMA: SchemaDescriptor = SchemaDescriptor {
         name: "qg-positionless-typed-capability-test",
         fields: &POSITIONLESS_QG_FIELDS,
+    };
+    const MIXED_BUDGET_FIELDS: [FieldDescriptor; 5] = [
+        FieldDescriptor {
+            id: 0,
+            name: "id",
+            kind: FieldKind::Keyword,
+            stored: true,
+        },
+        FieldDescriptor {
+            id: 1,
+            name: "content",
+            kind: FieldKind::Text {
+                analyzer: Analyzer::FrankensearchDefault,
+                positions: true,
+            },
+            stored: true,
+        },
+        FieldDescriptor {
+            id: 2,
+            name: "title",
+            kind: FieldKind::Text {
+                analyzer: Analyzer::FrankensearchDefault,
+                positions: false,
+            },
+            stored: true,
+        },
+        FieldDescriptor {
+            id: 3,
+            name: "metadata_json",
+            kind: FieldKind::StoredOnly,
+            stored: true,
+        },
+        FieldDescriptor {
+            id: 4,
+            name: "ord",
+            kind: FieldKind::U64 {
+                indexed: false,
+                fast: true,
+            },
+            stored: true,
+        },
+    ];
+    const MIXED_BUDGET_SCHEMA: SchemaDescriptor = SchemaDescriptor {
+        name: "parallel-budget-mixed-positions-test",
+        fields: &MIXED_BUDGET_FIELDS,
     };
     #[cfg(feature = "bench-internals")]
     const POSITIONED_QG_FIELDS: [FieldDescriptor; 5] = [
@@ -8888,6 +11794,300 @@ mod tests {
             deterministic_ingest: true,
             ..QuillConfig::default()
         }
+    }
+
+    #[cfg(all(feature = "bench-internals", feature = "conformance-internals"))]
+    #[derive(Clone, Debug)]
+    struct RankedCacheTraceWriter {
+        buffer: Arc<StdMutex<Vec<u8>>>,
+    }
+
+    #[cfg(all(feature = "bench-internals", feature = "conformance-internals"))]
+    impl Write for RankedCacheTraceWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.buffer
+                .lock()
+                .expect("ranked-cache trace buffer lock is not poisoned")
+                .extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[cfg(all(feature = "bench-internals", feature = "conformance-internals"))]
+    fn trace_text_field<'a>(line: &'a str, field: &str) -> Option<&'a str> {
+        let prefix = format!("{field}=");
+        let start = line.find(&prefix)?.saturating_add(prefix.len());
+        let value = line.get(start..)?;
+        if let Some(quoted) = value.strip_prefix('"') {
+            return quoted.split_once('"').map(|(field_value, _)| field_value);
+        }
+        let end = value
+            .find(|ch: char| ch.is_ascii_whitespace() || matches!(ch, ',' | '}'))
+            .unwrap_or(value.len());
+        value.get(..end)
+    }
+
+    #[cfg(all(feature = "bench-internals", feature = "conformance-internals"))]
+    fn is_trace_stage_close(line: &str, stage: &str) -> bool {
+        if !line.contains(": close") {
+            return false;
+        }
+        let Some(stage_position) = line.rfind(stage) else {
+            return false;
+        };
+        crate::tracing_conventions::ALL_SPAN_NAMES
+            .iter()
+            .filter_map(|candidate| line.rfind(candidate))
+            .all(|candidate_position| candidate_position <= stage_position)
+    }
+
+    #[cfg(all(feature = "bench-internals", feature = "conformance-internals"))]
+    fn assert_ranked_cache_trace_case(
+        logs: &str,
+        trace_case: &str,
+        query_form: &str,
+        cache_lookup: &str,
+        expected_children: &[&str],
+    ) {
+        let case_lines = logs
+            .lines()
+            .filter(|line| trace_text_field(line, "trace_case") == Some(trace_case))
+            .collect::<Vec<_>>();
+        assert!(
+            !case_lines.is_empty(),
+            "missing trace case {trace_case}: {logs}"
+        );
+        let query = case_lines
+            .iter()
+            .copied()
+            .find(|line| is_trace_stage_close(line, crate::tracing_conventions::ARGUS_QUERY))
+            .expect("ranked-cache trace case must contain one ARGUS_QUERY close");
+        assert_eq!(
+            trace_text_field(query, "query_form"),
+            Some(query_form),
+            "trace case {trace_case} reported the wrong query form: {query}",
+        );
+        assert_eq!(
+            trace_text_field(query, "cache_lookup"),
+            Some(cache_lookup),
+            "trace case {trace_case} reported the wrong cache disposition: {query}",
+        );
+        assert!(
+            query.contains("duration_us="),
+            "trace case {trace_case} omitted query timing: {query}",
+        );
+        if cache_lookup == "not_checked" {
+            assert!(
+                !query.contains("result_count=") && !query.contains("total_count="),
+                "pre-cancelled trace case {trace_case} fabricated result evidence: {query}",
+            );
+        } else {
+            assert!(
+                query.contains("result_count=") && query.contains("total_count="),
+                "successful exact-count trace case {trace_case} omitted result evidence: {query}",
+            );
+        }
+
+        for stage in [
+            crate::tracing_conventions::ARGUS_PARSE,
+            crate::tracing_conventions::ARGUS_SCORE,
+            crate::tracing_conventions::ARGUS_COLLECT,
+        ] {
+            let observed = case_lines
+                .iter()
+                .any(|line| is_trace_stage_close(line, stage));
+            assert_eq!(
+                observed,
+                expected_children.contains(&stage),
+                "trace case {trace_case} child-stage mismatch for {stage}: {logs}",
+            );
+        }
+    }
+
+    #[test]
+    fn ranked_query_cache_requires_an_exact_key_and_snapshot_epoch() {
+        let cache = RankedQueryCache::default();
+        let raw_result = QuillSearchResult {
+            hits: vec![QuillHit {
+                document_id: "raw-hit".to_owned(),
+                global_docid: 7,
+                score: 3.5,
+            }],
+            total_count: None,
+            doc_count: 11,
+            diagnostics: Vec::new(),
+        };
+        cache.insert_raw(4, "rust", 10, 2, false, &raw_result);
+
+        assert_eq!(cache.get_raw(4, "rust", 10, 2, false), Some(raw_result));
+        assert!(cache.get_raw(5, "rust", 10, 2, false).is_none());
+        assert!(cache.get_raw(4, "Rust", 10, 2, false).is_none());
+        assert!(cache.get_raw(4, "rust", 11, 2, false).is_none());
+        assert!(cache.get_raw(4, "rust", 10, 3, false).is_none());
+        assert!(cache.get_raw(4, "rust", 10, 2, true).is_none());
+
+        let query = Query::Boost {
+            query: Box::new(Query::All),
+            factor: 2.0,
+        };
+        let preparsed_result = QuillSearchResult {
+            hits: Vec::new(),
+            total_count: Some(11),
+            doc_count: 11,
+            diagnostics: Vec::new(),
+        };
+        cache.insert_preparsed(4, &query, 0, 0, true, &preparsed_result);
+        assert_eq!(
+            cache.get_preparsed(4, &query, 0, 0, true),
+            Some(preparsed_result)
+        );
+        assert!(cache.get_preparsed(5, &query, 0, 0, true).is_none());
+        assert!(
+            cache
+                .get_preparsed(
+                    4,
+                    &Query::Boost {
+                        query: Box::new(Query::All),
+                        factor: 2.5,
+                    },
+                    0,
+                    0,
+                    true,
+                )
+                .is_none()
+        );
+    }
+
+    #[cfg(all(feature = "bench-internals", feature = "conformance-internals"))]
+    #[test]
+    fn ranked_query_cache_trace_contract_covers_every_lookup_disposition() {
+        let trace_buffer = Arc::new(StdMutex::new(Vec::<u8>::new()));
+        let writer_buffer = Arc::clone(&trace_buffer);
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .without_time()
+            .with_env_filter("off,frankensearch.quill=info")
+            .with_span_events(tracing_subscriber::fmt::format::FmtSpan::CLOSE)
+            .with_writer(move || RankedCacheTraceWriter {
+                buffer: Arc::clone(&writer_buffer),
+            })
+            .finish();
+
+        tracing::subscriber::with_default(subscriber, || {
+            run_with_cx(|cx| async move {
+                let index = QuillIndex::in_memory(deterministic_config())
+                    .expect("ranked-cache trace index");
+                index
+                    .index_document(&cx, &IndexableDocument::new("doc-1", "alpha beta"))
+                    .await
+                    .expect("index ranked-cache trace document");
+                index
+                    .commit(&cx)
+                    .await
+                    .expect("commit ranked-cache trace index");
+                let query = Query::Term {
+                    fields: vec![QueryField::new(1, 1.0)],
+                    text: "alpha".to_owned(),
+                };
+
+                let run_raw = |trace_case: &'static str, request_cx: &Cx| {
+                    let span = tracing::info_span!(
+                        target: crate::tracing_conventions::TARGET,
+                        "ranked_cache_trace_case",
+                        trace_case,
+                    );
+                    let _entered = span.enter();
+                    index.search_paginated(request_cx, "alpha", 10, 0, true)
+                };
+                let run_preparsed = |trace_case: &'static str, request_cx: &Cx| {
+                    let span = tracing::info_span!(
+                        target: crate::tracing_conventions::TARGET,
+                        "ranked_cache_trace_case",
+                        trace_case,
+                    );
+                    let _entered = span.enter();
+                    index.search_preparsed_paginated(request_cx, &query, 10, 0, true)
+                };
+
+                run_raw("raw-miss", &cx).expect("raw cache miss executes");
+                run_raw("raw-hit", &cx).expect("raw cache hit returns");
+                run_preparsed("preparsed-miss", &cx).expect("preparsed cache miss executes");
+                run_preparsed("preparsed-hit", &cx).expect("preparsed cache hit returns");
+
+                let controller = index.conformance_cancellation_controller();
+                controller
+                    .arm(ConformanceCancellationStage::CommitPublication, 1)
+                    .expect("arm unrelated conformance stage to disable the cache");
+                run_raw("raw-disabled", &cx).expect("disabled raw cache executes");
+                run_preparsed("preparsed-disabled", &cx)
+                    .expect("disabled preparsed cache executes");
+                assert_eq!(controller.observed_checkpoints(), 0);
+                assert!(!controller.fired());
+                controller.disarm();
+
+                let cancelled = cx.clone();
+                cancelled.set_cancel_requested(true);
+                assert!(matches!(
+                    run_raw("raw-not-checked", &cancelled),
+                    Err(QuillIndexError::Cancelled { phase }) if phase == "search"
+                ));
+                assert!(matches!(
+                    run_preparsed("preparsed-not-checked", &cancelled),
+                    Err(QuillIndexError::Cancelled { phase }) if phase == "search_preparsed"
+                ));
+            });
+        });
+
+        let logs = String::from_utf8(
+            trace_buffer
+                .lock()
+                .expect("ranked-cache trace buffer lock is not poisoned")
+                .clone(),
+        )
+        .expect("ranked-cache trace output is UTF-8");
+        let raw_children = [
+            crate::tracing_conventions::ARGUS_PARSE,
+            crate::tracing_conventions::ARGUS_SCORE,
+            crate::tracing_conventions::ARGUS_COLLECT,
+        ];
+        let preparsed_children = [
+            crate::tracing_conventions::ARGUS_SCORE,
+            crate::tracing_conventions::ARGUS_COLLECT,
+        ];
+        assert_ranked_cache_trace_case(&logs, "raw-miss", "raw", "miss", &raw_children);
+        assert_ranked_cache_trace_case(&logs, "raw-hit", "raw", "hit", &[]);
+        assert_ranked_cache_trace_case(
+            &logs,
+            "preparsed-miss",
+            "preparsed",
+            "miss",
+            &preparsed_children,
+        );
+        assert_ranked_cache_trace_case(&logs, "preparsed-hit", "preparsed", "hit", &[]);
+        assert_ranked_cache_trace_case(&logs, "raw-disabled", "raw", "disabled", &raw_children);
+        assert_ranked_cache_trace_case(
+            &logs,
+            "preparsed-disabled",
+            "preparsed",
+            "disabled",
+            &preparsed_children,
+        );
+        assert_ranked_cache_trace_case(&logs, "raw-not-checked", "raw", "not_checked", &[]);
+        assert_ranked_cache_trace_case(
+            &logs,
+            "preparsed-not-checked",
+            "preparsed",
+            "not_checked",
+            &[],
+        );
+        assert!(
+            !logs.contains("cache_key=") && !logs.contains("cache_fingerprint="),
+            "ranked-cache traces leaked a high-cardinality cache identity: {logs}",
+        );
     }
 
     fn fuel_diagnostics(error: &QuillIndexError) -> (u64, u64, u64, u64, u64, u64) {
@@ -9100,10 +12300,35 @@ mod tests {
     fn shipping_content_hash(document_id: &str, content: &str) -> u64 {
         let document = IndexableDocument::new(document_id, content);
         let metadata = canonical_metadata(&document.metadata).expect("canonical fixture metadata");
-        xxh3_64(
-            &canonical_document_preimage(&document, &metadata)
-                .expect("canonical fixture document preimage"),
-        )
+        canonical_document_content_hash(&document, &metadata)
+            .expect("canonical fixture document hash")
+    }
+
+    #[test]
+    fn content_hash_has_unambiguous_fields_and_canonical_metadata() {
+        let first = IndexableDocument::new("ab", "c")
+            .with_title("title")
+            .with_metadata("zeta", "last")
+            .with_metadata("alpha", "first");
+        let reordered = IndexableDocument::new("ab", "c")
+            .with_title("title")
+            .with_metadata("alpha", "first")
+            .with_metadata("zeta", "last");
+        let boundary_shifted = IndexableDocument::new("a", "bc")
+            .with_title("title")
+            .with_metadata("alpha", "first")
+            .with_metadata("zeta", "last");
+
+        let first_hash = indexable_document_content_hash(&first).expect("hash first document");
+        assert_eq!(
+            first_hash,
+            indexable_document_content_hash(&reordered).expect("hash reordered metadata")
+        );
+        assert_ne!(
+            first_hash,
+            indexable_document_content_hash(&boundary_shifted)
+                .expect("hash field-boundary-shifted document")
+        );
     }
 
     fn fixture_documents() -> Vec<IndexableDocument> {
@@ -9520,7 +12745,7 @@ mod tests {
     ) -> Q1Ob2aSeal {
         let mut accumulator =
             ColumnarAccumulator::new(DEFAULT_SCHEMA).expect("Q1-OB2a accumulator");
-        let mut canonical_contents = Vec::with_capacity(documents.len());
+        let mut content_hashes = Vec::with_capacity(documents.len());
         for (offset, document) in documents.iter().enumerate() {
             let doc_ord = q1_ob2a_doc_ord(first_doc_ord, offset);
             let metadata = canonical_metadata(&document.metadata).expect("canonical metadata");
@@ -9538,9 +12763,9 @@ mod tests {
             accumulator
                 .add_document_with_values(doc_ord, &indexed, &[], &stored)
                 .expect("accumulate Q1-OB2a document");
-            canonical_contents.push(
-                canonical_document_preimage(document, &metadata)
-                    .expect("canonical Q1-OB2a content"),
+            content_hashes.push(
+                canonical_document_content_hash(document, &metadata)
+                    .expect("canonical Q1-OB2a content hash"),
             );
         }
 
@@ -9552,13 +12777,13 @@ mod tests {
             .collect::<BTreeMap<_, _>>();
         let identities = documents
             .iter()
-            .zip(&canonical_contents)
+            .zip(&content_hashes)
             .enumerate()
-            .map(|(offset, (document, canonical_content))| {
-                FlushDocumentInput::from_canonical_content(
+            .map(|(offset, (document, &content_hash))| {
+                FlushDocumentInput::new(
                     q1_ob2a_doc_ord(first_doc_ord, offset),
                     &document.id,
-                    canonical_content,
+                    content_hash,
                 )
             })
             .collect::<Vec<_>>();
@@ -9925,7 +13150,15 @@ mod tests {
             "alpha", "beta", "gamma", "delta", "epsilon", "zeta", "shared", "rare", "quill",
             "argus",
         ];
-        let index = QuillIndex::in_memory(deterministic_config()).expect("memory index");
+        let tier_fanout = segments
+            .checked_add(1)
+            .expect("fan-out fixture segment count leaves room for its tier policy");
+        let index = QuillIndex::in_memory(QuillConfig {
+            deterministic_ingest: true,
+            tier_fanout,
+            ..QuillConfig::default()
+        })
+        .expect("memory index");
         let mut state = seed | 1;
         let mut next = move || {
             state ^= state << 13;
@@ -10048,6 +13281,273 @@ mod tests {
         assert!(sealed_segment_fanout(16, u64::MAX));
     }
 
+    #[cfg(feature = "pruning-conformance")]
+    #[test]
+    fn pruning_conformance_traced_search_bypasses_warm_cache_without_mutation() {
+        run_with_cx(|cx| async move {
+            const QUERY: &str = "shared OR alpha";
+            const LIMIT: usize = 20;
+            const OFFSET: usize = 0;
+            const EXACT_COUNT: bool = false;
+            let fixtures = [
+                (
+                    1,
+                    0x5e21_a11c_0000_0001,
+                    ConformancePruningExecutionMode::Serial,
+                ),
+                (
+                    SEGMENT_COUNT_FANOUT_THRESHOLD,
+                    0x5e21_a11c_0000_0002,
+                    ConformancePruningExecutionMode::Rayon,
+                ),
+            ];
+
+            for (segment_count, seed, expected_mode) in fixtures {
+                let index = segment_fanout_fixture_index(&cx, segment_count, 64, seed).await;
+                let snapshot = index.search_snapshot();
+                let snapshot_epoch = snapshot.snapshot_epoch();
+                let expected_doc_counts = index
+                    .snapshot()
+                    .segments()
+                    .iter()
+                    .map(|segment| u64::from(segment.doc_count()))
+                    .collect::<Vec<_>>();
+                let cache = &index.reader.published_snapshot.ranked_query_cache;
+
+                assert!(
+                    cache
+                        .get_raw(snapshot_epoch, QUERY, LIMIT, OFFSET, EXACT_COUNT)
+                        .is_none(),
+                    "fixture must begin cold for {expected_mode:?}",
+                );
+                let warm = index
+                    .search_paginated(&cx, QUERY, LIMIT, OFFSET, EXACT_COUNT)
+                    .expect("ordinary search warms the ranked query cache");
+                assert_eq!(
+                    cache.get_raw(snapshot_epoch, QUERY, LIMIT, OFFSET, EXACT_COUNT),
+                    Some(warm.clone()),
+                    "ordinary search must populate the exact raw-query cache key for {expected_mode:?}",
+                );
+                let slots_before = cache
+                    .slots
+                    .iter()
+                    .map(ArcSwapOption::load_full)
+                    .collect::<Vec<_>>();
+
+                let (traced, receipt) = index
+                    .search_paginated_with_conformance_pruning_trace(
+                        &cx,
+                        QUERY,
+                        LIMIT,
+                        OFFSET,
+                        EXACT_COUNT,
+                    )
+                    .expect("traced search must execute instead of returning from the warm cache");
+                assert_eq!(traced, warm);
+                assert_eq!(receipt.execution_mode(), expected_mode);
+                assert_eq!(receipt.segments().len(), expected_doc_counts.len());
+                assert_eq!(
+                    receipt
+                        .segments()
+                        .iter()
+                        .map(ConformanceSegmentPruningReceipt::segment_ordinal)
+                        .collect::<Vec<_>>(),
+                    (0..u64::try_from(expected_doc_counts.len())
+                        .expect("fixture segment count fits u64"))
+                        .collect::<Vec<_>>(),
+                );
+                assert_eq!(
+                    receipt
+                        .segments()
+                        .iter()
+                        .map(ConformanceSegmentPruningReceipt::segment_doc_count)
+                        .collect::<Vec<_>>(),
+                    expected_doc_counts,
+                );
+
+                let slots_after = cache
+                    .slots
+                    .iter()
+                    .map(ArcSwapOption::load_full)
+                    .collect::<Vec<_>>();
+                assert_eq!(slots_after.len(), slots_before.len());
+                for (slot, (before, after)) in slots_before.iter().zip(&slots_after).enumerate() {
+                    match (before, after) {
+                        (Some(before), Some(after)) => assert!(
+                            Arc::ptr_eq(before, after),
+                            "traced search replaced cache slot {slot} for {expected_mode:?}",
+                        ),
+                        (None, None) => {}
+                        _ => panic!(
+                            "traced search changed cache slot occupancy at {slot} for {expected_mode:?}",
+                        ),
+                    }
+                }
+            }
+        });
+    }
+
+    #[cfg(feature = "pruning-conformance")]
+    #[test]
+    fn pruning_conformance_invocation_bound_traces_do_not_cross_concurrent_searches() {
+        run_with_cx(|cx| async move {
+            let index =
+                segment_fanout_fixture_index(&cx, SEGMENT_COUNT_FANOUT_THRESHOLD, 64, 0x51A7).await;
+            let expected_doc_counts = index
+                .snapshot()
+                .segments()
+                .iter()
+                .map(|segment| u64::from(segment.doc_count()))
+                .collect::<Vec<_>>();
+            let query = "shared OR alpha";
+            let (first, (second, ordinary)) = rayon::join(
+                || {
+                    index
+                        .search_paginated_with_conformance_pruning_trace(&cx, query, 20, 0, false)
+                        .expect("first concurrent traced search")
+                },
+                || {
+                    rayon::join(
+                        || {
+                            index
+                                .search_paginated_with_conformance_pruning_trace(
+                                    &cx, query, 20, 0, false,
+                                )
+                                .expect("second concurrent traced search")
+                        },
+                        || {
+                            index
+                                .search_paginated(&cx, query, 20, 0, false)
+                                .expect("concurrent ordinary search")
+                        },
+                    )
+                },
+            );
+
+            assert_eq!(first.0, second.0);
+            assert_eq!(first.0, ordinary);
+            for receipt in [&first.1, &second.1] {
+                assert_eq!(
+                    receipt.execution_mode(),
+                    ConformancePruningExecutionMode::Rayon,
+                );
+                assert_eq!(receipt.segments().len(), expected_doc_counts.len());
+                assert_eq!(
+                    receipt
+                        .segments()
+                        .iter()
+                        .map(ConformanceSegmentPruningReceipt::segment_ordinal)
+                        .collect::<Vec<_>>(),
+                    (0..u64::try_from(expected_doc_counts.len())
+                        .expect("fan-out segment count fits u64"))
+                        .collect::<Vec<_>>(),
+                );
+                assert_eq!(
+                    receipt
+                        .segments()
+                        .iter()
+                        .map(ConformanceSegmentPruningReceipt::segment_doc_count)
+                        .collect::<Vec<_>>(),
+                    expected_doc_counts,
+                );
+            }
+        });
+    }
+
+    #[cfg(feature = "pruning-conformance")]
+    #[test]
+    fn pruning_conformance_cancellation_forces_high_fanout_trace_to_serial() {
+        run_with_cx(|cx| async move {
+            let index =
+                segment_fanout_fixture_index(&cx, SEGMENT_COUNT_FANOUT_THRESHOLD, 64, 0x5A1E).await;
+            let controller = index.conformance_cancellation_controller();
+            controller
+                .arm(ConformanceCancellationStage::PruningTraceSegmentRecorded, 1)
+                .expect("arm high-fanout pruning cancellation");
+
+            let error = index
+                .search_paginated_with_conformance_pruning_trace(
+                    &cx,
+                    "shared OR alpha",
+                    20,
+                    0,
+                    false,
+                )
+                .expect_err("armed high-fanout trace must cancel after its first receipt");
+            assert!(matches!(
+                error,
+                QuillIndexError::Cancelled { phase: "search" }
+            ));
+            assert_eq!(controller.observed_checkpoints(), 1);
+            assert_eq!(controller.recorded_pruning_receipts_at_fire(), 1);
+            assert_eq!(
+                controller.pruning_trace_execution_mode_at_fire(),
+                Some(ConformancePruningExecutionMode::Serial),
+                "the injected invocation must replace schedule-dependent Rayon receipt order with serial segment order",
+            );
+            assert_eq!(controller.discarded_pruning_trace_sessions(), 1);
+
+            controller.disarm();
+            cx.set_cancel_requested(false);
+            let (_, receipt) = index
+                .search_paginated_with_conformance_pruning_trace(
+                    &cx,
+                    "shared OR alpha",
+                    20,
+                    0,
+                    false,
+                )
+                .expect("unarmed high-fanout replay");
+            assert_eq!(
+                receipt.execution_mode(),
+                ConformancePruningExecutionMode::Rayon,
+                "ordinary traced high-fanout searches must retain the shipping Rayon branch",
+            );
+        });
+    }
+
+    #[cfg(feature = "pruning-conformance")]
+    #[test]
+    fn pruning_conformance_stale_session_cannot_checkpoint_rearmed_controller() {
+        run_with_cx(|cx| async move {
+            let controller = ConformanceCancellationController::default();
+            controller
+                .arm(ConformanceCancellationStage::PruningTraceSegmentRecorded, 1)
+                .expect("arm stale-session generation");
+            let stale_generation = controller
+                .active_pruning_trace_arm_generation()
+                .expect("capture stale pruning generation");
+            let stale_session =
+                ConformancePruningTraceSession::new_for_cancellation_arm(1, Some(stale_generation));
+            stale_session
+                .bind_execution_mode(ConformancePruningExecutionMode::Serial)
+                .expect("bind stale session");
+
+            controller.disarm();
+            controller
+                .arm(ConformanceCancellationStage::PruningTraceSegmentRecorded, 1)
+                .expect("arm replacement generation");
+            assert_eq!(
+                stale_session
+                    .record_and_checkpoint(0, 1, &[], &controller, &cx)
+                    .expect("record stale receipt without crossing generations"),
+                1,
+            );
+            assert_eq!(controller.observed_checkpoints(), 0);
+            assert_eq!(controller.recorded_pruning_receipts_at_fire(), 0);
+            assert_eq!(controller.pruning_trace_execution_mode_at_fire(), None);
+            assert!(!controller.fired());
+            assert!(!cx.is_cancel_requested());
+            assert_eq!(
+                stale_session
+                    .complete()
+                    .expect("complete generation-isolated stale session")
+                    .execution_mode(),
+                ConformancePruningExecutionMode::Serial,
+            );
+        });
+    }
+
     #[test]
     fn fanned_sealed_collection_matches_serial_exactly() {
         run_with_cx(|cx| async move {
@@ -10119,6 +13619,145 @@ mod tests {
         assert_send_sync::<QuillSearchSnapshot>();
         assert_send_sync::<SnapshotPublisher>();
         assert_send_sync::<QuillIndex>();
+    }
+
+    #[test]
+    fn repeated_doc_frequency_cursor_and_search_calls_reuse_validated_termdict_metadata() {
+        run_with_cx(|cx| async move {
+            let index = QuillIndex::in_memory(deterministic_config()).expect("memory index");
+            index
+                .index_documents(
+                    &cx,
+                    &[
+                        IndexableDocument::new("first", "alpha shared"),
+                        IndexableDocument::new("second", "beta shared"),
+                        IndexableDocument::new("third", "gamma"),
+                    ],
+                )
+                .await
+                .expect("index cache fixture");
+            index.commit(&cx).await.expect("seal cache fixture");
+
+            let snapshot = index.snapshot();
+            assert_eq!(snapshot.segments().len(), 1);
+            let segment = &snapshot.segments()[0];
+            let (full_validations_before, borrowed_views_before) =
+                segment.term_dictionary_cache_counts();
+            assert_eq!(full_validations_before, 1);
+
+            assert_eq!(
+                snapshot_doc_freq(&snapshot, DEFAULT_SCHEMA, CONTENT_FIELD, b"shared")
+                    .expect("cached doc frequency"),
+                2
+            );
+            let term_count = usize::try_from(
+                segment
+                    .term_dictionary(DEFAULT_SCHEMA)
+                    .expect("cached cursor dictionary")
+                    .term_count(),
+            )
+            .expect("fixture term count fits usize");
+            let cursor_rows = segment
+                .term_dictionary(DEFAULT_SCHEMA)
+                .expect("cached cursor dictionary")
+                .cursor()
+                .and_then(|cursor| cursor.collect_bounded(term_count))
+                .expect("collect cached cursor");
+            assert!(!cursor_rows.is_empty());
+
+            for _ in 0..32 {
+                let hits = index
+                    .search_doc_ids(&cx, "shared", 10)
+                    .expect("repeat cached search");
+                assert_eq!(hits.len(), 2);
+            }
+            let (full_validations_after, borrowed_views_after) =
+                segment.term_dictionary_cache_counts();
+            assert_eq!(
+                full_validations_after, 1,
+                "no query path may repeat complete TERMDICT validation"
+            );
+            assert_eq!(
+                borrowed_views_after,
+                borrowed_views_before.saturating_add(7),
+                "doc-frequency, two cursor opens, and four field-specific views for the first search must be borrowed; the remaining 31 searches must use the immutable-snapshot result cache"
+            );
+        });
+    }
+
+    #[test]
+    fn tombstone_only_delete_commit_reuses_termdict_metadata_and_preserves_results() {
+        run_with_cx(|cx| async move {
+            let index = QuillIndex::in_memory(deterministic_config()).expect("memory index");
+            index
+                .index_documents(
+                    &cx,
+                    &[
+                        IndexableDocument::new("first", "alpha shared"),
+                        IndexableDocument::new("second", "beta shared"),
+                        IndexableDocument::new("third", "gamma only"),
+                    ],
+                )
+                .await
+                .expect("index rebind fixture");
+            index.commit(&cx).await.expect("seal rebind fixture");
+
+            let before_snapshot = index.snapshot();
+            assert_eq!(before_snapshot.segments().len(), 1);
+            let segment = &before_snapshot.segments()[0];
+            assert_eq!(segment.term_dictionary_cache_counts().0, 1);
+            assert_eq!(segment.term_dictionary_metadata_reuse_count(), 0);
+            let metadata_bytes = segment.term_dictionary_metadata_payload_bytes();
+            assert!(metadata_bytes > 0, "validated metadata must be accounted");
+            let baseline = index
+                .search_paginated(&cx, "shared", 10, 0, true)
+                .expect("baseline ranked search")
+                .hits
+                .iter()
+                .map(|hit| (hit.global_docid, hit.score.to_bits()))
+                .collect::<Vec<_>>();
+            assert_eq!(baseline.len(), 2);
+
+            // Deleting the only non-matching document publishes a
+            // tombstone-only successor generation over the same immutable
+            // segment backing.
+            assert!(
+                index
+                    .delete_document(&cx, "third")
+                    .await
+                    .expect("tombstone delete")
+            );
+
+            let after_snapshot = index.snapshot();
+            assert_eq!(after_snapshot.segments().len(), 1);
+            let rebound = &after_snapshot.segments()[0];
+            assert_eq!(
+                rebound.term_dictionary_cache_counts().0,
+                1,
+                "a tombstone-only successor generation must not re-validate TERMDICT"
+            );
+            assert!(
+                rebound.term_dictionary_metadata_reuse_count() >= 1,
+                "the successor generation must reuse the validated metadata"
+            );
+            assert_eq!(
+                rebound.term_dictionary_metadata_payload_bytes(),
+                metadata_bytes,
+                "reuse must not grow persistent metadata bytes"
+            );
+            let after = index
+                .search_paginated(&cx, "shared", 10, 0, true)
+                .expect("post-rebind ranked search")
+                .hits
+                .iter()
+                .map(|hit| (hit.global_docid, hit.score.to_bits()))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                after, baseline,
+                "ranked hits and exact score bits must be byte-identical across \
+                 a tombstone-only rebind that does not touch matching documents"
+            );
+        });
     }
 
     #[test]
@@ -13124,6 +16763,422 @@ mod tests {
         });
     }
 
+    /// Pre-publication cancellation: the cancel gate immediately before
+    /// MANIFEST authority changes aborts the attempt AFTER the retained
+    /// proposal was cloned for owned publication but BEFORE
+    /// `publish_owned_segments` runs. This pins retention across an aborted
+    /// attempt; it is NOT a publisher failure — see
+    /// `durable_delta_seal_retains_pending_on_manifest_write_failure_then_retries`
+    /// for a real typed publisher error.
+    #[test]
+    fn memory_delta_seal_retains_pending_on_prepublication_cancellation_then_retries() {
+        run_with_cx(|cx| async move {
+            let mut index =
+                QuillIndex::in_memory(deterministic_config()).expect("create in-memory index");
+            let generation = index.snapshot().loaded_manifest().manifest.generation;
+            let base_seal_seq = index.writer_mut().next_seal_seq;
+            let mut delta = DeltaSegment::new(DEFAULT_SCHEMA, 0, usize::MAX)
+                .expect("in-memory retry-test Delta source");
+            apply_alpha_delta(&mut delta, 0, "retry-survivor", 1);
+            let sealed = Arc::new(delta.freeze(generation));
+            index
+                .publish_delta_table(vec![Arc::clone(&sealed)])
+                .expect("publish retry-test Delta");
+            let before = index
+                .search_paginated(&cx, "alpha", 10, 0, true)
+                .expect("query pre-seal Delta");
+
+            let encoded = Arc::new(
+                flush_delta_snapshot(
+                    &sealed,
+                    DeltaFlushInput {
+                        segment_id: 0x51c1_0001,
+                        created_unix_s: 1_700_000_050,
+                        engine_version: CURRENT_ENGINE_VERSION,
+                    },
+                )
+                .expect("build retained seal")
+                .expect("live Delta emits FSLX"),
+            );
+            let mut manifest = index
+                .snapshot()
+                .next_manifest()
+                .expect("successor MANIFEST");
+            manifest.last_publish_unix_s = 0;
+            manifest
+                .segments
+                .push(manifest_segment(&encoded, base_seal_seq));
+            manifest.docid_high_watermark = sealed.lease_end();
+            let mut pending_field_stats = BTreeMap::new();
+            for field in DEFAULT_SCHEMA
+                .fields
+                .iter()
+                .filter(|field| matches!(field.kind, FieldKind::Keyword | FieldKind::Text { .. }))
+            {
+                pending_field_stats.insert(
+                    field.id,
+                    (
+                        sealed
+                            .live_total_tokens(field.id)
+                            .expect("retained Delta field stats"),
+                        1,
+                    ),
+                );
+            }
+            manifest.field_stats = merge_field_stats(&manifest.field_stats, &pending_field_stats)
+                .expect("merge retained Delta field stats");
+            let prepared = index
+                .reader
+                .published_snapshot
+                .prepare_sealed_manifest(DEFAULT_SCHEMA, &manifest)
+                .expect("prepare retained local swap");
+            index.writer_mut().pending_delta_seal = Some(PendingDeltaSeal {
+                encoded: Some(Arc::clone(&encoded)),
+                segment_installed: false,
+                manifest,
+                prepared,
+                next_seal_seq: base_seal_seq + 1,
+                successor_watermark: sealed.lease_end(),
+            });
+
+            // Pre-publication cancellation: `check_cancel(cx, "Delta
+            // MANIFEST publish")` fires after the memory-owned clones ran
+            // but before the publisher executes.
+            let cancelled = Cx::for_testing();
+            cancelled.set_cancel_requested(true);
+            let failure = index.resume_pending_delta_seal(&cancelled).await;
+            assert!(failure.is_err(), "cancelled attempt must fail");
+            let retained_encoded = index
+                .writer_mut()
+                .pending_delta_seal
+                .as_ref()
+                .expect("aborted attempt must retain the pending seal")
+                .encoded
+                .as_ref()
+                .map(Arc::clone)
+                .expect("retained seal keeps its encoded segment");
+            assert!(
+                Arc::ptr_eq(&retained_encoded, &encoded),
+                "the retained seal must still reference the exact encoded bytes"
+            );
+            drop(retained_encoded);
+            assert_eq!(
+                Arc::strong_count(&encoded),
+                2,
+                "only the test handle and the retained seal may hold the segment"
+            );
+            assert_eq!(
+                index
+                    .search_paginated(&cx, "alpha", 10, 0, true)
+                    .expect("old epoch remains visible after the aborted attempt"),
+                before
+            );
+
+            index
+                .resume_pending_delta_seal(&cx)
+                .await
+                .expect("retried publication succeeds with no bytes lost");
+            assert!(index.writer_mut().pending_delta_seal.is_none());
+            assert_eq!(
+                Arc::strong_count(&encoded),
+                1,
+                "publication must consume the retained reference"
+            );
+            assert_eq!(
+                index
+                    .search_paginated(&cx, "alpha", 10, 0, true)
+                    .expect("query the published successor"),
+                before
+            );
+        });
+    }
+
+    /// A REAL publisher failure: an exact MANIFEST temp-file collision returns
+    /// a typed error after the segment was already installed. The retained seal
+    /// must survive the failed publication attempt, and a retry must publish
+    /// losslessly once the conflicting artifact is preserved aside.
+    #[cfg(all(
+        unix,
+        not(any(
+            target_os = "espidf",
+            target_os = "horizon",
+            target_os = "solaris",
+            target_os = "vita",
+            target_os = "wasi"
+        ))
+    ))]
+    #[test]
+    fn durable_delta_seal_retains_pending_on_manifest_write_failure_then_retries() {
+        run_with_cx(|cx| async move {
+            const INJECTED_MANIFEST_TEMP_BYTES: &[u8] = b"injected conflicting MANIFEST bytes";
+
+            let directory = tempfile::tempdir().expect("temporary Keeper directory");
+            let mut index = QuillIndex::create(&cx, directory.path(), deterministic_config())
+                .await
+                .expect("create durable index");
+            let generation = index.snapshot().loaded_manifest().manifest.generation;
+            let base_seal_seq = index.writer_mut().next_seal_seq;
+            let mut delta = DeltaSegment::new(DEFAULT_SCHEMA, 0, usize::MAX)
+                .expect("manifest-failure Delta source");
+            apply_alpha_delta(&mut delta, 0, "manifest-failure-survivor", 1);
+            let sealed = Arc::new(delta.freeze(generation));
+            index
+                .publish_delta_table(vec![Arc::clone(&sealed)])
+                .expect("publish manifest-failure Delta");
+            let before = index
+                .search_paginated(&cx, "alpha", 10, 0, true)
+                .expect("query pre-seal Delta");
+
+            let encoded = Arc::new(
+                flush_delta_snapshot(
+                    &sealed,
+                    DeltaFlushInput {
+                        segment_id: 0x51c1_0002,
+                        created_unix_s: 1_700_000_051,
+                        engine_version: CURRENT_ENGINE_VERSION,
+                    },
+                )
+                .expect("build retained seal")
+                .expect("live Delta emits FSLX"),
+            );
+            let mut manifest = index
+                .snapshot()
+                .next_manifest()
+                .expect("successor MANIFEST");
+            manifest.last_publish_unix_s = 0;
+            manifest
+                .segments
+                .push(manifest_segment(&encoded, base_seal_seq));
+            manifest.docid_high_watermark = sealed.lease_end();
+            let mut pending_field_stats = BTreeMap::new();
+            for field in DEFAULT_SCHEMA
+                .fields
+                .iter()
+                .filter(|field| matches!(field.kind, FieldKind::Keyword | FieldKind::Text { .. }))
+            {
+                pending_field_stats.insert(
+                    field.id,
+                    (
+                        sealed
+                            .live_total_tokens(field.id)
+                            .expect("retained Delta field stats"),
+                        1,
+                    ),
+                );
+            }
+            manifest.field_stats = merge_field_stats(&manifest.field_stats, &pending_field_stats)
+                .expect("merge retained Delta field stats");
+            let prepared = index
+                .reader
+                .published_snapshot
+                .prepare_sealed_manifest(DEFAULT_SCHEMA, &manifest)
+                .expect("prepare retained local swap");
+            index.writer_mut().pending_delta_seal = Some(PendingDeltaSeal {
+                encoded: Some(Arc::clone(&encoded)),
+                segment_installed: false,
+                manifest,
+                prepared,
+                next_seal_seq: base_seal_seq + 1,
+                successor_watermark: sealed.lease_end(),
+            });
+
+            // Install the segment for real while the directory is writable,
+            // exactly like a publication whose caller future lost completion
+            // after the install step.
+            {
+                let writer = match &mut index.writer_mut().backend {
+                    IndexBackend::Durable(writer) => Some(writer),
+                    IndexBackend::Memory(_) => None,
+                }
+                .expect("fixture must use a durable Keeper");
+                writer
+                    .publish_encoded_segment_retryable(&cx, Arc::clone(&encoded))
+                    .await
+                    .expect("install segment before the injected MANIFEST failure");
+            }
+
+            // Injected REAL publisher failure: a mismatched file at the exact
+            // temp path cannot be reused as the pending generation's MANIFEST.
+            // Unlike permission bits, this remains effective when the worker
+            // has root or another write-bypassing capability, and unlike a
+            // directory collision it has the same typed result cross-platform.
+            let pending_generation = generation
+                .checked_add(1)
+                .expect("fixture generation has a successor");
+            let collision_path = directory
+                .path()
+                .join(format!(".tmp-manifest-{pending_generation}"));
+            std::fs::write(&collision_path, INJECTED_MANIFEST_TEMP_BYTES)
+                .expect("create exact MANIFEST temp-file collision");
+            let failure = index
+                .resume_pending_delta_seal(&cx)
+                .await
+                .err()
+                .expect("MANIFEST temp-path collision must fail publication");
+            assert!(
+                matches!(
+                    &failure,
+                    QuillIndexError::Keeper(KeeperError::TempConflict { .. })
+                ),
+                "failure must be the injected typed temp conflict, got: {failure:?}"
+            );
+            if let QuillIndexError::Keeper(KeeperError::TempConflict { path }) = &failure {
+                // ubs:ignore -- these are public temporary filesystem paths, not secrets.
+                assert_eq!(path, &collision_path);
+            }
+            assert_eq!(
+                index.snapshot().loaded_manifest().manifest.generation,
+                generation,
+                "failed MANIFEST publication must not advance durable authority"
+            );
+            {
+                let retained = index
+                    .writer_mut()
+                    .pending_delta_seal
+                    .as_ref()
+                    .expect("failed publication must retain the pending seal");
+                assert!(
+                    retained.segment_installed,
+                    "the reconciled install must be recorded before the failed publish"
+                );
+                assert!(
+                    Arc::ptr_eq(
+                        retained.encoded.as_ref().expect("retained encoded segment"),
+                        &encoded
+                    ),
+                    "the retained seal must still reference the exact encoded bytes"
+                );
+            }
+            let preserved_collision = directory.path().join(format!(
+                ".injected-manifest-temp-conflict-{pending_generation}"
+            ));
+            std::fs::rename(&collision_path, &preserved_collision)
+                .expect("preserve injected collision aside before retry");
+            assert!(
+                preserved_collision.is_file(),
+                "the injected failure artifact must remain preserved for diagnosis"
+            );
+            // ubs:ignore -- this public test sentinel is not credential material.
+            assert_eq!(
+                std::fs::read(&preserved_collision)
+                    .expect("read preserved MANIFEST temp-file collision"),
+                INJECTED_MANIFEST_TEMP_BYTES,
+                "the failed reusable-temp probe must not overwrite the collision"
+            );
+            assert_eq!(
+                Arc::strong_count(&encoded),
+                2,
+                "only the test handle and the retained seal may hold the segment"
+            );
+            assert_eq!(
+                index
+                    .search_paginated(&cx, "alpha", 10, 0, true)
+                    .expect("old epoch remains visible after the failed publication"),
+                before
+            );
+
+            index
+                .resume_pending_delta_seal(&cx)
+                .await
+                .expect("retried publication succeeds with no bytes lost");
+            assert!(index.writer_mut().pending_delta_seal.is_none());
+            assert_eq!(
+                Arc::strong_count(&encoded),
+                1,
+                "publication must consume the retained reference"
+            );
+            assert_eq!(
+                index.snapshot().loaded_manifest().manifest.generation,
+                generation + 1,
+                "retried publication must advance exactly one generation"
+            );
+            assert_eq!(
+                index
+                    .search_paginated(&cx, "alpha", 10, 0, true)
+                    .expect("query the published successor"),
+                before
+            );
+        });
+    }
+
+    #[test]
+    fn published_memory_snapshot_bytes_survive_successor_publication() {
+        run_with_cx(|cx| async move {
+            let index =
+                QuillIndex::in_memory(deterministic_config()).expect("create in-memory index");
+            index
+                .index_document(
+                    &cx,
+                    &IndexableDocument::new("doc-a", "aardvark burrows deep"),
+                )
+                .await
+                .expect("index first document");
+            index.commit(&cx).await.expect("first commit publishes");
+            let old = index.snapshot();
+            for segment in old.segments() {
+                segment.verify().expect("fresh snapshot verifies");
+            }
+            let old_segment_count = old.segments().len();
+            let old_backing: Vec<*const u8> = old
+                .segments()
+                .iter()
+                .map(|segment| segment.source_bytes().as_ptr())
+                .collect();
+            let before = index
+                .search_paginated(&cx, "aardvark", 10, 0, true)
+                .expect("query first publication");
+
+            index
+                .index_document(
+                    &cx,
+                    &IndexableDocument::new("doc-b", "bobcat prowls quietly"),
+                )
+                .await
+                .expect("index second document");
+            index.commit(&cx).await.expect("second commit publishes");
+
+            let new = index.snapshot();
+            assert!(
+                !Arc::ptr_eq(&old, &new),
+                "a successor publication must install a new snapshot"
+            );
+            assert!(new.segments().len() > old_segment_count);
+            // The pre-publication snapshot still owns valid, hash-verified
+            // bytes: successor publication and writer-side pending-state
+            // clearing must not disturb the shared backing.
+            for segment in old.segments() {
+                segment
+                    .verify()
+                    .expect("pre-publication snapshot backing must stay intact");
+            }
+            assert_eq!(old.segments().len(), old_segment_count);
+            let old_backing_after: Vec<*const u8> = old
+                .segments()
+                .iter()
+                .map(|segment| segment.source_bytes().as_ptr())
+                .collect();
+            assert_eq!(
+                old_backing, old_backing_after,
+                "the old snapshot must keep its exact byte backing"
+            );
+            // Corpus statistics legitimately change with the second commit,
+            // so compare identity, not scores.
+            let after = index
+                .search_paginated(&cx, "aardvark", 10, 0, true)
+                .expect("first document remains visible");
+            assert_eq!(after.total_count, Some(1));
+            assert_eq!(after.hits.len(), 1);
+            assert_eq!(after.hits[0].document_id, before.hits[0].document_id);
+            assert_eq!(
+                index
+                    .search_paginated(&cx, "bobcat", 10, 0, true)
+                    .expect("second document becomes visible")
+                    .total_count,
+                Some(1)
+            );
+        });
+    }
+
     #[test]
     fn dropped_delta_seal_after_manifest_install_resumes_exact_generation() {
         // This fixture intentionally pauses inside real blocking filesystem
@@ -13699,7 +17754,14 @@ mod tests {
     fn mixed_snapshot_disjunction_count_free_matches_exhaustive_at_pinned_k() {
         const DOCS_PER_RESIDENCY: u32 = 5_000;
         run_with_cx(|cx| async move {
-            let mixed = QuillIndex::in_memory(deterministic_config()).expect("mixed index");
+            let mixed = QuillIndex::in_memory(QuillConfig {
+                // This fixture requires one segment spanning more than the
+                // 4,096-document union horizon. A wall-clock visibility
+                // barrier would make its shape depend on concurrent test load.
+                max_visibility_lag_ms: u64::MAX,
+                ..deterministic_config()
+            })
+            .expect("mixed index");
             let mut sealed_documents = Vec::with_capacity(
                 usize::try_from(DOCS_PER_RESIDENCY).expect("fixture count fits usize"),
             );
@@ -13722,12 +17784,28 @@ mod tests {
                         .with_title(title),
                 );
             }
-            mixed
-                .index_documents(&cx, &sealed_documents)
-                .await
-                .expect("accumulate large sealed fixture");
+            for batch in sealed_documents.chunks(PARALLEL_INGEST_MIN_DOCS_PER_SHARD - 1) {
+                mixed
+                    .index_documents(&cx, batch)
+                    .await
+                    .expect("accumulate monolithic sealed fixture");
+            }
             mixed.commit(&cx).await.expect("seal large fixture");
             let keeper = mixed.snapshot();
+            assert_eq!(
+                keeper.segments().len(),
+                1,
+                "mixed-snapshot pruning fixture must remain one monolithic sealed segment"
+            );
+            assert_eq!(
+                keeper
+                    .segments()
+                    .first()
+                    .expect("mixed-snapshot fixture has its asserted segment")
+                    .at_seal_doc_count(),
+                DOCS_PER_RESIDENCY,
+                "sealed pruning leaf must span the complete 5,000-document residency"
+            );
             let sealed_snapshot = QuillSearchSnapshot::compose(0, Arc::clone(&keeper), Vec::new())
                 .expect("sealed-only statistics snapshot");
             let sealed_stats = sealed_snapshot
@@ -15261,6 +19339,139 @@ mod tests {
     }
 
     #[test]
+    fn owned_phrase_cursor_streams_positions_across_independent_block_seams() {
+        run_with_cx(|cx| async move {
+            const DOCUMENT_COUNT: usize = 270;
+            const TERM_FREQUENCY: usize = 24;
+
+            let content = std::iter::repeat_n("anchor", TERM_FREQUENCY)
+                .collect::<Vec<_>>()
+                .join(" ");
+            let documents = (0..DOCUMENT_COUNT)
+                .map(|ordinal| {
+                    IndexableDocument::new(format!("phrase-seam-{ordinal:03}"), content.clone())
+                })
+                .collect::<Vec<_>>();
+            let index = QuillIndex::in_memory(QuillConfig {
+                deterministic_ingest: true,
+                max_ingest_shards: 1,
+                ..QuillConfig::default()
+            })
+            .expect("construct phrase-seam index");
+            // Seed the deterministic accumulator below the internal bulk-parallel
+            // threshold. The following call must then stay on the scalar wrapper
+            // route, giving this cursor test one segment without coupling its
+            // seam oracle to the independent four-segment bulk-ingest policy.
+            index
+                .index_documents(&cx, &documents[..1])
+                .await
+                .expect("seed phrase-seam corpus");
+            index
+                .index_documents(&cx, &documents[1..])
+                .await
+                .expect("index remaining phrase-seam corpus");
+            index.commit(&cx).await.expect("commit phrase-seam corpus");
+
+            let snapshot = index.snapshot();
+            assert_eq!(snapshot.segments().len(), 1);
+            let segment = &snapshot.segments()[0];
+            let dictionary =
+                open_dictionary(segment, DEFAULT_SCHEMA).expect("open phrase-seam term dictionary");
+            let found = dictionary
+                .lookup(CONTENT_FIELD, b"anchor")
+                .expect("look up phrase-seam term")
+                .expect("phrase-seam term is present");
+            assert_eq!(
+                usize::try_from(found.metadata.doc_freq).expect("document frequency fits usize"),
+                DOCUMENT_COUNT,
+            );
+
+            let postings_section =
+                required_section(segment, SectionKind::POSTINGS).expect("POSTINGS section");
+            let postings_bytes = span(
+                postings_section,
+                found.metadata.postings,
+                "phrase-seam POSTINGS",
+            )
+            .expect("slice phrase-seam postings");
+            let postings = PostingList::parse(postings_bytes, found.metadata.doc_freq)
+                .expect("parse phrase-seam postings");
+            let position_span = found.metadata.positions.expect("positioned anchor term");
+            let position_section =
+                required_section(segment, SectionKind::POSITIONS).expect("POSITIONS section");
+            let position_bytes = span(position_section, position_span, "phrase-seam POSITIONS")
+                .expect("slice phrase-seam positions");
+            let position_list = PositionList::parse(position_bytes, &postings)
+                .expect("parse phrase-seam positions");
+            assert!(postings.blocks().len() >= 2, "fixture needs posting seams");
+            assert!(
+                position_list.block_count() >= 2,
+                "fixture needs position seams"
+            );
+            assert_ne!(
+                postings.blocks()[1].base_posting_ordinal,
+                position_list.blocks()[1].base_posting_ordinal(),
+                "the first posting and position seams must be independent",
+            );
+            let legacy_position_rows = (0..found.metadata.doc_freq)
+                .map(|ordinal| {
+                    position_list
+                        .positions_for_ordinal(ordinal)?
+                        .collect::<Result<Vec<_>, _>>()
+                })
+                .collect::<Result<Vec<_>, PositionCodecError>>()
+                .expect("materialize legacy ordinal position rows");
+
+            crate::quiver::reset_position_run_work_for_test();
+            PositionList::parse(position_bytes, &postings)
+                .expect("measure the mandatory position-validation pass");
+            let (validation_decodes, validation_consumes) =
+                crate::quiver::position_run_work_for_test();
+            assert_eq!(validation_decodes, 0);
+            assert_eq!(validation_consumes, DOCUMENT_COUNT);
+
+            crate::quiver::reset_position_run_work_for_test();
+            let owned = open_owned_cursor(
+                segment,
+                DEFAULT_SCHEMA,
+                CONTENT_FIELD,
+                b"anchor",
+                true,
+                None,
+            )
+            .expect("materialize production phrase cursor");
+            let (owned_decodes, scan_consumes) = crate::quiver::position_run_work_for_test();
+            assert_eq!(owned_decodes, DOCUMENT_COUNT);
+            assert_eq!(
+                scan_consumes, validation_consumes,
+                "materialization may validate each run once but must not rescan preceding rows",
+            );
+            assert_eq!(owned.postings.len(), DOCUMENT_COUNT);
+            let position_rows = owned.positions.expect("owned position rows");
+            assert_eq!(position_rows.len(), DOCUMENT_COUNT);
+            assert_eq!(position_rows, legacy_position_rows);
+            let expected_frequency =
+                u32::try_from(TERM_FREQUENCY).expect("term frequency fits u32");
+            let expected_positions = (0..expected_frequency).collect::<Vec<_>>();
+            for (ordinal, (posting, positions)) in
+                owned.postings.iter().zip(&position_rows).enumerate()
+            {
+                assert_eq!(posting.freq, expected_frequency);
+                assert_eq!(positions, &expected_positions, "posting ordinal {ordinal}");
+            }
+
+            let phrase = index
+                .search_paginated(&cx, "\"anchor anchor\"", DOCUMENT_COUNT, 0, true)
+                .expect("execute checkpointed phrase query across both seam families");
+            assert_eq!(
+                phrase.total_count,
+                Some(u64::try_from(DOCUMENT_COUNT).expect("document count fits u64")),
+            );
+            assert_eq!(phrase.hits.len(), DOCUMENT_COUNT);
+        });
+    }
+
+    #[test]
     fn scalar_memory_commit_is_visibility_boundary_and_queries_end_to_end() {
         run_with_cx(|cx| async move {
             let index = QuillIndex::in_memory(deterministic_config()).expect("memory index");
@@ -15357,6 +19568,1248 @@ mod tests {
         });
     }
 
+    fn parallel_budget_fixture_documents(count: usize) -> Vec<IndexableDocument> {
+        (0..count)
+            .map(|ordinal| {
+                IndexableDocument::new(
+                    format!("parallel-budget-{ordinal:05}"),
+                    format!("shared budget token group-{}", ordinal % 17),
+                )
+                .with_title(format!("budget title {}", ordinal % 5))
+                .with_metadata("ordinal", ordinal.to_string())
+            })
+            .collect()
+    }
+
+    fn assert_parallel_budget_bound_for_schema(schema: SchemaDescriptor) {
+        let exact_maximum = "X".repeat(MAX_TERM_BYTES);
+        let dropped_oversized = "Y".repeat(MAX_TERM_BYTES + 1);
+        let mut documents = vec![
+            IndexableDocument::new("bound-0", "alpha alpha İSTANBUL 東京")
+                .with_title("Repeated REPEATED")
+                .with_metadata("escaped", "line\nquote\"nul\0"),
+            IndexableDocument::new("bound-1", format!("{exact_maximum} {dropped_oversized}"))
+                .with_title("z-z-z"),
+            IndexableDocument::new(exact_maximum.clone(), "keyword boundary admitted"),
+            IndexableDocument::new(dropped_oversized.clone(), "keyword boundary dropped"),
+        ];
+        documents.extend((0..32).map(|ordinal| {
+            IndexableDocument::new(
+                format!("bound-random-{ordinal:02}"),
+                format!(
+                    "{} {} shared-{} Ω{}",
+                    "unique".repeat(ordinal % 7 + 1),
+                    "repeat ".repeat(ordinal % 5 + 1),
+                    ordinal % 3,
+                    ordinal
+                ),
+            )
+            .with_title(format!("title-{}", ordinal % 4))
+            .with_metadata("bucket", format!("{}\n{}", ordinal % 9, ordinal))
+        }));
+
+        let mut accumulator = ColumnarAccumulator::new(schema).expect("budget-bound accumulator");
+        let mut analyzer = FrankensearchTokenizer::default();
+        let mut cumulative_upper_bound = accumulator.bytes_used();
+        for (ordinal, document) in documents.iter().enumerate() {
+            let document_bound =
+                parallel_document_logical_upper_bound(schema, &mut analyzer, document, usize::MAX)
+                    .expect("estimate budget-bound document")
+                    .expect("shipping-shaped schema has a bound");
+            let ParallelDocumentBudgetBound::Within(document_upper_bound) = document_bound else {
+                panic!("unbounded fixture must not reach the rejection ceiling");
+            };
+            cumulative_upper_bound = cumulative_upper_bound
+                .checked_add(document_upper_bound)
+                .expect("fixture upper bound fits usize");
+
+            let metadata = canonical_metadata(&document.metadata).expect("canonical metadata");
+            let title = document.title.as_deref().unwrap_or("");
+            let indexed = [
+                IndexedFieldValue::new(ID_FIELD, &document.id),
+                IndexedFieldValue::new(CONTENT_FIELD, &document.content),
+                IndexedFieldValue::new(TITLE_FIELD, title),
+            ];
+            let numeric = [IndexedNumericValue::u64(
+                ORD_FIELD,
+                u64::try_from(ordinal).expect("fixture ordinal fits u64"),
+            )];
+            let stored = [StoredFieldValue::new(METADATA_FIELD, &metadata)];
+            let mut fresh = ColumnarAccumulator::new(schema).expect("fresh bound accumulator");
+            let fresh_initial = fresh.bytes_used();
+            fresh
+                .add_document_with_values(0, &indexed, &numeric, &stored)
+                .expect("accumulate fresh budget-bound document");
+            let fresh_delta = fresh
+                .bytes_used()
+                .checked_sub(fresh_initial)
+                .expect("one document cannot reduce logical use");
+            assert!(
+                fresh_delta <= document_upper_bound,
+                "fresh-document logical increment {fresh_delta} exceeded bound {document_upper_bound} for document {ordinal}",
+            );
+
+            accumulator
+                .add_document_with_values(
+                    u32::try_from(ordinal).expect("fixture ordinal fits u32"),
+                    &indexed,
+                    &numeric,
+                    &stored,
+                )
+                .expect("accumulate budget-bound document");
+            assert!(
+                accumulator.bytes_used() <= cumulative_upper_bound,
+                "logical use {} exceeded conservative bound {cumulative_upper_bound} after document {ordinal}",
+                accumulator.bytes_used(),
+            );
+        }
+    }
+
+    #[test]
+    fn parallel_budget_fit_bound_is_conservative() {
+        assert_parallel_budget_bound_for_schema(DEFAULT_SCHEMA);
+        assert_parallel_budget_bound_for_schema(MIXED_BUDGET_SCHEMA);
+    }
+
+    #[test]
+    fn parallel_budget_source_length_validation_rejects_u32_overflow() {
+        let maximum = usize::try_from(u32::MAX).expect("test requires a usize at least u32 wide");
+        assert!(validate_parallel_source_len(CONTENT_FIELD, maximum).is_ok());
+        let Some(oversized) = maximum.checked_add(1) else {
+            return;
+        };
+        assert!(matches!(
+            validate_parallel_source_len(CONTENT_FIELD, oversized),
+            Err(QuillIndexError::Accumulator(
+                AccumulatorError::SourceTooLarge {
+                    field_ord: CONTENT_FIELD,
+                    bytes,
+                }
+            )) if bytes == oversized
+        ));
+    }
+
+    #[test]
+    fn parallel_budget_fixed_lower_bound_precedes_tokenization() {
+        let document = IndexableDocument::new("lower-bound-id", "content must not be tokenized")
+            .with_title("title must not be tokenized");
+        let mut analyzer = FrankensearchTokenizer::default();
+        assert_eq!(analyzer.bytes_reserved(), 0);
+        assert_eq!(
+            parallel_document_logical_upper_bound(DEFAULT_SCHEMA, &mut analyzer, &document, 1)
+                .expect("estimate lower-bound fixture"),
+            Some(ParallelDocumentBudgetBound::ReachesCeiling),
+        );
+        assert_eq!(
+            analyzer.bytes_reserved(),
+            0,
+            "fixed/stored rejection must precede tokenizer scratch allocation",
+        );
+    }
+
+    #[test]
+    fn parallel_budget_token_charge_honors_exclusive_ceiling() {
+        let document =
+            IndexableDocument::new("token-ceiling-id", "alpha beta").with_title("gamma delta");
+        let mut unbounded_analyzer = FrankensearchTokenizer::default();
+        let full = parallel_document_logical_upper_bound(
+            DEFAULT_SCHEMA,
+            &mut unbounded_analyzer,
+            &document,
+            usize::MAX,
+        )
+        .expect("estimate token-ceiling fixture")
+        .expect("shipping schema has token-ceiling bound");
+        let ParallelDocumentBudgetBound::Within(full) = full else {
+            panic!("unbounded token fixture must produce a complete bound");
+        };
+
+        let mut equality_analyzer = FrankensearchTokenizer::default();
+        assert_eq!(
+            parallel_document_logical_upper_bound(
+                DEFAULT_SCHEMA,
+                &mut equality_analyzer,
+                &document,
+                full,
+            )
+            .expect("estimate token-bound equality"),
+            Some(ParallelDocumentBudgetBound::ReachesCeiling),
+        );
+
+        let mut fitting_analyzer = FrankensearchTokenizer::default();
+        assert_eq!(
+            parallel_document_logical_upper_bound(
+                DEFAULT_SCHEMA,
+                &mut fitting_analyzer,
+                &document,
+                full.checked_add(1).expect("fixture bound fits usize"),
+            )
+            .expect("estimate token-bound fit"),
+            Some(ParallelDocumentBudgetBound::Within(full)),
+        );
+    }
+
+    #[cfg(feature = "bench-internals")]
+    #[test]
+    fn parallel_budget_fit_bound_is_conservative_without_positions() {
+        assert_parallel_budget_bound_for_schema(POSITIONLESS_QG_SCHEMA);
+    }
+
+    #[test]
+    fn parallel_budget_arena_chunk_slack_is_aggregate_bounded() {
+        const WIDTHS: [usize; 10] = [1, 2, 3, 4, 8, 16, 32, 128, 256, 512];
+        let near_default_budget = crate::config::DEFAULT_SCRIBE_SHARD_BUDGET_BYTES - 1;
+        for active_shards in WIDTHS {
+            let chunk_bytes = parallel_arena_chunk_bytes(near_default_budget, active_shards);
+            let aggregate_chunk_slack = active_shards
+                .checked_mul(chunk_bytes)
+                .expect("aggregate chunk slack fits usize");
+            let arena_floor = active_shards
+                .checked_mul(MIN_ARENA_CHUNK_BYTES)
+                .expect("aggregate arena floor fits usize");
+            assert!(
+                aggregate_chunk_slack <= DEFAULT_ARENA_CHUNK_BYTES.max(arena_floor),
+                "width {active_shards} selected {chunk_bytes} bytes per shard ({aggregate_chunk_slack} aggregate)",
+            );
+        }
+    }
+
+    #[test]
+    fn parallel_budget_threshold_falls_back_before_workers() {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .expect("build four-worker budget test pool");
+        pool.install(|| {
+            run_with_cx(|cx| async move {
+                let config = QuillConfig {
+                    max_ingest_shards: 4,
+                    max_visibility_lag_ms: 60_000,
+                    ..QuillConfig::default()
+                };
+                let mut index = QuillIndex::in_memory(config).expect("budget threshold index");
+                let documents = parallel_budget_fixture_documents(250);
+                let writer = index.writer_mut();
+                let plan = plan_parallel_ingest(
+                    documents.len(),
+                    writer.shard_router.shard_count(),
+                    rayon::current_num_threads(),
+                )
+                .expect("plan budget threshold fixture");
+                assert_eq!(plan.route, ParallelIngestRoute::SharedNothing);
+                let projected = writer
+                    .parallel_budget_admission(&cx, &documents, plan.active_shards)
+                    .expect("admit fixture under default budget")
+                    .expect("default budget fits fixture")
+                    .projected_logical_upper_bound;
+                let grants_before = writer.docid_allocator.lease_grants().len();
+                let watermark_before = writer.docid_allocator.watermark();
+                let next_shard_before = writer.shard_router.clone().route_batch();
+
+                for budget in [projected, projected.saturating_sub(1)] {
+                    writer.reader.config.scribe_shard_budget_bytes = budget;
+                    assert!(
+                        writer
+                            .try_index_documents_parallel(&cx, &documents, &BTreeSet::new(), false)
+                            .await
+                            .expect("budget fallback is not an error")
+                            .is_none(),
+                        "projected logical use {projected} must not be admitted at budget {budget}",
+                    );
+                    assert_eq!(writer.docid_allocator.lease_grants().len(), grants_before);
+                    assert_eq!(writer.docid_allocator.watermark(), watermark_before);
+                    assert_eq!(writer.shard_router.clone().route_batch(), next_shard_before);
+                    assert!(!writer.ingest_retry_required);
+                    assert!(writer.shards.iter().all(|shard| {
+                        shard.accumulator.document_count() == 0
+                            && shard.identities.is_empty()
+                            && shard.current_lease_base.is_none()
+                    }));
+                }
+            });
+        });
+    }
+
+    #[test]
+    fn parallel_budget_fit_uses_shared_nothing_without_budget_flush() {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .expect("build four-worker budget admission pool");
+        pool.install(|| {
+            run_with_cx(|cx| async move {
+                let config = QuillConfig {
+                    max_ingest_shards: 4,
+                    max_visibility_lag_ms: 60_000,
+                    ..QuillConfig::default()
+                };
+                let mut index = QuillIndex::in_memory(config).expect("budget fit index");
+                let documents = parallel_budget_fixture_documents(250);
+                let writer = index.writer_mut();
+                let plan = plan_parallel_ingest(
+                    documents.len(),
+                    writer.shard_router.shard_count(),
+                    rayon::current_num_threads(),
+                )
+                .expect("plan budget fit fixture");
+                assert_eq!(plan.route, ParallelIngestRoute::SharedNothing);
+                let projected = writer
+                    .parallel_budget_admission(&cx, &documents, plan.active_shards)
+                    .expect("estimate budget fit fixture")
+                    .expect("default budget fits fixture")
+                    .projected_logical_upper_bound;
+                writer.reader.config.scribe_shard_budget_bytes = projected + 1;
+
+                let receipt = writer
+                    .try_index_documents_parallel(&cx, &documents, &BTreeSet::new(), false)
+                    .await
+                    .expect("run budget-fit shared-nothing ingest")
+                    .expect("budget-fit fixture uses shared-nothing");
+                assert_eq!(receipt.route, ParallelIngestRoute::SharedNothing);
+                assert_eq!(receipt.logical_budget_bytes, projected + 1);
+                assert_eq!(receipt.projected_logical_upper_bound, projected);
+                assert!(receipt.arena_bytes_used_high_water <= projected);
+                assert!(receipt.arena_bytes_used_high_water < receipt.logical_budget_bytes);
+                assert!(receipt.arena_chunk_bytes < DEFAULT_ARENA_CHUNK_BYTES);
+                assert!(writer.pending_segments.is_empty());
+                assert_eq!(
+                    writer
+                        .shards
+                        .iter()
+                        .map(|shard| shard.accumulator.document_count())
+                        .sum::<usize>(),
+                    documents.len(),
+                );
+
+                writer
+                    .commit_with_trigger(&cx, LifecycleTrigger::ExplicitFlush)
+                    .await
+                    .expect("publish budget-fit shared-nothing batch");
+                assert_eq!(writer.snapshot().doc_count(), 250);
+            });
+        });
+    }
+
+    #[test]
+    fn parallel_budget_default_bounds_reused_generation_reservations() {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .expect("build four-worker default-budget pool");
+        pool.install(|| {
+            run_with_cx(|cx| async move {
+                let config = QuillConfig {
+                    max_ingest_shards: 4,
+                    max_visibility_lag_ms: 60_000,
+                    ..QuillConfig::default()
+                };
+                let mut index = QuillIndex::in_memory(config).expect("default-budget index");
+                let documents = parallel_budget_fixture_documents(256);
+                let writer = index.writer_mut();
+                if writer.shard_router.shard_count() < 2 {
+                    return;
+                }
+                let initial_reserved = writer
+                    .shards
+                    .iter()
+                    .try_fold(0_usize, |total, shard| {
+                        total.checked_add(shard.accumulator.bytes_reserved())
+                    })
+                    .expect("initial reserve total fits usize");
+                let first = writer
+                    .try_index_documents_parallel(&cx, &documents, &BTreeSet::new(), false)
+                    .await
+                    .expect("run first default-budget generation")
+                    .expect("first default-budget generation uses shared-nothing");
+                assert_eq!(
+                    first.logical_budget_bytes,
+                    crate::config::DEFAULT_SCRIBE_SHARD_BUDGET_BYTES,
+                );
+                assert_eq!(
+                    first.arena_chunk_bytes,
+                    parallel_arena_chunk_bytes(
+                        first.batch_logical_upper_bound,
+                        first.active_shards,
+                    ),
+                );
+                assert!(first.arena_chunk_bytes < DEFAULT_ARENA_CHUNK_BYTES);
+                let first_installed_reserved = writer
+                    .shards
+                    .iter()
+                    .filter(|shard| shard.accumulator.document_count() != 0)
+                    .try_fold(0_usize, |total, shard| {
+                        total.checked_add(shard.accumulator.bytes_reserved())
+                    })
+                    .expect("first installed reserve total fits usize");
+                assert_eq!(
+                    first.arena_bytes_reserved_high_water,
+                    initial_reserved
+                        .checked_add(first_installed_reserved)
+                        .expect("first exact reserve peak fits usize"),
+                );
+                let first_default_chunk_peak = initial_reserved
+                    .checked_add(
+                        first
+                            .active_shards
+                            .checked_mul(DEFAULT_ARENA_CHUNK_BYTES)
+                            .expect("default chunk peak fits usize"),
+                    )
+                    .expect("first-generation peak fits usize");
+                assert!(first.arena_bytes_reserved_high_water < first_default_chunk_peak);
+                assert!(
+                    writer
+                        .shards
+                        .iter()
+                        .filter(|shard| shard.accumulator.document_count() != 0)
+                        .all(|shard| {
+                            shard.accumulator.terms().arena_stats().1 < DEFAULT_ARENA_CHUNK_BYTES
+                        })
+                );
+
+                writer
+                    .commit_with_trigger(&cx, LifecycleTrigger::ExplicitFlush)
+                    .await
+                    .expect("publish first default-budget generation");
+                assert!(writer.shards.iter().all(|shard| {
+                    shard.accumulator.document_count() == 0
+                        && shard.identities.is_empty()
+                        && shard.current_lease_base.is_none()
+                }));
+                let retained_reserved = writer
+                    .shards
+                    .iter()
+                    .try_fold(0_usize, |total, shard| {
+                        total.checked_add(shard.accumulator.bytes_reserved())
+                    })
+                    .expect("retained reserve total fits usize");
+                assert!(retained_reserved > initial_reserved);
+                let (retained_arena_bytes, retained_arena_chunks) = writer
+                    .shards
+                    .iter()
+                    .try_fold((0_usize, 0_usize), |(bytes, chunks), shard| {
+                        let (_, shard_bytes, shard_chunks) =
+                            shard.accumulator.terms().arena_stats();
+                        Some((
+                            bytes.checked_add(shard_bytes)?,
+                            chunks.checked_add(shard_chunks)?,
+                        ))
+                    })
+                    .expect("retained arena totals fit usize");
+                assert!(retained_arena_bytes > 0);
+                assert!(retained_arena_chunks > 0);
+
+                let mut second_documents = parallel_budget_fixture_documents(256);
+                for (ordinal, document) in second_documents.iter_mut().enumerate() {
+                    document.id = format!("parallel-budget-second-{ordinal:05}");
+                }
+                let second = writer
+                    .try_index_documents_parallel(&cx, &second_documents, &BTreeSet::new(), false)
+                    .await
+                    .expect("run second default-budget generation")
+                    .expect("second default-budget generation uses shared-nothing");
+                assert!(second.arena_chunk_bytes < DEFAULT_ARENA_CHUNK_BYTES);
+                let second_installed_reserved = writer
+                    .shards
+                    .iter()
+                    .filter(|shard| shard.accumulator.document_count() != 0)
+                    .try_fold(0_usize, |total, shard| {
+                        total.checked_add(shard.accumulator.bytes_reserved())
+                    })
+                    .expect("second installed reserve total fits usize");
+                assert_eq!(
+                    second.arena_bytes_reserved_high_water,
+                    retained_reserved
+                        .checked_add(second_installed_reserved)
+                        .expect("second exact reserve peak fits usize"),
+                );
+                let second_default_chunk_peak = retained_reserved
+                    .checked_add(
+                        second
+                            .active_shards
+                            .checked_mul(DEFAULT_ARENA_CHUNK_BYTES)
+                            .expect("second default chunk peak fits usize"),
+                    )
+                    .expect("second-generation peak fits usize");
+                assert!(second.arena_bytes_reserved_high_water < second_default_chunk_peak);
+
+                writer
+                    .commit_with_trigger(&cx, LifecycleTrigger::ExplicitFlush)
+                    .await
+                    .expect("publish second default-budget generation");
+                assert_eq!(writer.snapshot().doc_count(), 512);
+            });
+        });
+    }
+
+    #[test]
+    fn dirty_prior_shard_blocks_parallel_budget_admission() {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .expect("build four-worker dirty-shard pool");
+        pool.install(|| {
+            run_with_cx(|cx| async move {
+                let config = QuillConfig {
+                    max_ingest_shards: 4,
+                    max_visibility_lag_ms: 60_000,
+                    ..QuillConfig::default()
+                };
+                let mut index = QuillIndex::in_memory(config).expect("dirty-shard index");
+                index
+                    .index_documents(
+                        &cx,
+                        &[IndexableDocument::new("prior", "retained prior shard")],
+                    )
+                    .await
+                    .expect("seed one dirty serial shard");
+                let documents = parallel_budget_fixture_documents(250);
+                let writer = index.writer_mut();
+                let grants_before = writer.docid_allocator.lease_grants().len();
+                let watermark_before = writer.docid_allocator.watermark();
+                assert!(
+                    writer
+                        .try_index_documents_parallel(&cx, &documents, &BTreeSet::new(), false)
+                        .await
+                        .expect("dirty-shard fallback is not an error")
+                        .is_none()
+                );
+                assert_eq!(writer.docid_allocator.lease_grants().len(), grants_before);
+                assert_eq!(writer.docid_allocator.watermark(), watermark_before);
+                assert_eq!(
+                    writer
+                        .shards
+                        .iter()
+                        .map(|shard| shard.accumulator.document_count())
+                        .sum::<usize>(),
+                    1,
+                );
+            });
+        });
+    }
+
+    #[test]
+    fn scalar_budget_overshoot_flushes_before_the_successor_document() {
+        run_with_cx(|cx| async move {
+            let config = QuillConfig {
+                scribe_shard_budget_bytes: 10_000,
+                deterministic_ingest: true,
+                max_visibility_lag_ms: 60_000,
+                ..QuillConfig::default()
+            };
+            let mut index = QuillIndex::in_memory(config).expect("scalar boundary index");
+            let documents = [
+                IndexableDocument::new("large", "unique ".repeat(5_000)),
+                IndexableDocument::new("tiny", "x"),
+            ];
+            index
+                .index_documents(&cx, &documents)
+                .await
+                .expect("index scalar boundary fixture");
+            let writer = index.writer_mut();
+            assert_eq!(writer.pending_segments.len(), 1);
+            assert_eq!(writer.pending_segments[0].doc_count, 1);
+            let dirty = writer
+                .shards
+                .iter()
+                .find(|shard| shard.accumulator.document_count() != 0)
+                .expect("successor document remains in a fresh accumulator");
+            assert_eq!(dirty.accumulator.document_count(), 1);
+            assert_eq!(dirty.identities[0].document_id, "tiny");
+        });
+    }
+
+    #[test]
+    fn parallel_budget_boundary_matches_forced_scalar() {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .expect("build four-worker boundary parity pool");
+        pool.install(|| {
+            run_with_cx(|cx| async move {
+                let documents = parallel_budget_fixture_documents(250);
+                let common = QuillConfig {
+                    scribe_shard_budget_bytes: 1,
+                    max_visibility_lag_ms: 60_000,
+                    tier_fanout: usize::MAX,
+                    ..QuillConfig::default()
+                };
+                let mut adaptive = QuillIndex::in_memory(QuillConfig {
+                    max_ingest_shards: 4,
+                    ..common.clone()
+                })
+                .expect("adaptive boundary index");
+                let mut scalar = QuillIndex::in_memory(QuillConfig {
+                    deterministic_ingest: true,
+                    ..common
+                })
+                .expect("forced scalar boundary index");
+
+                adaptive
+                    .index_documents(&cx, &documents)
+                    .await
+                    .expect("index adaptive boundary fixture");
+                scalar
+                    .index_documents(&cx, &documents)
+                    .await
+                    .expect("index scalar boundary fixture");
+                assert_eq!(adaptive.writer_mut().pending_segments.len(), 250);
+                assert_eq!(scalar.writer_mut().pending_segments.len(), 250);
+
+                adaptive
+                    .commit(&cx)
+                    .await
+                    .expect("publish adaptive boundary");
+                scalar.commit(&cx).await.expect("publish scalar boundary");
+                assert_eq!(
+                    adaptive.snapshot().loaded_manifest().manifest.field_stats,
+                    scalar.snapshot().loaded_manifest().manifest.field_stats,
+                );
+                for document in &documents {
+                    assert_eq!(
+                        adaptive
+                            .document_witness(&document.id)
+                            .expect("adaptive document witness"),
+                        scalar
+                            .document_witness(&document.id)
+                            .expect("scalar document witness"),
+                        "budget fallback witness differs for {}",
+                        document.id,
+                    );
+                }
+                assert_eq!(
+                    adaptive
+                        .search_doc_ids(&cx, "shared budget", 300)
+                        .expect("search adaptive boundary"),
+                    scalar
+                        .search_doc_ids(&cx, "shared budget", 300)
+                        .expect("search scalar boundary"),
+                );
+            });
+        });
+    }
+
+    #[test]
+    fn parallel_budget_equality_wrapper_matches_forced_scalar() {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .expect("build four-worker equality parity pool");
+        pool.install(|| {
+            run_with_cx(|cx| async move {
+                let documents = parallel_budget_fixture_documents(250);
+                let mut adaptive = QuillIndex::in_memory(QuillConfig {
+                    max_ingest_shards: 4,
+                    max_visibility_lag_ms: 60_000,
+                    ..QuillConfig::default()
+                })
+                .expect("adaptive equality index");
+                let projected = {
+                    let writer = adaptive.writer_mut();
+                    let plan = plan_parallel_ingest(
+                        documents.len(),
+                        writer.shard_router.shard_count(),
+                        rayon::current_num_threads(),
+                    )
+                    .expect("plan equality fixture");
+                    writer
+                        .parallel_budget_admission(&cx, &documents, plan.active_shards)
+                        .expect("estimate equality fixture")
+                        .expect("default budget fits equality fixture")
+                        .projected_logical_upper_bound
+                };
+                adaptive
+                    .writer_mut()
+                    .reader
+                    .config
+                    .scribe_shard_budget_bytes = projected;
+                let scalar = QuillIndex::in_memory(QuillConfig {
+                    scribe_shard_budget_bytes: projected,
+                    deterministic_ingest: true,
+                    max_visibility_lag_ms: 60_000,
+                    ..QuillConfig::default()
+                })
+                .expect("scalar equality control");
+
+                adaptive
+                    .index_documents(&cx, &documents)
+                    .await
+                    .expect("index equality fallback");
+                scalar
+                    .index_documents(&cx, &documents)
+                    .await
+                    .expect("index equality scalar control");
+                let adaptive_writer = adaptive.writer_mut();
+                assert!(adaptive_writer.pending_segments.is_empty());
+                assert_eq!(
+                    adaptive_writer
+                        .shards
+                        .iter()
+                        .filter(|shard| shard.accumulator.document_count() != 0)
+                        .count(),
+                    1,
+                    "budget equality must enter the scalar wrapper route",
+                );
+
+                adaptive
+                    .commit(&cx)
+                    .await
+                    .expect("publish equality fallback");
+                scalar
+                    .commit(&cx)
+                    .await
+                    .expect("publish equality scalar control");
+                assert_eq!(
+                    adaptive.snapshot().loaded_manifest().manifest.field_stats,
+                    scalar.snapshot().loaded_manifest().manifest.field_stats,
+                );
+                for document in [
+                    documents.first().expect("first equality document"),
+                    documents.last().expect("last equality document"),
+                ] {
+                    assert_eq!(
+                        adaptive
+                            .document_witness(&document.id)
+                            .expect("adaptive equality witness"),
+                        scalar
+                            .document_witness(&document.id)
+                            .expect("scalar equality witness"),
+                    );
+                }
+                assert_eq!(
+                    adaptive
+                        .search_doc_ids(&cx, "shared budget", 300)
+                        .expect("search equality fallback"),
+                    scalar
+                        .search_doc_ids(&cx, "shared budget", 300)
+                        .expect("search equality control"),
+                );
+            });
+        });
+    }
+
+    #[test]
+    fn large_batch_builds_all_available_shard_segments_shared_nothing() {
+        run_with_cx(|cx| async move {
+            let config = QuillConfig {
+                max_ingest_shards: 4,
+                ..QuillConfig::default()
+            };
+            let mut index = QuillIndex::in_memory(config).expect("multi-shard memory index");
+            let shard_count = index.writer_mut().shard_router.shard_count();
+            let documents = (0..shard_count * PARALLEL_INGEST_MIN_DOCS_PER_SHARD)
+                .map(|ordinal| {
+                    IndexableDocument::new(
+                        format!("parallel-shard-{ordinal:05}"),
+                        "parallel shared nothing indexing fixture",
+                    )
+                })
+                .collect::<Vec<_>>();
+            index
+                .index_documents(&cx, &documents)
+                .await
+                .expect("accumulate one large batch");
+
+            let active_shards =
+                plan_parallel_ingest(documents.len(), shard_count, rayon::current_num_threads())
+                    .expect("plan large parallel fixture")
+                    .active_shards;
+            let expected_segments = active_shards.max(1);
+            index.commit(&cx).await.expect("publish parallel batch");
+            assert_eq!(index.snapshot().segments().len(), expected_segments);
+            assert_eq!(
+                index.snapshot().doc_count(),
+                u64::try_from(documents.len()).expect("fixture document count fits u64"),
+            );
+            assert_pairwise_disjoint_manifest(
+                index
+                    .snapshot()
+                    .loaded_manifest()
+                    .manifest
+                    .segments
+                    .as_slice(),
+            );
+        });
+    }
+
+    #[test]
+    fn deterministic_large_batch_builds_four_contiguous_segments() {
+        run_with_cx(|cx| async move {
+            let mut index =
+                QuillIndex::in_memory(deterministic_config()).expect("deterministic memory index");
+            let document_count = INTERNAL_PARALLEL_INGEST_SHARDS
+                .checked_mul(PARALLEL_INGEST_MIN_DOCS_PER_SHARD)
+                .expect("bounded deterministic parallel fixture");
+            let documents = (0..document_count)
+                .map(|ordinal| {
+                    IndexableDocument::new(
+                        format!("internal-parallel-{ordinal:05}"),
+                        "deterministic internal parallel indexing fixture",
+                    )
+                })
+                .collect::<Vec<_>>();
+            index
+                .index_documents(&cx, &documents)
+                .await
+                .expect("build deterministic internal segments");
+
+            assert_eq!(
+                index.writer_mut().pending_segments.len(),
+                INTERNAL_PARALLEL_INGEST_SHARDS,
+            );
+            assert!(index.writer_mut().shards.iter().all(|shard| {
+                shard.accumulator.document_count() == 0 && shard.identities.is_empty()
+            }));
+            index
+                .commit(&cx)
+                .await
+                .expect("publish deterministic internal segments");
+
+            let snapshot = index.snapshot();
+            let manifest = &snapshot.loaded_manifest().manifest;
+            assert_eq!(manifest.segments.len(), INTERNAL_PARALLEL_INGEST_SHARDS);
+            assert_eq!(
+                index.snapshot().doc_count(),
+                u64::try_from(document_count).expect("fixture document count fits u64"),
+            );
+            assert_eq!(
+                manifest.segments.first().map(|segment| segment.docid_lo),
+                Some(0)
+            );
+            assert_eq!(
+                manifest.segments.last().map(|segment| segment.docid_hi),
+                Some(u64::try_from(document_count).expect("fixture document count fits u64")),
+            );
+            assert!(
+                manifest
+                    .segments
+                    .windows(2)
+                    .all(|pair| pair[0].docid_hi == pair[1].docid_lo),
+                "internal segment ranges must be contiguous and gap-free",
+            );
+            assert_pairwise_disjoint_manifest(&manifest.segments);
+        });
+    }
+
+    #[cfg(feature = "pruning-conformance")]
+    #[test]
+    fn scalar_topology_conformance_seam_preserves_one_requested_leaf() {
+        run_with_cx(|cx| async move {
+            let document_count = INTERNAL_PARALLEL_INGEST_SHARDS
+                .checked_mul(PARALLEL_INGEST_MIN_DOCS_PER_SHARD)
+                .expect("bounded scalar-topology fixture");
+            let documents = (0..document_count)
+                .map(|ordinal| {
+                    IndexableDocument::new(
+                        format!("scalar-topology-{ordinal:05}"),
+                        "scalar topology conformance fixture",
+                    )
+                })
+                .collect::<Vec<_>>();
+            let config = QuillConfig {
+                max_visibility_lag_ms: u64::MAX,
+                ..deterministic_config()
+            };
+            let mut adaptive =
+                QuillIndex::in_memory(config.clone()).expect("adaptive control index");
+            let mut scalar = QuillIndex::in_memory(config).expect("scalar topology index");
+
+            adaptive
+                .index_documents(&cx, &documents)
+                .await
+                .expect("build adaptive internal segments");
+            scalar
+                .index_documents_with_scalar_topology_conformance(&cx, &documents)
+                .await
+                .expect("accumulate one scalar topology leaf");
+
+            assert_eq!(
+                adaptive.writer_mut().pending_segments.len(),
+                INTERNAL_PARALLEL_INGEST_SHARDS,
+                "shipping ingest must retain its fixed-width internal fanout",
+            );
+            assert!(scalar.writer_mut().pending_segments.is_empty());
+            assert_eq!(
+                scalar
+                    .writer_mut()
+                    .shards
+                    .iter()
+                    .map(|shard| shard.accumulator.document_count())
+                    .sum::<usize>(),
+                document_count,
+            );
+
+            adaptive
+                .commit(&cx)
+                .await
+                .expect("publish adaptive control");
+            scalar
+                .commit(&cx)
+                .await
+                .expect("publish scalar topology leaf");
+            assert_eq!(
+                adaptive.snapshot().segments().len(),
+                INTERNAL_PARALLEL_INGEST_SHARDS,
+            );
+            assert_eq!(scalar.snapshot().segments().len(), 1);
+            assert_eq!(
+                scalar.snapshot().segments()[0].doc_count(),
+                u32::try_from(document_count).expect("fixture count fits u32"),
+            );
+            assert_eq!(
+                adaptive.snapshot().loaded_manifest().manifest.field_stats,
+                scalar.snapshot().loaded_manifest().manifest.field_stats,
+            );
+            assert_eq!(
+                adaptive
+                    .search_doc_ids(&cx, "scalar topology", document_count)
+                    .expect("search adaptive control"),
+                scalar
+                    .search_doc_ids(&cx, "scalar topology", document_count)
+                    .expect("search scalar topology leaf"),
+            );
+        });
+    }
+
+    #[test]
+    fn adaptive_parallel_planner_v1_covers_frozen_matrix() {
+        const DOCUMENT_COUNTS: [usize; 10] = [0, 1, 63, 64, 127, 128, 249, 250, 5_000, 8_192];
+        const WIDTHS: [usize; 6] = [1, 2, 4, 64, 96, 128];
+
+        let goldens = [
+            (250, 4, 4, 3),
+            (5_000, 96, 96, 78),
+            (5_000, 128, 128, 78),
+            (8_192, 128, 128, 128),
+        ];
+        for (document_count, configured_width, pool_capacity, expected_active) in goldens {
+            let plan = plan_parallel_ingest(document_count, configured_width, pool_capacity)
+                .expect("plan frozen adaptive-ingest golden");
+            assert_eq!(plan.active_shards, expected_active);
+        }
+
+        for document_count in DOCUMENT_COUNTS {
+            for width in WIDTHS {
+                let plan = plan_parallel_ingest(document_count, width, width)
+                    .expect("plan frozen adaptive-ingest matrix cell");
+                let repeated = plan_parallel_ingest(document_count, width, width)
+                    .expect("repeat frozen adaptive-ingest matrix cell");
+                assert_eq!(plan, repeated, "planner must be deterministic");
+                assert_eq!(plan.planner_version, PARALLEL_INGEST_PLANNER_VERSION);
+                assert_eq!(plan.configured_width, width);
+                assert_eq!(plan.verified_pool_capacity, width);
+                assert_eq!(plan.eligible_shards, width);
+                assert_eq!(
+                    plan.active_shards,
+                    width.min(document_count / PARALLEL_INGEST_MIN_DOCS_PER_SHARD),
+                );
+
+                if plan.active_shards < 2 {
+                    assert_eq!(plan.route, ParallelIngestRoute::Serial);
+                    assert!(plan.ranges.is_empty());
+                    continue;
+                }
+
+                assert_eq!(plan.route, ParallelIngestRoute::SharedNothing);
+                assert_eq!(plan.ranges.len(), plan.active_shards);
+                assert_eq!(plan.ranges.first().map(|range| range.start), Some(0));
+                assert_eq!(
+                    plan.ranges.last().map(|range| range.end),
+                    Some(document_count),
+                );
+                assert!(
+                    plan.ranges.windows(2).all(|pair| pair
+                        .first()
+                        .zip(pair.get(1))
+                        .is_some_and(|(first, second)| first.end == second.start)),
+                    "ranges must be contiguous and nonoverlapping",
+                );
+                assert!(
+                    plan.ranges.iter().all(|range| {
+                        range.len() >= PARALLEL_INGEST_MIN_DOCS_PER_SHARD
+                            && range.end <= document_count
+                    }),
+                    "tail documents must be folded into nonempty amortized ranges",
+                );
+                let shortest = plan
+                    .ranges
+                    .iter()
+                    .map(|range| range.len())
+                    .min()
+                    .expect("parallel plan has ranges");
+                let longest = plan
+                    .ranges
+                    .iter()
+                    .map(|range| range.len())
+                    .max()
+                    .expect("parallel plan has ranges");
+                assert!(longest - shortest <= 1, "ranges must remain balanced");
+                assert_eq!(
+                    plan.ranges.iter().map(|range| range.len()).sum::<usize>(),
+                    document_count,
+                );
+            }
+        }
+
+        let capacity_limited =
+            plan_parallel_ingest(8_192, 128, 96).expect("plan capacity-limited adaptive ingest");
+        assert_eq!(capacity_limited.eligible_shards, 96);
+        assert_eq!(capacity_limited.active_shards, 96);
+    }
+
+    #[test]
+    fn adaptive_parallel_batch_activates_only_amortized_shards() {
+        run_with_cx(|cx| async move {
+            let config = QuillConfig {
+                max_ingest_shards: 4,
+                ..QuillConfig::default()
+            };
+            let mut index = QuillIndex::in_memory(config).expect("multi-shard memory index");
+            let shard_count = index.writer_mut().shard_router.shard_count();
+            let documents = (0..250)
+                .map(|ordinal| {
+                    IndexableDocument::new(
+                        format!("adaptive-shard-{ordinal:05}"),
+                        "adaptive shared nothing indexing fixture",
+                    )
+                })
+                .collect::<Vec<_>>();
+            index
+                .index_documents(&cx, &documents)
+                .await
+                .expect("accumulate one adaptive batch");
+
+            let active_shards =
+                plan_parallel_ingest(documents.len(), shard_count, rayon::current_num_threads())
+                    .expect("plan adaptive parallel fixture")
+                    .active_shards;
+            index.commit(&cx).await.expect("publish adaptive batch");
+            assert_eq!(index.snapshot().segments().len(), active_shards.max(1));
+            assert_eq!(index.snapshot().doc_count(), 250);
+            assert_pairwise_disjoint_manifest(
+                index
+                    .snapshot()
+                    .loaded_manifest()
+                    .manifest
+                    .segments
+                    .as_slice(),
+            );
+        });
+    }
+
+    #[cfg(feature = "conformance-internals")]
+    #[test]
+    fn cancelled_parallel_budget_preflight_is_pristine_and_retryable() {
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .expect("build four-worker budget cancellation pool");
+        pool.install(|| {
+            run_with_cx(|cx| async move {
+                let config = QuillConfig {
+                    max_ingest_shards: 4,
+                    max_visibility_lag_ms: 60_000,
+                    ..QuillConfig::default()
+                };
+                let index =
+                    QuillIndex::in_memory(config.clone()).expect("budget cancellation index");
+                let documents = parallel_budget_fixture_documents(250);
+                let state_before = index
+                    .conformance_pending_writer_state()
+                    .expect("capture pristine budget-preflight state");
+                let controller = index.conformance_cancellation_controller();
+                controller
+                    .arm(ConformanceCancellationStage::ParallelBudgetAdmission, 3)
+                    .expect("arm budget-preflight cancellation");
+
+                let cancelled = index
+                    .index_documents(&cx, &documents)
+                    .await
+                    .expect_err("budget preflight must observe injected cancellation");
+                assert!(matches!(
+                    &cancelled,
+                    QuillIndexError::Cancelled {
+                        phase: "parallel budget admission"
+                    }
+                ));
+                assert!(controller.fired());
+                assert!(controller.observed_checkpoints() >= 3);
+                assert_eq!(
+                    index
+                        .conformance_pending_writer_state()
+                        .expect("capture cancelled budget-preflight state"),
+                    state_before,
+                );
+
+                controller.disarm();
+                cx.set_cancel_requested(false);
+                index
+                    .index_documents(&cx, &documents)
+                    .await
+                    .expect("retry cancelled budget preflight");
+                let retry_state = index
+                    .conformance_pending_writer_state()
+                    .expect("capture retried budget-preflight state");
+                let control = QuillIndex::in_memory(config).expect("fresh budget control index");
+                control
+                    .index_documents(&cx, &documents)
+                    .await
+                    .expect("run fresh budget control");
+                assert_eq!(
+                    retry_state,
+                    control
+                        .conformance_pending_writer_state()
+                        .expect("capture fresh budget-control state"),
+                );
+            });
+        });
+    }
+
+    #[cfg(feature = "conformance-internals")]
+    #[test]
+    fn cancelled_parallel_batch_preserves_exact_state_and_retries_identically() {
+        run_with_cx(|cx| async move {
+            let config = QuillConfig {
+                max_ingest_shards: 4,
+                max_visibility_lag_ms: 60_000,
+                ..QuillConfig::default()
+            };
+            let mut index = QuillIndex::in_memory(config.clone()).expect("parallel memory index");
+            let shard_count = index.writer_mut().shard_router.shard_count();
+            let plan = plan_parallel_ingest(256, shard_count, rayon::current_num_threads())
+                .expect("plan cancellation fixture");
+            assert_eq!(
+                plan.route,
+                ParallelIngestRoute::SharedNothing,
+                "transaction test requires at least two verified worker shards",
+            );
+            let documents = (0..256)
+                .map(|ordinal| {
+                    IndexableDocument::new(
+                        format!("parallel-transaction-{ordinal:05}"),
+                        "shared nothing cancellation transaction fixture",
+                    )
+                })
+                .collect::<Vec<_>>();
+            let state_before = index
+                .conformance_pending_writer_state()
+                .expect("capture pristine writer state");
+            let controller = index.conformance_cancellation_controller();
+            controller
+                .arm(ConformanceCancellationStage::ParallelIngest, 3)
+                .expect("arm mid-worker cancellation");
+
+            let cancelled = index
+                .index_documents(&cx, &documents)
+                .await
+                .expect_err("parallel worker must observe injected cancellation");
+            assert!(
+                matches!(
+                    &cancelled,
+                    QuillIndexError::Cancelled {
+                        phase: "parallel index worker"
+                    }
+                ),
+                "unexpected cancellation result: {cancelled:?}",
+            );
+            assert!(controller.fired());
+            assert!(controller.observed_checkpoints() >= 3);
+            assert!(cx.is_cancel_requested());
+            assert!(!index.has_uncommitted_changes());
+            assert_eq!(
+                index
+                    .conformance_pending_writer_state()
+                    .expect("capture cancelled writer state"),
+                state_before,
+                "a joined worker cancellation must not commit allocator, router, shard, or retry-guard state",
+            );
+
+            controller.disarm();
+            cx.set_cancel_requested(false);
+            index
+                .index_documents(&cx, &documents)
+                .await
+                .expect("retry cancelled parallel batch");
+            let retry_state = index
+                .conformance_pending_writer_state()
+                .expect("capture retried writer state");
+
+            let control = QuillIndex::in_memory(config).expect("fresh parallel control index");
+            control
+                .index_documents(&cx, &documents)
+                .await
+                .expect("accumulate fresh parallel control batch");
+            assert_eq!(
+                retry_state,
+                control
+                    .conformance_pending_writer_state()
+                    .expect("capture control writer state"),
+                "retry must reproduce the exact fresh allocator, router, shard, and identity state",
+            );
+
+            index.commit(&cx).await.expect("publish retried batch");
+            control.commit(&cx).await.expect("publish control batch");
+            assert_eq!(index.snapshot().doc_count(), 256);
+            assert_eq!(control.snapshot().doc_count(), 256);
+            for document in &documents {
+                assert_eq!(
+                    index
+                        .document_witness(&document.id)
+                        .expect("resolve retried witness"),
+                    control
+                        .document_witness(&document.id)
+                        .expect("resolve control witness"),
+                    "retry witness differs for {}",
+                    document.id,
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn parallel_worker_panic_is_a_typed_precommit_failure() {
+        let error = catch_parallel_ingest_worker(7, || -> Result<(), QuillIndexError> {
+            panic!("injected parallel worker panic");
+        })
+        .expect_err("worker panic must be caught");
+        assert!(matches!(
+            error,
+            QuillIndexError::InvalidState { detail }
+                if detail == "parallel ingest worker 7 panicked before transactional commit"
+        ));
+    }
+
+    #[test]
+    fn deterministic_batch_uses_fixed_internal_parallel_plan() {
+        run_with_cx(|cx| async move {
+            let config = QuillConfig {
+                max_ingest_shards: 4,
+                deterministic_ingest: true,
+                ..QuillConfig::default()
+            };
+            let index = QuillIndex::in_memory(config).expect("deterministic memory index");
+            let documents = (0..250)
+                .map(|ordinal| {
+                    IndexableDocument::new(
+                        format!("deterministic-shard-{ordinal:05}"),
+                        "deterministic indexing fixture",
+                    )
+                })
+                .collect::<Vec<_>>();
+            index
+                .index_documents(&cx, &documents)
+                .await
+                .expect("accumulate deterministic batch");
+            index
+                .commit(&cx)
+                .await
+                .expect("publish deterministic batch");
+            let expected_segments = INTERNAL_PARALLEL_INGEST_SHARDS
+                .min(documents.len() / PARALLEL_INGEST_MIN_DOCS_PER_SHARD);
+            assert_eq!(index.snapshot().segments().len(), expected_segments);
+            assert_eq!(index.snapshot().doc_count(), 250);
+        });
+    }
+
     /// Build a batch large enough that every shard clears the per-shard floor
     /// and the writer takes the fan-out path.
     fn fanout_corpus(prefix: &str, count: usize) -> Vec<IndexableDocument> {
@@ -15383,7 +20836,7 @@ mod tests {
             };
             let detected = std::thread::available_parallelism().map_or(1, usize::from);
             let fanout_shards = fanout_config.resolved_ingest_shards(detected);
-            let mut fanout = QuillIndex::in_memory(fanout_config).expect("fan-out memory index");
+            let fanout = QuillIndex::in_memory(fanout_config).expect("fan-out memory index");
             fanout
                 .index_documents(&cx, &documents)
                 .await
@@ -15395,7 +20848,7 @@ mod tests {
                 deterministic_ingest: true,
                 ..QuillConfig::default()
             };
-            let mut serial = QuillIndex::in_memory(serial_config).expect("serial memory index");
+            let serial = QuillIndex::in_memory(serial_config).expect("serial memory index");
             serial
                 .index_documents(&cx, &documents)
                 .await
@@ -15433,7 +20886,12 @@ mod tests {
             assert_eq!(fanned_ids, control_ids, "fan-out changed the result set");
 
             assert_pairwise_disjoint_manifest(
-                fanout.snapshot().loaded_manifest().manifest.segments.as_slice(),
+                fanout
+                    .snapshot()
+                    .loaded_manifest()
+                    .manifest
+                    .segments
+                    .as_slice(),
             );
             if fanout_shards > 1 {
                 assert!(
@@ -15458,7 +20916,7 @@ mod tests {
                 max_ingest_shards: 4,
                 ..QuillConfig::default()
             };
-            let mut index = QuillIndex::in_memory(config).expect("fan-out memory index");
+            let index = QuillIndex::in_memory(config).expect("fan-out memory index");
             let error = index
                 .index_documents(&cx, &documents)
                 .await
@@ -15731,12 +21189,35 @@ mod tests {
                 .collect_docids(&cx, "rust OR python")
                 .expect("collect pre-merge docids");
             let output_segment_id = fresh_merge_segment_id(&index, 0xc011_ca7e_0000_0001);
+            let source_snapshot = index.snapshot();
+            let source_dictionary_counts = source_snapshot
+                .segments()
+                .iter()
+                .map(RecoveredSegment::term_dictionary_cache_counts)
+                .collect::<Vec<_>>();
 
             index
                 .concat_merge(&cx, &source_ids, output_segment_id, 17)
                 .await
                 .expect("merge the complete in-memory leaf run");
 
+            for (segment, (full_validations_before, borrowed_views_before)) in source_snapshot
+                .segments()
+                .iter()
+                .zip(source_dictionary_counts)
+            {
+                let (full_validations_after, borrowed_views_after) =
+                    segment.term_dictionary_cache_counts();
+                assert_eq!(
+                    full_validations_after, full_validations_before,
+                    "concat must not repeat complete TERMDICT validation"
+                );
+                assert_eq!(
+                    borrowed_views_after,
+                    borrowed_views_before + 1,
+                    "concat must open one cached dictionary view per source segment"
+                );
+            }
             assert_eq!(index.snapshot().segments().len(), 1);
             assert_eq!(
                 index.snapshot().loaded_manifest().manifest.generation,

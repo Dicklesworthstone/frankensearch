@@ -30,9 +30,11 @@ pub mod host_adapter;
 pub mod metrics_eval;
 pub mod observability_lint;
 pub mod parsed_query;
+pub mod platform_dirs;
 pub mod query_class;
 pub mod recovery_plan;
 pub mod repair;
+pub mod rfc3339;
 pub mod shadow;
 pub mod simd;
 pub mod time_travel;
@@ -117,11 +119,15 @@ pub use generation::{
     EMBEDDING_PRODUCER_ATTESTATION_SCHEMA_V1, EMBEDDING_SPACE_IDENTITY_SCHEMA_V1, EmbedderRevision,
     EmbedderTierTag, EmbeddingArtifactIdentityV1, EmbeddingIdentityBundleV1,
     EmbeddingInputContractV1, EmbeddingProducerAttestationV1, EmbeddingProjectionV1,
-    EmbeddingSpaceIdentityV1, EmbeddingSpaceKindV1, FrozenEmbeddingIdentityBundleV1,
-    GenerationManifest, GoldenVectorCertificateV1, HashControlProfileV1, InvariantKind,
-    LexicalArtifact, MANIFEST_SCHEMA_VERSION, QuantizationFormat, RepairDescriptor,
+    EmbeddingSpaceIdentityV1, EmbeddingSpaceKindV1,
+    FOREIGN_PRODUCER_CONFORMANCE_CERTIFICATE_SCHEMA_V1, ForeignProducerConformanceCertificateV1,
+    FrozenEmbeddingIdentityBundleV1, GenerationManifest, GoldenVectorCertificateV1,
+    HashControlProfileV1, InvariantKind, LexicalArtifact, MANIFEST_SCHEMA_VERSION,
+    ProducerCompatibilityErrorV1, ProducerCompatibilityKindV1, ProducerCompatibilityWitnessV1,
+    QuantizationFormat, RepairDescriptor, TrustedProducerConformanceContextV1,
     VECTOR_STORAGE_IDENTITY_SCHEMA_V1, ValidationFinding, ValidationResult, VectorArtifact,
-    VectorStorageIdentityV1, compute_manifest_hash, require_valid, validate_manifest,
+    VectorStorageIdentityV1, VerifiedGoldenConformanceManifestV1, compute_manifest_hash,
+    require_valid, validate_manifest,
 };
 pub use graph::{DocumentGraph, EdgeType, GraphDocId, GraphEdge};
 pub use host_adapter::{
@@ -140,6 +146,17 @@ pub use observability_lint::{
     lint_stream,
 };
 pub use parsed_query::ParsedQuery;
+pub use recovery_plan::{
+    ARG_INDEX_DIR, ARG_MODEL_BUNDLE, ARG_SOURCE_DIR, COMPLETE_COVERAGE_PPM, InteractionPolicy,
+    MAX_MODEL_ACQUISITION_AUTHORIZATION_LIFETIME_SECONDS,
+    MODEL_ACQUISITION_AUTHORIZATION_SCHEMA_VERSION, ModelAcquisitionAuthorization,
+    ModelAcquisitionAuthorizationSchemaVersion, ModelAcquisitionSource, ModelAcquisitionTarget,
+    ModelDestinationClass, NetworkPolicy, RECOVERY_PLAN_SCHEMA_VERSION, RecoveryAction,
+    RecoveryContractError, RecoveryPlan, RecoveryPlanSchemaVersion, RecoveryPolicy,
+    RecoveryRequest, RequestMode, Retryability, SemanticProvenance, SemanticReadiness,
+    SemanticResponseContract, TrustedRecoveryContext, UntrustedRecoveryPlan,
+    VerifiedSemanticProvenance, plan,
+};
 pub use repair::{
     CorruptionEvent, CorruptionPolicy, DegradedReason, DetectionMethod, RepairAttempt,
     RepairOrchestrator, RepairOutcome, RepairProvider, ServiceState,
@@ -167,7 +184,13 @@ pub use traits::{
     cosine_similarity, l2_normalize, truncate_embedding,
 };
 pub use types::{
-    BoundQueryEmbedding, DocId, EmbeddingMetrics, FusedHit, IndexMetrics, IndexableDocument,
-    PhaseMetrics, RankChanges, RetrievalTopology, ScoreSource, ScoredResult, SearchMetrics,
-    SearchMode, SearchPhase, TieredQueryEmbeddings, VectorHit,
+    BoundQueryEmbedding, CoverageBasisV1, CoverageCountsV1, CoverageRelationV1, CoverageScopeV1,
+    CoverageTierV1, CoverageUnknownReasonV1, CoverageUnverifiedReasonV1, CoverageWitnessV1,
+    CrossScopeCoverageEvidenceV1, CrossTierUniverseEvidenceV1, DerivedRetrievalTopologyV1, DocId,
+    EmbeddingMetrics, FusedHit, IndexMetrics, IndexableDocument, PhaseMetrics, RankChanges,
+    RealizedTierCoverageV1, RetrievalIntentV1, RetrievalTopology, ScoreSource, ScoredResult,
+    SearchMetrics, SearchMode, SearchPhase, TIER_COVERAGE_SCHEMA_VERSION_V1, TierCoveragePairV1,
+    TierCoverageRealizationV1, TierCoverageRequestV1, TierCoverageV1, TieredQueryEmbeddings,
+    TrustedTierCoverageContextV1, UntrustedDerivedRetrievalTopologyV1, UntrustedTierCoveragePairV1,
+    UntrustedTierCoverageV1, VectorHit, retrieval_topology_fits_request,
 };

@@ -17,18 +17,19 @@ Minimal repro:     <smallest invocation that shows the cost>
 Expected signal:   <percent of the class's ceiling gap (per ceiling.json when M1 lands; raw estimate until then)>
 Falsified if:      <what observation kills it>
 Invocation:        <one-line command>
-Machine classes:   <which classes the claim targets>
+Machine profiles:  <which canonical hardware/execution profiles the claim targets>
 Results (inline):  <PENDING | numbers + artifact paths>
 Retry predicate:   <filled only on REJECT>
 ```
 
-## Machine-class fingerprint corrections (authoritative over class-ID labels)
+## Historical fingerprint corrections and current canonical profiles
 
-- The trj classes follow the committed-baseline convention **`trj-zen3-<width>c`**
-  (first artifact: `QG-2.trj-zen3-16c.latest.json`, activated on 2026-07-28
+- Historical trj attempts used **`trj-zen3-<width>c`** names. Those names are
+  provenance only and are rejected for new evidence. The first artifact,
+  `QG-2.trj-zen3-16c.latest.json`, was activated on 2026-07-28
   with a measured 0.350 [0.345–0.356] MISS vs the ≥1.5x target — Quill
-  59.8k vs Tantivy 171.2k docs/s single-thread, 30 paired runs, clean A/A
-  null). That pre-fix artifact is now **quarantined**, not an active baseline:
+  59.8k vs Tantivy 171.2k docs/s single-thread, 30 paired runs, clean A/A null.
+  That pre-fix artifact is now **quarantined**, not an active baseline:
   the Tantivy arm constructed and dropped an unused replacement writer after
   its measured worker join. Although replacement construction was excluded
   from `join_elapsed_ns`, its post-sample work and resource churn could bleed
@@ -40,12 +41,23 @@ Retry predicate:   <filled only on REJECT>
   is a Threadripper PRO **5995WX: Zen 3, 64 cores / 128 threads**, single
   NUMA node (NPS1), 512 GB, governor=performance, SMT on
   (`docs/evidence/e8h/fingerprints/trj-zen-128c-20260728/` — directory name
-  predates the convention; contents authoritative). Consequences: **no AVX-512
-  in silicon** (Zen 4+ only); per-CCD L3 partitioning still applies (8 CCDs).
-- `m4-macos` is a Mac mini **M4 Pro, 14 cores (10P+4E), 64 GB, 16 KiB pages**
-  (`docs/evidence/e8h/fingerprints/m4-macos-20260728/`).
-- `m5-macos`: no reachable host as of 2026-07-28 (mmini/mmini-legacy asleep on the
-  tailnet). Class stays declared; beads must not block on it (see p1-m5 bead body).
+  predates the current grammar; contents authoritative). Consequences:
+  **no AVX-512 in silicon** (Zen 4+ only); per-CCD L3 partitioning still
+  applies (8 CCDs). New evidence uses exactly
+  `trj-zen3-5995wx/physical-64` or
+  `trj-zen3-5995wx/smt2-128`; literal widths never create a profile or cross
+  its baseline/null band.
+- Current M4 evidence key is `m4-macos/scheduler-10`: Mac mini **M4 Pro,
+  14 cores (10P+4E), 64 GB, 16 KiB pages**, scheduler-managed capacity 10,
+  but maximum canonical QG-1/QG-8 width 8
+  (`docs/evidence/e8h/fingerprints/m4-macos-20260728/`). P/E residency is not
+  inferred. Promotion remains unavailable until executing-image attestation
+  lands.
+- `m5-macos/scheduler-14`: no reachable host as of 2026-07-28
+  (mmini/mmini-legacy asleep on the tailnet). It remains a required
+  default-flip profile with `availability=unavailable`, absent capacity, and
+  zero runnable cells. It does not block work on other profiles, but it does
+  remain a final release requirement.
 
 ## First m4-macos diagnostic (2026-07-28, NON-CLAIM label, run receipt m4-macos/20260728T233512Z-qg2-diag-w5-r30-v2)
 
@@ -89,12 +101,14 @@ same invocation through the RUN_ID-defaulting runner; lifecycle receipt shows
 | quill | 88,051.5 | [86,344.9, 88,934.9] | 4.0 |
 | tantivy | 163,602.2 | [159,398.3, 210,883.0] | 20.1 |
 | paired_ab | 0.5284 | [0.4041, 0.5445] | 18.5 |
-| paired_null | 0.9974 | [0.9646, 1.0720] | 26.4 — contains 1.0, admissible |
+| paired_null | 0.9974 | [0.9646, 1.0720] | 26.4 — `INVALID_NULL`; no decision |
 
-Two-run reading: ab CIs overlap in [0.404, 0.481]; the m4 truth sits in the
-0.40–0.53 band and the dominant uncertainty is the INCUMBENT arm's macOS
-variance (cv 20%, Quill's own arm tight at cv 4%). This is Observation 2
-confirming itself; no single-run m4 ratio may be quoted without its band.
+Evidence disposition: `INVALID_NULL` / no decision. The observed 0.528
+[0.404, 0.545] ratio is diagnostic only and is neither an admissible baseline
+nor performance truth. The source tree was dirty, A/A log-MAD was 0.089611
+(limit 0.048790), and the A/A order effect was 0.051195 (limit 0.048790).
+QG-2 remains inactive pending a clean, calibrated m4-macos rerun; this receipt
+must not be used to make or refine a cross-engine performance claim.
 
 ## Open rows
 
@@ -103,9 +117,9 @@ Hypothesis:        After gwd4, residual QG-6 fixed cost is re-DECODING termdict 
 Minimal repro:     QG-6 smoke cell, repeat-query lane, gwd4-landed build vs cache build.
 Expected signal:   large fraction of the residual post-gwd4 QG-6 gap on m4-macos (quantify % once the m4 P1 card + ceiling land).
 Falsified if:      post-gwd4 profile shows decode frames <0.1% self-time.
-Invocation:        scripts/perf-runner.sh --class m4-macos -- cargo bench -p frankensearch-quill-gauntlet --bench perf_matrix --features perf-harness --profile release-perf (QG-6 fixture narrowed)
-Machine classes:   m4-macos primary; x86-vps-ovh, trj secondary.
-Results (inline):  PENDING (blocked: gwd4 landing + m4 P1 card).
+Invocation:        scripts/perf-diagnostic.sh --class m4-macos -- cargo bench -p frankensearch-quill-gauntlet --bench perf_matrix --features perf-harness --profile release-perf (QG-6 fixture narrowed). DIAGNOSTIC ONLY — produces no promotable evidence. The promotion runner (scripts/perf-runner.sh) intentionally rejects m4-macos/scheduler-10 until executing-image attestation exists, and this diagnostic path does not yet materialize the exact scheduler-10 applicability plan.
+Machine profiles:  m4-macos/scheduler-10 primary; x86-vps-ovh/x86-diagnostic and both trj-zen3-5995wx profiles secondary.
+Results (inline):  PENDING (blocked: gwd4 landing + M4 profile card + scheduler-10 applicability plan).
 Retry predicate:   n/a
 
 ### bd-e8h-w1-verify-once-checksums-d06f — verify-once checksum memoization
@@ -114,7 +128,7 @@ Minimal repro:     QG-6 repeat-query lane; count checksum frames in samply.
 Expected signal:   small-to-moderate; only pursued if frames >=0.1% after W1.1.
 Falsified if:      validation frames <0.1% post-W1.1.
 Invocation:        same as W1.1, sequenced after it.
-Machine classes:   m4-macos, x86-vps-ovh.
+Machine profiles:  m4-macos/scheduler-10 and x86-vps-ovh/x86-diagnostic.
 Results (inline):  PENDING.
 Retry predicate:   n/a
 
@@ -124,7 +138,7 @@ Minimal repro:     dhat census, QG-6 smoke + 100k.
 Expected signal:   modest; NoClaim is a valid outcome.
 Falsified if:      dhat shows no per-query collector allocs >=0.1%.
 Invocation:        dhat-instrumented QG-6 run, local.
-Machine classes:   all (claims per class).
+Machine profiles:  all available canonical profiles (claims remain per profile).
 Results (inline):  **FALSIFIED → NoClaim** (2026-07-28, MossyPine). Counting-allocator +
                    symbolized dhat census at 500 and 100k docs, 1,600 measured queries:
                    collector-owned frames = 0.011% of bytes / 0.27% of blocks; largest
@@ -146,7 +160,7 @@ Minimal repro:     bd-6oiq flamegraph on bulk/medium/1.
 Expected signal:   material share of the 8.9x single-thread gap (state as % of ceiling gap when M1 lands).
 Falsified if:      interner frames <0.1% in the bd-6oiq card.
 Invocation:        per bd-6oiq card; then paired A/B thread=1 and 16.
-Machine classes:   x86-vps-ovh + trj primary.
+Machine profiles:  x86-vps-ovh/x86-diagnostic plus both trj-zen3-5995wx profiles primary.
 Results (inline):  PENDING (blocked on bd-6oiq card).
 Retry predicate:   n/a
 
@@ -156,7 +170,7 @@ Minimal repro:     dhat census on bulk/medium/1.
 Expected signal:   material; quantify from census.
 Falsified if:      realloc/memmove frames <0.1%.
 Invocation:        per bd-6oiq card; then paired A/B.
-Machine classes:   x86-vps-ovh + trj primary.
+Machine profiles:  x86-vps-ovh/x86-diagnostic plus both trj-zen3-5995wx profiles primary.
 Results (inline):  PROFILE-FIRST GATE SATISFIED, SITE REFINED, LEVER IMPLEMENTED —
                    A/B PENDING (2026-07-29, ScarletPelican). heaptrack census on the
                    QG-2 cell (trj, run receipt trj-zen3-64c/20260729T021441Z, trace
@@ -212,7 +226,7 @@ Minimal repro:     flamegraph attribution over the seal phase.
 Expected signal:   decision row only (proceed to format-registry lever vs NoClaim).
 Falsified if:      checksum frames <5% of bulk wall-time.
 Invocation:        local flamegraph lane, bulk/medium.
-Machine classes:   x86-vps-ovh, trj.
+Machine profiles:  x86-vps-ovh/x86-diagnostic plus both trj-zen3-5995wx profiles.
 Results (inline):  PENDING.
 Retry predicate:   n/a
 
@@ -222,7 +236,7 @@ Minimal repro:     strace both arms, one commit cell.
 Expected signal:   count table; batching lever filed only if counts differ materially.
 Falsified if:      counts are comparable.
 Invocation:        strace -f -y -ttt -e trace=fsync,fdatasync,sync_file_range,msync,sync,syncfs,renameat,renameat2 around perf_matrix cells.
-Machine classes:   trj-zen3-64c executed; macOS lane needs Law-7 attestation.
+Machine profiles:  historical trj-zen3-64c provenance executed; any new run must use trj-zen3-5995wx/physical-64 or /smt2-128. macOS needs scheduler-10 plus Law-7 attestation.
 Results (inline):  QG-2 CENSUS COMPLETE (trj, 2026-07-28, receipts
                    trj-zen3-64c/20260728T233926Z + 234453Z-wide): across
                    warmup+10 runs of bulk/medium/1/positions_on, BOTH arms
@@ -247,7 +261,7 @@ Minimal repro:     w13 ingest census + lifetime appendix (c7a745cb + amendment),
 Expected signal:   ~7% of ingest allocation bytes and ~10 MB peak RSS per active commit; wall-time effect modest (~10 MB memcpy ≈ 1–3 ms/commit); primary axes are allocation traffic + QG-7 RSS, stated honestly.
 Falsified if:      a reading pass shows two consumers genuinely mutate/retain both copies, or removal shows no QG-1/QG-2/QG-7 delta beyond null.
 Invocation:        reading pass over segment.rs/keeper.rs/index.rs commit path first (WAIT on fk04a combined-train integration for index/keeper surfaces); then paired A/B under the QG harness.
-Machine classes:   all; claims per class.
+Machine profiles:  all available canonical profiles; claims remain per profile.
 Results (inline):  PENDING (hypothesis filed from census; no reading pass yet). Not to be mixed with W2.2's chunked-arena lever (msg 5585).
 Retry predicate:   n/a
 

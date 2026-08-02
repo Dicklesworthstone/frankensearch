@@ -1,0 +1,155 @@
+{
+  "schema_version": "quill-perf-artifact-v5",
+  "gate": "Qg1",
+  "bench_elf_sha256": "90bf6c4cd69606def56fd2b526a07f398a40aacad8ac7a73e77bf2653c51ed1a",
+  "machine_fingerprint": "linux-x86_64-threadripperje-128thread-AMD_Ryzen_Threadripper_PRO_5995WX_64-Cores",
+  "execution": {
+    "producer_os": "linux",
+    "host_identity": "threadripperje",
+    "physical_cores": 64,
+    "logical_threads": 128,
+    "ram_bytes": 536069869568,
+    "numa_nodes": 1,
+    "process_available_threads": 128,
+    "thread_counts_requested": [
+      128
+    ],
+    "thread_observations": [
+      {
+        "fixture": "bulk/xlarge/128/positions_on",
+        "thread_count_requested": 128,
+        "cpu_affinity_allowed_list": "0-127",
+        "quill": {
+          "engine": "quill",
+          "runtime_available_parallelism": 128,
+          "process_threads_before_probe": 2,
+          "peak_process_threads": 131,
+          "thread_count_actually_used": 1,
+          "cpu_active_new_worker_threads": 1,
+          "cpu_active_threshold_ns": 1000000,
+          "peak_new_worker_threads": 128,
+          "observation_method": "untimed-linux-proc-task-schedstat-1ms-active-plus-thread-high-water-v1"
+        },
+        "tantivy": {
+          "engine": "tantivy",
+          "runtime_available_parallelism": 128,
+          "process_threads_before_probe": 13,
+          "peak_process_threads": 278,
+          "thread_count_actually_used": 3556,
+          "cpu_active_new_worker_threads": 3556,
+          "cpu_active_threshold_ns": 1000000,
+          "peak_new_worker_threads": 264,
+          "observation_method": "untimed-linux-proc-task-schedstat-1ms-active-plus-thread-high-water-v1"
+        }
+      }
+    ],
+    "engine_binaries": [
+      {
+        "engine": "quill",
+        "role": "subject",
+        "version": "0.2.1",
+        "executable_sha256": "90bf6c4cd69606def56fd2b526a07f398a40aacad8ac7a73e77bf2653c51ed1a",
+        "identity_scheme": "same-static-elf-v1"
+      },
+      {
+        "engine": "tantivy",
+        "role": "oracle",
+        "version": "0.26.1",
+        "executable_sha256": "90bf6c4cd69606def56fd2b526a07f398a40aacad8ac7a73e77bf2653c51ed1a",
+        "identity_scheme": "same-static-elf-v1"
+      }
+    ],
+    "runtime_detected_isa": [
+      "avx2",
+      "fma",
+      "bmi2",
+      "aes",
+      "vaes"
+    ],
+    "cpu_affinity_allowed_list": "0-127",
+    "affinity_or_cpuset_cap": null
+  },
+  "git_rev": "3684b147797c5babdad4a5568e993db40ed90da5",
+  "run_window": "qg1-trj-exclusive-fullsweep-3684b147-20260729T1645Z",
+  "run_id": "qg1-trj-exclusive-xlarge-t128-3684b147-r10-20260729T1645Z",
+  "corpus_manifest_hash": "8f143fd276144d52cbd591d23dee268445e98773c94c94d1c2fdef307c9c67ca",
+  "manifest_sha256": "6a7be4cf0ee90dc0db518156a3724a822dcc90916786fa1c991857a218609f86",
+  "cells": [
+    {
+      "fixture": "bulk/xlarge/128/positions_on",
+      "metric": "docs_per_second",
+      "engine": "quill",
+      "unit": "docs/s",
+      "value": 27130.469367608854,
+      "p50": 27130.469367608854,
+      "median_ci95_low": 26710.76974644989,
+      "median_ci95_high": 27426.274964569588,
+      "p95": 27785.328768891966,
+      "p99": 27785.328768891966,
+      "mad": 307.7540379408565,
+      "cv_pct": 1.8883808325772578,
+      "runs": 10
+    },
+    {
+      "fixture": "bulk/xlarge/128/positions_on",
+      "metric": "docs_per_second",
+      "engine": "tantivy",
+      "unit": "docs/s",
+      "value": 109413.7240067898,
+      "p50": 109413.7240067898,
+      "median_ci95_low": 106913.21423190903,
+      "median_ci95_high": 111899.22213181882,
+      "p95": 114879.42970355085,
+      "p99": 114879.42970355085,
+      "mad": 2168.3272469910953,
+      "cv_pct": 3.8559881706221613,
+      "runs": 10
+    },
+    {
+      "fixture": "bulk/xlarge/128/positions_on",
+      "metric": "docs_per_second_quill_over_tantivy",
+      "engine": "paired_ab",
+      "unit": "ratio",
+      "value": 0.2493783098127445,
+      "p50": 0.2493783098127445,
+      "median_ci95_low": 0.23667113795818745,
+      "median_ci95_high": 0.25831782728026,
+      "p95": 0.27137055567904295,
+      "p99": 0.27137055567904295,
+      "mad": 0.009117968117552888,
+      "cv_pct": 4.555742405431074,
+      "runs": 10
+    },
+    {
+      "fixture": "bulk/xlarge/128/positions_on",
+      "metric": "docs_per_second_tantivy_over_tantivy",
+      "engine": "paired_null",
+      "unit": "ratio",
+      "value": 0.9820487328066472,
+      "p50": 0.9820487328066472,
+      "median_ci95_low": 0.9514217486334553,
+      "median_ci95_high": 1.013385533397309,
+      "p95": 1.0508532518122617,
+      "p99": 1.0508532518122617,
+      "mad": 0.02792223820831302,
+      "cv_pct": 4.3932513039887,
+      "runs": 10
+    },
+    {
+      "fixture": "bulk/xlarge/128/positions_on",
+      "metric": "docs_per_second_quill_over_quill",
+      "engine": "paired_null_quill",
+      "unit": "ratio",
+      "value": 0.9909398483872079,
+      "p50": 0.9909398483872079,
+      "median_ci95_low": 0.9823979091616686,
+      "median_ci95_high": 1.0173254501621742,
+      "p95": 1.0504808821699139,
+      "p99": 1.0504808821699139,
+      "mad": 0.010554202604615759,
+      "cv_pct": 2.309063612961129,
+      "runs": 10
+    }
+  ],
+  "laws_attested": false
+}

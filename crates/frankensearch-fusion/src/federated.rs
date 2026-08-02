@@ -60,12 +60,21 @@ pub struct FederatedConfig {
     pub fusion_method: FederatedFusion,
     /// Per-index timeout budget in milliseconds.
     pub per_index_timeout_ms: u64,
-    /// Minimum number of indices that must respond successfully.
+    /// Minimum number of indices that must respond successfully — a FLOOR,
+    /// enforced after the gather completes. Fewer successful responses fail the
+    /// query with [`SearchError::FederatedInsufficientResponses`]. This knob
+    /// never stops the gather early; that is `wait_for_indices`.
     pub min_indices: usize,
     /// Candidate multiplier per index before global fusion.
     pub candidate_pool_factor: usize,
     /// Maximum number of indices to query.
     pub max_indices: usize,
+    /// Latency/recall trade-off: stop gathering (cancelling still-in-flight
+    /// shards) once this many shards have responded successfully. `usize::MAX`
+    /// (the default) and `0` both mean "wait for every dispatched shard"
+    /// (bounded per shard by `per_index_timeout_ms`). Cancelled shards are
+    /// reported in [`FederatedCoverage::cancelled_in_flight`] (bd-3zh67).
+    pub wait_for_indices: usize,
 }
 
 impl Default for FederatedConfig {
@@ -76,6 +85,7 @@ impl Default for FederatedConfig {
             min_indices: 1,
             candidate_pool_factor: 3,
             max_indices: usize::MAX,
+            wait_for_indices: usize::MAX,
         }
     }
 }
@@ -133,6 +143,55 @@ pub struct FederatedHit {
     pub appeared_in: Vec<String>,
 }
 
+/// A shard that returned an error during a federated query.
+#[derive(Debug, Clone)]
+pub struct FederatedShardError {
+    /// Index name as registered via `add_index`.
+    pub index: String,
+    /// Rendered shard error (the underlying `SearchError` display).
+    pub error: String,
+}
+
+/// Per-query record of which shards were dispatched and how each one ended.
+///
+/// Partial federation was previously invisible: shard failures and timeouts
+/// were swallowed into `tracing::warn!` and a healthy-looking `Ok(hits)` came
+/// back from whatever subset answered (bd-3zh67 HALF B). Callers that care
+/// about recall must check [`FederatedCoverage::is_complete`].
+#[derive(Debug, Clone, Default)]
+pub struct FederatedCoverage {
+    /// Shards dispatched for this query (bounded by `max_indices`), in
+    /// registration order.
+    pub queried: Vec<String>,
+    /// Shards whose results are included in the fused output.
+    pub answered: Vec<String>,
+    /// Shards that returned an error.
+    pub failed: Vec<FederatedShardError>,
+    /// Shards that exceeded `per_index_timeout_ms`.
+    pub timed_out: Vec<String>,
+    /// Shards still in flight when the gather stopped early because
+    /// `wait_for_indices` was satisfied.
+    pub cancelled_in_flight: Vec<String>,
+}
+
+impl FederatedCoverage {
+    /// True when every dispatched shard contributed results.
+    #[must_use]
+    pub fn is_complete(&self) -> bool {
+        self.answered.len() == self.queried.len()
+    }
+}
+
+/// Fused hits plus the shard coverage that produced them.
+#[derive(Debug, Clone)]
+pub struct FederatedResponse {
+    /// Globally fused, truncated-to-limit hits.
+    pub hits: Vec<FederatedHit>,
+    /// Which shards were queried / answered / failed / timed out / were
+    /// cancelled for this query.
+    pub coverage: FederatedCoverage,
+}
+
 /// Multi-index search orchestrator with scatter-gather fusion.
 #[derive(Debug, Default)]
 pub struct FederatedSearcher {
@@ -184,7 +243,12 @@ impl FederatedSearcher {
         self.indices.is_empty()
     }
 
-    /// Execute federated search and return globally fused results.
+    /// Execute federated search and return globally fused results along with
+    /// the per-shard coverage record for this query.
+    ///
+    /// The gather waits for every dispatched shard (each bounded by
+    /// `per_index_timeout_ms`) unless `wait_for_indices` requests an early
+    /// stop. `min_indices` is a floor validated after the gather.
     ///
     /// # Errors
     ///
@@ -198,18 +262,21 @@ impl FederatedSearcher {
         query: &str,
         limit: usize,
         text_fn: F,
-    ) -> SearchResult<Vec<FederatedHit>>
+    ) -> SearchResult<FederatedResponse>
     where
         F: Fn(&str) -> Option<String> + Send + Sync,
     {
         if query.is_empty() || limit == 0 || self.indices.is_empty() {
-            return Ok(Vec::new());
+            return Ok(FederatedResponse {
+                hits: Vec::new(),
+                coverage: FederatedCoverage::default(),
+            });
         }
 
         let candidate_pool_factor = self.config.candidate_pool_factor.max(1);
         let per_index_limit = limit.saturating_mul(candidate_pool_factor);
         let timeout_budget = Duration::from_millis(self.config.per_index_timeout_ms);
-        let shard_results = self
+        let (shard_results, coverage) = self
             .collect_shard_results(cx, query, per_index_limit, timeout_budget, &text_fn)
             .await?;
 
@@ -220,7 +287,7 @@ impl FederatedSearcher {
             });
         }
 
-        let mut fused = match self.config.fusion_method {
+        let mut hits = match self.config.fusion_method {
             FederatedFusion::Rrf { k } => fuse_rrf(&shard_results, k),
             FederatedFusion::WeightedScore { normalization } => {
                 fuse_weighted(&shard_results, normalization, false)
@@ -230,8 +297,8 @@ impl FederatedSearcher {
             }
         };
 
-        fused.truncate(limit);
-        Ok(fused)
+        hits.truncate(limit);
+        Ok(FederatedResponse { hits, coverage })
     }
 
     #[allow(clippy::too_many_lines)]
@@ -242,10 +309,19 @@ impl FederatedSearcher {
         per_index_limit: usize,
         timeout_budget: Duration,
         text_fn: &F,
-    ) -> SearchResult<Vec<ShardResult>>
+    ) -> SearchResult<(Vec<ShardResult>, FederatedCoverage)>
     where
         F: Fn(&str) -> Option<String> + Send + Sync,
     {
+        let mut coverage = FederatedCoverage {
+            queried: self
+                .indices
+                .iter()
+                .take(self.config.max_indices)
+                .map(|index| index.name.clone())
+                .collect(),
+            ..FederatedCoverage::default()
+        };
         let mut pending: Vec<ShardFuture<'_>> = self
             .indices
             .iter()
@@ -315,6 +391,7 @@ impl FederatedSearcher {
                             hit_count = shard.hits.len(),
                             "federated shard search completed"
                         );
+                        coverage.answered.push(shard.name.clone());
                         shard_results.push(shard);
                     }
                     ShardCompletion::Cancelled { phase, reason } => {
@@ -326,6 +403,10 @@ impl FederatedSearcher {
                             error = %error,
                             "federated shard search failed; continuing with remaining indices"
                         );
+                        coverage.failed.push(FederatedShardError {
+                            index,
+                            error: error.to_string(),
+                        });
                         if first_shard_error.is_none() {
                             first_shard_error = Some(error);
                         }
@@ -336,13 +417,35 @@ impl FederatedSearcher {
                             timeout_ms = self.config.per_index_timeout_ms,
                             "federated shard timed out; continuing with remaining indices"
                         );
+                        coverage.timed_out.push(index);
                     }
                 }
             }
 
-            if self.config.min_indices > 0 && shard_results.len() >= self.config.min_indices {
+            // bd-3zh67: the early stop is gated on `wait_for_indices` alone.
+            // `min_indices` is a floor (validated by the caller after the
+            // gather) and must never cancel in-flight shards.
+            if self.config.wait_for_indices > 0
+                && shard_results.len() >= self.config.wait_for_indices
+            {
                 break;
             }
+        }
+
+        // Anything dropped from `pending` on the early break was cancelled
+        // in flight: dispatched, but neither answered nor failed nor timed out.
+        if !pending.is_empty() {
+            drop(pending);
+            coverage.cancelled_in_flight = coverage
+                .queried
+                .iter()
+                .filter(|name| {
+                    !coverage.answered.iter().any(|n| n == *name)
+                        && !coverage.failed.iter().any(|f| &f.index == *name)
+                        && !coverage.timed_out.iter().any(|n| n == *name)
+                })
+                .cloned()
+                .collect();
         }
 
         if shard_results.is_empty()
@@ -351,7 +454,7 @@ impl FederatedSearcher {
             return Err(error);
         }
 
-        Ok(shard_results)
+        Ok((shard_results, coverage))
     }
 }
 
@@ -655,7 +758,84 @@ mod tests {
         }
 
         fn category(&self) -> ModelCategory {
-            ModelCategory::StaticEmbedder
+            // ApiEmbedder keeps the searcher on its genuinely-async await path
+            // so the shard stays pending until the federated per-index timeout
+            // fires — the condition these fixtures exist to produce. The rayon
+            // path would poll_immediate the pending embed into an instant
+            // failure instead.
+            ModelCategory::ApiEmbedder
+        }
+    }
+
+    /// Completes successfully after yielding to the executor a fixed number of
+    /// times. Forces its shard to finish in a later poll batch than a shard
+    /// backed by [`StubEmbedder`], without needing timers — the deterministic
+    /// stand-in for "healthy but slower shard".
+    struct YieldingEmbedder {
+        id: &'static str,
+        dimension: usize,
+        yields: u32,
+    }
+
+    impl YieldingEmbedder {
+        const fn new(id: &'static str, dimension: usize, yields: u32) -> Self {
+            Self {
+                id,
+                dimension,
+                yields,
+            }
+        }
+    }
+
+    impl Embedder for YieldingEmbedder {
+        fn embed<'a>(
+            &'a self,
+            _cx: &'a asupersync::Cx,
+            _text: &'a str,
+        ) -> SearchFuture<'a, Vec<f32>> {
+            let dimension = self.dimension;
+            let total_yields = self.yields;
+            Box::pin(async move {
+                let mut remaining = total_yields;
+                std::future::poll_fn(move |task_cx| {
+                    if remaining == 0 {
+                        std::task::Poll::Ready(())
+                    } else {
+                        remaining -= 1;
+                        task_cx.waker().wake_by_ref();
+                        std::task::Poll::Pending
+                    }
+                })
+                .await;
+                let mut vector = vec![0.0; dimension];
+                if !vector.is_empty() {
+                    vector[0] = 1.0;
+                }
+                Ok(vector)
+            })
+        }
+
+        fn dimension(&self) -> usize {
+            self.dimension
+        }
+
+        fn id(&self) -> &str {
+            self.id
+        }
+
+        fn model_name(&self) -> &str {
+            self.id
+        }
+
+        fn is_semantic(&self) -> bool {
+            true
+        }
+
+        fn category(&self) -> ModelCategory {
+            // ApiEmbedder routes through the searcher's genuinely-async await
+            // path; the rayon path poll_immediates non-API embedders and would
+            // convert the deliberate yields into an embed failure.
+            ModelCategory::ApiEmbedder
         }
     }
 
@@ -758,6 +938,94 @@ mod tests {
         ))
     }
 
+    fn build_yielding_searcher(records: &[(&str, &[f32])]) -> Arc<TwoTierSearcher> {
+        let dimension = records.first().map_or(1, |(_, vector)| vector.len());
+        let index = build_index(records);
+        let embedder: Arc<dyn Embedder> =
+            Arc::new(YieldingEmbedder::new("stub-yielding", dimension, 32));
+        Arc::new(TwoTierSearcher::new(
+            index,
+            embedder,
+            TwoTierConfig::default(),
+        ))
+    }
+
+    /// bd-3zh67 red proof: an out-of-the-box `FederatedSearcher` must return
+    /// results from EVERY healthy shard, not just whichever answered first.
+    #[test]
+    fn default_config_returns_results_from_all_healthy_shards() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let fast = build_searcher(&[("doc-fast", &[1.0, 0.0])]);
+            let slow = build_yielding_searcher(&[("doc-slow", &[1.0, 0.0])]);
+
+            let federated = FederatedSearcher::new()
+                .add_index("fast", fast, 1.0)
+                .add_index("slow", slow, 1.0);
+
+            let response = federated.search(&cx, "query", 10, |_| None).await.unwrap();
+            let ids: std::collections::BTreeSet<_> = response
+                .hits
+                .iter()
+                .map(|hit| hit.result.doc_id.as_str())
+                .collect();
+            assert!(ids.contains("doc-fast"), "fast shard doc must be present");
+            assert!(
+                ids.contains("doc-slow"),
+                "slow-but-healthy shard doc must be present: the default config \
+                 must not cancel in-flight shards after the first reply (bd-3zh67)"
+            );
+            assert!(response.coverage.is_complete());
+            assert_eq!(response.coverage.answered.len(), 2);
+            assert!(response.coverage.cancelled_in_flight.is_empty());
+        });
+    }
+
+    /// bd-3zh67 HALF B: failures and timeouts must be visible per query, and
+    /// the first shard error must not be silently discarded just because some
+    /// other shard answered.
+    #[test]
+    fn coverage_reports_failed_and_timed_out_shards() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let healthy = build_searcher(&[("doc-healthy", &[1.0, 0.0])]);
+            let failing = build_failing_searcher(&[("doc-failing", &[1.0, 0.0])]);
+            let pending = build_pending_searcher(&[("doc-pending", &[1.0, 0.0])]);
+
+            let federated = FederatedSearcher::new()
+                .with_config(FederatedConfig {
+                    per_index_timeout_ms: 80,
+                    ..FederatedConfig::default()
+                })
+                .add_index("healthy", healthy, 1.0)
+                .add_index("failing", failing, 1.0)
+                .add_index("pending", pending, 1.0);
+
+            let response = federated.search(&cx, "query", 10, |_| None).await.unwrap();
+
+            assert_eq!(response.hits.len(), 1);
+            assert_eq!(response.hits[0].result.doc_id, "doc-healthy");
+
+            let coverage = &response.coverage;
+            assert_eq!(
+                coverage.queried,
+                vec![
+                    "healthy".to_owned(),
+                    "failing".to_owned(),
+                    "pending".to_owned()
+                ]
+            );
+            assert_eq!(coverage.answered, vec!["healthy".to_owned()]);
+            assert_eq!(coverage.failed.len(), 1, "failed shard must be recorded");
+            assert_eq!(coverage.failed[0].index, "failing");
+            assert!(
+                !coverage.failed[0].error.is_empty(),
+                "shard error text must be preserved for the caller"
+            );
+            assert_eq!(coverage.timed_out, vec!["pending".to_owned()]);
+            assert!(coverage.cancelled_in_flight.is_empty());
+            assert!(!coverage.is_complete());
+        });
+    }
+
     #[test]
     fn single_index_returns_ranked_hits() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
@@ -769,7 +1037,11 @@ mod tests {
                 })
                 .add_index("primary", index, 1.0);
 
-            let results = federated.search(&cx, "query", 2, |_| None).await.unwrap();
+            let results = federated
+                .search(&cx, "query", 2, |_| None)
+                .await
+                .unwrap()
+                .hits;
             assert_eq!(results.len(), 2);
             assert_eq!(results[0].result.doc_id, "doc-a");
             assert_eq!(results[0].source_index, "primary");
@@ -799,8 +1071,16 @@ mod tests {
                 .add_index("a", index_a, 1.0)
                 .add_index("b", index_b, 2.0);
 
-            let results_a = prefer_a.search(&cx, "query", 3, |_| None).await.unwrap();
-            let results_b = prefer_b.search(&cx, "query", 3, |_| None).await.unwrap();
+            let results_a = prefer_a
+                .search(&cx, "query", 3, |_| None)
+                .await
+                .unwrap()
+                .hits;
+            let results_b = prefer_b
+                .search(&cx, "query", 3, |_| None)
+                .await
+                .unwrap()
+                .hits;
 
             assert_eq!(results_a[0].result.doc_id, "shared");
             assert_eq!(results_b[0].result.doc_id, "b-only");
@@ -825,7 +1105,11 @@ mod tests {
                 .add_index("large", large_scale, 1.0)
                 .add_index("small", small_scale, 1.0);
 
-            let results = federated.search(&cx, "query", 4, |_| None).await.unwrap();
+            let results = federated
+                .search(&cx, "query", 4, |_| None)
+                .await
+                .unwrap()
+                .hits;
             let top_ids: std::collections::BTreeSet<_> = results
                 .iter()
                 .take(2)
@@ -865,7 +1149,11 @@ mod tests {
                 .add_index("a", index_a, 1.0)
                 .add_index("b", index_b, 1.0);
 
-            let results = federated.search(&cx, "query", 3, |_| None).await.unwrap();
+            let results = federated
+                .search(&cx, "query", 3, |_| None)
+                .await
+                .unwrap()
+                .hits;
             assert_eq!(results[0].result.doc_id, "shared");
             assert_eq!(results[0].appeared_in.len(), 2);
         });
@@ -886,7 +1174,11 @@ mod tests {
                 .add_index("a", index_a, 1.0)
                 .add_index("b", index_b, 0.0);
 
-            let results = federated.search(&cx, "query", 10, |_| None).await.unwrap();
+            let results = federated
+                .search(&cx, "query", 10, |_| None)
+                .await
+                .unwrap()
+                .hits;
             assert!(results.iter().any(|hit| hit.result.doc_id == "a-only"));
             assert!(!results.iter().any(|hit| hit.result.doc_id == "b-only"));
         });
@@ -940,7 +1232,11 @@ mod tests {
                 .add_index("healthy", healthy, 1.0)
                 .add_index("failing", failing, 1.0);
 
-            let results = federated.search(&cx, "query", 10, |_| None).await.unwrap();
+            let results = federated
+                .search(&cx, "query", 10, |_| None)
+                .await
+                .unwrap()
+                .hits;
             assert_eq!(results.len(), 1);
             assert_eq!(results[0].result.doc_id, "doc-healthy");
             assert_eq!(results[0].appeared_in, vec!["healthy".to_owned()]);
@@ -993,7 +1289,8 @@ mod tests {
                     }
                 })
                 .await
-                .unwrap();
+                .unwrap()
+                .hits;
             assert_eq!(results.len(), 1);
             assert_eq!(results[0].result.doc_id, "doc-full");
             assert_eq!(results[0].appeared_in, vec!["full".to_owned()]);
@@ -1018,7 +1315,11 @@ mod tests {
                 .add_index("b", index_b, 1.0)
                 .add_index("c", index_c, 1.0);
 
-            let results = federated.search(&cx, "query", 5, |_| None).await.unwrap();
+            let results = federated
+                .search(&cx, "query", 5, |_| None)
+                .await
+                .unwrap()
+                .hits;
             let shared = results
                 .iter()
                 .find(|hit| hit.result.doc_id == "shared")
@@ -1047,7 +1348,11 @@ mod tests {
                 .add_index("second", second, 1.0)
                 .add_index("third", third, 1.0);
 
-            let results = federated.search(&cx, "query", 10, |_| None).await.unwrap();
+            let results = federated
+                .search(&cx, "query", 10, |_| None)
+                .await
+                .unwrap()
+                .hits;
             let ids: std::collections::BTreeSet<_> = results
                 .iter()
                 .map(|hit| hit.result.doc_id.as_str())
@@ -1064,7 +1369,7 @@ mod tests {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             let index = build_searcher(&[("doc-a", &[1.0, 0.0])]);
             let federated = FederatedSearcher::new().add_index("primary", index, 1.0);
-            let results = federated.search(&cx, "", 10, |_| None).await.unwrap();
+            let results = federated.search(&cx, "", 10, |_| None).await.unwrap().hits;
             assert!(results.is_empty());
         });
     }
@@ -1074,7 +1379,11 @@ mod tests {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             let index = build_searcher(&[("doc-a", &[1.0, 0.0])]);
             let federated = FederatedSearcher::new().add_index("primary", index, 1.0);
-            let results = federated.search(&cx, "query", 0, |_| None).await.unwrap();
+            let results = federated
+                .search(&cx, "query", 0, |_| None)
+                .await
+                .unwrap()
+                .hits;
             assert!(results.is_empty());
         });
     }
@@ -1085,7 +1394,11 @@ mod tests {
             let federated = FederatedSearcher::new();
             assert!(federated.is_empty());
             assert_eq!(federated.len(), 0);
-            let results = federated.search(&cx, "query", 10, |_| None).await.unwrap();
+            let results = federated
+                .search(&cx, "query", 10, |_| None)
+                .await
+                .unwrap()
+                .hits;
             assert!(results.is_empty());
         });
     }
@@ -1105,6 +1418,11 @@ mod tests {
         assert_eq!(config.min_indices, 1);
         assert_eq!(config.candidate_pool_factor, 3);
         assert_eq!(config.max_indices, usize::MAX);
+        assert_eq!(
+            config.wait_for_indices,
+            usize::MAX,
+            "default must wait for every dispatched shard (bd-3zh67)"
+        );
     }
 
     #[test]
@@ -1157,7 +1475,11 @@ mod tests {
                 .add_index("fast", fast, 1.0);
 
             let start = Instant::now();
-            let results = federated.search(&cx, "query", 10, |_| None).await.unwrap();
+            let results = federated
+                .search(&cx, "query", 10, |_| None)
+                .await
+                .unwrap()
+                .hits;
             let elapsed = start.elapsed();
 
             assert!(
@@ -1171,8 +1493,11 @@ mod tests {
         });
     }
 
+    /// bd-3zh67: the early stop is an explicit opt-in via `wait_for_indices`;
+    /// `min_indices` (the floor) must not trigger it. Cancelled shards are
+    /// visible in coverage.
     #[test]
-    fn scatter_gather_returns_early_when_min_indices_is_satisfied() {
+    fn scatter_gather_returns_early_when_wait_for_indices_is_satisfied() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             let timeout_ms = 200_u64;
             let fast = build_searcher(&[("doc-fast", &[1.0, 0.0])]);
@@ -1181,24 +1506,34 @@ mod tests {
             let federated = FederatedSearcher::new()
                 .with_config(FederatedConfig {
                     per_index_timeout_ms: timeout_ms,
-                    min_indices: 1,
+                    wait_for_indices: 1,
                     ..FederatedConfig::default()
                 })
                 .add_index("pending", pending, 1.0)
                 .add_index("fast", fast, 1.0);
 
             let start = Instant::now();
-            let results = federated.search(&cx, "query", 10, |_| None).await.unwrap();
+            let response = federated.search(&cx, "query", 10, |_| None).await.unwrap();
             let elapsed = start.elapsed();
 
             assert!(
-                results.iter().any(|hit| hit.result.doc_id == "doc-fast"),
+                response
+                    .hits
+                    .iter()
+                    .any(|hit| hit.result.doc_id == "doc-fast"),
                 "fast shard result should be returned"
             );
             assert!(
                 elapsed < Duration::from_millis(120),
-                "search should return once min_indices is satisfied without waiting for timeout; elapsed={elapsed:?}"
+                "search should return once wait_for_indices is satisfied without waiting for timeout; elapsed={elapsed:?}"
             );
+            assert_eq!(response.coverage.answered, vec!["fast".to_owned()]);
+            assert_eq!(
+                response.coverage.cancelled_in_flight,
+                vec!["pending".to_owned()],
+                "the shard cancelled by the early stop must be visible in coverage"
+            );
+            assert!(!response.coverage.is_complete());
         });
     }
 
@@ -1286,6 +1621,7 @@ mod tests {
             candidate_pool_factor: 10,
             max_indices: 42,
             fusion_method: FederatedFusion::Rrf { k: 30.0 },
+            wait_for_indices: 7,
         };
         let searcher = FederatedSearcher::new().with_config(config);
         // Verify it compiles and constructs (config is private, so we test behavior)
@@ -1368,7 +1704,11 @@ mod tests {
                 })
                 .add_index("primary", index, 1.0);
 
-            let results = federated.search(&cx, "query", 2, |_| None).await.unwrap();
+            let results = federated
+                .search(&cx, "query", 2, |_| None)
+                .await
+                .unwrap()
+                .hits;
             assert_eq!(results.len(), 2);
             // With k=0, rank 0 gets score 1.0, rank 1 gets 0.5
             assert!(results[0].result.score > results[1].result.score);

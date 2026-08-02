@@ -22,6 +22,7 @@ use std::time::{Duration, Instant, SystemTime};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
+use crate::adapters::cli::{CliCommand, CliInput, ConfigAction, OutputFormat, parse_cli_args};
 use crate::config::PressureConfig;
 use crate::evidence::FsfsReasonCode;
 
@@ -396,6 +397,7 @@ pub const INDEX_FOOTPRINT_ADVISOR_SCHEMA_VERSION: u32 = 1;
 pub const INDEX_FOOTPRINT_ADVISOR_CONTRACT_KIND: &str = "fsfs_index_footprint_advisor_contract";
 pub const INDEX_FOOTPRINT_ADVISOR_REPORT_KIND: &str = "fsfs_index_footprint_advisor_report";
 pub const INDEX_FOOTPRINT_ADVISOR_POLICY_VERSION: &str = "fsfs-index-footprint-advisor-policy-v1";
+pub const OPERATOR_COMMAND_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -454,6 +456,135 @@ pub enum IndexFootprintAdvisorRisk {
     Low,
     Medium,
     High,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OperatorCommandMutationClass {
+    ReadOnlyDiagnostic,
+    Mutating,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OperatorCommandDryRunSupport {
+    Unavailable,
+    NativePreview,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OperatorCommandPrecondition {
+    ReviewDiagnosticOutput,
+    SelectSupportedMutationWorkflow,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OperatorCommandContract {
+    pub schema_version: u32,
+    pub command: String,
+    pub arguments: Vec<String>,
+    pub preconditions: Vec<OperatorCommandPrecondition>,
+    pub mutation_class: OperatorCommandMutationClass,
+    pub dry_run_support: OperatorCommandDryRunSupport,
+    pub confirmation_required: bool,
+    pub guidance: String,
+}
+
+impl OperatorCommandContract {
+    /// Validates the structured command and feeds its argv through the real
+    /// fsfs parser.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an unknown schema, shell-shaped command, malformed
+    /// argv, ambiguous output format, mutation mislabeled as read-only, or
+    /// missing operator guidance.
+    pub fn validate(&self) -> Result<(), String> {
+        self.parsed_input().map(|_| ())
+    }
+
+    fn parsed_input(&self) -> Result<CliInput, String> {
+        if self.schema_version != OPERATOR_COMMAND_SCHEMA_VERSION {
+            return Err("unsupported operator-command schema version".to_owned());
+        }
+        if self.command != "fsfs" {
+            return Err("operator command must use the fsfs executable directly".to_owned());
+        }
+        if self.arguments.is_empty()
+            || self.arguments.iter().any(|argument| {
+                argument.is_empty()
+                    || argument
+                        .chars()
+                        .any(|character| matches!(character, '\0' | '\n' | '\r'))
+            })
+        {
+            return Err("operator command contains malformed argv".to_owned());
+        }
+        if self.preconditions.is_empty()
+            || self
+                .preconditions
+                .iter()
+                .enumerate()
+                .any(|(index, precondition)| self.preconditions[..index].contains(precondition))
+        {
+            return Err("operator command requires unique preconditions".to_owned());
+        }
+        if !self
+            .preconditions
+            .contains(&OperatorCommandPrecondition::ReviewDiagnosticOutput)
+            || !self
+                .preconditions
+                .contains(&OperatorCommandPrecondition::SelectSupportedMutationWorkflow)
+        {
+            return Err("operator command omits a required precondition".to_owned());
+        }
+        if self.guidance.trim().is_empty() {
+            return Err("operator command requires human guidance".to_owned());
+        }
+        if self
+            .arguments
+            .iter()
+            .any(|argument| argument == "--dry-run")
+        {
+            return Err("operator command advertises unsupported dry-run syntax".to_owned());
+        }
+        if self
+            .arguments
+            .iter()
+            .filter(|argument| argument.as_str() == "--format")
+            .count()
+            != 1
+        {
+            return Err("operator command requires one unambiguous output format".to_owned());
+        }
+
+        let parsed = parse_cli_args(self.arguments.clone())
+            .map_err(|error| format!("operator command does not parse: {error}"))?;
+        if parsed.format != OutputFormat::Json || !parsed.format_explicit {
+            return Err("operator command must request explicit json output".to_owned());
+        }
+        if !matches!(parsed.command, CliCommand::Status | CliCommand::Config) {
+            return Err("operator command must be a supported read-only diagnostic".to_owned());
+        }
+        if parsed.command == CliCommand::Config
+            && parsed.config_action != Some(ConfigAction::Validate)
+        {
+            return Err(
+                "operator config command must use the read-only validate action".to_owned(),
+            );
+        }
+        if self.mutation_class != OperatorCommandMutationClass::ReadOnlyDiagnostic
+            || self.dry_run_support != OperatorCommandDryRunSupport::Unavailable
+            || self.confirmation_required
+        {
+            return Err(
+                "supported operator command must be labeled as a read-only diagnostic without native preview or mutation confirmation"
+                    .to_owned(),
+            );
+        }
+        Ok(parsed)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -640,7 +771,7 @@ pub struct IndexFootprintRecommendation {
     pub measured_bytes: u64,
     pub projected_savings_bytes: u64,
     pub replay_command: String,
-    pub operator_command: String,
+    pub operator_command: OperatorCommandContract,
     pub rationale: String,
 }
 
@@ -1019,11 +1150,32 @@ impl IndexFootprintRecommendation {
         {
             return Err("index-footprint recommendation missing exact replay command".to_owned());
         }
-        if self.operator_command.trim().is_empty() {
-            return Err("index-footprint recommendation missing operator command".to_owned());
+        let parsed_operator_command = self.operator_command.parsed_input()?;
+        let command_matches_action = match self.action {
+            IndexFootprintAdvisorAction::Compaction | IndexFootprintAdvisorAction::Rebuild => {
+                parsed_operator_command.command == CliCommand::Status
+            }
+            IndexFootprintAdvisorAction::Retention => {
+                parsed_operator_command.command == CliCommand::Status
+            }
+            IndexFootprintAdvisorAction::FeatureAdjustment => {
+                parsed_operator_command.command == CliCommand::Config
+                    && parsed_operator_command.config_action == Some(ConfigAction::Validate)
+            }
+        };
+        if !command_matches_action {
+            return Err(
+                "index-footprint recommendation diagnostic does not match its action".to_owned(),
+            );
         }
-        if !self.operator_command.contains("--dry-run") {
-            return Err("index-footprint recommendation must be dry-run".to_owned());
+        if self.operator_command.mutation_class != OperatorCommandMutationClass::ReadOnlyDiagnostic
+            || self.operator_command.dry_run_support != OperatorCommandDryRunSupport::Unavailable
+            || self.operator_command.confirmation_required
+        {
+            return Err(
+                "index-footprint recommendation must advertise a truthful read-only diagnostic"
+                    .to_owned(),
+            );
         }
         if self.projected_savings_bytes > self.measured_bytes {
             return Err("index-footprint projected savings exceed measured bytes".to_owned());
@@ -1119,23 +1271,70 @@ fn replay_command(scenario: IndexFootprintScenario, domain: IndexFootprintDomain
 }
 
 #[must_use]
-fn operator_command(action: IndexFootprintAdvisorAction, domain: IndexFootprintDomain) -> String {
-    match action {
-        IndexFootprintAdvisorAction::Compaction => {
-            "fsfs compact --dry-run --format json".to_owned()
-        }
-        IndexFootprintAdvisorAction::Rebuild => {
+fn operator_command(
+    action: IndexFootprintAdvisorAction,
+    domain: IndexFootprintDomain,
+) -> OperatorCommandContract {
+    let (arguments, guidance) = match action {
+        IndexFootprintAdvisorAction::Compaction => (
+            vec![
+                "status".to_owned(),
+                "--format".to_owned(),
+                "json".to_owned(),
+            ],
             format!(
-                "fsfs index --rebuild {} --dry-run --format json",
-                domain.as_str()
-            )
-        }
-        IndexFootprintAdvisorAction::Retention => {
-            "fsfs doctor --retention-audit --dry-run --format json".to_owned()
-        }
-        IndexFootprintAdvisorAction::FeatureAdjustment => {
-            "fsfs config set search.fast_only true --dry-run --format json".to_owned()
-        }
+                "Compaction preview is not supported; inspect {domain} status, then select a documented mutation workflow and independently confirm its targets.",
+                domain = domain.as_str()
+            ),
+        ),
+        IndexFootprintAdvisorAction::Rebuild => (
+            vec![
+                "status".to_owned(),
+                "--format".to_owned(),
+                "json".to_owned(),
+            ],
+            format!(
+                "Rebuild preview is not supported; inspect {domain} status, then select a documented mutation workflow and independently confirm its targets.",
+                domain = domain.as_str()
+            ),
+        ),
+        IndexFootprintAdvisorAction::Retention => (
+            vec![
+                "status".to_owned(),
+                "--format".to_owned(),
+                "json".to_owned(),
+            ],
+            format!(
+                "Retention preview is not supported; run read-only diagnostics for {domain} and review policy guidance before selecting any mutation workflow.",
+                domain = domain.as_str()
+            ),
+        ),
+        IndexFootprintAdvisorAction::FeatureAdjustment => (
+            vec![
+                "config".to_owned(),
+                "validate".to_owned(),
+                "--format".to_owned(),
+                "json".to_owned(),
+            ],
+            format!(
+                "Configuration mutation preview is not supported; validate the current configuration for {domain}, then edit it through a documented confirmed workflow.",
+                domain = domain.as_str()
+            ),
+        ),
+    };
+
+    OperatorCommandContract {
+        schema_version: OPERATOR_COMMAND_SCHEMA_VERSION,
+        command: "fsfs".to_owned(),
+        arguments,
+        preconditions: vec![
+            OperatorCommandPrecondition::ReviewDiagnosticOutput,
+            OperatorCommandPrecondition::SelectSupportedMutationWorkflow,
+        ],
+        mutation_class: OperatorCommandMutationClass::ReadOnlyDiagnostic,
+        dry_run_support: OperatorCommandDryRunSupport::Unavailable,
+        confirmation_required: false,
+        guidance,
     }
 }
 
@@ -1724,8 +1923,8 @@ impl PidFile {
     /// Default PID file path.
     #[must_use]
     pub fn default_path() -> PathBuf {
-        let runtime_dir = dirs::runtime_dir()
-            .or_else(|| dirs::cache_dir().map(|d| d.join("run")))
+        let runtime_dir = frankensearch_core::platform_dirs::runtime_dir()
+            .or_else(|| frankensearch_core::platform_dirs::cache_dir().map(|d| d.join("run")))
             .unwrap_or_else(|| PathBuf::from("/tmp"));
         runtime_dir.join("fsfs.pid")
     }
@@ -2331,6 +2530,163 @@ const fn epoch_days_to_ymd(days: u64) -> (u64, u64, u64) {
     (y, m, d)
 }
 
+// ─── Cross-process publication lease (bd-jr74s) ─────────────────────────────
+
+/// File name of the index-root publication lock.
+pub const PUBLICATION_LOCK_FILE_NAME: &str = "fsfs.publication.lock";
+
+/// Refusal detail when another process holds the publication lease.
+#[derive(Debug)]
+pub struct PublicationLeaseBusy {
+    /// Path of the contended lock file.
+    pub lock_path: PathBuf,
+    /// PID recorded by the current holder, when readable.
+    pub owner_pid: Option<u32>,
+}
+
+impl std::fmt::Display for PublicationLeaseBusy {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.owner_pid {
+            Some(pid) => write!(
+                formatter,
+                "another fsfs process (pid {pid}) holds the publication lease at {}; wait for it to finish or stop the daemon",
+                self.lock_path.display()
+            ),
+            None => write!(
+                formatter,
+                "another fsfs process holds the publication lease at {}; wait for it to finish or stop the daemon",
+                self.lock_path.display()
+            ),
+        }
+    }
+}
+
+impl std::error::Error for PublicationLeaseBusy {}
+
+/// Cross-process publication lease for one fsfs index root (bd-jr74s).
+///
+/// Every mutating fsfs surface (one-shot index scaffold + watch mode, delete,
+/// compact, append-batch, daemon) must hold this lease before touching shared
+/// index state — checkpoint, FSVI main + WAL, sentinel. Without it, a daemon
+/// compaction can run concurrently with another process's WAL appends and
+/// silently discard acknowledged vectors inside a generation whose sentinel
+/// still reads `generation_complete: true`.
+///
+/// The authority is an exclusive non-blocking `flock(2)` on
+/// `<index_root>/fsfs.publication.lock` — the same primitive the Quill keeper
+/// uses one layer down for its engine directory. The kernel releases the lock
+/// when the holder dies, so there is no stale-lease recovery protocol. The
+/// PID record inside the file is diagnostic only and written best-effort.
+/// Non-flock platforms fail closed rather than pretending exclusion.
+#[derive(Debug)]
+pub struct PublicationLease {
+    lock_path: PathBuf,
+    lock_file: std::fs::File,
+}
+
+impl PublicationLease {
+    /// Acquire the exclusive publication lease for `index_root`.
+    ///
+    /// # Errors
+    ///
+    /// Returns `SearchError::SubsystemError` (subsystem `publication-lease`)
+    /// carrying [`PublicationLeaseBusy`] when another process holds the lease,
+    /// and `SearchError::Io` for filesystem failures.
+    #[cfg(unix)]
+    pub fn acquire(index_root: &Path) -> frankensearch_core::SearchResult<Self> {
+        use rustix::fs::{FlockOperation, OFlags, flock};
+        use std::io::{Read, Seek, SeekFrom, Write};
+        use std::os::unix::fs::OpenOptionsExt;
+
+        std::fs::create_dir_all(index_root)?;
+        let lock_path = index_root.join(PUBLICATION_LOCK_FILE_NAME);
+        let no_follow = i32::try_from(OFlags::NOFOLLOW.bits()).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "O_NOFOLLOW does not fit the open(2) flag word on this target",
+            )
+        })?;
+        let mut lock_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .custom_flags(no_follow)
+            .open(&lock_path)?;
+        if !lock_file.metadata()?.file_type().is_file() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("{} must be a regular file", lock_path.display()),
+            )
+            .into());
+        }
+        if let Err(errno) = flock(&lock_file, FlockOperation::NonBlockingLockExclusive) {
+            if errno == rustix::io::Errno::AGAIN {
+                let mut recorded = String::new();
+                let owner_pid = lock_file
+                    .read_to_string(&mut recorded)
+                    .ok()
+                    .and_then(|_| recorded.split_whitespace().next()?.parse::<u32>().ok());
+                return Err(frankensearch_core::SearchError::SubsystemError {
+                    subsystem: "publication-lease",
+                    source: Box::new(PublicationLeaseBusy {
+                        lock_path,
+                        owner_pid,
+                    }),
+                });
+            }
+            return Err(std::io::Error::from(errno).into());
+        }
+        // Diagnostic record only; the flock above is the authority.
+        let record = format!(
+            "{} {}\n",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .map_or(0, |elapsed| elapsed.as_secs())
+        );
+        let _ = lock_file.set_len(0);
+        let _ = lock_file.seek(SeekFrom::Start(0));
+        let _ = lock_file.write_all(record.as_bytes());
+        let _ = lock_file.sync_all();
+        Ok(Self {
+            lock_path,
+            lock_file,
+        })
+    }
+
+    /// Non-Unix targets cannot provide flock exclusion semantics; fail closed.
+    ///
+    /// # Errors
+    ///
+    /// Always returns `SearchError::Io` with `ErrorKind::Unsupported`.
+    #[cfg(not(unix))]
+    pub fn acquire(index_root: &Path) -> frankensearch_core::SearchResult<Self> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            format!(
+                "cross-process fsfs publication exclusion requires flock semantics (index root {})",
+                index_root.display()
+            ),
+        )
+        .into())
+    }
+
+    /// Path of the held lock file.
+    #[must_use]
+    pub fn lock_path(&self) -> &Path {
+        &self.lock_path
+    }
+}
+
+impl Drop for PublicationLease {
+    fn drop(&mut self) {
+        // Clear the diagnostic record; closing the descriptor releases the
+        // flock itself.
+        let _ = self.lock_file.set_len(0);
+    }
+}
+
 // ─── Tests ──────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -2338,6 +2694,39 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+
+    #[test]
+    fn publication_lease_excludes_second_holder_and_releases_on_drop() {
+        let root = tempfile::tempdir().expect("index root");
+        let first = PublicationLease::acquire(root.path()).expect("first acquire");
+        assert!(first.lock_path().ends_with(PUBLICATION_LOCK_FILE_NAME));
+
+        let busy = PublicationLease::acquire(root.path())
+            .expect_err("second acquire must refuse while the lease is held");
+        match busy {
+            frankensearch_core::SearchError::SubsystemError { subsystem, source } => {
+                assert_eq!(subsystem, "publication-lease");
+                let detail = source
+                    .downcast_ref::<PublicationLeaseBusy>()
+                    .expect("busy detail carries the typed refusal");
+                assert_eq!(detail.owner_pid, Some(std::process::id()));
+            }
+            other => panic!("expected publication-lease busy error, got {other:?}"),
+        }
+
+        drop(first);
+        let reacquired = PublicationLease::acquire(root.path())
+            .expect("lease must be reacquirable after the holder releases");
+        drop(reacquired);
+    }
+
+    #[test]
+    fn publication_lease_rejects_directory_lock_path() {
+        let root = tempfile::tempdir().expect("index root");
+        std::fs::create_dir_all(root.path().join(PUBLICATION_LOCK_FILE_NAME))
+            .expect("occupy the lock path with a directory");
+        assert!(PublicationLease::acquire(root.path()).is_err());
+    }
 
     // ── DaemonPhase ──
 
@@ -2830,7 +3219,10 @@ mod tests {
             .expect("vector recommendation");
         assert_eq!(vector.action, IndexFootprintAdvisorAction::Compaction);
         assert_eq!(vector.risk, IndexFootprintAdvisorRisk::Low);
-        assert!(vector.operator_command.contains("--dry-run"));
+        assert_eq!(
+            vector.operator_command.arguments,
+            ["status", "--format", "json"]
+        );
 
         let lexical = fragmented
             .recommendations
@@ -2839,7 +3231,10 @@ mod tests {
             .expect("lexical recommendation");
         assert_eq!(lexical.action, IndexFootprintAdvisorAction::Rebuild);
         assert_eq!(lexical.risk, IndexFootprintAdvisorRisk::Medium);
-        assert!(lexical.operator_command.contains("--dry-run"));
+        assert_eq!(
+            lexical.operator_command.arguments,
+            ["status", "--format", "json"]
+        );
 
         let oversized = index_footprint_advisor_oversized_fixture();
         let model_cache = oversized
@@ -2852,7 +3247,10 @@ mod tests {
             IndexFootprintAdvisorAction::FeatureAdjustment
         );
         assert_eq!(model_cache.risk, IndexFootprintAdvisorRisk::High);
-        assert!(model_cache.operator_command.contains("--dry-run"));
+        assert_eq!(
+            model_cache.operator_command.arguments,
+            ["config", "validate", "--format", "json"]
+        );
     }
 
     #[test]
@@ -2882,7 +3280,103 @@ mod tests {
                     .replay_command
                     .contains("index_footprint_advisor_policy_suite")
             }));
+            assert!(report.recommendations.iter().all(|recommendation| {
+                recommendation.operator_command.mutation_class
+                    == OperatorCommandMutationClass::ReadOnlyDiagnostic
+                    && recommendation.operator_command.dry_run_support
+                        == OperatorCommandDryRunSupport::Unavailable
+                    && !recommendation.operator_command.confirmation_required
+                    && !recommendation
+                        .operator_command
+                        .arguments
+                        .iter()
+                        .any(|argument| argument == "--dry-run")
+            }));
         }
+    }
+
+    #[test]
+    fn index_footprint_operator_commands_parse_through_the_real_cli() {
+        for report in [
+            index_footprint_advisor_small_fixture(),
+            index_footprint_advisor_fragmented_fixture(),
+            index_footprint_advisor_oversized_fixture(),
+        ] {
+            for recommendation in report.recommendations {
+                recommendation
+                    .operator_command
+                    .validate()
+                    .expect("advertised operator argv must parse");
+
+                let parsed = parse_cli_args(recommendation.operator_command.arguments)
+                    .expect("advertised operator argv must parse through the real CLI");
+                let expected_command = match recommendation.action {
+                    IndexFootprintAdvisorAction::Compaction
+                    | IndexFootprintAdvisorAction::Rebuild => CliCommand::Status,
+                    IndexFootprintAdvisorAction::Retention => CliCommand::Status,
+                    IndexFootprintAdvisorAction::FeatureAdjustment => CliCommand::Config,
+                };
+                assert_eq!(parsed.command, expected_command);
+                assert_eq!(parsed.format, OutputFormat::Json);
+                assert!(parsed.format_explicit);
+                if recommendation.action == IndexFootprintAdvisorAction::FeatureAdjustment {
+                    assert_eq!(parsed.config_action, Some(ConfigAction::Validate));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn index_footprint_operator_command_rejects_ambiguous_or_fictional_argv() {
+        let baseline = operator_command(
+            IndexFootprintAdvisorAction::Compaction,
+            IndexFootprintDomain::VectorIndex,
+        );
+
+        for arguments in [
+            vec!["compact", "--dry-run", "--format", "json"],
+            vec!["status", "--unknown", "--format", "json"],
+            vec!["status", "--index-dir", "--format", "json"],
+            vec!["status", "--format", "json", "--format", "toon"],
+            vec!["status;rm", "--format", "json"],
+            vec!["doctor", "--format", "json"],
+        ] {
+            let mut candidate = baseline.clone();
+            candidate.arguments = arguments.into_iter().map(str::to_owned).collect();
+            assert!(candidate.validate().is_err());
+        }
+
+        let mut shell_shaped_executable = baseline.clone();
+        shell_shaped_executable.command = "fsfs;rm".to_owned();
+        assert!(shell_shaped_executable.validate().is_err());
+
+        let mut mislabeled_mutation = baseline.clone();
+        mislabeled_mutation.mutation_class = OperatorCommandMutationClass::Mutating;
+        mislabeled_mutation.confirmation_required = true;
+        assert!(mislabeled_mutation.validate().is_err());
+
+        let mut fictional_preview = baseline;
+        fictional_preview.dry_run_support = OperatorCommandDryRunSupport::NativePreview;
+        assert!(fictional_preview.validate().is_err());
+    }
+
+    #[test]
+    fn index_footprint_operator_command_preserves_space_and_unicode_argv() {
+        let mut command = operator_command(
+            IndexFootprintAdvisorAction::Compaction,
+            IndexFootprintDomain::VectorIndex,
+        );
+        command.arguments = vec![
+            "status".to_owned(),
+            "--index-dir".to_owned(),
+            "/tmp/index with spaces/$(not-a-shell);still-one-argument/Δ".to_owned(),
+            "--format".to_owned(),
+            "json".to_owned(),
+        ];
+
+        command
+            .validate()
+            .expect("structured argv must preserve spaces and Unicode without a shell");
     }
 
     // ── LifecycleTracker ──

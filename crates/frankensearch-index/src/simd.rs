@@ -739,7 +739,7 @@ pub fn dot_product_f32_bytes_f32_generic(stored_bytes: &[u8], query: &[f32]) -> 
 ///
 /// This is the candidate **pass-1 kernel** for an int8 ADC two-pass scan (`bd-b5wl`):
 /// quantized vectors are 1 byte/elem (half the bandwidth of f16) and the multiply
-/// accumulates in integer lanes. `i16::mul_widen` keeps every product in full i32
+/// accumulates in integer lanes. `i16x8::widening_mul` keeps every product in full i32
 /// precision, so the only overflow bound is the i32 accumulator (a 512-dim dot of
 /// ±127 values peaks at ~8.3M, far below `i32::MAX`) — exact for any realistic dim.
 ///
@@ -1265,10 +1265,10 @@ pub fn dot_i8_i8_generic(stored: &[i8], query: &[i8]) -> i32 {
     let (s32, s_rem32) = stored.as_chunks::<32>();
     let (q32, q_rem32) = query.as_chunks::<32>();
     for (s, q) in s32.iter().zip(q32) {
-        acc0 += w8::<0>(s).mul_widen(w8::<0>(q));
-        acc1 += w8::<8>(s).mul_widen(w8::<8>(q));
-        acc2 += w8::<16>(s).mul_widen(w8::<16>(q));
-        acc3 += w8::<24>(s).mul_widen(w8::<24>(q));
+        acc0 += w8::<0>(s).widening_mul(w8::<0>(q));
+        acc1 += w8::<8>(s).widening_mul(w8::<8>(q));
+        acc2 += w8::<16>(s).widening_mul(w8::<16>(q));
+        acc3 += w8::<24>(s).widening_mul(w8::<24>(q));
     }
     let mut sum = (acc0 + acc1) + (acc2 + acc3);
 
@@ -1276,7 +1276,7 @@ pub fn dot_i8_i8_generic(stored: &[i8], query: &[i8]) -> i32 {
     let (s8, s_rem) = s_rem32.as_chunks::<8>();
     let (q8, q_rem) = q_rem32.as_chunks::<8>();
     for (s, q) in s8.iter().zip(q8) {
-        sum += i16x8::from(s.map(i16::from)).mul_widen(i16x8::from(q.map(i16::from)));
+        sum += i16x8::from(s.map(i16::from)).widening_mul(i16x8::from(q.map(i16::from)));
     }
     let mut result = sum.reduce_add();
     for (s, q) in s_rem.iter().zip(q_rem) {
@@ -3259,6 +3259,19 @@ mod tests {
             .collect()
     }
 
+    /// Whether the production dispatcher can select the approximate,
+    /// pair-saturating AVX2 kernel on this test host.
+    fn maddubs_saturating_path_available() -> bool {
+        #[cfg(target_arch = "x86_64")]
+        {
+            std::is_x86_feature_detected!("avx2")
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            false
+        }
+    }
+
     /// CORRECTNESS GATE. On magnitudes where no adjacent-pair `u8·i8` sum can exceed `i16`, the
     /// `vpmaddubs` kernel is **bit-exact** to the scalar dot — proving the domain shift and the
     /// `128·Σq` bias are correct. Bound 90: `u∈[0,218]`, `q∈[-90,90]`, pair-sum ≤ 2·218·90 ≈ 39k
@@ -3316,10 +3329,17 @@ mod tests {
                 break;
             }
         }
-        assert!(
-            any_diff,
-            "uniform ±127 is expected to saturate maddubs; if it no longer does, revisit the recall bound"
-        );
+        if maddubs_saturating_path_available() {
+            assert!(
+                any_diff,
+                "uniform ±127 is expected to saturate the AVX2 maddubs path; if it no longer does, revisit the recall bound"
+            );
+        } else {
+            assert!(
+                !any_diff,
+                "non-AVX2 dispatch must retain the exact generic fallback at the full int8 range"
+            );
+        }
     }
 
     /// CORRECTNESS + ORDERING GATE for the FMA f16 dot (scan lever). FMA is not bit-identical to
@@ -3481,14 +3501,23 @@ mod tests {
         let query_i8 = quantize_query_i8(&query);
         let bias = maddubs_query_bias(&query_i8, dim);
 
-        // Confirm the corpus actually saturates maddubs (else this proves nothing new).
+        // Confirm the corpus actually saturates maddubs when the approximate AVX2 path is active.
+        // On other architectures, the same fixture instead proves that runtime dispatch retains
+        // the exact generic fallback before the common candidate-recall checks below.
         let saturates = (0..n).any(|d| {
             dot_i8_i8_generic(doc_i8[d], &query_i8) != dot_i8_i8_maddubs(doc_i8[d], &query_i8, bias)
         });
-        assert!(
-            saturates,
-            "real quantized corpus must exercise maddubs saturation for this proof to bite"
-        );
+        if maddubs_saturating_path_available() {
+            assert!(
+                saturates,
+                "real quantized corpus must exercise AVX2 maddubs saturation for this proof to bite"
+            );
+        } else {
+            assert!(
+                !saturates,
+                "non-AVX2 dispatch must retain the exact generic fallback on the real corpus"
+            );
+        }
 
         // Pass-1 candidate sets (top k·mult) by exact int8 vs approximate maddubs.
         let cand = k * mult;

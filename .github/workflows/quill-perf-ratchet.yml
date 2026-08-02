@@ -1,14 +1,21 @@
-name: Quill performance ratchet
+name: Quill structural evidence rehearsal
 
 on:
   pull_request:
     paths:
       - ".bench-history/**"
       - ".github/workflows/quill-perf-ratchet.yml"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - "crates/frankensearch-core/**"
       - "crates/frankensearch-lexical/**"
       - "crates/frankensearch-quill/**"
       - "crates/frankensearch-quill-gauntlet/**"
+      - "docs/contracts/quill-machine-classes.json"
+      - "docs/contracts/quill-hyperopt-campaign.md"
       - "docs/contracts/quill-perf-gates.*"
+      - "scripts/perf-runner.sh"
   schedule:
     - cron: "41 4 * * *"
   workflow_dispatch:
@@ -24,7 +31,7 @@ permissions:
 
 jobs:
   ratchet:
-    name: Ratchet ${{ matrix.gate }}
+    name: Rehearse ${{ matrix.gate }}
     runs-on: ubuntu-latest
     timeout-minutes: 360
     concurrency:
@@ -36,10 +43,45 @@ jobs:
         gate: ${{ fromJSON(github.event_name == 'pull_request' && '["QG-2"]' || '["QG-1","QG-2","QG-3","QG-4","QG-5","QG-6","QG-7","QG-8","QG-9","QG-10"]') }}
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+
+      - name: Verify frozen machine-class registry pin
+        shell: bash
+        run: |
+          set -euo pipefail
+          source_file="crates/frankensearch-quill-gauntlet/src/machine_class_registry.rs"
+          registry="docs/contracts/quill-machine-classes.json"
+          spec_commit="$(
+            sed -n 's/^pub const MACHINE_CLASS_REGISTRY_SPEC_COMMIT: &str = \"\\([0-9a-f]\\{40\\}\\)\";/\\1/p' \
+              "${source_file}"
+          )"
+          expected_blob="$(
+            sed -n 's/^pub const MACHINE_CLASS_REGISTRY_GIT_BLOB: &str = \"\\([0-9a-f]\\{40\\}\\)\";/\\1/p' \
+              "${source_file}"
+          )"
+          expected_sha="$(
+            sed -n '/^pub const MACHINE_CLASS_REGISTRY_SHA256: &str =$/{
+              n
+              s/^    \"\\([0-9a-f]\\{64\\}\\)\";/\\1/p
+            }' "${source_file}"
+          )"
+          test -n "${spec_commit}"
+          test -n "${expected_blob}"
+          test -n "${expected_sha}"
+          test "$(sha256sum "${registry}" | cut -d' ' -f1)" = "${expected_sha}"
+          test "$(git hash-object "${registry}")" = "${expected_blob}"
+          git cat-file -e "${spec_commit}^{commit}"
+          test "$(
+            git ls-tree "${spec_commit}" -- "${registry}" | awk '{print $3}'
+          )" = "${expected_blob}"
 
       - name: Install nightly toolchain
-        uses: dtolnay/rust-toolchain@nightly
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
+        with:
+          toolchain: nightly-2026-07-20
+          components: rustfmt, clippy
 
       - name: Prepare pinned sibling dependencies
         shell: bash
@@ -73,61 +115,53 @@ jobs:
             sed -i -e "s|/data/projects/|${deps_dir}/|g" {} +
 
       - name: Cache Cargo registry and target
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2.9.1
         with:
           shared-key: quill-perf-ratchet-${{ matrix.gate }}
           cache-targets: true
 
-      - name: Measure candidate and same-revision rerun
+      - name: Validate registered-host launcher syntax
         shell: bash
-        env:
-          QUILL_PERF_GATE: ${{ matrix.gate }}
-          QUILL_PERF_GIT_REV: ${{ github.sha }}
-          QUILL_PERF_RUNS: "10"
-          QUILL_PERF_SCALE: ${{ github.event_name == 'pull_request' && 'smoke' || 'full' }}
-          QUILL_PERF_RUN_WINDOW: ${{ github.run_id }}-${{ github.run_attempt }}-${{ matrix.gate }}
+        run: bash -n scripts/perf-runner.sh
+
+      - name: Verify typed profile, plan, and bootstrap contracts
+        shell: bash
         run: |
           set -euo pipefail
-          for pass in candidate rerun; do
-            export QUILL_PERF_RUN_ID="${pass}"
-            export QUILL_PERF_OUTPUT_DIR="${GITHUB_WORKSPACE}/ci_artifacts/quill-perf/${pass}"
-            cargo bench \
-              --profile release-perf \
-              -p frankensearch-quill-gauntlet \
-              --bench perf_matrix \
-              --features perf-harness \
-              -- \
-              --noplot
-          done
+          cargo test \
+            --profile release-perf \
+            -p frankensearch-quill-gauntlet \
+            --lib \
+            perf::tests::profile_plans_cover_the_complete_matrix_and_reject_plan_or_matrix_drift \
+            -- --exact
+          cargo test \
+            --profile release-perf \
+            -p frankensearch-quill-gauntlet \
+            --lib \
+            perf_ratchet::tests::every_committed_unmeasured_placeholder_is_the_exact_current_manifest_sentinel \
+            -- --exact
 
-      - name: Evaluate committed pass-over-pass ratchet
+      - name: Prove hosted rehearsal remains fail-closed
         id: ratchet
         shell: bash
         env:
           QG_GATE: ${{ matrix.gate }}
-          QG_MODE: ${{ github.event_name == 'pull_request' && 'regression-alarm' || 'promotion' }}
+          # Hosted runners have no immutable registered hardware/profile
+          # identity and therefore execute no performance cells. Replaying the
+          # exact unmeasured sentinel as both baseline and candidate must remain
+          # Block or Quarantine. Allow would be a fail-open defect.
+          QG_MODE: regression-alarm
         run: |
           set -euo pipefail
-          history=".bench-history/${QG_GATE}.github-ubuntu.latest.json"
-          if [[ ! -f "${history}" ]]; then
-            history=".bench-history/${QG_GATE}.unmeasured.latest.json"
-          fi
+          history=".bench-history/${QG_GATE}.unmeasured.latest.json"
 
           args=(
             --manifest docs/contracts/quill-perf-gates.toml
             --baseline "${history}"
-            --candidate "ci_artifacts/quill-perf/candidate/${QG_GATE}.json"
-            --rerun "ci_artifacts/quill-perf/rerun/${QG_GATE}.json"
+            --candidate "${history}"
             --output "ci_artifacts/quill-perf/${QG_GATE}.ratchet.json"
             --mode "${QG_MODE}"
           )
-          if [[ "${QG_MODE}" == "promotion" ]]; then
-            args+=(
-              --promote-dir .bench-history
-              --machine-class github-ubuntu
-              --date "$(date -u +%F)"
-            )
-          fi
 
           set +e
           cargo run \
@@ -141,15 +175,16 @@ jobs:
 
           case "${status}" in
             0)
-              echo "decision=allow" >> "${GITHUB_OUTPUT}"
+              echo "hosted structural rehearsal unexpectedly allowed an unmeasured sentinel" >&2
+              exit 1
               ;;
             1)
               echo "decision=block" >> "${GITHUB_OUTPUT}"
-              exit 1
+              echo "::notice::${QG_GATE} unmeasured sentinel correctly blocked"
               ;;
             2)
               echo "decision=quarantine" >> "${GITHUB_OUTPUT}"
-              echo "::warning::${QG_GATE} evidence quarantined; inspect the ratchet artifact"
+              echo "::notice::${QG_GATE} unmeasured sentinel correctly quarantined"
               ;;
             *)
               echo "ratchet invocation failed with status ${status}" >&2
@@ -157,13 +192,13 @@ jobs:
               ;;
           esac
 
-      - name: Upload QG measurements, decision, and history candidate
+      - name: Upload QG fail-closed rehearsal artifacts and decision
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: quill-perf-${{ matrix.gate }}-${{ steps.ratchet.outputs.decision || 'error' }}
           if-no-files-found: error
           retention-days: 30
           path: |
             ci_artifacts/quill-perf/
-            .bench-history/${{ matrix.gate }}.*.json
+            .bench-history/${{ matrix.gate }}.unmeasured.latest.json

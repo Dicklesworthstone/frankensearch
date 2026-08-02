@@ -1,0 +1,63 @@
+{
+  "schema_version": "quill-perf-ratchet-v3",
+  "gate": "Qg2",
+  "mode": "promotion",
+  "gate_activated": false,
+  "decision": "quarantine",
+  "reasons": [
+    {
+      "code": "perf.ratchet.bootstrap_promotion",
+      "message": "an otherwise-Allow promotion will establish the first measured baseline"
+    },
+    {
+      "code": "perf.ratchet.bootstrap_target_missed",
+      "message": "QG-2 single-thread median-ratio CI [0.407935, 0.445484] does not clear 1.5"
+    },
+    {
+      "code": "perf.ratchet.current_reproduction_failed",
+      "message": "current-schema candidate and rerun disagree beyond the predeclared tolerance for QG-2/bulk/medium/1/positions_on/docs_per_second"
+    },
+    {
+      "code": "perf.ratchet.bootstrap_target_missed",
+      "message": "QG-2 single-thread median-ratio CI [0.428744, 0.446829] does not clear 1.5"
+    },
+    {
+      "code": "perf.ratchet.gate_inactive",
+      "message": "QG-2 remains provisional because the normative manifest has activated=false"
+    }
+  ],
+  "comparisons": [],
+  "evidence": [
+    {
+      "role": "manifest",
+      "path": "docs/contracts/quill-perf-gates.toml",
+      "sha256": "68be56bd481ae44433b42b2310fa97352b08483a1f619366be549c20b07ae851"
+    },
+    {
+      "role": "baseline",
+      "path": ".bench-history/QG-2.unmeasured.latest.json",
+      "sha256": "dea65ca784bff9ef47bf2aa2f3bcd511458516a0160a91ab5558081a80c9a85b"
+    },
+    {
+      "role": "candidate",
+      "path": ".bench-history/attempts/2026-07-28/QG-2/qg2-candidate-trj-b083-cpu2-20260728T1932Z/QG-2.json",
+      "sha256": "b5e44b20f183b712250214c4afb6df79ca6a485fa68b81ed0c466b346983262d"
+    },
+    {
+      "role": "rerun",
+      "path": ".bench-history/attempts/2026-07-28/QG-2/qg2-rerun-trj-b083-cpu2-20260728T1933Z/QG-2.json",
+      "sha256": "501912692ac31ccb3096b168515b22b305d43b186fa5e75df6f222b7e023c035"
+    },
+    {
+      "role": "candidate_current",
+      "path": ".bench-history/attempts/2026-07-28/QG-2/qg2-candidate-trj-b083-cpu2-20260728T1932Z/QG-2.evidence.json",
+      "sha256": "706b08274c1a8a137c8bd4d245f80834b85002948e40edfeb73e300ff6fc273b"
+    },
+    {
+      "role": "rerun_current",
+      "path": ".bench-history/attempts/2026-07-28/QG-2/qg2-rerun-trj-b083-cpu2-20260728T1933Z/QG-2.evidence.json",
+      "sha256": "277baf01616079e5354440eedca1095b14e066cc320cc4739be598a27ba29be5"
+    }
+  ],
+  "history_updates": []
+}

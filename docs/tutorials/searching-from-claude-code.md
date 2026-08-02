@@ -8,6 +8,10 @@ This tutorial shows a minimal pattern for using `fsfs` from an agent workflow.
 fsfs index /data/projects/frankensearch
 ```
 
+The command is one-shot and returns after publishing the generation, which
+makes it safe for an agent subprocess to await. Use `fsfs watch <path>` only in
+a deliberately supervised long-running session.
+
 ## 2) Use stream mode for agent-friendly output
 
 `jsonl` is the easiest format for incremental parsing:

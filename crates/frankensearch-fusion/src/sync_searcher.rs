@@ -44,11 +44,14 @@ pub trait SyncLexicalSearch: Send + Sync {
 /// [`SyncLexicalSearch`] receives only the semantic query vector, so the text
 /// query and its structured-concurrency context are carried explicitly by this
 /// adapter. Quill's reader path is synchronous and lock-free; `search_sync`
-/// therefore never creates a runtime or blocks on an async operation.
+/// therefore never creates a runtime or blocks on an async operation. The
+/// adapter accepts only a [`frankensearch_quill::QuillSearchIndex`], so a
+/// synchronous search consumer cannot retain Quill's writer lease or mutation
+/// surface.
 #[cfg(feature = "quill")]
 #[derive(Clone)]
 pub struct QuillSyncLexicalSearch {
-    index: Arc<frankensearch_quill::QuillIndex>,
+    index: Arc<frankensearch_quill::QuillSearchIndex>,
     cx: asupersync::Cx,
     query: Arc<str>,
 }
@@ -58,7 +61,7 @@ impl QuillSyncLexicalSearch {
     /// Bind a Quill index to one consumer-owned request context and text query.
     #[must_use]
     pub fn new(
-        index: Arc<frankensearch_quill::QuillIndex>,
+        index: Arc<frankensearch_quill::QuillSearchIndex>,
         cx: asupersync::Cx,
         query: impl Into<Arc<str>>,
     ) -> Self {
@@ -468,7 +471,7 @@ impl SyncTwoTierSearcher {
         // Typed zero-signal classification (bd-tqhc): an empty semantic lane
         // must carry why. Lazy — the non-empty path pays nothing.
         metrics.zero_signal = if fast_hits.is_empty() {
-            self.classify_fast_empty(query_vec, fetch, filter)
+            Some(self.classify_fast_empty(query_vec, fetch, filter))
         } else {
             None
         };
@@ -533,8 +536,11 @@ impl SyncTwoTierSearcher {
         }
 
         if self.config.fast_only || !self.index.has_quality_index() {
+            // Same vocabulary as the async searcher (searcher.rs) — the two
+            // sides share one skip_reason contract; "fast_only" is the string
+            // the fsfs surfaces document (bd-k3089 parity suite pins this).
             metrics.skip_reason = Some(if self.config.fast_only {
-                "fast_only_enabled".to_owned()
+                "fast_only".to_owned()
             } else {
                 "quality_index_unavailable".to_owned()
             });
@@ -691,17 +697,17 @@ impl SyncTwoTierSearcher {
         query_vec: &[f32],
         fetch: usize,
         filter: Option<&dyn SearchFilter>,
-    ) -> Option<ZeroSignalReason> {
+    ) -> ZeroSignalReason {
         // Request-scoped conditions take precedence over index state, in the
         // order documented on `ZeroSignalReason`.
         if fetch == 0 {
-            return Some(ZeroSignalReason::CallerRequestedZeroK);
+            return ZeroSignalReason::CallerRequestedZeroK;
         }
         if query_vec.iter().any(|value| !value.is_finite()) {
-            return Some(ZeroSignalReason::NonFiniteQuery);
+            return ZeroSignalReason::NonFiniteQuery;
         }
         if query_vec.iter().all(|&value| value == 0.0) {
-            return Some(ZeroSignalReason::ZeroNormQuery);
+            return ZeroSignalReason::ZeroNormQuery;
         }
         // State-scoped reasons come from the index census rather than from a
         // second search. Re-scanning would cost a full extra pass on a path
@@ -710,12 +716,10 @@ impl SyncTwoTierSearcher {
         // the two can disagree, which would leave an empty result carrying
         // no reason at all. The census cannot disagree with itself, and
         // always yields a reason.
-        Some(
-            self.index
-                .fast_index()
-                .zero_signal_state()
-                .empty_result_reason(filter.is_some()),
-        )
+        self.index
+            .fast_index()
+            .zero_signal_state()
+            .empty_result_reason(filter.is_some())
     }
 }
 
@@ -1360,20 +1364,23 @@ mod tests {
 
     #[cfg(feature = "quill")]
     #[test]
-    fn quill_sync_adapter_carries_query_context_and_maps_cancellation() {
+    fn quill_sync_adapter_is_read_only_and_maps_cancellation() {
         use frankensearch_core::IndexableDocument;
-        use frankensearch_quill::{QuillConfig, QuillIndex};
+        use frankensearch_quill::{QuillConfig, QuillIndex, QuillSearchIndex};
 
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             fn assert_send_sync<T: Send + Sync>() {}
             assert_send_sync::<QuillSyncLexicalSearch>();
 
-            let quill = QuillIndex::in_memory(QuillConfig {
+            let directory = tempfile::tempdir().expect("Quill fixture directory");
+            let config = QuillConfig {
                 deterministic_ingest: true,
                 ..QuillConfig::default()
-            })
-            .expect("create in-memory Quill index");
-            quill
+            };
+            let writer = QuillIndex::create(&cx, directory.path(), config.clone())
+                .await
+                .expect("create durable Quill writer");
+            writer
                 .index_documents(
                     &cx,
                     &[IndexableDocument::new(
@@ -1383,9 +1390,19 @@ mod tests {
                 )
                 .await
                 .expect("index Quill fixture");
-            quill.commit(&cx).await.expect("commit Quill fixture");
+            writer.commit(&cx).await.expect("commit Quill fixture");
+            drop(writer);
 
-            let quill = Arc::new(quill);
+            let quill = Arc::new(
+                QuillSearchIndex::open(&cx, directory.path(), config.clone())
+                    .await
+                    .expect("open read-only Quill search handle"),
+            );
+            let reopened_writer = QuillIndex::open(&cx, directory.path(), config)
+                .await
+                .expect("read-only search handle must not retain the writer lease");
+            drop(reopened_writer);
+
             let lexical = Arc::new(QuillSyncLexicalSearch::new(
                 Arc::clone(&quill),
                 cx.clone(),

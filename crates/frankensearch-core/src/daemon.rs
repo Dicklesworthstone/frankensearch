@@ -140,6 +140,9 @@ pub enum DaemonOperationV1 {
     Embed,
     /// An ordered embedding batch.
     EmbedBatch,
+    /// An ordered rerank batch: input 0 is the query, the remainder are the
+    /// documents. The response is one score row of `input_count - 1` scores.
+    Rerank,
 }
 
 impl DaemonOperationV1 {
@@ -149,6 +152,7 @@ impl DaemonOperationV1 {
             Self::Health => 2,
             Self::Embed => 3,
             Self::EmbedBatch => 4,
+            Self::Rerank => 5,
         }
     }
 }
@@ -314,6 +318,8 @@ impl DaemonChallengeV1 {
             DaemonOperationV1::Handshake | DaemonOperationV1::Health => self.input_count == 0,
             DaemonOperationV1::Embed => self.input_count == 1,
             DaemonOperationV1::EmbedBatch => self.input_count > 0,
+            // Query plus at least one document.
+            DaemonOperationV1::Rerank => self.input_count >= 2,
         };
         if self.schema_version != DAEMON_CHALLENGE_SCHEMA_V1
             || !is_canonical_sha256(&self.request_nonce)
@@ -394,12 +400,13 @@ impl DaemonEmbeddingAttestationV1 {
             return Err(DaemonError::UnverifiableRemoteSpace);
         }
         validate_response_shape(&challenge, &connection, vectors)?;
+        let vector_dimension = expected_attested_dimension(&challenge, &connection)?;
         Ok(Self {
             schema_version: DAEMON_ATTESTATION_SCHEMA_V1,
             challenge,
             vector_count: u32::try_from(vectors.len())
                 .map_err(|_| DaemonError::UnverifiableRemoteSpace)?,
-            vector_dimension: connection.embedding_identity.space.dimension,
+            vector_dimension,
             response_payload_sha256: daemon_embedding_payload_sha256(vectors),
             connection,
             signature_hmac_sha256: String::new(),
@@ -464,7 +471,7 @@ impl DaemonEmbeddingAttestationV1 {
             || self.challenge.expected_connection_fingerprint != expected_connection.fingerprint()
             || self.vector_count
                 != u32::try_from(vectors.len()).map_err(|_| DaemonError::UnverifiableRemoteSpace)?
-            || self.vector_dimension != expected_connection.embedding_identity.space.dimension
+            || self.vector_dimension != expected_attested_dimension(challenge, expected_connection)?
             || self.response_payload_sha256 != daemon_embedding_payload_sha256(vectors)
         {
             return Err(DaemonError::UnverifiableRemoteSpace);
@@ -477,13 +484,14 @@ impl DaemonEmbeddingAttestationV1 {
         self.connection.validate()?;
         let expected_vector_count = match self.challenge.operation {
             DaemonOperationV1::Handshake | DaemonOperationV1::Health => 0,
-            DaemonOperationV1::Embed => 1,
+            DaemonOperationV1::Embed | DaemonOperationV1::Rerank => 1,
             DaemonOperationV1::EmbedBatch => self.challenge.input_count,
         };
         if self.schema_version != DAEMON_ATTESTATION_SCHEMA_V1
             || self.challenge.expected_connection_fingerprint != self.connection.fingerprint()
             || self.vector_count != expected_vector_count
-            || self.vector_dimension != self.connection.embedding_identity.space.dimension
+            || self.vector_dimension
+                != expected_attested_dimension(&self.challenge, &self.connection)?
             || !is_canonical_sha256(&self.response_payload_sha256)
         {
             return Err(DaemonError::UnverifiableRemoteSpace);
@@ -633,6 +641,22 @@ pub trait DaemonClient: Send + Sync {
         Err(DaemonError::UnverifiableRemoteSpace)
     }
 
+    /// Rerank an ordered document batch against a query and return a
+    /// producer-authenticated response envelope holding exactly one score row
+    /// of `documents.len()` scores.
+    ///
+    /// The challenge's ordered inputs are the query followed by the documents
+    /// (`DaemonOperationV1::Rerank`). The fail-closed default makes a
+    /// legacy/raw client ineligible for verified rerank paths.
+    fn rerank_attested(
+        &self,
+        _query: &str,
+        _documents: &[&str],
+        _challenge: &DaemonChallengeV1,
+    ) -> Result<AttestedDaemonEmbeddingResponseV1, DaemonError> {
+        Err(DaemonError::UnverifiableRemoteSpace)
+    }
+
     /// Raw unverified inference primitive.
     ///
     /// This may only be exposed through an explicit transient assumed-mode
@@ -693,6 +717,25 @@ pub fn daemon_embedding_payload_sha256(vectors: &[Vec<f32>]) -> String {
     sha256_hex(&bytes)
 }
 
+/// Expected per-row length of an attested response: the embedding dimension
+/// for embed operations, `input_count - 1` scores for a rerank (input 0 is the
+/// query, which receives no score).
+fn expected_attested_dimension(
+    challenge: &DaemonChallengeV1,
+    connection: &DaemonConnectionIdentityV1,
+) -> Result<u32, DaemonError> {
+    match challenge.operation {
+        DaemonOperationV1::Rerank => challenge
+            .input_count
+            .checked_sub(1)
+            .ok_or(DaemonError::UnverifiableRemoteSpace),
+        DaemonOperationV1::Handshake
+        | DaemonOperationV1::Health
+        | DaemonOperationV1::Embed
+        | DaemonOperationV1::EmbedBatch => Ok(connection.embedding_identity.space.dimension),
+    }
+}
+
 fn validate_response_shape(
     challenge: &DaemonChallengeV1,
     connection: &DaemonConnectionIdentityV1,
@@ -700,17 +743,20 @@ fn validate_response_shape(
 ) -> Result<(), DaemonError> {
     let expected_count = match challenge.operation {
         DaemonOperationV1::Handshake | DaemonOperationV1::Health => 0,
-        DaemonOperationV1::Embed => 1,
+        DaemonOperationV1::Embed | DaemonOperationV1::Rerank => 1,
         DaemonOperationV1::EmbedBatch => challenge.input_count,
     };
     let observed_count =
         u32::try_from(vectors.len()).map_err(|_| DaemonError::UnverifiableRemoteSpace)?;
-    let dimension = usize::try_from(connection.embedding_identity.space.dimension)
+    let row_len = usize::try_from(expected_attested_dimension(challenge, connection)?)
         .map_err(|_| DaemonError::UnverifiableRemoteSpace)?;
+    // A rerank score row may legitimately be all zeros; embedding vectors must
+    // carry signal in every row.
+    let requires_nonzero = challenge.operation != DaemonOperationV1::Rerank;
     let vectors_valid = vectors.iter().all(|vector| {
-        vector.len() == dimension
+        vector.len() == row_len
             && vector.iter().all(|value| value.is_finite())
-            && vector.iter().any(|value| *value != 0.0)
+            && (!requires_nonzero || vector.iter().any(|value| *value != 0.0))
     });
     if observed_count != expected_count || !vectors_valid {
         return Err(DaemonError::UnverifiableRemoteSpace);

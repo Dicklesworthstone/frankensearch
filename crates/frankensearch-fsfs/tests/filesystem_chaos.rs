@@ -538,7 +538,9 @@ fn default_filesystem_chaos_bundle_set_has_required_artifacts_and_reasons() {
 fn replay_guidance_uses_filesystem_harness_for_chaos_scenarios() {
     for scenario in default_cli_e2e_filesystem_chaos_scenarios() {
         let replay = replay_command_for_scenario(&scenario);
-        assert!(replay.contains("cargo test -p frankensearch-fsfs --test filesystem_chaos"));
+        assert!(replay.contains(
+            "cargo test -p frankensearch-fsfs --features embedded-models --test filesystem_chaos"
+        ));
         assert!(replay.contains("-- --nocapture --exact scenario_"));
     }
 }

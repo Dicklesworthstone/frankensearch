@@ -7182,3 +7182,1356 @@ KEEP gate failed. Shipping therefore retains
 retained E4.4 pruning path. Full command, binary SHA-256, p5–p95 provenance,
 absolute timings, invalid-harness attempts, and the concrete retry predicate
 are recorded in `docs/NEGATIVE_EVIDENCE.md`.
+
+## 2026-07-28 — QG-2 MISS: single-thread indexing is 0.1087x Tantivy 0.26.1 (`bd-h6eh`, FoggySquirrel)
+
+**Comparison class: INCUMBENT. Actual legacy incumbent: Tantivy 0.26.1.**
+One strict-remote full-scale invocation at clean revision
+`9fc478e5fed15f3fd4b9079b42d42ca53acf66c2` interleaved 80 Quill/Tantivy A/B
+pairs and 80 Tantivy/Tantivy A/A pairs on
+`bulk/medium/1/positions_on`. Executing ELF SHA-256 was
+`d32f54eef6028f0ad8b0fb3714fb51f53432e3dd1bc2a6c92dc3fc100590c5d6`.
+
+Quill measured 22,186.53 docs/s and Tantivy measured 200,495.69 docs/s. The
+paired Quill/Tantivy median was **0.108698** with 95% CI
+**[0.107024, 0.111538]**; the same-invocation A/A median was **0.993436** with
+95% CI **[0.980159, 1.019927]**. The evidence cell is valid and eligible for a
+decision, but it misses the >=1.5x target. QG-2 therefore remains inactive and
+the sealed run is retained as an attempt, not promoted as a baseline.
+
+Do not rerun the unchanged path. Retry only after an exact-fixture profile and
+counted mechanism demonstrate enough Amdahl headroom to close the 13.8x target
+gap plus at least a 10x reduction in whole-operation cycles or instructions
+per document with indexed-byte and query-result parity. Full artifacts and
+seal are recorded in `docs/NEGATIVE_EVIDENCE.md`.
+
+## 2026-07-28 — QG-2 REPRODUCTION HOLD: valid rerun exceeds the predeclared 2% delta (`bd-h6eh`, FoggySquirrel)
+
+The required independent rerun used the same clean revision, exact ELF
+SHA-256, `ovh-a` worker, run window, full-scale fixture, and 80-pair protocol as
+the QG-2 candidate. Its Quill/Tantivy paired median was **0.112106** with 95%
+CI **[0.110907, 0.114173]** and its Tantivy/Tantivy A/A median was **1.001282**
+with 95% CI **[0.992489, 1.011084]**. The cell itself is valid, with evidence
+seal `6138b07c0e2da7d241a9def38bb88473d5958cd6f01879009c426a0e3069f9c6`.
+
+The candidate and rerun paired-log centers differ by **0.030869**, exceeding
+the artifact's predeclared `max_reproduction_delta_log = 0.019803`. This does
+not reverse the QG-2 MISS, but it prevents promotion of that pair as the real
+baseline. Gate activation remains pending a reproducible pair.
+
+This is a reproduction retry, not permission to reopen the unchanged indexing
+lever. Retry only with a new candidate/rerun pair from one exact ELF on one
+quiet worker and accept it only when both A/A controls are valid and the paired
+log centers satisfy the predeclared 2% reproduction bound. The performance
+lever itself retains the profile-plus-counted-mechanism retry predicate above.
+
+## 2026-07-28 — QG-3 INVALID-NULL: two complete watch-mode attempts make no claim (`bd-h6eh`, FoggySquirrel)
+
+Two same-invocation Tantivy-oracle matrices were preserved rather than promoted:
+a 10-pair diagnostic run on `vmi1149989` and an 80-pair full run on
+`vmi1152480`. Both used revision
+`96e8bf49ccbcb7fe7478f42dbbf169666dd2b4cd` and exact ELF SHA-256
+`54d94df4dbc2223cbb28f604396a6de32a6a19a349f010085c34da6f538aebbb`.
+Every required QG-3 cell was `invalid_null`; the 80-pair run's A/A log-MAD
+ranged from **0.117303** to **0.153406**, above the predeclared **0.048790**
+limit. Its apparent update-to-searchable ratios of **2.524324** in-process and
+**2.076067** fresh-process are therefore not gate numbers.
+
+No QG-3 PASS or MISS follows from these attempts. Retry only on a quiet worker
+with the same-invocation A/A+A/B protocol; require every required cell to pass
+the null center, CI-width, dispersion, order, and drift laws before comparing
+the median CI with the 4x target. The preserved attempts are detailed in
+`docs/NEGATIVE_EVIDENCE.md`.
+
+## 2026-07-28 — QG-6 INVALID-HARNESS: single-search samples and a truncated native-tie envelope make no claim (`bd-h6eh`, FoggySquirrel)
+
+A full-scale prepared-query attempt on `vmi1152480` used clean revision
+`d2458e59a76a611bb5c3ffe940ad57dee9d14a70` and exact executable SHA-256
+`db1ee59eb3f7df5b8a103a0d683503bb92634ef793e117daca53820a999d770e`.
+The first three cells carried same-invocation Tantivy/Tantivy A/A controls, but
+their 95% intervals were respectively `[0.743538, 1.747614]`,
+`[0.595198, 1.203728]`, and `[0.498653, 1.345124]`; none was admissible.
+
+The following `query/identifier/k100/1m` preflight agreed through rank 13 and
+then reported rank 14 inside a BM25 tie larger than the 100,000-document
+native-tie expansion. The run stopped before sealing artifacts. Its apparent
+Quill/Tantivy latency ratios are not gate numbers and support neither PASS nor
+MISS.
+
+Retry only after an exact new ELF (1) proves the complete 1M-document native
+tie at the failing fixture and (2) derives each query p50 from a fixed,
+lifecycle-counted subsample of individually timed searches whose same-run A/A
+passes the predeclared median-CI laws. Then run and reproduce all 20 normative
+QG-6 cells; CV remains provenance only.
+
+## 2026-07-28 — QG-2 INVALID-NULL: quiet 10-vCPU EPYC reroute is not gate evidence (`bd-h6eh`, FoggySquirrel)
+
+An 80-pair candidate on `vmi1152480` used revision
+`d2458e59a76a611bb5c3ffe940ad57dee9d14a70` and exact ELF SHA-256
+`db1ee59eb3f7df5b8a103a0d683503bb92634ef793e117daca53820a999d770e`.
+Its same-invocation Tantivy/Tantivy A/A center was **0.940816** with 95% CI
+**[0.870175, 0.991807]**, log-MAD `0.153567`, and log drift `0.097864`.
+Because the control excludes identity and fails four predeclared null laws,
+the apparent `0.221193` Quill/Tantivy ratio is not a QG-2 number.
+
+The sealed no-claim attempt is retained under
+`.bench-history/attempts/2026-07-28/QG-2/qg2-candidate-r3-20260728T1049Z/`.
+Retry only with a candidate/rerun pair from this exact ELF on one quiet
+16-thread Zen3 worker, admitting both A/A controls and requiring paired-log
+reproduction delta at most `0.0198026273`. The performance lever itself remains
+closed until the existing profile-plus-counted-mechanism predicate is met.
+
+## 2026-07-28 — QG-3 EXECUTION FAILURE: 16 GiB remote tmpfs exhausted (`bd-h6eh`, FoggySquirrel)
+
+The `ovh-b` full-scale reroute from revision
+`96e8bf49ccbcb7fe7478f42dbbf169666dd2b4cd` and ELF
+`54d94df4dbc2223cbb28f604396a6de32a6a19a349f010085c34da6f538aebbb`
+stopped after three cells when Tantivy's writer worker encountered an I/O
+error. `/tmp` was a 16 GiB tmpfs at 100% usage and zero free bytes, while the
+persistent root filesystem retained 97 GiB. No complete or sealed artifact was
+emitted, so the partial ratios support no decision.
+
+Retry only after the selected `QUILL_PERF_SCRATCH_DIR` is proven to reside on a
+persistent non-tmpfs filesystem with at least 120 GiB free. Require all five
+cells, valid same-run A/A controls, and a sealed artifact; otherwise preserve
+the attempt as execution diagnostics only.
+
+## 2026-07-28 — QG-2 INVALID-NULL: Zen3 reproduction excludes identity (`bd-h6eh`, FoggySquirrel)
+
+An 80-pair candidate and immediate reproduction on quiet 16-thread Zen3
+worker `ovh-a` used revision
+`d2458e59a76a611bb5c3ffe940ad57dee9d14a70`, exact ELF SHA-256
+`db1ee59eb3f7df5b8a103a0d683503bb92634ef793e117daca53820a999d770e`,
+and same-invocation Tantivy 0.26.1 A/A plus Quill/Tantivy A/B arms.
+
+The candidate was admissible: A/A **1.007384 [0.997673, 1.016251]** and
+apparent effect **0.114468 [0.113013, 0.115198]**. The reproduction was
+`INVALID-NULL`: A/A **0.987888 [0.976918, 0.998038]**, excluding identity.
+Its apparent `0.116139 [0.114059, 0.118162]` effect supports no gate verdict.
+The sealed artifacts are retained under the QG-2 2026-07-28 attempt tree.
+
+Because three QG-2 evidence routes in this sequence have now failed admission
+or reproduction and `a70977d727a938de73c6355366f3f635df3ca5dd` changed the
+indexing hot path, do not resample this Zen3/source pair. Retry only with one
+exact current-main ELF on a quiet 16-core Genoa worker; both candidate and
+rerun must independently pass every null law and remain within paired-log
+reproduction delta `0.0198026273`.
+
+## 2026-07-28 — QG-3 INVALID-NULL: every cell fails the VPS noise floor (`bd-h6eh`, FoggySquirrel)
+
+A complete 80-pair full-scale run on 8-vCPU EPYC worker `vmi1156319` used
+revision `96e8bf49ccbcb7fe7478f42dbbf169666dd2b4cd`, exact ELF SHA-256
+`54d94df4dbc2223cbb28f604396a6de32a6a19a349f010085c34da6f538aebbb`,
+and same-invocation Tantivy 0.26.1 A/A plus Quill/Tantivy A/B arms.
+
+All five required nulls were invalid. Their log-MAD values ranged from
+`0.124731` to `0.212927` against a `0.048790` limit, with additional order and
+drift failures. The apparent in-process `3.117017 [2.991030, 3.256942]` and
+fresh-process `2.460239 [2.366650, 2.593945]` update-to-searchable ratios are
+not gate numbers. Seal
+`699a2d21ec4e5e6d21511e36c6e53c5b633d5199f0c2315388d62ddaab5e674b`
+is retained under the QG-3 2026-07-28 attempt tree.
+
+After three VPS/noise failures, switch veins. Retry only on a quiet physical
+16-thread Zen3 worker with current exact ELF
+`d7396f0c236cb6da7cb4bed4f461928de1cbc5b55f6a756f6f10433f11947182`,
+persistent scratch with at least 120 GiB free, and 10 pairs per cell. Require
+all five A/A controls and an immediate same-ELF reproduction to admit before
+evaluating the 4x target; never weaken the log-MAD law or gate on CV.
+
+## 2026-07-28 — QG-5 EXECUTION FAILURE: 8-vCPU route was SIGKILLed before sealing (`bd-h6eh`, FoggySquirrel)
+
+The full three-cell 1M-document compaction candidate
+`qg5-candidate-r1-20260728T0810Z` ran on `vmi1264463` from revision
+`96e8bf49ccbcb7fe7478f42dbbf169666dd2b4cd` and exact executing ELF SHA-256
+`54d94df4dbc2223cbb28f604396a6de32a6a19a349f010085c34da6f538aebbb`.
+The strict-remote invocation remained active for `16,181,625 ms` before the
+remote process received `SIGKILL` and exited 137. It emitted no complete cell,
+gate artifact, or evidence seal. Post-failure kernel logs exposed no OOM
+record, so the kill source is not inferred.
+
+No QG-5 ratio or PASS/MISS follows from this execution failure. Retry only by
+switching away from the 8-vCPU/29-GiB VPS route: run the exact current ELF
+directly on a quiet certified host with at least 60 GiB RAM and persistent
+scratch with at least 120 GiB free, so the measurement is not subject to the
+remote-build job lifetime. Require all three density cells, valid
+same-invocation Tantivy/Tantivy A/A controls, a sealed candidate, and an
+immediate same-ELF reproduction before evaluating the 5x target.
+
+## 2026-07-28 — QG-3 INVALID-NULL: physical Zen3 route became contaminated (`bd-h6eh`, FoggySquirrel)
+
+The prescribed worker-family switch completed all five QG-3 cells on physical
+16-thread Zen3 host `fmd` from revision
+`966958a19fa050054ebe095cbd3f30c2f1572e1d` and exact executing ELF SHA-256
+`f9ab1cd946742357ce172f9d28829052129b702011c70a5e1117a2b300d93c00`.
+The invocation used the actual Tantivy 0.26.1 incumbent, a Tantivy/Tantivy A/A
+control, persistent scratch with 183 GiB free, and 10 paired blocks per cell.
+
+Only the initial-ingest null admitted. The other four cells failed the
+predeclared null laws: both in-process cells exceeded the A/A median-CI width
+limit, while the fresh-process cells also exposed dispersion, order, or drift
+failures. Host load rose from `0.52` to `9.97` during the run. Apparent
+in-process and fresh-process update-to-searchable ratios of `2.047944
+[1.709623, 2.242787]` and `1.927117 [1.813852, 2.127288]` are therefore not
+gate numbers.
+
+No QG-3 PASS or MISS follows. The sealed invalid artifact is retained under
+`.bench-history/attempts/2026-07-28/QG-3/qg3-candidate-final-20260728T1344Z/`
+with seal
+`fbec09ce49313d68c04534fa9f59ded3788a97d330b023f0d7379237ae0b3c9f`.
+
+This physical-host route satisfies the prior retry predicate but refutes its
+noise assumption. Switch veins again: retry on the quiet 32-core Zen3
+reference host with the same exact ELF and persistent scratch, and require all
+five same-invocation A/A controls to admit before starting a reproduction or
+evaluating the 4x target. Do not resample `fmd`, weaken a null law, or gate on
+CV.
+
+## 2026-07-28 — QG-5 INVALID-HARNESS: declared persistent scratch was not used (`bd-h6eh`, FoggySquirrel)
+
+A live pre-admission audit of direct physical-host candidate
+`qg5-candidate-final-20260728T1405Z` found that exact executing ELF SHA-256
+`f9ab1cd946742357ce172f9d28829052129b702011c70a5e1117a2b300d93c00`
+reported
+`QUILL_PERF_SCRATCH_DIR=/data/tmp/qg-activation-foggysquirrel-20260728/scratch`,
+but its open 1M-document Quill fixture was actually
+`/tmp/qg5-quill-*/seg-*.fslx`. `findmnt -T /tmp` identified that location as a
+32 GiB tmpfs. Static adjudication confirmed that both QG-5 arms used
+`tempfile::Builder::tempdir()` and bypassed the declared scratch helper.
+
+The invocation was left to finish rather than terminated mid-write. It sealed
+all three densities, but every same-invocation null was independently invalid:
+5% failed CI width at `0.993856 [0.865454, 1.003710]`; 20% failed dispersion
+at `1.023046 [0.969285, 1.073249]`; and 50% failed CI width plus dispersion at
+`0.995314 [0.902538, 1.100319]`. The apparent Quill/Tantivy wall ratios
+`81.227867`, `73.780321`, and `61.455389` are non-claims.
+
+No QG-5 ratio or PASS/MISS follows from this route: its storage provenance
+does not describe the filesystem that carried the measured fixtures, and no
+required A/A control admitted. Evidence JSON SHA-256
+`7df4266455f62f4a6415a943c58175c3f7e0da549adca2ff1aad90848ff43aee`
+with embedded seal
+`1b2e36cddbf1d36d81a42c68caa6f8b103cf48d8df9a757dcc8bc08af63d9354`
+is retained under
+`.bench-history/attempts/2026-07-28/QG-5/qg5-candidate-final-20260728T1405Z/`.
+
+The harness now creates both QG-5 arm directories with
+`tempdir_in(scratch_root())`. Retry only from a newly built, self-hashing exact
+ELF on the quiet 32-core reference host, with the declared scratch root on a
+persistent filesystem with at least 120 GiB free. Before admitting the
+candidate, verify from the live process that an open `qg5-{quill,tantivy}-*`
+fixture is below that exact root; then require all three A/A controls and an
+immediate same-ELF reproduction before evaluating the 5x target.
+
+## 2026-07-28 — QG-6 EXECUTION FAILURE: expanded oracle evidence redefined native top-k (`bd-h6eh`, FoggySquirrel)
+
+Full-scale candidate `qg6-candidate-final-20260728T1353Z` ran on the quiet
+32-core reference host from revision
+`966958a19fa050054ebe095cbd3f30c2f1572e1d` and exact executing ELF SHA-256
+`f9ab1cd946742357ce172f9d28829052129b702011c70a5e1117a2b300d93c00`.
+It used the linked Tantivy 0.26.1 incumbent, four independently populated arms
+per fixture, and same-invocation Tantivy/Tantivy A/A controls. After completing
+10 of 20 required fixtures, the first natural-language `k=100` preflight
+stopped with exit 101 before any artifact could be sealed:
+`AdapterFailure { phase: Preflight, arm: NullLeft, query_id:
+"naturallanguage-0", error_sha256:
+"5278b0954f07e15ab4ae302a7dc2b4113fd287e7198fc22d5ae20f1d21730459",
+error_bytes: 70 }`.
+
+The hash resolves exactly to `Tantivy native timed query disagrees with its
+tie-evidence observation`. Source adjudication found that the timed arm used
+Tantivy's shipping `TopDocs`-only top-k path, while
+`oracle_observe_query` populated its nominal native hits from a larger
+`(TopDocs, Count)` collection. A larger/count-paired collector can select a
+different exact-score cutoff-tie member or score-accumulation path, so the
+evidence query had incorrectly been allowed to redefine the incumbent result.
+This is an oracle self-consistency defect, not a Quill/Tantivy mismatch.
+
+No QG-6 ratio or PASS/MISS follows. The ten printed partial cells are
+diagnostic-only because the normative 20-cell gate did not complete and no
+candidate artifact exists.
+
+The repair preserves `oracle_observe_query.hits` from the exact shipping
+`TopDocs`-only path, builds expanded cutoff-tie evidence with a second
+`TopDocs`-only collection, and obtains exact match count from an independent
+`Count` query.
+
+Retry only from a newly built, self-hashing exact ELF containing that repair.
+First require the focused natural-language `k=100` preflight to establish that
+the oracle's native `(doc_id, score_bits)` rows equal `search_doc_ids`; then
+run all 20 full-scale fixtures at the 10-pair minimum on the quiet 32-core
+reference host. Admit a gate result only if every same-invocation A/A control
+passes and an immediate same-ELF reproduction completes; never promote the
+ten-cell partial output.
+
+## 2026-07-28 — QG-3 INVALID-NULL: 32-core 5975WX route fails two controls (`bd-h6eh`, FoggySquirrel)
+
+Full-scale candidate `qg3-candidate-final2-20260728T1532Z` completed all five
+required cells on the 32-core Threadripper PRO 5975WX host from revision
+`966958a19fa050054ebe095cbd3f30c2f1572e1d` and exact executing ELF SHA-256
+`f9ab1cd946742357ce172f9d28829052129b702011c70a5e1117a2b300d93c00`.
+It used the actual linked Tantivy 0.26.1 incumbent, same-invocation
+Tantivy/Tantivy A/A, 10 paired blocks per cell, and a clean build identity.
+The machine receipt recorded 64 logical CPUs, `powersave` governor, and load
+average `1.99` at start / `4.14` at end.
+
+Three cells admitted, but two did not:
+
+- initial ingest: A/A log-MAD `0.060301` exceeded `0.048790`, and drift
+  `0.097409` exceeded `0.048790`;
+- in-process update throughput: A/A center `-0.070367` with log-CI
+  `[-0.115867,-0.006122]`, CI half-width `0.115867`, and order effect
+  `-0.050491` each failed their predeclared law.
+
+The valid in-process and fresh-process update-to-searchable A/B ratios were
+respectively `1.989707 [1.870255,2.111947]` and
+`1.245745 [1.210001,1.295709]` Quill/Tantivy, but they are not QG-3 gate
+numbers because the required gate is indivisible.
+
+No QG-3 PASS or MISS follows. Artifact
+`1f0b5a5d313e4bdb02f2fc149d6d41ba93e73acc5ebd0b0e05c7fce828f12f4b`
+is retained under
+`.bench-history/attempts/2026-07-28/QG-3/qg3-candidate-final2-20260728T1532Z/`.
+
+Close the 5975WX/powersave vein. Retry only after switching to the isolated
+Threadripper PRO 5995WX host with its `performance` governor, after its natural
+maintenance sweep and the already-prioritized QG-2 pair complete. Preserve the
+exact `f9ab…` ELF and 10-pair minimum; require all five A/A controls to admit,
+then start one immediate same-window reproduction. Do not resample this host,
+change its governor, weaken a null law, or gate on CV.
+
+## 2026-07-28 — QG-6 INVALID-PROVENANCE/EXECUTION: Quill count collector redefined native top-k (`bd-h6eh`, FoggySquirrel)
+
+Filtered diagnostic `qg6-natural-k100-preflight-20260728T1603Z` ran exact ELF
+SHA-256
+`5085f4769031e40eddefdd1d7b2791c42a63f6f683b588a52984d5a94858804d`
+(76,695,704 bytes), with the linked Tantivy 0.26.1 incumbent, on only
+`query/naturallanguage/k100/100k`. The incomplete selection was diagnostic by
+construction and could not support a gate claim.
+
+The command supplied the wrong Git identity
+`3ef37beba8c257d13e9ab320e4d80d00a17e5c2e`; the ELF was actually built from
+`3ef37beb9d2057940897fe7891480255fa4c9596`. Preflight also stopped before any
+paired sample or A/A control with exit 101:
+`AdapterFailure { phase: Preflight, arm: EffectTreatment, query_id:
+"naturallanguage-0", error_sha256:
+"0728a6e7101cbcf065ef0de045870718ee3b7bace6b06e1ac302ee5a86e5cb42",
+error_bytes: 68 }`. That digest is exactly `Quill native timed query disagrees
+with its tie-evidence observation`.
+
+The shipping Quill top-k is count-free, but the evidence adapter had required
+it to equal a second execution with exact counting enabled. Exact counting
+changes the scorer/collector mode and, at a large exact-score cutoff tie, may
+select a different native tie member. This is another harness
+self-consistency defect: the count query may supply count facts, but it may not
+redefine the native result whose latency and rank are compared.
+
+No QG-6 number follows and no artifact sealed. The repair retains the exact
+count-free native hits and runs a separate zero-limit exact-count query solely
+for `total_count` and `doc_count`.
+
+Retry from a newly built exact ELF containing that repair and supply the exact
+full source revision. Require the same filtered natural-language `k=100`,
+100k-document preflight to pass all four independently populated arms before
+timing. A complete gate run still requires all 20 normative cells, every
+same-invocation A/A control, and an immediate same-ELF reproduction on a quiet
+reference host.
+
+## 2026-07-28 — QG-6 INVALID-SEMANTIC-PREFLIGHT: one-ULP cross-engine score drift (`bd-h6eh`, FoggySquirrel)
+
+Filtered, non-promotable diagnostic
+`qg6-natural-k100-preflight-020b6ce0-20260728T1625Z` ran source revision
+`020b6ce0e507cb759b16718fe65987b70c288391` from exact self-reporting ELF
+SHA-256
+`92e43957ea91a60d0504897edfcb60324b3b9f9fc6cae5c2ea55b9182b118c7f`
+(76,681,576 bytes) against the linked Tantivy 0.26.1 incumbent. Independent
+native top-k and count collectors agreed, but semantic preflight rejected
+`naturallanguage-2` at rank 65: top-100 membership and exact counts matched,
+while one common score differed by one `f32` ULP (`1083368074` versus
+`1083368073`). No timed sample, A/A control, or artifact followed.
+
+No QG-6 number follows. The repair enables only the comparator's existing,
+contract-pinned `0.0001` epsilon with the artifact-visible
+`OracleSegmentGeometry` reason. Exact top-k membership and counts remain
+mandatory, per-document score deltas remain bounded, and reordering is limited
+to oracle epsilon-connected components. New tests prove membership and count
+changes still fail. This is not the previously rejected same-engine
+plain-query bypass, whose altered query tree produced unreviewed rank changes.
+
+Retry from a newly built exact ELF and require this filtered fixture to pass
+all four semantic-preflight arms with a printed policy receipt. Only then run
+and reproduce the complete 20-cell QG-6 matrix on a quiet reference host.
+Reject any changed membership, count mismatch, score delta above `0.0001`, or
+cross-component reorder; all same-invocation A/A controls and reproduction
+laws remain unchanged.
+
+## 2026-07-28 — QG-6 FILTERED DIAGNOSTIC: semantic repair passes; no gate decision (`bd-h6eh`, FoggySquirrel)
+
+Filtered run `qg6-natural-k100-preflight-d72f3f83-20260728T1705Z` executed
+clean revision `d72f3f837da14d5e508c5d99d7e3240c92b0fee0` from exact ELF
+SHA-256
+`5f1af4d9e1770ee31ba0ed1b998d58e682c1aa26bef0a57252e16ab63b2e08e9`
+against the linked Tantivy 0.26.1 incumbent. All four independently populated
+semantic arms preserved exact membership and counts. Three queries were
+bit-exact; the reviewed one-ULP `naturallanguage-2` case printed an
+artifact-bound `OracleSegmentGeometry` receipt and remained inside the
+contract-pinned `0.0001` score bound.
+
+The same-invocation A/A control admitted at **1.000704
+[0.998719, 1.002890]**. The filtered Quill/Tantivy p50 latency ratio was
+**110.703751 [106.930043, 113.676243]** (98.953 ms versus 0.903 ms), but this
+is not a gate number: only `query/naturallanguage/k100/100k` ran, so the
+artifact correctly records `laws_attested=false`. The evidence is retained at
+`.bench-history/attempts/2026-07-28/QG-6/qg6-natural-k100-preflight-d72f3f83-20260728T1705Z/`
+with evidence JSON SHA-256
+`79c928e5b108f7deb8a284d54fa09593b3b217daf8d85734d53a2544e94071d1`.
+
+Retry only by running and immediately reproducing all 20 normative QG-6
+fixtures from this exact ELF on one quiet reference host. Every semantic
+receipt, A/A control, and reproduction law must pass before evaluating the
+per-class ±10% target; CV remains provenance only.
+
+## 2026-07-28 — QG-3 INVALID-NULL: eligible 5995WX rerun finds a warm-fixture lifecycle leak (`bd-h6eh`, FoggySquirrel)
+
+Candidate `qg3-candidate-threadripper5995-f9ab-20260728T1727Z` completed the
+full five-cell QG-3 matrix on an eligible Threadripper PRO 5995WX host with 128
+logical CPUs, `performance` governor, and a quiet `0.63` / `2.04` start/end
+load receipt. The run used clean revision
+`966958a19fa050054ebe095cbd3f30c2f1572e1d`, exact executing ELF SHA-256
+`f9ab1cd946742357ce172f9d28829052129b702011c70a5e1117a2b300d93c00`,
+the actual linked Tantivy 0.26.1 incumbent, 10 paired blocks, and
+same-invocation A/A controls.
+
+All five controls failed at least one predeclared law:
+
+- initial docs/s: order effect `-0.078757` and drift `-0.068135`;
+- in-process updates/s: CI half-width `0.423731` and log-MAD `0.057952`;
+- in-process latency: CI half-width `0.133028`;
+- fresh-process updates/s: center `0.019591`, log-CI
+  `[0.001755, 0.065349]`;
+- fresh-process latency: drift `-0.053829`.
+
+Accordingly, the apparent Quill/Tantivy ratios—`0.321504
+[0.302387, 0.343013]` initial docs/s, `0.521828
+[0.489604, 0.542868]` in-process updates/s, `2.063031
+[2.016110, 2.149795]` in-process latency, `0.587486
+[0.573602, 0.593036]` fresh-process updates/s, and `1.712895
+[1.684956, 1.762627]` fresh-process latency—are non-claims.
+
+The eligible, quiet-host result refutes the preceding host/governor retry
+hypothesis. Raw A/A samples instead expose large, repeatable Tantivy outliers.
+The measured path commits a newly built warm corpus and immediately starts its
+update clock without joining Tantivy background merges spawned by setup, so
+unobserved setup maintenance can contaminate either member of a null pair.
+
+**Decision: INVALID-NULL / NO CLAIM.** The evidence JSON SHA-256 is
+`16c3dd51dd89c8237dad49bb86b604ca73e4c8deded6ba9dcc1d5cbb3165af65`;
+the sealed artifact SHA-256 is
+`333ce31ece9ebfbf9e45a550c15521fbc5ea3cd50136e7fb0cc556c452194470`.
+Artifacts are retained at
+`.bench-history/attempts/2026-07-28/QG-3/qg3-candidate-threadripper5995-f9ab-20260728T1727Z/`.
+There is no QG-3 PASS/MISS.
+
+Retry only after the harness joins every warm-fixture background operation
+before starting the update timer while keeping maintenance caused by the
+measured update inside the metric. Require a counted segment/merge lifecycle
+receipt for that boundary, a newly built self-hashing exact ELF, all five valid
+A/A controls on an eligible quiet host, and one immediate same-ELF
+reproduction. Do not resample either current Threadripper route, weaken a null
+law, or use CV as the gate.
+
+## 2026-07-28 — QG-3 LIFECYCLE PREFLIGHT / INVALID-NULL: fence is counted; smoke timing is not admissible (`bd-h6eh`, FoggySquirrel)
+
+Filtered smoke preflight
+`qg3-lifecycle-preflight-b083-20260728T1845Z` ran clean revision
+`b083751e2198519c15beed3bac939e21c63783c4` from self-reporting exact ELF
+SHA-256
+`77fc06afa6eb7004569a4ab95210a4cace99604b1d2d2b977f97cd91312fb4b8`
+(76,818,792 bytes) on the eligible Threadripper PRO 5995WX host. The linked
+incumbent was Tantivy 0.26.1. The incomplete smoke selection intentionally ran
+only `watch/medium/initial`, so it could not activate QG-3.
+
+The new lifecycle sidecar counted 563 `measured_work` fences. Every fence
+joined Tantivy's indexing/merge workers and rearmed the writer; join time
+ranged from 141,044 ns to 580,066 ns (median 271,689 ns), and no searchable
+segment count changed across the join boundary. The sidecar SHA-256 is
+`8ea955fea03d6471c0f08f34260a671d65ab8b49cc6c31ce6c9f3c65b151c176`.
+This proves the missing harness boundary is now executed and counted.
+
+The same-invocation Tantivy/Tantivy control nevertheless failed:
+**0.946217**, log-CI corresponding to ratio
+**[0.711185, 1.037331]**, log-MAD `0.099718`, order effect `-0.155310`,
+and drift `-0.053459`. Two consecutive small-fixture operations were about
+10x slower than the other 18 A/A arm observations even though their join
+receipts stayed below 0.6 ms. Accordingly, the apparent Quill/Tantivy
+`0.898246 [0.814406, 0.995098]` ratio is not a gate number.
+
+**Decision: INVALID-NULL / NO CLAIM.** Evidence JSON SHA-256
+`8b249f5439c1ef31447461829adc36b270a47ef74b771c7b0b25da564dba6dc8`
+is retained under
+`.bench-history/attempts/2026-07-28/QG-3/qg3-lifecycle-preflight-b083-20260728T1845Z/`.
+
+Retry only with the required full-scale five-cell QG-3 candidate after the
+hourly `git-prune-broken-refs` timer is explicitly suspended for the complete
+candidate/reproduction window. Require every counted lifecycle receipt, all
+five A/A controls, and an immediate same-ELF reproduction to admit. Do not
+repeat the small smoke slice, weaken a null law, or gate on CV.
+
+## 2026-07-28 — QG-2 INVALID-EXECUTION: maintenance guard misread `activating` as inactive (`bd-h6eh`, FoggySquirrel)
+
+**Comparison class: INCUMBENT. Actual legacy incumbent: Tantivy 0.26.1.**
+Candidate and incumbent ran side-by-side in one invocation from clean revision
+`b083751e2198519c15beed3bac939e21c63783c4` and self-reporting exact ELF
+SHA-256
+`77fc06afa6eb7004569a4ab95210a4cace99604b1d2d2b977f97cd91312fb4b8`
+on the eligible Threadripper PRO 5995WX host. The launcher gated on
+`systemctl is-active --quiet`, which returned nonzero even though
+`git-prune-broken-refs.service` still reported
+`ActiveState=activating, SubState=start`. The measurement consequently
+overlapped the hourly prune job.
+
+A/A null: `0.970095 [0.936478, 1.011197]`, same invocation. Its order effect
+was `-0.063025`, outside the predeclared bound. The apparent Quill/Tantivy
+ratio `0.342649 [0.330444, 0.358951]` is not a QG-2 number. The counted
+lifecycle sidecar recorded 33 Tantivy joins at 9,297,158–15,888,253 ns
+(median 10,409,801 ns), no segment-count changes, and SHA-256
+`2df747267e80a7351bbd760d16a7643abefd73fa920e39c90206d0fe88b11c3f`.
+
+**Decision: INVALID-EXTERNAL-INTERFERENCE + INVALID-NULL / NO CLAIM.**
+Evidence JSON SHA-256
+`2dbdbe0f5762ed3e8216f0f1e141fd9cad4b95da245204351dc5982b461cbd74`
+with embedded seal
+`d77ebb732788e4775c5ea939de83a81a2bbebbaad95785b9f26245a264ae6cff`
+is retained at
+`.bench-history/attempts/2026-07-28/QG-2/qg2-candidate-trj-b083-20260728T1927Z/`.
+
+Retry only after literal `ActiveState` and `SubState` checks prove the prune
+service is neither `activating` nor `start`, with the next timer deadline and
+quiet load recorded. Then run a fresh candidate plus immediate same-ELF
+reproduction; both A/A controls and the 2% reproduction bound must admit before
+activation. CV remains provenance only.
+
+## 2026-07-28 — QG-2 ACTIVATED / MISS: warm-state single-thread incumbent comparison (`bd-h6eh`, FoggySquirrel)
+
+Candidate and immediate same-ELF reproduction ran side-by-side against the
+linked Tantivy 0.26.1 incumbent on the eligible Threadripper PRO 5995WX,
+bound to physical cores 0–15 and SMT siblings 64–79. Exact ELF SHA-256:
+`a23ff78e42c12cb71a269800250c492a03da56e43472225ac07420dc8afccaa1`.
+Both runs used five excluded warmup rounds, 30 paired blocks, identical
+window/configuration, and admissible same-invocation A/A controls.
+
+Measured Quill/Tantivy docs/s ratios were **0.349777 [0.344699, 0.356242]**
+(candidate) and **0.345546 [0.341425, 0.351114]** (reproduction). The QG-2
+target is 1.5x, so this is an honest **MISS**. The bootstrap ratchet accepted
+the complete reproducible measurement and activated QG-2 while preserving the
+MISS verdict. Baseline: `.bench-history/QG-2.trj-zen3-16c.latest.json`.
+Evidence SHA-256 values are `6936ae195a7b939083a9f5fc9b81db1ee306619182ba8820a0c99a7fb32ae0d1`
+and `876f20b8be76eaec69b34d9fb97bfd5da85e84462c5d8f0a1080f1173ad09ffb`.
+
+Retry predicate: after a profile-attributed Quill change, rerun the same
+exact ELF contract on the same 16-core slice with five excluded warmups and
+30 paired blocks; require both A/A nulls and immediate same-ELF reproduction
+to admit before evaluating whether the ratio clears 1.5x. CV remains
+provenance only.
+
+## 2026-07-28 — QG-2 corrected terminal-lifecycle fairness audit: FAIR configuration, INVALID evidence (`bd-h6eh`, FoggySquirrel)
+
+**Comparison class: INCUMBENT. Actual legacy incumbent: Tantivy 0.26.1.**
+The corrected harness at clean revision
+`ebd9175725ef9d97fd02d794394209b4719f8ce7` passed the required comparison
+audit item by item:
+
+- **Analyzer — FAIR.** Tantivy's `FrankensearchTokenizer` is the fused
+  equivalent of `SimpleTokenizer` plus `LowerCaser`: Unicode-alphanumeric
+  token boundaries and lowercase normalization, with no stemming or stopword
+  removal. The shipping Quill SWAR analyzer has the same semantics. The
+  release-profile oracle parity suite passed all three lane-edge, shipping-
+  incumbent, and 4,000-case randomized corpus tests.
+- **Schema — FAIR.** Both arms used `frankensearch-default-v1`: stored string
+  `id`; stored, indexed `content` and `title` with frequencies and positions;
+  stored-only `metadata`; and stored fast-u64 `ord`. Runtime ordered-hit
+  preflight passed for both arms with positions enabled.
+- **Commit policy and durability — FAIR.** Each 50,000-document timed engine
+  operation remained below Quill's one-second automatic publication interval,
+  so each arm performed one explicit terminal commit. Both indexes were
+  in-memory and issued no durability syscalls. Tantivy's timed arm included
+  commit, reader reload, and terminal indexing/merge-worker join. The corrected
+  terminal API did not create a replacement writer: every one of 735 lifecycle
+  receipts across the five attempts recorded `writer_rearmed=false`.
+- **Heap budget — FAIR.** Both single-thread writers received the same
+  50,000,000-byte total heap budget.
+- **Corpus, order, and batch size — FAIR.** Both arms consumed the same 50,000
+  documents in the same ordinal order and 5,000-document generated batches
+  from seed `0x5155494c4c504552`; corpus SHA-256
+  `31272ba338d2a07389ce66677440ed763964207afb76448fec02c5524f4d0be8`.
+  Corpus generation was outside the engine interval.
+- **Build profile — FAIR.** Both arms were linked into and run from the same
+  `release-perf` ELF (opt-level 3, ThinLTO, one codegen unit), SHA-256
+  `fab920d0bb28b2c2302700d5523461380a064a4acd43750dc3aa50fbeeef0c1d`,
+  with runtime-linked Tantivy 0.26.1. The same invocation supplied the A/A
+  control.
+
+The fair configuration did **not** produce a promotable corrected magnitude.
+The first 30-pair candidate was `INVALID-NULL` because null log-MAD
+`0.068650` exceeded `0.048790`. A second candidate and immediate rerun each
+had valid A/A controls and measured Quill/Tantivy **0.342848 [0.332870,
+0.352168]** and **0.355719 [0.347940, 0.364383]**, but their log-ratio delta
+`0.036853` exceeded the fixed `0.019803` reproduction law. A 60-pair
+candidate measured **0.348789 [0.344656, 0.355771]** with a valid A/A;
+its immediate 60-pair rerun was `INVALID-NULL` because null log-MAD
+`0.051362` exceeded `0.048790`. These magnitudes are diagnostic only.
+
+**Decision: FAIR CONFIGURATION / INVALID-NULL + INVALID-REPRODUCTION / NO
+QG-2 CLAIM.** QG-2 remains inactive and the quarantined pre-fix baseline is
+not replaced. Evidence JSON SHA-256 values, in attempt order, are
+`6f3ba52bd787c3694bb1d5e185fbe6d8c781a6bb8871be25e11298c27fd58d0e`,
+`27f48f7301ee288b55ec54d0f8a54f04d546b7e1879de4a1db0c35ccc9a9a933`,
+`dfe2ea6de49a4cef6047938c536f4b70774212c85a7235abfca4aba56070fe03`,
+`37e5325a2fc4c04692fa92ff264253eabc412939836f1c06fa787ba06094a3a1`,
+and
+`d99aa3551b71c08652af85a261cf4fe75af128d7533ff846c94432d32dcc0488`.
+Artifacts are retained under the corresponding
+`.bench-history/attempts/2026-07-28/QG-2/qg2-terminal-*` directories.
+
+Retry only on a distinct eligible machine/topology, or after a counted
+mechanism explains and removes the Tantivy A/A dispersion. Preserve the exact
+terminal-lifecycle API and all six fairness pins, then require a valid A/A
+candidate, an immediate valid A/A rerun, and at most `0.019803` log-ratio
+delta. Do not resample the unchanged Threadripper route, weaken a null law, or
+use CV as the gate.
+
+## 2026-07-28 — QG-1 corrected-cadence target tranche: medium target misses; xlarge null is invalid (`bd-h6eh`, FoggySquirrel)
+
+**Comparison class: INCUMBENT. Actual legacy incumbent: Tantivy 0.26.1.**
+Every attempt ran the incumbent and Quill side-by-side in one invocation from
+clean revision `02372ce9c4bc501bf56e8dfba74f73692398acfd` and the same
+self-reporting `release-perf` ELF, SHA-256
+`0973c16226f37cbd9f70e989536f9672ae77ac6c54733e1081fb1f6143b90c0a`
+(76,863,272 bytes). Runtime preflight identified Tantivy 0.26.1 / index format
+v7. Both eight-thread writers received the same 120,000,000-byte total heap,
+the same positions-enabled schema and analyzer, and byte-identical seeded
+corpora in the same order and 5,000-document batches. The decisive runs used
+physical cores 0–15, `performance` governor, and `RAYON_NUM_THREADS=8`.
+
+Commit policy is now symmetric. Both arms use the shipping 1,000 ms visibility
+cadence and one terminal commit, in memory. Medium operations stayed below the
+cadence and made zero periodic commits. On the 1,000,000-document xlarge
+fixture, Tantivy made 10–11 periodic commits and Quill made 22–23; the count
+difference follows their different elapsed time, not a policy difference.
+Across the nine attempts below, 498 Tantivy lifecycle receipts all recorded
+eight writer threads, 120,000,000 bytes, joined indexing and merge workers,
+and `writer_rearmed=false`.
+
+The null-calibration sequence was preserved rather than averaged away:
+
+| fixture / execution pin | A/A verdict | Quill/Tantivy median-CI | reading |
+|---|---|---:|---|
+| medium, SMT-eligible cpuset, warmup 1 / pairs 10 | invalid: CI too wide | `0.423925 [0.409020, 0.427619]` | diagnostic |
+| medium rerun, same pin | invalid: width + dispersion + order effect | `0.408081 [0.394410, 0.421535]` | diagnostic |
+| medium, 16 physical cores, warmup 1 / pairs 10 | invalid: center + width + dispersion + order + drift | `0.401922 [0.395089, 0.416259]` | diagnostic |
+| medium, 16 physical cores, warmup 10 / pairs 10 | invalid: width + drift | `0.404418 [0.383978, 0.427316]` | diagnostic |
+| medium, 16 physical cores, warmup 10 / pairs 30 | **valid**: `0.988191 [0.976000, 1.002801]` | **`0.405807 [0.403372, 0.410703]`** | target MISS |
+| immediate medium rerun, same pin | **valid**: `1.009861 [0.970286, 1.031514]` | **`0.414845 [0.409321, 0.418691]`** | target MISS |
+| xlarge, 16 physical cores, warmup 1 / pairs 10 | invalid: log-MAD `0.059332 > 0.048790` | `0.209583 [0.194532, 0.219311]` | diagnostic |
+| predeclared xlarge candidate, same pin | invalid: dispersion + order effect + drift | `0.197288 [0.194559, 0.217702]` | diagnostic |
+| immediate xlarge rerun, same pin | invalid: order effect | `0.206296 [0.198693, 0.213267]` | diagnostic |
+
+The two valid medium invocations independently miss QG-1's 3.0x threshold by
+a wide margin. They are not a promotable reproduction pair: their
+cross-invocation log-median delta is `0.022027`, just above the fixed
+`0.019803` bound. The xlarge magnitude is likewise not a number because its
+same-invocation null failed dispersion. Its artifact completed at 20:57:57
+EDT; the next hourly prune sweep began at 20:58:09, so that attempt did not
+overlap maintenance. The predeclared fresh xlarge pair was retained in full.
+Its A/A controls were `0.978179 [0.928430, 1.061322]` (dispersion, order,
+and drift invalid) and `1.006406 [0.974261, 1.055636]` (order invalid).
+Their diagnostic effect medians also differed by `0.044648` log, above the
+`0.019803` reproduction bound. Both completed before the next maintenance
+sweep.
+
+**Decision: TARGET-SLICE MISS AT MEDIUM / INVALID-REPRODUCTION +
+INVALID-NULL / NO QG-1 PROMOTION.** The normative 34-cell gate was not run,
+every artifact correctly records `laws_attested=false`, QG-1 remains inactive,
+and `.bench-history/QG-1.unmeasured.latest.json` is not replaced. Evidence
+JSON SHA-256 values, in attempt order, are
+`ea12d51a87fcd742b195b09ede2a55a5c148128e0b3c530206e2bb5796d505b7`,
+`96ac39cd3dceddf153fc5ac9e39111ca26338cad774dcc72f904a29d70ea2ef4`,
+`430d41e03391d0c4a0ba72db96b3da63041d220000723589dba0f4ac96e26fd9`,
+`f7218d6fd9783c53e1e22e6d7ca11d53ea6dde64aab45c5fa931760c3dc5385d`,
+`0c64964d80a3b9557ffb2ecabdd5db0b3ea6cdd2433f712b506d959715e454d1`,
+`ed7e597b07553665a1e7c203a9b2ae0237d256f94e11643f76e5958b14cef373`,
+`749b31bd0529dd9702ece070151cfe04eaf8c3b312e63b079936fac5a68ec6ac`,
+`da61921fa4d67672ed4ceabe15d2c9b308c5e99abe972cebfe6c31d236c2fbfb`,
+and
+`a56b1384727d6071da0862e405039c96cf67d6bd5e8bbc3f073769b219bf32a7`.
+Artifacts are retained under
+`.bench-history/attempts/2026-07-28/QG-1/qg1-target-*`.
+
+Stop resampling this xlarge route: its predeclared candidate and immediate
+rerun both failed the A/A contract. A retry requires a materially different
+harness or workload scale that removes the counted 10/11-commit boundary,
+plus a canonical machine receipt, both target corpora, both tokenizer
+denominators, valid candidate and immediate-rerun nulls, and reproduction
+within `0.019803`. Do not select a favorable attempt, weaken a null law, or
+gate on CV.
+
+## 2026-07-28 — QG-1 alternate-host medium slice: diagnostic MISS, invalid null (`bd-h6eh`, FoggySquirrel)
+
+To test host quietness by measurement rather than a subjective pre-filter, the
+same self-reporting ELF (`0973c16226f37cbd9f70e989536f9672ae77ac6c54733e1081fb1f6143b90c0a`,
+revision `02372ce9c4bc501bf56e8dfba74f73692398acfd`) ran Quill and Tantivy
+interleaved on worker `vmi1264463` (`38.242.209.154`), an 8-CPU AMD EPYC
+host, cpuset `0-7`, with 10 excluded warmups and 30 paired blocks. Recorded
+load was `3.05` to `4.49`; this was deliberately left to the A/A control.
+
+The diagnostic Quill/Tantivy ratio was **`0.431254 [0.394635, 0.455288]`**
+(Quill `20,400.857` docs/s; Tantivy `47,555.318` docs/s), a target MISS
+against `3.0x`. The same-invocation A/A was `0.984157 [0.858930, 1.117099]`
+and invalid on its width; the artifact is `invalid_null`, not a certified
+gate number. Evidence JSON SHA-256 is
+`86626a6d1d45ad3b82815159f0ec6cb5a993cfa0e0573c9404ae8d5d6706e695` and the
+legacy summary SHA-256 is
+`665cf5898b8eb6828fb17079fc30d5ded2cec5aa8aa5fa08a5ff6304406ef406`.
+
+**Decision: diagnostic MISS / UNSCORED because A/A null is invalid.** QG-1
+remains inactive and the partial slice cannot replace its unmeasured
+baseline. Retry only with a predeclared same-host candidate/rerun whose null
+CI admits; do not claim this ratio or gate on CV.
+
+## 2026-07-29 — QG-1 full-SMT xlarge sweep: two target-slice MISS rows, seven UNSCORED (`bd-h6eh`, FoggySquirrel)
+
+**Comparison class: INCUMBENT. Actual legacy incumbent: Tantivy 0.26.1.**
+Quill and Tantivy ran side-by-side at every thread point in one invocation,
+with a Tantivy/Tantivy null, a Quill/Quill null, and the A/B comparison.
+Source revision
+`bb31daa04ee58f9c38c9a0d6e42b5a125e6f02ae` was clean; the self-reporting
+`release-perf` ELF SHA-256 was
+`a466d5a64a67843a8f2acd4b7add23c25b2015241c64ea35b385ae59431b8c12`
+(76,985,272 bytes).
+
+The v4 artifacts identify `threadripperje` as a Threadripper PRO 5995WX with
+64 physical cores, 128 logical threads, one NUMA node, 499 GiB RAM, runtime
+AVX2/FMA/BMI2/AES/VAES, process affinity `0-127`, and no cpuset cap. Each row
+records its actual requested thread count: 1, 2, 4, 8, 16, 32, 64, 96, or
+128. The fixture used one million deterministic documents, positions on,
+5,000-document batches, in-memory indexes, one excluded warmup, and ten
+paired blocks. Both arms had the same analyzer/schema, total heap, generated
+documents/order, 1,000 ms visibility cadence, and terminal commit. Quill's
+higher realized periodic-commit count follows its longer elapsed time; all
+counts are retained in the raw logs.
+
+| threads | Quill docs/s | Tantivy docs/s | Quill/Tantivy median-CI | null verdict | target verdict |
+|---:|---:|---:|---:|---|---|
+| 1 | 34,896.923 | 135,684.166 | `0.256083 [0.250163, 0.258549]` | both valid | **MISS** |
+| 2 | 34,543.200 | 165,817.834 | `(0.208493 [0.195344, 0.225094])` | Tantivy dispersion + order + drift | **UNSCORED** |
+| 4 | 35,589.081 | 173,165.385 | `(0.205067 [0.191886, 0.209096])` | Tantivy width + dispersion + drift | **UNSCORED** |
+| 8 | 33,770.710 | 142,833.746 | `(0.237273 [0.231981, 0.245118])` | Tantivy width + order | **UNSCORED** |
+| 16 | 32,791.136 | 136,259.514 | `(0.240605 [0.235825, 0.248195])` | Tantivy width + dispersion | **UNSCORED** |
+| 32 | 25,142.024 | 117,388.872 | `(0.209419 [0.199148, 0.216683])` | Tantivy dispersion | **UNSCORED** |
+| 64 | 28,562.221 | 126,486.750 | `(0.226495 [0.221930, 0.231632])` | Tantivy order + drift | **UNSCORED** |
+| 96 | 26,570.020 | 112,658.279 | `0.236489 [0.233668, 0.239445]` | both valid | **MISS** |
+| 128 | 28,211.911 | 108,901.704 | `(0.254452 [0.248195, 0.263064])` | Tantivy dispersion + order + drift | **UNSCORED** |
+
+Every Quill/Quill null passed. CV is provenance only and decided no row. The
+scoreable ratio does not narrow from one to 96 threads; the raw diagnostic
+endpoints are likewise nearly flat at `0.256083` and `0.254452`. Thus this
+tranche shows no manifested high-thread concat-merge advantage, while seven
+invalid incumbent nulls prevent calling it a certified nine-point curve.
+
+**Decision: PARTIAL TARGET-SLICE MISS / NO QG-1 PROMOTION.** QG-1 remains
+inactive because this was the xlarge positions-on tranche, not the complete
+normative matrix or an immediate reproduction. All 72 raw/evidence/host/
+lifecycle files plus the adjudication are retained under
+`.bench-history/attempts/2026-07-29/QG-1/qg1-trj-5995wx-fullsweep-bb31daa0-r10-20260729T0824Z/`.
+
+Retry the valid 1- and 96-thread rows only after a profile-attributed Quill
+hot-path change, preserving the same topology, corpus, exact-ELF, dual-null,
+and median-CI contract. Do not blind-resample the seven invalid rows: retry
+only on a distinct eligible 64C/128T host or after a counted mechanism removes
+the Tantivy commit-boundary/order/drift failure. Activation still requires the
+full gate and immediate same-ELF reproduction; never weaken a null law, select
+a favorable row, or gate on CV.
+
+## 2026-07-29 — W2.5 scalar canonical encoder: INVALID-EXTERNAL-INTERFERENCE / NO-SHIP (`bd-e8h-w2-canonical-encode-si8mk`, YellowSparrow)
+
+**Comparison class: SELF-SPEEDUP diagnostic; no incumbent or QG claim.**
+The experimental source base was committed candidate
+`37c42ed4a278e6fa50022c3e358db65388802b22`; its uncommitted, index-only
+overlay had SHA-256
+`77f95402188255bd62a65e98dbc9a262a2420a8197cdd6dc882e11f6fb8101f8`.
+It replaced `serde_json::to_vec` in deterministic IDMAP serialization with a
+scalar direct emitter.
+
+Correctness job `j-29952570386546852` ran strictly remote and passed 15/15
+selected tests: independent golden bytes, hostile Unicode/control content,
+all `u8` digit-width boundaries, metadata insertion-order permutations,
+canonical byte and content-hash equality, and whole FSLX segment byte
+identity.
+
+Timing job `j-29952570386546854` ran exact ELF SHA-256
+`21d8aa832825fdecf69a95069ab66c15bbdfb676f1e69b4025f3ef3bb35a88e4`
+(51,677,560 bytes) on `vmi1227854`. The raw 41-round, four-inner result was:
+
+- serde/serde same-invocation A/A null: `0.989567 [0.977726, 1.000756]`;
+- direct/serde latency median-CI:
+  `1.133086 [1.123543, 1.140405]`;
+- raw medians: serde 6,084.7 ns/document; direct 6,791.2 ns/document.
+
+The entire timing result is **invalid**, including the apparently admissible
+same-binary null. The enclosing RCH job interval was
+13:48:09Z–14:02:58Z, but per-sample occupancy was not bound. Scheduler mail
+records unrelated four-slot job `j-29952570386546855` starting on the same
+worker at 13:59:32Z while the benchmark remained in execute, filling the
+worker to eight of eight slots. RCH history also records earlier job-level
+co-residency with `j-29952570386546853`. Complete-interval isolation is
+therefore unproven, so cross-project CPU, memory, and cache interference
+invalidates the entire invocation. The raw 1.133x slowdown is recorded only
+as an adverse diagnostic and may not be quoted as a decision-valid regression.
+
+**Decision: INVALID-EXTERNAL-INTERFERENCE / CONSERVATIVE NO-SHIP.** The
+candidate has exact correctness but no admissible positive timing evidence;
+the entire overlay was manually removed and no product change landed. This is
+not a QG activation, baseline, incumbent comparison, or terminal W2.5 verdict.
+
+Retry only for a profile-named, materially different mechanism such as block
+escape scanning or a one-pass serializer/hash/IDMAP sink. Require the same
+byte/hash/whole-segment oracle first, then prove same-binary A/A and A/B with
+exclusive-worker occupancy bound over the complete interval. Terminal W2.5
+claims still require the separate Apple-Silicon and Threadripper cross-engine
+contract.
+
+## 2026-07-29 — CORRECTION: retract QG-1 width-sweep MISS labels; concurrency was not receipt-bound (`bd-h6eh`, YellowSparrow)
+
+The preceding full-SMT sweep row is corrected to **DIAGNOSTIC / UNSCORED**.
+Its clean source revision
+`bb31daa04ee58f9c38c9a0d6e42b5a125e6f02ae` predates `9b23e0d4`, the
+change that records and binds QG-1 concurrency observations. Every sealed
+cell artifact has `spec.concurrency_witness: null`.
+
+Requested thread counts, affinity, and the old Quill-side Rayon pool assertion
+do not satisfy the current contract's requirement for persisted Quill and
+Tantivy observations. That contract explicitly says configuration alone is
+never observed concurrency. The 1- and 96-thread A/A controls therefore
+cannot admit their A/B rows.
+
+**Corrected decision: DIAGNOSTIC / UNSCORED / NO QG-1 CLAIM.** Retract the
+previous 1-thread `0.256083 [0.250163, 0.258549]` and 96-thread
+`0.236489 [0.233668, 0.239445]` target-slice MISS labels. Those values and
+the other seven ratios remain raw routing diagnostics only. The evidence does
+not establish a certified width curve, high-thread convergence, or any QG
+activation.
+
+Retry only with source at or after `9b23e0d4`, requiring each QG-1 cell's
+receipt to prove positive Quill and Tantivy observations with
+`min == max == configured width`. Preserve the same exact-ELF, dual-null,
+complete-matrix, and immediate-reproduction laws before interpreting any
+A/B magnitude.
+## 2026-07-29 — REJECT: exclusive QG-1 xlarge sweep proves requested workers do not reach Quill ingest (`bd-h6eh`, FoggySquirrel)
+
+**Comparison class: INCUMBENT. Actual legacy incumbent: Tantivy 0.26.1.**
+The clean revision `3684b147797c5babdad4a5568e993db40ed90da5` ran Quill
+0.2.1 and Tantivy 0.26.1 side-by-side in each same invocation from the
+self-reporting `release-perf` ELF SHA-256
+`90bf6c4cd69606def56fd2b526a07f398a40aacad8ac7a73e77bf2653c51ed1a`
+(77,945,432 bytes). The sweep held the exclusive `trj-booking` claim for its
+entire 2026-07-29T16:45:32Z to 21:23:28Z window.
+
+A/A null: `0.998882 [0.975242, 1.036296]` Tantivy/Tantivy and
+`0.997971 [0.980798, 1.010896]` Quill/Quill, same invocation at requested
+1.
+
+The v5 artifacts identify `threadripperje` as a 64-core/128-thread
+Threadripper PRO 5995WX with 499 GiB RAM, one NUMA node, performance
+governor, AVX2/FMA/BMI2/AES/VAES, full `0-127` affinity, and no cpuset cap.
+Every row used the deterministic one-million-document positions-on fixture,
+in-memory durability, one excluded warmup, ten paired blocks, a 1,000 ms
+commit cadence, and one terminal commit. Both A/A nulls and the A/B ran in
+the same invocation. CV decided no row.
+
+| requested | Quill actual active / peak | Tantivy actual active IDs / peak | Quill/Tantivy median-CI | verdict |
+|---:|---:|---:|---:|---|
+| 1 | 1 / 1 | 39 / 8 | `0.257438 [0.250622, 0.262109]` | **MISS** |
+| 2 | 1 / 2 | 85 / 10 | `0.189423 [0.183838, 0.193821]` | **MISS** |
+| 4 | 1 / 4 | 504 / 16 | `(0.219794 [0.214862, 0.221369])` | **UNSCORED**, Tantivy null |
+| 8 | 1 / 8 | 595 / 25 | `(0.249382 [0.231247, 0.252693])` | **UNSCORED**, Quill null |
+| 16 | 1 / 16 | 720 / 39 | `(0.242964 [0.234366, 0.263901])` | **UNSCORED**, Tantivy null |
+| 32 | 1 / 32 | 984 / 75 | `0.218916 [0.209276, 0.227571]` | **MISS** |
+| 64 | 1 / 64 | 1,827 / 141 | `0.219276 [0.217200, 0.226471]` | **MISS** |
+| 96 | 1 / 96 | 2,759 / 193 | `(0.256653 [0.253520, 0.260727])` | **UNSCORED**, Quill null |
+| 128 | 1 / 128 | 3,556 / 264 | `0.249378 [0.236671, 0.258318]` | **MISS** |
+
+For the scoreable endpoints, A/A null:
+`0.998882 [0.975242, 1.036296]` Tantivy/Tantivy and
+`0.997971 [0.980798, 1.010896]` Quill/Quill, same invocation at requested
+1. At requested 128,
+Tantivy/Tantivy `0.982049 [0.951422, 1.013386]` and Quill/Quill
+`0.990940 [0.982398, 1.017325]`, same invocation. The five scoreable rows
+all MISS the `>=3.0x` target. The four invalid-null rows are UNSCORED.
+
+The decisive new provenance field is actual observed work: Quill created up
+to the requested number of workers, but only one new worker crossed the
+1 ms CPU-active threshold on the exact fixture at every width. Quill
+throughput consequently falls from 35,854.674 docs/s at requested 8 to
+27,130.469 docs/s at 128 instead of scaling. Tantivy churns and
+oversubscribes thousands of distinct thread IDs, yet remains 4.0x to 5.3x
+faster in every scoreable row.
+
+**Decision: REJECT / TARGET-SLICE MISS / NO QG-1 PROMOTION.** This partial
+xlarge positions-on slice has `laws_attested=false`; QG-1 remains inactive
+and the unmeasured placeholder remains authoritative. All 72 source
+artifacts plus the adjudication are retained under
+`.bench-history/attempts/2026-07-29/QG-1/qg1-trj-exclusive-fullsweep-3684b147-r10-20260729T1645Z/`.
+
+**Retry predicate:** require a counted mechanism that either reduces Quill
+copy calls/bytes per document on identical input or makes the measured ingest
+hot path use more than one CPU-active worker. Then rerun the same
+exact-ELF/same-invocation Tantivy incumbent, dual-null, bootstrap median-CI,
+topology, corpus, and affinity contract. Do not blind-resample invalid-null
+rows, weaken a null law, choose a favorable width, or gate on CV.
+
+## 2026-07-29 — CORRECTION: exclusive QG-1 sweep is diagnostic/no-claim (`bd-h6eh`, YellowSparrow)
+
+The preceding MISS/negative-verdict adjudication is superseded. All nine
+sealed `QG-1.evidence.json` files have `gate_decision: null` and
+`admission_no_claim.code: evidence.incomplete_gate_selection`. Widths 1, 2,
+32, 64, and 128 report `gate_status: no_decision` and remain
+measured-provisional; widths 4, 8, 16, and 96 report
+`gate_status: invalid_null` and remain UNSCORED. All nine cell manifests have
+`laws_attested: false`.
+
+**Corrected decision: DIAGNOSTIC / NO-CLAIM / NO QG-1 VERDICT.** Retract
+every MISS and target-slice negative-verdict label attached to this tranche.
+It does not certify a scaling curve, activate QG-1, or support promotion. The
+one-CPU-active-Quill-worker observation remains useful mechanism-routing
+evidence only. The tracked tranche is 63 per-width files plus `SWEEP.md`, or
+64 files total; nine ignored `run.log` files caused the earlier local
+filesystem count of 72 source artifacts.
+
+Retry only after a counted change reduces Quill copy calls/bytes per document
+or reaches more than one CPU-active Quill worker, then run the complete
+normative QG-1 matrix and immediate reproduction. A publishable verdict
+requires the actual Tantivy incumbent in the same invocation, both A/A
+controls, bootstrap median-CIs, exact-ELF provenance, sealed concurrency
+witnesses, and `laws_attested: true`.
+
+## 2026-07-29 — METHODOLOGY / VALID-MECHANISM: Quill moves 8.1587x Tantivy copy bytes/document on the source-3684 diagnostic child (`bd-e8h`, FoggySquirrel)
+
+**Evidence class: DIAGNOSTIC MECHANISM, not an incumbent timing or QG
+claim.** Exact ELF SHA-256
+`03308f4b4b74140cc2a9cbcf926cbe29b9c9118e34512af947e70538d88114e0`
+ran an identical 200,000-document, 50,000,000-byte writer-heap,
+requested-threads=1, positions-on child fixture. Separate sequential uprobe
+invocations counted 203,720,623 resolved AVX copy entries and
+41,437,077,594 bytes for Quill, versus 104,016,287 entries and
+5,078,894,209 bytes for pinned Tantivy 0.26.1. That is 1,018.603 versus
+520.081 calls/document, 202.329 versus 24.799 KiB/document, and
+Quill/Tantivy ratios of 1.958545x calls and 8.158681x bytes.
+
+Matching profiles attribute 7.74% dwarf / 7.25% frame-pointer self-time to
+Quill memmove and 5.75% / 5.29% to Tantivy. Quill copy bytes/document rise
+205.63% from 20,000 to 200,000 documents while Tantivy stays flat, supporting
+flush, seal, or publication copy amplification as the next investigation
+route. A five-run balanced powersave audit observed median 4.268922 GHz for
+Quill and 4.029451 GHz for Tantivy; the 5.943% frequency skew favored Quill
+and cannot explain its copy deficit. The diagnostic child also reports about
+0.996 versus 1.815 CPU-equivalents, so it is not single-hardware-thread wall
+timing evidence.
+
+**Decision: VALID-MECHANISM / DIAGNOSTIC ONLY.** There is no A/A control
+because the counters came from separate profiler invocations. Do not infer a
+performance ratio, current-incumbent verdict, QG state, or activation from
+this mechanism receipt. Route the next lever to an already mapped copy site.
+The complete receipt and counter definitions are in
+`docs/evidence/e8h/p1-qg2-cross-engine-memmove-counters-20260729.md`.
+
+**Retry predicate:** after immutable integration, require byte-identical
+index output and repeat the same 200,000-document mechanism probe. The lever
+must materially reduce Quill copy bytes/document before any QG rerun. Then
+run QG-2 with the exact-current ELF, pinned Tantivy in the same invocation,
+both A/A nulls, and bootstrap median-CIs. QG-1 additionally requires more
+than one observed CPU-active Quill ingest worker. If bytes/document do not
+fall, record the counted mechanism as unchanged and route elsewhere without
+timing; never derive an A/B ratio from separate profiler invocations or gate
+on CV.
+
+## 2026-07-30 — KEEP: Quill TermInterner bucket-map identity hasher — 1.033x QG-2 single-thread ingest (`bd-e8h-w2-u64-hasher-swap-vcfft`, P6)
+
+- **Comparison class: SELF-SPEEDUP.** Both arms are frankensearch (Quill);
+  maintenance evidence only, no incumbent arm anywhere in this measurement.
+- **Machine class:** `local-5975wx-32c` (diagnostic-only class, P1 card
+  fingerprint; not ratchet-admissible). Measured 2026-07-29 from a
+  continuity-base `3684b1477` overlay export; toolchain rustc
+  1.99.0-nightly (9f36de775). **Landed 2026-07-30 at the
+  `928a16baed6d997fb5f63827387eb51cb3f4f4fa` landing base under the
+  revision-bound clause:** scribe.rs is blob-identical
+  (`0d66bba20f4fd988c4b0f4a13cc757b274c63af2`) between the measurement base
+  and the landing base, and the byte-identity probe re-run fresh at the
+  landing base reproduces the banked artifact hashes exactly.
+- **Lever:** `scribe.rs` `TermInterner.buckets` was
+  `std::collections::HashMap<u64, Bucket>` (SipHash) keyed by the
+  ALREADY-FINALIZED `hash_parts` output (ahash) — every token paid a
+  SipHash re-hash of a u64 that is already a hash. Swapped the MAP hasher
+  to a local identity `Hasher` (`PrehashedKeyHasher`, key-is-already-a-hash
+  invariant documented at the type and field); `hash_parts` itself and all
+  durable xxh3 hashing are untouched (the workspace "never substitute
+  durable xxh3" rule governs on-disk hashes, not in-memory map hashers —
+  delta.rs `AHashMap` precedent). No new dependency.
+- **Workload:** QG-2 smoke memory child, `QUILL_PERF_CHILD_MODE=memory`,
+  `ENGINE=quill`, 200k docs, heap 50 MB, threads 1, positions on, taskset
+  core 8, external wall time, interleaved paired.
+- **Executing ELFs (Arm A = base, pass-2 stash, SHA re-verified; Arm B = lever):**
+  - Arm A ELF sha256: `9c3cacf0fa0ab66b46b9fb9482c1b8e858985a02b4e7775ef47dec574f22078b`
+  - Arm B ELF sha256: `454205fd818de191ceca5d69700c51f5c6b441e1e4c39e574a65ed38e66e1bd9`
+- **A/A null (same invocation method, n=16):** paired docs/s ratio median
+  1.0012, mean 1.0010, 95% t-CI [0.9962, 1.0057], span 0.9802–1.0184.
+- **Result (n=32 pairs, two independent batches):** docs/s ratio lever/base
+  mean **1.0334**, median 1.0340, 95% t-CI [1.0296, 1.0372], 32/32 pairs
+  favor the lever; time-ratio convention (new/old) **0.9677**,
+  CI [0.9641, 0.9713] — point and median clear the [0.97, 1.03] band, CI
+  upper bound touches the band edge, and the A/B interval is disjoint from
+  the A/A null interval. ~38.8k → ~40.1k docs/s.
+- **Mechanism (perf dwarf F=1997, self-time):** `hash_one::<&u64>`
+  3.11% → absent; sip `Hasher::write` (u64 site) 1.40% → absent;
+  `find_in_bucket` 2.08% → 1.81%; `matches` 1.47% → 0.78%;
+  `intern_accounted` 0.86% → 1.14% (inlined map op); `hash_parts`
+  unchanged (0.93% → 0.99%), as required.
+- **Byte identity:** deterministic 3-cycle ingest probe (9k docs, ~20k
+  terms/cycle, flush + interner reset each cycle) — all emitted FSLX
+  segment files SHA-256-identical across arms and across repeated runs, on
+  BOTH the 3684-era overlay ELFs AND fresh rebuilds from the 928a16ba
+  landing worktree (pristine probe ELF `aa314dee…`, patched `e3e86843…`,
+  identical artifact hashes `d3b2382d…`/`1a42f42e…`/`dc861ef5…`/
+  `dd4257a8…`); ordering seam pinned by
+  `sorted_ids_match_composite_byte_order_and_field_grouping`, and a
+  deliberately reversed sort turns that test RED and hard-errors the flush
+  (`TermDictionary(NonAscendingInput)`), so an ordering leak cannot emit
+  bytes silently.
+- **Tests at the landing base:** `cargo test -p frankensearch-quill` =
+  482 passed / 0 failed / 1 ignored (lib) + green integration suites, exit
+  0, on BOTH pristine and patched arms; the 3684-era labruntime flake did
+  not reproduce, so no exemption was needed. clippy `--no-deps` warning-set
+  diff vs pristine: empty. `cargo fmt --check`: clean. UBS on scribe.rs:
+  identical totals (47/1408/163) and a byte-identical 22-row per-class
+  census on both arms — zero new findings.
+- **Status:** LANDED (this commit; scribe.rs +48/−3 including one
+  doc-comment backtick added post-measurement to satisfy
+  `clippy::doc_markdown` — doc-text only, probe artifacts re-verified
+  identical after the fix). Full evidence:
+  `docs/evidence/e8h/p6-local-qg2-hasher-swap-20260730.md`.
+## 2026-07-30 — KEEP: Quill TermInterner span-inline bucket entries — 1.032x QG-2 single-thread ingest (`bd-e8h-w2-interner-arena-x9s38`, P8 retry)
+
+- **Comparison class: SELF-SPEEDUP.** Both arms are frankensearch (Quill);
+  maintenance evidence only, no incumbent arm anywhere in this measurement.
+- **Machine class:** `local-5975wx-32c` (diagnostic-only class, P1 card
+  fingerprint; not ratchet-admissible). Measured 2026-07-30 from a clean
+  detached worktree at the published base
+  `d5ad5d59e3ca7a4000f97867d06f7ecc5fc59baa` (which contains the landed P6
+  identity-hasher KEEP `bd16d35d`, so this row attributes the span-inline
+  lever alone); toolchain rustc 1.99.0-nightly (9f36de775). Landed on parent
+  `6c70c86f7c852fb5e650fe44ff1b4939bb019fcc` after proving the intervening
+  train left the Quill source and dependency seam byte-identical; the
+  pre-lever `scribe.rs` blob is `47cf87cd…` at both bases.
+- **Graze history (honest):** the original P8 measurement (2026-07-29,
+  overlay ELFs on the 3684-era base) pooled n=32 at paired median 1.0293,
+  32/32 favor — adjudicated WASH against the 1.03 material line, with a
+  frozen single-retry predicate: one rerun at the published base, n=64
+  independent pairs, KEEP iff the new independent median >= 1.03, else
+  terminal reject. This row is that one permitted retry; the retry
+  budget for this lever is now spent either way.
+- **Lever:** `scribe.rs` `Bucket` arms carried bare `u32` term ids; every
+  hit-path key verification (`find_in_bucket` → `matches`) paid a
+  dependent random-access load of `spans[id]` before it could touch the
+  arena bytes. `BucketEntry { id, span }` inlines a copy of the arena span
+  into the bucket entry (span-mirror invariant documented at the type and
+  pinned by `bucket_entries_mirror_spans_across_collisions_and_reset`);
+  `spans` remains the id→span source of truth for the resolve APIs. Flush
+  accounting is PINNED (`const _: () = assert!(TERM_BUCKET_BYTES_ESTIMATE
+  == 40)`; niche layout keeps `Bucket` at 24 bytes) so flush boundaries
+  and on-disk bytes cannot drift. No new dependency.
+- **Workload:** QG-2 smoke memory child, `QUILL_PERF_CHILD_MODE=memory`,
+  `ENGINE=quill`, 200k docs, heap 50 MB, threads 1, positions on, taskset
+  core 8, external wall time, interleaved paired, per-batch untimed
+  warmups.
+- **Executing ELFs (Arm A = pristine d5ad5d59, Arm B = +P8 patch):**
+  - Arm A ELF sha256: `fdc7c5c7b7b1a0b2c7d107f10f26813bb39d02557534b3bbe8aff26a58120064`
+  - Arm B ELF sha256: `3246d1b844467e50b83750abf4445e507ec3abcc27370350a2777c1724e68617`
+- **A/A null (same invocation method, n=16):** paired docs/s ratio median
+  0.9996, mean 0.9982, 95% t-CI [0.9935, 1.0030], span 0.9754-1.0125.
+- **Result (n=64 pairs, four independent 16-pair batches):** docs/s ratio
+  lever/base **median 1.0325**, mean 1.0306, 95% t-CI [1.0271, 1.0340],
+  63/64 pairs favor the lever; per-batch medians 1.0349 / 1.0263 / 1.0328
+  / 1.0314 (batch 2 rode a transient host-noise window, per-arm cv ~3%);
+  time-ratio convention (new/old) **0.9705**, CI [0.9672, 0.9738]. ~38.9k
+  → ~40.2k docs/s. A/B interval disjoint from the A/A null interval;
+  frozen predicate met (1.0325 >= 1.03).
+- **RSS diagnostic — NO CLAIM:** one separate `/usr/bin/time -v` sample
+  observed 500.3→526.3 MiB (+26 MiB), but the 64 paired rows are noisy:
+  median B/A 1.0097, median delta +4.84 MiB, mean +5.34 MiB, interpolated
+  p5-p95 −14.00 to +22.86 MiB, and only 42/64 rows have B>A. Their arm
+  maxima are 555,061,248 and 561,410,048 bytes. The `Bucket` enum remains
+  24 bytes and the dominant `One` path keeps the same pinned 40-byte outer
+  estimate; only rare `Many` collision-vector capacity grows. No QG-7 or
+  high-collision/high-shard memory experiment ran, so the +26 MiB sample is
+  retained as an observation, not attributed to inline span copies and not
+  promoted as a bounded-memory result.
+- **Mechanism (perf fp call-graph, self-time):** `matches` 0.80% → absent
+  (span read inline from the bucket entry; the dependent `spans[id]` load
+  chain is gone); `find_in_bucket` 1.79% → 1.76%; `intern_accounted`
+  0.73% → 1.06% (absorbed inline work); `hash_parts` ~unchanged. Total
+  samples 20355 → 19862.
+- **Byte identity:** deterministic 3-cycle ingest probe (9k docs, ~20k
+  terms/cycle, flush + interner reset each cycle), rebuilt from THIS
+  worktree in both arms — all emitted FSLX segment files
+  SHA-256-identical across arms and across repeated runs
+  (`d3b2382d…`/`1a42f42e…`/`dc861ef5…`/`dd4257a8…`), matching the
+  original P8 overlay probe's artifact hashes exactly across bases.
+- **Tests at the retry base (patched arm):** `cargo test -p
+  frankensearch-quill` = 484 passed / 0 failed / 1 ignored (lib; +1 vs
+  base is the lever's own span-mirror pin) + green integration suites +
+  doctests, exit 0. clippy `--no-deps -p frankensearch-quill`: clean.
+  At the landing parent, the focused span-mirror test also passed strictly
+  remote on `ovh-a`; the final commit received the repository landing gates
+  recorded in the evidence card.
+- **Status:** LANDED (this commit). The source hunk is byte-identical to the
+  measured candidate; only publication-state and RSS-attribution corrections
+  were added during hostile review. Full narrative and consolidated raw rows:
+  `docs/evidence/e8h/p8-retry-local-qg2-span-inline-20260730.md` and
+  `docs/evidence/e8h/p8-retry-local-qg2-span-inline-raw-20260730.json`.
+
+## 2026-08-01 — KEEP: Quill phrase position runs decode once — 21.85x self-speedup at 100k (`bd-qg6-phrase-position-decode-once-zcxk3`, YellowSparrow)
+
+- **Comparison class: SELF-SPEEDUP.** The keep decision compares Quill before
+  and after one narrow phrase-position decode lever. This is maintenance
+  evidence only. It does **not** activate QG-6, change a ratchet, authorize the
+  default-engine flip, or establish Quill/Tantivy parity.
+- **Exact source identities:** control
+  `0ed5be9d67afcb8ead092801cf7fb564062e3a8c`; production candidate
+  `11c42096aee1dc4d1c3ec77f22d8270e297942e0`; test-only landing head
+  `bd800c41c1146775e9cfee87a432b9b92e3e4b5d`. The second commit changes only
+  how the independent-block-seam regression constructs its fixture, so the
+  executing production candidate is exactly `11c42096`.
+- **Lever:** the old owned phrase materializer called `positions_for_ordinal`
+  for every posting. Each call restarted a POSITIONS reader at that ordinal's
+  block boundary, consumed every preceding run in the block, then decoded the
+  target run into a new row, producing triangular rescans across ordinals. The
+  candidate instead traverses paired postings/positions once; its transactional
+  owned decode advances the reader after success, and a consumed marker prevents
+  `next`/forward `advance` from consuming that just-decoded run again. Immutable
+  replay, unpositioned callers, typed corruption, fuel checkpoints, and public
+  cursor contracts are unchanged.
+- **Machine and execution:** strict-remote RCH job
+  `j-29956918973825140` on `vmi1152480`, reported CPU `AMD EPYC Processor
+  (with IBPB)`, `x86_64-linux`, 10 available CPUs, and
+  `RAYON_NUM_THREADS=1`. This VPS is a diagnostic machine class, not the Apple
+  Silicon or high-core-count AMD reference hardware required for campaign
+  promotion.
+- **First executing ELF:** SHA-256
+  `115546e8aa9ef52c8dbf0b923b26d22e6856b66847c67ba3e0a9ada91776e35b`,
+  built with `release-perf` (`opt-level=3`, thin LTO, one codegen unit). One
+  process linked both exact Quill revisions under distinct crate names plus a
+  runtime-asserted linked incumbent Tantivy v0.26.1; its linked-version receipt
+  reported `index_format v7`.
+- **Workload and schedule:** pinned `SyntheticCorpus` seed
+  `0x5155494c4c504552`, 100,000 documents, vocabulary 8,192, Zipf S1.1,
+  maximum document size 4,096 bytes, four quoted two-term phrase queries,
+  top-10, and 15 rounds per query. Every invocation received a unique
+  whitespace suffix. Each round rotated the interleaved order of control A,
+  candidate, control B, and Tantivy. Control B/control A is the same-invocation
+  A/A null. Point estimates are empirical medians of per-round paired ratios;
+  95% CIs are ordinary deterministic 10,000-resample percentile-bootstrap
+  intervals over those ratios. The pooled CI is non-hierarchical across all 60
+  individual samples. Build times (not part of the query verdict) were
+  4,672.642 ms control, 5,057.470 ms candidate, and 3,332.090 ms Tantivy.
+- **Absolute p50 latency (ms):**
+
+  | phrase | control A | candidate | control B | Tantivy |
+  |---|---:|---:|---:|---:|
+  | `term00001 term00002` | 1,145.747 | 67.126 | 1,181.914 | 19.445 |
+  | `term00002 term00003` | 1,172.588 | 54.246 | 1,206.178 | 13.166 |
+  | `term00003 term00004` | 1,171.324 | 42.822 | 1,143.068 | 9.947 |
+  | `term00005 term00006` | 891.350 | 32.655 | 879.318 | 6.998 |
+
+- **Per-query candidate/control ratios:** 0.057525
+  [0.055690, 0.062253], 0.047089 [0.045087, 0.050173], 0.035988
+  [0.034311, 0.039159], and 0.038863 [0.034104, 0.053112]. The executing
+  harness emitted `null_contains_one=true` and
+  `effect_ci_below_null_ci=true` for all four query groups.
+- **Pooled result (60 paired samples per arm):** candidate/control latency
+  median **0.045774 [0.040337, 0.050173]**, p5-p95
+  [0.032413, 0.079339], or **21.85x faster** at the median. The pooled
+  control-B/control-A null is **1.006872 [0.993514, 1.022058]**. The effect
+  and null intervals are disjoint by an order of magnitude.
+- **Cache and parity receipts:** all 188 expected Quill lookups were observed
+  as misses; hits, disabled lookups, and not-checked lookups were all zero.
+  Candidate and control returned identical ordered top-10 document IDs on
+  every warmup and timed query. Tantivy returned the same ordered IDs for all
+  four groups and every timed round.
+- **Incumbent disclosure:** candidate/Tantivy latency remains **4.233582
+  [3.872581, 4.584200]** pooled, so the optimized Quill phrase path is still
+  about 4.23x slower than genuine linked Tantivy on this slice. That honest
+  remaining gap is why this is a self-speedup keep, not a QG-6 result.
+- **Immediate same-worker reproduction:** strict-remote job
+  `j-29956918973825151` repeated the exact source identities, harness command,
+  100,000-document corpus, four queries, 15-round rotation, cache busting,
+  `RAYON_NUM_THREADS=1`, and linked-incumbent contract on the same
+  `vmi1152480` worker/machine/10-CPU environment. Its freshly rebuilt ELF was
+  `6cd356a50fc1c13f53cbf6c280ee4463879b5f45dd147e6fe17c9e81004249bc`;
+  the linked-version receipt again reported `tantivy v0.26.1, index_format
+  v7`. The exact Cargo harness command was `cargo run --profile release-perf
+  --manifest-path .scratch/qg6-phrase-paired-20260801/Cargo.toml -- --count
+  100000 --rounds 15`. The first invocation's individual sample rows were not
+  persisted; its preserved summaries are recorded above. The reproduction's
+  complete printed meta, build, arm-summary, ratio, decision, and cache
+  receipts are preserved field-for-field below, with tabs normalized to spaces
+  for Markdown (individual timed sample rows are not repeated):
+
+  ```text
+  meta control_sha 0ed5be9d67afcb8ead092801cf7fb564062e3a8c
+  meta candidate_production_sha 11c42096aee1dc4d1c3ec77f22d8270e297942e0
+  meta executable_sha256 6cd356a50fc1c13f53cbf6c280ee4463879b5f45dd147e6fe17c9e81004249bc
+  meta linked_tantivy tantivy v0.26.1, index_format v7
+  meta target x86_64-linux
+  meta cpu_model AMD EPYC Processor (with IBPB)
+  meta available_parallelism 10
+  meta document_count 100000
+  meta rounds 15
+  meta rayon_num_threads 1
+  build control_ms 4337.662
+  build candidate_ms 5079.036
+  build tantivy_ms 3456.113
+  summary arm=control_a group=0 p50_ns=1258495149 p95_ns=1419278695 p99_ns=1464172399 min_ns=1134408700 max_ns=1464172399
+  summary arm=control_a group=1 p50_ns=1254801018 p95_ns=1394705389 p99_ns=1420186890 min_ns=1164052133 max_ns=1420186890
+  summary arm=control_a group=2 p50_ns=1242328560 p95_ns=1389834932 p99_ns=1550805198 min_ns=1143976012 max_ns=1550805198
+  summary arm=control_a group=3 p50_ns=988994721 p95_ns=1151737175 p99_ns=1238715184 min_ns=878825556 max_ns=1238715184
+  summary arm=candidate group=0 p50_ns=71128938 p95_ns=93324621 p99_ns=122224773 min_ns=61117971 max_ns=122224773
+  summary arm=candidate group=1 p50_ns=53347017 p95_ns=84031005 p99_ns=110009415 min_ns=40729283 max_ns=110009415
+  summary arm=candidate group=2 p50_ns=46398525 p95_ns=70822270 p99_ns=149666063 min_ns=34790480 max_ns=149666063
+  summary arm=candidate group=3 p50_ns=31883135 p95_ns=55573515 p99_ns=58119880 min_ns=25699855 max_ns=58119880
+  summary arm=control_b group=0 p50_ns=1203624574 p95_ns=1306503174 p99_ns=1415108931 min_ns=1102336308 max_ns=1415108931
+  summary arm=control_b group=1 p50_ns=1273286638 p95_ns=1372801162 p99_ns=1392402493 min_ns=1167128022 max_ns=1392402493
+  summary arm=control_b group=2 p50_ns=1225399086 p95_ns=1323728609 p99_ns=1366154381 min_ns=1094601672 max_ns=1366154381
+  summary arm=control_b group=3 p50_ns=1004213114 p95_ns=1150162066 p99_ns=1450400639 min_ns=896221978 max_ns=1450400639
+  summary arm=tantivy group=0 p50_ns=18715433 p95_ns=34365346 p99_ns=38733798 min_ns=16267414 max_ns=38733798
+  summary arm=tantivy group=1 p50_ns=13345076 p95_ns=32697359 p99_ns=68694620 min_ns=11588718 max_ns=68694620
+  summary arm=tantivy group=2 p50_ns=10958488 p95_ns=15548221 p99_ns=16288504 min_ns=8737787 max_ns=16288504
+  summary arm=tantivy group=3 p50_ns=7045374 p95_ns=15258209 p99_ns=56699526 min_ns=6306743 max_ns=56699526
+  ratio group=0 control_a_over_control_b=1.045588 control_over_candidate=17.307440 candidate_over_tantivy=3.800550 tantivy_order_matches=true
+  paired metric=candidate_over_control group=0 median=0.055443 ci95_low=0.051695 ci95_high=0.060854 p5=0.048564 p95=0.077584
+  paired metric=control_b_over_control_a_null group=0 median=0.940039 ci95_low=0.910137 ci95_high=1.000911 p5=0.852693 p95=1.014395
+  paired metric=candidate_over_tantivy group=0 median=3.489711 ci95_low=3.024344 ci95_high=4.332849 p5=1.843907 p95=5.736906
+  decision group=0 null_contains_one=true effect_ci_below_null_ci=true
+  ratio group=1 control_a_over_control_b=0.985482 control_over_candidate=23.694742 candidate_over_tantivy=3.997506 tantivy_order_matches=true
+  paired metric=candidate_over_control group=1 median=0.043965 ci95_low=0.041013 ci95_high=0.047925 p5=0.039172 p95=0.059169
+  paired metric=control_b_over_control_a_null group=1 median=1.018600 ci95_low=0.985977 ci95_high=1.047439 p5=0.927661 p95=1.100103
+  paired metric=candidate_over_tantivy group=1 median=4.008068 ci95_low=3.625796 ci95_high=4.584589 p5=3.052008 p95=5.123871
+  decision group=1 null_contains_one=true effect_ci_below_null_ci=true
+  ratio group=2 control_a_over_control_b=1.013815 control_over_candidate=26.592738 candidate_over_tantivy=4.234026 tantivy_order_matches=true
+  paired metric=candidate_over_control group=2 median=0.036190 ci95_low=0.033721 ci95_high=0.043726 p5=0.028918 p95=0.061909
+  paired metric=control_b_over_control_a_null group=2 median=0.958571 ci95_low=0.917245 ci95_high=1.048972 p5=0.853575 p95=1.097350
+  paired metric=candidate_over_tantivy group=2 median=4.326269 ci95_low=3.472104 ci95_high=5.150850 p5=2.964191 p95=5.667976
+  decision group=2 null_contains_one=true effect_ci_below_null_ci=true
+  ratio group=3 control_a_over_control_b=0.984845 control_over_candidate=31.258028 candidate_over_tantivy=4.525400 tantivy_order_matches=true
+  paired metric=candidate_over_control group=3 median=0.032978 ci95_low=0.030363 ci95_high=0.033793 p5=0.028258 p95=0.050934
+  paired metric=control_b_over_control_a_null group=3 median=0.998632 ci95_low=0.971421 ci95_high=1.085658 p5=0.894977 p95=1.173358
+  paired metric=candidate_over_tantivy group=3 median=4.097719 ci95_low=2.785226 ci95_high=4.879725 p5=2.089573 p95=7.312987
+  decision group=3 null_contains_one=true effect_ci_below_null_ci=true
+  paired metric=candidate_over_control group=pooled median=0.043616 ci95_low=0.038855 ci95_high=0.047925 p5=0.028435 p95=0.077584
+  paired metric=control_b_over_control_a_null group=pooled median=0.995678 ci95_low=0.957449 ci95_high=1.009403 p5=0.852693 p95=1.176434
+  paired metric=candidate_over_tantivy group=pooled median=4.022228 ci95_low=3.625796 ci95_high=4.326269 p5=1.843907 p95=6.707800
+  decision group=pooled null_contains_one=true effect_ci_below_null_ci=true
+  cache_receipt expected_misses=188 observed_misses=188 hits=0 disabled=0 not_checked=0
+  ```
+
+  This independent invocation reproduces the first run without pooling:
+  candidate/control is **0.043616 [0.038855, 0.047925]**, or **22.93x
+  faster**; the A/A null is **0.995678 [0.957449, 1.009403]**; and
+  candidate/Tantivy is **4.022228 [3.625796, 4.326269]**. Every per-query
+  and pooled decision receipt is true, all 188 Quill lookups are attested
+  misses, all other cache states are zero, and ordered candidate/control and
+  Tantivy document-ID parity holds. This confirms the self-speedup direction
+  and magnitude while independently confirming the roughly 4x incumbent gap;
+  it does not upgrade the comparison class, activate QG-6, change a ratchet,
+  or authorize the engine flip.
+- **Correctness and landing gates:** hostile peer review passed. Strict-remote
+  exact-head validation passed 512 runnable Quill unit tests (one scale test
+  ignored), 3 cancellation integration tests, and 2 doctests; workspace
+  `cargo check --workspace --all-targets` and workspace Clippy with
+  `-D warnings` passed. `cargo fmt --all -- --check` and `git diff --check`
+  passed. UBS scanned both changed Rust files with exit 0 and zero critical
+  findings; its warning/info census is inherited whole-file heuristic output,
+  not newly introduced findings.
+- **Decision: KEEP.** The production seam is unchanged after measurement.
+  QG-6 still requires its complete normative query-class matrix, reference
+  hardware, all gate receipts, and an independently admissible campaign
+  artifact; none is claimed here.
+
+## 2026-07-30 — KEEP (BANKED; push gated on the user ruling `bd-s1rc1-ubs-user-ruling-gate-82rpt`): Quill `EncodedSegment` per-commit deep-clone elimination via `Arc<Vec<u8>>` byte backing (`bd-s1rc1`, REBASE pass at tip `504fa185`)
+
+- **Comparison class: SELF-SPEEDUP (maintenance).** Both arms are
+  frankensearch (Quill); no incumbent arm anywhere in this evidence.
+- **Claim class: MEMORY/MECHANISM.** Allocation censuses (valgrind-3.25.1
+  DHAT, load-insensitive); explicitly NOT a latency/throughput claim; zero
+  wall-clock measurements in this pass.
+- **Lever:** `EncodedSegment.bytes` became `Arc<Vec<u8>>`;
+  `impl AsRef<[u8]> for EncodedSegment`; new `SegmentReader::from_encoded`
+  retains the shared backing through the existing
+  `SegmentReader<B: AsRef<[u8]>>` generic; `RecoveredSegment::bind_owned`
+  switched to it; `into_bytes` is
+  `Arc::try_unwrap(...).unwrap_or_else(|arc| (*arc).clone())` so unique
+  owners stay zero-copy. `sections` stays a plain Vec.
+  `publish_owned_segments` signature unchanged; index.rs functionally
+  untouched — its clone sites collapse by type effect. Blessed design
+  FoggyPrairie #6267/#6255 + MossyPine refinement, followed exactly.
+  Rebased from base `3684b147` onto tip `504fa185` via `git apply --3way`:
+  all hunks applied cleanly (segment.rs base blob identical; keeper.rs and
+  index.rs hunks context-shifted only, train changes preserved, no
+  semantic redesign).
+- **Exact mechanism claim:** the payload-site allocation family — program
+  points whose stacks contain a `(to_vec|clone)<u8>` byte-copy frame
+  reached through `EncodedSegment`'s derive-Clone (`clone (segment.rs:NNN)`)
+  — drops to **0 bytes / 0 pps** on the lever arm at both scales
+  (`dhat_family.py` v2, mutation selftest 4/4 PASS).
+- **Executing ELFs (both arms built from tip `504fa185`,
+  `--profile release-perf --features perf-harness`, frame pointers on):**
+  - BEFORE (pristine tip) ELF sha256: `39c4ecabd787e3ca4f4fdcd62c5af3381bf1309362c8937324b1182fe7c74ab4`
+  - AFTER (lever) ELF sha256: `40de3a53a6886af16096f608556b04fc868e3cf730a297c1c27ca8b397187311`
+- **DHAT 50k (memory child, 1 thread, positions on):** v2 payload-site
+  87,884,436 bytes (2 pps) → **0 bytes (0 pps)**; total allocated
+  1,171,626,962 → 1,085,915,139 (−7.32%). Against the banked 3684-era
+  baseline (88,280,448 payload bytes) the lever is likewise 0.
+- **DHAT 200k:** v2 payload-site 353,951,118 bytes (2 pps) → **0 (0 pps)**;
+  payload bytes/doc 1,769.8 → 0; total 7,275,372,547 → 6,906,437,248
+  (−5.07%). Child peak 1,052,307,456 → 1,028,395,008 (observation only).
+- **Byte identity (tip-built probe, 2 ELFs × 2 runs, 10 artifacts each):**
+  all four per-run SHA-256 manifests byte-identical; combined-manifest
+  canonical digest
+  `8678387786cb0cbc1e8473bba34641393f7bd57016adc32d89d60f598211b98a` —
+  identical to the REV 3 overlay digest, so neither the tip train nor the
+  lever changed a single emitted byte.
+- **Behavior proofs (tests land with the patch, all green):**
+  pre-publication cancellation retains the pending seal and retries
+  losslessly (aborted attempt, not a publisher failure); a REAL typed
+  MANIFEST-write permission failure on a read-only Keeper directory
+  retains the pending seal (`segment_installed == true`, same `Arc`) and a
+  retry publishes losslessly advancing exactly one generation
+  (`#[cfg(unix)]`); old snapshots keep pointer-stable byte backing across
+  successor publications; unique-owner `into_bytes` is pointer-identical
+  zero-copy.
+- **Gates at tip:** check/clippy/fmt/tests all strict EXIT_STATUS=0;
+  clippy warning sets EMPTY on both arms (diff empty); 490 lib tests
+  (489 passed, 1 ignored) + 3 integration + 2 doctests, 0 failed.
+- **UBS three-file census (v5.3.7), honest state:** raw exit 1 on BOTH
+  arms (inherited pre-existing findings). Pristine tip 310 critical /
+  4,879 warning / 981 info; lever 310 / 5,055 / 988. **Zero new criticals**
+  — the two net-new test `panic!` sites from the REV 3 patch were
+  converted to typed expect-style assertions in this pass (−2 vs the REV 3
+  patch state); `panic!(` counts per file are identical across arms.
+  Warning +176 / info +7 are the `.expect()` density of ~390 added
+  TEST-only lines, same finding classes both arms.
+- **Timing:** intentionally EMPTY in this row class; any timing claim
+  requires the separate same-worker interleaved paired A/B and its own
+  ledger discipline.
+- **Status:** BANKED — commit prepared in a detached worktree at base
+  `504fa185`, NOT pushed; push awaits the user ruling gate
+  (`bd-s1rc1-ubs-user-ruling-gate-82rpt`). Full narrative:
+  `docs/evidence/e8h/p5-s1rc1-arc-backing-rebase-20260730.md`.

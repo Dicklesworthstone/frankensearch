@@ -27,8 +27,6 @@ use tracing::instrument;
 use frankensearch_core::config::TwoTierConfig;
 use frankensearch_core::error::{SearchError, SearchResult};
 use frankensearch_core::traits::LexicalRead;
-#[cfg(all(feature = "lexical", not(feature = "quill")))]
-use frankensearch_core::traits::LexicalWrite;
 use frankensearch_core::traits::{Embedder, MetricsExporter};
 use frankensearch_core::types::{EmbeddingMetrics, IndexMetrics, IndexableDocument};
 #[cfg(all(feature = "durability", feature = "quill"))]
@@ -954,6 +952,11 @@ async fn build_lexical_index(
     data_dir: &Path,
     documents: &[IndexableDocument],
 ) -> SearchResult<LexicalArmReceipt> {
+    // bd-b7pz: the LexicalRead flip (0220d5c5) left this write-side arm
+    // without the trait that provides index_documents/commit; this cfg combo
+    // (lexical without quill) is not built by the default-feature gates.
+    use frankensearch_core::traits::LexicalWrite;
+
     let lexical = TantivyIndex::create(data_dir)?;
     let mut indexed = 0usize;
     let mut errors: Vec<(String, String)> = Vec::new();
@@ -1037,6 +1040,11 @@ mod tests {
     use frankensearch_durability::{DefaultSymbolCodec, DurabilityConfig, FsviVerifyResult};
     #[cfg(all(feature = "lexical", not(feature = "quill")))]
     use frankensearch_lexical::TantivyIndex;
+    #[cfg(feature = "quill")]
+    use frankensearch_quill::{
+        DEFAULT_SCHEMA, EncodedSegment, SectionInput, SectionKind, SegmentHeaderInput,
+        SegmentReader, load_manifest_pair,
+    };
 
     use super::*;
 
@@ -1399,6 +1407,129 @@ mod tests {
                 lexical.search(&cx, "Alpha", 5).await.unwrap()
             };
             assert!(!hits.is_empty());
+        });
+    }
+
+    /// Eager TERMDICT admission deliberately upgrades malformed dictionary
+    /// bytes from a query-time subsystem failure to an open-time corruption
+    /// diagnosis. Pin that public facade contract with a structurally valid,
+    /// checksum-consistent FSLX image whose dictionary payload is malformed.
+    #[cfg(feature = "quill")]
+    #[test]
+    fn open_hybrid_reports_malformed_termdict_as_index_corrupted() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let dir = tempfile::tempdir().unwrap();
+            IndexBuilder::new(dir.path())
+                .with_embedder_stack(stub_stack())
+                .add_document("doc-alpha", "alpha retrieval sentinel")
+                .build(&cx)
+                .await
+                .expect("build intact hybrid fixture");
+
+            let intact = open_hybrid(&cx, dir.path(), TwoTierConfig::default())
+                .await
+                .expect("open intact hybrid fixture");
+            let lexical = intact.lexical.as_ref().expect("Quill lexical arm");
+            let hits = lexical
+                .search(&cx, "alpha", 10)
+                .await
+                .expect("search intact Quill arm");
+            assert_eq!(hits.len(), 1);
+            assert_eq!(hits[0].doc_id.as_str(), "doc-alpha");
+            drop(intact);
+
+            let lexical_dir = dir.path().join("lexical");
+            let segment_path = std::fs::read_dir(&lexical_dir)
+                .expect("read lexical fixture directory")
+                .filter_map(Result::ok)
+                .map(|entry| entry.path())
+                .find(|path| {
+                    path.extension()
+                        .is_some_and(|extension| extension == "fslx")
+                })
+                .expect("published FSLX fixture");
+            let reader = SegmentReader::from_owned(
+                std::fs::read(&segment_path).expect("read intact FSLX fixture"),
+                DEFAULT_SCHEMA,
+            )
+            .expect("parse intact FSLX fixture");
+            let header = reader.header();
+            let malformed_termdict = 1_u32.to_le_bytes();
+            let payloads = reader
+                .section_entries()
+                .iter()
+                .map(|entry| {
+                    let bytes = if entry.kind == SectionKind::TERMDICT {
+                        malformed_termdict.to_vec()
+                    } else {
+                        reader
+                            .section(entry.kind)
+                            .expect("verify intact section")
+                            .expect("known section")
+                            .to_vec()
+                    };
+                    (entry.kind, entry.flags, bytes)
+                })
+                .collect::<Vec<_>>();
+            let sections = payloads
+                .iter()
+                .map(|(kind, flags, bytes)| SectionInput {
+                    kind: *kind,
+                    flags: *flags,
+                    bytes,
+                })
+                .collect::<Vec<_>>();
+            let corrupted = EncodedSegment::encode(
+                SegmentHeaderInput {
+                    segment_id: header.segment_id,
+                    schema: DEFAULT_SCHEMA,
+                    docid_lo: header.docid_lo,
+                    docid_hi: header.docid_hi,
+                    doc_count: header.doc_count,
+                    created_unix_s: header.created_unix_s,
+                    engine_version: header.engine_version,
+                },
+                &sections,
+            )
+            .expect("encode checksum-consistent malformed TERMDICT fixture");
+            std::fs::write(&segment_path, corrupted.as_bytes())
+                .expect("publish malformed FSLX fixture");
+
+            let mut manifest = load_manifest_pair(&lexical_dir)
+                .expect("load lexical fixture manifest")
+                .manifest;
+            let witness = manifest
+                .segments
+                .iter_mut()
+                .find(|segment| segment.segment_id == header.segment_id)
+                .expect("manifest witness for fixture segment");
+            witness.file_len = corrupted.file_len();
+            witness.file_xxh3 = corrupted.file_xxh3();
+            let manifest_bytes = manifest
+                .to_bytes()
+                .expect("encode updated fixture manifest");
+            std::fs::write(lexical_dir.join("MANIFEST"), &manifest_bytes)
+                .expect("publish updated fixture manifest");
+            let previous_manifest = lexical_dir.join("MANIFEST.prev");
+            if previous_manifest.exists() {
+                std::fs::write(previous_manifest, &manifest_bytes)
+                    .expect("keep equal-generation fixture manifests byte-identical");
+            }
+
+            let error = open_hybrid(&cx, dir.path(), TwoTierConfig::default())
+                .await
+                .expect_err("malformed TERMDICT must fail during facade open");
+            assert!(
+                matches!(&error, SearchError::IndexCorrupted { .. }),
+                "expected IndexCorrupted, got {error:?}"
+            );
+            if let SearchError::IndexCorrupted { path, detail } = error {
+                assert_eq!(path, segment_path);
+                assert!(
+                    detail.contains("TERMDICT declares 1 blocks in only 4 bytes"),
+                    "corruption detail must identify the malformed dictionary: {detail}"
+                );
+            }
         });
     }
 

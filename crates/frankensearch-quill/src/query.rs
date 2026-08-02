@@ -524,6 +524,82 @@ pub struct ParsedQuery {
     pub was_truncated: bool,
 }
 
+/// Maximum raw-query bytes admitted by the dev-only CASS observation boundary.
+///
+/// Shipping parsing still admits [`MAX_QUERY_LENGTH`] Unicode scalar values.
+/// This separate byte cap prevents a conformance caller from retaining an
+/// arbitrarily large pre-truncation witness.
+#[cfg(any(test, feature = "conformance-internals"))]
+pub const MAX_CASS_OBSERVATION_RAW_QUERY_BYTES: usize = 1_048_576;
+
+/// Maximum number of exact filter values admitted by one CASS observation.
+#[cfg(any(test, feature = "conformance-internals"))]
+pub const MAX_CASS_OBSERVATION_FILTER_VALUES: usize = 4_096;
+
+/// Maximum bytes admitted for any individual exact filter value.
+#[cfg(any(test, feature = "conformance-internals"))]
+pub const MAX_CASS_OBSERVATION_FILTER_VALUE_BYTES: usize = 4_096;
+
+/// Maximum aggregate bytes admitted across all exact filter values.
+#[cfg(any(test, feature = "conformance-internals"))]
+pub const MAX_CASS_OBSERVATION_FILTER_BYTES: usize = 1_048_576;
+
+/// One token consumed by the native CASS grammar, including its source offset.
+///
+/// This is an evidence boundary rather than a second lexer: values are projected
+/// from the private token stream that [`CassQueryParser`] actually lowers. Text
+/// is intentionally retained here only in memory; durable gauntlet artifacts
+/// must redact it before persistence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg(any(test, feature = "conformance-internals"))]
+pub enum CassQueryToken {
+    /// A term operand and its starting UTF-8 byte offset.
+    Term { text: String, byte_offset: usize },
+    /// A quoted phrase operand and its opening-quote byte offset.
+    Phrase { text: String, byte_offset: usize },
+    /// An explicit conjunction.
+    And { byte_offset: usize },
+    /// An explicit disjunction.
+    Or { byte_offset: usize },
+    /// An explicit or prefix negation.
+    Not { byte_offset: usize },
+}
+
+/// Complete in-memory witness emitted by the real native CASS parser.
+///
+/// `parsed` is exactly the value returned by [`CassQueryParser::parse`]. The
+/// additional fields expose the parser's actual token stream and the named
+/// CASS sanitization transform so a conformance adapter does not reconstruct
+/// either value from the source corpus.
+#[derive(Debug, Clone, PartialEq)]
+#[cfg(any(test, feature = "conformance-internals"))]
+pub struct CassParsedQueryObservation {
+    /// Lowered query tree, classification, diagnostics, and truncation state.
+    pub parsed: ParsedQuery,
+    /// Shipping CASS sanitization applied to the admitted query prefix.
+    pub sanitized_query: String,
+    /// Exact query prefix admitted to the shipping parser.
+    pub admitted_query: String,
+    /// Ordered tokens consumed by the native grammar.
+    pub tokens: Vec<CassQueryToken>,
+}
+
+/// A bounded CASS observation request was rejected before witness allocation.
+#[derive(Debug, Clone, Error, PartialEq, Eq)]
+#[cfg(any(test, feature = "conformance-internals"))]
+pub enum CassQueryObservationError {
+    /// One request dimension exceeded its fixed conformance-only cap.
+    #[error("CASS observation field {field} has size {actual}, exceeding limit {limit}")]
+    BoundExceeded {
+        /// Stable request dimension.
+        field: &'static str,
+        /// Observed size, saturated to `usize::MAX` on arithmetic overflow.
+        actual: usize,
+        /// Maximum admitted size.
+        limit: usize,
+    },
+}
+
 /// Invalid schema configuration for the shipping default parser.
 #[derive(Debug, Clone, Error, PartialEq, Eq)]
 pub enum QueryParserConfigError {
@@ -3436,7 +3512,50 @@ impl CassQueryParser {
     /// Parse one CASS query and append its structured filters.
     #[must_use]
     pub fn parse(&self, raw_query: &str, filters: &CassQueryFilters) -> ParsedQuery {
-        let (truncated_query, was_truncated) = truncated_prefix(raw_query);
+        let (admitted_query, was_truncated) = truncated_prefix(raw_query);
+        self.parse_admitted(admitted_query, was_truncated, filters, |_| {})
+    }
+
+    /// Parse one CASS query and retain the exact lexer/lowering witness.
+    ///
+    /// This calls the same implementation as [`Self::parse`]. It exists for
+    /// dev-only conformance adapters that must observe the real parser boundary
+    /// without echoing or independently reparsing the input corpus.
+    /// # Errors
+    ///
+    /// Returns a typed bound error before parsing or cloning evidence when the
+    /// raw query, filter count, individual filter value, or aggregate filter
+    /// bytes exceed the diagnostic contract.
+    #[cfg(any(test, feature = "conformance-internals"))]
+    pub fn parse_observed(
+        &self,
+        raw_query: &str,
+        filters: &CassQueryFilters,
+    ) -> Result<CassParsedQueryObservation, CassQueryObservationError> {
+        cass_observation_preflight(raw_query, filters)?;
+        let (admitted_query, was_truncated) = truncated_prefix(raw_query);
+        let mut observed_tokens = Vec::new();
+        let parsed = self.parse_admitted(admitted_query, was_truncated, filters, |tokens| {
+            observed_tokens.extend(tokens.iter().map(CassLexToken::observed));
+        });
+        Ok(CassParsedQueryObservation {
+            parsed,
+            sanitized_query: cass_sanitize_query(admitted_query),
+            admitted_query: admitted_query.to_owned(),
+            tokens: observed_tokens,
+        })
+    }
+
+    fn parse_admitted<Observe>(
+        &self,
+        admitted_query: &str,
+        was_truncated: bool,
+        filters: &CassQueryFilters,
+        mut observe_tokens: Observe,
+    ) -> ParsedQuery
+    where
+        Observe: FnMut(&[CassLexToken]),
+    {
         let mut diagnostics = Vec::new();
         if was_truncated {
             emit_diagnostic(
@@ -3446,12 +3565,13 @@ impl CassQueryParser {
                     message: format!(
                         "CASS query truncated to {MAX_QUERY_LENGTH} Unicode scalar values"
                     ),
-                    byte_offset: Some(truncated_query.len()),
+                    byte_offset: Some(admitted_query.len()),
                     fragment: None,
                 },
             );
         }
-        let tokens = cass_lex(truncated_query, &mut diagnostics);
+        let tokens = cass_lex(admitted_query, &mut diagnostics);
+        observe_tokens(&tokens);
         let mut grammar = CassGrammar {
             parser: *self,
             tokens,
@@ -3468,7 +3588,7 @@ impl CassQueryParser {
         let query = self.apply_filters(root, filters);
         ParsedQuery {
             query,
-            explanation: classify_query(truncated_query),
+            explanation: classify_query(admitted_query),
             diagnostics: grammar.diagnostics,
             was_truncated,
         }
@@ -3683,6 +3803,72 @@ fn cass_complement(query: Query) -> Query {
     }
 }
 
+#[cfg(any(test, feature = "conformance-internals"))]
+fn cass_observation_preflight(
+    raw_query: &str,
+    filters: &CassQueryFilters,
+) -> Result<(), CassQueryObservationError> {
+    cass_observation_bound(
+        "raw_query_bytes",
+        raw_query.len(),
+        MAX_CASS_OBSERVATION_RAW_QUERY_BYTES,
+    )?;
+
+    let source_value = match &filters.source_filter {
+        CassSourceFilter::SourceId(value) => Some(value.as_str()),
+        CassSourceFilter::All | CassSourceFilter::Local | CassSourceFilter::Remote => None,
+    };
+    let filter_count = filters
+        .agents
+        .len()
+        .checked_add(filters.workspaces.len())
+        .and_then(|count| count.checked_add(usize::from(source_value.is_some())))
+        .unwrap_or(usize::MAX);
+    cass_observation_bound(
+        "filter_value_count",
+        filter_count,
+        MAX_CASS_OBSERVATION_FILTER_VALUES,
+    )?;
+
+    let mut aggregate_bytes = 0_usize;
+    for value in filters
+        .agents
+        .iter()
+        .chain(&filters.workspaces)
+        .map(String::as_str)
+        .chain(source_value)
+    {
+        cass_observation_bound(
+            "filter_value_bytes",
+            value.len(),
+            MAX_CASS_OBSERVATION_FILTER_VALUE_BYTES,
+        )?;
+        aggregate_bytes = aggregate_bytes.saturating_add(value.len());
+        cass_observation_bound(
+            "aggregate_filter_bytes",
+            aggregate_bytes,
+            MAX_CASS_OBSERVATION_FILTER_BYTES,
+        )?;
+    }
+    Ok(())
+}
+
+#[cfg(any(test, feature = "conformance-internals"))]
+fn cass_observation_bound(
+    field: &'static str,
+    actual: usize,
+    limit: usize,
+) -> Result<(), CassQueryObservationError> {
+    if actual > limit {
+        return Err(CassQueryObservationError::BoundExceeded {
+            field,
+            actual,
+            limit,
+        });
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum CassLexToken {
     Term { text: String, offset: usize },
@@ -3690,6 +3876,31 @@ enum CassLexToken {
     And { offset: usize },
     Or { offset: usize },
     Not { offset: usize },
+}
+
+impl CassLexToken {
+    #[cfg(any(test, feature = "conformance-internals"))]
+    fn observed(&self) -> CassQueryToken {
+        match self {
+            Self::Term { text, offset } => CassQueryToken::Term {
+                text: text.clone(),
+                byte_offset: *offset,
+            },
+            Self::Phrase { text, offset } => CassQueryToken::Phrase {
+                text: text.clone(),
+                byte_offset: *offset,
+            },
+            Self::And { offset } => CassQueryToken::And {
+                byte_offset: *offset,
+            },
+            Self::Or { offset } => CassQueryToken::Or {
+                byte_offset: *offset,
+            },
+            Self::Not { offset } => CassQueryToken::Not {
+                byte_offset: *offset,
+            },
+        }
+    }
 }
 
 fn cass_lex(query: &str, diagnostics: &mut Vec<QueryDiagnostic>) -> Vec<CassLexToken> {
@@ -3976,7 +4187,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     #[cfg(feature = "tantivy-oracle")]
-    use frankensearch_core::traits::LexicalSearch;
+    use frankensearch_core::traits::LexicalWrite;
     #[cfg(feature = "tantivy-oracle")]
     use frankensearch_core::types::IndexableDocument;
     #[cfg(feature = "tantivy-oracle")]
@@ -4614,6 +4825,158 @@ mod tests {
 
     fn cass_parser() -> CassQueryParser {
         CassQueryParser::new(CASS_SEMANTIC_SCHEMA).expect("CASS schema supports its parser")
+    }
+
+    #[test]
+    fn cass_parser_observation_uses_the_real_lexer_and_admitted_prefix() {
+        let parser = cass_parser();
+        let raw = "c++ \"exact phrase\" OR -deprecated";
+        let filters = CassQueryFilters::default();
+        let observed = parser
+            .parse_observed(raw, &filters)
+            .expect("bounded observation");
+
+        assert_eq!(observed.parsed, parser.parse(raw, &filters));
+        assert_eq!(observed.admitted_query, raw);
+        assert_eq!(
+            observed.sanitized_query,
+            "c   \"exact phrase\" OR -deprecated"
+        );
+        assert_eq!(
+            observed.tokens,
+            vec![
+                CassQueryToken::Term {
+                    text: "c++".to_owned(),
+                    byte_offset: 0,
+                },
+                CassQueryToken::Phrase {
+                    text: "exact phrase".to_owned(),
+                    byte_offset: 4,
+                },
+                CassQueryToken::Or { byte_offset: 19 },
+                CassQueryToken::Not { byte_offset: 22 },
+                CassQueryToken::Term {
+                    text: "deprecated".to_owned(),
+                    byte_offset: 23,
+                },
+            ]
+        );
+
+        let mut oversized = "auth".to_owned();
+        oversized.push_str(&" ".repeat(MAX_QUERY_LENGTH - oversized.chars().count()));
+        oversized.push_str("private-tail");
+        let truncated = parser
+            .parse_observed(&oversized, &filters)
+            .expect("bounded truncated observation");
+        assert!(truncated.parsed.was_truncated);
+        assert_eq!(truncated.admitted_query.chars().count(), MAX_QUERY_LENGTH);
+        assert!(!truncated.sanitized_query.contains("private-tail"));
+        assert!(truncated.tokens.iter().all(|token| {
+            !matches!(
+                token,
+                CassQueryToken::Term { text, .. } if text.contains("private-tail")
+            )
+        }));
+    }
+
+    #[test]
+    fn cass_parser_observation_uses_utf8_byte_offsets_within_the_admitted_prefix() {
+        let parser = cass_parser();
+        let filters = CassQueryFilters::default();
+        let raw = "搜索 \"éclair\" OR 尾巴";
+        let observed = parser
+            .parse_observed(raw, &filters)
+            .expect("multibyte observation is bounded");
+
+        assert_eq!(observed.admitted_query, raw);
+        assert_eq!(
+            observed.tokens,
+            vec![
+                CassQueryToken::Term {
+                    text: "搜索".to_owned(),
+                    byte_offset: 0,
+                },
+                CassQueryToken::Phrase {
+                    text: "éclair".to_owned(),
+                    byte_offset: "搜索 ".len(),
+                },
+                CassQueryToken::Or {
+                    byte_offset: "搜索 \"éclair\" ".len(),
+                },
+                CassQueryToken::Term {
+                    text: "尾巴".to_owned(),
+                    byte_offset: "搜索 \"éclair\" OR ".len(),
+                },
+            ]
+        );
+        assert!(observed.tokens.iter().all(|token| {
+            let offset = match token {
+                CassQueryToken::Term { byte_offset, .. }
+                | CassQueryToken::Phrase { byte_offset, .. }
+                | CassQueryToken::And { byte_offset }
+                | CassQueryToken::Or { byte_offset }
+                | CassQueryToken::Not { byte_offset } => *byte_offset,
+            };
+            offset < observed.admitted_query.len()
+                && observed.admitted_query.is_char_boundary(offset)
+        }));
+    }
+
+    #[test]
+    fn cass_parser_observation_rejects_hostile_bounds_before_witness_allocation() {
+        let parser = cass_parser();
+        let oversized_raw = "x".repeat(MAX_CASS_OBSERVATION_RAW_QUERY_BYTES + 1);
+        assert_eq!(
+            parser.parse_observed(&oversized_raw, &CassQueryFilters::default()),
+            Err(CassQueryObservationError::BoundExceeded {
+                field: "raw_query_bytes",
+                actual: MAX_CASS_OBSERVATION_RAW_QUERY_BYTES + 1,
+                limit: MAX_CASS_OBSERVATION_RAW_QUERY_BYTES,
+            })
+        );
+
+        let oversized_filter = "x".repeat(MAX_CASS_OBSERVATION_FILTER_VALUE_BYTES + 1);
+        let filters = CassQueryFilters {
+            agents: vec![oversized_filter],
+            ..CassQueryFilters::default()
+        };
+        assert_eq!(
+            parser.parse_observed("bounded", &filters),
+            Err(CassQueryObservationError::BoundExceeded {
+                field: "filter_value_bytes",
+                actual: MAX_CASS_OBSERVATION_FILTER_VALUE_BYTES + 1,
+                limit: MAX_CASS_OBSERVATION_FILTER_VALUE_BYTES,
+            })
+        );
+
+        let aggregate_filters = CassQueryFilters {
+            agents: vec![
+                "x".repeat(MAX_CASS_OBSERVATION_FILTER_VALUE_BYTES);
+                MAX_CASS_OBSERVATION_FILTER_BYTES / MAX_CASS_OBSERVATION_FILTER_VALUE_BYTES
+                    + 1
+            ],
+            ..CassQueryFilters::default()
+        };
+        assert!(matches!(
+            parser.parse_observed("bounded", &aggregate_filters),
+            Err(CassQueryObservationError::BoundExceeded {
+                field: "aggregate_filter_bytes",
+                ..
+            })
+        ));
+
+        let filters = CassQueryFilters {
+            agents: vec!["x".to_owned(); MAX_CASS_OBSERVATION_FILTER_VALUES + 1],
+            ..CassQueryFilters::default()
+        };
+        assert_eq!(
+            parser.parse_observed("bounded", &filters),
+            Err(CassQueryObservationError::BoundExceeded {
+                field: "filter_value_count",
+                actual: MAX_CASS_OBSERVATION_FILTER_VALUES + 1,
+                limit: MAX_CASS_OBSERVATION_FILTER_VALUES,
+            })
+        );
     }
 
     fn cass_filters_from_fixture(case: &Value) -> CassQueryFilters {

@@ -24,6 +24,7 @@ CANDIDATE=""
 SURFACE=""
 LEDGER_OVERRIDE=""
 SELF_CHECK_FIXTURE=""
+SELF_CHECK_ADDED_HEADING_LINE=""
 
 usage() {
   cat <<'USAGE'
@@ -43,7 +44,7 @@ Options:
   --selfcheck         Exercise fail-closed synthetic contract cases
                       (also runs --leakcheck).
   --leakcheck         Regression-check per-entry flag leakage across mixed
-                      history (the 79d999ad bug) via a temp-repo staged/since
+                      history (the 79d999ad bug) via a temp-repo staged
                       simulation. LEDGER_LEAKCHECK_TARGET=<path> substitutes
                       the script under test (RED-proofing old versions).
   --ledger <path>     Override the default ledger set (test/diagnostic use).
@@ -237,7 +238,11 @@ diff_stream() {
       # No hunks are needed in report mode; awk checks every entry.
       ;;
     selfcheck)
-      # Synthetic self-check entries are all considered newly added.
+      # Most synthetic self-check entries are all considered newly added.
+      # A selected heading can instead model a new row after an existing row.
+      if [[ -n "${SELF_CHECK_ADDED_HEADING_LINE}" ]]; then
+        printf '@@ -0,0 +%s @@\n' "${SELF_CHECK_ADDED_HEADING_LINE}"
+      fi
       ;;
   esac
 }
@@ -266,11 +271,13 @@ blob_stream() {
   esac
 }
 
-lint_one() {
+lint_one_materialized() {
   local requested="$1"
   resolve_ledger "${requested}"
 
-  awk -v mode="${MODE}" -v ledger="${LEDGER_REL}" '
+  awk -v mode="${MODE}" \
+      -v ledger="${LEDGER_REL}" \
+      -v selfcheck_added_heading="${SELF_CHECK_ADDED_HEADING_LINE}" '
     function has_hex64(line,    fields, n, i) {
       n = split(line, fields, /[^[:xdigit:]]+/)
       for (i = 1; i <= n; i++) {
@@ -347,7 +354,7 @@ coefficient of variation[_ -]*gate/ ||
         cv_verdict = 1
       }
     }
-    function reset_entry() {
+    function reset_entry_state() {
       # Reset EVERY per-entry flag. Both flush exits must use this: the
       # early-return for non-new entries previously reset only header and
       # evidence, so flags set by historical rows (cv_verdict, decision_lines,
@@ -359,13 +366,26 @@ coefficient of variation[_ -]*gate/ ||
       side_by_side = 0; self_speedup_class = 0; incumbent_class = 0
       actual_incumbent = 0; incumbent_ratio = 0; competitive_claim = 0
     }
-    function flush(    upper, explicit_reject, explicit_keep, exempt,
+    function entry_touched(first, last,    i) {
+      # bd-z4lqq: newness used to key on the HEADING line alone, so a body-only
+      # edit to a historical entry (e.g. flipping a REJECT rationale to KEEP
+      # wording) was never gated. An entry is touched if ANY line of its span
+      # appears in the diff.
+      for (i = first; i <= last; i++) {
+        if (added[i]) return 1
+      }
+      return 0
+    }
+    function flush(end_line,    upper, explicit_reject, explicit_keep, exempt,
                        is_reject, is_keep, new_entry, has_null,
                        incumbent_complete) {
       if (header == "") return
-      new_entry = (mode == "all" || mode == "selfcheck" || added[start_line])
+      new_entry = (mode == "all" ||
+                   (mode == "selfcheck" && selfcheck_added_heading == "") ||
+                   entry_touched(start_line, end_line))
       if (!new_entry) {
-        reset_entry(); return
+        reset_entry_state()
+        return
       }
 
       checked++
@@ -383,6 +403,20 @@ AUDIT|INVENTORY|METHODOLOGY|BLOCKED|UNTIMED|INVALID|HOLD/)
       if (ledger ~ /NEGATIVE_EVIDENCE[.]md$/ &&
           !explicit_keep && !exempt) {
         is_reject = 1
+      }
+      # bd-z4lqq: classification was an opt-in keyword allowlist — a new row
+      # whose verdict word fell outside every enumerated set (e.g. "ADOPTED")
+      # matched neither KEEP nor REJECT nor an exempt class and was admitted
+      # with zero evidence checks. Fail closed instead.
+      if (!is_keep && !is_reject && !exempt) {
+        violations++
+        if (mode != "all" || violations <= 20) {
+          print "BLOCKED UNCLASSIFIED " ledger ":" start_line
+          print "  " header
+          print "  missing: explicit verdict — the heading or a Decision/Verdict line"
+          print "           must classify the row as KEEP, REJECT, or an exempt"
+          print "           survey/audit/route-next class"
+        }
       }
       has_null = numeric_null && same_invocation
       incumbent_complete = actual_incumbent && incumbent_ratio &&
@@ -446,7 +480,7 @@ AUDIT|INVENTORY|METHODOLOGY|BLOCKED|UNTIMED|INVALID|HOLD/)
         }
       }
 
-      reset_entry()
+      reset_entry_state()
     }
 
     FNR == NR {
@@ -464,7 +498,7 @@ AUDIT|INVENTORY|METHODOLOGY|BLOCKED|UNTIMED|INVALID|HOLD/)
 
     {
       if (is_entry_heading($0)) {
-        flush()
+        flush(FNR - 1)
         header = $0
         sub(/^##+ /, "", header)
         start_line = FNR
@@ -480,7 +514,7 @@ AUDIT|INVENTORY|METHODOLOGY|BLOCKED|UNTIMED|INVALID|HOLD/)
       }
     }
     END {
-      flush()
+      flush(FNR)
       if (mode == "all") {
         print "[ledger-gate] mechanical report " ledger \
               ": checked=" (checked + 0) " violations=" (violations + 0)
@@ -490,7 +524,34 @@ AUDIT|INVENTORY|METHODOLOGY|BLOCKED|UNTIMED|INVALID|HOLD/)
       print "[ledger-gate] OK " ledger ": checked_new_rows=" (checked + 0)
       exit 0
     }
-  ' <(diff_stream "${LEDGER_REL}") <(blob_stream "${LEDGER_REL}" "${LEDGER_ABS}")
+  ' "${LINT_DIFF_TMP}" "${LINT_BLOB_TMP}"
+}
+
+lint_one() {
+  # bd-z4lqq: diff_stream/blob_stream used to run inside process substitutions
+  # <(...) whose failures are invisible to `set -euo pipefail` — a failing
+  # `git diff` (e.g. --since with no merge-base) produced an empty diff and the
+  # gate passed vacuously with checked_new_rows=0. Materialize both streams and
+  # check their exit status explicitly before awk runs.
+  local requested="$1"
+  local status=0
+  LINT_DIFF_TMP="$(mktemp "${TMPDIR:-/tmp}/ledger-gate-diff.XXXXXX")"
+  LINT_BLOB_TMP="$(mktemp "${TMPDIR:-/tmp}/ledger-gate-blob.XXXXXX")"
+  resolve_ledger "${requested}"
+  if ! diff_stream "${LEDGER_REL}" >"${LINT_DIFF_TMP}"; then
+    echo "ERROR: ledger diff stream failed for ${LEDGER_REL} (mode=${MODE}," \
+         "since=${SINCE_REF:-n/a}); refusing to lint against an empty diff" >&2
+    rm -f "${LINT_DIFF_TMP}" "${LINT_BLOB_TMP}"
+    return 64
+  fi
+  if ! blob_stream "${LEDGER_REL}" "${LEDGER_ABS}" >"${LINT_BLOB_TMP}"; then
+    echo "ERROR: ledger blob stream failed for ${LEDGER_REL} (mode=${MODE})" >&2
+    rm -f "${LINT_DIFF_TMP}" "${LINT_BLOB_TMP}"
+    return 64
+  fi
+  lint_one_materialized "${requested}" || status=$?
+  rm -f "${LINT_DIFF_TMP}" "${LINT_BLOB_TMP}"
+  return "${status}"
 }
 
 lint_ledgers() {
@@ -555,11 +616,13 @@ run_selfcheck_case() {
 
   SELF_CHECK_TOTAL=$((SELF_CHECK_TOTAL + 1))
   SELF_CHECK_FIXTURE="${fixture}"
+  SELF_CHECK_ADDED_HEADING_LINE="${5:-}"
   if output="$(lint_one "${ledger}" 2>&1)"; then
     rc=0
   else
     rc=$?
   fi
+  SELF_CHECK_ADDED_HEADING_LINE=""
 
   if [[ ${rc} -ne ${expected} ]]; then
     echo "[ledger-selfcheck] FAIL ${ledger} ${label}: expected exit ${expected}, got ${rc}" >&2
@@ -577,6 +640,7 @@ run_selfcheck_suite() {
 
   run_selfcheck_case "VOID-NONULL reject is blocked" 2 "${ledger}" $'### 2099-01-01 — REJECT: synthetic no-null row\nA/B median ratio: 1.001\nDecision: reject as no improvement.' || SELF_CHECK_FAILED=1
   run_selfcheck_case "CV-only reject is blocked" 2 "${ledger}" $'### 2099-01-02 — REJECT / INVALID-CV: synthetic CV row\nA/A null: 1.000 [0.900, 1.100], same invocation\nA/B median CI: 0.980 [0.950, 1.020]\nDecision: reject because arm CV exceeded 5%.' || SELF_CHECK_FAILED=1
+  run_selfcheck_case "existing CV verdict does not contaminate a new row" 0 "${ledger}" $'### 2099-01-02 — REJECT / INVALID-CV: existing synthetic CV row\nA/A null: 1.000 [0.900, 1.100], same invocation\nDecision: reject because arm CV exceeded 5%.\n### 2099-01-03 — REJECT: new null-contained row\nA/A null: 1.000 [0.980, 1.020], same invocation\nDecision: no-ship because the effect remains inside the A/A null floor.' 4 || SELF_CHECK_FAILED=1
   run_selfcheck_case "null-floor reject is admitted" 0 "${ledger}" $'### 2099-01-03 — REJECT: synthetic null-contained row\nA/A null: 1.000 [0.980, 1.020], same invocation\nA/B median CI: 1.001 [0.990, 1.010]\nDecision: no-ship because the effect remains inside the A/A null floor.' || SELF_CHECK_FAILED=1
   run_selfcheck_case "counted-mechanism reject is admitted" 0 "${ledger}" $'### 2099-01-04 — REJECT: synthetic counted-mechanism row\nInstructions count unchanged: baseline 100, candidate 100.\nDecision: reject because the counted mechanism removed no work.' || SELF_CHECK_FAILED=1
   run_selfcheck_case "KEEP without ELF SHA is blocked" 2 "${ledger}" $'### 2099-01-05 — KEEP: synthetic unbound binary\nComparison class: SELF-SPEEDUP\nA/B median CI: 0.900 [0.880, 0.920].' || SELF_CHECK_FAILED=1
@@ -619,6 +683,9 @@ Decision: KEEP." || SELF_CHECK_FAILED=1
 Comparison class: SELF-SPEEDUP
 ELF sha256: ${sha}
 Decision: KEEP." || SELF_CHECK_FAILED=1
+  run_selfcheck_case "unclassified verdict word is blocked" 2 "${ledger}" $'### 2099-01-14 — synthetic adopted row\nA/B median CI: 0.900 [0.880, 0.920]\nDecision: ADOPTED into the build.' || SELF_CHECK_FAILED=1
+  run_selfcheck_case "body-only edit of an existing entry is gated" 2 "${ledger}" $'### 2099-01-15 — REJECT: synthetic historical row\nA/B median ratio: 1.02\nDecision: reject as no improvement.' 2 || SELF_CHECK_FAILED=1
+  run_selfcheck_case "body-only edit of a conformant entry stays admitted" 0 "${ledger}" $'### 2099-01-16 — REJECT: synthetic null-contained row\nA/A null: 1.000 [0.980, 1.020], same invocation\nDecision: no-ship because the effect remains inside the A/A null floor.' 2 || SELF_CHECK_FAILED=1
 }
 
 run_selfcheck() {
@@ -637,21 +704,20 @@ run_selfcheck() {
 }
 
 # --- leakcheck: regression coverage for the 79d999ad per-entry flag leak ---
-# Mixed-history topology the ordinary --selfcheck cannot reach (it treats every
-# row as new): HISTORICAL committed entries arm cv_verdict, decision_lines KEEP
-# tokens, and competitive_claim; then ONE new staged row is linted. A correct
-# linter judges the new row on its own text; the pre-79d999ad linter leaked the
-# historical flags onto it and falsely blocked. A positive control (a genuinely
-# non-conformant staged row) proves the harness actually exercises the linter,
-# so a broken harness can never pass vacuously.
+# The synthetic suite now covers one selected-heading mixed-history case. This
+# executable regression additionally exercises the real staged-Git path under
+# hook-like inherited environment state: HISTORICAL committed entries arm
+# cv_verdict, decision_lines KEEP tokens, and competitive_claim; then ONE new
+# staged row is linted. A correct linter judges the new row on its own text; the
+# pre-79d999ad linter leaked the historical flags onto it and falsely blocked.
+# A positive control (a genuinely non-conformant staged row) proves the harness
+# actually exercises the linter, so a broken harness can never pass vacuously.
 
-cleanup_leakcheck_dir() {
-  # Conservative cleanup matching scripts/install.sh precedent (no rm -rf).
+retain_leakcheck_dir() {
   local dir="$1"
-  [[ -n "${dir}" && -d "${dir}" && "${dir}" == *ledger-leakcheck* ]] || return 0
-  find "${dir}" -depth -mindepth 1 \( -type f -o -type l \) -delete 2>/dev/null || true
-  find "${dir}" -depth -mindepth 1 -type d -exec rmdir {} + 2>/dev/null || true
-  rmdir "${dir}" 2>/dev/null || true
+  if [[ -n "${dir}" && -d "${dir}" && "${dir}" == *ledger-leakcheck* ]]; then
+    echo "[ledger-leakcheck] retained temp repo: ${dir}" >&2
+  fi
 }
 
 leakcheck_env() {
@@ -747,7 +813,7 @@ run_leakcheck() {
     echo "[ledger-leakcheck] BLOCKED mixed-history probe: conformant new row was rejected (exit ${rc}) — per-entry flag leak (79d999ad class)" >&2
     failed=1
   fi
-  cleanup_leakcheck_dir "${dir}"
+  retain_leakcheck_dir "${dir}"
 
   LEAKCHECK_LAST_DIR=""
   rc=0
@@ -759,7 +825,7 @@ run_leakcheck() {
     echo "[ledger-leakcheck] BLOCKED harness control: expected exit 2, got ${rc} — harness is not exercising the linter" >&2
     failed=1
   fi
-  cleanup_leakcheck_dir "${dir}"
+  retain_leakcheck_dir "${dir}"
 
   if [[ ${failed} -ne 0 ]]; then
     echo "[ledger-leakcheck] BLOCKED: leak regression detected" >&2

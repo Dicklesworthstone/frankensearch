@@ -1,0 +1,2445 @@
+{
+  "schema_version": "quill-perf-evidence-v2",
+  "gate": "Qg1",
+  "policy": {
+    "reconciliation_dead_band_log": 0.004987541511038968,
+    "reconciliation_tolerance_log": 0.22314355131420976,
+    "min_hierarchical_groups": 2,
+    "min_group_pairs": 2,
+    "warmup_rounds": 1,
+    "max_raw_samples": 20000
+  },
+  "provenance": {
+    "run_id": "qg1-trj-xlarge-t2-bb31daa0-r10-20260729T0824Z",
+    "run_window": "qg1-trj-xlarge-fullsweep-bb31daa0-20260729T0824Z",
+    "manifest_sha256": "41e341ee4a2b881b2b3b7a4d09bfcc13748f8fd646e763be81881b93ac8c314d",
+    "build": {
+      "executable_sha256": "a466d5a64a67843a8f2acd4b7add23c25b2015241c64ea35b385ae59431b8c12",
+      "git_revision": "bb31daa04ee58f9c38c9a0d6e42b5a125e6f02ae",
+      "git_dirty": false,
+      "worktree_state_sha256": null,
+      "cargo_lock_sha256": null,
+      "rustc_version": "rustc 1.99.0-nightly (26ae60a9e 2026-07-28)",
+      "target_triple": "x86_64-unknown-linux-gnu",
+      "build_profile": "release-perf",
+      "cargo_features": [
+        "perf-harness",
+        "tantivy-oracle"
+      ]
+    },
+    "machine": {
+      "fingerprint": "linux-x86_64-threadripperje-128thread-AMD_Ryzen_Threadripper_PRO_5995WX_64-Cores",
+      "os": "linux",
+      "arch": "x86_64",
+      "logical_cpus": 128,
+      "execution": {
+        "host_identity": "threadripperje",
+        "physical_cores": 64,
+        "logical_threads": 128,
+        "process_available_threads": 128,
+        "threads_actually_used": [
+          2
+        ],
+        "runtime_detected_isa": [
+          "avx2",
+          "fma",
+          "bmi2",
+          "aes",
+          "vaes"
+        ],
+        "cpu_affinity_allowed_list": "0-127",
+        "affinity_or_cpuset_cap": null
+      },
+      "cpu_governor": "performance",
+      "load_average_start": 2.88,
+      "load_average_end": 4.35
+    },
+    "peak_rss": {
+      "method": "linux_vmhwm",
+      "bytes": 4644147200
+    },
+    "corpus": {
+      "corpus_sha256": "507ed661a749e5ca92d87459465ee853031ce46f3aa3faae15d4f1ef1d11de39",
+      "query_set_sha256": "749b38f35df58646c9812fa5aa07aa500f1bfffd585ae102e2a93eb3f74ab111",
+      "qrels_sha256": null,
+      "document_count": 1000000,
+      "content_bytes": null,
+      "generator_seed": 5860671082139239762,
+      "generator_revision": "synthetic-zipf-s11-vocab8192-doc4096-v1"
+    }
+  },
+  "cells": [
+    {
+      "cell_id": "QG-1/bulk/xlarge/2/positions_on/docs_per_second",
+      "spec": {
+        "gate": "Qg1",
+        "fixture": "bulk/xlarge/2/positions_on",
+        "metric": "docs_per_second",
+        "unit": "docs/s",
+        "role": "required",
+        "cold_cache": null
+      },
+      "estimand": "paired_log_ratio",
+      "body": {
+        "kind": "paired",
+        "paired": {
+          "schema_version": "quill-paired-estimator-v1",
+          "scope": {
+            "operation_id": "QG-1.bulk/xlarge/2/positions_on.docs_per_second",
+            "version": 1,
+            "semantics": "gauge_higher_is_better",
+            "unit": "docs/s"
+          },
+          "provenance": {
+            "run_id": "qg1-trj-xlarge-t2-bb31daa0-r10-20260729T0824Z",
+            "executable_sha256": "a466d5a64a67843a8f2acd4b7add23c25b2015241c64ea35b385ae59431b8c12",
+            "corpus_sha256": "507ed661a749e5ca92d87459465ee853031ce46f3aa3faae15d4f1ef1d11de39",
+            "worker_id": "linux-x86_64-threadripperje-128thread-AMD_Ryzen_Threadripper_PRO_5995WX_64-Cores",
+            "build_profile": "release-perf"
+          },
+          "config": {
+            "bootstrap_seed": 5860671082138523204,
+            "bootstrap_resamples": 2000,
+            "min_pairs": 10,
+            "max_order_imbalance": 1,
+            "max_null_center_log": 0.04879016416943205,
+            "max_null_ci_half_width_log": 0.09531017980432493,
+            "max_null_log_mad": 0.04879016416943205,
+            "max_null_order_effect_log": 0.04879016416943205,
+            "max_null_drift_log": 0.04879016416943205,
+            "summary_direction_dead_band_log": 9.999994999180668e-7,
+            "max_reproduction_delta_log": 0.01980262729617973
+          },
+          "effect": {
+            "median_log_ratio": -1.5678518849476515,
+            "treatment_over_control": 0.20849256769036006,
+            "ci95_low_log": -1.6329957252871914,
+            "ci95_high_log": -1.4912367407864773,
+            "ci95_low_ratio": 0.19534350124217204,
+            "ci95_high_ratio": 0.22509410027001273,
+            "log_mad": 0.06380873326441261,
+            "mean_log_ratio": -1.5600621379658421,
+            "ratio_of_arm_medians": 0.20832017434752145,
+            "algebraic_reconciliation_error": 1.3322676295501878e-15,
+            "control": {
+              "value": 165817.83386113984,
+              "p50": 165817.83386113984,
+              "median_ci95_low": 152966.94381346038,
+              "median_ci95_high": 176142.49290885826,
+              "p95": 178462.88878094367,
+              "p99": 178462.88878094367,
+              "mad": 10668.00412757427,
+              "cv_pct": 7.530407433066146,
+              "runs": 10
+            },
+            "treatment": {
+              "value": 34543.200059881,
+              "p50": 34543.200059881,
+              "median_ci95_low": 34278.349516506234,
+              "median_ci95_high": 34804.123167638085,
+              "p95": 34862.363535705896,
+              "p99": 34862.363535705896,
+              "mad": 262.8868255659254,
+              "cv_pct": 1.4682149207809188,
+              "runs": 10
+            },
+            "pair_count": 10,
+            "control_first_blocks": 5,
+            "treatment_first_blocks": 5,
+            "order_effect_log": 0.05864716989511631,
+            "drift_log": 0.02466418367956358
+          },
+          "null": {
+            "median_log_ratio": -0.002876388078202172,
+            "treatment_over_control": 0.9971277447624852,
+            "ci95_low_log": -0.06237231983317258,
+            "ci95_high_log": 0.09193139102649213,
+            "ci95_low_ratio": 0.9395330148876432,
+            "ci95_high_ratio": 1.0962896041961243,
+            "log_mad": 0.08577417737196458,
+            "mean_log_ratio": 0.017045842361160614,
+            "ratio_of_arm_medians": 1.013308767384108,
+            "algebraic_reconciliation_error": 2.4771851236948805e-15,
+            "control": {
+              "value": 164861.9288042134,
+              "p50": 164861.9288042134,
+              "median_ci95_low": 158925.92795469996,
+              "median_ci95_high": 178124.36437600842,
+              "p95": 181864.10865593093,
+              "p99": 181864.10865593093,
+              "mad": 6911.780742794421,
+              "cv_pct": 5.855810882985284,
+              "runs": 10
+            },
+            "treatment": {
+              "value": 167056.03786516405,
+              "p50": 167056.03786516405,
+              "median_ci95_low": 160970.3513242821,
+              "median_ci95_high": 176073.9090202865,
+              "p95": 195303.0149488695,
+              "p99": 195303.0149488695,
+              "mad": 5382.635358752203,
+              "cv_pct": 6.595133281469023,
+              "runs": 10
+            },
+            "pair_count": 10,
+            "control_first_blocks": 5,
+            "treatment_first_blocks": 5,
+            "order_effect_log": 0.10655848386936069,
+            "drift_log": 0.054001992635372364
+          },
+          "status": "invalid_null",
+          "claim_state": "no_decision",
+          "reasons": [
+            {
+              "code": "paired.null_dispersion",
+              "message": "A/A log-MAD 0.085774 exceeds 0.048790"
+            },
+            {
+              "code": "paired.null_order_effect",
+              "message": "A/A order effect 0.106558 exceeds 0.048790"
+            },
+            {
+              "code": "paired.null_drift",
+              "message": "A/A first/second-half drift 0.054002 exceeds 0.048790"
+            }
+          ],
+          "effect_samples": [
+            {
+              "block_id": 0,
+              "sample_id": 1,
+              "arm": "treatment",
+              "order": "first",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-1.bulk/xlarge/2/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "qg1-trj-xlarge-t2-bb31daa0-r10-20260729T0824Z",
+                "executable_sha256": "a466d5a64a67843a8f2acd4b7add23c25b2015241c64ea35b385ae59431b8c12",
+                "corpus_sha256": "507ed661a749e5ca92d87459465ee853031ce46f3aa3faae15d4f1ef1d11de39",
+                "worker_id": "linux-x86_64-threadripperje-128thread-AMD_Ryzen_Threadripper_PRO_5995WX_64-Cores",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 1190264586564,
+              "ended_ns": 1226164400554,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 34641.500170317915,
+              "group_id": null
+            },
+            {
+              "block_id": 0,
+              "sample_id": 0,
+              "arm": "control",
+              "order": "second",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-1.bulk/xlarge/2/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "qg1-trj-xlarge-t2-bb31daa0-r10-20260729T0824Z",
+                "executable_sha256": "a466d5a64a67843a8f2acd4b7add23c25b2015241c64ea35b385ae59431b8c12",
+                "corpus_sha256": "507ed661a749e5ca92d87459465ee853031ce46f3aa3faae15d4f1ef1d11de39",
+                "worker_id": "linux-x86_64-threadripperje-128thread-AMD_Ryzen_Threadripper_PRO_5995WX_64-Cores",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 1226164403239,
+              "ended_ns": 1241943767154,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 168213.89716763818,
+              "group_id": null
+            },
+            {
+              "block_id": 1,
+              "sample_id": 2,
+              "arm": "control",
+              "order": "first",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-1.bulk/xlarge/2/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "qg1-trj-xlarge-t2-bb31daa0-r10-20260729T0824Z",
+                "executable_sha256": "a466d5a64a67843a8f2acd4b7add23c25b2015241c64ea35b385ae59431b8c12",
+                "corpus_sha256": "507ed661a749e5ca92d87459465ee853031ce46f3aa3faae15d4f1ef1d11de39",
+                "worker_id": "linux-x86_64-threadripperje-128thread-AMD_Ryzen_Threadripper_PRO_5995WX_64-Cores",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 1241943772834,
+              "ended_ns": 1257584349603,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 177833.5766744569,
+              "group_id": null
+            },
+            {
+              "block_id": 1,
+              "sample_id": 3,
+              "arm": "treatment",
+              "order": "second",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-1.bulk/xlarge/2/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "qg1-trj-xlarge-t2-bb31daa0-r10-20260729T0824Z",
+                "executable_sha256": "a466d5a64a67843a8f2acd4b7add23c25b2015241c64ea35b385ae59431b8c12",
+                "corpus_sha256": "507ed661a749e5ca92d87459465ee853031ce46f3aa3faae15d4f1ef1d11de39",
+                "worker_id": "linux-x86_64-threadripperje-128thread-AMD_Ryzen_Threadripper_PRO_5995WX_64-Cores",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 1257584351617,
+              "ended_ns": 1294990949981,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 33043.17108505746,
+              "group_id": null
+            },
+            {
+              "block_id": 2,
+              "sample_id": 5,
+              "arm": "treatment",
+              "order": "first",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-1.bulk/xlarge/2/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "qg1-trj-xlarge-t2-bb31daa0-r10-20260729T0824Z",
+                "executable_sha256": "a466d5a64a67843a8f2acd4b7add23c25b2015241c64ea35b385ae59431b8c12",
+                "corpus_sha256": "507ed661a749e5ca92d87459465ee853031ce46f3aa3faae15d4f1ef1d11de39",
+                "worker_id": "linux-x86_64-threadripperje-128thread-AMD_Ryzen_Threadripper_PRO_5995WX_64-Cores",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 1294990954069,
+              "ended_ns": 1331351482368,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 34211.30640406878,
+              "group_id": null
+            },
+            {
+              "block_id": 2,
+              "sample_id": 4,
+              "arm": "control",
+              "order": "second",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-1.bulk/xlarge/2/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "qg1-trj-xlarge-t2-bb31daa0-r10-20260729T0824Z",
+                "executable_sha256": "a466d5a64a67843a8f2acd4b7add23c25b2015241c64ea35b385ae59431b8c12",
+                "corpus_sha256": "507ed661a749e5ca92d87459465ee853031ce46f3aa3faae15d4f1ef1d11de39",
+                "worker_id": "linux-x86_64-threadripperje-128thread-AMD_Ryzen_Threadripper_PRO_5995WX_64-Cores",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 1331351484933,
+              "ended_ns": 1347028453780,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 178462.88878094367,
+              "group_id": null
+            },
+            {
+              "block_id": 3,
+              "sample_id": 7,
+              "arm": "treatment",
+              "order": "first",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-1.bulk/xlarge/2/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "qg1-trj-xlarge-t2-bb31daa0-r10-20260729T0824Z",
+                "executable_sha256": "a466d5a64a67843a8f2acd4b7add23c25b2015241c64ea35b385ae59431b8c12",
+                "corpus_sha256": "507ed661a749e5ca92d87459465ee853031ce46f3aa3faae15d4f1ef1d11de39",
+                "worker_id": "linux-x86_64-threadripperje-128thread-AMD_Ryzen_Threadripper_PRO_5995WX_64-Cores",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 1347028455583,
+              "ended_ns": 1382845524640,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 34804.123167638085,
+              "group_id": null
+            },
+            {
+              "block_id": 3,
+              "sample_id": 6,
+              "arm": "control",
+              "order": "second",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-1.bulk/xlarge/2/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "qg1-trj-xlarge-t2-bb31daa0-r10-20260729T0824Z",
+                "executable_sha256": "a466d5a64a67843a8f2acd4b7add23c25b2015241c64ea35b385ae59431b8c12",
+                "corpus_sha256": "507ed661a749e5ca92d87459465ee853031ce46f3aa3faae15d4f1ef1d11de39",
+                "worker_id": "linux-x86_64-threadripperje-128thread-AMD_Ryzen_Threadripper_PRO_5995WX_64-Cores",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 1382845529198,
+              "ended_ns": 1399930553625,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 148393.44957723224,
+              "group_id": null
+            },
+            {
+              "block_id": 4,
+              "sample_id": 8,
+              "arm": "control",
+              "order": "first",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-1.bulk/xlarge/2/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "qg1-trj-xlarge-t2-bb31daa0-r10-20260729T0824Z",
+                "executable_sha256": "a466d5a64a67843a8f2acd4b7add23c25b2015241c64ea35b385ae59431b8c12",
+                "corpus_sha256": "507ed661a749e5ca92d87459465ee853031ce46f3aa3faae15d4f1ef1d11de39",
+                "worker_id": "linux-x86_64-threadripperje-128thread-AMD_Ryzen_Threadripper_PRO_5995WX_64-Cores",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 1399930555619,
+              "ended_ns": 1416114082582,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 163421.7705546415,
+              "group_id": null
+            },
+            {
+              "block_id": 4,
+              "sample_id": 9,
+              "arm": "treatment",
+              "order": "second",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-1.bulk/xlarge/2/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "qg1-trj-xlarge-t2-bb31daa0-r10-20260729T0824Z",
+                "executable_sha256": "a466d5a64a67843a8f2acd4b7add23c25b2015241c64ea35b385ae59431b8c12",
+                "corpus_sha256": "507ed661a749e5ca92d87459465ee853031ce46f3aa3faae15d4f1ef1d11de39",
+                "worker_id": "linux-x86_64-threadripperje-128thread-AMD_Ryzen_Threadripper_PRO_5995WX_64-Cores",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 1416114084296,
+              "ended_ns": 1452130557719,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 34523.11351544213,
+              "group_id": null
+            },
+            {
+              "block_id": 5,
+              "sample_id": 10,
+              "arm": "control",
+              "order": "first",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-1.bulk/xlarge/2/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "qg1-trj-xlarge-t2-bb31daa0-r10-20260729T0824Z",
+                "executable_sha256": "a466d5a64a67843a8f2acd4b7add23c25b2015241c64ea35b385ae59431b8c12",
+                "corpus_sha256": "507ed661a749e5ca92d87459465ee853031ce46f3aa3faae15d4f1ef1d11de39",
+                "worker_id": "linux-x86_64-threadripperje-128thread-AMD_Ryzen_Threadripper_PRO_5995WX_64-Cores",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 1452130573829,
+              "ended_ns": 1468596266757,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 152966.94381346038,
+              "group_id": null
+            },
+            {
+              "block_id": 5,
+              "sample_id": 11,
+              "arm": "treatment",
+              "order": "second",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-1.bulk/xlarge/2/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "qg1-trj-xlarge-t2-bb31daa0-r10-20260729T0824Z",
+                "executable_sha256": "a466d5a64a67843a8f2acd4b7add23c25b2015241c64ea35b385ae59431b8c12",
+                "corpus_sha256": "507ed661a749e5ca92d87459465ee853031ce46f3aa3faae15d4f1ef1d11de39",
+                "worker_id": "linux-x86_64-threadripperje-128thread-AMD_Ryzen_Threadripper_PRO_5995WX_64-Cores",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 1468596273339,
+              "ended_ns": 1504687627435,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 34431.956588744455,
+              "group_id": null
+            },
+            {
+              "block_id": 6,
+              "sample_id": 13,
+              "arm": "treatment",
+              "order": "first",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-1.bulk/xlarge/2/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "qg1-trj-xlarge-t2-bb31daa0-r10-20260729T0824Z",
+                "executable_sha256": "a466d5a64a67843a8f2acd4b7add23c25b2015241c64ea35b385ae59431b8c12",
+                "corpus_sha256": "507ed661a749e5ca92d87459465ee853031ce46f3aa3faae15d4f1ef1d11de39",
+                "worker_id": "linux-x86_64-threadripperje-128thread-AMD_Ryzen_Threadripper_PRO_5995WX_64-Cores",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 1504687631612,
+              "ended_ns": 1540934943371,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 34278.349516506234,
+              "group_id": null
+            },
+            {
+              "block_id": 6,
+              "sample_id": 12,
+              "arm": "control",
+              "order": "second",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-1.bulk/xlarge/2/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "qg1-trj-xlarge-t2-bb31daa0-r10-20260729T0824Z",
+                "executable_sha256": "a466d5a64a67843a8f2acd4b7add23c25b2015241c64ea35b385ae59431b8c12",
+                "corpus_sha256": "507ed661a749e5ca92d87459465ee853031ce46f3aa3faae15d4f1ef1d11de39",
+                "worker_id": "linux-x86_64-threadripperje-128thread-AMD_Ryzen_Threadripper_PRO_5995WX_64-Cores",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 1540934947068,
+              "ended_ns": 1557105325683,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 162395.3409447051,
+              "group_id": null
+            },
+            {
+              "block_id": 7,
+              "sample_id": 14,
+              "arm": "control",
+              "order": "first",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-1.bulk/xlarge/2/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "qg1-trj-xlarge-t2-bb31daa0-r10-20260729T0824Z",
+                "executable_sha256": "a466d5a64a67843a8f2acd4b7add23c25b2015241c64ea35b385ae59431b8c12",
+                "corpus_sha256": "507ed661a749e5ca92d87459465ee853031ce46f3aa3faae15d4f1ef1d11de39",
+                "worker_id": "linux-x86_64-threadripperje-128thread-AMD_Ryzen_Threadripper_PRO_5995WX_64-Cores",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 1557105342495,
+              "ended_ns": 1573053283748,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 174451.4091432596,
+              "group_id": null
+            },
+            {
+              "block_id": 7,
+              "sample_id": 15,
+              "arm": "treatment",
+              "order": "second",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-1.bulk/xlarge/2/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "qg1-trj-xlarge-t2-bb31daa0-r10-20260729T0824Z",
+                "executable_sha256": "a466d5a64a67843a8f2acd4b7add23c25b2015241c64ea35b385ae59431b8c12",
+                "corpus_sha256": "507ed661a749e5ca92d87459465ee853031ce46f3aa3faae15d4f1ef1d11de39",
+                "worker_id": "linux-x86_64-threadripperje-128thread-AMD_Ryzen_Threadripper_PRO_5995WX_64-Cores",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 1573053286163,
+              "ended_ns": 1609136676572,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 34563.28660431986,
+              "group_id": null
+            },
+            {
+              "block_id": 8,
+              "sample_id": 16,
+              "arm": "control",
+              "order": "first",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-1.bulk/xlarge/2/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "qg1-trj-xlarge-t2-bb31daa0-r10-20260729T0824Z",
+                "executable_sha256": "a466d5a64a67843a8f2acd4b7add23c25b2015241c64ea35b385ae59431b8c12",
+                "corpus_sha256": "507ed661a749e5ca92d87459465ee853031ce46f3aa3faae15d4f1ef1d11de39",
+                "worker_id": "linux-x86_64-threadripperje-128thread-AMD_Ryzen_Threadripper_PRO_5995WX_64-Cores",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 1609136679307,
+              "ended_ns": 1624657102948,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 175138.0993029713,
+              "group_id": null
+            },
+            {
+              "block_id": 8,
+              "sample_id": 17,
+              "arm": "treatment",
+              "order": "second",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-1.bulk/xlarge/2/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "qg1-trj-xlarge-t2-bb31daa0-r10-20260729T0824Z",
+                "executable_sha256": "a466d5a64a67843a8f2acd4b7add23c25b2015241c64ea35b385ae59431b8c12",
+                "corpus_sha256": "507ed661a749e5ca92d87459465ee853031ce46f3aa3faae15d4f1ef1d11de39",
+                "worker_id": "linux-x86_64-threadripperje-128thread-AMD_Ryzen_Threadripper_PRO_5995WX_64-Cores",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 1624657105833,
+              "ended_ns": 1660376967144,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 34862.363535705896,
+              "group_id": null
+            },
+            {
+              "block_id": 9,
+              "sample_id": 19,
+              "arm": "treatment",
+              "order": "first",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-1.bulk/xlarge/2/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "qg1-trj-xlarge-t2-bb31daa0-r10-20260729T0824Z",
+                "executable_sha256": "a466d5a64a67843a8f2acd4b7add23c25b2015241c64ea35b385ae59431b8c12",
+                "corpus_sha256": "507ed661a749e5ca92d87459465ee853031ce46f3aa3faae15d4f1ef1d11de39",
+                "worker_id": "linux-x86_64-threadripperje-128thread-AMD_Ryzen_Threadripper_PRO_5995WX_64-Cores",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 1660376972915,
+              "ended_ns": 1696151860812,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 34833.39771717376,
+              "group_id": null
+            },
+            {
+              "block_id": 9,
+              "sample_id": 18,
+              "arm": "control",
+              "order": "second",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-1.bulk/xlarge/2/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "qg1-trj-xlarge-t2-bb31daa0-r10-20260729T0824Z",
+                "executable_sha256": "a466d5a64a67843a8f2acd4b7add23c25b2015241c64ea35b385ae59431b8c12",
+                "corpus_sha256": "507ed661a749e5ca92d87459465ee853031ce46f3aa3faae15d4f1ef1d11de39",
+                "worker_id": "linux-x86_64-threadripperje-128thread-AMD_Ryzen_Threadripper_PRO_5995WX_64-Cores",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 1696151866863,
+              "ended_ns": 1713628124111,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 141392.8142361977,
+              "group_id": null
+            }
+          ],
+          "null_samples": [
+            {
+              "block_id": 0,
+              "sample_id": 1000001,
+              "arm": "treatment",
+              "order": "first",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-1.bulk/xlarge/2/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "qg1-trj-xlarge-t2-bb31daa0-r10-20260729T0824Z",
+                "executable_sha256": "a466d5a64a67843a8f2acd4b7add23c25b2015241c64ea35b385ae59431b8c12",
+                "corpus_sha256": "507ed661a749e5ca92d87459465ee853031ce46f3aa3faae15d4f1ef1d11de39",
+                "worker_id": "linux-x86_64-threadripperje-128thread-AMD_Ryzen_Threadripper_PRO_5995WX_64-Cores",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 30057517652,
+              "ended_ns": 44677765704,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 195303.0149488695,
+              "group_id": null
+            },
+            {
+              "block_id": 0,
+              "sample_id": 1000000,
+              "arm": "control",
+              "order": "second",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-1.bulk/xlarge/2/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "qg1-trj-xlarge-t2-bb31daa0-r10-20260729T0824Z",
+                "executable_sha256": "a466d5a64a67843a8f2acd4b7add23c25b2015241c64ea35b385ae59431b8c12",
+                "corpus_sha256": "507ed661a749e5ca92d87459465ee853031ce46f3aa3faae15d4f1ef1d11de39",
+                "worker_id": "linux-x86_64-threadripperje-128thread-AMD_Ryzen_Threadripper_PRO_5995WX_64-Cores",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 44677768700,
+              "ended_ns": 60184270795,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 164946.12153536308,
+              "group_id": null
+            },
+            {
+              "block_id": 1,
+              "sample_id": 1000003,
+              "arm": "treatment",
+              "order": "first",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-1.bulk/xlarge/2/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "qg1-trj-xlarge-t2-bb31daa0-r10-20260729T0824Z",
+                "executable_sha256": "a466d5a64a67843a8f2acd4b7add23c25b2015241c64ea35b385ae59431b8c12",
+                "corpus_sha256": "507ed661a749e5ca92d87459465ee853031ce46f3aa3faae15d4f1ef1d11de39",
+                "worker_id": "linux-x86_64-threadripperje-128thread-AMD_Ryzen_Threadripper_PRO_5995WX_64-Cores",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 60184272588,
+              "ended_ns": 74983267029,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 184431.52818442878,
+              "group_id": null
+            },
+            {
+              "block_id": 1,
+              "sample_id": 1000002,
+              "arm": "control",
+              "order": "second",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-1.bulk/xlarge/2/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "qg1-trj-xlarge-t2-bb31daa0-r10-20260729T0824Z",
+                "executable_sha256": "a466d5a64a67843a8f2acd4b7add23c25b2015241c64ea35b385ae59431b8c12",
+                "corpus_sha256": "507ed661a749e5ca92d87459465ee853031ce46f3aa3faae15d4f1ef1d11de39",
+                "worker_id": "linux-x86_64-threadripperje-128thread-AMD_Ryzen_Threadripper_PRO_5995WX_64-Cores",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 74983269103,
+              "ended_ns": 90720708108,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 164777.73607306372,
+              "group_id": null
+            },
+            {
+              "block_id": 2,
+              "sample_id": 1000005,
+              "arm": "treatment",
+              "order": "first",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-1.bulk/xlarge/2/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "qg1-trj-xlarge-t2-bb31daa0-r10-20260729T0824Z",
+                "executable_sha256": "a466d5a64a67843a8f2acd4b7add23c25b2015241c64ea35b385ae59431b8c12",
+                "corpus_sha256": "507ed661a749e5ca92d87459465ee853031ce46f3aa3faae15d4f1ef1d11de39",
+                "worker_id": "linux-x86_64-threadripperje-128thread-AMD_Ryzen_Threadripper_PRO_5995WX_64-Cores",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 90720709621,
+              "ended_ns": 106487516094,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 171735.6220417865,
+              "group_id": null
+            },
+            {
+              "block_id": 2,
+              "sample_id": 1000004,
+              "arm": "control",
+              "order": "second",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-1.bulk/xlarge/2/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "qg1-trj-xlarge-t2-bb31daa0-r10-20260729T0824Z",
+                "executable_sha256": "a466d5a64a67843a8f2acd4b7add23c25b2015241c64ea35b385ae59431b8c12",
+                "corpus_sha256": "507ed661a749e5ca92d87459465ee853031ce46f3aa3faae15d4f1ef1d11de39",
+                "worker_id": "linux-x86_64-threadripperje-128thread-AMD_Ryzen_Threadripper_PRO_5995WX_64-Cores",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 106487518107,
+              "ended_ns": 121628320983,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 179417.39398308226,
+              "group_id": null
+            },
+            {
+              "block_id": 3,
+              "sample_id": 1000007,
+              "arm": "treatment",
+              "order": "first",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-1.bulk/xlarge/2/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "qg1-trj-xlarge-t2-bb31daa0-r10-20260729T0824Z",
+                "executable_sha256": "a466d5a64a67843a8f2acd4b7add23c25b2015241c64ea35b385ae59431b8c12",
+                "corpus_sha256": "507ed661a749e5ca92d87459465ee853031ce46f3aa3faae15d4f1ef1d11de39",
+                "worker_id": "linux-x86_64-threadripperje-128thread-AMD_Ryzen_Threadripper_PRO_5995WX_64-Cores",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 121628324620,
+              "ended_ns": 137283947684,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 160970.3513242821,
+              "group_id": null
+            },
+            {
+              "block_id": 3,
+              "sample_id": 1000006,
+              "arm": "control",
+              "order": "second",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-1.bulk/xlarge/2/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "qg1-trj-xlarge-t2-bb31daa0-r10-20260729T0824Z",
+                "executable_sha256": "a466d5a64a67843a8f2acd4b7add23c25b2015241c64ea35b385ae59431b8c12",
+                "corpus_sha256": "507ed661a749e5ca92d87459465ee853031ce46f3aa3faae15d4f1ef1d11de39",
+                "worker_id": "linux-x86_64-threadripperje-128thread-AMD_Ryzen_Threadripper_PRO_5995WX_64-Cores",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 137283949327,
+              "ended_ns": 152210790520,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 178124.36437600842,
+              "group_id": null
+            },
+            {
+              "block_id": 4,
+              "sample_id": 1000008,
+              "arm": "control",
+              "order": "first",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-1.bulk/xlarge/2/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "qg1-trj-xlarge-t2-bb31daa0-r10-20260729T0824Z",
+                "executable_sha256": "a466d5a64a67843a8f2acd4b7add23c25b2015241c64ea35b385ae59431b8c12",
+                "corpus_sha256": "507ed661a749e5ca92d87459465ee853031ce46f3aa3faae15d4f1ef1d11de39",
+                "worker_id": "linux-x86_64-threadripperje-128thread-AMD_Ryzen_Threadripper_PRO_5995WX_64-Cores",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 152210792203,
+              "ended_ns": 167226651531,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 181864.10865593093,
+              "group_id": null
+            },
+            {
+              "block_id": 4,
+              "sample_id": 1000009,
+              "arm": "treatment",
+              "order": "second",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-1.bulk/xlarge/2/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "qg1-trj-xlarge-t2-bb31daa0-r10-20260729T0824Z",
+                "executable_sha256": "a466d5a64a67843a8f2acd4b7add23c25b2015241c64ea35b385ae59431b8c12",
+                "corpus_sha256": "507ed661a749e5ca92d87459465ee853031ce46f3aa3faae15d4f1ef1d11de39",
+                "worker_id": "linux-x86_64-threadripperje-128thread-AMD_Ryzen_Threadripper_PRO_5995WX_64-Cores",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 167226653675,
+              "ended_ns": 182879127704,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 167716.2898561442,
+              "group_id": null
+            },
+            {
+              "block_id": 5,
+              "sample_id": 1000010,
+              "arm": "control",
+              "order": "first",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-1.bulk/xlarge/2/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "qg1-trj-xlarge-t2-bb31daa0-r10-20260729T0824Z",
+                "executable_sha256": "a466d5a64a67843a8f2acd4b7add23c25b2015241c64ea35b385ae59431b8c12",
+                "corpus_sha256": "507ed661a749e5ca92d87459465ee853031ce46f3aa3faae15d4f1ef1d11de39",
+                "worker_id": "linux-x86_64-threadripperje-128thread-AMD_Ryzen_Threadripper_PRO_5995WX_64-Cores",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 182879129277,
+              "ended_ns": 198594427143,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 164477.89787456792,
+              "group_id": null
+            },
+            {
+              "block_id": 5,
+              "sample_id": 1000011,
+              "arm": "treatment",
+              "order": "second",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-1.bulk/xlarge/2/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "qg1-trj-xlarge-t2-bb31daa0-r10-20260729T0824Z",
+                "executable_sha256": "a466d5a64a67843a8f2acd4b7add23c25b2015241c64ea35b385ae59431b8c12",
+                "corpus_sha256": "507ed661a749e5ca92d87459465ee853031ce46f3aa3faae15d4f1ef1d11de39",
+                "worker_id": "linux-x86_64-threadripperje-128thread-AMD_Ryzen_Threadripper_PRO_5995WX_64-Cores",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 198594428987,
+              "ended_ns": 214183338010,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 166171.3535371432,
+              "group_id": null
+            },
+            {
+              "block_id": 6,
+              "sample_id": 1000012,
+              "arm": "control",
+              "order": "first",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-1.bulk/xlarge/2/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "qg1-trj-xlarge-t2-bb31daa0-r10-20260729T0824Z",
+                "executable_sha256": "a466d5a64a67843a8f2acd4b7add23c25b2015241c64ea35b385ae59431b8c12",
+                "corpus_sha256": "507ed661a749e5ca92d87459465ee853031ce46f3aa3faae15d4f1ef1d11de39",
+                "worker_id": "linux-x86_64-threadripperje-128thread-AMD_Ryzen_Threadripper_PRO_5995WX_64-Cores",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 214183340074,
+              "ended_ns": 230000438804,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 166288.32887426275,
+              "group_id": null
+            },
+            {
+              "block_id": 6,
+              "sample_id": 1000013,
+              "arm": "treatment",
+              "order": "second",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-1.bulk/xlarge/2/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "qg1-trj-xlarge-t2-bb31daa0-r10-20260729T0824Z",
+                "executable_sha256": "a466d5a64a67843a8f2acd4b7add23c25b2015241c64ea35b385ae59431b8c12",
+                "corpus_sha256": "507ed661a749e5ca92d87459465ee853031ce46f3aa3faae15d4f1ef1d11de39",
+                "worker_id": "linux-x86_64-threadripperje-128thread-AMD_Ryzen_Threadripper_PRO_5995WX_64-Cores",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 230000441299,
+              "ended_ns": 246360563505,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 156308.69760385857,
+              "group_id": null
+            },
+            {
+              "block_id": 7,
+              "sample_id": 1000015,
+              "arm": "treatment",
+              "order": "first",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-1.bulk/xlarge/2/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "qg1-trj-xlarge-t2-bb31daa0-r10-20260729T0824Z",
+                "executable_sha256": "a466d5a64a67843a8f2acd4b7add23c25b2015241c64ea35b385ae59431b8c12",
+                "corpus_sha256": "507ed661a749e5ca92d87459465ee853031ce46f3aa3faae15d4f1ef1d11de39",
+                "worker_id": "linux-x86_64-threadripperje-128thread-AMD_Ryzen_Threadripper_PRO_5995WX_64-Cores",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 246360568304,
+              "ended_ns": 262300449167,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 167583.98871407905,
+              "group_id": null
+            },
+            {
+              "block_id": 7,
+              "sample_id": 1000014,
+              "arm": "control",
+              "order": "second",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-1.bulk/xlarge/2/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "qg1-trj-xlarge-t2-bb31daa0-r10-20260729T0824Z",
+                "executable_sha256": "a466d5a64a67843a8f2acd4b7add23c25b2015241c64ea35b385ae59431b8c12",
+                "corpus_sha256": "507ed661a749e5ca92d87459465ee853031ce46f3aa3faae15d4f1ef1d11de39",
+                "worker_id": "linux-x86_64-threadripperje-128thread-AMD_Ryzen_Threadripper_PRO_5995WX_64-Cores",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 262300452844,
+              "ended_ns": 278514573441,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 153074.11983633623,
+              "group_id": null
+            },
+            {
+              "block_id": 8,
+              "sample_id": 1000016,
+              "arm": "control",
+              "order": "first",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-1.bulk/xlarge/2/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "qg1-trj-xlarge-t2-bb31daa0-r10-20260729T0824Z",
+                "executable_sha256": "a466d5a64a67843a8f2acd4b7add23c25b2015241c64ea35b385ae59431b8c12",
+                "corpus_sha256": "507ed661a749e5ca92d87459465ee853031ce46f3aa3faae15d4f1ef1d11de39",
+                "worker_id": "linux-x86_64-threadripperje-128thread-AMD_Ryzen_Threadripper_PRO_5995WX_64-Cores",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 278514576797,
+              "ended_ns": 294499196883,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 162826.17628650175,
+              "group_id": null
+            },
+            {
+              "block_id": 8,
+              "sample_id": 1000017,
+              "arm": "treatment",
+              "order": "second",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-1.bulk/xlarge/2/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "qg1-trj-xlarge-t2-bb31daa0-r10-20260729T0824Z",
+                "executable_sha256": "a466d5a64a67843a8f2acd4b7add23c25b2015241c64ea35b385ae59431b8c12",
+                "corpus_sha256": "507ed661a749e5ca92d87459465ee853031ce46f3aa3faae15d4f1ef1d11de39",
+                "worker_id": "linux-x86_64-threadripperje-128thread-AMD_Ryzen_Threadripper_PRO_5995WX_64-Cores",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 294499199077,
+              "ended_ns": 310613878477,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 160242.31655947096,
+              "group_id": null
+            },
+            {
+              "block_id": 9,
+              "sample_id": 1000018,
+              "arm": "control",
+              "order": "first",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-1.bulk/xlarge/2/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "qg1-trj-xlarge-t2-bb31daa0-r10-20260729T0824Z",
+                "executable_sha256": "a466d5a64a67843a8f2acd4b7add23c25b2015241c64ea35b385ae59431b8c12",
+                "corpus_sha256": "507ed661a749e5ca92d87459465ee853031ce46f3aa3faae15d4f1ef1d11de39",
+                "worker_id": "linux-x86_64-threadripperje-128thread-AMD_Ryzen_Threadripper_PRO_5995WX_64-Cores",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 310613880371,
+              "ended_ns": 327456476843,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 151901.54716313214,
+              "group_id": null
+            },
+            {
+              "block_id": 9,
+              "sample_id": 1000019,
+              "arm": "treatment",
+              "order": "second",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-1.bulk/xlarge/2/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "qg1-trj-xlarge-t2-bb31daa0-r10-20260729T0824Z",
+                "executable_sha256": "a466d5a64a67843a8f2acd4b7add23c25b2015241c64ea35b385ae59431b8c12",
+                "corpus_sha256": "507ed661a749e5ca92d87459465ee853031ce46f3aa3faae15d4f1ef1d11de39",
+                "worker_id": "linux-x86_64-threadripperje-128thread-AMD_Ryzen_Threadripper_PRO_5995WX_64-Cores",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 327456478306,
+              "ended_ns": 343535016368,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 166528.08701624905,
+              "group_id": null
+            }
+          ]
+        },
+        "treatment_arm_null": {
+          "schema_version": "quill-paired-estimator-v1",
+          "scope": {
+            "operation_id": "QG-1.bulk/xlarge/2/positions_on.docs_per_second",
+            "version": 1,
+            "semantics": "gauge_higher_is_better",
+            "unit": "docs/s"
+          },
+          "provenance": {
+            "run_id": "qg1-trj-xlarge-t2-bb31daa0-r10-20260729T0824Z",
+            "executable_sha256": "a466d5a64a67843a8f2acd4b7add23c25b2015241c64ea35b385ae59431b8c12",
+            "corpus_sha256": "507ed661a749e5ca92d87459465ee853031ce46f3aa3faae15d4f1ef1d11de39",
+            "worker_id": "linux-x86_64-threadripperje-128thread-AMD_Ryzen_Threadripper_PRO_5995WX_64-Cores",
+            "build_profile": "release-perf"
+          },
+          "config": {
+            "bootstrap_seed": 5860671082138523204,
+            "bootstrap_resamples": 2000,
+            "min_pairs": 10,
+            "max_order_imbalance": 1,
+            "max_null_center_log": 0.04879016416943205,
+            "max_null_ci_half_width_log": 0.09531017980432493,
+            "max_null_log_mad": 0.04879016416943205,
+            "max_null_order_effect_log": 0.04879016416943205,
+            "max_null_drift_log": 0.04879016416943205,
+            "summary_direction_dead_band_log": 9.999994999180668e-7,
+            "max_reproduction_delta_log": 0.01980262729617973
+          },
+          "effect": {
+            "median_log_ratio": -1.5678518849476515,
+            "treatment_over_control": 0.20849256769036006,
+            "ci95_low_log": -1.6329957252871914,
+            "ci95_high_log": -1.4912367407864773,
+            "ci95_low_ratio": 0.19534350124217204,
+            "ci95_high_ratio": 0.22509410027001273,
+            "log_mad": 0.06380873326441261,
+            "mean_log_ratio": -1.5600621379658421,
+            "ratio_of_arm_medians": 0.20832017434752145,
+            "algebraic_reconciliation_error": 1.3322676295501878e-15,
+            "control": {
+              "value": 165817.83386113984,
+              "p50": 165817.83386113984,
+              "median_ci95_low": 152966.94381346038,
+              "median_ci95_high": 176142.49290885826,
+              "p95": 178462.88878094367,
+              "p99": 178462.88878094367,
+              "mad": 10668.00412757427,
+              "cv_pct": 7.530407433066146,
+              "runs": 10
+            },
+            "treatment": {
+              "value": 34543.200059881,
+              "p50": 34543.200059881,
+              "median_ci95_low": 34278.349516506234,
+              "median_ci95_high": 34804.123167638085,
+              "p95": 34862.363535705896,
+              "p99": 34862.363535705896,
+              "mad": 262.8868255659254,
+              "cv_pct": 1.4682149207809188,
+              "runs": 10
+            },
+            "pair_count": 10,
+            "control_first_blocks": 5,
+            "treatment_first_blocks": 5,
+            "order_effect_log": 0.05864716989511631,
+            "drift_log": 0.02466418367956358
+          },
+          "null": {
+            "median_log_ratio": -0.0036011697440149646,
+            "treatment_over_control": 0.9964053066911677,
+            "ci95_low_log": -0.012544684710400803,
+            "ci95_high_log": 0.006834159697439419,
+            "ci95_low_ratio": 0.9875336718518133,
+            "ci95_high_ratio": 1.0068575658569212,
+            "log_mad": 0.009075185395598272,
+            "mean_log_ratio": -0.002356482575360602,
+            "ratio_of_arm_medians": 0.9964978479407619,
+            "algebraic_reconciliation_error": 1.0937431516033769e-15,
+            "control": {
+              "value": 34482.28353718972,
+              "p50": 34482.28353718972,
+              "median_ci95_low": 34284.88246863862,
+              "median_ci95_high": 34761.91024369195,
+              "p95": 35102.78034938114,
+              "p99": 35102.78034938114,
+              "mad": 194.46550875062167,
+              "cv_pct": 0.9957151841926982,
+              "runs": 10
+            },
+            "treatment": {
+              "value": 34361.52133689272,
+              "p50": 34361.52133689272,
+              "median_ci95_low": 34156.18624415989,
+              "median_ci95_high": 34616.44297511599,
+              "p95": 34993.748444176636,
+              "p99": 34993.748444176636,
+              "mad": 197.4792049432035,
+              "cv_pct": 0.7999999653568537,
+              "runs": 10
+            },
+            "pair_count": 10,
+            "control_first_blocks": 5,
+            "treatment_first_blocks": 5,
+            "order_effect_log": -0.009970106877902417,
+            "drift_log": -0.011817565996121264
+          },
+          "status": "valid",
+          "claim_state": "eligible_for_decision",
+          "reasons": [],
+          "effect_samples": [
+            {
+              "block_id": 0,
+              "sample_id": 1,
+              "arm": "treatment",
+              "order": "first",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-1.bulk/xlarge/2/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "qg1-trj-xlarge-t2-bb31daa0-r10-20260729T0824Z",
+                "executable_sha256": "a466d5a64a67843a8f2acd4b7add23c25b2015241c64ea35b385ae59431b8c12",
+                "corpus_sha256": "507ed661a749e5ca92d87459465ee853031ce46f3aa3faae15d4f1ef1d11de39",
+                "worker_id": "linux-x86_64-threadripperje-128thread-AMD_Ryzen_Threadripper_PRO_5995WX_64-Cores",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 1190264586564,
+              "ended_ns": 1226164400554,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 34641.500170317915,
+              "group_id": null
+            },
+            {
+              "block_id": 0,
+              "sample_id": 0,
+              "arm": "control",
+              "order": "second",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-1.bulk/xlarge/2/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "qg1-trj-xlarge-t2-bb31daa0-r10-20260729T0824Z",
+                "executable_sha256": "a466d5a64a67843a8f2acd4b7add23c25b2015241c64ea35b385ae59431b8c12",
+                "corpus_sha256": "507ed661a749e5ca92d87459465ee853031ce46f3aa3faae15d4f1ef1d11de39",
+                "worker_id": "linux-x86_64-threadripperje-128thread-AMD_Ryzen_Threadripper_PRO_5995WX_64-Cores",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 1226164403239,
+              "ended_ns": 1241943767154,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 168213.89716763818,
+              "group_id": null
+            },
+            {
+              "block_id": 1,
+              "sample_id": 2,
+              "arm": "control",
+              "order": "first",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-1.bulk/xlarge/2/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "qg1-trj-xlarge-t2-bb31daa0-r10-20260729T0824Z",
+                "executable_sha256": "a466d5a64a67843a8f2acd4b7add23c25b2015241c64ea35b385ae59431b8c12",
+                "corpus_sha256": "507ed661a749e5ca92d87459465ee853031ce46f3aa3faae15d4f1ef1d11de39",
+                "worker_id": "linux-x86_64-threadripperje-128thread-AMD_Ryzen_Threadripper_PRO_5995WX_64-Cores",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 1241943772834,
+              "ended_ns": 1257584349603,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 177833.5766744569,
+              "group_id": null
+            },
+            {
+              "block_id": 1,
+              "sample_id": 3,
+              "arm": "treatment",
+              "order": "second",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-1.bulk/xlarge/2/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "qg1-trj-xlarge-t2-bb31daa0-r10-20260729T0824Z",
+                "executable_sha256": "a466d5a64a67843a8f2acd4b7add23c25b2015241c64ea35b385ae59431b8c12",
+                "corpus_sha256": "507ed661a749e5ca92d87459465ee853031ce46f3aa3faae15d4f1ef1d11de39",
+                "worker_id": "linux-x86_64-threadripperje-128thread-AMD_Ryzen_Threadripper_PRO_5995WX_64-Cores",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 1257584351617,
+              "ended_ns": 1294990949981,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 33043.17108505746,
+              "group_id": null
+            },
+            {
+              "block_id": 2,
+              "sample_id": 5,
+              "arm": "treatment",
+              "order": "first",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-1.bulk/xlarge/2/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "qg1-trj-xlarge-t2-bb31daa0-r10-20260729T0824Z",
+                "executable_sha256": "a466d5a64a67843a8f2acd4b7add23c25b2015241c64ea35b385ae59431b8c12",
+                "corpus_sha256": "507ed661a749e5ca92d87459465ee853031ce46f3aa3faae15d4f1ef1d11de39",
+                "worker_id": "linux-x86_64-threadripperje-128thread-AMD_Ryzen_Threadripper_PRO_5995WX_64-Cores",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 1294990954069,
+              "ended_ns": 1331351482368,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 34211.30640406878,
+              "group_id": null
+            },
+            {
+              "block_id": 2,
+              "sample_id": 4,
+              "arm": "control",
+              "order": "second",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-1.bulk/xlarge/2/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "qg1-trj-xlarge-t2-bb31daa0-r10-20260729T0824Z",
+                "executable_sha256": "a466d5a64a67843a8f2acd4b7add23c25b2015241c64ea35b385ae59431b8c12",
+                "corpus_sha256": "507ed661a749e5ca92d87459465ee853031ce46f3aa3faae15d4f1ef1d11de39",
+                "worker_id": "linux-x86_64-threadripperje-128thread-AMD_Ryzen_Threadripper_PRO_5995WX_64-Cores",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 1331351484933,
+              "ended_ns": 1347028453780,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 178462.88878094367,
+              "group_id": null
+            },
+            {
+              "block_id": 3,
+              "sample_id": 7,
+              "arm": "treatment",
+              "order": "first",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-1.bulk/xlarge/2/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "qg1-trj-xlarge-t2-bb31daa0-r10-20260729T0824Z",
+                "executable_sha256": "a466d5a64a67843a8f2acd4b7add23c25b2015241c64ea35b385ae59431b8c12",
+                "corpus_sha256": "507ed661a749e5ca92d87459465ee853031ce46f3aa3faae15d4f1ef1d11de39",
+                "worker_id": "linux-x86_64-threadripperje-128thread-AMD_Ryzen_Threadripper_PRO_5995WX_64-Cores",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 1347028455583,
+              "ended_ns": 1382845524640,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 34804.123167638085,
+              "group_id": null
+            },
+            {
+              "block_id": 3,
+              "sample_id": 6,
+              "arm": "control",
+              "order": "second",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-1.bulk/xlarge/2/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "qg1-trj-xlarge-t2-bb31daa0-r10-20260729T0824Z",
+                "executable_sha256": "a466d5a64a67843a8f2acd4b7add23c25b2015241c64ea35b385ae59431b8c12",
+                "corpus_sha256": "507ed661a749e5ca92d87459465ee853031ce46f3aa3faae15d4f1ef1d11de39",
+                "worker_id": "linux-x86_64-threadripperje-128thread-AMD_Ryzen_Threadripper_PRO_5995WX_64-Cores",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 1382845529198,
+              "ended_ns": 1399930553625,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 148393.44957723224,
+              "group_id": null
+            },
+            {
+              "block_id": 4,
+              "sample_id": 8,
+              "arm": "control",
+              "order": "first",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-1.bulk/xlarge/2/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "qg1-trj-xlarge-t2-bb31daa0-r10-20260729T0824Z",
+                "executable_sha256": "a466d5a64a67843a8f2acd4b7add23c25b2015241c64ea35b385ae59431b8c12",
+                "corpus_sha256": "507ed661a749e5ca92d87459465ee853031ce46f3aa3faae15d4f1ef1d11de39",
+                "worker_id": "linux-x86_64-threadripperje-128thread-AMD_Ryzen_Threadripper_PRO_5995WX_64-Cores",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 1399930555619,
+              "ended_ns": 1416114082582,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 163421.7705546415,
+              "group_id": null
+            },
+            {
+              "block_id": 4,
+              "sample_id": 9,
+              "arm": "treatment",
+              "order": "second",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-1.bulk/xlarge/2/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "qg1-trj-xlarge-t2-bb31daa0-r10-20260729T0824Z",
+                "executable_sha256": "a466d5a64a67843a8f2acd4b7add23c25b2015241c64ea35b385ae59431b8c12",
+                "corpus_sha256": "507ed661a749e5ca92d87459465ee853031ce46f3aa3faae15d4f1ef1d11de39",
+                "worker_id": "linux-x86_64-threadripperje-128thread-AMD_Ryzen_Threadripper_PRO_5995WX_64-Cores",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 1416114084296,
+              "ended_ns": 1452130557719,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 34523.11351544213,
+              "group_id": null
+            },
+            {
+              "block_id": 5,
+              "sample_id": 10,
+              "arm": "control",
+              "order": "first",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-1.bulk/xlarge/2/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "qg1-trj-xlarge-t2-bb31daa0-r10-20260729T0824Z",
+                "executable_sha256": "a466d5a64a67843a8f2acd4b7add23c25b2015241c64ea35b385ae59431b8c12",
+                "corpus_sha256": "507ed661a749e5ca92d87459465ee853031ce46f3aa3faae15d4f1ef1d11de39",
+                "worker_id": "linux-x86_64-threadripperje-128thread-AMD_Ryzen_Threadripper_PRO_5995WX_64-Cores",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 1452130573829,
+              "ended_ns": 1468596266757,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 152966.94381346038,
+              "group_id": null
+            },
+            {
+              "block_id": 5,
+              "sample_id": 11,
+              "arm": "treatment",
+              "order": "second",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-1.bulk/xlarge/2/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "qg1-trj-xlarge-t2-bb31daa0-r10-20260729T0824Z",
+                "executable_sha256": "a466d5a64a67843a8f2acd4b7add23c25b2015241c64ea35b385ae59431b8c12",
+                "corpus_sha256": "507ed661a749e5ca92d87459465ee853031ce46f3aa3faae15d4f1ef1d11de39",
+                "worker_id": "linux-x86_64-threadripperje-128thread-AMD_Ryzen_Threadripper_PRO_5995WX_64-Cores",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 1468596273339,
+              "ended_ns": 1504687627435,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 34431.956588744455,
+              "group_id": null
+            },
+            {
+              "block_id": 6,
+              "sample_id": 13,
+              "arm": "treatment",
+              "order": "first",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-1.bulk/xlarge/2/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "qg1-trj-xlarge-t2-bb31daa0-r10-20260729T0824Z",
+                "executable_sha256": "a466d5a64a67843a8f2acd4b7add23c25b2015241c64ea35b385ae59431b8c12",
+                "corpus_sha256": "507ed661a749e5ca92d87459465ee853031ce46f3aa3faae15d4f1ef1d11de39",
+                "worker_id": "linux-x86_64-threadripperje-128thread-AMD_Ryzen_Threadripper_PRO_5995WX_64-Cores",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 1504687631612,
+              "ended_ns": 1540934943371,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 34278.349516506234,
+              "group_id": null
+            },
+            {
+              "block_id": 6,
+              "sample_id": 12,
+              "arm": "control",
+              "order": "second",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-1.bulk/xlarge/2/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "qg1-trj-xlarge-t2-bb31daa0-r10-20260729T0824Z",
+                "executable_sha256": "a466d5a64a67843a8f2acd4b7add23c25b2015241c64ea35b385ae59431b8c12",
+                "corpus_sha256": "507ed661a749e5ca92d87459465ee853031ce46f3aa3faae15d4f1ef1d11de39",
+                "worker_id": "linux-x86_64-threadripperje-128thread-AMD_Ryzen_Threadripper_PRO_5995WX_64-Cores",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 1540934947068,
+              "ended_ns": 1557105325683,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 162395.3409447051,
+              "group_id": null
+            },
+            {
+              "block_id": 7,
+              "sample_id": 14,
+              "arm": "control",
+              "order": "first",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-1.bulk/xlarge/2/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "qg1-trj-xlarge-t2-bb31daa0-r10-20260729T0824Z",
+                "executable_sha256": "a466d5a64a67843a8f2acd4b7add23c25b2015241c64ea35b385ae59431b8c12",
+                "corpus_sha256": "507ed661a749e5ca92d87459465ee853031ce46f3aa3faae15d4f1ef1d11de39",
+                "worker_id": "linux-x86_64-threadripperje-128thread-AMD_Ryzen_Threadripper_PRO_5995WX_64-Cores",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 1557105342495,
+              "ended_ns": 1573053283748,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 174451.4091432596,
+              "group_id": null
+            },
+            {
+              "block_id": 7,
+              "sample_id": 15,
+              "arm": "treatment",
+              "order": "second",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-1.bulk/xlarge/2/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "qg1-trj-xlarge-t2-bb31daa0-r10-20260729T0824Z",
+                "executable_sha256": "a466d5a64a67843a8f2acd4b7add23c25b2015241c64ea35b385ae59431b8c12",
+                "corpus_sha256": "507ed661a749e5ca92d87459465ee853031ce46f3aa3faae15d4f1ef1d11de39",
+                "worker_id": "linux-x86_64-threadripperje-128thread-AMD_Ryzen_Threadripper_PRO_5995WX_64-Cores",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 1573053286163,
+              "ended_ns": 1609136676572,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 34563.28660431986,
+              "group_id": null
+            },
+            {
+              "block_id": 8,
+              "sample_id": 16,
+              "arm": "control",
+              "order": "first",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-1.bulk/xlarge/2/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "qg1-trj-xlarge-t2-bb31daa0-r10-20260729T0824Z",
+                "executable_sha256": "a466d5a64a67843a8f2acd4b7add23c25b2015241c64ea35b385ae59431b8c12",
+                "corpus_sha256": "507ed661a749e5ca92d87459465ee853031ce46f3aa3faae15d4f1ef1d11de39",
+                "worker_id": "linux-x86_64-threadripperje-128thread-AMD_Ryzen_Threadripper_PRO_5995WX_64-Cores",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 1609136679307,
+              "ended_ns": 1624657102948,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 175138.0993029713,
+              "group_id": null
+            },
+            {
+              "block_id": 8,
+              "sample_id": 17,
+              "arm": "treatment",
+              "order": "second",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-1.bulk/xlarge/2/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "qg1-trj-xlarge-t2-bb31daa0-r10-20260729T0824Z",
+                "executable_sha256": "a466d5a64a67843a8f2acd4b7add23c25b2015241c64ea35b385ae59431b8c12",
+                "corpus_sha256": "507ed661a749e5ca92d87459465ee853031ce46f3aa3faae15d4f1ef1d11de39",
+                "worker_id": "linux-x86_64-threadripperje-128thread-AMD_Ryzen_Threadripper_PRO_5995WX_64-Cores",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 1624657105833,
+              "ended_ns": 1660376967144,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 34862.363535705896,
+              "group_id": null
+            },
+            {
+              "block_id": 9,
+              "sample_id": 19,
+              "arm": "treatment",
+              "order": "first",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-1.bulk/xlarge/2/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "qg1-trj-xlarge-t2-bb31daa0-r10-20260729T0824Z",
+                "executable_sha256": "a466d5a64a67843a8f2acd4b7add23c25b2015241c64ea35b385ae59431b8c12",
+                "corpus_sha256": "507ed661a749e5ca92d87459465ee853031ce46f3aa3faae15d4f1ef1d11de39",
+                "worker_id": "linux-x86_64-threadripperje-128thread-AMD_Ryzen_Threadripper_PRO_5995WX_64-Cores",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 1660376972915,
+              "ended_ns": 1696151860812,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 34833.39771717376,
+              "group_id": null
+            },
+            {
+              "block_id": 9,
+              "sample_id": 18,
+              "arm": "control",
+              "order": "second",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-1.bulk/xlarge/2/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "qg1-trj-xlarge-t2-bb31daa0-r10-20260729T0824Z",
+                "executable_sha256": "a466d5a64a67843a8f2acd4b7add23c25b2015241c64ea35b385ae59431b8c12",
+                "corpus_sha256": "507ed661a749e5ca92d87459465ee853031ce46f3aa3faae15d4f1ef1d11de39",
+                "worker_id": "linux-x86_64-threadripperje-128thread-AMD_Ryzen_Threadripper_PRO_5995WX_64-Cores",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 1696151866863,
+              "ended_ns": 1713628124111,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 141392.8142361977,
+              "group_id": null
+            }
+          ],
+          "null_samples": [
+            {
+              "block_id": 2000000,
+              "sample_id": 2000000,
+              "arm": "control",
+              "order": "first",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-1.bulk/xlarge/2/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "qg1-trj-xlarge-t2-bb31daa0-r10-20260729T0824Z",
+                "executable_sha256": "a466d5a64a67843a8f2acd4b7add23c25b2015241c64ea35b385ae59431b8c12",
+                "corpus_sha256": "507ed661a749e5ca92d87459465ee853031ce46f3aa3faae15d4f1ef1d11de39",
+                "worker_id": "linux-x86_64-threadripperje-128thread-AMD_Ryzen_Threadripper_PRO_5995WX_64-Cores",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 415209599878,
+              "ended_ns": 450810738152,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 35102.78034938114,
+              "group_id": null
+            },
+            {
+              "block_id": 2000000,
+              "sample_id": 2000001,
+              "arm": "treatment",
+              "order": "second",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-1.bulk/xlarge/2/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "qg1-trj-xlarge-t2-bb31daa0-r10-20260729T0824Z",
+                "executable_sha256": "a466d5a64a67843a8f2acd4b7add23c25b2015241c64ea35b385ae59431b8c12",
+                "corpus_sha256": "507ed661a749e5ca92d87459465ee853031ce46f3aa3faae15d4f1ef1d11de39",
+                "worker_id": "linux-x86_64-threadripperje-128thread-AMD_Ryzen_Threadripper_PRO_5995WX_64-Cores",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 450810741729,
+              "ended_ns": 486796067189,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 34722.3895347086,
+              "group_id": null
+            },
+            {
+              "block_id": 2000001,
+              "sample_id": 2000002,
+              "arm": "control",
+              "order": "first",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-1.bulk/xlarge/2/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "qg1-trj-xlarge-t2-bb31daa0-r10-20260729T0824Z",
+                "executable_sha256": "a466d5a64a67843a8f2acd4b7add23c25b2015241c64ea35b385ae59431b8c12",
+                "corpus_sha256": "507ed661a749e5ca92d87459465ee853031ce46f3aa3faae15d4f1ef1d11de39",
+                "worker_id": "linux-x86_64-threadripperje-128thread-AMD_Ryzen_Threadripper_PRO_5995WX_64-Cores",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 486796069684,
+              "ended_ns": 523024101347,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 34478.76895868545,
+              "group_id": null
+            },
+            {
+              "block_id": 2000001,
+              "sample_id": 2000003,
+              "arm": "treatment",
+              "order": "second",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-1.bulk/xlarge/2/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "qg1-trj-xlarge-t2-bb31daa0-r10-20260729T0824Z",
+                "executable_sha256": "a466d5a64a67843a8f2acd4b7add23c25b2015241c64ea35b385ae59431b8c12",
+                "corpus_sha256": "507ed661a749e5ca92d87459465ee853031ce46f3aa3faae15d4f1ef1d11de39",
+                "worker_id": "linux-x86_64-threadripperje-128thread-AMD_Ryzen_Threadripper_PRO_5995WX_64-Cores",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 523024105104,
+              "ended_ns": 558886353405,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 34993.748444176636,
+              "group_id": null
+            },
+            {
+              "block_id": 2000002,
+              "sample_id": 2000004,
+              "arm": "control",
+              "order": "first",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-1.bulk/xlarge/2/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "qg1-trj-xlarge-t2-bb31daa0-r10-20260729T0824Z",
+                "executable_sha256": "a466d5a64a67843a8f2acd4b7add23c25b2015241c64ea35b385ae59431b8c12",
+                "corpus_sha256": "507ed661a749e5ca92d87459465ee853031ce46f3aa3faae15d4f1ef1d11de39",
+                "worker_id": "linux-x86_64-threadripperje-128thread-AMD_Ryzen_Threadripper_PRO_5995WX_64-Cores",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 558886356160,
+              "ended_ns": 595145664046,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 34284.88246863862,
+              "group_id": null
+            },
+            {
+              "block_id": 2000002,
+              "sample_id": 2000005,
+              "arm": "treatment",
+              "order": "second",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-1.bulk/xlarge/2/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "qg1-trj-xlarge-t2-bb31daa0-r10-20260729T0824Z",
+                "executable_sha256": "a466d5a64a67843a8f2acd4b7add23c25b2015241c64ea35b385ae59431b8c12",
+                "corpus_sha256": "507ed661a749e5ca92d87459465ee853031ce46f3aa3faae15d4f1ef1d11de39",
+                "worker_id": "linux-x86_64-threadripperje-128thread-AMD_Ryzen_Threadripper_PRO_5995WX_64-Cores",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 595145667382,
+              "ended_ns": 631394929933,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 34286.76728915581,
+              "group_id": null
+            },
+            {
+              "block_id": 2000003,
+              "sample_id": 2000006,
+              "arm": "control",
+              "order": "first",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-1.bulk/xlarge/2/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "qg1-trj-xlarge-t2-bb31daa0-r10-20260729T0824Z",
+                "executable_sha256": "a466d5a64a67843a8f2acd4b7add23c25b2015241c64ea35b385ae59431b8c12",
+                "corpus_sha256": "507ed661a749e5ca92d87459465ee853031ce46f3aa3faae15d4f1ef1d11de39",
+                "worker_id": "linux-x86_64-threadripperje-128thread-AMD_Ryzen_Threadripper_PRO_5995WX_64-Cores",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 631394932938,
+              "ended_ns": 667736533639,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 34217.465612863234,
+              "group_id": null
+            },
+            {
+              "block_id": 2000003,
+              "sample_id": 2000007,
+              "arm": "treatment",
+              "order": "second",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-1.bulk/xlarge/2/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "qg1-trj-xlarge-t2-bb31daa0-r10-20260729T0824Z",
+                "executable_sha256": "a466d5a64a67843a8f2acd4b7add23c25b2015241c64ea35b385ae59431b8c12",
+                "corpus_sha256": "507ed661a749e5ca92d87459465ee853031ce46f3aa3faae15d4f1ef1d11de39",
+                "worker_id": "linux-x86_64-threadripperje-128thread-AMD_Ryzen_Threadripper_PRO_5995WX_64-Cores",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 667736536144,
+              "ended_ns": 704247499978,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 34156.18624415989,
+              "group_id": null
+            },
+            {
+              "block_id": 2000004,
+              "sample_id": 2000009,
+              "arm": "treatment",
+              "order": "first",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-1.bulk/xlarge/2/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "qg1-trj-xlarge-t2-bb31daa0-r10-20260729T0824Z",
+                "executable_sha256": "a466d5a64a67843a8f2acd4b7add23c25b2015241c64ea35b385ae59431b8c12",
+                "corpus_sha256": "507ed661a749e5ca92d87459465ee853031ce46f3aa3faae15d4f1ef1d11de39",
+                "worker_id": "linux-x86_64-threadripperje-128thread-AMD_Ryzen_Threadripper_PRO_5995WX_64-Cores",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 704247505228,
+              "ended_ns": 740451428226,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 34382.01088977731,
+              "group_id": null
+            },
+            {
+              "block_id": 2000004,
+              "sample_id": 2000008,
+              "arm": "control",
+              "order": "second",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-1.bulk/xlarge/2/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "qg1-trj-xlarge-t2-bb31daa0-r10-20260729T0824Z",
+                "executable_sha256": "a466d5a64a67843a8f2acd4b7add23c25b2015241c64ea35b385ae59431b8c12",
+                "corpus_sha256": "507ed661a749e5ca92d87459465ee853031ce46f3aa3faae15d4f1ef1d11de39",
+                "worker_id": "linux-x86_64-threadripperje-128thread-AMD_Ryzen_Threadripper_PRO_5995WX_64-Cores",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 740451431762,
+              "ended_ns": 777089932605,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 33917.12817569568,
+              "group_id": null
+            },
+            {
+              "block_id": 2000005,
+              "sample_id": 2000011,
+              "arm": "treatment",
+              "order": "first",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-1.bulk/xlarge/2/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "qg1-trj-xlarge-t2-bb31daa0-r10-20260729T0824Z",
+                "executable_sha256": "a466d5a64a67843a8f2acd4b7add23c25b2015241c64ea35b385ae59431b8c12",
+                "corpus_sha256": "507ed661a749e5ca92d87459465ee853031ce46f3aa3faae15d4f1ef1d11de39",
+                "worker_id": "linux-x86_64-threadripperje-128thread-AMD_Ryzen_Threadripper_PRO_5995WX_64-Cores",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 777089935300,
+              "ended_ns": 813558400360,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 34082.53211071934,
+              "group_id": null
+            },
+            {
+              "block_id": 2000005,
+              "sample_id": 2000010,
+              "arm": "control",
+              "order": "second",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-1.bulk/xlarge/2/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "qg1-trj-xlarge-t2-bb31daa0-r10-20260729T0824Z",
+                "executable_sha256": "a466d5a64a67843a8f2acd4b7add23c25b2015241c64ea35b385ae59431b8c12",
+                "corpus_sha256": "507ed661a749e5ca92d87459465ee853031ce46f3aa3faae15d4f1ef1d11de39",
+                "worker_id": "linux-x86_64-threadripperje-128thread-AMD_Ryzen_Threadripper_PRO_5995WX_64-Cores",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 813558406832,
+              "ended_ns": 849635607677,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 34485.79811569399,
+              "group_id": null
+            },
+            {
+              "block_id": 2000006,
+              "sample_id": 2000013,
+              "arm": "treatment",
+              "order": "first",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-1.bulk/xlarge/2/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "qg1-trj-xlarge-t2-bb31daa0-r10-20260729T0824Z",
+                "executable_sha256": "a466d5a64a67843a8f2acd4b7add23c25b2015241c64ea35b385ae59431b8c12",
+                "corpus_sha256": "507ed661a749e5ca92d87459465ee853031ce46f3aa3faae15d4f1ef1d11de39",
+                "worker_id": "linux-x86_64-threadripperje-128thread-AMD_Ryzen_Threadripper_PRO_5995WX_64-Cores",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 849635611844,
+              "ended_ns": 885628120072,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 34551.1446540463,
+              "group_id": null
+            },
+            {
+              "block_id": 2000006,
+              "sample_id": 2000012,
+              "arm": "control",
+              "order": "second",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-1.bulk/xlarge/2/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "qg1-trj-xlarge-t2-bb31daa0-r10-20260729T0824Z",
+                "executable_sha256": "a466d5a64a67843a8f2acd4b7add23c25b2015241c64ea35b385ae59431b8c12",
+                "corpus_sha256": "507ed661a749e5ca92d87459465ee853031ce46f3aa3faae15d4f1ef1d11de39",
+                "worker_id": "linux-x86_64-threadripperje-128thread-AMD_Ryzen_Threadripper_PRO_5995WX_64-Cores",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 885628127506,
+              "ended_ns": 921199768647,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 35045.05152869846,
+              "group_id": null
+            },
+            {
+              "block_id": 2000007,
+              "sample_id": 2000015,
+              "arm": "treatment",
+              "order": "first",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-1.bulk/xlarge/2/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "qg1-trj-xlarge-t2-bb31daa0-r10-20260729T0824Z",
+                "executable_sha256": "a466d5a64a67843a8f2acd4b7add23c25b2015241c64ea35b385ae59431b8c12",
+                "corpus_sha256": "507ed661a749e5ca92d87459465ee853031ce46f3aa3faae15d4f1ef1d11de39",
+                "worker_id": "linux-x86_64-threadripperje-128thread-AMD_Ryzen_Threadripper_PRO_5995WX_64-Cores",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 921199774097,
+              "ended_ns": 957285709816,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 34510.49641552339,
+              "group_id": null
+            },
+            {
+              "block_id": 2000007,
+              "sample_id": 2000014,
+              "arm": "control",
+              "order": "second",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-1.bulk/xlarge/2/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "qg1-trj-xlarge-t2-bb31daa0-r10-20260729T0824Z",
+                "executable_sha256": "a466d5a64a67843a8f2acd4b7add23c25b2015241c64ea35b385ae59431b8c12",
+                "corpus_sha256": "507ed661a749e5ca92d87459465ee853031ce46f3aa3faae15d4f1ef1d11de39",
+                "worker_id": "linux-x86_64-threadripperje-128thread-AMD_Ryzen_Threadripper_PRO_5995WX_64-Cores",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 957285713172,
+              "ended_ns": 993554151525,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 34290.75358823958,
+              "group_id": null
+            },
+            {
+              "block_id": 2000008,
+              "sample_id": 2000017,
+              "arm": "treatment",
+              "order": "first",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-1.bulk/xlarge/2/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "qg1-trj-xlarge-t2-bb31daa0-r10-20260729T0824Z",
+                "executable_sha256": "a466d5a64a67843a8f2acd4b7add23c25b2015241c64ea35b385ae59431b8c12",
+                "corpus_sha256": "507ed661a749e5ca92d87459465ee853031ce46f3aa3faae15d4f1ef1d11de39",
+                "worker_id": "linux-x86_64-threadripperje-128thread-AMD_Ryzen_Threadripper_PRO_5995WX_64-Cores",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 993554155352,
+              "ended_ns": 1030018019862,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 34098.222550915496,
+              "group_id": null
+            },
+            {
+              "block_id": 2000008,
+              "sample_id": 2000016,
+              "arm": "control",
+              "order": "second",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-1.bulk/xlarge/2/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "qg1-trj-xlarge-t2-bb31daa0-r10-20260729T0824Z",
+                "executable_sha256": "a466d5a64a67843a8f2acd4b7add23c25b2015241c64ea35b385ae59431b8c12",
+                "corpus_sha256": "507ed661a749e5ca92d87459465ee853031ce46f3aa3faae15d4f1ef1d11de39",
+                "worker_id": "linux-x86_64-threadripperje-128thread-AMD_Ryzen_Threadripper_PRO_5995WX_64-Cores",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 1030018022817,
+              "ended_ns": 1066048260106,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 34592.52327597658,
+              "group_id": null
+            },
+            {
+              "block_id": 2000009,
+              "sample_id": 2000018,
+              "arm": "control",
+              "order": "first",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-1.bulk/xlarge/2/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "qg1-trj-xlarge-t2-bb31daa0-r10-20260729T0824Z",
+                "executable_sha256": "a466d5a64a67843a8f2acd4b7add23c25b2015241c64ea35b385ae59431b8c12",
+                "corpus_sha256": "507ed661a749e5ca92d87459465ee853031ce46f3aa3faae15d4f1ef1d11de39",
+                "worker_id": "linux-x86_64-threadripperje-128thread-AMD_Ryzen_Threadripper_PRO_5995WX_64-Cores",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 1066048265917,
+              "ended_ns": 1102104368266,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 34527.31518512676,
+              "group_id": null
+            },
+            {
+              "block_id": 2000009,
+              "sample_id": 2000019,
+              "arm": "treatment",
+              "order": "second",
+              "phase": "measurement",
+              "scope": {
+                "operation_id": "QG-1.bulk/xlarge/2/positions_on.docs_per_second",
+                "version": 1,
+                "semantics": "gauge_higher_is_better",
+                "unit": "docs/s"
+              },
+              "provenance": {
+                "run_id": "qg1-trj-xlarge-t2-bb31daa0-r10-20260729T0824Z",
+                "executable_sha256": "a466d5a64a67843a8f2acd4b7add23c25b2015241c64ea35b385ae59431b8c12",
+                "corpus_sha256": "507ed661a749e5ca92d87459465ee853031ce46f3aa3faae15d4f1ef1d11de39",
+                "worker_id": "linux-x86_64-threadripperje-128thread-AMD_Ryzen_Threadripper_PRO_5995WX_64-Cores",
+                "build_profile": "release-perf"
+              },
+              "started_ns": 1102104371091,
+              "ended_ns": 1138349746408,
+              "work_units": null,
+              "byte_count": null,
+              "observed_value": 34341.03178400814,
+              "group_id": null
+            }
+          ]
+        },
+        "hierarchical": null,
+        "reconciliation": {
+          "paired_median_ratio": 0.20849256769036006,
+          "marginal_median_ratio": 0.20832017434752145,
+          "abs_log_delta": 0.0008271980929654976,
+          "direction_agrees": true,
+          "within_tolerance": true
+        }
+      },
+      "status": "invalid_null",
+      "reasons": [
+        {
+          "code": "evidence.paired_invalid",
+          "message": "paired estimator status InvalidNull with 3 reason(s)",
+          "severity": "no_claim"
+        }
+      ]
+    }
+  ],
+  "gate_status": "invalid_null",
+  "gate_decision": null,
+  "admission_no_claim": {
+    "code": "evidence.incomplete_gate_selection",
+    "message": "the invocation selected only part of the normative gate; durable pre-admission evidence cannot support a publication or ratchet claim",
+    "severity": "no_claim"
+  },
+  "reasons": [
+    {
+      "code": "evidence.gate_cell_invalid_null",
+      "message": "required cell QG-1/bulk/xlarge/2/positions_on/docs_per_second has an invalid A/A null",
+      "severity": "no_claim"
+    },
+    {
+      "code": "evidence.incomplete_gate_selection",
+      "message": "the invocation selected only part of the normative gate; durable pre-admission evidence cannot support a publication or ratchet claim",
+      "severity": "no_claim"
+    }
+  ],
+  "artifact_sha256": "fd2be7b13b3803e70d45135b2db61ea6e1db6a87a7a18e14811dc6ff1d5d4743"
+}

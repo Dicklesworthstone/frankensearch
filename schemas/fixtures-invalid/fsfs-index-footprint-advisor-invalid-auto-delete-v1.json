@@ -55,7 +55,23 @@
       "measured_bytes": 1,
       "projected_savings_bytes": 0,
       "replay_command": "FSFS_INDEX_FOOTPRINT_FIXTURE=small FSFS_INDEX_FOOTPRINT_DOMAIN=vector_index cargo test -p frankensearch-fsfs index_footprint_advisor_policy_suite -- --nocapture",
-      "operator_command": "fsfs doctor --retention-audit --dry-run --format json",
+      "operator_command": {
+        "schema_version": 1,
+        "command": "fsfs",
+        "arguments": [
+          "status",
+          "--format",
+          "json"
+        ],
+        "preconditions": [
+          "review_diagnostic_output",
+          "select_supported_mutation_workflow"
+        ],
+        "mutation_class": "read_only_diagnostic",
+        "dry_run_support": "unavailable",
+        "confirmation_required": false,
+        "guidance": "Retention preview is not supported; run read-only diagnostics for vector_index and review policy guidance before selecting any mutation workflow."
+      },
       "rationale": "small: retain current files and only audit policy for vector_index"
     }
   ],
