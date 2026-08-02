@@ -6202,6 +6202,7 @@ mod platform {
 }
 
 #[cfg(not(any(target_os = "linux", all(target_os = "macos", target_arch = "aarch64"))))]
+#[allow(dead_code)] // Typed zero-I/O stubs intentionally have no native consumers yet.
 mod platform {
     use super::{
         GenerationFileExpectation, GenerationRootError, GenerationRootErrorKind,
