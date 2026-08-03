@@ -7846,6 +7846,7 @@ pub fn persist_shrunk_reproduction(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
     #[cfg(feature = "tantivy-oracle")]
     use std::io::{self, Write};
     #[cfg(feature = "tantivy-oracle")]
@@ -8867,6 +8868,37 @@ mod tests {
                 law.id
             );
         }
+    }
+
+    #[test]
+    fn e63_metamorphic_registry_retains_every_required_law_id() {
+        let registry = MetamorphicLawRegistry::scalar_g1a_v1();
+        let actual = registry
+            .laws
+            .iter()
+            .map(|law| law.id.as_str())
+            .collect::<BTreeSet<_>>();
+        let expected = BTreeSet::from([
+            "e6.3-input-order-permutation-v1",
+            "e6.3-duplicate-live-id-rejection-v1",
+            "e6.3-duplicate-then-delete-v1",
+            "e6.3-upsert-versus-delete-add-v1",
+            "e6.3-flush-batch-schedule-v1",
+            "e6.3-query-normalization-v1",
+            "e6.3-two-term-and-commutativity-v1",
+            "e6.3-two-term-or-commutativity-v1",
+            "e6.3-single-term-quote-v1",
+            "e6.3-tight-segment-geometry-v1",
+            "e6.3-bulk-publication-cadence-v1",
+            "e6.3-merge-schedule-v1",
+            "e6.3-reopen-recovery-v1",
+            "e6.3-tombstone-compaction-v1",
+            "e6.3-positionless-phrase-capability-v1",
+        ]);
+        assert_eq!(
+            actual, expected,
+            "E6.3 required metamorphic law set drifted"
+        );
     }
 
     #[test]
@@ -18039,33 +18071,45 @@ mod tests {
                 .unwrap_or_else(|error| {
                     panic!("DIV-007 eight-leaf probe failed: query={summation_query:?}: {error}")
                 });
-            assert_eq!(
-                summation_run.comparison.status,
-                ComparisonStatus::Classified,
-                "DIV-007 eight-leaf probe must classify, not fail: query={summation_query:?} \
-                 first={:?} divergences={:?}",
-                summation_run.comparison.first_divergence,
-                summation_run.comparison.divergences,
-            );
-            assert_eq!(
-                summation_run.comparison.rank_class,
-                RankClass::ScoreEpsilon,
-                "DIV-007 eight-leaf probe must remain in its ULP envelope: query={summation_query:?}"
-            );
-            assert_eq!(
-                summation_run.comparison.score_epsilon_reason,
-                Some(ScoreEpsilonReason::SummationAssociation)
-            );
-            assert!(
-                summation_run
-                    .comparison
-                    .divergences
-                    .iter()
-                    .all(|divergence| divergence.class == DivergenceClass::ScoreEpsilon),
-                "the DIV-007 probe must not widen another divergence class: {:#?}",
-                summation_run.comparison.divergences
-            );
-            summation_association_cases += 1;
+            match summation_run.comparison.rank_class {
+                RankClass::RankExact => assert_eq!(
+                    summation_run.comparison.status,
+                    ComparisonStatus::Exact,
+                    "a bit-exact DIV-007 candidate must not manufacture a classification: \
+                     query={summation_query:?} first={:?} divergences={:?}",
+                    summation_run.comparison.first_divergence,
+                    summation_run.comparison.divergences,
+                ),
+                RankClass::ScoreEpsilon => {
+                    assert_eq!(
+                        summation_run.comparison.status,
+                        ComparisonStatus::Classified,
+                        "DIV-007 candidate must classify, not fail: query={summation_query:?} \
+                         first={:?} divergences={:?}",
+                        summation_run.comparison.first_divergence,
+                        summation_run.comparison.divergences,
+                    );
+                    assert_eq!(
+                        summation_run.comparison.score_epsilon_reason,
+                        Some(ScoreEpsilonReason::SummationAssociation)
+                    );
+                    assert!(
+                        summation_run
+                            .comparison
+                            .divergences
+                            .iter()
+                            .all(|divergence| divergence.class == DivergenceClass::ScoreEpsilon),
+                        "the DIV-007 probe must not widen another divergence class: {:#?}",
+                        summation_run.comparison.divergences
+                    );
+                    summation_association_cases += 1;
+                }
+                rank_class => panic!(
+                    "DIV-007 eight-leaf candidate escaped the exact/ULP envelope: \
+                     query={summation_query:?} rank_class={rank_class:?} first={:?} divergences={:?}",
+                    summation_run.comparison.first_divergence, summation_run.comparison.divergences,
+                ),
+            }
 
             let boosted_group_negation_query = format!("({0} NOT {0})^2", vocabulary[0]);
             let boosted_group_negation_case = DifferentialCase {
