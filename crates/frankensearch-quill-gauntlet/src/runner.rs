@@ -17027,7 +17027,7 @@ mod tests {
         #[derive(Debug)]
         enum Operand {
             Term(String),
-            Phrase(Vec<String>),
+            Phrase { words: Vec<String>, prefix: bool },
             NegatedTerm(String),
             Fielded(&'static str, String),
         }
@@ -17035,10 +17035,13 @@ mod tests {
             fn render(&self, out: &mut String) {
                 match self {
                     Self::Term(term) => out.push_str(term),
-                    Self::Phrase(words) => {
+                    Self::Phrase { words, prefix } => {
                         out.push('"');
                         out.push_str(&words.join(" "));
                         out.push('"');
+                        if *prefix {
+                            out.push('*');
+                        }
                     }
                     Self::NegatedTerm(term) => {
                         out.push('-');
@@ -17063,7 +17066,10 @@ mod tests {
                     let words = (0..2 + rng.bounded(3))
                         .map(|_| pick(rng, vocabulary).to_owned())
                         .collect();
-                    Operand::Phrase(words)
+                    Operand::Phrase {
+                        words,
+                        prefix: false,
+                    }
                 }
                 // In-group negation is part of the association-parity
                 // residual (ULP-scale divergence on mixed-occur nests);
@@ -17093,11 +17099,12 @@ mod tests {
                 1 => "   \t ".to_owned(),
                 2 => {
                     let mut out = String::new();
-                    Operand::Phrase(
-                        (0..2 + rng.bounded(3))
+                    Operand::Phrase {
+                        words: (0..2 + rng.bounded(3))
                             .map(|_| pick(rng, vocabulary).to_owned())
                             .collect(),
-                    )
+                        prefix: false,
+                    }
                     .render(&mut out);
                     out
                 }
@@ -17379,6 +17386,60 @@ mod tests {
                 assert!(
                     harness_error.to_string().contains("slop"),
                     "harness must preserve the typed slop refusal for {label}: {harness_error}"
+                );
+            }
+
+            // Phrase-prefix ASTs are another declared Quill capability gap.
+            // They belong beside slop in the typed-error lane, never in the
+            // exact generator: the oracle executes, while Quill names the
+            // unsupported prefix capability and the harness stops before a
+            // one-sided result can become a comparison report.
+            for (label, word_count) in [("two", 2_usize), ("three", 3)] {
+                let prefix_query = format!(
+                    "\"{}\"*",
+                    (0..word_count)
+                        .map(|index| vocabulary[index].as_str())
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                );
+                let prefix_case = DifferentialCase {
+                    fixture_id: format!("bsjw-typed-error-prefix-{label}"),
+                    query: prefix_query,
+                    limit: 20,
+                    offset: 0,
+                    tie_expansion_limit: 256,
+                    count_requested: false,
+                    snippet_max_chars: None,
+                    metadata: DifferentialCaseMetadata {
+                        generator_id: Some("bsjw-query-tree-v1".to_owned()),
+                        generator_seed: Some(
+                            u64::try_from(word_count).expect("prefix word count fits u64"),
+                        ),
+                        corpus_hash: Some(corpus_hash.clone()),
+                    },
+                };
+                let subject_error =
+                    crate::engine::GauntletEngine::observe(&subject, &cx, &prefix_case)
+                        .await
+                        .expect_err(
+                            "phrase prefix must be a typed Quill refusal, not a silent execution",
+                        );
+                assert!(
+                    subject_error.to_string().contains("prefix"),
+                    "prefix refusal must name the capability for {label}: {subject_error}"
+                );
+                crate::engine::GauntletEngine::observe(&oracle, &cx, &prefix_case)
+                    .await
+                    .unwrap_or_else(|error| {
+                        panic!("the oracle must execute prefix case {label}: {error}")
+                    });
+                let harness_error = harness
+                    .run(&cx, &subject, &oracle, &prefix_case)
+                    .await
+                    .expect_err("a typed prefix refusal must not manufacture a comparison report");
+                assert!(
+                    harness_error.to_string().contains("prefix"),
+                    "harness must preserve the typed prefix refusal for {label}: {harness_error}"
                 );
             }
 
