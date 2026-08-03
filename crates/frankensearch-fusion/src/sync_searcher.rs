@@ -4,25 +4,24 @@
 //! [`crate::searcher::TwoTierSearcher`] but operates on precomputed query
 //! embeddings and fully in-memory indices.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 
 // The per-query `&str`-keyed score maps + `seen` dedup set are `.get()`/`.insert()`
 // probed only (never iterated for output), so `ahash` is bit-identical to std and
 // ~2× faster than SipHash on short doc_ids (`sync_hash_ab` bench: 0.44–0.51 across
-// n=30..300), matching the sibling fusion paths (`rrf.rs`, `blend.rs`). `rank_map`
-// below stays std `HashMap` — it feeds `blend::compute_rank_changes_with_maps`.
+// n=30..300), matching the sibling fusion paths (`rrf.rs`, `blend.rs`).
 use ahash::{AHashMap, AHashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use frankensearch_core::filter::SearchFilter;
 use frankensearch_core::{
-    FusedHit, PhaseMetrics, RankChanges, ScoreSource, ScoredResult, SearchError, SearchPhase,
-    SearchResult, TwoTierConfig, TwoTierMetrics, VectorHit, ZeroSignalReason,
+    FusedHit, PhaseMetrics, ScoreSource, ScoredResult, SearchError, SearchPhase, SearchResult,
+    TwoTierConfig, TwoTierMetrics, VectorHit, ZeroSignalReason,
 };
 use frankensearch_index::{InMemoryTwoTierIndex, SearchParams};
 
-use crate::blend::{blend_two_tier_aligned_vector_index, compute_rank_changes_with_maps};
+use crate::blend::{blend_two_tier_aligned_vector_index, compute_rank_changes};
 use crate::normalize::{AdaptiveNqcDenseWeight, NqcDenseWeight, nqc_cv_iter};
 use crate::rrf::{RrfConfig, RrfTiebreak, candidate_count, fuse_by_strategy};
 
@@ -594,6 +593,12 @@ impl SyncTwoTierSearcher {
         metrics.quality_search_ms = ms(phase2_started.elapsed());
         metrics.quality_embed_ms = 0.0;
 
+        // Keep this diagnostic on the full phase candidate pools, not only
+        // the displayed top-k. The async searcher uses the same definition;
+        // truncating here made identical searches report different stable /
+        // promoted / demoted counts whenever `k < fetch` (bd-k3089).
+        let rank_changes = compute_rank_changes(&fast_hits, &blended);
+
         let refined_results = if let Some(lexical) = lexical_hits.as_ref() {
             fused_hits_to_scored_results(
                 fuse_by_strategy(
@@ -623,7 +628,6 @@ impl SyncTwoTierSearcher {
             )
         };
 
-        let rank_changes = compute_rank_changes_for_scored(&initial_results, &refined_results);
         metrics.rank_changes = rank_changes.clone();
         metrics.phase2_total_ms = ms(phase2_started.elapsed());
         metrics.kendall_tau = None;
@@ -959,30 +963,6 @@ fn unique_vector_hits_to_scored_results_aligned_owned(
             }
         })
         .collect()
-}
-
-fn compute_rank_changes_for_scored(
-    initial: &[ScoredResult],
-    refined: &[ScoredResult],
-) -> RankChanges {
-    // Build the doc_id → rank maps directly from the `ScoredResult` slices.
-    // `build_borrowed_rank_map` only ever reads `doc_id` (rank = enumerate index;
-    // it ignores `VectorHit::index`/`score`), so the previous code allocated two
-    // throwaway `Vec<VectorHit>` and cloned every `doc_id` into them per query for
-    // nothing. Borrowing `doc_id.as_str()` straight from the input drops those two
-    // Vec allocations + 2·N `String` clones on the sync hybrid path. First-occurrence
-    // wins (`entry().or_insert`), identical to `build_borrowed_rank_map`, so the
-    // resulting maps — and the `RankChanges` — are unchanged.
-    fn rank_map(hits: &[ScoredResult]) -> HashMap<&str, usize> {
-        let mut ranks = HashMap::with_capacity(hits.len());
-        for (rank, hit) in hits.iter().enumerate() {
-            ranks.entry(hit.doc_id.as_str()).or_insert(rank);
-        }
-        ranks
-    }
-    let initial_map = rank_map(initial);
-    let refined_map = rank_map(refined);
-    compute_rank_changes_with_maps(&initial_map, &refined_map)
 }
 
 #[cfg(test)]

@@ -24,11 +24,25 @@ use frankensearch_index::{InMemoryTwoTierIndex, InMemoryVectorIndex, TwoTierInde
 /// Known, documented divergences between the two searchers (bd-k3089).
 /// Each entry pins WHERE the divergence lives so accidental convergence or a
 /// new divergence both surface as test failures worth reading.
-const KNOWN_DIVERGENCES: &[&str] = &[
-    // The sync searcher takes a pre-embedded query vector and has no
-    // embedder, so fast/quality embedder ids are absent from its metrics.
-    "fast_embedder_id/quality_embedder_id: async-only",
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KnownDivergence {
+    /// The sync API receives an already embedded query vector.
+    EmbedderIdentity,
+    /// A vector has no source text from which the sync API could classify it.
+    QueryClass,
+    /// The sync API intentionally does not compute a timing-independent tau.
+    KendallTau,
+}
+
+const KNOWN_DIVERGENCES: &[KnownDivergence] = &[
+    KnownDivergence::EmbedderIdentity,
+    KnownDivergence::QueryClass,
+    KnownDivergence::KendallTau,
 ];
+
+fn is_known_divergence(divergence: KnownDivergence) -> bool {
+    KNOWN_DIVERGENCES.contains(&divergence)
+}
 
 const DIM: usize = 4;
 
@@ -329,6 +343,74 @@ fn assert_metric_parity(case: &str, sync_m: &TwoTierMetrics, async_m: &TwoTierMe
         async_m.phase2_vectors_searched > 0,
         "[{case}] phase2 ran on one side only"
     );
+    assert_eq!(
+        sync_m.lexical_candidates, async_m.lexical_candidates,
+        "[{case}] lexical candidate count diverges"
+    );
+    assert_eq!(
+        sync_m.semantic_candidates, async_m.semantic_candidates,
+        "[{case}] semantic candidate count diverges"
+    );
+    assert_eq!(
+        sync_m.incomplete_embeddings, async_m.incomplete_embeddings,
+        "[{case}] incomplete embedding count diverges"
+    );
+    assert_eq!(
+        sync_m.zero_signal, async_m.zero_signal,
+        "[{case}] zero-signal classification diverges"
+    );
+    assert_eq!(
+        sync_m.rank_changes.promoted, async_m.rank_changes.promoted,
+        "[{case}] promoted rank-change count diverges"
+    );
+    assert_eq!(
+        sync_m.rank_changes.demoted, async_m.rank_changes.demoted,
+        "[{case}] demoted rank-change count diverges"
+    );
+    assert_eq!(
+        sync_m.rank_changes.stable, async_m.rank_changes.stable,
+        "[{case}] stable rank-change count diverges"
+    );
+
+    // The sync API starts from a query vector, not query text, and therefore
+    // cannot truthfully supply either an embedder identity or query class.
+    assert!(is_known_divergence(KnownDivergence::EmbedderIdentity));
+    assert_eq!(
+        sync_m.fast_embedder_id, None,
+        "[{case}] sync fast id changed"
+    );
+    assert_eq!(
+        sync_m.quality_embedder_id, None,
+        "[{case}] sync quality id changed"
+    );
+    assert!(
+        async_m.fast_embedder_id.is_some(),
+        "[{case}] async fast id missing"
+    );
+    assert!(
+        async_m.quality_embedder_id.is_some(),
+        "[{case}] async quality id missing"
+    );
+
+    assert!(is_known_divergence(KnownDivergence::QueryClass));
+    assert_eq!(
+        sync_m.query_class, None,
+        "[{case}] sync query class changed"
+    );
+    assert!(
+        async_m.query_class.is_some(),
+        "[{case}] async query class missing"
+    );
+
+    assert!(is_known_divergence(KnownDivergence::KendallTau));
+    assert_eq!(
+        sync_m.kendall_tau, None,
+        "[{case}] sync kendall tau changed"
+    );
+    assert!(
+        async_m.kendall_tau.is_some(),
+        "[{case}] async kendall tau missing"
+    );
 }
 
 fn conformance_case(case: &str, config: &TwoTierConfig, query: Vec<f32>, k: usize) {
@@ -438,7 +520,7 @@ fn orthogonal_query_agrees() {
 
 #[test]
 fn phase1_vectors_searched_reports_the_evaluated_corpus_at_small_k() {
-    assert_eq!(KNOWN_DIVERGENCES.len(), 1);
+    assert_eq!(KNOWN_DIVERGENCES.len(), 3);
     let config = TwoTierConfig::default();
     let k = 1;
     let query = normalize(vec![1.0, 0.0, 0.0, 0.0]);
