@@ -2991,17 +2991,45 @@ mod tests {
         generator_id: &str,
         subject_config: QuillConfig,
     ) -> Vec<(String, EngineObservation, EngineObservation)> {
+        e63_observations_with_config_and_batch_size(
+            cx,
+            documents,
+            cases,
+            seed,
+            generator_id,
+            subject_config,
+            documents.len(),
+        )
+        .await
+    }
+
+    /// E6.3 observation runner variant that fixes the ingest batch schedule.
+    /// A non-zero batch size lets lifecycle laws exercise publication
+    /// boundaries without changing the corpus or query projection.
+    #[cfg(feature = "perf-harness")]
+    async fn e63_observations_with_config_and_batch_size(
+        cx: &Cx,
+        documents: &[frankensearch_core::IndexableDocument],
+        cases: &[(&str, &str)],
+        seed: u64,
+        generator_id: &str,
+        subject_config: QuillConfig,
+        batch_size: usize,
+    ) -> Vec<(String, EngineObservation, EngineObservation)> {
+        assert!(batch_size > 0, "E6.3 ingest batch size must be non-zero");
         let mut subject = qg_position_mode_subject_with_config(true, subject_config);
         let mut oracle = qg_position_mode_oracle(true);
         subject
             .claim_fresh_campaign()
             .expect("E6.3 claim Quill input-order campaign");
-        subject
-            .index_mut()
-            .expect("E6.3 open Quill input-order campaign")
-            .index_documents(cx, documents)
-            .await
-            .expect("E6.3 index Quill input-order fixture");
+        for batch in documents.chunks(batch_size) {
+            subject
+                .index_mut()
+                .expect("E6.3 open Quill input-order campaign")
+                .index_documents(cx, batch)
+                .await
+                .expect("E6.3 index Quill input-order fixture");
+        }
         subject
             .index_mut()
             .expect("E6.3 open Quill input-order campaign")
@@ -6407,6 +6435,151 @@ mod tests {
                     comparison.status,
                     ComparisonStatus::Failed,
                     "E6.3 {engine} incorrectly accepted a content mutation as segment geometry",
+                );
+            }
+        });
+    }
+
+    /// E6.3 law: bulk publication cadence changes only the intermediate
+    /// manifest schedule. With the same stable-ID corpus and scalar contract,
+    /// it must not change the committed query observation. Both arms use bulk
+    /// mode and identical tight shard budgets so the only transformed setting
+    /// is the cadence. A content mutation remains the invalid control.
+    #[cfg(feature = "perf-harness")]
+    #[test]
+    fn e63_bulk_publish_cadence_preserves_observations_but_content_mutation_does_not() {
+        use frankensearch_core::IndexableDocument;
+
+        const SEED: u64 = 0xe63_b011_5eed_0001;
+        let documents = vec![
+            IndexableDocument::new("doc-1", "alpha beta beta").with_title("guide"),
+            IndexableDocument::new("doc-2", "alpha gamma").with_title("alpha overview"),
+            IndexableDocument::new("doc-3", "beta gamma gamma gamma").with_title("alpha"),
+            IndexableDocument::new("doc-4", "alpha beta gamma delta").with_title("reference"),
+            IndexableDocument::new("doc-5", "delta epsilon").with_title("quiet"),
+        ];
+        let queries = [
+            ("bare-term", "alpha"),
+            ("repeated-term", "beta"),
+            ("boolean-and", "alpha AND beta"),
+            ("negative-sentinel", "saffron"),
+        ];
+        let baseline_config = QuillConfig {
+            scribe_shard_budget_bytes: 1,
+            delta_budget_bytes: 1,
+            tier_fanout: 2,
+            bulk_load_mode: true,
+            bulk_publish_segment_cadence: 1,
+            ..e55_config()
+        };
+        let transformed_config = QuillConfig {
+            bulk_publish_segment_cadence: 3,
+            ..baseline_config.clone()
+        };
+        let mut content_mutated = documents.clone();
+        content_mutated[3] =
+            IndexableDocument::new("doc-4", "alpha beta saffron").with_title("reference");
+
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let baseline = e63_observations_with_config_and_batch_size(
+                &cx,
+                &documents,
+                &queries,
+                SEED,
+                "e6.3-bulk-publish-cadence-v1",
+                baseline_config,
+                1,
+            )
+            .await;
+            let transformed = e63_observations_with_config_and_batch_size(
+                &cx,
+                &documents,
+                &queries,
+                SEED,
+                "e6.3-bulk-publish-cadence-v1",
+                transformed_config,
+                1,
+            )
+            .await;
+            let invalid = e63_observations_with_config_and_batch_size(
+                &cx,
+                &content_mutated,
+                &queries,
+                SEED,
+                "e6.3-bulk-publish-cadence-v1",
+                QuillConfig {
+                    scribe_shard_budget_bytes: 1,
+                    delta_budget_bytes: 1,
+                    tier_fanout: 2,
+                    bulk_load_mode: true,
+                    bulk_publish_segment_cadence: 1,
+                    ..e55_config()
+                },
+                1,
+            )
+            .await;
+
+            for (
+                (baseline_id, baseline_quill, baseline_tantivy),
+                (transformed_id, transformed_quill, transformed_tantivy),
+            ) in baseline.iter().zip(&transformed)
+            {
+                assert_eq!(
+                    baseline_id, transformed_id,
+                    "E6.3 bulk cadence case identity drifted"
+                );
+                for (engine, before, after) in [
+                    ("Quill", baseline_quill, transformed_quill),
+                    ("Tantivy", baseline_tantivy, transformed_tantivy),
+                ] {
+                    let comparison = compare_observations(
+                        before.clone(),
+                        after.clone(),
+                        ComparatorConfig::default(),
+                    )
+                    .unwrap_or_else(|error| {
+                        panic!(
+                            "E6.3 {engine} {baseline_id} bulk cadence comparison failed: {error}"
+                        )
+                    });
+                    assert!(
+                        matches!(
+                            comparison.rank_class,
+                            RankClass::RankExact | RankClass::TieOrder
+                        ) && comparison
+                            .divergences
+                            .iter()
+                            .all(|divergence| divergence.class == DivergenceClass::TieOrder),
+                        "E6.3 {engine} {baseline_id} produced a non-tie divergence under bulk cadence: {:?}",
+                        comparison.divergences,
+                    );
+                }
+            }
+
+            let baseline_sentinel = baseline
+                .iter()
+                .find(|(case_id, _, _)| case_id == "negative-sentinel")
+                .expect("E6.3 baseline bulk cadence negative fixture");
+            let invalid_sentinel = invalid
+                .iter()
+                .find(|(case_id, _, _)| case_id == "negative-sentinel")
+                .expect("E6.3 invalid bulk cadence negative fixture");
+            for (engine, before, after) in [
+                ("Quill", &baseline_sentinel.1, &invalid_sentinel.1),
+                ("Tantivy", &baseline_sentinel.2, &invalid_sentinel.2),
+            ] {
+                let comparison = compare_observations(
+                    before.clone(),
+                    after.clone(),
+                    ComparatorConfig::default(),
+                )
+                .unwrap_or_else(|error| {
+                    panic!("E6.3 {engine} invalid bulk cadence comparison failed: {error}")
+                });
+                assert_eq!(
+                    comparison.status,
+                    ComparisonStatus::Failed,
+                    "E6.3 {engine} incorrectly accepted a content mutation as bulk cadence",
                 );
             }
         });
