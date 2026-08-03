@@ -6179,6 +6179,103 @@ mod tests {
         });
     }
 
+    /// E6.3 seeded property campaign for the qualified input-order law. Each
+    /// seed must replay exactly and exercise a nonidentity stable-ID
+    /// permutation; the paired single-seed law supplies the intentionally
+    /// invalid content-mutation control. This stays bounded for PR execution
+    /// while making the generator rather than one hand-picked permutation the
+    /// unit under test.
+    #[cfg(feature = "perf-harness")]
+    #[test]
+    fn e63_input_order_seed_matrix_replays_live_observations() {
+        use frankensearch_core::IndexableDocument;
+
+        const SEEDS: [u64; 3] = [
+            0xe63_1a00_5eed_0001,
+            0xe63_1a00_5eed_0002,
+            0xe63_1a00_5eed_0003,
+        ];
+        let canonical = vec![
+            IndexableDocument::new("doc-1", "alpha beta beta").with_title("guide"),
+            IndexableDocument::new("doc-2", "alpha gamma").with_title("alpha overview"),
+            IndexableDocument::new("doc-3", "beta gamma gamma gamma").with_title("alpha"),
+            IndexableDocument::new("doc-4", "alpha beta gamma delta").with_title("reference"),
+            IndexableDocument::new("doc-5", "delta epsilon").with_title("quiet"),
+        ];
+        let queries = [("bare-term", "alpha"), ("boolean-and", "alpha AND beta")];
+
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            for seed in SEEDS {
+                let permutation = e63_seeded_input_permutation(canonical.len(), seed);
+                assert_ne!(
+                    permutation,
+                    (0..canonical.len()).collect::<Vec<_>>(),
+                    "E6.3 seed {seed:#x} must exercise a real ingest-order transform",
+                );
+                assert_eq!(
+                    permutation,
+                    e63_seeded_input_permutation(canonical.len(), seed),
+                    "E6.3 seed {seed:#x} must replay byte-identically",
+                );
+                let permuted = permutation
+                    .iter()
+                    .map(|&index| canonical[index].clone())
+                    .collect::<Vec<_>>();
+                let baseline = e63_observations(
+                    &cx,
+                    &canonical,
+                    &queries,
+                    seed,
+                    "e6.3-input-order-permutation-v1",
+                )
+                .await;
+                let transformed = e63_observations(
+                    &cx,
+                    &permuted,
+                    &queries,
+                    seed,
+                    "e6.3-input-order-permutation-v1",
+                )
+                .await;
+
+                for (
+                    (baseline_id, baseline_quill, baseline_tantivy),
+                    (transformed_id, transformed_quill, transformed_tantivy),
+                ) in baseline.iter().zip(&transformed)
+                {
+                    assert_eq!(
+                        baseline_id, transformed_id,
+                        "E6.3 seed {seed:#x} replay case identity drifted"
+                    );
+                    for (engine, before, after) in [
+                        ("Quill", baseline_quill, transformed_quill),
+                        ("Tantivy", baseline_tantivy, transformed_tantivy),
+                    ] {
+                        let comparison = compare_observations(
+                            before.clone(),
+                            after.clone(),
+                            ComparatorConfig::default(),
+                        )
+                        .unwrap_or_else(|error| {
+                            panic!("E6.3 {engine} seed {seed:#x} {baseline_id} replay comparison failed: {error}")
+                        });
+                        assert!(
+                            matches!(
+                                comparison.rank_class,
+                                RankClass::RankExact | RankClass::TieOrder
+                            ) && comparison
+                                .divergences
+                                .iter()
+                                .all(|divergence| divergence.class == DivergenceClass::TieOrder),
+                            "E6.3 {engine} seed {seed:#x} {baseline_id} produced a non-tie divergence: {:?}",
+                            comparison.divergences,
+                        );
+                    }
+                }
+            }
+        });
+    }
+
     /// E6.3 law: segment boundaries are an implementation detail when the
     /// corpus, stable IDs, and scalar configuration contract are unchanged.
     /// The tight budget below is intentionally small enough to exercise the
