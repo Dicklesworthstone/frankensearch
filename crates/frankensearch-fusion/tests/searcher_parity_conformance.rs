@@ -14,6 +14,7 @@
 
 use std::sync::Arc;
 
+use frankensearch_core::explanation::{ExplainedSource, HitExplanation};
 use frankensearch_core::traits::{LexicalRead, SearchFuture};
 use frankensearch_core::{
     Cx, Embedder, ModelCategory, ScoredResult, SearchPhase, TwoTierConfig, TwoTierMetrics,
@@ -318,6 +319,58 @@ fn phase_label(phase: &SearchPhase) -> &'static str {
     }
 }
 
+fn phase_results(phase: &SearchPhase) -> &[ScoredResult] {
+    match phase {
+        SearchPhase::Initial { results, .. }
+        | SearchPhase::Refined { results, .. }
+        | SearchPhase::Reranked { results, .. } => results,
+        SearchPhase::RefinementFailed {
+            initial_results, ..
+        } => initial_results,
+    }
+}
+
+fn phase_snapshots(
+    query_vec: &[f32],
+    with_quality: bool,
+    config: TwoTierConfig,
+) -> (
+    Vec<(&'static str, Vec<ScoredResult>)>,
+    Vec<(&'static str, Vec<ScoredResult>)>,
+) {
+    let sync = SyncTwoTierSearcher::new(sync_index(with_quality), config.clone())
+        .search_iter(query_vec, 4)
+        .map(|phase| (phase_label(&phase), phase_results(&phase).to_vec()))
+        .collect();
+    let index = async_index("phase-snapshots", with_quality);
+    let fast: Arc<dyn Embedder> = Arc::new(FixedVecEmbedder {
+        id: "parity-fast",
+        vector: query_vec.to_vec(),
+    });
+    let quality: Arc<dyn Embedder> = Arc::new(FixedVecEmbedder {
+        id: "parity-quality",
+        vector: query_vec.to_vec(),
+    });
+    let mut async_phases = Vec::new();
+    asupersync::test_utils::run_test_with_cx(|cx| {
+        let slot = &mut async_phases;
+        async move {
+            TwoTierSearcher::new(index, fast, config)
+                .with_quality_embedder(quality)
+                .search(
+                    &cx,
+                    "parity conformance query",
+                    4,
+                    |_| None,
+                    |phase| slot.push((phase_label(&phase), phase_results(&phase).to_vec())),
+                )
+                .await
+                .expect("async phase search");
+        }
+    });
+    (sync, async_phases)
+}
+
 fn phase_labels(
     query_vec: &[f32],
     with_quality: bool,
@@ -406,11 +459,96 @@ fn assert_result_parity(case: &str, sync_r: &[ScoredResult], async_r: &[ScoredRe
             "[{case}] {}: explanation presence diverges",
             s.doc_id
         );
+        if let (Some(sync_explanation), Some(async_explanation)) = (&s.explanation, &a.explanation)
+        {
+            assert_explanation_parity(case, &s.doc_id, sync_explanation, async_explanation);
+        }
         assert_eq!(
             s.metadata.as_deref(),
             a.metadata.as_deref(),
             "[{case}] {}: metadata diverges",
             s.doc_id
+        );
+    }
+}
+
+fn explained_source_kind(source: &ExplainedSource) -> &'static str {
+    match source {
+        ExplainedSource::LexicalBm25 { .. } => "lexical",
+        ExplainedSource::SemanticFast { .. } => "semantic_fast",
+        ExplainedSource::SemanticQuality { .. } => "semantic_quality",
+        ExplainedSource::Rerank { .. } => "rerank",
+    }
+}
+
+fn assert_explanation_parity(
+    case: &str,
+    doc: &str,
+    sync: &HitExplanation,
+    asynchronous: &HitExplanation,
+) {
+    assert_eq!(
+        sync.phase, asynchronous.phase,
+        "[{case}] {doc}: explanation phase diverges"
+    );
+    assert!(
+        (sync.final_score - asynchronous.final_score).abs() < 1e-5,
+        "[{case}] {doc}: explanation final score diverges"
+    );
+    assert_eq!(
+        sync.components.len(),
+        asynchronous.components.len(),
+        "[{case}] {doc}: explanation component count diverges"
+    );
+    for (sync_component, async_component) in sync.components.iter().zip(&asynchronous.components) {
+        assert_eq!(
+            explained_source_kind(&sync_component.source),
+            explained_source_kind(&async_component.source),
+            "[{case}] {doc}: explanation component source diverges"
+        );
+        for (field, sync_value, async_value) in [
+            (
+                "raw score",
+                sync_component.raw_score,
+                async_component.raw_score,
+            ),
+            (
+                "normalized score",
+                sync_component.normalized_score,
+                async_component.normalized_score,
+            ),
+            (
+                "rrf contribution",
+                sync_component.rrf_contribution,
+                async_component.rrf_contribution,
+            ),
+            ("weight", sync_component.weight, async_component.weight),
+        ] {
+            assert!(
+                (sync_value - async_value).abs() < 1e-5,
+                "[{case}] {doc}: explanation {field} diverges: sync={sync_value}, async={async_value}"
+            );
+        }
+    }
+    assert_eq!(
+        sync.rank_movement.is_some(),
+        asynchronous.rank_movement.is_some(),
+        "[{case}] {doc}: explanation rank-movement presence diverges"
+    );
+    if let (Some(sync_rank), Some(async_rank)) = (&sync.rank_movement, &asynchronous.rank_movement)
+    {
+        assert_eq!(
+            (
+                sync_rank.initial_rank,
+                sync_rank.refined_rank,
+                sync_rank.delta
+            ),
+            (
+                async_rank.initial_rank,
+                async_rank.refined_rank,
+                async_rank.delta
+            ),
+            "[{case}] {doc}: explanation rank movement diverges"
         );
     }
 }
@@ -681,6 +819,43 @@ fn quality_index_present_emits_matching_initial_then_refined_phases() {
     let (sync_phases, async_phases) = phase_labels(&query, true, TwoTierConfig::default());
     assert_eq!(sync_phases, ["initial", "refined"]);
     assert_eq!(sync_phases, async_phases);
+}
+
+#[test]
+fn explain_mode_preserves_field_parity_in_each_progressive_phase() {
+    let config = TwoTierConfig {
+        explain: true,
+        ..TwoTierConfig::default()
+    };
+    let query = normalize(vec![1.0, 0.0, 0.0, 0.0]);
+    let (sync_phases, async_phases) = phase_snapshots(&query, true, config);
+    let sync_labels = sync_phases
+        .iter()
+        .map(|(label, _)| *label)
+        .collect::<Vec<_>>();
+    let async_labels = async_phases
+        .iter()
+        .map(|(label, _)| *label)
+        .collect::<Vec<_>>();
+    assert_eq!(sync_labels, ["initial", "refined"]);
+    assert_eq!(sync_labels, async_labels);
+    for ((label, sync_results), (_, async_results)) in sync_phases.iter().zip(async_phases.iter()) {
+        assert_result_parity(
+            &format!("phase-{label}-explain"),
+            sync_results,
+            async_results,
+        );
+        assert!(
+            sync_results
+                .iter()
+                .all(|result| result.explanation.is_some())
+        );
+        assert!(
+            async_results
+                .iter()
+                .all(|result| result.explanation.is_some())
+        );
+    }
 }
 
 #[test]
