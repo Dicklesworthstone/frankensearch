@@ -6,6 +6,7 @@
 //! same boundary when the scalar G1a facade lands.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
 
@@ -440,6 +441,16 @@ pub enum MetamorphicLawScope {
     Quill,
     Tantivy,
     CrossEngine,
+}
+
+impl fmt::Display for MetamorphicLawScope {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Quill => "quill",
+            Self::Tantivy => "tantivy",
+            Self::CrossEngine => "cross_engine",
+        })
+    }
 }
 
 /// Closed reasons why a declared metamorphic law cannot execute.
@@ -897,7 +908,8 @@ impl MetamorphicLawRegistry {
     /// # Errors
     ///
     /// Returns an error when a result names an unknown law/scope, repeats a
-    /// law/scope pair, or tries to record a skip as a terminal outcome.
+    /// law/scope pair, omits a declared applicability cell, or tries to record
+    /// a skip as a terminal outcome.
     pub fn summarize(
         &self,
         results: &[MetamorphicLawResult],
@@ -918,7 +930,7 @@ impl MetamorphicLawRegistry {
             };
             if !law.scopes.contains(&result.scope)
                 || law.applicability != result.applicability
-                || !seen.insert((&result.law_id, result.scope))
+                || !seen.insert((result.law_id.clone(), result.scope))
             {
                 return Err(campaign_error(
                     "metamorphic result has a duplicate or unsupported scope",
@@ -942,6 +954,21 @@ impl MetamorphicLawRegistry {
                     ));
                 }
             }
+        }
+        let expected = self
+            .applicability_matrix()?
+            .into_iter()
+            .map(|entry| (entry.law_id, entry.scope))
+            .collect::<BTreeSet<_>>();
+        let missing = expected
+            .difference(&seen)
+            .map(|(law_id, scope)| format!("{law_id}/{scope}"))
+            .collect::<Vec<_>>();
+        if !missing.is_empty() {
+            return Err(campaign_error(format!(
+                "metamorphic campaign is incomplete; missing law/scope cells: {}",
+                missing.join(", ")
+            )));
         }
         Ok(summary)
     }
@@ -8914,37 +8941,91 @@ mod tests {
                         reason: MetamorphicSkipReason::ScoreSensitiveCorpusStatistics,
                     }
         }));
-        let results = [
-            MetamorphicLawResult {
-                law_id: "e6.3-input-order-permutation-v1".to_owned(),
-                scope: MetamorphicLawScope::Quill,
-                applicability: MetamorphicLawApplicability::Applies,
-                outcome: Some(MetamorphicLawOutcome::Passed),
-            },
-            MetamorphicLawResult {
-                law_id: "e6.3-tombstone-compaction-v1".to_owned(),
-                scope: MetamorphicLawScope::Quill,
-                applicability: MetamorphicLawApplicability::SkipWithReason {
-                    reason: MetamorphicSkipReason::ScoreSensitiveCorpusStatistics,
+        let results = matrix
+            .iter()
+            .map(|entry| MetamorphicLawResult {
+                law_id: entry.law_id.clone(),
+                scope: entry.scope,
+                applicability: entry.applicability,
+                outcome: match entry.applicability {
+                    MetamorphicLawApplicability::Applies => Some(MetamorphicLawOutcome::Passed),
+                    MetamorphicLawApplicability::SkipWithReason { .. } => None,
                 },
-                outcome: None,
-            },
-        ];
+            })
+            .collect::<Vec<_>>();
+        let expected_applicable = u64::try_from(
+            matrix
+                .iter()
+                .filter(|entry| entry.applicability == MetamorphicLawApplicability::Applies)
+                .count(),
+        )
+        .expect("E6.3 matrix count fits u64");
+        let expected_skipped =
+            u64::try_from(matrix.len()).expect("E6.3 matrix count fits u64") - expected_applicable;
         assert_eq!(
             registry.summarize(&results).expect("valid E6.3 accounting"),
             MetamorphicLawSummary {
-                applicable: 1,
-                passed: 1,
+                applicable: expected_applicable,
+                passed: expected_applicable,
                 failed: 0,
-                skipped: 1,
+                skipped: expected_skipped,
             }
         );
 
-        let mut invalid = results[1].clone();
+        let mut invalid = results
+            .iter()
+            .find(|result| {
+                matches!(
+                    result.applicability,
+                    MetamorphicLawApplicability::SkipWithReason { .. }
+                )
+            })
+            .expect("E6.3 registry declares a skip")
+            .clone();
         invalid.outcome = Some(MetamorphicLawOutcome::Passed);
         assert!(
-            registry.summarize(&[results[0].clone(), invalid]).is_err(),
+            registry.summarize(&[invalid]).is_err(),
             "a SkipWithReason must never be counted as a pass"
+        );
+    }
+
+    #[test]
+    fn e63_metamorphic_accounting_rejects_exact_missing_law_scope_cell() {
+        let registry = MetamorphicLawRegistry::scalar_g1a_v1();
+        let mut results = registry
+            .applicability_matrix()
+            .expect("valid E6.3 applicability matrix")
+            .into_iter()
+            .map(|entry| MetamorphicLawResult {
+                law_id: entry.law_id,
+                scope: entry.scope,
+                applicability: entry.applicability,
+                outcome: match entry.applicability {
+                    MetamorphicLawApplicability::Applies => Some(MetamorphicLawOutcome::Passed),
+                    MetamorphicLawApplicability::SkipWithReason { .. } => None,
+                },
+            })
+            .collect::<Vec<_>>();
+        let omitted = results.remove(
+            results
+                .iter()
+                .position(|result| {
+                    result.law_id == "e6.3-input-order-permutation-v1"
+                        && result.scope == MetamorphicLawScope::CrossEngine
+                })
+                .expect("planted E6.3 law/scope cell"),
+        );
+
+        let error = registry
+            .summarize(&results)
+            .expect_err("a campaign missing one declared law/scope must fail closed");
+        assert!(matches!(error, GauntletError::InvalidCampaign { .. }));
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "invalid differential campaign: metamorphic campaign is incomplete; missing law/scope cells: {}/{}",
+                omitted.law_id, omitted.scope
+            )
         );
     }
 
