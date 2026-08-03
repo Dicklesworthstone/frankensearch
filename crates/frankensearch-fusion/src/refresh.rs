@@ -1310,6 +1310,26 @@ impl RefreshWorker {
         } else {
             None
         };
+        // A canonical pair whose tiers came from DIFFERENT publications must
+        // never be admitted for a merge: carrying both forward would stamp
+        // the staged generation with one fresh shared nonce and erase the
+        // split origin that `assemble_opened` degrades on (bd-miio8).
+        // Legacy pre-nonce pairs read 0 == 0 and remain admissible.
+        if let (Some(fast_tier), Some(quality_tier)) = (&fast, &quality) {
+            let fast_nonce = fast_tier.owner.metadata().publication_nonce;
+            let quality_nonce = quality_tier.owner.metadata().publication_nonce;
+            if fast_nonce != quality_nonce {
+                return Err(SearchError::InvalidConfig {
+                    field: "refresh.canonical_pair_publication_nonce".to_owned(),
+                    value: format!("fast={fast_nonce} quality={quality_nonce}"),
+                    reason: "canonical fast/quality tiers carry disagreeing publication \
+                             nonces (mixed-generation pair, likely a crash between tier \
+                             installs); refusing to launder the pair into one staged \
+                             generation — rebuild from source instead"
+                        .to_owned(),
+                });
+            }
+        }
         Ok(ExistingGenerationClass::AttestedV2 { fast, quality })
     }
 
@@ -1739,6 +1759,9 @@ impl RefreshWorker {
             quality_binding.as_ref(),
         )?;
         debug_assert!(index.fast_identity_is_attested());
+        // The staged pair shares one nonce by construction, so admission must
+        // never have silently degraded the quality tier (round-2 hardening).
+        debug_assert!(quality_binding.is_some() == index.has_quality_index());
 
         info!(
             target: "frankensearch.refresh",
@@ -2167,7 +2190,18 @@ mod tests {
     }
 
     fn write_v2_tier(path: &Path, binding: &FsviV2IdentityBinding, rows: &[(&str, Vec<f32>)]) {
-        let mut writer = VectorIndex::create_v2(path, binding.clone()).expect("create_v2 fixture");
+        write_v2_tier_with_nonce(path, binding, rows, 0);
+    }
+
+    fn write_v2_tier_with_nonce(
+        path: &Path,
+        binding: &FsviV2IdentityBinding,
+        rows: &[(&str, Vec<f32>)],
+        nonce: u16,
+    ) {
+        let mut writer = VectorIndex::create_v2(path, binding.clone())
+            .expect("create_v2 fixture")
+            .with_publication_nonce(nonce);
         for (doc_id, vector) in rows {
             writer.write_record(doc_id, vector).expect("write v2 row");
         }
@@ -3706,7 +3740,7 @@ mod tests {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             let fast = Arc::new(StubEmbedder::new("v2-fast", V2_DIM));
             let quality = Arc::new(StubEmbedder::new("v2-quality", 16));
-            let (dir, cache, _fast_binding, _fast_path) = v2_canonical_fixture(
+            let (dir, cache, fast_binding, fast_path) = v2_canonical_fixture(
                 "v2-pair-nonce",
                 fast.identity_bundle(),
                 &[("old-1", normalized(V2_DIM, 0.25))],
@@ -3714,10 +3748,20 @@ mod tests {
             );
             let quality_binding = v2_binding(quality.identity_bundle(), 2);
             let quality_path = dir.join(VECTOR_INDEX_QUALITY_FILENAME);
-            write_v2_tier(
+            // Stamp the CANONICAL pair with nonce 7 so the successor
+            // assertion below distinguishes real derivation (7 -> 8) from a
+            // hard-coded 1 (round-2 hardening).
+            write_v2_tier_with_nonce(
+                &fast_path,
+                &fast_binding,
+                &[("old-1", normalized(V2_DIM, 0.25))],
+                7,
+            );
+            write_v2_tier_with_nonce(
                 &quality_path,
                 &quality_binding,
                 &[("old-1", normalized(16, 0.5))],
+                7,
             );
 
             let queue = make_queue(100);
@@ -3748,6 +3792,59 @@ mod tests {
             assert_eq!(
                 fast_nonce, quality_nonce,
                 "both staged tiers share one publication"
+            );
+            assert_eq!(
+                fast_nonce, 8,
+                "the staged nonce must be the canonical pair's successor (7 -> 8)"
+            );
+        });
+    }
+
+    /// A canonical pair whose tiers carry DISAGREEING publication nonces is a
+    /// mixed-generation pair (crash between tier installs); admission must
+    /// refuse it rather than launder both tiers into one freshly-stamped
+    /// staged generation (round-2 hardening of bd-miio8).
+    #[test]
+    fn staging_refuses_a_mixed_nonce_canonical_pair() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let fast = Arc::new(StubEmbedder::new("v2-fast", V2_DIM));
+            let quality = Arc::new(StubEmbedder::new("v2-quality", 16));
+            let (dir, cache, fast_binding, fast_path) = v2_canonical_fixture(
+                "v2-pair-nonce-mismatch",
+                fast.identity_bundle(),
+                &[("old-1", normalized(V2_DIM, 0.25))],
+                2,
+            );
+            let quality_binding = v2_binding(quality.identity_bundle(), 2);
+            let quality_path = dir.join(VECTOR_INDEX_QUALITY_FILENAME);
+            write_v2_tier_with_nonce(
+                &fast_path,
+                &fast_binding,
+                &[("old-1", normalized(V2_DIM, 0.25))],
+                7,
+            );
+            write_v2_tier_with_nonce(
+                &quality_path,
+                &quality_binding,
+                &[("old-1", normalized(16, 0.5))],
+                3,
+            );
+
+            let queue = make_queue(100);
+            submit(&queue, "doc-2", "a second document");
+            let jobs = queue.drain_batch();
+            let worker =
+                RefreshWorker::new(RefreshWorkerConfig::new(&dir), queue.clone(), fast, cache)
+                    .with_quality_embedder(quality.clone());
+
+            let error = worker
+                .stage_identity_bound_generation(&cx, &jobs)
+                .await
+                .expect_err("a mixed-nonce canonical pair must refuse admission");
+            assert_invalid_config(
+                &error,
+                "refresh.canonical_pair_publication_nonce",
+                "fast=7 quality=3",
             );
         });
     }

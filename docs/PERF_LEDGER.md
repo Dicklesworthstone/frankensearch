@@ -8673,7 +8673,6 @@ this tranche.
   hardware, all gate receipts, and an independently admissible campaign
   artifact; none is claimed here.
 
-
 ## 2026-08-03 — CORRECTION: FSVI 4-bit two-pass is not an externally fastest primitive (`bd-retract-fastest-lossless-superlative-3ush8`)
 
 The historical self-comparison descriptions at rows 825, 827, and 828 use
