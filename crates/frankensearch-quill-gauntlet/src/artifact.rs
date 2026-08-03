@@ -3706,6 +3706,14 @@ mod tests {
             tampered.validate(),
             Err(GauntletError::InvalidPreparedArtifact { .. })
         ));
+
+        let mut retargeted = reordered;
+        retargeted.entries.reverse();
+        retargeted.entries[1].symlink_target = Some("Cargo.lock".to_owned());
+        assert!(matches!(
+            retargeted.validate(),
+            Err(GauntletError::InvalidPreparedArtifact { .. })
+        ));
     }
 
     #[test]
