@@ -6272,6 +6272,108 @@ mod tests {
         });
     }
 
+    /// E6.3 law: the two distinct, unboosted positive operands of one scalar
+    /// `AND` are commutative. This deliberately excludes three-or-more clause
+    /// association, boosts, and mixed Boolean occurrences because their score
+    /// accumulation or parser shape is observable. The normal differential
+    /// observation is the projection; changing the operator to `OR` is the
+    /// intentionally invalid counterexample.
+    #[cfg(feature = "perf-harness")]
+    #[test]
+    fn e63_two_term_and_commutes_but_or_is_not_equivalent() {
+        use frankensearch_core::IndexableDocument;
+
+        const SEED: u64 = 0xe63_a11d_c0aa_5eed;
+        let documents = vec![
+            IndexableDocument::new("doc-1", "alpha beta beta").with_title("guide"),
+            IndexableDocument::new("doc-2", "alpha gamma").with_title("alpha overview"),
+            IndexableDocument::new("doc-3", "beta gamma gamma gamma").with_title("alpha"),
+            IndexableDocument::new("doc-4", "alpha beta gamma delta").with_title("reference"),
+            IndexableDocument::new("doc-5", "delta epsilon").with_title("quiet"),
+        ];
+        let canonical = [("two-term-and", "alpha AND beta")];
+        let commuted = [("two-term-and", "beta AND alpha")];
+        let operator_mutated = [("two-term-and", "alpha OR beta")];
+
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let baseline = e63_observations(
+                &cx,
+                &documents,
+                &canonical,
+                SEED,
+                "e6.3-two-term-and-commutativity-v1",
+            )
+            .await;
+            let transformed = e63_observations(
+                &cx,
+                &documents,
+                &commuted,
+                SEED,
+                "e6.3-two-term-and-commutativity-v1",
+            )
+            .await;
+            let invalid = e63_observations(
+                &cx,
+                &documents,
+                &operator_mutated,
+                SEED,
+                "e6.3-two-term-and-commutativity-v1",
+            )
+            .await;
+
+            let baseline_case = baseline.first().expect("E6.3 baseline AND fixture");
+            let commuted_case = transformed.first().expect("E6.3 commuted AND fixture");
+            assert_eq!(
+                baseline_case.0, commuted_case.0,
+                "E6.3 two-term AND case identity drifted"
+            );
+            for (engine, before, after) in [
+                ("Quill", &baseline_case.1, &commuted_case.1),
+                ("Tantivy", &baseline_case.2, &commuted_case.2),
+            ] {
+                let comparison = compare_observations(
+                    before.clone(),
+                    after.clone(),
+                    ComparatorConfig::default(),
+                )
+                .unwrap_or_else(|error| {
+                    panic!("E6.3 {engine} two-term AND comparison failed: {error}")
+                });
+                assert!(
+                    matches!(
+                        comparison.rank_class,
+                        RankClass::RankExact | RankClass::TieOrder
+                    ) && comparison
+                        .divergences
+                        .iter()
+                        .all(|divergence| divergence.class == DivergenceClass::TieOrder),
+                    "E6.3 {engine} produced a non-tie divergence under two-term AND commutation: {:?}",
+                    comparison.divergences,
+                );
+            }
+
+            let invalid_case = invalid.first().expect("E6.3 invalid OR fixture");
+            for (engine, before, after) in [
+                ("Quill", &baseline_case.1, &invalid_case.1),
+                ("Tantivy", &baseline_case.2, &invalid_case.2),
+            ] {
+                let comparison = compare_observations(
+                    before.clone(),
+                    after.clone(),
+                    ComparatorConfig::default(),
+                )
+                .unwrap_or_else(|error| {
+                    panic!("E6.3 {engine} invalid AND-to-OR comparison failed: {error}")
+                });
+                assert_eq!(
+                    comparison.status,
+                    ComparisonStatus::Failed,
+                    "E6.3 {engine} incorrectly accepted an AND-to-OR mutation as commutation",
+                );
+            }
+        });
+    }
+
     #[cfg(feature = "tantivy-oracle")]
     #[test]
     fn e410_controlled_public_search_semantics_match_oracle() {
