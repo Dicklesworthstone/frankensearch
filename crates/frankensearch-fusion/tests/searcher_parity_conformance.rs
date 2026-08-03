@@ -14,11 +14,11 @@
 
 use std::sync::Arc;
 
-use frankensearch_core::traits::SearchFuture;
+use frankensearch_core::traits::{LexicalRead, SearchFuture};
 use frankensearch_core::{
     Cx, Embedder, ModelCategory, ScoredResult, SearchPhase, TwoTierConfig, TwoTierMetrics,
 };
-use frankensearch_fusion::{SyncTwoTierSearcher, TwoTierSearcher};
+use frankensearch_fusion::{SyncLexicalSearch, SyncTwoTierSearcher, TwoTierSearcher};
 use frankensearch_index::{InMemoryTwoTierIndex, InMemoryVectorIndex, TwoTierIndex};
 
 /// Known, documented divergences between the two searchers (bd-k3089).
@@ -120,6 +120,53 @@ fn sync_index(with_quality: bool) -> Arc<InMemoryTwoTierIndex> {
     Arc::new(InMemoryTwoTierIndex::new(fast, quality))
 }
 
+fn lexical_hits() -> Vec<ScoredResult> {
+    [("doc-c", 3.0_f32), ("doc-a", 2.0_f32), ("doc-d", 1.0_f32)]
+        .into_iter()
+        .map(|(doc_id, score)| ScoredResult {
+            doc_id: doc_id.into(),
+            score,
+            source: frankensearch_core::ScoreSource::Lexical,
+            index: None,
+            fast_score: None,
+            quality_score: None,
+            lexical_score: Some(score),
+            rerank_score: None,
+            explanation: None,
+            metadata: None,
+        })
+        .collect()
+}
+
+struct StaticLexical {
+    hits: Vec<ScoredResult>,
+}
+
+impl SyncLexicalSearch for StaticLexical {
+    fn search_sync(
+        &self,
+        _query_vec: &[f32],
+        limit: usize,
+    ) -> frankensearch_core::SearchResult<Vec<ScoredResult>> {
+        Ok(self.hits.iter().take(limit).cloned().collect())
+    }
+}
+
+impl LexicalRead for StaticLexical {
+    fn search<'a>(
+        &'a self,
+        _cx: &'a Cx,
+        _query: &'a str,
+        limit: usize,
+    ) -> SearchFuture<'a, Vec<ScoredResult>> {
+        Box::pin(async move { Ok(self.hits.iter().take(limit).cloned().collect()) })
+    }
+
+    fn doc_count(&self) -> usize {
+        self.hits.len()
+    }
+}
+
 fn async_index(tag: &str, with_quality: bool) -> Arc<TwoTierIndex> {
     let dir = std::env::temp_dir().join(format!(
         "fsx-parity-{tag}-{}-{}",
@@ -207,6 +254,59 @@ fn run_sync_with_quality_index(
     searcher
         .search_collect(query_vec, k)
         .expect("sync search_collect")
+}
+
+fn run_async_with_lexical(
+    config: &TwoTierConfig,
+    query_vec: &[f32],
+    k: usize,
+) -> (Vec<ScoredResult>, TwoTierMetrics) {
+    let index = async_index("lexical", true);
+    let fast: Arc<dyn Embedder> = Arc::new(FixedVecEmbedder {
+        id: "parity-fast",
+        vector: query_vec.to_vec(),
+    });
+    let quality: Arc<dyn Embedder> = Arc::new(FixedVecEmbedder {
+        id: "parity-quality",
+        vector: query_vec.to_vec(),
+    });
+    let lexical = Arc::new(StaticLexical {
+        hits: lexical_hits(),
+    });
+    let config = config.clone();
+    let mut out = None;
+    asupersync::test_utils::run_test_with_cx(|cx| {
+        let slot = &mut out;
+        async move {
+            let searcher = TwoTierSearcher::new(index, fast, config)
+                .with_quality_embedder(quality)
+                .with_lexical(lexical);
+            *slot = Some(
+                searcher
+                    .search_collect(
+                        &cx,
+                        "how does this parity conformance query retrieve results",
+                        k,
+                    )
+                    .await
+                    .expect("async lexical search_collect"),
+            );
+        }
+    });
+    out.expect("async lexical search ran")
+}
+
+fn run_sync_with_lexical(
+    config: &TwoTierConfig,
+    query_vec: &[f32],
+    k: usize,
+) -> (Vec<ScoredResult>, TwoTierMetrics) {
+    SyncTwoTierSearcher::new(sync_index(true), config.clone())
+        .with_lexical(Arc::new(StaticLexical {
+            hits: lexical_hits(),
+        }))
+        .search_collect(query_vec, k)
+        .expect("sync lexical search_collect")
 }
 
 fn phase_label(phase: &SearchPhase) -> &'static str {
@@ -516,6 +616,19 @@ fn orthogonal_query_agrees() {
         vec![0.0, 1.0, 0.0, 0.0],
         4,
     );
+}
+
+#[test]
+fn lexical_rrf_agrees_on_ordered_results_and_metrics() {
+    let config = TwoTierConfig {
+        candidate_multiplier: 3,
+        ..TwoTierConfig::default()
+    };
+    let query = normalize(vec![1.0, 0.0, 0.0, 0.0]);
+    let (sync_results, sync_metrics) = run_sync_with_lexical(&config, &query, 3);
+    let (async_results, async_metrics) = run_async_with_lexical(&config, &query, 3);
+    assert_result_parity("lexical-rrf", &sync_results, &async_results);
+    assert_metric_parity("lexical-rrf", &sync_metrics, &async_metrics);
 }
 
 #[test]

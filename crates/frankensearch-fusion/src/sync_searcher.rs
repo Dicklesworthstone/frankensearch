@@ -599,7 +599,7 @@ impl SyncTwoTierSearcher {
         // promoted / demoted counts whenever `k < fetch` (bd-k3089).
         let rank_changes = compute_rank_changes(&fast_hits, &blended);
 
-        let refined_results = if let Some(lexical) = lexical_hits.as_ref() {
+        let mut refined_results = if let Some(lexical) = lexical_hits.as_ref() {
             fused_hits_to_scored_results(
                 fuse_by_strategy(
                     self.config.fusion_strategy,
@@ -627,6 +627,21 @@ impl SyncTwoTierSearcher {
                 &quality_scores,
             )
         };
+
+        // Re-fusion ranks on blended semantic scores, but `fast_score` and
+        // `quality_score` are evidence fields: they must retain the raw
+        // per-tier values. The async searcher restores this provenance after
+        // lexical re-fusion; leaving the blended score in `fast_score` here
+        // made the two APIs report different evidence for identical hits.
+        let aligned_scores = AlignedScoreLookup::new(&fast_hits, &quality_scores);
+        for result in &mut refined_results {
+            if let Some(index) = result.index
+                && let Some((fast_score, quality_score)) = aligned_scores.get(index)
+            {
+                result.fast_score = Some(fast_score);
+                result.quality_score = quality_score;
+            }
+        }
 
         metrics.rank_changes = rank_changes.clone();
         metrics.phase2_total_ms = ms(phase2_started.elapsed());
