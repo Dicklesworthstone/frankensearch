@@ -122,8 +122,8 @@ fn read_bounded_child(mut child: Child) -> ChildOutput {
         match rx.recv_timeout(Duration::from_millis(10)) {
             Ok((_is_stderr, chunk)) if chunk.is_empty() => closed_streams += 1,
             Ok((_is_stderr, chunk)) => {
-                for byte in chunk {
-                    if byte == b'\n' {
+                for byte in &chunk {
+                    if *byte == b'\n' {
                         lines += 1;
                     }
                 }
