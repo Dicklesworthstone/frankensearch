@@ -4229,6 +4229,38 @@ mod tests {
     }
 
     #[test]
+    fn authority_resolver_accepts_consecutive_heads_across_slot_orientations() {
+        let mut older = authority_reference(1, None);
+        let mut older_slot_index = 1;
+        for sequence in 2..=32 {
+            let object_byte = u8::try_from(sequence).expect("bounded test sequence");
+            let newer = AuthorityRefV1::new(
+                sequence,
+                [object_byte; 16],
+                4_096 + sequence,
+                [object_byte.wrapping_add(16); 32],
+                Some(older.fingerprint()),
+            )
+            .expect("consecutive authority reference");
+            let newer_slot_index = u8::try_from(sequence & 1).expect("slot parity fits u8");
+            let older_slot = authority_slot(older_slot_index, older);
+            let newer_slot = authority_slot(newer_slot_index, newer);
+            assert_eq!(
+                resolve_authority_slots_v1(Some(older_slot), Some(newer_slot)),
+                Ok(Some(newer_slot)),
+                "sequence {sequence} resolves in old/new input order"
+            );
+            assert_eq!(
+                resolve_authority_slots_v1(Some(newer_slot), Some(older_slot)),
+                Ok(Some(newer_slot)),
+                "sequence {sequence} resolves in new/old input order"
+            );
+            older = newer;
+            older_slot_index = newer_slot_index;
+        }
+    }
+
+    #[test]
     fn raw_authority_frame_resolver_preserves_corruption_as_an_error() {
         let genesis = authority_reference(1, None);
         let successor = authority_reference(2, Some(genesis.fingerprint()));
