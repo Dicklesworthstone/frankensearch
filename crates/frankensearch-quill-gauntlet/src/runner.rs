@@ -9065,6 +9065,20 @@ mod tests {
             registry.summarize(&[invalid]).is_err(),
             "a SkipWithReason must never be counted as a pass"
         );
+
+        let mut relabeled = results
+            .iter()
+            .find(|result| result.applicability == MetamorphicLawApplicability::Applies)
+            .expect("E6.3 registry declares an applicable law")
+            .clone();
+        relabeled.applicability = MetamorphicLawApplicability::SkipWithReason {
+            reason: MetamorphicSkipReason::ProfileOutsideScalarG1a,
+        };
+        relabeled.outcome = None;
+        assert!(
+            registry.summarize(&[relabeled]).is_err(),
+            "an executor cannot relabel an applicable law as skipped"
+        );
     }
 
     #[test]
