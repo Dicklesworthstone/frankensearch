@@ -428,6 +428,410 @@ impl CampaignSelection {
     }
 }
 
+/// Schema for the runner-owned E6.3 metamorphic-law registry.
+pub const METAMORPHIC_LAW_REGISTRY_SCHEMA_VERSION: u32 = 1;
+const MAX_METAMORPHIC_LAWS: usize = 32;
+const MAX_METAMORPHIC_TEXT_BYTES: usize = 4_096;
+
+/// Engine boundary on which a metamorphic law is evaluated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MetamorphicLawScope {
+    Quill,
+    Tantivy,
+    CrossEngine,
+}
+
+/// Closed reasons why a declared metamorphic law cannot execute.
+///
+/// A skip is a coverage fact, never an equivalence result. Keeping reasons
+/// closed makes a report auditable instead of allowing an arbitrary string to
+/// turn an unsupported transform into a green outcome.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MetamorphicSkipReason {
+    /// The profile does not expose the lifecycle operation required by the law.
+    LifecycleCapabilityUnavailable,
+    /// Total lexical observations retain corpus-statistics-sensitive scores.
+    ScoreSensitiveCorpusStatistics,
+    /// The selected schema cannot provide phrase positions.
+    PositionsUnavailable,
+    /// The scalar-G1A preconditions do not hold for the selected profile.
+    ProfileOutsideScalarG1a,
+}
+
+/// Applicability result for one law/scope pair before execution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum MetamorphicLawApplicability {
+    Applies,
+    SkipWithReason { reason: MetamorphicSkipReason },
+}
+
+/// Terminal result for an applicable metamorphic law.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MetamorphicLawOutcome {
+    Passed,
+    Failed,
+}
+
+/// Data declaration for one qualified E6.3 metamorphic law.
+///
+/// The runner owns the declaration so engine tests and future CI executors
+/// share the same law ID, projection, replay command, and shrink policy.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MetamorphicLawDescriptor {
+    pub id: String,
+    pub generator_id: String,
+    pub preconditions: String,
+    pub observable_projection: String,
+    pub equivalence_relation: String,
+    pub allowed_divergence: String,
+    pub positive_fixture_id: String,
+    pub invalid_fixture_id: String,
+    pub replay_test: String,
+    pub shrinker_id: String,
+    pub scopes: Vec<MetamorphicLawScope>,
+}
+
+/// Versioned runner registry for E6.3's declared metamorphic laws.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MetamorphicLawRegistry {
+    pub schema_version: u32,
+    pub laws: Vec<MetamorphicLawDescriptor>,
+}
+
+/// One auditable law/scope result recorded by a runner integration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MetamorphicLawResult {
+    pub law_id: String,
+    pub scope: MetamorphicLawScope,
+    pub applicability: MetamorphicLawApplicability,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<MetamorphicLawOutcome>,
+}
+
+/// Aggregate accounting for a bounded metamorphic campaign.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MetamorphicLawSummary {
+    pub applicable: u64,
+    pub passed: u64,
+    pub failed: u64,
+    pub skipped: u64,
+}
+
+impl MetamorphicLawRegistry {
+    /// Returns the current qualified scalar-G1A E6.3 declaration.
+    ///
+    /// Lifecycle and corpus-statistics-sensitive transforms remain registered
+    /// as explicit skips until a runner can execute their declared projection;
+    /// they are deliberately not omitted or treated as passing.
+    #[must_use]
+    pub fn scalar_g1a_v1() -> Self {
+        let law = |id: &str,
+                   generator_id: &str,
+                   preconditions: &str,
+                   projection: &str,
+                   equivalence: &str,
+                   allowed_divergence: &str,
+                   positive: &str,
+                   invalid: &str,
+                   replay: &str,
+                   scopes: Vec<MetamorphicLawScope>| MetamorphicLawDescriptor {
+            id: id.to_owned(),
+            generator_id: generator_id.to_owned(),
+            preconditions: preconditions.to_owned(),
+            observable_projection: projection.to_owned(),
+            equivalence_relation: equivalence.to_owned(),
+            allowed_divergence: allowed_divergence.to_owned(),
+            positive_fixture_id: positive.to_owned(),
+            invalid_fixture_id: invalid.to_owned(),
+            replay_test: replay.to_owned(),
+            shrinker_id: "e6.3-total-lexical-ddmin-v1".to_owned(),
+            scopes,
+        };
+        Self {
+            schema_version: METAMORPHIC_LAW_REGISTRY_SCHEMA_VERSION,
+            laws: vec![
+                law(
+                    "e6.3-input-order-permutation-v1",
+                    "e6.3-input-order-permutation-v1",
+                    "stable external IDs and unchanged document payloads",
+                    "total lexical observation",
+                    "rank exact or tie order only",
+                    "tie_order",
+                    "e63-input-order-positive",
+                    "e63-input-order-content-mutation",
+                    "engine::tests::e63_input_order_seed_matrix_replays_live_observations",
+                    vec![
+                        MetamorphicLawScope::Quill,
+                        MetamorphicLawScope::Tantivy,
+                        MetamorphicLawScope::CrossEngine,
+                    ],
+                ),
+                law(
+                    "e6.3-duplicate-live-id-rejection-v1",
+                    "e6.3-duplicate-live-id-rejection-v1",
+                    "scalar Quill live-ID uniqueness contract",
+                    "typed lifecycle error plus published corpus observation",
+                    "duplicate input is rejected without partial publication",
+                    "none",
+                    "e63-duplicate-live-id-positive",
+                    "e63-duplicate-live-id-partial-publication",
+                    "engine::tests::e63_duplicate_live_id_is_typed_rejection_and_preserves_published_original",
+                    vec![MetamorphicLawScope::Quill],
+                ),
+                law(
+                    "e6.3-flush-batch-schedule-v1",
+                    "e6.3-flush-batch-schedule-v1",
+                    "unchanged scalar configuration, corpus, IDs, and query suite",
+                    "total lexical observation",
+                    "rank exact or tie order only",
+                    "tie_order",
+                    "e63-flush-batch-positive",
+                    "e63-flush-batch-content-mutation",
+                    "engine::tests::e63_flush_batch_seed_matrix_preserves_observations_but_content_mutation_does_not",
+                    vec![
+                        MetamorphicLawScope::Quill,
+                        MetamorphicLawScope::Tantivy,
+                        MetamorphicLawScope::CrossEngine,
+                    ],
+                ),
+                law(
+                    "e6.3-query-normalization-v1",
+                    "e6.3-query-normalization-v1",
+                    "free-text scalar query only; no field or syntax-bearing spelling",
+                    "total lexical observation",
+                    "rank exact or tie order only",
+                    "tie_order",
+                    "e63-query-normalization-positive",
+                    "e63-query-normalization-term-mutation",
+                    "engine::tests::e63_query_normalization_seed_matrix_replays_live_observations",
+                    vec![
+                        MetamorphicLawScope::Quill,
+                        MetamorphicLawScope::Tantivy,
+                        MetamorphicLawScope::CrossEngine,
+                    ],
+                ),
+                law(
+                    "e6.3-two-term-and-commutativity-v1",
+                    "e6.3-two-term-and-commutativity-v1",
+                    "two distinct unboosted positive scalar AND operands",
+                    "total lexical observation",
+                    "rank exact or tie order only",
+                    "tie_order",
+                    "e63-two-term-and-positive",
+                    "e63-two-term-and-to-or",
+                    "engine::tests::e63_two_term_and_seed_matrix_replays_live_observations",
+                    vec![
+                        MetamorphicLawScope::Quill,
+                        MetamorphicLawScope::Tantivy,
+                        MetamorphicLawScope::CrossEngine,
+                    ],
+                ),
+                law(
+                    "e6.3-two-term-or-commutativity-v1",
+                    "e6.3-two-term-or-commutativity-v1",
+                    "two distinct unboosted optional scalar OR operands",
+                    "total lexical observation",
+                    "rank exact or tie order only",
+                    "tie_order",
+                    "e63-two-term-or-positive",
+                    "e63-two-term-or-to-and",
+                    "engine::tests::e63_two_term_or_seed_matrix_replays_live_observations",
+                    vec![
+                        MetamorphicLawScope::Quill,
+                        MetamorphicLawScope::Tantivy,
+                        MetamorphicLawScope::CrossEngine,
+                    ],
+                ),
+                law(
+                    "e6.3-single-term-quote-v1",
+                    "e6.3-single-term-quote-v1",
+                    "one quoted term on a position-capable scalar field",
+                    "total lexical observation",
+                    "rank exact or tie order only",
+                    "tie_order",
+                    "e63-single-term-quote-positive",
+                    "e63-single-term-quote-multi-term-phrase",
+                    "engine::tests::e63_single_term_quote_seed_matrix_replays_live_observations",
+                    vec![
+                        MetamorphicLawScope::Quill,
+                        MetamorphicLawScope::Tantivy,
+                        MetamorphicLawScope::CrossEngine,
+                    ],
+                ),
+                law(
+                    "e6.3-tight-segment-geometry-v1",
+                    "e6.3-tight-segment-geometry-v1",
+                    "valid geometry change with fixed scalar analyzer, corpus, IDs, and queries",
+                    "total lexical observation",
+                    "rank exact or tie order only",
+                    "tie_order",
+                    "e63-tight-geometry-positive",
+                    "e63-tight-geometry-content-mutation",
+                    "engine::tests::e63_tight_segment_geometry_preserves_observations_but_content_mutation_does_not",
+                    vec![
+                        MetamorphicLawScope::Quill,
+                        MetamorphicLawScope::Tantivy,
+                        MetamorphicLawScope::CrossEngine,
+                    ],
+                ),
+                law(
+                    "e6.3-bulk-publication-cadence-v1",
+                    "e6.3-bulk-publication-cadence-v1",
+                    "fixed corpus/IDs and valid publication batches under tight geometry",
+                    "total lexical observation",
+                    "rank exact or tie order only",
+                    "tie_order",
+                    "e63-bulk-cadence-positive",
+                    "e63-bulk-cadence-content-mutation",
+                    "engine::tests::e63_bulk_publish_cadence_preserves_observations_but_content_mutation_does_not",
+                    vec![
+                        MetamorphicLawScope::Quill,
+                        MetamorphicLawScope::Tantivy,
+                        MetamorphicLawScope::CrossEngine,
+                    ],
+                ),
+                law(
+                    "e6.3-positionless-phrase-capability-v1",
+                    "e6.3-positionless-phrase-capability-v1",
+                    "positionless scalar schema and a multi-term phrase",
+                    "typed capability error",
+                    "exact PositionsRequired error; single-term quote remains servable",
+                    "none",
+                    "e63-positionless-typed-error",
+                    "e63-positionless-silent-phrase",
+                    "engine::tests::e63_positionless_multi_term_phrase_is_typed_error_but_single_term_quote_is_servable",
+                    vec![MetamorphicLawScope::Quill],
+                ),
+            ],
+        }
+    }
+
+    /// Validates every law's required declaration and deterministic identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a missing qualification/replay field, duplicate
+    /// law ID, empty scope set, or an unsupported schema version.
+    pub fn validate(&self) -> Result<(), GauntletError> {
+        if self.schema_version != METAMORPHIC_LAW_REGISTRY_SCHEMA_VERSION
+            || self.laws.is_empty()
+            || self.laws.len() > MAX_METAMORPHIC_LAWS
+        {
+            return Err(campaign_error(
+                "metamorphic law registry has an invalid schema or size",
+            ));
+        }
+        let mut ids = BTreeSet::new();
+        for law in &self.laws {
+            let fields = [
+                &law.id,
+                &law.generator_id,
+                &law.preconditions,
+                &law.observable_projection,
+                &law.equivalence_relation,
+                &law.allowed_divergence,
+                &law.positive_fixture_id,
+                &law.invalid_fixture_id,
+                &law.replay_test,
+                &law.shrinker_id,
+            ];
+            if law.scopes.is_empty()
+                || law.scopes.windows(2).any(|pair| pair[0] == pair[1])
+                || fields.iter().any(|value| {
+                    value.is_empty()
+                        || value.len() > MAX_METAMORPHIC_TEXT_BYTES
+                        || value.trim() != **value
+                        || value.chars().any(char::is_control)
+                })
+                || !ids.insert(law.id.as_str())
+            {
+                return Err(campaign_error(
+                    "metamorphic law registry has incomplete or duplicate declarations",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn law(&self, law_id: &str) -> Option<&MetamorphicLawDescriptor> {
+        self.laws.iter().find(|law| law.id == law_id)
+    }
+
+    /// Validates and summarizes runner-recorded law results.
+    ///
+    /// `SkipWithReason` is intentionally excluded from both `applicable` and
+    /// `passed`; an applicable law must have a terminal outcome.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a result names an unknown law/scope, repeats a
+    /// law/scope pair, or tries to record a skip as a terminal outcome.
+    pub fn summarize(
+        &self,
+        results: &[MetamorphicLawResult],
+    ) -> Result<MetamorphicLawSummary, GauntletError> {
+        self.validate()?;
+        if results.len() > self.laws.len().saturating_mul(3) {
+            return Err(campaign_error(
+                "metamorphic result count exceeds registry scope budget",
+            ));
+        }
+        let mut seen = BTreeSet::new();
+        let mut summary = MetamorphicLawSummary::default();
+        for result in results {
+            let Some(law) = self.law(&result.law_id) else {
+                return Err(campaign_error(
+                    "metamorphic result names an unregistered law",
+                ));
+            };
+            if !law.scopes.contains(&result.scope) || !seen.insert((&result.law_id, result.scope)) {
+                return Err(campaign_error(
+                    "metamorphic result has a duplicate or unsupported scope",
+                ));
+            }
+            match (result.applicability, result.outcome) {
+                (MetamorphicLawApplicability::Applies, Some(MetamorphicLawOutcome::Passed)) => {
+                    summary.applicable = summary.applicable.saturating_add(1);
+                    summary.passed = summary.passed.saturating_add(1);
+                }
+                (MetamorphicLawApplicability::Applies, Some(MetamorphicLawOutcome::Failed)) => {
+                    summary.applicable = summary.applicable.saturating_add(1);
+                    summary.failed = summary.failed.saturating_add(1);
+                }
+                (MetamorphicLawApplicability::SkipWithReason { .. }, None) => {
+                    summary.skipped = summary.skipped.saturating_add(1);
+                }
+                _ => {
+                    return Err(campaign_error(
+                        "metamorphic skips must not carry outcomes and applicable laws require one",
+                    ));
+                }
+            }
+        }
+        Ok(summary)
+    }
+}
+
+impl DifferentialCampaignRunner {
+    /// Returns the E6.3 registry declared for the runner's semantic profile.
+    ///
+    /// Non-scalar profiles still receive the same declarations, but callers
+    /// must record their unsupported scopes with `SkipWithReason`; this avoids
+    /// quietly dropping required-law coverage from campaign accounting.
+    #[must_use]
+    pub fn metamorphic_law_registry(&self) -> MetamorphicLawRegistry {
+        MetamorphicLawRegistry::scalar_g1a_v1()
+    }
+}
+
 /// One reviewed per-fixture divergence allowlist row.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -8307,6 +8711,72 @@ mod tests {
 
     fn semantic_contract() -> SemanticContract {
         SemanticContract::shipping_default()
+    }
+
+    #[test]
+    fn e63_metamorphic_registry_declares_qualified_replayable_laws() {
+        let registry = MetamorphicLawRegistry::scalar_g1a_v1();
+        registry
+            .validate()
+            .expect("E6.3 registry must retain complete qualified declarations");
+        assert_eq!(
+            registry.schema_version,
+            METAMORPHIC_LAW_REGISTRY_SCHEMA_VERSION
+        );
+        assert!(
+            registry.laws.len() >= 10,
+            "E6.3 registry lost declared laws"
+        );
+        for law in &registry.laws {
+            assert!(
+                !law.preconditions.is_empty()
+                    && !law.observable_projection.is_empty()
+                    && !law.equivalence_relation.is_empty()
+                    && !law.positive_fixture_id.is_empty()
+                    && !law.invalid_fixture_id.is_empty()
+                    && !law.replay_test.is_empty()
+                    && !law.shrinker_id.is_empty(),
+                "{} must retain qualification, positive/negative, replay, and shrink fields",
+                law.id
+            );
+        }
+    }
+
+    #[test]
+    fn e63_metamorphic_accounting_excludes_skips_from_passes() {
+        let registry = MetamorphicLawRegistry::scalar_g1a_v1();
+        let results = [
+            MetamorphicLawResult {
+                law_id: "e6.3-input-order-permutation-v1".to_owned(),
+                scope: MetamorphicLawScope::Quill,
+                applicability: MetamorphicLawApplicability::Applies,
+                outcome: Some(MetamorphicLawOutcome::Passed),
+            },
+            MetamorphicLawResult {
+                law_id: "e6.3-input-order-permutation-v1".to_owned(),
+                scope: MetamorphicLawScope::Tantivy,
+                applicability: MetamorphicLawApplicability::SkipWithReason {
+                    reason: MetamorphicSkipReason::ProfileOutsideScalarG1a,
+                },
+                outcome: None,
+            },
+        ];
+        assert_eq!(
+            registry.summarize(&results).expect("valid E6.3 accounting"),
+            MetamorphicLawSummary {
+                applicable: 1,
+                passed: 1,
+                failed: 0,
+                skipped: 1,
+            }
+        );
+
+        let mut invalid = results[1].clone();
+        invalid.outcome = Some(MetamorphicLawOutcome::Passed);
+        assert!(
+            registry.summarize(&[results[0].clone(), invalid]).is_err(),
+            "a SkipWithReason must never be counted as a pass"
+        );
     }
 
     fn fixture_provenance(
