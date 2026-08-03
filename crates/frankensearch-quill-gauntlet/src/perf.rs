@@ -17,8 +17,8 @@ use thiserror::Error;
 
 use crate::GauntletError;
 use crate::local_perf_runner::{
-    LOCAL_PERF_ATTEMPT_RECEIPT_SCHEMA_VERSION, LOCAL_PERF_LEASE_RELEASE_RECEIPT_SCHEMA_VERSION,
-    PERF_RUN_PRECOMMIT_SCHEMA_VERSION,
+    LOCAL_PERF_ATTEMPT_RECEIPT_SCHEMA_VERSION, LOCAL_PERF_BOOKING_RECEIPT_SCHEMA_VERSION,
+    LOCAL_PERF_LEASE_RELEASE_RECEIPT_SCHEMA_VERSION, PERF_RUN_PRECOMMIT_SCHEMA_VERSION,
 };
 use crate::machine_class_registry::{
     DefaultFlipDisposition, ExecutionCapacitySemantics, LOCAL_PERF_PRODUCER_CONTRACT_VERSION,
@@ -920,6 +920,10 @@ fn validate_perf_manifest_schema_bindings(
             "runner_lease_release_receipt",
             LOCAL_PERF_LEASE_RELEASE_RECEIPT_SCHEMA_VERSION,
         ),
+        (
+            "runner_booking_receipt",
+            LOCAL_PERF_BOOKING_RECEIPT_SCHEMA_VERSION,
+        ),
         ("precommit_inventory", PERF_RUN_PRECOMMIT_SCHEMA_VERSION),
     ] {
         let found = schemas
@@ -949,6 +953,7 @@ fn validate_perf_manifest_schema_bindings(
             "history_pointer",
             "runner_attempt_receipt",
             "runner_lease_release_receipt",
+            "runner_booking_receipt",
             "precommit_inventory",
         ]
         .contains(&field.as_str())
@@ -4686,10 +4691,10 @@ mod tests {
 
     #[test]
     fn qg1_profile_plans_have_frozen_exhaustive_applicability_counts() {
-        // GOLDEN-CHANGE (lease release receipt v1): the manifest now binds a
-        // post-unlock release receipt to the completed, physical-identity
-        // attempt receipt. Matrix cells and applicability counts are
-        // unchanged; only their manifest-bound plan identities advance.
+        // GOLDEN-CHANGE (booking receipt v1): the manifest now binds the
+        // pre-build exclusive resource booking receipt. Matrix cells and
+        // applicability counts are unchanged; only their manifest-bound plan
+        // identities advance.
         let registry = MachineClassRegistry::frozen().expect("frozen machine registry");
         let cases = [
             (
@@ -4699,7 +4704,7 @@ mod tests {
                 16,
                 Some(64),
                 Some(64),
-                "b49415821a8c4b2d0cf5a59ef05a058846825f8fff4ae87ed4f88db2dba9d57b",
+                "f377f667aba2a909cfe92c58755cdcd6800c3e68b37e5f71a395b4bee544ef41",
             ),
             (
                 ExecutionProfileId::Smt2_128,
@@ -4708,7 +4713,7 @@ mod tests {
                 0,
                 Some(128),
                 Some(128),
-                "2e1169fbe0bb96c1580b5fa75edc5bd46fb52c7533c3be9575b8d99cbd2e46c8",
+                "fc805c6261b5cc9c31388ccddf81707ee8bf53432bdfcd30647d35d97b2245d6",
             ),
             (
                 ExecutionProfileId::Scheduler10,
@@ -4717,7 +4722,7 @@ mod tests {
                 40,
                 Some(10),
                 Some(8),
-                "942c940393b959490987413e7ccadda55645c10dac97d025e1007f4544955286",
+                "adc95829b5aa907a15bfb085c3eca36a5f53486dcb5978482c8e2d4494bf405e",
             ),
         ];
         let mut plan_hashes = BTreeSet::new();
@@ -4962,6 +4967,10 @@ mod tests {
             (
                 "runner_lease_release_receipt",
                 LOCAL_PERF_LEASE_RELEASE_RECEIPT_SCHEMA_VERSION,
+            ),
+            (
+                "runner_booking_receipt",
+                LOCAL_PERF_BOOKING_RECEIPT_SCHEMA_VERSION,
             ),
             ("precommit_inventory", PERF_RUN_PRECOMMIT_SCHEMA_VERSION),
         ] {
@@ -5527,12 +5536,12 @@ mod tests {
     fn manifest_contract_hash_ignores_only_activation_state() {
         let manifest = PERF_MANIFEST;
         assert_eq!(manifest.matches("activated = false").count(), 10);
-        // GOLDEN-CHANGE (lease release receipt v1): the manifest now names
-        // the post-unlock receipt that binds the exact completed attempt.
+        // GOLDEN-CHANGE (booking receipt v1): the manifest now names the
+        // pre-build receipt that binds the exclusive resource scope.
         // Activation is still the sole administrative normalization exception.
         assert_eq!(
             perf_manifest_contract_sha256(manifest),
-            "545c6dadcee75c22c0d40238ded74663df70fcc58adc7c5066455dfe845b3bf1",
+            "abde88dcaa525112a5373f6d5f98ab79c36d0b24ebaf4df74034b2cc09f04902",
             "the normalized all-inactive manifest digest must remain frozen"
         );
         assert_eq!(

@@ -59,6 +59,8 @@ pub const LOCAL_PERF_ATTEMPT_RECEIPT_SCHEMA_VERSION: &str = "frankensearch.perf-
 /// Strict wire schema for the post-unlock lease-release receipt.
 pub const LOCAL_PERF_LEASE_RELEASE_RECEIPT_SCHEMA_VERSION: &str =
     "frankensearch.perf-runner-lease-release.v1";
+/// Strict wire schema for the pre-build host-global booking receipt.
+pub const LOCAL_PERF_BOOKING_RECEIPT_SCHEMA_VERSION: &str = "frankensearch.perf-runner-booking.v1";
 /// Strict schema for the diagnostic inventory retained before runner completion.
 pub const PERF_RUN_PRECOMMIT_SCHEMA_VERSION: &str = "frankensearch.perf-run-precommit.v5";
 const MAX_IDENTITY_COMPONENT_BYTES: usize = 96;
@@ -127,6 +129,9 @@ impl LocalPerfRunSelection {
 /// Files emitted after a successful self-verifying finalization.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LocalPerfRunOutput {
+    /// Exact strict receipt that records the exclusive pre-build resource
+    /// booking for this invocation.
+    pub booking_receipt: PathBuf,
     /// Exact child log.
     pub run_log: PathBuf,
     /// Exact canonical compact artifact manifest.
@@ -162,6 +167,18 @@ pub struct LocalPerfRunOutput {
 /// and the pre-commit inventory.
 #[derive(Debug, Error)]
 pub enum LocalPerfRunError {
+    /// The exclusive lease was acquired but its pre-build booking receipt could
+    /// not be durably published. No benchmark child was started.
+    #[error(
+        "local performance runner could not durably publish booking receipt at {}: {detail}",
+        receipt_path.display()
+    )]
+    BookingReceiptUnavailable {
+        /// Intended booking-receipt path; it may be absent or nondurable.
+        receipt_path: PathBuf,
+        /// Bounded non-secret publication diagnostic.
+        detail: String,
+    },
     /// Filesystem or process I/O failed.
     #[error("local performance runner I/O failed: {0}")]
     Io(#[from] std::io::Error),
@@ -280,6 +297,15 @@ struct LocalPerfProducerContract {
 struct LeaseFileIdentity {
     device: String,
     inode: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LocalPerfBookingStorageSlots {
+    output_parent: LeaseFileIdentity,
+    target_directory: LeaseFileIdentity,
+    run_directory: LeaseFileIdentity,
+    artifact_directory: LeaseFileIdentity,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -803,6 +829,121 @@ impl LocalPerfLeaseReleaseReceipt {
         if sha256_hex(&serde_json::to_vec(&unsigned)?) != expected_seal {
             return Err(LocalPerfRunError::Invalid(
                 "lease release receipt content seal does not verify".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Strict, canonical proof of the exclusive resource scope booked before
+/// benchmark compilation and child spawn.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LocalPerfBookingReceipt {
+    schema_version: String,
+    gate: String,
+    profile: MachineProfileKey,
+    run_id: String,
+    run_window: String,
+    fixture_selector: Option<String>,
+    selected_cell_ids: Vec<String>,
+    lease_file_identity: LeaseFileIdentity,
+    worker_fingerprint_sha256: String,
+    effective_cpuset_sha256: String,
+    storage_slots: LocalPerfBookingStorageSlots,
+    source_git_revision: String,
+    cargo_lock_sha256: String,
+    booked_at_utc: String,
+    seal_sha256: String,
+}
+
+impl LocalPerfBookingReceipt {
+    /// Parse exact canonical bytes and verify their self-seal and booking
+    /// identity.
+    ///
+    /// # Errors
+    ///
+    /// Rejects duplicate or unknown fields, noncanonical JSON, stale schema,
+    /// malformed booked resources, or a modified booking receipt.
+    pub fn from_verified_slice(contents: &[u8]) -> Result<Self, LocalPerfRunError> {
+        let probe =
+            crate::machine_class_registry::parse_strict_json(contents).map_err(|error| {
+                LocalPerfRunError::Invalid(format!("booking receipt is not strict JSON: {error}"))
+            })?;
+        let receipt: Self = serde_json::from_value(probe.clone()).map_err(|error| {
+            LocalPerfRunError::Invalid(format!(
+                "booking receipt does not decode as the current schema: {error}"
+            ))
+        })?;
+        if probe != serde_json::to_value(&receipt)?
+            || contents != receipt.to_json_bytes()?.as_slice()
+        {
+            return Err(LocalPerfRunError::Invalid(
+                "booking receipt bytes are not the exact canonical encoding".to_owned(),
+            ));
+        }
+        receipt.verify()?;
+        Ok(receipt)
+    }
+
+    /// Load and independently verify one exact booking receipt.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed I/O or receipt-verification error.
+    pub fn load_verified(path: &Path) -> Result<Self, LocalPerfRunError> {
+        Self::from_verified_slice(&fs::read(path)?)
+    }
+
+    /// Canonical compact JSON bytes used for durable booking persistence.
+    ///
+    /// # Errors
+    ///
+    /// Returns a JSON error only if the typed schema stops being encodable.
+    pub fn to_json_bytes(&self) -> Result<Vec<u8>, LocalPerfRunError> {
+        serde_json::to_vec(self).map_err(LocalPerfRunError::from)
+    }
+
+    fn verify(&self) -> Result<(), LocalPerfRunError> {
+        if self.schema_version != LOCAL_PERF_BOOKING_RECEIPT_SCHEMA_VERSION
+            || !is_sha256(&self.worker_fingerprint_sha256)
+            || !is_sha256(&self.effective_cpuset_sha256)
+            || !is_git_revision(&self.source_git_revision)
+            || !is_sha256(&self.cargo_lock_sha256)
+            || !is_sha256(&self.seal_sha256)
+        {
+            return Err(LocalPerfRunError::Invalid(
+                "booking receipt has an invalid schema or digest".to_owned(),
+            ));
+        }
+        validate_component(&self.run_id, "booking run ID")?;
+        validate_component(&self.run_window, "booking run window")?;
+        validate_lease_file_identity(&self.lease_file_identity)?;
+        validate_booking_storage_slots(&self.storage_slots)?;
+        validate_utc_timestamp(&self.booked_at_utc, "booking")?;
+        let gate = self.gate.parse::<PerfGate>().map_err(|error| {
+            LocalPerfRunError::Invalid(format!("booking receipt names an invalid gate: {error}"))
+        })?;
+        self.profile.latest_basename(gate.label())?;
+        if let Some(fixture) = &self.fixture_selector {
+            validate_fixture_selector_syntax(fixture)?;
+        }
+        if self.selected_cell_ids.is_empty()
+            || self
+                .selected_cell_ids
+                .iter()
+                .any(|cell| cell.is_empty() || cell.trim() != cell || !cell.is_ascii())
+        {
+            return Err(LocalPerfRunError::Invalid(
+                "booking receipt has malformed selected-cell identifiers".to_owned(),
+            ));
+        }
+        let mut unsigned = self.clone();
+        let expected_seal = unsigned.seal_sha256.clone();
+        unsigned.seal_sha256.clear();
+        if sha256_hex(&serde_json::to_vec(&unsigned)?) != expected_seal {
+            return Err(LocalPerfRunError::Invalid(
+                "booking receipt content seal does not verify".to_owned(),
             ));
         }
         Ok(())
@@ -1421,6 +1562,58 @@ fn run_local_perf_command_inner(
     let producer_before = capture_validated_producer(&source_before)?;
     let run_directories = create_run_directories(config, &external_paths.output_parent)?;
     let artifact_dir = benchmark_artifact_directory_path(&run_directories.artifacts)?;
+    let booking_receipt_name = format!("{}.booking.json", config.gate.label());
+    let booking_receipt_path = config.output_dir.join(&booking_receipt_name);
+    let booking_platform = capture_platform(config)?;
+    let booking_receipt_bytes = utc_now()
+        .and_then(|booked_at_utc| {
+            booking_receipt_bytes(
+                config,
+                &run_selection,
+                &lease_identity,
+                &booking_platform,
+                &external_paths,
+                &run_directories,
+                &source_before,
+                &booked_at_utc,
+            )
+        })
+        .map_err(|error| LocalPerfRunError::BookingReceiptUnavailable {
+            receipt_path: booking_receipt_path.clone(),
+            detail: bounded_diagnostic(&error),
+        })?;
+    write_new_sync_at(
+        &run_directories.run.handle,
+        &booking_receipt_name,
+        &booking_receipt_bytes,
+    )
+    .and_then(|()| {
+        run_directories
+            .run
+            .handle
+            .sync_all()
+            .map_err(LocalPerfRunError::from)
+    })
+    .map_err(|error| LocalPerfRunError::BookingReceiptUnavailable {
+        receipt_path: booking_receipt_path.clone(),
+        detail: bounded_diagnostic(&error),
+    })?;
+    let persisted_booking = read_file_at(&run_directories.run.handle, &booking_receipt_name)
+        .map_err(|error| LocalPerfRunError::BookingReceiptUnavailable {
+            receipt_path: booking_receipt_path.clone(),
+            detail: bounded_diagnostic(&error),
+        })?;
+    if persisted_booking != booking_receipt_bytes {
+        return Err(LocalPerfRunError::BookingReceiptUnavailable {
+            receipt_path: booking_receipt_path,
+            detail: "persisted booking receipt bytes differ from the sealed publication".to_owned(),
+        });
+    }
+    LocalPerfBookingReceipt::load_verified(&config.output_dir.join(&booking_receipt_name))
+        .map_err(|error| LocalPerfRunError::BookingReceiptUnavailable {
+            receipt_path: config.output_dir.join(&booking_receipt_name),
+            detail: bounded_diagnostic(&error),
+        })?;
     let environments = controlled_environments(
         config,
         &run_selection,
@@ -2247,6 +2440,7 @@ fn run_local_perf_command_inner(
         }
     })?;
     Ok(LocalPerfRunOutput {
+        booking_receipt: booking_receipt_path,
         run_log: run_log_path,
         artifact_manifest: manifest_path,
         environment_policy: environment_policy_path,
@@ -3750,6 +3944,39 @@ fn checked_lease_identity(lease_file: &impl AsFd) -> Result<LeaseFileIdentity, L
         device: stat.st_dev.to_string(),
         inode: stat.st_ino.to_string(),
     })
+}
+
+fn receipt_file_identity(identity: &FileIdentity) -> LeaseFileIdentity {
+    LeaseFileIdentity {
+        device: identity.device.to_string(),
+        inode: identity.inode.to_string(),
+    }
+}
+
+fn booking_storage_slots(
+    external_paths: &ExternalRunPaths,
+    run_directories: &RunDirectories,
+) -> LocalPerfBookingStorageSlots {
+    LocalPerfBookingStorageSlots {
+        output_parent: receipt_file_identity(&external_paths.output_parent.identity),
+        target_directory: receipt_file_identity(&external_paths.target.identity),
+        run_directory: receipt_file_identity(&run_directories.run.identity),
+        artifact_directory: receipt_file_identity(&run_directories.artifacts.identity),
+    }
+}
+
+fn validate_booking_storage_slots(
+    slots: &LocalPerfBookingStorageSlots,
+) -> Result<(), LocalPerfRunError> {
+    for identity in [
+        &slots.output_parent,
+        &slots.target_directory,
+        &slots.run_directory,
+        &slots.artifact_directory,
+    ] {
+        validate_lease_file_identity(identity)?;
+    }
+    Ok(())
 }
 
 fn validate_lease_file_identity(identity: &LeaseFileIdentity) -> Result<(), LocalPerfRunError> {
@@ -5426,6 +5653,48 @@ fn bounded_diagnostic<T: std::fmt::Display + ?Sized>(value: &T) -> String {
     message
 }
 
+fn booking_receipt_bytes(
+    config: &LocalPerfRunConfig,
+    selection: &ResolvedRunSelection,
+    lease_file_identity: &LeaseFileIdentity,
+    platform: &PlatformCapture,
+    external_paths: &ExternalRunPaths,
+    run_directories: &RunDirectories,
+    source: &CleanSourceSnapshot,
+    booked_at_utc: &str,
+) -> Result<Vec<u8>, LocalPerfRunError> {
+    validate_utc_timestamp(booked_at_utc, "booking")?;
+    let receipt = LocalPerfBookingReceipt {
+        schema_version: LOCAL_PERF_BOOKING_RECEIPT_SCHEMA_VERSION.to_owned(),
+        gate: config.gate.label().to_owned(),
+        profile: config.profile,
+        run_id: config.run_id.clone(),
+        run_window: config.run_window.clone(),
+        fixture_selector: selection.fixture.clone(),
+        selected_cell_ids: selection.selected_cell_ids.clone(),
+        lease_file_identity: lease_file_identity.clone(),
+        worker_fingerprint_sha256: platform.hardware.fingerprint_sha256.clone(),
+        effective_cpuset_sha256: platform.snapshot.effective_cpuset_sha256.clone(),
+        storage_slots: booking_storage_slots(external_paths, run_directories),
+        source_git_revision: source.revision.clone(),
+        cargo_lock_sha256: source.cargo_lock_sha256.clone(),
+        booked_at_utc: booked_at_utc.to_owned(),
+        seal_sha256: String::new(),
+    };
+    let receipt_bytes = seal_booking_receipt(receipt)?;
+    LocalPerfBookingReceipt::from_verified_slice(&receipt_bytes)?;
+    Ok(receipt_bytes)
+}
+
+fn seal_booking_receipt(
+    mut receipt: LocalPerfBookingReceipt,
+) -> Result<Vec<u8>, LocalPerfRunError> {
+    receipt.seal_sha256.clear();
+    let preimage = serde_json::to_vec(&receipt)?;
+    receipt.seal_sha256 = sha256_hex(&preimage);
+    serde_json::to_vec(&receipt).map_err(LocalPerfRunError::from)
+}
+
 fn completed_lease_release_receipt_bytes(
     config: &LocalPerfRunConfig,
     lease_file_identity: &LeaseFileIdentity,
@@ -6996,6 +7265,58 @@ mod tests {
     }
 
     #[test]
+    fn booking_receipt_binds_exclusive_worker_cpuset_storage_and_fixture_scope() {
+        let (attempt, _, _) = attempt_fixture(LocalPerfAttemptOutcome::Completed, Some(b"bound"));
+        let receipt = LocalPerfBookingReceipt {
+            schema_version: LOCAL_PERF_BOOKING_RECEIPT_SCHEMA_VERSION.to_owned(),
+            gate: attempt.gate.clone(),
+            profile: attempt.profile,
+            run_id: attempt.run_id.clone(),
+            run_window: attempt.run_window.clone(),
+            fixture_selector: attempt.fixture_selector.clone(),
+            selected_cell_ids: attempt.selected_cell_ids.clone(),
+            lease_file_identity: attempt.lease_file_identity.clone(),
+            worker_fingerprint_sha256: attempt.hardware.fingerprint_sha256.clone(),
+            effective_cpuset_sha256: attempt.execution_start.effective_cpuset_sha256.clone(),
+            storage_slots: LocalPerfBookingStorageSlots {
+                output_parent: LeaseFileIdentity {
+                    device: "1".to_owned(),
+                    inode: "2".to_owned(),
+                },
+                target_directory: LeaseFileIdentity {
+                    device: "3".to_owned(),
+                    inode: "4".to_owned(),
+                },
+                run_directory: LeaseFileIdentity {
+                    device: "5".to_owned(),
+                    inode: "6".to_owned(),
+                },
+                artifact_directory: LeaseFileIdentity {
+                    device: "7".to_owned(),
+                    inode: "8".to_owned(),
+                },
+            },
+            source_git_revision: attempt.build.git_revision.clone(),
+            cargo_lock_sha256: attempt.build.cargo_lock_sha256.clone(),
+            booked_at_utc: attempt.started_at_utc.clone(),
+            seal_sha256: String::new(),
+        };
+        let bytes = seal_booking_receipt(receipt).expect("seal booking receipt");
+        let verified =
+            LocalPerfBookingReceipt::from_verified_slice(&bytes).expect("verify booking receipt");
+        assert_eq!(verified.profile, attempt.profile);
+        assert_eq!(
+            verified.effective_cpuset_sha256,
+            attempt.execution_start.effective_cpuset_sha256
+        );
+
+        let mut tampered = verified;
+        tampered.storage_slots.run_directory.inode = "not-a-decimal-inode".to_owned();
+        let bytes = seal_booking_receipt(tampered).expect("reseal storage tamper");
+        assert!(LocalPerfBookingReceipt::from_verified_slice(&bytes).is_err());
+    }
+
+    #[test]
     fn log_sync_and_capture_failures_are_typed_without_false_durability_claims() {
         let (sync_failure, _, run_log) = attempt_fixture(
             LocalPerfAttemptOutcome::PostExitRejected {
@@ -7291,6 +7612,7 @@ mod tests {
     #[test]
     fn completed_shard_syncs_inputs_then_publishes_verified_attempt_evidence_pair_last() {
         let source = production_source();
+        let booking_publish = unique_marker_offset(source, "&booking_receipt_bytes,");
         let child_inputs_durable = unique_marker_offset(
             source,
             "let durable_child_artifacts = match read_and_sync_child_artifacts(",
@@ -7313,6 +7635,7 @@ mod tests {
         let lease_unlock =
             unique_marker_offset(source, "flock(&lease_file, FlockOperation::Unlock)");
         let release_publish = unique_marker_offset(source, "&release_receipt_bytes,");
+        assert!(booking_publish < child_inputs_durable);
         assert!(child_inputs_durable < nested_runner);
         assert!(nested_runner < bound_write);
         assert!(bound_write < bound_reload);
