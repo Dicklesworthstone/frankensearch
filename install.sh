@@ -192,6 +192,23 @@ install_binary() {
   fi
 }
 
+provision_default_semantic_models() {
+  local staged_binary="$1"
+
+  info "Provisioning the registered semantic model artifacts..."
+  if ! "$staged_binary" download-models; then
+    err "Semantic model provisioning failed. The existing fsfs installation was not replaced."
+    return 1
+  fi
+
+  if ! "$staged_binary" download-models --verify; then
+    err "Semantic model verification failed. The existing fsfs installation was not replaced."
+    return 1
+  fi
+
+  ok "Registered semantic model artifacts are present and verified."
+}
+
 run_installer_contract_test() {
   local action="${1:-}"
   case "$action" in
@@ -583,6 +600,12 @@ if [ "$FROM_SOURCE" -eq 1 ]; then
       exit 1
     fi
   fi
+  if [ "$LITE" -eq 0 ]; then
+    if ! provision_default_semantic_models "$BIN"; then
+      exit 1
+    fi
+  fi
+
   install_binary "$BIN" "$DEST/${BINARY_NAME}"
   ok "Installed to $DEST/${BINARY_NAME} (source build)"
   maybe_add_path

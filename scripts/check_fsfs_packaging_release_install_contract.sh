@@ -479,6 +479,19 @@ require(
     "cargo build --release -p frankensearch-fsfs)" in installer,
     "ordinary source installation must exercise the loader-capable Cargo default",
 )
+provision_call = 'provision_default_semantic_models "$BIN"'
+source_install = 'install_binary "$BIN" "$DEST/${BINARY_NAME}"'
+require(
+    '"$staged_binary" download-models' in installer
+    and '"$staged_binary" download-models --verify' in installer,
+    "ordinary source installation must provision and verify registered semantic models",
+)
+require(
+    provision_call in installer
+    and source_install in installer
+    and installer.index(provision_call) < installer.index(source_install),
+    "ordinary source installation must verify semantic models before replacing the destination binary",
+)
 require(
     "plain build" in crate_readme
     and "fsfs download-models potion-multilingual-128m" in crate_readme,
