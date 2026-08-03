@@ -856,6 +856,31 @@ pub fn resolve_authority_slots_v1(
     }
 }
 
+/// Decode and resolve the two physical authority frames without filesystem
+/// access.
+///
+/// A present but malformed frame is never converted to `None`: callers must
+/// reconcile that corruption explicitly rather than treating it as one-slot
+/// survival. Only an absent physical frame may enter the survival path.
+///
+/// # Errors
+///
+/// Returns the exact bounded slot decode error for malformed, copied, or
+/// cross-root frames before attempting pair resolution.
+pub fn resolve_authority_slot_frames_v1(
+    first: Option<&[u8]>,
+    second: Option<&[u8]>,
+    expected_root_id: [u8; 16],
+) -> Result<Option<AuthoritySlotV1>, GenerationAuthorityErrorV1> {
+    let first = first
+        .map(|bytes| AuthoritySlotV1::from_authenticated_bytes(bytes, 0, expected_root_id))
+        .transpose()?;
+    let second = second
+        .map(|bytes| AuthoritySlotV1::from_authenticated_bytes(bytes, 1, expected_root_id))
+        .transpose()?;
+    resolve_authority_slots_v1(first, second)
+}
+
 /// Resolve authority slots while refusing to silently step around a valid
 /// owner/attempt `LOCK` state.
 ///
@@ -4111,6 +4136,36 @@ mod tests {
             ),
             Ok(Some(authority_slot(0, successor))),
             "resolver input order never changes the selected consecutive head"
+        );
+    }
+
+    #[test]
+    fn raw_authority_frame_resolver_preserves_corruption_as_an_error() {
+        let genesis = authority_reference(1, None);
+        let successor = authority_reference(2, Some(genesis.fingerprint()));
+        let first = authority_slot(1, genesis)
+            .encode()
+            .expect("encode genesis frame");
+        let second = authority_slot(0, successor)
+            .encode()
+            .expect("encode successor frame");
+        assert_eq!(
+            resolve_authority_slot_frames_v1(Some(&first), Some(&second), [0x5a; 16]),
+            Ok(Some(authority_slot(0, successor))),
+            "two valid raw physical frames resolve their linked head"
+        );
+        assert_eq!(
+            resolve_authority_slot_frames_v1(Some(&first), None, [0x5a; 16]),
+            Ok(Some(authority_slot(1, genesis))),
+            "only a genuinely absent second frame permits one-slot survival"
+        );
+
+        let mut corrupt_second = second;
+        corrupt_second[200] ^= 1;
+        assert_eq!(
+            resolve_authority_slot_frames_v1(Some(&first), Some(&corrupt_second), [0x5a; 16]),
+            Err(GenerationAuthorityErrorV1::ChecksumMismatch),
+            "a present corrupt frame must not be silently treated as absent"
         );
     }
 
