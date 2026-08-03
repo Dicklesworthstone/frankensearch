@@ -706,6 +706,12 @@ if [ ! -x "$BIN" ]; then
 fi
 [ -x "$BIN" ] || { err "Binary not found in archive"; exit 1; }
 
+if [ "$LITE" -eq 0 ]; then
+  if ! provision_default_semantic_models "$BIN"; then
+    exit 1
+  fi
+fi
+
 if [ "$VERIFY" -eq 1 ]; then
   if ! verify_staged_binary "$BIN"; then
     exit 1

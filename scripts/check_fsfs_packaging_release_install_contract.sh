@@ -509,6 +509,8 @@ require(
 )
 provision_call = 'provision_default_semantic_models "$BIN"'
 source_install = 'install_binary "$BIN" "$DEST/${BINARY_NAME}"'
+artifact_start = installer.index('[ -x "$BIN" ] || { err "Binary not found in archive"; exit 1; }')
+artifact_section = installer[artifact_start:]
 require(
     '"$staged_binary" download-models' in installer
     and '"$staged_binary" download-models --verify' in installer,
@@ -519,6 +521,12 @@ require(
     and source_install in installer
     and installer.index(provision_call) < installer.index(source_install),
     "ordinary source installation must verify semantic models before replacing the destination binary",
+)
+require(
+    provision_call in artifact_section
+    and source_install in artifact_section
+    and artifact_section.index(provision_call) < artifact_section.index(source_install),
+    "ordinary release artifact installation must verify semantic models before replacing the destination binary",
 )
 require(
     "plain build" in crate_readme
