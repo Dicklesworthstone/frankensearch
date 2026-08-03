@@ -174,6 +174,8 @@ const AUTHORITY_SLOT_BODY_BYTES: usize =
     GENERATION_AUTHORITY_SLOT_BYTES_V1 - AUTHORITY_SLOT_DIGEST_BYTES;
 const AUTHORITY_SLOT_MAGIC_V1: [u8; 8] = *b"FSAUTH01";
 const AUTHORITY_SLOT_HEADER_BYTES: usize = 131;
+const AUTHORITY_REF_MAGIC_V1: [u8; 9] = *b"FSAUTHREF";
+const AUTHORITY_REF_BYTES_V1: usize = 100;
 const LOCK_FRAME_DIGEST_BYTES: usize = 32;
 const LOCK_FRAME_BODY_BYTES: usize = GENERATION_LOCK_FRAME_BYTES_V1 - LOCK_FRAME_DIGEST_BYTES;
 const LOCK_FRAME_MAGIC_V1: [u8; 8] = *b"FSLOCK01";
@@ -328,9 +330,9 @@ impl AuthorityRefV1 {
 
     /// Canonical bytes used to link consecutive authority references.
     #[must_use]
-    pub fn canonical_bytes(&self) -> [u8; 100] {
-        let mut bytes = [0_u8; 100];
-        bytes[..9].copy_from_slice(b"FSAUTHREF");
+    pub fn canonical_bytes(&self) -> [u8; AUTHORITY_REF_BYTES_V1] {
+        let mut bytes = [0_u8; AUTHORITY_REF_BYTES_V1];
+        bytes[..9].copy_from_slice(&AUTHORITY_REF_MAGIC_V1);
         bytes[9..11].copy_from_slice(&self.schema_version.to_be_bytes());
         bytes[11..19].copy_from_slice(&self.sequence.to_be_bytes());
         bytes[19..35].copy_from_slice(&self.object_id);
@@ -341,6 +343,74 @@ impl AuthorityRefV1 {
             bytes[76..].copy_from_slice(&predecessor);
         }
         bytes
+    }
+
+    /// Decode the exact fixed canonical representation of one authority
+    /// reference without allocating from caller-controlled lengths.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed error for malformed, future, or non-canonical bytes.
+    pub fn from_canonical_bytes(bytes: &[u8]) -> Result<Self, GenerationAuthorityErrorV1> {
+        if bytes.len() != AUTHORITY_REF_BYTES_V1 {
+            return Err(GenerationAuthorityErrorV1::InvalidField {
+                field: "authority_ref.canonical_bytes",
+            });
+        }
+        if !bytes[..9].eq(AUTHORITY_REF_MAGIC_V1.as_slice()) {
+            return Err(GenerationAuthorityErrorV1::InvalidField {
+                field: "authority_ref.magic",
+            });
+        }
+        let predecessor = match bytes[75] {
+            0 => {
+                if !bytes[76..].iter().all(|byte| byte.eq(&0)) {
+                    return Err(GenerationAuthorityErrorV1::NonCanonicalPadding);
+                }
+                None
+            }
+            1 => Some(bytes[76..].try_into().map_err(|_| {
+                GenerationAuthorityErrorV1::InvalidField {
+                    field: "authority_ref.predecessor",
+                }
+            })?),
+            _ => {
+                return Err(GenerationAuthorityErrorV1::InvalidField {
+                    field: "authority_ref.predecessor_present",
+                });
+            }
+        };
+        let reference = Self {
+            schema_version: u16::from_be_bytes([bytes[9], bytes[10]]),
+            sequence: u64::from_be_bytes(bytes[11..19].try_into().map_err(|_| {
+                GenerationAuthorityErrorV1::InvalidField {
+                    field: "authority_ref.sequence",
+                }
+            })?),
+            object_id: bytes[19..35].try_into().map_err(|_| {
+                GenerationAuthorityErrorV1::InvalidField {
+                    field: "authority_ref.object_id",
+                }
+            })?,
+            manifest_len: u64::from_be_bytes(bytes[35..43].try_into().map_err(|_| {
+                GenerationAuthorityErrorV1::InvalidField {
+                    field: "authority_ref.manifest_len",
+                }
+            })?),
+            manifest_sha256: bytes[43..75].try_into().map_err(|_| {
+                GenerationAuthorityErrorV1::InvalidField {
+                    field: "authority_ref.manifest_sha256",
+                }
+            })?,
+            predecessor,
+        };
+        reference.validate()?;
+        if !reference.canonical_bytes().eq(bytes) {
+            return Err(GenerationAuthorityErrorV1::InvalidField {
+                field: "authority_ref.canonical_bytes",
+            });
+        }
+        Ok(reference)
     }
 
     /// SHA-256 fingerprint of this exact canonical reference.
@@ -3864,6 +3934,39 @@ mod tests {
         assert_eq!(&bytes[..9], b"FSAUTHREF");
         assert_eq!(bytes.len(), 100);
         assert_ne!(genesis.fingerprint(), [0; 32]);
+    }
+
+    #[test]
+    fn authority_reference_codec_round_trips_and_rejects_noncanonical_forms() {
+        let genesis = authority_reference(1, None);
+        let successor = authority_reference(2, Some(genesis.fingerprint()));
+        assert_eq!(
+            AuthorityRefV1::from_canonical_bytes(&successor.canonical_bytes())
+                .expect("decode successor authority reference"),
+            successor
+        );
+
+        let mut noncanonical_genesis = genesis.canonical_bytes();
+        noncanonical_genesis[76] = 1;
+        assert_eq!(
+            AuthorityRefV1::from_canonical_bytes(&noncanonical_genesis),
+            Err(GenerationAuthorityErrorV1::NonCanonicalPadding),
+            "absent predecessors have a single all-zero representation"
+        );
+
+        let mut future_schema = successor.canonical_bytes();
+        future_schema[9..11].copy_from_slice(&(GENERATION_AUTHORITY_SCHEMA_V1 + 1).to_be_bytes());
+        assert_eq!(
+            AuthorityRefV1::from_canonical_bytes(&future_schema),
+            Err(GenerationAuthorityErrorV1::InvalidField {
+                field: "authority_ref.schema_version"
+            }),
+            "a self-consistent but unknown authority schema fails closed"
+        );
+        assert!(
+            AuthorityRefV1::from_canonical_bytes(&successor.canonical_bytes()[..99]).is_err(),
+            "truncated authority references never decode"
+        );
     }
 
     #[test]
