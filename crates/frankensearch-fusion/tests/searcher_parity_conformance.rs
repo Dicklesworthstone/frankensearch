@@ -318,8 +318,11 @@ fn phase_label(phase: &SearchPhase) -> &'static str {
     }
 }
 
-fn phase_labels(query_vec: &[f32], with_quality: bool) -> (Vec<&'static str>, Vec<&'static str>) {
-    let config = TwoTierConfig::default();
+fn phase_labels(
+    query_vec: &[f32],
+    with_quality: bool,
+    config: TwoTierConfig,
+) -> (Vec<&'static str>, Vec<&'static str>) {
     let sync = SyncTwoTierSearcher::new(sync_index(with_quality), config.clone())
         .search_iter(query_vec, 4)
         .map(|phase| phase_label(&phase))
@@ -542,6 +545,31 @@ fn default_config_agrees_at_small_k() {
 }
 
 #[test]
+fn zero_k_agrees_without_scanning_or_refining() {
+    let config = TwoTierConfig::default();
+    let query = normalize(vec![1.0, 0.0, 0.0, 0.0]);
+    let (sync_results, sync_metrics) = run_sync(&config, &query, 0);
+    let (async_results, async_metrics) = run_async("zero-k", &config, &query, 0);
+    assert_result_parity("zero-k", &sync_results, &async_results);
+    assert_eq!(
+        sync_metrics.phase1_vectors_searched, 0,
+        "sync scanned at k=0"
+    );
+    assert_eq!(
+        async_metrics.phase1_vectors_searched, 0,
+        "async scanned at k=0"
+    );
+    assert_eq!(
+        sync_metrics.phase2_vectors_searched, 0,
+        "sync refined at k=0"
+    );
+    assert_eq!(
+        async_metrics.phase2_vectors_searched, 0,
+        "async refined at k=0"
+    );
+}
+
+#[test]
 fn fast_only_agrees_and_skips_phase_two_on_both_sides() {
     let config = TwoTierConfig {
         fast_only: true,
@@ -581,7 +609,7 @@ fn quality_index_unavailable_agrees_and_skips_phase_two_on_both_sides() {
         "sync must report the typed unavailable-index skip"
     );
     assert_eq!(sync_metrics.skip_reason, async_metrics.skip_reason);
-    let (sync_phases, async_phases) = phase_labels(&query, false);
+    let (sync_phases, async_phases) = phase_labels(&query, false, TwoTierConfig::default());
     assert_eq!(sync_phases, ["initial"]);
     assert_eq!(sync_phases, async_phases);
 }
@@ -589,8 +617,20 @@ fn quality_index_unavailable_agrees_and_skips_phase_two_on_both_sides() {
 #[test]
 fn quality_index_present_emits_matching_initial_then_refined_phases() {
     let query = normalize(vec![1.0, 0.0, 0.0, 0.0]);
-    let (sync_phases, async_phases) = phase_labels(&query, true);
+    let (sync_phases, async_phases) = phase_labels(&query, true, TwoTierConfig::default());
     assert_eq!(sync_phases, ["initial", "refined"]);
+    assert_eq!(sync_phases, async_phases);
+}
+
+#[test]
+fn fast_only_emits_matching_initial_only_phase() {
+    let query = normalize(vec![1.0, 0.0, 0.0, 0.0]);
+    let config = TwoTierConfig {
+        fast_only: true,
+        ..TwoTierConfig::default()
+    };
+    let (sync_phases, async_phases) = phase_labels(&query, true, config);
+    assert_eq!(sync_phases, ["initial"]);
     assert_eq!(sync_phases, async_phases);
 }
 
