@@ -1587,30 +1587,33 @@ impl RefreshWorker {
 
         // 5. Merge: carried live rows first (tombstones stay dead), then the
         //    new records override per doc_id (last write in the batch wins).
-        let mut merged: HashMap<String, (Vec<f32>, Option<Vec<f32>>)> = HashMap::new();
+        //    A row's fast slot is `None` only for a carried quality row with
+        //    no live fast sibling — including the reachable quality-only
+        //    generation (`AttestedV2 { fast: None, quality: Some(_) }`):
+        //    such rows land in the staged quality tier and never fabricate a
+        //    fast row.
+        let mut merged: HashMap<String, (Option<Vec<f32>>, Option<Vec<f32>>)> = HashMap::new();
+        let mut quality_lookup: HashMap<String, Vec<f32>> = HashMap::new();
+        if let Some(AdmittedCanonicalTier {
+            owner: quality_owner,
+            ..
+        }) = &quality_admitted
+        {
+            for i in 0..quality_owner.record_count() {
+                let row = quality_owner.row(i)?;
+                if !row.flags().is_live() {
+                    continue;
+                }
+                // Last-wins on duplicate doc_ids, matching the fast-tier
+                // loop below (the former first-wins `Entry::Vacant` here was
+                // an unintended asymmetry between the two carry loops).
+                quality_lookup.insert(row.doc_id().to_owned(), quality_owner.vector_at_f32(i)?);
+            }
+        }
         if let Some(AdmittedCanonicalTier {
             owner: fast_owner, ..
         }) = &fast_admitted
         {
-            let mut quality_lookup: HashMap<String, Vec<f32>> = HashMap::new();
-            if let Some(AdmittedCanonicalTier {
-                owner: quality_owner,
-                ..
-            }) = &quality_admitted
-            {
-                for i in 0..quality_owner.record_count() {
-                    let row = quality_owner.row(i)?;
-                    if !row.flags().is_live() {
-                        continue;
-                    }
-                    let doc_id = row.doc_id().to_owned();
-                    if let std::collections::hash_map::Entry::Vacant(entry) =
-                        quality_lookup.entry(doc_id)
-                    {
-                        entry.insert(quality_owner.vector_at_f32(i)?);
-                    }
-                }
-            }
             for i in 0..fast_owner.record_count() {
                 let row = fast_owner.row(i)?;
                 if !row.flags().is_live() {
@@ -1619,14 +1622,20 @@ impl RefreshWorker {
                 let doc_id = row.doc_id().to_owned();
                 let vector = fast_owner.vector_at_f32(i)?;
                 let quality = quality_lookup.get(&doc_id).cloned();
-                merged.insert(doc_id, (vector, quality));
+                merged.insert(doc_id, (Some(vector), quality));
             }
+        }
+        for (doc_id, vector) in quality_lookup {
+            // Carried quality rows whose doc has no live fast row keep an
+            // empty fast slot: they must reach the staged quality tier even
+            // when no fast tier was admitted at all.
+            merged.entry(doc_id).or_insert((None, Some(vector)));
         }
         for record in &records {
             merged.insert(
                 record.doc_id.clone(),
                 (
-                    record.fast_embedding.vector().to_vec(),
+                    Some(record.fast_embedding.vector().to_vec()),
                     record
                         .quality_embedding
                         .as_ref()
@@ -1662,8 +1671,12 @@ impl RefreshWorker {
         let fast_binding =
             FsviV2IdentityBinding::new(fast_generation, fast_artifact_bundle.freeze()?)?;
         let mut fast_writer = VectorIndex::create_v2(&staged_fast, fast_binding.clone())?;
-        for (doc_id, (vector, _)) in &merged {
-            fast_writer.write_record(doc_id, vector)?;
+        for (doc_id, (fast_vector, _)) in &merged {
+            // Quality-only carried rows have no fast slot; never fabricate a
+            // fast row for them.
+            if let Some(vector) = fast_vector {
+                fast_writer.write_record(doc_id, vector)?;
+            }
         }
         fast_writer.finish()?;
 
@@ -3665,6 +3678,76 @@ mod tests {
             let vectors = admitted_vectors_by_doc(&quality_owner);
             assert!(vectors.contains_key("old-1"), "carried quality row");
             assert!(vectors.contains_key("doc-2"), "new quality row");
+        });
+    }
+
+    /// Carry-forward regression: an admitted v2 QUALITY tier with no
+    /// admitted fast tier (`AttestedV2 { fast: None, quality: Some(_) }`) is
+    /// reachable, and its live quality rows must still be carried into the
+    /// staged generation — landing in the staged quality tier only, never as
+    /// fabricated fast rows. The former merge nested the quality carry
+    /// inside the fast-tier `if let`, silently dropping every carried
+    /// quality row while still stamping successor lineage.
+    #[test]
+    fn staging_quality_only_generation_carries_quality_rows() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let fast = Arc::new(StubEmbedder::new("v2-fast", V2_DIM));
+            let quality = Arc::new(StubEmbedder::new("v2-quality", 16));
+            let dir = temp_index_dir("v2-quality-only-carry");
+            let cache = make_cache_with_fallback_seed(&dir, V2_DIM);
+            // Attested v2 quality tier; the fast tier is only the empty v1
+            // fallback seed, so admission yields fast: None, quality: Some.
+            let quality_binding = v2_binding(quality.identity_bundle(), 4);
+            let quality_path = dir.join(VECTOR_INDEX_QUALITY_FILENAME);
+            write_v2_tier(
+                &quality_path,
+                &quality_binding,
+                &[("old-q", normalized(16, 0.5))],
+            );
+
+            let queue = make_queue(100);
+            submit(&queue, "doc-2", "a second document");
+            let jobs = queue.drain_batch();
+            let worker =
+                RefreshWorker::new(RefreshWorkerConfig::new(&dir), queue.clone(), fast, cache)
+                    .with_quality_embedder(quality.clone());
+
+            let staged = worker
+                .stage_identity_bound_generation(&cx, &jobs)
+                .await
+                .expect("quality-only generation must stage successfully");
+
+            let quality_owner = VectorIndex::open_admitted_v2(
+                staged.quality_path.as_ref().expect("quality path"),
+                staged.quality_binding.as_ref().expect("quality binding"),
+            )
+            .expect("staged quality admits");
+            let quality_vectors = admitted_vectors_by_doc(&quality_owner);
+            assert!(
+                quality_vectors.contains_key("old-q"),
+                "carried quality rows must survive without an admitted fast tier"
+            );
+            assert!(quality_vectors.contains_key("doc-2"), "new quality row");
+            assert_eq!(
+                staged
+                    .quality_binding
+                    .as_ref()
+                    .expect("quality binding")
+                    .generation()
+                    .sequence,
+                5,
+                "successor lineage must build on the attested quality sequence 4"
+            );
+
+            // The quality-only carried row must not fabricate a fast row.
+            let fast_owner = VectorIndex::open_admitted_v2(&staged.fast_path, &staged.fast_binding)
+                .expect("staged fast admits");
+            let fast_vectors = admitted_vectors_by_doc(&fast_owner);
+            assert!(
+                !fast_vectors.contains_key("old-q"),
+                "a carried quality-only row must never fabricate a fast row"
+            );
+            assert!(fast_vectors.contains_key("doc-2"), "new fast row");
         });
     }
 
