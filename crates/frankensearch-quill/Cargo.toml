@@ -22,6 +22,10 @@ bench-internals = ["frankensearch-core/bench-internals", "dep:sha2"]
 # Deterministic fault-injection seams used only by method-bound conformance
 # witnesses. Shipping consumers never enable this feature.
 conformance-internals = ["dep:sha2"]
+# Invocation-local diagnostic profile receipts. This remains separate from
+# benchmark and conformance features so timing builds cannot accidentally link
+# profile instrumentation.
+profile-internals = []
 # Exact per-refill receipts for the UNION_HORIZON oracle campaign. Kept
 # separate so the same-binary performance harness never pays for tracing state.
 pruning-conformance = ["conformance-internals"]

@@ -9,10 +9,12 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ops::{Bound, Deref};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-#[cfg(feature = "conformance-internals")]
+#[cfg(any(feature = "conformance-internals", feature = "profile-internals"))]
 use std::sync::Mutex as StdMutex;
+#[cfg(feature = "profile-internals")]
+use std::sync::atomic::AtomicBool;
 #[cfg(feature = "conformance-internals")]
-use std::sync::atomic::{AtomicBool, AtomicU8};
+use std::sync::atomic::AtomicU8;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -1904,6 +1906,323 @@ struct QueryFuelState {
     dictionary_blocks: AtomicU64,
     posting_blocks: AtomicU64,
     position_docs: AtomicU64,
+}
+
+/// Cache disposition observed by one invocation-local diagnostic profile.
+///
+/// This type is deliberately unavailable to ordinary and benchmark builds.
+/// Profiled observations must be collected by a separately built sidecar ELF,
+/// never by the timing executable.
+#[cfg(feature = "profile-internals")]
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuillProfileCacheDisposition {
+    /// The invocation returned before a cache lookup could occur.
+    NotChecked,
+    /// The ranked query cache supplied the ordinary result.
+    Hit,
+    /// The ranked query cache was checked but had no matching result.
+    Miss,
+    /// The ranked query cache was intentionally unavailable for this invocation.
+    Disabled,
+}
+
+/// Shipping sealed-segment branch observed by one diagnostic invocation.
+#[cfg(feature = "profile-internals")]
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuillProfileExecutionMode {
+    /// Sealed segments were collected in snapshot order.
+    Serial,
+    /// Sealed segments were collected through the shipping Rayon fan-out path.
+    Rayon,
+}
+
+/// Terminal outcome recorded by an invocation-local diagnostic profile.
+#[cfg(feature = "profile-internals")]
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuillProfileOutcome {
+    /// The ordinary query returned its normal result.
+    Completed,
+    /// The ordinary query observed cancellation.
+    Cancelled,
+    /// The ordinary query exhausted its shipping fuel budget.
+    FuelExhausted,
+    /// The ordinary query ended with another typed error.
+    OtherError,
+}
+
+/// Immutable counters and single-assignment facts from one diagnostic query.
+#[cfg(feature = "profile-internals")]
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QuillProfileReceipt {
+    snapshot_epoch: u64,
+    keeper_generation: u64,
+    sealed_segments: u64,
+    delta_segments: u64,
+    cache: QuillProfileCacheDisposition,
+    execution: Option<QuillProfileExecutionMode>,
+    snapshot_doc_freq_calls: u64,
+    global_doc_freq_probes: u64,
+    term_dictionary_views: u64,
+    segments_lowered: u64,
+    fuel_units: u64,
+    overflowed: bool,
+    outcome: QuillProfileOutcome,
+}
+
+#[cfg(feature = "profile-internals")]
+impl QuillProfileReceipt {
+    /// Snapshot epoch bound to the profiled ordinary invocation.
+    #[must_use]
+    pub const fn snapshot_epoch(&self) -> u64 {
+        self.snapshot_epoch
+    }
+
+    /// Retained Keeper generation bound to the profiled ordinary invocation.
+    #[must_use]
+    pub const fn keeper_generation(&self) -> u64 {
+        self.keeper_generation
+    }
+
+    /// Sealed and Delta segment counts observed at query admission.
+    #[must_use]
+    pub const fn segment_counts(&self) -> (u64, u64) {
+        (self.sealed_segments, self.delta_segments)
+    }
+
+    /// Cache disposition, including the explicit no-lookup state.
+    #[must_use]
+    pub const fn cache(&self) -> QuillProfileCacheDisposition {
+        self.cache
+    }
+
+    /// Actual sealed-segment execution branch, when sealed work was reached.
+    #[must_use]
+    pub const fn execution(&self) -> Option<QuillProfileExecutionMode> {
+        self.execution
+    }
+
+    /// Counter tuple in the order: snapshot DF, global DF, TERMDICT views,
+    /// lowered segments, and admitted fuel units.
+    #[must_use]
+    pub const fn counters(&self) -> (u64, u64, u64, u64, u64) {
+        (
+            self.snapshot_doc_freq_calls,
+            self.global_doc_freq_probes,
+            self.term_dictionary_views,
+            self.segments_lowered,
+            self.fuel_units,
+        )
+    }
+
+    /// Whether a counter saturated before the receipt could be finalized.
+    #[must_use]
+    pub const fn overflowed(&self) -> bool {
+        self.overflowed
+    }
+
+    /// Terminal ordinary-query outcome.
+    #[must_use]
+    pub const fn outcome(&self) -> QuillProfileOutcome {
+        self.outcome
+    }
+}
+
+/// Invocation-local sidecar session for Quill diagnostic instrumentation.
+///
+/// Counters use relaxed increments because the caller only finalizes after all
+/// worker joins; finalization reads with acquire ordering and rejects any
+/// repeated or contradictory single-assignment fact. The session has no global
+/// reset path and is therefore safe to keep beside an ordinary invocation.
+#[cfg(feature = "profile-internals")]
+#[doc(hidden)]
+#[derive(Debug)]
+pub struct QuillProfileSession {
+    snapshot_epoch: u64,
+    keeper_generation: u64,
+    sealed_segments: u64,
+    delta_segments: u64,
+    snapshot_doc_freq_calls: AtomicU64,
+    global_doc_freq_probes: AtomicU64,
+    term_dictionary_views: AtomicU64,
+    segments_lowered: AtomicU64,
+    fuel_units: AtomicU64,
+    overflowed: AtomicBool,
+    state: StdMutex<QuillProfileSessionState>,
+}
+
+#[cfg(feature = "profile-internals")]
+#[derive(Debug)]
+struct QuillProfileSessionState {
+    cache: Option<QuillProfileCacheDisposition>,
+    execution: Option<QuillProfileExecutionMode>,
+    completed: bool,
+}
+
+#[cfg(feature = "profile-internals")]
+impl QuillProfileSession {
+    /// Begin a sidecar receipt bound to one already-admitted snapshot.
+    #[must_use]
+    pub fn new(
+        snapshot_epoch: u64,
+        keeper_generation: u64,
+        sealed_segments: u64,
+        delta_segments: u64,
+    ) -> Self {
+        Self {
+            snapshot_epoch,
+            keeper_generation,
+            sealed_segments,
+            delta_segments,
+            snapshot_doc_freq_calls: AtomicU64::new(0),
+            global_doc_freq_probes: AtomicU64::new(0),
+            term_dictionary_views: AtomicU64::new(0),
+            segments_lowered: AtomicU64::new(0),
+            fuel_units: AtomicU64::new(0),
+            overflowed: AtomicBool::new(false),
+            state: StdMutex::new(QuillProfileSessionState {
+                cache: None,
+                execution: None,
+                completed: false,
+            }),
+        }
+    }
+
+    /// Bind one cache disposition. Conflicting or repeated binding fails closed.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed invalid-state error if the session was finalized, the
+    /// cache disposition was already bound, or the session lock is poisoned.
+    pub fn bind_cache(&self, cache: QuillProfileCacheDisposition) -> Result<(), QuillIndexError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| invalid_state("profile-internals session lock is poisoned"))?;
+        if state.completed || state.cache.is_some() {
+            return Err(invalid_state(
+                "profile-internals cache disposition was already bound",
+            ));
+        }
+        state.cache = Some(cache);
+        drop(state);
+        Ok(())
+    }
+
+    /// Bind one actual sealed-segment execution branch.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed invalid-state error if the session was finalized, the
+    /// execution branch was already bound, or the session lock is poisoned.
+    pub fn bind_execution(
+        &self,
+        execution: QuillProfileExecutionMode,
+    ) -> Result<(), QuillIndexError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| invalid_state("profile-internals session lock is poisoned"))?;
+        if state.completed || state.execution.is_some() {
+            return Err(invalid_state(
+                "profile-internals execution mode was already bound",
+            ));
+        }
+        state.execution = Some(execution);
+        drop(state);
+        Ok(())
+    }
+
+    /// Record one or more snapshot document-frequency calls.
+    pub fn record_snapshot_doc_freq(&self, units: u64) {
+        self.record_counter(&self.snapshot_doc_freq_calls, units);
+    }
+
+    /// Record one or more global document-frequency probes.
+    pub fn record_global_doc_freq(&self, units: u64) {
+        self.record_counter(&self.global_doc_freq_probes, units);
+    }
+
+    /// Record one or more borrowed TERMDICT views.
+    pub fn record_term_dictionary_view(&self, units: u64) {
+        self.record_counter(&self.term_dictionary_views, units);
+    }
+
+    /// Record one or more lowered sealed or Delta segments.
+    pub fn record_segment_lowered(&self, units: u64) {
+        self.record_counter(&self.segments_lowered, units);
+    }
+
+    /// Record admitted shipping fuel units, including unmetered observations.
+    pub fn record_fuel_units(&self, units: u64) {
+        self.record_counter(&self.fuel_units, units);
+    }
+
+    fn record_counter(&self, counter: &AtomicU64, units: u64) {
+        if units == 0 {
+            return;
+        }
+        if counter
+            .try_update(Ordering::Relaxed, Ordering::Relaxed, |value| {
+                value.checked_add(units)
+            })
+            .is_err()
+        {
+            self.overflowed.store(true, Ordering::Release);
+        }
+    }
+
+    /// Finalize the session once all worker joins have completed.
+    ///
+    /// A profile with an unset cache state, an overflow, or a second finalizer
+    /// is rejected rather than becoming a partial timing artifact.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed invalid-state error for a repeated finalizer, missing
+    /// cache disposition, poisoned session lock, or counter overflow.
+    pub fn complete(
+        &self,
+        outcome: QuillProfileOutcome,
+    ) -> Result<QuillProfileReceipt, QuillIndexError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| invalid_state("profile-internals session lock is poisoned"))?;
+        if state.completed {
+            return Err(invalid_state(
+                "profile-internals session was already completed",
+            ));
+        }
+        state.completed = true;
+        let cache = state
+            .cache
+            .ok_or_else(|| invalid_state("profile-internals cache disposition was never bound"))?;
+        let overflowed = self.overflowed.load(Ordering::Acquire);
+        if overflowed {
+            return Err(invalid_state(
+                "profile-internals counter overflowed before finalization",
+            ));
+        }
+        Ok(QuillProfileReceipt {
+            snapshot_epoch: self.snapshot_epoch,
+            keeper_generation: self.keeper_generation,
+            sealed_segments: self.sealed_segments,
+            delta_segments: self.delta_segments,
+            cache,
+            execution: state.execution,
+            snapshot_doc_freq_calls: self.snapshot_doc_freq_calls.load(Ordering::Acquire),
+            global_doc_freq_probes: self.global_doc_freq_probes.load(Ordering::Acquire),
+            term_dictionary_views: self.term_dictionary_views.load(Ordering::Acquire),
+            segments_lowered: self.segments_lowered.load(Ordering::Acquire),
+            fuel_units: self.fuel_units.load(Ordering::Acquire),
+            overflowed,
+            outcome,
+        })
+    }
 }
 
 /// Refill strategy observed by the exact pruning-conformance witness.
@@ -11361,6 +11680,83 @@ mod tests {
         "\"shared left\"",
         "ord:[0 TO 39]",
     ];
+
+    #[cfg(feature = "profile-internals")]
+    #[test]
+    fn profile_session_is_invocation_local_one_shot_and_counter_exact() {
+        let session = QuillProfileSession::new(17, 23, 5, 2);
+        session
+            .bind_cache(QuillProfileCacheDisposition::Miss)
+            .expect("bind cache disposition once");
+        session
+            .bind_execution(QuillProfileExecutionMode::Rayon)
+            .expect("bind actual shipping branch once");
+        session.record_snapshot_doc_freq(5);
+        session.record_global_doc_freq(25);
+        session.record_term_dictionary_view(30);
+        session.record_segment_lowered(7);
+        session.record_fuel_units(41);
+
+        let receipt = session
+            .complete(QuillProfileOutcome::Completed)
+            .expect("complete one invocation-local receipt");
+        assert_eq!(receipt.snapshot_epoch(), 17);
+        assert_eq!(receipt.keeper_generation(), 23);
+        assert_eq!(receipt.segment_counts(), (5, 2));
+        assert_eq!(receipt.cache(), QuillProfileCacheDisposition::Miss);
+        assert_eq!(receipt.execution(), Some(QuillProfileExecutionMode::Rayon));
+        assert_eq!(receipt.counters(), (5, 25, 30, 7, 41));
+        assert!(!receipt.overflowed());
+        assert_eq!(receipt.outcome(), QuillProfileOutcome::Completed);
+        assert!(matches!(
+            session.complete(QuillProfileOutcome::Completed),
+            Err(QuillIndexError::InvalidState { detail })
+                if detail.contains("already completed")
+        ));
+
+        let conflicting_cache = QuillProfileSession::new(1, 1, 0, 0);
+        conflicting_cache
+            .bind_cache(QuillProfileCacheDisposition::Disabled)
+            .expect("bind first cache fact");
+        assert!(matches!(
+            conflicting_cache.bind_cache(QuillProfileCacheDisposition::Hit),
+            Err(QuillIndexError::InvalidState { detail })
+                if detail.contains("already bound")
+        ));
+        let retained = conflicting_cache
+            .complete(QuillProfileOutcome::Cancelled)
+            .expect("conflicting bind cannot overwrite the original fact");
+        assert_eq!(retained.cache(), QuillProfileCacheDisposition::Disabled);
+        assert_eq!(retained.outcome(), QuillProfileOutcome::Cancelled);
+
+        let incomplete = QuillProfileSession::new(1, 1, 0, 0);
+        assert!(matches!(
+            incomplete.complete(QuillProfileOutcome::OtherError),
+            Err(QuillIndexError::InvalidState { detail })
+                if detail.contains("never bound")
+        ));
+        assert!(matches!(
+            incomplete.bind_cache(QuillProfileCacheDisposition::NotChecked),
+            Err(QuillIndexError::InvalidState { detail })
+                if detail.contains("already bound")
+        ));
+    }
+
+    #[cfg(feature = "profile-internals")]
+    #[test]
+    fn profile_session_rejects_counter_overflow() {
+        let session = QuillProfileSession::new(1, 1, 0, 0);
+        session
+            .bind_cache(QuillProfileCacheDisposition::NotChecked)
+            .expect("bind explicit no-lookup fact");
+        session.record_fuel_units(u64::MAX);
+        session.record_fuel_units(1);
+        assert!(matches!(
+            session.complete(QuillProfileOutcome::FuelExhausted),
+            Err(QuillIndexError::InvalidState { detail })
+                if detail.contains("counter overflowed")
+        ));
+    }
 
     #[cfg(feature = "pruning-conformance")]
     #[test]

@@ -52,6 +52,12 @@ pub use index::{
     QuillSearchIndex, QuillSearchResult, QuillSearchSnapshot, QuillSnippetHit, SnapshotError,
     SnapshotPublisher, indexable_document_content_hash,
 };
+#[cfg(feature = "profile-internals")]
+#[doc(hidden)]
+pub use index::{
+    QuillProfileCacheDisposition, QuillProfileExecutionMode, QuillProfileOutcome,
+    QuillProfileReceipt, QuillProfileSession,
+};
 #[cfg(feature = "durability")]
 pub use keeper::UnrepairableSegmentPolicy;
 pub use keeper::{
