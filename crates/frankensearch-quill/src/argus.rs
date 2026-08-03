@@ -352,6 +352,17 @@ pub trait PostingCursor {
     /// storage invariants.
     fn advance(&mut self, target: u32) -> Result<Option<u32>, ArgusError>;
 
+    /// Whether this cursor's backing storage validates every post-move
+    /// invariant required by a term scorer.
+    ///
+    /// The default keeps defensive post-move validation enabled for custom
+    /// and Delta cursors. The sealed Quiver adapter may opt in only because
+    /// its validated codec guarantees ordered document ids and positive
+    /// frequencies for every decoded posting.
+    fn has_validated_post_move_contract(&self) -> bool {
+        false
+    }
+
     /// Fork the current position into an independent cursor suitable for
     /// competitive candidate generation.
     ///
@@ -457,6 +468,10 @@ where
 
     fn advance(&mut self, target: u32) -> Result<Option<u32>, ArgusError> {
         (**self).advance(target)
+    }
+
+    fn has_validated_post_move_contract(&self) -> bool {
+        (**self).has_validated_post_move_contract()
     }
 
     fn fork_for_pruning(&self) -> Option<Box<dyn PostingCursor + '_>> {
@@ -595,6 +610,10 @@ impl PostingCursor for CheckpointPostingCursor<'_> {
         let moved = self.inner.advance(target)?;
         self.checkpoint_move(previous)?;
         Ok(moved)
+    }
+
+    fn has_validated_post_move_contract(&self) -> bool {
+        self.inner.has_validated_post_move_contract()
     }
 
     fn fork_for_pruning(&self) -> Option<Box<dyn PostingCursor + '_>> {
@@ -825,6 +844,10 @@ impl PostingCursor for SealedPostingCursor<'_> {
                 Ok(cursor.advance(target)?.map(|posting| posting.doc_id))
             }
         }
+    }
+
+    fn has_validated_post_move_contract(&self) -> bool {
+        true
     }
 
     fn fork_for_pruning(&self) -> Option<Box<dyn PostingCursor + '_>> {
@@ -1338,6 +1361,7 @@ pub struct TermScorer<'a> {
     cost: u64,
     size_hint: u32,
     segment_num_docs: u32,
+    validated_post_move_contract: bool,
 }
 
 impl<'a> TermScorer<'a> {
@@ -1382,6 +1406,7 @@ impl<'a> TermScorer<'a> {
         let size_hint = cursor.size_hint();
         let cost = cursor.cost();
         let segment_num_docs = cursor.segment_num_docs();
+        let validated_post_move_contract = cursor.has_validated_post_move_contract();
         if u64::from(segment_num_docs) > snapshot.doc_count() {
             return Err(ArgusError::InvalidSnapshot {
                 field_ord: snapshot.field_ord(),
@@ -1457,6 +1482,7 @@ impl<'a> TermScorer<'a> {
             cost,
             size_hint,
             segment_num_docs,
+            validated_post_move_contract,
         })
     }
 
@@ -1467,8 +1493,11 @@ impl<'a> TermScorer<'a> {
     fn next(&mut self) -> Result<Option<u32>, ArgusError> {
         let previous = self.cursor.doc();
         let moved = self.cursor.next()?;
-        let moved =
-            validate_cursor_after_move(self.cursor.as_ref(), self.fieldnorms.as_ref(), moved)?;
+        let moved = if self.validated_post_move_contract {
+            moved
+        } else {
+            validate_cursor_after_move(self.cursor.as_ref(), self.fieldnorms.as_ref(), moved)?
+        };
         match (previous, moved) {
             (None, Some(_)) => Err(ArgusError::CursorInvariant(
                 "exhausted cursor resurrected during next",
@@ -1483,8 +1512,11 @@ impl<'a> TermScorer<'a> {
     fn seek(&mut self, target: u32) -> Result<Option<u32>, ArgusError> {
         let previous = self.cursor.doc();
         let moved = self.cursor.advance(target)?;
-        let moved =
-            validate_cursor_after_move(self.cursor.as_ref(), self.fieldnorms.as_ref(), moved)?;
+        let moved = if self.validated_post_move_contract {
+            moved
+        } else {
+            validate_cursor_after_move(self.cursor.as_ref(), self.fieldnorms.as_ref(), moved)?
+        };
         match (previous, moved) {
             (None, Some(_)) => Err(ArgusError::CursorInvariant(
                 "exhausted cursor resurrected during advance",
@@ -5520,6 +5552,8 @@ mod tests {
         let sealed = SealedPostingCursor::new(&list, segment_num_docs)?;
         let mut cursor = CheckpointPostingCursor::new(sealed, checkpoint_for_cursor)?;
 
+        assert!(PostingCursor::has_validated_post_move_contract(&cursor));
+
         while cursor.next()?.is_some() {}
 
         assert_eq!(
@@ -6803,6 +6837,10 @@ mod tests {
             )
         };
 
+        assert!(!PostingCursor::has_validated_post_move_contract(
+            &FaultCursor::new(CursorFault::StickyNext)
+        ));
+
         let mut sticky = scorer(CursorFault::StickyNext)?;
         assert!(matches!(sticky.next(), Err(ArgusError::CursorInvariant(_))));
         let mut backward = scorer(CursorFault::BackwardNext)?;
@@ -6852,6 +6890,7 @@ mod tests {
         let positions = encoded_positions.position_list(&list)?;
         let mut cursor = SealedPostingCursor::with_positions(&positions, 3)?;
 
+        assert!(PostingCursor::has_validated_post_move_contract(&cursor));
         assert_eq!(PostingCursor::doc(&cursor), Some(3));
         assert_eq!(PostingCursor::freq(&cursor), Some(2));
         let handle = PostingCursor::positions_handle(&cursor).expect("position handle");
@@ -6881,6 +6920,7 @@ mod tests {
         assert!(PostingCursor::positions_handle(&cursor).is_none());
 
         let cursor = SealedPostingCursor::new(&list, 3)?;
+        assert!(PostingCursor::has_validated_post_move_contract(&cursor));
         assert_eq!(PostingCursor::doc(&cursor), Some(3));
         assert!(PostingCursor::positions_handle(&cursor).is_none());
         Ok(())
