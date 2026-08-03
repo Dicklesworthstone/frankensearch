@@ -8535,3 +8535,19 @@ on CV.
   `504fa185`, NOT pushed; push awaits the user ruling gate
   (`bd-s1rc1-ubs-user-ruling-gate-82rpt`). Full narrative:
   `docs/evidence/e8h/p5-s1rc1-arc-backing-rebase-20260730.md`.
+
+## 2026-08-03 — CORRECTION: FSVI 4-bit two-pass is not an externally fastest primitive (`bd-retract-fastest-lossless-superlative-3ush8`)
+
+The historical self-comparison descriptions at rows 825, 827, and 828 use
+unbounded “fastest lossless” language. They compare only repository-local
+arms and do not establish an external ranking. The independently measured
+same-invocation conversion card reports the equal-thread candidate/incumbent
+ratio as **1.5790** against a third-party BLAS-class exact scan, above the
+null p95 of **1.4825**: 4-bit is decidably slower in that comparison. The
+4-bit path did return the same top-k as the full-precision arm on the card's
+32/32 clustered-fixture check; that bounded losslessness result remains
+separate from any speed ranking. See
+[`fsvi-4bit-vs-incumbent-20260731.md`](evidence/fsvi-4bit-vs-incumbent-20260731.md)
+and the corresponding negative-evidence entry for full provenance. The public
+CHANGELOG therefore carries no fastest or external-performance claim for this
+primitive.
