@@ -341,7 +341,10 @@ pub use stream_protocol::{
     encode_stream_frame_toon, failure_category_for_error, is_retryable_error, retry_backoff_ms,
     terminal_event_completed, terminal_event_from_error, validate_stream_frame,
 };
-pub use tracing_setup::{Verbosity, init_subscriber};
+pub use tracing_setup::{
+    LogFilterResolution, LogFilterSource, Verbosity, current_unicode_environment, init_subscriber,
+    resolve_log_filter,
+};
 pub use watcher::{
     DEFAULT_BATCH_SIZE, DEFAULT_DEBOUNCE_MS, FileSnapshot, FsWatcher, NoopWatchIngestPipeline,
     WatchBatchOutcome, WatchEvent, WatchEventKind, WatchIngestOp, WatchIngestPipeline,
