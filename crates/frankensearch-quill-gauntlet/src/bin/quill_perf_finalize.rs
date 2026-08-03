@@ -796,6 +796,37 @@ mod tests {
     }
 
     #[test]
+    fn terminal_attempt_outcomes_report_the_bound_release_receipt_before_returning() {
+        let source = production_source();
+        let run_body = source
+            .split("fn run() -> Result<FinalizeOutcome, Box<dyn Error>>")
+            .nth(1)
+            .and_then(|suffix| suffix.split("fn parse_assembly_args").next())
+            .expect("production run body");
+        let failed_attempt = unique_marker_offset(
+            run_body,
+            "Err(LocalPerfRunError::AttemptFailed {\n            receipt_path,\n            lease_release_receipt,",
+        );
+        let failed_release = unique_marker_offset(
+            run_body,
+            "println!(\"lease_release_receipt={}\", lease_release_receipt.display());",
+        );
+        let durable_no_claim =
+            unique_marker_offset(run_body, "return Ok(FinalizeOutcome::DurableNoClaim);");
+        let successful_attempt = unique_marker_offset(
+            run_body,
+            "println!(\"attempt_receipt={}\", output.attempt_receipt.display());",
+        );
+        let successful_release = unique_marker_offset(
+            run_body,
+            "\"lease_release_receipt={}\",\n        output.lease_release_receipt.display()",
+        );
+        assert!(failed_attempt < failed_release);
+        assert!(failed_release < durable_no_claim);
+        assert!(successful_attempt < successful_release);
+    }
+
+    #[test]
     fn assembly_uses_the_descriptor_verified_publication_without_path_reload() {
         let source = production_source();
         let assembly_body = source
