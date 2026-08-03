@@ -136,6 +136,7 @@ fn run() -> Result<PerfGateDecision, Box<dyn Error>> {
     let manifest_text = std::str::from_utf8(&manifest_bytes)?;
     let manifest_sha256 = perf_manifest_contract_sha256(manifest_text);
     let manifest = toml::from_str::<toml::Value>(manifest_text)?;
+    validate_manifest_gate_set(&manifest)?;
 
     let _history_lock = acquire_promotion_history_lock(&args)?;
     let loaded_baseline = read_baseline(&args.baseline, args.baseline_evidence.as_deref())?;
@@ -1043,6 +1044,40 @@ fn gate_activated(manifest: &toml::Value, gate: PerfGate) -> Result<bool, Box<dy
         .ok_or_else(|| format!("manifest does not define gate.{}.activated", gate.label()).into())
 }
 
+/// Reject a manifest that omits, renames, or adds a normative performance gate.
+///
+/// The gate set is the contract from which all admission decisions derive. A
+/// selected gate's `activated` flag alone is insufficient: a malformed
+/// unrelated table would otherwise evade validation and make the committed
+/// manifest an incomplete source of truth.
+fn validate_manifest_gate_set(manifest: &toml::Value) -> Result<(), Box<dyn Error>> {
+    let gates = manifest
+        .get("gate")
+        .and_then(toml::Value::as_table)
+        .ok_or("manifest does not define a [gate] table")?;
+
+    for gate in PerfGate::ALL {
+        let label = gate.label();
+        let policy = gates
+            .get(label)
+            .ok_or_else(|| format!("manifest is missing gate.{label}"))?;
+        if !policy.is_table() {
+            return Err(format!("manifest gate.{label} is not a table").into());
+        }
+    }
+
+    for label in gates.keys() {
+        if !PerfGate::ALL
+            .iter()
+            .any(|gate| gate.label() == label.as_str())
+        {
+            return Err(format!("manifest defines unexpected gate.{label}").into());
+        }
+    }
+
+    Ok(())
+}
+
 fn evidence(role: &str, path: &Path, bytes: &[u8]) -> PerfEvidenceFile {
     PerfEvidenceFile {
         role: role.to_owned(),
@@ -1333,6 +1368,35 @@ mod tests {
         assert!(validate_component("../worker", "run ID").is_err());
         assert!(validate_component("candidate-1", "run ID").is_ok());
         assert!(validate_component("2026-07-23", "date").is_ok());
+    }
+
+    #[test]
+    fn manifest_gate_set_is_exact_and_fails_closed_for_missing_or_extra_gates() {
+        let manifest_text = include_str!("../../../../docs/contracts/quill-perf-gates.toml");
+        let manifest = toml::from_str::<toml::Value>(manifest_text)
+            .expect("parse normative performance manifest");
+        validate_manifest_gate_set(&manifest)
+            .expect("normative manifest has every QG gate exactly once");
+
+        let missing = manifest_text.replacen("[gate.QG-10]", "[omitted.QG-10]", 1);
+        let missing = toml::from_str::<toml::Value>(&missing).expect("parse missing-gate mutation");
+        let missing_error = validate_manifest_gate_set(&missing)
+            .expect_err("missing normative gate must fail closed")
+            .to_string();
+        assert!(
+            missing_error.contains("missing gate.QG-10"),
+            "unexpected missing-gate error: {missing_error}"
+        );
+
+        let extra = format!("{manifest_text}\n[gate.QG-11]\nactivated = false\n");
+        let extra = toml::from_str::<toml::Value>(&extra).expect("parse extra-gate mutation");
+        let extra_error = validate_manifest_gate_set(&extra)
+            .expect_err("extra normative gate must fail closed")
+            .to_string();
+        assert!(
+            extra_error.contains("unexpected gate.QG-11"),
+            "unexpected extra-gate error: {extra_error}"
+        );
     }
 
     #[test]
