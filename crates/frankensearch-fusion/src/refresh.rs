@@ -84,6 +84,7 @@ use frankensearch_index::{
     FsviAdmissionError, FsviV2IdentityBinding, FsviV2IdentityMetadata, TwoTierIndex,
     TwoTierIndexPaths, VECTOR_INDEX_FALLBACK_FILENAME, VECTOR_INDEX_FAST_FILENAME,
     VECTOR_INDEX_QUALITY_FILENAME, ValidatedFsviBytes, VectorIndex, VectorMetadata,
+    next_publication_nonce,
 };
 
 use crate::cache::IndexCache;
@@ -1661,6 +1662,18 @@ impl RefreshWorker {
         let _ = std::fs::remove_file(&staged_fast);
         let _ = std::fs::remove_file(&staged_quality);
 
+        // Both staged tiers carry ONE publication nonce, the successor of
+        // the admitted destination pair's (mirroring the v1 publish_tier
+        // route, bd-miio8): the staged pair re-admits as a same-publication
+        // pair instead of a legacy 0 == 0 exemption, and a crash between the
+        // two eventual per-tier installs stays detectable at open time.
+        let publication_nonce = next_publication_nonce(
+            fast_admitted
+                .as_ref()
+                .or(quality_admitted.as_ref())
+                .map_or(0, |tier| tier.owner.metadata().publication_nonce),
+        );
+
         let fast_sequence =
             next_generation_sequence(fast_admitted.as_ref().map(|tier| &tier.owner))?;
         let fast_artifact_bundle = artifact_identity_for(self.fast_embedder.as_ref())?;
@@ -1670,7 +1683,8 @@ impl RefreshWorker {
         )?;
         let fast_binding =
             FsviV2IdentityBinding::new(fast_generation, fast_artifact_bundle.freeze()?)?;
-        let mut fast_writer = VectorIndex::create_v2(&staged_fast, fast_binding.clone())?;
+        let mut fast_writer = VectorIndex::create_v2(&staged_fast, fast_binding.clone())?
+            .with_publication_nonce(publication_nonce);
         for (doc_id, (fast_vector, _)) in &merged {
             // Quality-only carried rows have no fast slot; never fabricate a
             // fast row for them.
@@ -1702,7 +1716,8 @@ impl RefreshWorker {
                 generation_nonce(&self.config.index_dir, "quality", quality_sequence),
             )?;
             let binding = FsviV2IdentityBinding::new(quality_generation, quality_bundle.freeze()?)?;
-            let mut quality_writer = VectorIndex::create_v2(&staged_quality, binding.clone())?;
+            let mut quality_writer = VectorIndex::create_v2(&staged_quality, binding.clone())?
+                .with_publication_nonce(publication_nonce);
             for (doc_id, vector) in quality_rows {
                 quality_writer.write_record(doc_id, vector)?;
             }
@@ -3678,6 +3693,62 @@ mod tests {
             let vectors = admitted_vectors_by_doc(&quality_owner);
             assert!(vectors.contains_key("old-1"), "carried quality row");
             assert!(vectors.contains_key("doc-2"), "new quality row");
+        });
+    }
+
+    /// The staged v2 pair analog of the v1
+    /// `finish_stamps_both_tiers_with_one_nonzero_publication_nonce`: both
+    /// staged tiers must carry one shared NON-ZERO publication nonce
+    /// (bd-miio8), so the pair is bound as a single publication instead of
+    /// reading 0 == 0 and slipping past the mixed-generation check.
+    #[test]
+    fn staging_stamps_both_tiers_with_one_nonzero_publication_nonce() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let fast = Arc::new(StubEmbedder::new("v2-fast", V2_DIM));
+            let quality = Arc::new(StubEmbedder::new("v2-quality", 16));
+            let (dir, cache, _fast_binding, _fast_path) = v2_canonical_fixture(
+                "v2-pair-nonce",
+                fast.identity_bundle(),
+                &[("old-1", normalized(V2_DIM, 0.25))],
+                2,
+            );
+            let quality_binding = v2_binding(quality.identity_bundle(), 2);
+            let quality_path = dir.join(VECTOR_INDEX_QUALITY_FILENAME);
+            write_v2_tier(
+                &quality_path,
+                &quality_binding,
+                &[("old-1", normalized(16, 0.5))],
+            );
+
+            let queue = make_queue(100);
+            submit(&queue, "doc-2", "a second document");
+            let jobs = queue.drain_batch();
+            let worker =
+                RefreshWorker::new(RefreshWorkerConfig::new(&dir), queue.clone(), fast, cache)
+                    .with_quality_embedder(quality.clone());
+
+            let staged = worker
+                .stage_identity_bound_generation(&cx, &jobs)
+                .await
+                .expect("two-tier staging must succeed");
+
+            let fast_owner = VectorIndex::open_admitted_v2(&staged.fast_path, &staged.fast_binding)
+                .expect("staged fast admits");
+            let quality_owner = VectorIndex::open_admitted_v2(
+                staged.quality_path.as_ref().expect("quality path"),
+                staged.quality_binding.as_ref().expect("quality binding"),
+            )
+            .expect("staged quality admits");
+            let fast_nonce = fast_owner.metadata().publication_nonce;
+            let quality_nonce = quality_owner.metadata().publication_nonce;
+            assert_ne!(
+                fast_nonce, 0,
+                "a staged v2 pair must carry a real publication identity"
+            );
+            assert_eq!(
+                fast_nonce, quality_nonce,
+                "both staged tiers share one publication"
+            );
         });
     }
 

@@ -1817,6 +1817,11 @@ impl VectorIndex {
     /// The exact validated identity and full-width generation are required
     /// before any writer is returned.
     ///
+    /// The writer starts at publication nonce 0 (single-tier). Every tier of
+    /// one multi-tier v2 publication must be stamped with the same non-zero
+    /// nonce via [`VectorIndexWriter::with_publication_nonce`] (bd-miio8), or
+    /// the pair reads 0 == 0 and is exempt from the mixed-generation check.
+    ///
     /// # Errors
     ///
     /// Returns [`SearchError::InvalidConfig`] if the binding is invalid.
@@ -3810,6 +3815,7 @@ impl VectorIndexWriter {
                 })?;
                 let header = build_v2_header(
                     binding,
+                    self.publication_nonce,
                     record_count,
                     vectors_offset,
                     docset_digest,
@@ -4105,12 +4111,16 @@ fn parse_v2_header(path: &Path, data: &[u8]) -> SearchResult<(VectorMetadata, us
         path,
     )?;
     let flags = read_array::<1>(path, header, &mut cursor, "header_flags")?[0];
-    let reserved = u16::from_le_bytes(read_array::<2>(path, header, &mut cursor, "reserved")?);
-    if flags != 0 || reserved != 0 {
-        return Err(index_corrupted(
-            path,
-            "v2 header flags and reserved fields must be zero",
-        ));
+    // Formerly a reserved-zero u16; now the cross-tier publication nonce
+    // (bd-miio8), zero on single-tier and pre-nonce v2 files.
+    let publication_nonce = u16::from_le_bytes(read_array::<2>(
+        path,
+        header,
+        &mut cursor,
+        "publication_nonce",
+    )?);
+    if flags != 0 {
+        return Err(index_corrupted(path, "v2 header flags must be zero"));
     }
     let dimension_u32 =
         u32::from_le_bytes(read_array::<4>(path, header, &mut cursor, "dimension")?);
@@ -4333,9 +4343,10 @@ fn parse_v2_header(path: &Path, data: &[u8]) -> SearchResult<(VectorMetadata, us
             dimension,
             quantization,
             compaction_gen: 0,
-            // The v2 identity-complete header has no publication-nonce slot;
-            // pair binding applies to the v1 mutable tier surface only.
-            publication_nonce: 0,
+            // Cross-tier publication nonce from the v2 header's nonce slot
+            // (bd-miio8): binds the fast/quality tiers of one staged v2
+            // publication; zero on single-tier and pre-nonce files.
+            publication_nonce,
             record_count,
             vectors_offset,
             identity_v2: Some(FsviV2IdentityMetadata {
@@ -5435,6 +5446,7 @@ fn fsvi_v2_header_len(binding: &FsviV2IdentityBinding) -> SearchResult<usize> {
 
 fn build_v2_header(
     binding: &FsviV2IdentityBinding,
+    publication_nonce: u16,
     record_count: usize,
     vectors_offset: u64,
     ordered_docset_digest: [u8; SHA256_BYTES],
@@ -5461,7 +5473,10 @@ fn build_v2_header(
     header.extend_from_slice(&FSVI_V2_IDENTITY_BINDING_SCHEMA.to_le_bytes());
     header.push(binding.quantization as u8);
     header.push(0);
-    header.extend_from_slice(&0_u16.to_le_bytes());
+    // Cross-tier publication nonce (bd-miio8), mirroring the v1 reserved
+    // bytes: every tier of one multi-tier v2 publication carries the same
+    // non-zero value; zero marks a single-tier or pre-nonce file.
+    header.extend_from_slice(&publication_nonce.to_le_bytes());
     header.extend_from_slice(&dimension_u32.to_le_bytes());
     header.extend_from_slice(&record_count_u64.to_le_bytes());
     header.extend_from_slice(&vectors_offset.to_le_bytes());
