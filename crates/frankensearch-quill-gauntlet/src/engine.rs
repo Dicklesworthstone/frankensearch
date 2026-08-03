@@ -3100,6 +3100,20 @@ mod tests {
         permutation
     }
 
+    /// The replay identity includes the exact v1 LCG and Fisher-Yates swap
+    /// schedule. Determinism alone would not detect a changed generator that
+    /// silently maps a historical seed to a different ingest order.
+    #[cfg(feature = "perf-harness")]
+    #[test]
+    fn e63_input_permutation_seed_schedule_v1_is_exact_and_preserves_small_domains() {
+        assert_eq!(e63_seeded_input_permutation(0, 0), Vec::<usize>::new());
+        assert_eq!(e63_seeded_input_permutation(1, 0), vec![0]);
+        assert_eq!(
+            e63_seeded_input_permutation(5, 0xe63_1a00_5eed_0001),
+            vec![4, 1, 0, 3, 2]
+        );
+    }
+
     #[cfg(feature = "perf-harness")]
     fn e63_seeded_ascii_query_normalization(term: &str, seed: u64) -> String {
         match seed % 3 {
