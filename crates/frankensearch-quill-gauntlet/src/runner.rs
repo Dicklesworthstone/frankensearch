@@ -9121,6 +9121,45 @@ mod tests {
         );
     }
 
+    #[test]
+    fn e63_metamorphic_accounting_enumerates_every_missing_law_scope_cell() {
+        let registry = MetamorphicLawRegistry::scalar_g1a_v1();
+        let results = registry
+            .applicability_matrix()
+            .expect("valid E6.3 applicability matrix")
+            .into_iter()
+            .filter(|entry| {
+                !matches!(
+                    (entry.law_id.as_str(), entry.scope),
+                    (
+                        "e6.3-input-order-permutation-v1",
+                        MetamorphicLawScope::CrossEngine
+                    ) | ("e6.3-query-normalization-v1", MetamorphicLawScope::Quill)
+                )
+            })
+            .map(|entry| MetamorphicLawResult {
+                law_id: entry.law_id,
+                scope: entry.scope,
+                applicability: entry.applicability,
+                outcome: match entry.applicability {
+                    MetamorphicLawApplicability::Applies => Some(MetamorphicLawOutcome::Passed),
+                    MetamorphicLawApplicability::SkipWithReason { .. } => None,
+                },
+            })
+            .collect::<Vec<_>>();
+
+        let error = registry
+            .summarize(&results)
+            .expect_err("a campaign missing multiple declared law/scopes must fail closed");
+        assert!(matches!(error, GauntletError::InvalidCampaign { .. }));
+        assert_eq!(
+            error.to_string(),
+            "invalid differential campaign: metamorphic campaign is incomplete; missing law/scope cells: \
+             e6.3-input-order-permutation-v1/cross_engine, \
+             e6.3-query-normalization-v1/quill"
+        );
+    }
+
     fn fixture_provenance(
         fixture: &Fixture,
         config: &CampaignConfig,
