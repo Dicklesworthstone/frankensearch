@@ -777,6 +777,11 @@ impl Deref for VectorIndexData {
 pub struct VectorIndex {
     pub(crate) path: PathBuf,
     pub(crate) data: VectorIndexData,
+    /// Held for the lifetime of a mutable mapping so two cooperating
+    /// [`VectorIndex::open`] callers cannot observe and modify the same FSVI
+    /// bytes concurrently. Sealed v2 owners use immutable bytes instead and
+    /// therefore retain no mutable-path lock.
+    mutable_open_lock: Option<File>,
     pub(crate) metadata: VectorMetadata,
     pub(crate) records_offset: usize,
     pub(crate) strings_offset: usize,
@@ -1572,6 +1577,7 @@ impl ValidatedFsviBytes {
         let index = VectorIndex {
             path: PathBuf::from(OWNED_PATH),
             data: VectorIndexData::Immutable(Arc::clone(&bytes)),
+            mutable_open_lock: None,
             metadata,
             records_offset,
             strings_offset,
@@ -1673,6 +1679,16 @@ impl VectorIndex {
             .write(true)
             .open(path)
             .map_err(SearchError::Io)?;
+        file.try_lock().map_err(|error| {
+            SearchError::Io(std::io::Error::new(
+                error.kind(),
+                format!(
+                    "refusing a second mutable FSVI open for '{}': {error}; \
+                     release the existing VectorIndex before opening this path again",
+                    path.display()
+                ),
+            ))
+        })?;
         let data = unsafe { MmapMut::map_mut(&file).map_err(SearchError::Io)? };
         let (metadata, header_len) = parse_header(path, &data)?;
 
@@ -1784,6 +1800,7 @@ impl VectorIndex {
         Ok(Self {
             path: path.to_path_buf(),
             data: VectorIndexData::Mutable(data),
+            mutable_open_lock: Some(file),
             metadata,
             records_offset,
             strings_offset,
@@ -9600,6 +9617,23 @@ mod tests {
     }
 
     // ─── VectorIndex::open edge cases ───────────────────────────────────
+
+    #[test]
+    fn mutable_open_refuses_a_second_live_handle_until_the_first_is_dropped() {
+        let path = temp_index_path("mutable-open-exclusive");
+        let mut writer = VectorIndex::create(&path, "test", 4).expect("writer");
+        writer
+            .write_record("doc-0", &[1.0, 0.0, 0.0, 0.0])
+            .expect("record");
+        writer.finish().expect("finish fixture");
+
+        let first = VectorIndex::open(&path).expect("first mutable open");
+        let second = VectorIndex::open(&path).expect_err("second mutable open must be refused");
+        assert!(matches!(second, SearchError::Io(_)));
+
+        drop(first);
+        VectorIndex::open(&path).expect("open succeeds once the mutable owner is released");
+    }
 
     #[test]
     fn open_nonexistent_file_returns_index_not_found() {
