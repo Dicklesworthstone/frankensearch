@@ -1108,6 +1108,39 @@ impl LocalPerfAttemptReceipt {
         Ok(())
     }
 
+    /// Prove that exact post-unlock lease-release receipt bytes name this
+    /// completed process attempt and were issued no earlier than its finish.
+    ///
+    /// # Errors
+    ///
+    /// Rejects a failed attempt, substituted or noncanonical release receipt,
+    /// or a receipt from another invocation.
+    pub fn verify_lease_release_receipt(
+        &self,
+        lease_release_receipt_bytes: &[u8],
+    ) -> Result<(), LocalPerfRunError> {
+        if self.outcome != LocalPerfAttemptOutcome::Completed {
+            return Err(LocalPerfRunError::Invalid(
+                "failed attempt cannot have an admissible lease-release receipt".to_owned(),
+            ));
+        }
+        let release =
+            LocalPerfLeaseReleaseReceipt::from_verified_slice(lease_release_receipt_bytes)?;
+        if release.attempt_receipt_sha256 != self.exact_sha256()?
+            || release.gate != self.gate
+            || release.profile != self.profile
+            || release.run_id != self.run_id
+            || release.run_window != self.run_window
+            || release.lease_file_identity != self.lease_file_identity
+            || release.released_at_utc < self.finished_at_utc
+        {
+            return Err(LocalPerfRunError::Invalid(
+                "lease-release receipt identity differs from the sealed process receipt".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
     fn verify_completed_runner_identity(
         &self,
         identity: &VerifiedRunnerIdentity,
@@ -7285,6 +7318,19 @@ mod tests {
             receipt.attempt_receipt_sha256,
             sha256_hex(&attempt_bytes),
             "release receipt must bind the exact completed attempt bytes"
+        );
+        attempt
+            .verify_lease_release_receipt(&bytes)
+            .expect("release receipt matches completed attempt");
+
+        let mut mismatched = receipt.clone();
+        mismatched.run_window = "other-window".to_owned();
+        let mismatched_bytes =
+            seal_lease_release_receipt(mismatched).expect("reseal release identity mismatch");
+        assert!(
+            attempt
+                .verify_lease_release_receipt(&mismatched_bytes)
+                .is_err()
         );
 
         let mut tampered = receipt.clone();
