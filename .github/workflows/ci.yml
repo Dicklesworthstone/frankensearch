@@ -684,7 +684,7 @@ jobs:
               {"id":"snapshot","required":true,"status":"pending","bead":"bd-2yu.8.3"},
               {"id":"e2e","required":true,"lane":"cargo test -p frankensearch-fsfs --test cli_e2e_contract -- --nocapture"},
               {"id":"telemetry_adapter_dry_run","required":true,"lane":"scripts/e2e/telemetry_adapter_{cass,xf,agent_mail}.sh --mode all --dry-run"},
-              {"id":"perf","required":true,"status":"pending","bead":"bd-2yu.8.4"},
+              {"id":"perf_artifact_contract","required":true,"status":"provisional_artifact_only","bead":"bd-2yu.8.4","gate_active":false},
               {"id":"fault","required":true,"status":"pending","bead":"bd-2yu.8.4"},
               {"id":"soak","required":true,"status":"pending","bead":"bd-2yu.8.5"},
               {"id":"contract_schema","required":true,"lane":"python3 -m jsonschema --instance schemas/fixtures/e2e-*.json schemas/e2e-artifact-v1.schema.json"}
@@ -746,6 +746,8 @@ jobs:
             "confidence_target_pct": 95,
             "min_run_count": 5,
             "max_flake_reruns": 2,
+            "gate_active": false,
+            "enforcement": "artifact_contract_only",
             "reason_codes": [
               "perf.gate.pass",
               "perf.gate.missing_inputs",
@@ -762,8 +764,10 @@ jobs:
             cat > ci_artifacts/perf_regression_gate_result.json <<'EOF'
           {
             "schema": "perf-regression-gate-result-v1",
-            "status": "pending_evaluation_logic",
+            "status": "no_decision_provisional",
             "reason_code": "perf.gate.inconclusive_confidence",
+            "gate_active": false,
+            "enforcement": "artifact_contract_only",
             "details": "baseline/current artifacts present but evaluation lane not yet fully wired in this workflow",
             "replay_command": "cargo test --workspace --all-features -- --nocapture"
           }
@@ -772,8 +776,10 @@ jobs:
             cat > ci_artifacts/perf_regression_gate_result.json <<'EOF'
           {
             "schema": "perf-regression-gate-result-v1",
-            "status": "pending_inputs",
+            "status": "no_decision_provisional",
             "reason_code": "perf.gate.missing_inputs",
+            "gate_active": false,
+            "enforcement": "artifact_contract_only",
             "details": "benchmark metric artifacts not yet present in ci_artifacts/",
             "replay_command": "cargo test --workspace --all-features -- --nocapture"
           }
@@ -820,12 +826,17 @@ jobs:
             (.thresholds_pct.p99 >= .thresholds_pct.p95) and
             (.confidence_target_pct >= 50) and
             (.min_run_count >= 3) and
+            (.gate_active == false) and
+            (.enforcement == "artifact_contract_only") and
             (.reason_codes | length >= 5)
           ' ci_artifacts/perf_regression_gate_policy.json >/dev/null
 
           jq -e '
             .schema == "perf-regression-gate-result-v1" and
+            (.status == "no_decision_provisional") and
             (.reason_code | startswith("perf.gate.")) and
+            (.gate_active == false) and
+            (.enforcement == "artifact_contract_only") and
             (.replay_command | length > 0)
           ' ci_artifacts/perf_regression_gate_result.json >/dev/null
 
