@@ -6596,6 +6596,69 @@ mod tests {
         assert_eq!(observed_rows, expected_rows);
     }
 
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn sealed_owner_survives_post_admission_symlink_substitution() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().expect("private publication directory");
+        let path = directory.path().join("current.fsvi");
+        let retained_path = directory.path().join("retained-original.fsvi");
+        let binding = fsvi_v2_binding("post-admission-symlink", 4, Quantization::F16, 26, 0x86);
+
+        let mut writer = VectorIndex::create_v2(&path, binding.clone()).expect("original writer");
+        writer
+            .write_record("doc-alpha", &[1.0, 0.0, 0.0, 0.0])
+            .expect("original alpha");
+        writer
+            .write_record("doc-beta", &[0.0, 1.0, 0.0, 0.0])
+            .expect("original beta");
+        writer.finish().expect("finish original");
+
+        let owner =
+            ValidatedFsviBytes::open_published(&path, &binding).expect("admit original owner");
+        let expected_witness = owner.witness().clone();
+        let expected_hits = owner
+            .search_top_k(&[1.0, 0.0, 0.0, 0.0], 2, None)
+            .expect("search original");
+        let expected_rows: Vec<(String, Vec<u8>, FsviRecordFlags)> = (0..owner.record_count())
+            .map(|index| {
+                let row = owner.row(index).expect("original row");
+                (
+                    row.doc_id().to_owned(),
+                    row.vector_bytes().to_vec(),
+                    row.flags(),
+                )
+            })
+            .collect();
+
+        fs::rename(&path, &retained_path).expect("retain admitted pathname target");
+        symlink(&retained_path, &path).expect("substitute admitted pathname with symlink");
+        assert_snapshot_rejection(
+            ValidatedFsviBytes::open_published(&path, &binding),
+            FsviSnapshotRejectionReason::SymbolicLink,
+        );
+
+        assert_eq!(owner.witness(), &expected_witness);
+        assert_eq!(
+            owner
+                .search_top_k(&[1.0, 0.0, 0.0, 0.0], 2, None)
+                .expect("search retained owner after symlink substitution"),
+            expected_hits
+        );
+        let observed_rows: Vec<(String, Vec<u8>, FsviRecordFlags)> = (0..owner.record_count())
+            .map(|index| {
+                let row = owner.row(index).expect("retained owner row");
+                (
+                    row.doc_id().to_owned(),
+                    row.vector_bytes().to_vec(),
+                    row.flags(),
+                )
+            })
+            .collect();
+        assert_eq!(observed_rows, expected_rows);
+    }
+
     #[test]
     fn sealed_owner_survives_path_truncation_and_extension_after_admission() {
         let directory = tempfile::tempdir().expect("private publication directory");
