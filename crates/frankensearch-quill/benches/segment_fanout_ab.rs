@@ -90,6 +90,15 @@ const VOCABULARY: [&str; 24] = [
     "segment", "posting", "cursor", "rare", "singular",
 ];
 
+// The production bulk planner starts its fixed-width route at 64 documents
+// per leaf. Keep each fixture-builder submission below that threshold, then
+// make the declared `Shape` commit boundary explicit. This is setup only: the
+// measured serial and fanned reader paths consume the same sealed snapshot.
+const SCALAR_FIXTURE_INGEST_CHUNK_DOCS: usize = 63;
+/// Larger than the largest declared shape so an explicit fixture commit stays
+/// one observable leaf rather than becoming an unrequested tier merge.
+const FIXTURE_TIER_FANOUT: usize = 9;
+
 fn xorshift(state: &mut u64) -> u64 {
     *state ^= *state << 13;
     *state ^= *state >> 7;
@@ -100,6 +109,14 @@ fn xorshift(state: &mut u64) -> u64 {
 async fn build_index(cx: &Cx, shape: &Shape, seed: u64) -> QuillIndex {
     let config = QuillConfig {
         deterministic_ingest: true,
+        // The benchmark's shape names are an exact sealed-segment contract.
+        // Building a shape must therefore not let the production visibility
+        // timer insert an extra publication partway through one declared
+        // batch: that would silently change the fan-out denominator before
+        // the serial/fanned parity check. Explicit `commit` calls below are
+        // the only fixture publication boundaries.
+        max_visibility_lag_ms: u64::MAX,
+        tier_fanout: FIXTURE_TIER_FANOUT,
         ..QuillConfig::default()
     };
     let index = QuillIndex::in_memory(config).expect("in-memory bench index");
@@ -121,14 +138,29 @@ async fn build_index(cx: &Cx, shape: &Shape, seed: u64) -> QuillIndex {
                 text,
             ));
         }
-        index
-            .index_documents(cx, &batch)
-            .await
-            .expect("accumulate bench batch");
+        for scalar_chunk in batch.chunks(SCALAR_FIXTURE_INGEST_CHUNK_DOCS) {
+            index
+                .index_documents(cx, scalar_chunk)
+                .await
+                .expect("accumulate bench scalar fixture chunk");
+        }
         index.commit(cx).await.expect("seal bench segment");
     }
+    let segment_doc_counts: Vec<u32> = index
+        .snapshot()
+        .segments()
+        .iter()
+        .map(|segment| segment.doc_count())
+        .collect();
+    eprintln!(
+        "[setup-topology] shape={} expected_segments={} actual_segments={} docs_per_segment={} actual_doc_counts={segment_doc_counts:?}",
+        shape.name,
+        shape.segments,
+        segment_doc_counts.len(),
+        shape.docs_per_segment,
+    );
     assert_eq!(
-        index.snapshot().segments().len(),
+        segment_doc_counts.len(),
         shape.segments,
         "each commit must seal exactly one segment"
     );

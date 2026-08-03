@@ -6,6 +6,7 @@
 //! same boundary when the scalar G1a facade lands.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
 
@@ -84,6 +85,12 @@ const LEXICAL_MISMATCH_SIGNATURE_DOMAIN: &[u8] =
 const LEXICAL_QUERY_CONTRACT_DOMAIN: &[u8] = b"frankensearch/quill/lexical-query-contract/v1\0";
 const LEXICAL_INDEX_IDENTITY_DOMAIN: &[u8] = b"frankensearch/quill/lexical-index-identity/v1\0";
 const CAMPAIGN_REPORT_V7_HASH_DOMAIN: &[u8] = b"frankensearch/quill/campaign-report/v7\0";
+const PINNED_CAMPAIGN_REPORT_V7_BYTES: &[u8] =
+    include_bytes!("../fixtures/campaign-report-v7.json");
+const PINNED_CAMPAIGN_REPORT_V7_FIXTURE_SHA256: &str =
+    "62cf2484d04949589f8954ff661f2a2b8b633e3c6bda261d706355ea3060042d";
+const PINNED_CAMPAIGN_REPORT_V7_REPORT_SHA256: &str =
+    "339ea20afd54901894b14243b92f57b687559b2806a9c837c313359ce9dbfb57";
 const DIVERGENCE_REGISTRY_HASH_DOMAIN: &[u8] = b"frankensearch/quill/divergence-registry/v1\0";
 const DIVERGENCE_REGISTER_LEDGER_HASH_DOMAIN: &[u8] =
     b"frankensearch/quill/divergence-register-ledger/v2\0";
@@ -425,6 +432,566 @@ impl CampaignSelection {
         // Current creation is report v7. A future selection policy must add a
         // new current implementation rather than editing stored v7 semantics.
         self.select_stored_v7(cases)
+    }
+}
+
+/// Schema for the runner-owned E6.3 metamorphic-law registry.
+pub const METAMORPHIC_LAW_REGISTRY_SCHEMA_VERSION: u32 = 1;
+const MAX_METAMORPHIC_LAWS: usize = 32;
+const MAX_METAMORPHIC_TEXT_BYTES: usize = 4_096;
+
+/// Engine boundary on which a metamorphic law is evaluated.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MetamorphicLawScope {
+    Quill,
+    Tantivy,
+    CrossEngine,
+}
+
+impl fmt::Display for MetamorphicLawScope {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Quill => "quill",
+            Self::Tantivy => "tantivy",
+            Self::CrossEngine => "cross_engine",
+        })
+    }
+}
+
+/// Closed reasons why a declared metamorphic law cannot execute.
+///
+/// A skip is a coverage fact, never an equivalence result. Keeping reasons
+/// closed makes a report auditable instead of allowing an arbitrary string to
+/// turn an unsupported transform into a green outcome.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MetamorphicSkipReason {
+    /// The profile does not expose the lifecycle operation required by the law.
+    LifecycleCapabilityUnavailable,
+    /// Total lexical observations retain corpus-statistics-sensitive scores.
+    ScoreSensitiveCorpusStatistics,
+    /// The selected schema cannot provide phrase positions.
+    PositionsUnavailable,
+    /// The scalar-G1A preconditions do not hold for the selected profile.
+    ProfileOutsideScalarG1a,
+}
+
+/// Applicability result for one law/scope pair before execution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum MetamorphicLawApplicability {
+    Applies,
+    SkipWithReason { reason: MetamorphicSkipReason },
+}
+
+/// Terminal result for an applicable metamorphic law.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MetamorphicLawOutcome {
+    Passed,
+    Failed,
+}
+
+/// Data declaration for one qualified E6.3 metamorphic law.
+///
+/// The runner owns the declaration so engine tests and future CI executors
+/// share the same law ID, projection, replay command, and shrink policy.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MetamorphicLawDescriptor {
+    pub id: String,
+    pub generator_id: String,
+    /// Admission state declared by this qualified law before execution.
+    pub applicability: MetamorphicLawApplicability,
+    pub preconditions: String,
+    pub observable_projection: String,
+    pub equivalence_relation: String,
+    pub allowed_divergence: String,
+    pub positive_fixture_id: String,
+    pub invalid_fixture_id: String,
+    pub replay_test: String,
+    pub shrinker_id: String,
+    pub scopes: Vec<MetamorphicLawScope>,
+}
+
+/// Versioned runner registry for E6.3's declared metamorphic laws.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MetamorphicLawRegistry {
+    pub schema_version: u32,
+    pub laws: Vec<MetamorphicLawDescriptor>,
+}
+
+/// One auditable law/scope result recorded by a runner integration.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MetamorphicLawResult {
+    pub law_id: String,
+    pub scope: MetamorphicLawScope,
+    pub applicability: MetamorphicLawApplicability,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<MetamorphicLawOutcome>,
+}
+
+/// One deterministic cell in the runner's E6.3 applicability matrix.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MetamorphicLawApplicabilityEntry {
+    pub law_id: String,
+    pub scope: MetamorphicLawScope,
+    pub applicability: MetamorphicLawApplicability,
+}
+
+/// Aggregate accounting for a bounded metamorphic campaign.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MetamorphicLawSummary {
+    pub applicable: u64,
+    pub passed: u64,
+    pub failed: u64,
+    pub skipped: u64,
+}
+
+impl MetamorphicLawRegistry {
+    /// Returns the current qualified scalar-G1A E6.3 declaration.
+    ///
+    /// Lifecycle and corpus-statistics-sensitive transforms remain registered
+    /// as explicit skips until a runner can execute their declared projection;
+    /// they are deliberately not omitted or treated as passing.
+    #[must_use]
+    pub fn scalar_g1a_v1() -> Self {
+        let law = |id: &str,
+                   generator_id: &str,
+                   preconditions: &str,
+                   projection: &str,
+                   equivalence: &str,
+                   allowed_divergence: &str,
+                   positive: &str,
+                   invalid: &str,
+                   replay: &str,
+                   scopes: Vec<MetamorphicLawScope>| MetamorphicLawDescriptor {
+            id: id.to_owned(),
+            generator_id: generator_id.to_owned(),
+            applicability: MetamorphicLawApplicability::Applies,
+            preconditions: preconditions.to_owned(),
+            observable_projection: projection.to_owned(),
+            equivalence_relation: equivalence.to_owned(),
+            allowed_divergence: allowed_divergence.to_owned(),
+            positive_fixture_id: positive.to_owned(),
+            invalid_fixture_id: invalid.to_owned(),
+            replay_test: replay.to_owned(),
+            shrinker_id: "e6.3-total-lexical-ddmin-v1".to_owned(),
+            scopes,
+        };
+        Self {
+            schema_version: METAMORPHIC_LAW_REGISTRY_SCHEMA_VERSION,
+            laws: vec![
+                law(
+                    "e6.3-input-order-permutation-v1",
+                    "e6.3-input-order-permutation-v1",
+                    "stable external IDs and unchanged document payloads",
+                    "total lexical observation",
+                    "rank exact or tie order only",
+                    "tie_order",
+                    "e63-input-order-positive",
+                    "e63-input-order-content-mutation",
+                    "engine::tests::e63_input_order_seed_matrix_replays_live_observations",
+                    vec![
+                        MetamorphicLawScope::Quill,
+                        MetamorphicLawScope::Tantivy,
+                        MetamorphicLawScope::CrossEngine,
+                    ],
+                ),
+                law(
+                    "e6.3-duplicate-live-id-rejection-v1",
+                    "e6.3-duplicate-live-id-rejection-v1",
+                    "scalar Quill live-ID uniqueness contract",
+                    "typed lifecycle error plus published corpus observation",
+                    "duplicate input is rejected without partial publication",
+                    "none",
+                    "e63-duplicate-live-id-positive",
+                    "e63-duplicate-live-id-partial-publication",
+                    "engine::tests::e63_duplicate_live_id_is_typed_rejection_and_preserves_published_original",
+                    vec![MetamorphicLawScope::Quill],
+                ),
+                MetamorphicLawDescriptor {
+                    id: "e6.3-duplicate-then-delete-v1".to_owned(),
+                    generator_id: "e6.3-duplicate-then-delete-v1".to_owned(),
+                    applicability: MetamorphicLawApplicability::SkipWithReason {
+                        reason: MetamorphicSkipReason::LifecycleCapabilityUnavailable,
+                    },
+                    preconditions: "a declared duplicate/upsert lifecycle operation".to_owned(),
+                    observable_projection: "total lexical observation".to_owned(),
+                    equivalence_relation: "declared duplicate-then-delete behavior".to_owned(),
+                    allowed_divergence: "none".to_owned(),
+                    positive_fixture_id: "e63-duplicate-then-delete-positive".to_owned(),
+                    invalid_fixture_id: "e63-duplicate-then-delete-wrong-id".to_owned(),
+                    replay_test: "pending runner lifecycle hook".to_owned(),
+                    shrinker_id: "e6.3-total-lexical-ddmin-v1".to_owned(),
+                    scopes: vec![MetamorphicLawScope::Quill],
+                },
+                MetamorphicLawDescriptor {
+                    id: "e6.3-upsert-versus-delete-add-v1".to_owned(),
+                    generator_id: "e6.3-upsert-versus-delete-add-v1".to_owned(),
+                    applicability: MetamorphicLawApplicability::SkipWithReason {
+                        reason: MetamorphicSkipReason::LifecycleCapabilityUnavailable,
+                    },
+                    preconditions: "a declared upsert and delete/add lifecycle operation"
+                        .to_owned(),
+                    observable_projection: "total lexical observation".to_owned(),
+                    equivalence_relation: "declared replacement semantics".to_owned(),
+                    allowed_divergence: "none".to_owned(),
+                    positive_fixture_id: "e63-upsert-delete-add-positive".to_owned(),
+                    invalid_fixture_id: "e63-upsert-delete-add-content-mutation".to_owned(),
+                    replay_test: "pending runner lifecycle hook".to_owned(),
+                    shrinker_id: "e6.3-total-lexical-ddmin-v1".to_owned(),
+                    scopes: vec![MetamorphicLawScope::Quill],
+                },
+                law(
+                    "e6.3-flush-batch-schedule-v1",
+                    "e6.3-flush-batch-schedule-v1",
+                    "unchanged scalar configuration, corpus, IDs, and query suite",
+                    "total lexical observation",
+                    "rank exact or tie order only",
+                    "tie_order",
+                    "e63-flush-batch-positive",
+                    "e63-flush-batch-content-mutation",
+                    "engine::tests::e63_flush_batch_seed_matrix_preserves_observations_but_content_mutation_does_not",
+                    vec![
+                        MetamorphicLawScope::Quill,
+                        MetamorphicLawScope::Tantivy,
+                        MetamorphicLawScope::CrossEngine,
+                    ],
+                ),
+                law(
+                    "e6.3-query-normalization-v1",
+                    "e6.3-query-normalization-v1",
+                    "free-text scalar query only; no field or syntax-bearing spelling",
+                    "total lexical observation",
+                    "rank exact or tie order only",
+                    "tie_order",
+                    "e63-query-normalization-positive",
+                    "e63-query-normalization-term-mutation",
+                    "engine::tests::e63_query_normalization_seed_matrix_replays_live_observations",
+                    vec![
+                        MetamorphicLawScope::Quill,
+                        MetamorphicLawScope::Tantivy,
+                        MetamorphicLawScope::CrossEngine,
+                    ],
+                ),
+                law(
+                    "e6.3-two-term-and-commutativity-v1",
+                    "e6.3-two-term-and-commutativity-v1",
+                    "two distinct unboosted positive scalar AND operands",
+                    "total lexical observation",
+                    "rank exact or tie order only",
+                    "tie_order",
+                    "e63-two-term-and-positive",
+                    "e63-two-term-and-to-or",
+                    "engine::tests::e63_two_term_and_seed_matrix_replays_live_observations",
+                    vec![
+                        MetamorphicLawScope::Quill,
+                        MetamorphicLawScope::Tantivy,
+                        MetamorphicLawScope::CrossEngine,
+                    ],
+                ),
+                law(
+                    "e6.3-two-term-or-commutativity-v1",
+                    "e6.3-two-term-or-commutativity-v1",
+                    "two distinct unboosted optional scalar OR operands",
+                    "total lexical observation",
+                    "rank exact or tie order only",
+                    "tie_order",
+                    "e63-two-term-or-positive",
+                    "e63-two-term-or-to-and",
+                    "engine::tests::e63_two_term_or_seed_matrix_replays_live_observations",
+                    vec![
+                        MetamorphicLawScope::Quill,
+                        MetamorphicLawScope::Tantivy,
+                        MetamorphicLawScope::CrossEngine,
+                    ],
+                ),
+                law(
+                    "e6.3-single-term-quote-v1",
+                    "e6.3-single-term-quote-v1",
+                    "one quoted term on a position-capable scalar field",
+                    "total lexical observation",
+                    "rank exact or tie order only",
+                    "tie_order",
+                    "e63-single-term-quote-positive",
+                    "e63-single-term-quote-multi-term-phrase",
+                    "engine::tests::e63_single_term_quote_seed_matrix_replays_live_observations",
+                    vec![
+                        MetamorphicLawScope::Quill,
+                        MetamorphicLawScope::Tantivy,
+                        MetamorphicLawScope::CrossEngine,
+                    ],
+                ),
+                law(
+                    "e6.3-tight-segment-geometry-v1",
+                    "e6.3-tight-segment-geometry-v1",
+                    "valid geometry change with fixed scalar analyzer, corpus, IDs, and queries",
+                    "total lexical observation",
+                    "rank exact or tie order only",
+                    "tie_order",
+                    "e63-tight-geometry-positive",
+                    "e63-tight-geometry-content-mutation",
+                    "engine::tests::e63_tight_segment_geometry_preserves_observations_but_content_mutation_does_not",
+                    vec![
+                        MetamorphicLawScope::Quill,
+                        MetamorphicLawScope::Tantivy,
+                        MetamorphicLawScope::CrossEngine,
+                    ],
+                ),
+                law(
+                    "e6.3-bulk-publication-cadence-v1",
+                    "e6.3-bulk-publication-cadence-v1",
+                    "fixed corpus/IDs and valid publication batches under tight geometry",
+                    "total lexical observation",
+                    "rank exact or tie order only",
+                    "tie_order",
+                    "e63-bulk-cadence-positive",
+                    "e63-bulk-cadence-content-mutation",
+                    "engine::tests::e63_bulk_publish_cadence_preserves_observations_but_content_mutation_does_not",
+                    vec![
+                        MetamorphicLawScope::Quill,
+                        MetamorphicLawScope::Tantivy,
+                        MetamorphicLawScope::CrossEngine,
+                    ],
+                ),
+                MetamorphicLawDescriptor {
+                    id: "e6.3-merge-schedule-v1".to_owned(),
+                    generator_id: "e6.3-merge-schedule-v1".to_owned(),
+                    applicability: MetamorphicLawApplicability::SkipWithReason {
+                        reason: MetamorphicSkipReason::LifecycleCapabilityUnavailable,
+                    },
+                    preconditions: "runner-exposed deterministic merge scheduling".to_owned(),
+                    observable_projection: "total lexical observation".to_owned(),
+                    equivalence_relation: "same committed corpus under a different merge schedule"
+                        .to_owned(),
+                    allowed_divergence: "none".to_owned(),
+                    positive_fixture_id: "e63-merge-schedule-positive".to_owned(),
+                    invalid_fixture_id: "e63-merge-schedule-content-mutation".to_owned(),
+                    replay_test: "pending runner lifecycle hook".to_owned(),
+                    shrinker_id: "e6.3-total-lexical-ddmin-v1".to_owned(),
+                    scopes: vec![MetamorphicLawScope::Quill],
+                },
+                MetamorphicLawDescriptor {
+                    id: "e6.3-reopen-recovery-v1".to_owned(),
+                    generator_id: "e6.3-reopen-recovery-v1".to_owned(),
+                    applicability: MetamorphicLawApplicability::SkipWithReason {
+                        reason: MetamorphicSkipReason::LifecycleCapabilityUnavailable,
+                    },
+                    preconditions: "runner-exposed durable reopen/recovery lifecycle".to_owned(),
+                    observable_projection: "total lexical observation".to_owned(),
+                    equivalence_relation: "same committed corpus before and after reopen"
+                        .to_owned(),
+                    allowed_divergence: "none".to_owned(),
+                    positive_fixture_id: "e63-reopen-recovery-positive".to_owned(),
+                    invalid_fixture_id: "e63-reopen-recovery-corrupt-state".to_owned(),
+                    replay_test: "pending runner lifecycle hook".to_owned(),
+                    shrinker_id: "e6.3-total-lexical-ddmin-v1".to_owned(),
+                    scopes: vec![MetamorphicLawScope::Quill],
+                },
+                MetamorphicLawDescriptor {
+                    id: "e6.3-tombstone-compaction-v1".to_owned(),
+                    generator_id: "e6.3-tombstone-compaction-v1".to_owned(),
+                    applicability: MetamorphicLawApplicability::SkipWithReason {
+                        reason: MetamorphicSkipReason::ScoreSensitiveCorpusStatistics,
+                    },
+                    preconditions: "a score-insensitive projection approved by the runner"
+                        .to_owned(),
+                    observable_projection: "total lexical observation".to_owned(),
+                    equivalence_relation: "same live corpus before and after compaction".to_owned(),
+                    allowed_divergence: "none".to_owned(),
+                    positive_fixture_id: "e63-tombstone-compaction-positive".to_owned(),
+                    invalid_fixture_id: "e63-tombstone-compaction-extra-delete".to_owned(),
+                    replay_test: "pending score-insensitive runner projection".to_owned(),
+                    shrinker_id: "e6.3-total-lexical-ddmin-v1".to_owned(),
+                    scopes: vec![MetamorphicLawScope::Quill],
+                },
+                law(
+                    "e6.3-positionless-phrase-capability-v1",
+                    "e6.3-positionless-phrase-capability-v1",
+                    "positionless scalar schema and a multi-term phrase",
+                    "typed capability error",
+                    "exact PositionsRequired error; single-term quote remains servable",
+                    "none",
+                    "e63-positionless-typed-error",
+                    "e63-positionless-silent-phrase",
+                    "engine::tests::e63_positionless_multi_term_phrase_is_typed_error_but_single_term_quote_is_servable",
+                    vec![MetamorphicLawScope::Quill],
+                ),
+            ],
+        }
+    }
+
+    /// Validates every law's required declaration and deterministic identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a missing qualification/replay field, duplicate
+    /// law ID, empty scope set, or an unsupported schema version.
+    pub fn validate(&self) -> Result<(), GauntletError> {
+        if self.schema_version != METAMORPHIC_LAW_REGISTRY_SCHEMA_VERSION
+            || self.laws.is_empty()
+            || self.laws.len() > MAX_METAMORPHIC_LAWS
+        {
+            return Err(campaign_error(
+                "metamorphic law registry has an invalid schema or size",
+            ));
+        }
+        let mut ids = BTreeSet::new();
+        let mut generator_ids = BTreeSet::new();
+        for law in &self.laws {
+            let scopes = law.scopes.iter().copied().collect::<BTreeSet<_>>();
+            let fields = [
+                &law.id,
+                &law.generator_id,
+                &law.preconditions,
+                &law.observable_projection,
+                &law.equivalence_relation,
+                &law.allowed_divergence,
+                &law.positive_fixture_id,
+                &law.invalid_fixture_id,
+                &law.replay_test,
+                &law.shrinker_id,
+            ];
+            if law.scopes.is_empty()
+                || scopes.len() != law.scopes.len()
+                || fields.iter().any(|value| {
+                    value.is_empty()
+                        || value.len() > MAX_METAMORPHIC_TEXT_BYTES
+                        || value.trim() != **value
+                        || value.chars().any(char::is_control)
+                })
+                || !ids.insert(law.id.as_str())
+                || !generator_ids.insert(law.generator_id.as_str())
+            {
+                return Err(campaign_error(
+                    "metamorphic law registry has incomplete or duplicate declarations",
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn law(&self, law_id: &str) -> Option<&MetamorphicLawDescriptor> {
+        self.laws.iter().find(|law| law.id == law_id)
+    }
+
+    /// Expands each registered law into its deterministic runner scope cells.
+    ///
+    /// This is the single applicability plan PR and nightly executors consume;
+    /// skip cells remain present for audit and cannot disappear by omission.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the registry declaration itself is invalid.
+    pub fn applicability_matrix(
+        &self,
+    ) -> Result<Vec<MetamorphicLawApplicabilityEntry>, GauntletError> {
+        self.validate()?;
+        Ok(self
+            .laws
+            .iter()
+            .flat_map(|law| {
+                law.scopes
+                    .iter()
+                    .copied()
+                    .map(|scope| MetamorphicLawApplicabilityEntry {
+                        law_id: law.id.clone(),
+                        scope,
+                        applicability: law.applicability,
+                    })
+            })
+            .collect())
+    }
+
+    /// Validates and summarizes runner-recorded law results.
+    ///
+    /// `SkipWithReason` is intentionally excluded from both `applicable` and
+    /// `passed`; an applicable law must have a terminal outcome.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a result names an unknown law/scope, repeats a
+    /// law/scope pair, omits a declared applicability cell, or tries to record
+    /// a skip as a terminal outcome.
+    pub fn summarize(
+        &self,
+        results: &[MetamorphicLawResult],
+    ) -> Result<MetamorphicLawSummary, GauntletError> {
+        self.validate()?;
+        if results.len() > self.laws.len().saturating_mul(3) {
+            return Err(campaign_error(
+                "metamorphic result count exceeds registry scope budget",
+            ));
+        }
+        let mut seen = BTreeSet::new();
+        let mut summary = MetamorphicLawSummary::default();
+        for result in results {
+            let Some(law) = self.law(&result.law_id) else {
+                return Err(campaign_error(
+                    "metamorphic result names an unregistered law",
+                ));
+            };
+            if !law.scopes.contains(&result.scope)
+                || law.applicability != result.applicability
+                || !seen.insert((result.law_id.clone(), result.scope))
+            {
+                return Err(campaign_error(
+                    "metamorphic result has a duplicate or unsupported scope",
+                ));
+            }
+            match (result.applicability, result.outcome) {
+                (MetamorphicLawApplicability::Applies, Some(MetamorphicLawOutcome::Passed)) => {
+                    summary.applicable = summary.applicable.saturating_add(1);
+                    summary.passed = summary.passed.saturating_add(1);
+                }
+                (MetamorphicLawApplicability::Applies, Some(MetamorphicLawOutcome::Failed)) => {
+                    summary.applicable = summary.applicable.saturating_add(1);
+                    summary.failed = summary.failed.saturating_add(1);
+                }
+                (MetamorphicLawApplicability::SkipWithReason { .. }, None) => {
+                    summary.skipped = summary.skipped.saturating_add(1);
+                }
+                _ => {
+                    return Err(campaign_error(
+                        "metamorphic skips must not carry outcomes and applicable laws require one",
+                    ));
+                }
+            }
+        }
+        let expected = self
+            .applicability_matrix()?
+            .into_iter()
+            .map(|entry| (entry.law_id, entry.scope))
+            .collect::<BTreeSet<_>>();
+        let missing = expected
+            .difference(&seen)
+            .map(|(law_id, scope)| format!("{law_id}/{scope}"))
+            .collect::<Vec<_>>();
+        if !missing.is_empty() {
+            return Err(campaign_error(format!(
+                "metamorphic campaign is incomplete; missing law/scope cells: {}",
+                missing.join(", ")
+            )));
+        }
+        Ok(summary)
+    }
+}
+
+impl DifferentialCampaignRunner {
+    /// Returns the E6.3 registry declared for the runner's semantic profile.
+    ///
+    /// Non-scalar profiles still receive the same declarations, but callers
+    /// must record their unsupported scopes with `SkipWithReason`; this avoids
+    /// quietly dropping required-law coverage from campaign accounting.
+    #[must_use]
+    pub fn metamorphic_law_registry(&self) -> MetamorphicLawRegistry {
+        MetamorphicLawRegistry::scalar_g1a_v1()
     }
 }
 
@@ -3504,6 +4071,48 @@ impl CampaignReport {
         hasher.update(self.canonical_bytes_unchecked()?);
         Ok(lower_hex(&hasher.finalize()))
     }
+}
+
+/// Load the immutable stored `CampaignReport` V7 historical fixture.
+///
+/// The fixture is a diagnostic receipt, not a live-build template. Its exact
+/// canonical payload has one terminal LF in source control; the report bytes
+/// intentionally exclude that presentation LF.
+///
+/// # Errors
+///
+/// Returns an error if the checked-in bytes, canonical report encoding, or
+/// domain-separated report identity differs from the pinned historical object.
+pub fn load_pinned_campaign_report_v7() -> Result<CampaignReport, GauntletError> {
+    load_pinned_campaign_report_v7_bytes(PINNED_CAMPAIGN_REPORT_V7_BYTES)
+}
+
+fn load_pinned_campaign_report_v7_bytes(bytes: &[u8]) -> Result<CampaignReport, GauntletError> {
+    let canonical = bytes.strip_suffix(b"\n").ok_or_else(|| {
+        campaign_error("pinned CampaignReport V7 fixture must end in exactly one LF")
+    })?;
+    if canonical.ends_with(b"\n") {
+        return Err(campaign_error(
+            "pinned CampaignReport V7 fixture must not contain multiple terminal LFs",
+        ));
+    }
+    if lower_hex(&Sha256::digest(bytes)) != PINNED_CAMPAIGN_REPORT_V7_FIXTURE_SHA256 {
+        return Err(campaign_error(
+            "pinned CampaignReport V7 fixture bytes differ from their sealed SHA-256",
+        ));
+    }
+    let report = serde_json::from_slice::<CampaignReport>(canonical)?;
+    if report.canonical_bytes()? != canonical {
+        return Err(campaign_error(
+            "pinned CampaignReport V7 bytes are not the report canonical encoding",
+        ));
+    }
+    if report.report_hash()? != PINNED_CAMPAIGN_REPORT_V7_REPORT_SHA256 {
+        return Err(campaign_error(
+            "pinned CampaignReport V7 report identity differs from its sealed SHA-256",
+        ));
+    }
+    Ok(report)
 }
 
 /// Streaming cross-artifact validator for one structurally valid campaign report.
@@ -7315,6 +7924,7 @@ pub fn persist_shrunk_reproduction(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
     #[cfg(feature = "tantivy-oracle")]
     use std::io::{self, Read, Write};
     #[cfg(feature = "tantivy-oracle")]
@@ -7331,7 +7941,7 @@ mod tests {
         LexicalHydrationSelection, LexicalNonLexicalControlKind, LexicalNormalizedQuery,
         LexicalObservation, LexicalObservationContext, LexicalObservationOutcome, LexicalObserved,
         LexicalQueryClass, LexicalScoreSource, LexicalWinnerOrigin, LexicalWinnerProjection,
-        SensitiveValueObservation,
+        ScoreEpsilonReason, SensitiveValueObservation,
     };
     use crate::engine::{EngineFamily, TANTIVY_ORACLE_CONFIG_HASH};
     use crate::generator::{
@@ -8307,6 +8917,247 @@ mod tests {
 
     fn semantic_contract() -> SemanticContract {
         SemanticContract::shipping_default()
+    }
+
+    #[test]
+    fn e63_metamorphic_registry_declares_qualified_replayable_laws() {
+        let registry = MetamorphicLawRegistry::scalar_g1a_v1();
+        registry
+            .validate()
+            .expect("E6.3 registry must retain complete qualified declarations");
+        assert_eq!(
+            registry.schema_version,
+            METAMORPHIC_LAW_REGISTRY_SCHEMA_VERSION
+        );
+        assert!(
+            registry.laws.len() >= 10,
+            "E6.3 registry lost declared laws"
+        );
+        for law in &registry.laws {
+            assert!(
+                !law.preconditions.is_empty()
+                    && !law.observable_projection.is_empty()
+                    && !law.equivalence_relation.is_empty()
+                    && !law.positive_fixture_id.is_empty()
+                    && !law.invalid_fixture_id.is_empty()
+                    && !law.replay_test.is_empty()
+                    && !law.shrinker_id.is_empty(),
+                "{} must retain qualification, positive/negative, replay, and shrink fields",
+                law.id
+            );
+        }
+    }
+
+    #[test]
+    fn e63_metamorphic_registry_retains_every_required_law_id() {
+        let registry = MetamorphicLawRegistry::scalar_g1a_v1();
+        let actual = registry
+            .laws
+            .iter()
+            .map(|law| law.id.as_str())
+            .collect::<BTreeSet<_>>();
+        let expected = BTreeSet::from([
+            "e6.3-input-order-permutation-v1",
+            "e6.3-duplicate-live-id-rejection-v1",
+            "e6.3-duplicate-then-delete-v1",
+            "e6.3-upsert-versus-delete-add-v1",
+            "e6.3-flush-batch-schedule-v1",
+            "e6.3-query-normalization-v1",
+            "e6.3-two-term-and-commutativity-v1",
+            "e6.3-two-term-or-commutativity-v1",
+            "e6.3-single-term-quote-v1",
+            "e6.3-tight-segment-geometry-v1",
+            "e6.3-bulk-publication-cadence-v1",
+            "e6.3-merge-schedule-v1",
+            "e6.3-reopen-recovery-v1",
+            "e6.3-tombstone-compaction-v1",
+            "e6.3-positionless-phrase-capability-v1",
+        ]);
+        assert_eq!(
+            actual, expected,
+            "E6.3 required metamorphic law set drifted"
+        );
+    }
+
+    #[test]
+    fn e63_metamorphic_registry_rejects_nonadjacent_duplicate_scope() {
+        let mut registry = MetamorphicLawRegistry::scalar_g1a_v1();
+        registry.laws[0].scopes = vec![
+            MetamorphicLawScope::Quill,
+            MetamorphicLawScope::Tantivy,
+            MetamorphicLawScope::Quill,
+        ];
+
+        assert!(
+            registry.validate().is_err(),
+            "a law declaration must reject duplicate scopes even when they are non-adjacent"
+        );
+    }
+
+    #[test]
+    fn e63_metamorphic_registry_rejects_reused_generator_identity() {
+        let mut registry = MetamorphicLawRegistry::scalar_g1a_v1();
+        let reused_generator_id = registry.laws[0].generator_id.clone();
+        registry.laws[1].generator_id = reused_generator_id;
+
+        assert!(
+            registry.validate().is_err(),
+            "distinct laws must not silently reuse one metamorphic generator identity"
+        );
+    }
+
+    #[test]
+    fn e63_metamorphic_accounting_excludes_skips_from_passes() {
+        let registry = MetamorphicLawRegistry::scalar_g1a_v1();
+        let matrix = registry
+            .applicability_matrix()
+            .expect("valid E6.3 applicability matrix");
+        assert!(matrix.iter().any(|entry| {
+            entry.law_id == "e6.3-tombstone-compaction-v1"
+                && entry.applicability
+                    == MetamorphicLawApplicability::SkipWithReason {
+                        reason: MetamorphicSkipReason::ScoreSensitiveCorpusStatistics,
+                    }
+        }));
+        let results = matrix
+            .iter()
+            .map(|entry| MetamorphicLawResult {
+                law_id: entry.law_id.clone(),
+                scope: entry.scope,
+                applicability: entry.applicability,
+                outcome: match entry.applicability {
+                    MetamorphicLawApplicability::Applies => Some(MetamorphicLawOutcome::Passed),
+                    MetamorphicLawApplicability::SkipWithReason { .. } => None,
+                },
+            })
+            .collect::<Vec<_>>();
+        let expected_applicable = u64::try_from(
+            matrix
+                .iter()
+                .filter(|entry| entry.applicability == MetamorphicLawApplicability::Applies)
+                .count(),
+        )
+        .expect("E6.3 matrix count fits u64");
+        let expected_skipped =
+            u64::try_from(matrix.len()).expect("E6.3 matrix count fits u64") - expected_applicable;
+        assert_eq!(
+            registry.summarize(&results).expect("valid E6.3 accounting"),
+            MetamorphicLawSummary {
+                applicable: expected_applicable,
+                passed: expected_applicable,
+                failed: 0,
+                skipped: expected_skipped,
+            }
+        );
+
+        let mut invalid = results
+            .iter()
+            .find(|result| {
+                matches!(
+                    result.applicability,
+                    MetamorphicLawApplicability::SkipWithReason { .. }
+                )
+            })
+            .expect("E6.3 registry declares a skip")
+            .clone();
+        invalid.outcome = Some(MetamorphicLawOutcome::Passed);
+        assert!(
+            registry.summarize(&[invalid]).is_err(),
+            "a SkipWithReason must never be counted as a pass"
+        );
+
+        let mut relabeled = results
+            .iter()
+            .find(|result| result.applicability == MetamorphicLawApplicability::Applies)
+            .expect("E6.3 registry declares an applicable law")
+            .clone();
+        relabeled.applicability = MetamorphicLawApplicability::SkipWithReason {
+            reason: MetamorphicSkipReason::ProfileOutsideScalarG1a,
+        };
+        relabeled.outcome = None;
+        assert!(
+            registry.summarize(&[relabeled]).is_err(),
+            "an executor cannot relabel an applicable law as skipped"
+        );
+    }
+
+    #[test]
+    fn e63_metamorphic_accounting_rejects_exact_missing_law_scope_cell() {
+        let registry = MetamorphicLawRegistry::scalar_g1a_v1();
+        let mut results = registry
+            .applicability_matrix()
+            .expect("valid E6.3 applicability matrix")
+            .into_iter()
+            .map(|entry| MetamorphicLawResult {
+                law_id: entry.law_id,
+                scope: entry.scope,
+                applicability: entry.applicability,
+                outcome: match entry.applicability {
+                    MetamorphicLawApplicability::Applies => Some(MetamorphicLawOutcome::Passed),
+                    MetamorphicLawApplicability::SkipWithReason { .. } => None,
+                },
+            })
+            .collect::<Vec<_>>();
+        let omitted = results.remove(
+            results
+                .iter()
+                .position(|result| {
+                    result.law_id == "e6.3-input-order-permutation-v1"
+                        && result.scope == MetamorphicLawScope::CrossEngine
+                })
+                .expect("planted E6.3 law/scope cell"),
+        );
+
+        let error = registry
+            .summarize(&results)
+            .expect_err("a campaign missing one declared law/scope must fail closed");
+        assert!(matches!(error, GauntletError::InvalidCampaign { .. }));
+        assert_eq!(
+            error.to_string(),
+            format!(
+                "invalid differential campaign: metamorphic campaign is incomplete; missing law/scope cells: {}/{}",
+                omitted.law_id, omitted.scope
+            )
+        );
+    }
+
+    #[test]
+    fn e63_metamorphic_accounting_enumerates_every_missing_law_scope_cell() {
+        let registry = MetamorphicLawRegistry::scalar_g1a_v1();
+        let results = registry
+            .applicability_matrix()
+            .expect("valid E6.3 applicability matrix")
+            .into_iter()
+            .filter(|entry| {
+                !matches!(
+                    (entry.law_id.as_str(), entry.scope),
+                    (
+                        "e6.3-input-order-permutation-v1",
+                        MetamorphicLawScope::CrossEngine
+                    ) | ("e6.3-query-normalization-v1", MetamorphicLawScope::Quill)
+                )
+            })
+            .map(|entry| MetamorphicLawResult {
+                law_id: entry.law_id,
+                scope: entry.scope,
+                applicability: entry.applicability,
+                outcome: match entry.applicability {
+                    MetamorphicLawApplicability::Applies => Some(MetamorphicLawOutcome::Passed),
+                    MetamorphicLawApplicability::SkipWithReason { .. } => None,
+                },
+            })
+            .collect::<Vec<_>>();
+
+        let error = registry
+            .summarize(&results)
+            .expect_err("a campaign missing multiple declared law/scopes must fail closed");
+        assert!(matches!(error, GauntletError::InvalidCampaign { .. }));
+        assert_eq!(
+            error.to_string(),
+            "invalid differential campaign: metamorphic campaign is incomplete; missing law/scope cells: \
+             e6.3-input-order-permutation-v1/cross_engine, \
+             e6.3-query-normalization-v1/quill"
+        );
     }
 
     fn fixture_provenance(
@@ -14246,6 +15097,28 @@ mod tests {
     }
 
     #[test]
+    fn pinned_campaign_report_v7_is_exact_and_rejects_regeneration() {
+        let report = crate::artifact::pinned_campaign_report_v7()
+            .expect("load pinned CampaignReport V7")
+            .report()
+            .clone();
+        assert_eq!(report.schema_version, CAMPAIGN_REPORT_V7_SCHEMA_VERSION);
+        assert_eq!(
+            report.report_hash().expect("pinned report hash"),
+            PINNED_CAMPAIGN_REPORT_V7_REPORT_SHA256
+        );
+
+        let mut regenerated = report.canonical_bytes().expect("pinned canonical report");
+        regenerated[0] ^= 1;
+        let mut altered_fixture = regenerated;
+        altered_fixture.push(b'\n');
+        assert!(
+            load_pinned_campaign_report_v7_bytes(&altered_fixture).is_err(),
+            "a regenerated or otherwise mismatched report must not replace the pinned fixture"
+        );
+    }
+
+    #[test]
     fn generated_default_suite_has_no_unexecutable_register_claims() {
         let fixture = make_fixture();
         assert!(
@@ -17095,7 +17968,7 @@ mod tests {
         #[derive(Debug)]
         enum Operand {
             Term(String),
-            Phrase(Vec<String>),
+            Phrase { words: Vec<String>, prefix: bool },
             NegatedTerm(String),
             Fielded(&'static str, String),
         }
@@ -17103,10 +17976,13 @@ mod tests {
             fn render(&self, out: &mut String) {
                 match self {
                     Self::Term(term) => out.push_str(term),
-                    Self::Phrase(words) => {
+                    Self::Phrase { words, prefix } => {
                         out.push('"');
                         out.push_str(&words.join(" "));
                         out.push('"');
+                        if *prefix {
+                            out.push('*');
+                        }
                     }
                     Self::NegatedTerm(term) => {
                         out.push('-');
@@ -17125,18 +18001,17 @@ mod tests {
             &vocabulary[rng.bounded(vocabulary.len())]
         }
 
-        fn generate_operand(rng: &mut TreeRng, vocabulary: &[String], in_group: bool) -> Operand {
+        fn generate_operand(rng: &mut TreeRng, vocabulary: &[String]) -> Operand {
             match rng.bounded(6) {
                 0 => {
                     let words = (0..2 + rng.bounded(3))
                         .map(|_| pick(rng, vocabulary).to_owned())
                         .collect();
-                    Operand::Phrase(words)
+                    Operand::Phrase {
+                        words,
+                        prefix: false,
+                    }
                 }
-                // In-group negation is part of the association-parity
-                // residual (ULP-scale divergence on mixed-occur nests);
-                // top-level negation has proven bit parity.
-                1 if in_group => Operand::Term(pick(rng, vocabulary).to_owned()),
                 1 => Operand::NegatedTerm(pick(rng, vocabulary).to_owned()),
                 // Field scope is squarely in the pinned grammar
                 // (`field:value`). The campaign's third finding initially
@@ -17161,11 +18036,12 @@ mod tests {
                 1 => "   \t ".to_owned(),
                 2 => {
                     let mut out = String::new();
-                    Operand::Phrase(
-                        (0..2 + rng.bounded(3))
+                    Operand::Phrase {
+                        words: (0..2 + rng.bounded(3))
                             .map(|_| pick(rng, vocabulary).to_owned())
                             .collect(),
-                    )
+                        prefix: false,
+                    }
                     .render(&mut out);
                     out
                 }
@@ -17178,32 +18054,24 @@ mod tests {
             }
         }
 
-        /// The `^` boost family is fenced entirely for now: even a single
-        /// top-level leaf boost over the multi-field expansion diverges from
-        /// the oracle by 1 ULP (rounding/association order inside the boosted
-        /// sum — an arithmetic-parity question, not grammar). Non-finite
-        /// boosts additionally need the DIV-005 expected-divergence lane.
-        /// Both tracked as the bd-bsjw score-bit-parity residual.
-        fn maybe_boost(_rng: &mut TreeRng, _out: &mut String) {}
+        /// Probe one finite ordinary boost form. The separate DIV-005 lane
+        /// owns non-finite factors; all finite grammar positions stay live.
+        fn maybe_boost(rng: &mut TreeRng, out: &mut String) {
+            if rng.bounded(4) == 0 {
+                out.push_str("^2");
+            }
+        }
 
         fn render_chain(rng: &mut TreeRng, vocabulary: &[String], depth: usize, out: &mut String) {
             let operand_count = 1 + rng.bounded(4);
             render_operand_or_group(rng, vocabulary, depth, false, out);
-            // Group interiors stay pure disjunction (OR/implicit): any
-            // AND-, NOT-, or boost-bearing nesting produces mixed-occur
-            // shapes the Should-flatten cannot splice, and score
-            // accumulation then diverges from the oracle at ULP scale —
-            // one coherent residual (mirror the pinned grammar's full
-            // precedence-tree association), tracked on bd-bsjw. Top-level
-            // chains keep the full connective set with proven bit parity.
-            let in_group = depth < 2;
             for _ in 1..operand_count {
-                let connective = rng.bounded(if in_group { 3 } else { 4 });
-                let is_not = !in_group && connective == 2;
-                match (in_group, connective) {
-                    (false, 0) => out.push_str(" AND "),
-                    (_, 1) => out.push_str(" OR "),
-                    (false, 2) => out.push_str(" NOT "),
+                let connective = rng.bounded(4);
+                let is_not = connective == 2;
+                match connective {
+                    0 => out.push_str(" AND "),
+                    1 => out.push_str(" OR "),
+                    2 => out.push_str(" NOT "),
                     _ => out.push(' '),
                 }
                 render_operand_or_group(rng, vocabulary, depth, is_not, out);
@@ -17217,50 +18085,104 @@ mod tests {
             after_not: bool,
             out: &mut String,
         ) {
-            // Parenthesised groups are FENCED from generation: they inflate
-            // leaf counts past the score-bit-parity envelope — Quill fuses
-            // each term's [content, 2x title] expansion into one scorer sum
-            // while the oracle interleaves two clauses per term, so summation
-            // association diverges at ULP scale once enough leaves accumulate
-            // (reproduced at depth 1 with 8 leaves; four pinned repros on the
-            // parity-envelope bead). Boosted groups additionally hit the
-            // oracle's lenient fallback that DROPS negations (membership
-            // change, pinned three ways in the lexical crate), and a negated
-            // group could smuggle a phrase into the oracle-crashing shape
-            // (bd-nqeb4). Groups return when either Quill mirrors the
-            // oracle's per-term accumulation order or the parity doctrine
-            // adopts a ULP tolerance.
-            let _ = depth;
-            // `NOT -term` was this campaign's first finding (bd-251nt):
-            // Quill nested it as a double negation while the pinned oracle
-            // collapses the stack to one exclusion; Quill now matches, so
-            // that shape generates freely. A negated PHRASE, however, panics
-            // the ORACLE itself (Tantivy 0.26.1 PhraseScorer post-termination
-            // seek — second campaign finding, pinned should_panic in the
-            // lexical crate), so phrase operands stay out of the NOT position
-            // until the oracle is upgraded past the upstream defect.
-            // Inside a group, `NOT -x` re-enters lenient-parse quirk space:
-            // the oracle DROPS the negations entirely when the group carries
-            // a boost (membership change, pinned in the lexical crate —
-            // campaign finding 4), so the stacked shape stays top-level-only
-            // until that fallback is adjudicated.
-            let in_group = depth < 2;
+            if !after_not && depth < 3 && rng.bounded(4) == 0 {
+                out.push('(');
+                render_chain(rng, vocabulary, depth + 1, out);
+                out.push(')');
+                maybe_boost(rng, out);
+                return;
+            }
+
+            // bd-nqeb4: a phrase in any NOT operand can panic the pinned
+            // Tantivy PhraseScorer after post-termination seek. Keep that
+            // one oracle-crash fence, including when the NOT appears in a
+            // parenthesized group; all other in-group negation stays live.
             let operand = if after_not {
-                match rng.bounded(if in_group { 1 } else { 2 }) {
+                match rng.bounded(2) {
                     0 => Operand::Term(pick(rng, vocabulary).to_owned()),
                     _ => Operand::NegatedTerm(pick(rng, vocabulary).to_owned()),
                 }
             } else {
-                generate_operand(rng, vocabulary, in_group)
+                generate_operand(rng, vocabulary)
             };
             operand.render(out);
-            // Boosts inside groups join the association-parity residual: a
-            // boosted member of a nested group diverges from the oracle at
-            // ULP scale even without negation. Top-level leaf boosts remain
-            // under test.
-            if !after_not && !in_group {
+            if !after_not {
                 maybe_boost(rng, out);
             }
+        }
+
+        fn has_boosted_group_negation(query: &str) -> bool {
+            let mut groups_with_negation = Vec::new();
+            for token in query.split_ascii_whitespace() {
+                for character in token.chars() {
+                    match character {
+                        '(' => groups_with_negation.push(false),
+                        ')' => {
+                            let Some(has_negation) = groups_with_negation.pop() else {
+                                return false;
+                            };
+                            if has_negation && token.contains(")^2") {
+                                return true;
+                            }
+                            if has_negation && let Some(parent) = groups_with_negation.last_mut() {
+                                *parent = true;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                if token == "NOT"
+                    && let Some(group) = groups_with_negation.last_mut()
+                {
+                    *group = true;
+                }
+            }
+            false
+        }
+
+        fn classify_boosted_group_negation_oracle_bug(
+            query: &str,
+            comparison: &mut ComparisonReport,
+        ) -> bool {
+            if !has_boosted_group_negation(query)
+                || !comparison
+                    .divergences
+                    .iter()
+                    .any(|divergence| divergence.class == DivergenceClass::RankMismatch)
+            {
+                return false;
+            }
+
+            comparison
+                .divergences
+                .retain(|divergence| divergence.class != DivergenceClass::RankMismatch);
+            comparison.divergences.push(Divergence {
+                class: DivergenceClass::OracleBug,
+                pointer: "/comparison/subject/ast_differences/boosted_group_negation".to_owned(),
+                oracle: "pinned oracle lenient fallback dropped negation inside boosted group"
+                    .to_owned(),
+                subject: "Quill retained boosted-group negation".to_owned(),
+            });
+            comparison.status = if comparison.divergences.iter().any(|divergence| {
+                matches!(
+                    divergence.class,
+                    DivergenceClass::RankMismatch
+                        | DivergenceClass::SnippetMismatch
+                        | DivergenceClass::CountMismatch
+                        | DivergenceClass::DocumentCountMismatch
+                        | DivergenceClass::PostingRecordSemantics
+                )
+            }) {
+                ComparisonStatus::Failed
+            } else {
+                ComparisonStatus::Classified
+            };
+            comparison.first_divergence = comparison
+                .divergences
+                .first()
+                .map(|divergence| divergence.pointer.clone());
+            comparison.score_epsilon_reason = None;
+            true
         }
 
         asupersync::test_utils::run_test_with_cx(|cx| async move {
@@ -17339,13 +18261,25 @@ mod tests {
 
             let harness = crate::engine::DifferentialHarness::new(
                 ComparisonMode::CrossEngine,
-                ComparatorConfig::default(),
+                ComparatorConfig::default()
+                    .with_score_epsilon_reason(ScoreEpsilonReason::SummationAssociation),
             );
             let corpus_hash = fixture.corpus_hash.clone();
+            let mut finite_leaf_boost_cases = 0_usize;
+            let mut parenthesized_group_cases = 0_usize;
+            let mut in_group_negation_cases = 0_usize;
+            let mut boosted_group_cases = 0_usize;
+            let mut summation_association_cases = 0_usize;
+            let mut boosted_group_oracle_bug_cases = 0_usize;
             for seed in [0x6273_6a77_0001_u64, 0x6273_6a77_0002] {
                 for ordinal in 0_u64..96 {
                     let mut rng = TreeRng::for_case(seed, ordinal);
                     let query = generate_query(&mut rng, &vocabulary);
+                    finite_leaf_boost_cases += usize::from(query.contains("^2"));
+                    parenthesized_group_cases += usize::from(query.contains('('));
+                    in_group_negation_cases +=
+                        usize::from(query.contains(" NOT ") && query.rfind('(').is_some());
+                    boosted_group_cases += usize::from(query.contains(")^2"));
                     let case = DifferentialCase {
                         fixture_id: format!("bsjw-{seed:012x}-{ordinal:03}"),
                         query: query.clone(),
@@ -17360,7 +18294,7 @@ mod tests {
                             corpus_hash: Some(corpus_hash.clone()),
                         },
                     };
-                    let run = harness
+                    let mut run = harness
                         .run(&cx, &subject, &oracle, &case)
                         .await
                         .unwrap_or_else(|error| {
@@ -17369,18 +18303,28 @@ mod tests {
                                  query={query:?} failed to execute: {error}"
                             )
                         });
-                    // Exact is the bar; the sole tolerated classification is
-                    // TieOrder — a reorder the comparator PROVED stays inside
-                    // one oracle score group. Boosted groups legitimately
-                    // manufacture cross-engine ties; equal-score native order
-                    // is not a cross-engine promise. Anything else (or an
-                    // unprovable tie) fails.
-                    let acceptable =
-                        run.comparison.status == ComparisonStatus::Exact
-                            || (run.comparison.status == ComparisonStatus::Classified
-                                && run.comparison.divergences.iter().all(|divergence| {
-                                    divergence.class == DivergenceClass::TieOrder
-                                }));
+                    if classify_boosted_group_negation_oracle_bug(&query, &mut run.comparison) {
+                        boosted_group_oracle_bug_cases += 1;
+                    }
+                    if run.comparison.rank_class == RankClass::ScoreEpsilon {
+                        assert_eq!(
+                            run.comparison.score_epsilon_reason,
+                            Some(ScoreEpsilonReason::SummationAssociation),
+                            "only the DIV-007 summation-association reason may classify this campaign: \
+                             seed={seed:#x} ordinal={ordinal} query={query:?}"
+                        );
+                        summation_association_cases += 1;
+                    }
+                    let acceptable = run.comparison.status == ComparisonStatus::Exact
+                        || (run.comparison.status == ComparisonStatus::Classified
+                            && run.comparison.divergences.iter().all(|divergence| {
+                                matches!(
+                                    divergence.class,
+                                    DivergenceClass::TieOrder
+                                        | DivergenceClass::ScoreEpsilon
+                                        | DivergenceClass::OracleBug
+                                )
+                            }));
                     assert!(
                         acceptable,
                         "bsjw divergence seed={seed:#x} ordinal={ordinal} query={query:?} \
@@ -17391,19 +18335,287 @@ mod tests {
                     );
                 }
             }
+            assert!(
+                finite_leaf_boost_cases > 0,
+                "the seeded corpus must exercise the finite leaf-boost AST branch"
+            );
+            assert!(
+                parenthesized_group_cases > 0,
+                "the seeded corpus must exercise parenthesized group generation"
+            );
+            assert!(
+                in_group_negation_cases > 0,
+                "the seeded corpus must exercise negation inside a group"
+            );
+            assert!(
+                boosted_group_cases > 0,
+                "the seeded corpus must exercise finite boosted groups"
+            );
+
+            let summation_query = format!("({})", vocabulary[..8].join(" OR "));
+            let summation_case = DifferentialCase {
+                fixture_id: "bsjw-div007-eight-leaf-summation".to_owned(),
+                query: summation_query.clone(),
+                limit: 20,
+                offset: 0,
+                tie_expansion_limit: 256,
+                count_requested: false,
+                snippet_max_chars: None,
+                metadata: DifferentialCaseMetadata {
+                    generator_id: Some("bsjw-query-tree-v1".to_owned()),
+                    generator_seed: Some(0x6273_6a77_0004),
+                    corpus_hash: Some(corpus_hash.clone()),
+                },
+            };
+            let summation_run = harness
+                .run(&cx, &subject, &oracle, &summation_case)
+                .await
+                .unwrap_or_else(|error| {
+                    panic!("DIV-007 eight-leaf probe failed: query={summation_query:?}: {error}")
+                });
+            match summation_run.comparison.rank_class {
+                RankClass::RankExact => assert_eq!(
+                    summation_run.comparison.status,
+                    ComparisonStatus::Exact,
+                    "a bit-exact DIV-007 candidate must not manufacture a classification: \
+                     query={summation_query:?} first={:?} divergences={:?}",
+                    summation_run.comparison.first_divergence,
+                    summation_run.comparison.divergences,
+                ),
+                RankClass::ScoreEpsilon => {
+                    assert_eq!(
+                        summation_run.comparison.status,
+                        ComparisonStatus::Classified,
+                        "DIV-007 candidate must classify, not fail: query={summation_query:?} \
+                         first={:?} divergences={:?}",
+                        summation_run.comparison.first_divergence,
+                        summation_run.comparison.divergences,
+                    );
+                    assert_eq!(
+                        summation_run.comparison.score_epsilon_reason,
+                        Some(ScoreEpsilonReason::SummationAssociation)
+                    );
+                    assert!(
+                        summation_run
+                            .comparison
+                            .divergences
+                            .iter()
+                            .all(|divergence| divergence.class == DivergenceClass::ScoreEpsilon),
+                        "the DIV-007 probe must not widen another divergence class: {:#?}",
+                        summation_run.comparison.divergences
+                    );
+                    summation_association_cases += 1;
+                }
+                rank_class => panic!(
+                    "DIV-007 eight-leaf candidate escaped the exact/ULP envelope: \
+                     query={summation_query:?} rank_class={rank_class:?} first={:?} divergences={:?}",
+                    summation_run.comparison.first_divergence, summation_run.comparison.divergences,
+                ),
+            }
+
+            let boosted_group_negation_query = format!("({0} NOT {0})^2", vocabulary[0]);
+            let boosted_group_negation_case = DifferentialCase {
+                fixture_id: "bsjw-boosted-group-negation-oracle-bug".to_owned(),
+                query: boosted_group_negation_query.clone(),
+                limit: 20,
+                offset: 0,
+                tie_expansion_limit: 256,
+                count_requested: false,
+                snippet_max_chars: None,
+                metadata: DifferentialCaseMetadata {
+                    generator_id: Some("bsjw-query-tree-v1".to_owned()),
+                    generator_seed: Some(0x6273_6a77_0005),
+                    corpus_hash: Some(corpus_hash.clone()),
+                },
+            };
+            let mut boosted_group_negation_run = harness
+                .run(&cx, &subject, &oracle, &boosted_group_negation_case)
+                .await
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "boosted-group negation probe failed: query={boosted_group_negation_query:?}: {error}"
+                    )
+                });
+            assert!(
+                boosted_group_negation_run
+                    .comparison
+                    .divergences
+                    .iter()
+                    .any(|divergence| divergence.class == DivergenceClass::RankMismatch),
+                "the pinned oracle fallback must make the raw membership divergence visible: {:#?}",
+                boosted_group_negation_run.comparison.divergences
+            );
+            assert!(
+                classify_boosted_group_negation_oracle_bug(
+                    &boosted_group_negation_query,
+                    &mut boosted_group_negation_run.comparison,
+                ),
+                "the known boosted-group negation shape must route to OracleBug"
+            );
+            assert_eq!(
+                boosted_group_negation_run.comparison.status,
+                ComparisonStatus::Classified
+            );
+            assert!(
+                boosted_group_negation_run
+                    .comparison
+                    .divergences
+                    .iter()
+                    .all(|divergence| divergence.class == DivergenceClass::OracleBug),
+                "boosted-group negation must never be relabeled ScoreEpsilon: {:#?}",
+                boosted_group_negation_run.comparison.divergences
+            );
+            boosted_group_oracle_bug_cases += 1;
+            assert!(
+                summation_association_cases > 0,
+                "the smoke slice must observe at least one DIV-007 ScoreEpsilon classification"
+            );
+            assert!(
+                boosted_group_oracle_bug_cases > 0,
+                "the smoke slice must observe the boosted-group OracleBug classification"
+            );
+
+            let grouped_query =
+                format!("({} OR {}) {}", vocabulary[0], vocabulary[1], vocabulary[2]);
+            let grouped_case = DifferentialCase {
+                fixture_id: "bsjw-nested-boolean-one-level".to_owned(),
+                query: grouped_query.clone(),
+                limit: 20,
+                offset: 0,
+                tie_expansion_limit: 256,
+                count_requested: false,
+                snippet_max_chars: None,
+                metadata: DifferentialCaseMetadata {
+                    generator_id: Some("bsjw-query-tree-v1".to_owned()),
+                    generator_seed: Some(0x6273_6a77_0003),
+                    corpus_hash: Some(corpus_hash.clone()),
+                },
+            };
+            let grouped_run = harness
+                .run(&cx, &subject, &oracle, &grouped_case)
+                .await
+                .unwrap_or_else(|error| panic!("nested Boolean probe failed: {error}"));
+            assert_eq!(
+                grouped_run.comparison.status,
+                ComparisonStatus::Exact,
+                "nested Boolean probe must be exact: query={grouped_query:?} first={:?} divergences={:?}",
+                grouped_run.comparison.first_divergence,
+                grouped_run.comparison.divergences,
+            );
 
             // Typed-error lane: phrase slop is a declared Quill capability gap.
-            // The subject must refuse with its exact typed error while the
-            // oracle executes — never a fabricated comparison, never a silent
-            // wrong result.
-            let slop_query = format!(
-                "\"{} {}\"~2",
-                vocabulary[0],
-                vocabulary[1.min(vocabulary.len() - 1)]
-            );
-            let slop_case = DifferentialCase {
-                fixture_id: "bsjw-typed-error-slop".to_owned(),
-                query: slop_query.clone(),
+            // The subject must refuse every generated slop AST with its exact
+            // typed error while the oracle executes. Crucially, the ordinary
+            // differential harness must also stop at that error instead of
+            // fabricating a comparison report from one engine's result.
+            for (label, slop) in [("one", 1_u32), ("two", 2), ("wide", 9)] {
+                let slop_query = format!(
+                    "\"{} {}\"~{slop}",
+                    vocabulary[0],
+                    vocabulary[1.min(vocabulary.len() - 1)]
+                );
+                let slop_case = DifferentialCase {
+                    fixture_id: format!("bsjw-typed-error-slop-{label}"),
+                    query: slop_query.clone(),
+                    limit: 20,
+                    offset: 0,
+                    tie_expansion_limit: 256,
+                    count_requested: false,
+                    snippet_max_chars: None,
+                    metadata: DifferentialCaseMetadata {
+                        generator_id: Some("bsjw-query-tree-v1".to_owned()),
+                        generator_seed: Some(u64::from(slop)),
+                        corpus_hash: Some(corpus_hash.clone()),
+                    },
+                };
+                let subject_error =
+                    crate::engine::GauntletEngine::observe(&subject, &cx, &slop_case)
+                        .await
+                        .expect_err(
+                            "phrase slop must be a typed Quill refusal, not a silent execution",
+                        );
+                assert!(
+                    subject_error.to_string().contains("slop"),
+                    "slop refusal must name the capability for {label}: {subject_error}"
+                );
+                crate::engine::GauntletEngine::observe(&oracle, &cx, &slop_case)
+                    .await
+                    .unwrap_or_else(|error| {
+                        panic!("the oracle must execute slop case {label}: {error}")
+                    });
+                let harness_error = harness
+                    .run(&cx, &subject, &oracle, &slop_case)
+                    .await
+                    .expect_err("a typed subject refusal must not manufacture a comparison report");
+                assert!(
+                    harness_error.to_string().contains("slop"),
+                    "harness must preserve the typed slop refusal for {label}: {harness_error}"
+                );
+            }
+
+            // Phrase-prefix ASTs are another declared Quill capability gap.
+            // They belong beside slop in the typed-error lane, never in the
+            // exact generator: the oracle executes, while Quill names the
+            // unsupported prefix capability and the harness stops before a
+            // one-sided result can become a comparison report.
+            for (label, word_count) in [("two", 2_usize), ("three", 3)] {
+                let prefix_query = format!(
+                    "\"{}\"*",
+                    (0..word_count)
+                        .map(|index| vocabulary[index].as_str())
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                );
+                let prefix_case = DifferentialCase {
+                    fixture_id: format!("bsjw-typed-error-prefix-{label}"),
+                    query: prefix_query,
+                    limit: 20,
+                    offset: 0,
+                    tie_expansion_limit: 256,
+                    count_requested: false,
+                    snippet_max_chars: None,
+                    metadata: DifferentialCaseMetadata {
+                        generator_id: Some("bsjw-query-tree-v1".to_owned()),
+                        generator_seed: Some(
+                            u64::try_from(word_count).expect("prefix word count fits u64"),
+                        ),
+                        corpus_hash: Some(corpus_hash.clone()),
+                    },
+                };
+                let subject_error =
+                    crate::engine::GauntletEngine::observe(&subject, &cx, &prefix_case)
+                        .await
+                        .expect_err(
+                            "phrase prefix must be a typed Quill refusal, not a silent execution",
+                        );
+                assert!(
+                    subject_error.to_string().contains("prefix"),
+                    "prefix refusal must name the capability for {label}: {subject_error}"
+                );
+                crate::engine::GauntletEngine::observe(&oracle, &cx, &prefix_case)
+                    .await
+                    .unwrap_or_else(|error| {
+                        panic!("the oracle must execute prefix case {label}: {error}")
+                    });
+                let harness_error = harness
+                    .run(&cx, &subject, &oracle, &prefix_case)
+                    .await
+                    .expect_err("a typed prefix refusal must not manufacture a comparison report");
+                assert!(
+                    harness_error.to_string().contains("prefix"),
+                    "harness must preserve the typed prefix refusal for {label}: {harness_error}"
+                );
+            }
+
+            let overflowing_boost =
+                format!("{} {}^{}", vocabulary[0], vocabulary[0], "9".repeat(400));
+            // DIV-005 is deliberately outside the ordinary exact lane. Quill
+            // recovers the invalid boost, but the pinned oracle can emit an
+            // infinite score. The harness must reject that observation before
+            // it could be mistaken for a classified cross-engine result.
+            let overflow_case = DifferentialCase {
+                fixture_id: "bsjw-div005-nonfinite-refusal".to_owned(),
+                query: overflowing_boost,
                 limit: 20,
                 offset: 0,
                 tie_expansion_limit: 256,
@@ -17412,20 +18624,21 @@ mod tests {
                 metadata: DifferentialCaseMetadata {
                     generator_id: Some("bsjw-query-tree-v1".to_owned()),
                     generator_seed: None,
-                    corpus_hash: Some(corpus_hash.clone()),
+                    corpus_hash: Some(corpus_hash),
                 },
             };
-            let subject_outcome =
-                crate::engine::GauntletEngine::observe(&subject, &cx, &slop_case).await;
-            let subject_error = subject_outcome
-                .expect_err("phrase slop must be a typed Quill refusal, not a silent execution");
-            assert!(
-                subject_error.to_string().contains("slop"),
-                "slop refusal must name the capability: {subject_error}"
-            );
-            crate::engine::GauntletEngine::observe(&oracle, &cx, &slop_case)
+            let overflow_error = harness
+                .run(&cx, &subject, &oracle, &overflow_case)
                 .await
-                .expect("the oracle executes the slop query the subject refuses");
+                .expect_err("DIV-005 non-finite oracle score must fail closed before comparison");
+            assert!(
+                matches!(
+                    overflow_error,
+                    GauntletError::InvalidObservation { ref reason }
+                        if reason.contains("oracle.hits") && reason.contains("non-finite score")
+                ),
+                "DIV-005 must remain a non-finite observation refusal: {overflow_error}"
+            );
         });
     }
 

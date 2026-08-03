@@ -48,6 +48,10 @@ ARTIFACT_URL="${ARTIFACT_URL:-}"
 LOCK_FILE="/tmp/fsfs-install.lock"
 SYSTEM=0
 NO_GUM=0
+NO_COLOR_MODE=0
+if [ -n "${NO_COLOR:-}" ]; then
+  NO_COLOR_MODE=1
+fi
 
 # Detect gum for fancy output (https://github.com/charmbracelet/gum)
 HAS_GUM=0
@@ -59,7 +63,9 @@ log() { [ "$QUIET" -eq 1 ] && return 0; echo -e "$@"; }
 
 info() {
   [ "$QUIET" -eq 1 ] && return 0
-  if [ "$HAS_GUM" -eq 1 ] && [ "$NO_GUM" -eq 0 ]; then
+  if [ "$NO_COLOR_MODE" -eq 1 ]; then
+    printf '%s\n' "→ $*"
+  elif [ "$HAS_GUM" -eq 1 ] && [ "$NO_GUM" -eq 0 ]; then
     gum style --foreground 39 "→ $*"
   else
     echo -e "\033[0;34m→\033[0m $*"
@@ -67,7 +73,10 @@ info() {
 }
 
 ok() {
-  if [ "$HAS_GUM" -eq 1 ] && [ "$NO_GUM" -eq 0 ]; then
+  [ "$QUIET" -eq 1 ] && return 0
+  if [ "$NO_COLOR_MODE" -eq 1 ]; then
+    printf '%s\n' "✓ $*"
+  elif [ "$HAS_GUM" -eq 1 ] && [ "$NO_GUM" -eq 0 ]; then
     gum style --foreground 42 "✓ $*"
   else
     echo -e "\033[0;32m✓\033[0m $*"
@@ -75,7 +84,10 @@ ok() {
 }
 
 warn() {
-  if [ "$HAS_GUM" -eq 1 ] && [ "$NO_GUM" -eq 0 ]; then
+  [ "$QUIET" -eq 1 ] && return 0
+  if [ "$NO_COLOR_MODE" -eq 1 ]; then
+    printf '%s\n' "⚠ $*"
+  elif [ "$HAS_GUM" -eq 1 ] && [ "$NO_GUM" -eq 0 ]; then
     gum style --foreground 214 "⚠ $*"
   else
     echo -e "\033[1;33m⚠\033[0m $*"
@@ -83,7 +95,9 @@ warn() {
 }
 
 err() {
-  if [ "$HAS_GUM" -eq 1 ] && [ "$NO_GUM" -eq 0 ]; then
+  if [ "$NO_COLOR_MODE" -eq 1 ]; then
+    printf '%s\n' "✗ $*" >&2
+  elif [ "$HAS_GUM" -eq 1 ] && [ "$NO_GUM" -eq 0 ]; then
     gum style --foreground 196 "✗ $*"
   else
     echo -e "\033[0;31m✗\033[0m $*"
@@ -192,6 +206,40 @@ install_binary() {
   fi
 }
 
+provision_default_semantic_models() {
+  local staged_binary="$1"
+
+  info "Provisioning the registered semantic model artifacts..."
+  if ! "$staged_binary" download-models; then
+    err "Semantic model provisioning failed. The existing fsfs installation was not replaced."
+    return 1
+  fi
+
+  if ! "$staged_binary" download-models --verify; then
+    err "Semantic model verification failed. The existing fsfs installation was not replaced."
+    return 1
+  fi
+
+  ok "Registered semantic model artifacts are present and verified."
+}
+
+verify_staged_binary() {
+  local staged_binary="$1" version_output=""
+
+  if version_output="$("$staged_binary" version 2>&1)" && [ -n "$version_output" ]; then
+    ok "Staged binary verification passed: $version_output"
+    return 0
+  fi
+
+  if version_output="$("$staged_binary" --version 2>&1)" && [ -n "$version_output" ]; then
+    ok "Staged binary verification passed (--version): $version_output"
+    return 0
+  fi
+
+  err "Staged binary failed version checks. The existing fsfs installation was not replaced."
+  return 1
+}
+
 run_installer_contract_test() {
   local action="${1:-}"
   case "$action" in
@@ -230,6 +278,24 @@ run_installer_contract_test() {
       [ "$#" -eq 2 ] || { err "contract unsupported requires TARGET"; return 2; }
       fail_unsupported_semantic_platform "$2"
       ;;
+    provision)
+      [ "$#" -eq 2 ] || { err "contract provision requires STAGED_BINARY"; return 2; }
+      provision_default_semantic_models "$2"
+      ;;
+    verify-staged)
+      [ "$#" -eq 2 ] || { err "contract verify-staged requires STAGED_BINARY"; return 2; }
+      verify_staged_binary "$2"
+      ;;
+    output-mode)
+      [ "$#" -eq 2 ] || { err "contract output-mode requires QUIET"; return 2; }
+      QUIET="$2"
+      HAS_GUM=0
+      NO_GUM=1
+      info "info-output"
+      ok "ok-output"
+      warn "warn-output"
+      err "error-output"
+      ;;
     install-built)
       [ "$#" -eq 3 ] || { err "contract install-built requires SOURCE DESTINATION"; return 2; }
       SYSTEM=0
@@ -253,7 +319,7 @@ fi
 run_with_spinner() {
   local title="$1"
   shift
-  if [ "$HAS_GUM" -eq 1 ] && [ "$NO_GUM" -eq 0 ] && [ "$QUIET" -eq 0 ]; then
+  if [ "$HAS_GUM" -eq 1 ] && [ "$NO_GUM" -eq 0 ] && [ "$NO_COLOR_MODE" -eq 0 ] && [ "$QUIET" -eq 0 ]; then
     gum spin --spinner dot --title "$title" -- "$@"
   else
     info "$title"
@@ -376,7 +442,9 @@ done
 
 # Show header
 if [ "$QUIET" -eq 0 ]; then
-  if [ "$HAS_GUM" -eq 1 ] && [ "$NO_GUM" -eq 0 ]; then
+  if [ "$NO_COLOR_MODE" -eq 1 ]; then
+    printf '\nfsfs installer\nTwo-tier hybrid local search\n\n'
+  elif [ "$HAS_GUM" -eq 1 ] && [ "$NO_GUM" -eq 0 ]; then
     gum style \
       --border rounded \
       --border-foreground 39 \
@@ -490,7 +558,7 @@ download_with_progress() {
     fi
   fi
 
-  if [ "$HAS_GUM" -eq 1 ] && [ "$NO_GUM" -eq 0 ] && [ "$QUIET" -eq 0 ]; then
+  if [ "$HAS_GUM" -eq 1 ] && [ "$NO_GUM" -eq 0 ] && [ "$NO_COLOR_MODE" -eq 0 ] && [ "$QUIET" -eq 0 ]; then
     # ── gum: rich styled output ──
     if [ -n "$size_human" ]; then
       gum style --foreground 39 "$(printf '↓ %s  %s  (%s)' "$label" "$(gum style --faint --italic "$(basename "$url")")" \
@@ -502,7 +570,7 @@ download_with_progress() {
     if ! curl -fL --progress-bar --connect-timeout 30 --max-time 1800 "$url" -o "$dest"; then
       return 1
     fi
-  elif [ -t 1 ] && [ "$QUIET" -eq 0 ]; then
+  elif [ -t 1 ] && [ "$NO_COLOR_MODE" -eq 0 ] && [ "$QUIET" -eq 0 ]; then
     # ── Interactive terminal: styled ANSI progress ──
     if [ -n "$size_human" ]; then
       printf '\033[1;36m↓\033[0m %s \033[2m%s\033[0m  \033[1;35m%s\033[0m\n' \
@@ -583,6 +651,17 @@ if [ "$FROM_SOURCE" -eq 1 ]; then
       exit 1
     fi
   fi
+  if [ "$LITE" -eq 0 ]; then
+    if ! provision_default_semantic_models "$BIN"; then
+      exit 1
+    fi
+  fi
+  if [ "$VERIFY" -eq 1 ]; then
+    if ! verify_staged_binary "$BIN"; then
+      exit 1
+    fi
+  fi
+
   install_binary "$BIN" "$DEST/${BINARY_NAME}"
   ok "Installed to $DEST/${BINARY_NAME} (source build)"
   maybe_add_path
@@ -653,6 +732,18 @@ if [ ! -x "$BIN" ]; then
 fi
 [ -x "$BIN" ] || { err "Binary not found in archive"; exit 1; }
 
+if [ "$LITE" -eq 0 ]; then
+  if ! provision_default_semantic_models "$BIN"; then
+    exit 1
+  fi
+fi
+
+if [ "$VERIFY" -eq 1 ]; then
+  if ! verify_staged_binary "$BIN"; then
+    exit 1
+  fi
+fi
+
 install_binary "$BIN" "$DEST/${BINARY_NAME}"
 ok "Installed to $DEST/${BINARY_NAME}"
 maybe_add_path
@@ -665,7 +756,20 @@ if [ "$VERIFY" -eq 1 ]; then
   ok "Self-test complete: $SELF_TEST_OUTPUT"
 fi
 
-if [ "$HAS_GUM" -eq 1 ] && [ "$NO_GUM" -eq 0 ]; then
+if [ "$QUIET" -eq 0 ]; then
+if [ "$NO_COLOR_MODE" -eq 1 ]; then
+  printf '\nInstallation complete!\n'
+  printf 'Binary: %s\n' "$DEST/${BINARY_NAME}"
+  printf 'Version: %s\n\n' "$VERSION"
+  printf '%s\n' 'Quick start:'
+  printf '%s\n' '  fsfs download-models potion-multilingual-128m'
+  printf '%s\n' '  fsfs download-models all-minilm-l6-v2'
+  printf '%s\n' '  fsfs download-models potion-multilingual-128m --verify'
+  printf '%s\n' '  fsfs download-models all-minilm-l6-v2 --verify'
+  printf '%s\n' '  fsfs index /path/to/files   Index a directory'
+  printf '%s\n' '  fsfs search "your query"    Search your index'
+  printf '%s\n\n' '  fsfs                        Interactive TUI'
+elif [ "$HAS_GUM" -eq 1 ] && [ "$NO_GUM" -eq 0 ]; then
   echo ""
   gum style \
     --border rounded \
@@ -711,4 +815,5 @@ else
   echo -e "  \033[1;32m│\033[0m  \033[0;90m$ fsfs\033[0m  \033[2m(interactive TUI)\033[0m          \033[1;32m│\033[0m"
   echo -e "  \033[1;32m╰─────────────────────────────────────────╯\033[0m"
   echo ""
+fi
 fi

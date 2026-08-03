@@ -24,6 +24,8 @@ use crate::{
 
 /// Version of the machine-readable ratchet decision artifact.
 pub const PERF_RATCHET_SCHEMA_VERSION: &str = "quill-perf-ratchet-v4";
+/// Strict schema for the immutable pointer to an admitted history artifact pair.
+pub const PERF_HISTORY_POINTER_SCHEMA_VERSION: &str = "frankensearch.perf-history-pointer.v2";
 /// Maximum directional pass-over-pass regression admitted for a cell.
 pub const PERF_MAX_REGRESSION_PCT: f64 = 5.0;
 /// Maximum disagreement admitted between same-revision candidate reruns.
@@ -2681,7 +2683,7 @@ impl GateTargetEvaluator<'_, '_> {
         if passed {
             return;
         }
-        if self.observe_only {
+        if self.observe_only && !self.activated {
             self.state
                 .note("perf.ratchet.bootstrap_target_missed", message);
         } else if self.activated {
@@ -6030,7 +6032,7 @@ mod tests {
     }
 
     #[test]
-    fn activated_bootstrap_records_target_miss_and_establishes_measured_baseline() {
+    fn activated_bootstrap_target_miss_blocks_baseline_replacement() {
         let baseline = explicit_bootstrap(PerfGate::Qg2);
         let (candidate, candidate_evidence) = qg2_current_pair("new", "candidate", 110.0, 100.0);
         let (rerun, rerun_evidence) = qg2_current_pair("new", "rerun", 110.0, 100.0);
@@ -6056,22 +6058,62 @@ mod tests {
         });
         assert_eq!(
             result.decision,
-            PerfGateDecision::Allow,
-            "bootstrap promotion reasons: {:#?}",
+            PerfGateDecision::Block,
+            "activated bootstrap target-miss reasons: {:#?}",
             result.reasons
         );
         assert!(
             result
                 .reasons
                 .iter()
-                .any(|reason| reason.code == "perf.ratchet.bootstrap_promotion")
+                .any(|reason| reason.code == "perf.ratchet.gate_target_missed")
         );
         assert!(
             result
                 .reasons
                 .iter()
-                .any(|reason| reason.code == "perf.ratchet.bootstrap_target_missed"),
-            "initial activation must retain the target MISS verdict"
+                .all(|reason| reason.code != "perf.ratchet.bootstrap_target_missed"),
+            "an activated gate must not re-enter the bootstrap target-miss concession"
+        );
+    }
+
+    #[test]
+    fn inactive_bootstrap_target_miss_remains_observational() {
+        let baseline = explicit_bootstrap(PerfGate::Qg2);
+        let (candidate, candidate_evidence) = qg2_current_pair("new", "candidate", 110.0, 100.0);
+        let (rerun, rerun_evidence) = qg2_current_pair("new", "rerun", 110.0, 100.0);
+        let expected_profile = candidate_evidence
+            .machine_class
+            .identity()
+            .expect("candidate identity")
+            .profile();
+        let result = evaluate_perf_ratchet(PerfRatchetRequest {
+            baseline: Some(&baseline),
+            baseline_evidence: None,
+            candidate: &candidate,
+            rerun: Some(&rerun),
+            candidate_evidence: Some(&candidate_evidence),
+            rerun_evidence: Some(&rerun_evidence),
+            expected_machine_profile: Some(expected_profile),
+            candidate_runner_identity: candidate_evidence.machine_class.identity(),
+            rerun_runner_identity: rerun_evidence.machine_class.identity(),
+            gate_activated: false,
+            mode: PerfRatchetMode::Promotion,
+            expected_manifest_sha256: &normalized_manifest_sha256(),
+            evidence: Vec::new(),
+        });
+        assert_eq!(result.decision, PerfGateDecision::Quarantine);
+        assert!(
+            result
+                .reasons
+                .iter()
+                .any(|reason| reason.code == "perf.ratchet.bootstrap_target_missed")
+        );
+        assert!(
+            result
+                .reasons
+                .iter()
+                .all(|reason| reason.code != "perf.ratchet.gate_target_missed")
         );
     }
 

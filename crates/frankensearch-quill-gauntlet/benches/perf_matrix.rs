@@ -115,16 +115,59 @@ struct GateManifest {
 
 #[derive(Deserialize)]
 struct GateManifestEntry {
+    name: String,
+    fixture: String,
+    target: String,
+    activated: bool,
+}
+
+#[derive(Deserialize)]
+struct Qg6Manifest {
+    gate: BTreeMap<String, Qg6ManifestEntry>,
+}
+
+#[derive(Deserialize)]
+struct Qg6ManifestEntry {
     queries_per_class: Option<usize>,
 }
 
 fn qg6_queries_per_class(manifest: &str) -> Result<usize, String> {
-    let manifest = toml::from_str::<GateManifest>(manifest).map_err(|error| error.to_string())?;
+    let manifest = toml::from_str::<Qg6Manifest>(manifest).map_err(|error| error.to_string())?;
     manifest
         .gate
         .get("QG-6")
         .and_then(|gate| gate.queries_per_class)
         .ok_or_else(|| "gate.QG-6.queries_per_class is missing".to_owned())
+}
+
+fn validate_manifest_gate_contract(manifest: &str) -> Result<(), String> {
+    let manifest = toml::from_str::<GateManifest>(manifest).map_err(|error| error.to_string())?;
+    for gate in PerfGate::ALL {
+        let label = gate.label();
+        let policy = manifest
+            .gate
+            .get(label)
+            .ok_or_else(|| format!("manifest is missing gate.{label}"))?;
+        for (field, value) in [
+            ("name", policy.name.as_str()),
+            ("fixture", policy.fixture.as_str()),
+            ("target", policy.target.as_str()),
+        ] {
+            if value.trim().is_empty() {
+                return Err(format!("manifest gate.{label}.{field} is empty"));
+            }
+        }
+        let _activated = policy.activated;
+    }
+    for label in manifest.gate.keys() {
+        if !PerfGate::ALL
+            .iter()
+            .any(|gate| gate.label() == label.as_str())
+        {
+            return Err(format!("manifest defines unexpected gate.{label}"));
+        }
+    }
+    Ok(())
 }
 
 fn validate_qg6_queries_per_class(manifest: &str) -> Result<(), String> {
@@ -5259,6 +5302,8 @@ fn assert_incumbent_is_genuine_tantivy() -> String {
 }
 
 fn main() {
+    validate_manifest_gate_contract(MANIFEST)
+        .expect("normative QG manifest has a complete, closed policy set");
     #[cfg(test)]
     if std::env::var_os("QUILL_PERF_H1_PRODUCER_SELF_CHECK").is_some() {
         tests::assert_qg1_continuous_interval_contract();
@@ -5269,6 +5314,8 @@ fn main() {
         tests::assert_non_qg1_corpus_identity_preserves_legacy_hash();
         tests::assert_qg9_cache_evidence_contract();
         tests::assert_qg9_cache_eviction_file_discovery();
+        tests::assert_qg9_cache_eviction_request();
+        tests::assert_manifest_gate_contract();
         eprintln!(
             "[quill-perf-self-check] H1 immutable producer and continuous-timing contracts passed"
         );
@@ -5345,6 +5392,27 @@ mod tests {
     #[test]
     fn qg9_cache_eviction_discovers_nested_regular_files_without_treating_dirs_as_files() {
         assert_qg9_cache_eviction_file_discovery();
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn assert_qg9_cache_eviction_request() {
+        let fixture = tempfile::tempdir().expect("QG-9 cache-eviction fixture directory");
+        std::fs::write(fixture.path().join("segment.fslx"), b"segment")
+            .expect("write QG-9 cache-eviction fixture");
+        assert_eq!(
+            super::evict_index_file_cache(fixture.path())
+                .expect("QG-9 Linux cache eviction request must succeed"),
+            1,
+            "QG-9 must request eviction for every regular index file"
+        );
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub fn assert_qg9_cache_eviction_request() {}
+
+    #[test]
+    fn qg9_linux_cache_eviction_request_is_real() {
+        assert_qg9_cache_eviction_request();
     }
 
     fn hostile_tantivy_continuous_receipt() -> super::Qg1ContinuousTimingReceipt {
@@ -6365,6 +6433,47 @@ mod tests {
                 "[gate.QG-6]\nqueries_per_class = \"sixteen\"\n",
             )
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn normative_manifest_gate_contract_is_complete_and_closed() {
+        assert_manifest_gate_contract();
+    }
+
+    pub fn assert_manifest_gate_contract() {
+        super::validate_manifest_gate_contract(super::MANIFEST)
+            .expect("normative manifest has every required QG policy");
+
+        let missing = super::MANIFEST.replacen("[gate.QG-10]", "[omitted.QG-10]", 1);
+        let missing_error = super::validate_manifest_gate_contract(&missing)
+            .expect_err("missing QG policy must fail closed");
+        assert!(
+            missing_error.contains("missing gate.QG-10"),
+            "unexpected missing-gate error: {missing_error}"
+        );
+
+        let extra = format!(
+            "{}\n[gate.QG-11]\nname = \"extra\"\nfixture = \"extra\"\ntarget = \"extra\"\nactivated = false\n",
+            super::MANIFEST
+        );
+        let extra_error = super::validate_manifest_gate_contract(&extra)
+            .expect_err("extra QG policy must fail closed");
+        assert!(
+            extra_error.contains("unexpected gate.QG-11"),
+            "unexpected extra-gate error: {extra_error}"
+        );
+
+        let empty_target = super::MANIFEST.replacen(
+            "target = \"open() <= 50ms (manifest + lazy sections) vs oracle reader open\"",
+            "target = \" \"",
+            1,
+        );
+        let target_error = super::validate_manifest_gate_contract(&empty_target)
+            .expect_err("empty QG target must fail closed");
+        assert!(
+            target_error.contains("gate.QG-9.target is empty"),
+            "unexpected empty-target error: {target_error}"
         );
     }
 }

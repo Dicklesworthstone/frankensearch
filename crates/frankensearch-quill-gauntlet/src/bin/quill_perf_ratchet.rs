@@ -12,8 +12,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use frankensearch_quill_gauntlet::{
     ExecutionProfileId, HardwareClassId, MachineClassAdmissionContext, MachineClassRegistry,
-    MachineProfileKey, PERF_ARTIFACT_SCHEMA_VERSION, PerfEvidenceArtifact, PerfEvidenceFile,
-    PerfGate, PerfGateArtifact, PerfGateDecision, PerfRatchetMode, PerfRatchetRequest,
+    MachineProfileKey, PERF_ARTIFACT_SCHEMA_VERSION, PERF_EVIDENCE_SCHEMA_VERSION,
+    PERF_HISTORY_POINTER_SCHEMA_VERSION, PerfEvidenceArtifact, PerfEvidenceFile, PerfGate,
+    PerfGateArtifact, PerfGateDecision, PerfRatchetMode, PerfRatchetRequest,
     VerifiedRunnerIdentity, evaluate_perf_ratchet, is_explicit_bootstrap,
     is_explicit_bootstrap_for, perf_manifest_contract_sha256,
 };
@@ -49,8 +50,6 @@ Exit status: 0=Allow, 1=Block, 2=Quarantine, 64=invalid invocation.";
 
 type LoadedEvidence = (PerfEvidenceArtifact, Vec<u8>);
 type AdmittedRunnerReceipt = (VerifiedRunnerIdentity, Vec<u8>, Vec<u8>, Vec<u8>);
-
-const HISTORY_POINTER_SCHEMA_VERSION: &str = "frankensearch.perf-history-pointer.v2";
 
 fn current_bootstrap_basename(gate: PerfGate) -> String {
     let Some(version) = PERF_ARTIFACT_SCHEMA_VERSION.strip_prefix("quill-perf-artifact-") else {
@@ -136,6 +135,8 @@ fn run() -> Result<PerfGateDecision, Box<dyn Error>> {
     let manifest_text = std::str::from_utf8(&manifest_bytes)?;
     let manifest_sha256 = perf_manifest_contract_sha256(manifest_text);
     let manifest = toml::from_str::<toml::Value>(manifest_text)?;
+    validate_manifest_gate_set(&manifest)?;
+    validate_manifest_schema_bindings(&manifest)?;
 
     let _history_lock = acquire_promotion_history_lock(&args)?;
     let loaded_baseline = read_baseline(&args.baseline, args.baseline_evidence.as_deref())?;
@@ -826,15 +827,15 @@ fn read_baseline(
         );
     }
 
-    if schema_version != HISTORY_POINTER_SCHEMA_VERSION {
+    if schema_version != PERF_HISTORY_POINTER_SCHEMA_VERSION {
         return Err(format!(
-            "baseline {} has unsupported schema {schema_version:?}; expected current threshold {PERF_ARTIFACT_SCHEMA_VERSION:?} or history pointer {HISTORY_POINTER_SCHEMA_VERSION:?}",
+            "baseline {} has unsupported schema {schema_version:?}; expected current threshold {PERF_ARTIFACT_SCHEMA_VERSION:?} or history pointer {PERF_HISTORY_POINTER_SCHEMA_VERSION:?}",
             path.display()
         )
         .into());
     }
     let pointer = serde_json::from_value::<HistoryPointer>(probe)?;
-    if pointer.schema_version != HISTORY_POINTER_SCHEMA_VERSION
+    if pointer.schema_version != PERF_HISTORY_POINTER_SCHEMA_VERSION
         || serde_json::to_vec_pretty(&pointer)? != bytes
     {
         return Err(format!(
@@ -1043,6 +1044,99 @@ fn gate_activated(manifest: &toml::Value, gate: PerfGate) -> Result<bool, Box<dy
         .ok_or_else(|| format!("manifest does not define gate.{}.activated", gate.label()).into())
 }
 
+/// Reject a manifest that omits, renames, or adds a normative performance gate.
+///
+/// The gate set is the contract from which all admission decisions derive. A
+/// selected gate's `activated` flag alone is insufficient: a malformed
+/// unrelated table would otherwise evade validation and make the committed
+/// manifest an incomplete source of truth.
+fn validate_manifest_gate_set(manifest: &toml::Value) -> Result<(), Box<dyn Error>> {
+    let gates = manifest
+        .get("gate")
+        .and_then(toml::Value::as_table)
+        .ok_or("manifest does not define a [gate] table")?;
+
+    for gate in PerfGate::ALL {
+        let label = gate.label();
+        let policy = gates
+            .get(label)
+            .ok_or_else(|| format!("manifest is missing gate.{label}"))?;
+        if !policy.is_table() {
+            return Err(format!("manifest gate.{label} is not a table").into());
+        }
+        for field in ["name", "fixture", "target"] {
+            if policy
+                .get(field)
+                .and_then(toml::Value::as_str)
+                .is_none_or(|value| value.trim().is_empty())
+            {
+                return Err(format!("manifest gate.{label}.{field} is missing or empty").into());
+            }
+        }
+        if policy
+            .get("activated")
+            .and_then(toml::Value::as_bool)
+            .is_none()
+        {
+            return Err(format!("manifest gate.{label}.activated is missing or not boolean").into());
+        }
+    }
+
+    for label in gates.keys() {
+        if !PerfGate::ALL
+            .iter()
+            .any(|gate| gate.label() == label.as_str())
+        {
+            return Err(format!("manifest defines unexpected gate.{label}").into());
+        }
+    }
+
+    Ok(())
+}
+
+/// Bind the manifest declaration to the only artifact schemas this ratchet
+/// accepts, so an internally inconsistent manifest fails before admission.
+fn validate_manifest_schema_bindings(manifest: &toml::Value) -> Result<(), Box<dyn Error>> {
+    let schemas = manifest
+        .get("schemas")
+        .and_then(toml::Value::as_table)
+        .ok_or("manifest does not define a [schemas] table")?;
+    const KNOWN_FIELDS: &[&str] = &[
+        "threshold_artifact",
+        "evidence_artifact",
+        "evidence_assembly",
+        "machine_registry",
+        "applicability_plan",
+        "runner_completion_receipt",
+        "runner_artifact_manifest",
+        "local_producer_contract",
+        "history_pointer",
+        "runner_attempt_receipt",
+        "precommit_inventory",
+    ];
+    for (field, expected) in [
+        ("threshold_artifact", PERF_ARTIFACT_SCHEMA_VERSION),
+        ("evidence_artifact", PERF_EVIDENCE_SCHEMA_VERSION),
+        ("history_pointer", PERF_HISTORY_POINTER_SCHEMA_VERSION),
+    ] {
+        let found = schemas
+            .get(field)
+            .and_then(toml::Value::as_str)
+            .ok_or_else(|| format!("manifest schemas.{field} is missing or not a string"))?;
+        if found != expected {
+            return Err(
+                format!("manifest schemas.{field} is {found:?}, expected {expected:?}").into(),
+            );
+        }
+    }
+    for field in schemas.keys() {
+        if !KNOWN_FIELDS.contains(&field.as_str()) {
+            return Err(format!("manifest schemas.{field} is unreviewed").into());
+        }
+    }
+    Ok(())
+}
+
 fn evidence(role: &str, path: &Path, bytes: &[u8]) -> PerfEvidenceFile {
     PerfEvidenceFile {
         role: role.to_owned(),
@@ -1105,7 +1199,7 @@ fn plan_history_if_requested(
     let rolling_evidence = history_dir.join(&evidence_file);
     let latest_pointer = history_dir.join(format!("{stem}.latest.json"));
     let pointer = HistoryPointer {
-        schema_version: HISTORY_POINTER_SCHEMA_VERSION.to_owned(),
+        schema_version: PERF_HISTORY_POINTER_SCHEMA_VERSION.to_owned(),
         gate,
         profile,
         run_id: candidate_run_id.to_owned(),
@@ -1333,6 +1427,127 @@ mod tests {
         assert!(validate_component("../worker", "run ID").is_err());
         assert!(validate_component("candidate-1", "run ID").is_ok());
         assert!(validate_component("2026-07-23", "date").is_ok());
+    }
+
+    #[test]
+    fn manifest_gate_set_is_exact_and_fails_closed_for_missing_or_extra_gates() {
+        let manifest_text = include_str!("../../../../docs/contracts/quill-perf-gates.toml");
+        let manifest = toml::from_str::<toml::Value>(manifest_text)
+            .expect("parse normative performance manifest");
+        validate_manifest_gate_set(&manifest)
+            .expect("normative manifest has every QG gate exactly once");
+
+        let missing = manifest_text.replacen("[gate.QG-10]", "[omitted.QG-10]", 1);
+        let missing = toml::from_str::<toml::Value>(&missing).expect("parse missing-gate mutation");
+        let missing_error = validate_manifest_gate_set(&missing)
+            .expect_err("missing normative gate must fail closed")
+            .to_string();
+        assert!(
+            missing_error.contains("missing gate.QG-10"),
+            "unexpected missing-gate error: {missing_error}"
+        );
+
+        let extra = format!("{manifest_text}\n[gate.QG-11]\nactivated = false\n");
+        let extra = toml::from_str::<toml::Value>(&extra).expect("parse extra-gate mutation");
+        let extra_error = validate_manifest_gate_set(&extra)
+            .expect_err("extra normative gate must fail closed")
+            .to_string();
+        assert!(
+            extra_error.contains("unexpected gate.QG-11"),
+            "unexpected extra-gate error: {extra_error}"
+        );
+
+        let mut missing_target = manifest.clone();
+        missing_target
+            .get_mut("gate")
+            .and_then(toml::Value::as_table_mut)
+            .and_then(|gates| gates.get_mut("QG-9"))
+            .and_then(toml::Value::as_table_mut)
+            .expect("QG-9 policy table")
+            .remove("target");
+        let missing_target_error = validate_manifest_gate_set(&missing_target)
+            .expect_err("missing normative target must fail closed")
+            .to_string();
+        assert!(
+            missing_target_error.contains("gate.QG-9.target is missing or empty"),
+            "unexpected missing-target error: {missing_target_error}"
+        );
+    }
+
+    #[test]
+    fn manifest_schema_bindings_reject_stale_or_missing_artifact_versions() {
+        let manifest_text = include_str!("../../../../docs/contracts/quill-perf-gates.toml");
+        let manifest = toml::from_str::<toml::Value>(manifest_text)
+            .expect("parse normative performance manifest");
+        validate_manifest_schema_bindings(&manifest)
+            .expect("normative manifest declares current ratchet artifact schemas");
+
+        let mut stale_evidence = manifest.clone();
+        stale_evidence
+            .get_mut("schemas")
+            .and_then(toml::Value::as_table_mut)
+            .expect("schema table")
+            .insert(
+                "evidence_artifact".to_owned(),
+                toml::Value::String("quill-perf-evidence-v4".to_owned()),
+            );
+        let stale_error = validate_manifest_schema_bindings(&stale_evidence)
+            .expect_err("stale evidence schema must fail closed")
+            .to_string();
+        assert!(
+            stale_error.contains("schemas.evidence_artifact")
+                && stale_error.contains("quill-perf-evidence-v5"),
+            "unexpected stale-schema error: {stale_error}"
+        );
+
+        let mut stale_history_pointer = manifest.clone();
+        stale_history_pointer
+            .get_mut("schemas")
+            .and_then(toml::Value::as_table_mut)
+            .expect("schema table")
+            .insert(
+                "history_pointer".to_owned(),
+                toml::Value::String("frankensearch.perf-history-pointer.v1".to_owned()),
+            );
+        let stale_history_pointer_error = validate_manifest_schema_bindings(&stale_history_pointer)
+            .expect_err("stale history-pointer schema must fail closed")
+            .to_string();
+        assert!(
+            stale_history_pointer_error.contains("schemas.history_pointer")
+                && stale_history_pointer_error.contains(PERF_HISTORY_POINTER_SCHEMA_VERSION),
+            "unexpected stale history-pointer schema error: {stale_history_pointer_error}"
+        );
+
+        let mut unreviewed_schema = manifest.clone();
+        unreviewed_schema
+            .get_mut("schemas")
+            .and_then(toml::Value::as_table_mut)
+            .expect("schema table")
+            .insert(
+                "unreviewed_schema".to_owned(),
+                toml::Value::String("unreviewed.v1".to_owned()),
+            );
+        let unreviewed_schema_error = validate_manifest_schema_bindings(&unreviewed_schema)
+            .expect_err("unreviewed schema key must fail closed")
+            .to_string();
+        assert!(
+            unreviewed_schema_error.contains("schemas.unreviewed_schema is unreviewed"),
+            "unexpected unreviewed-schema error: {unreviewed_schema_error}"
+        );
+
+        let mut missing_threshold = manifest;
+        missing_threshold
+            .get_mut("schemas")
+            .and_then(toml::Value::as_table_mut)
+            .expect("schema table")
+            .remove("threshold_artifact");
+        let missing_error = validate_manifest_schema_bindings(&missing_threshold)
+            .expect_err("missing threshold schema must fail closed")
+            .to_string();
+        assert!(
+            missing_error.contains("schemas.threshold_artifact is missing"),
+            "unexpected missing-schema error: {missing_error}"
+        );
     }
 
     #[test]

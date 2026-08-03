@@ -2847,7 +2847,10 @@ where
 /// Capture a snapshot of the current process environment.
 #[must_use]
 pub fn capture_current_env_snapshot() -> EnvSnapshot {
-    capture_env_snapshot(std::env::vars())
+    capture_env_snapshot(
+        std::env::vars_os()
+            .filter_map(|(key, value)| Some((key.into_string().ok()?, value.into_string().ok()?))),
+    )
 }
 
 // ─── Pack File Listing ──────────────────────────────────────────────────────

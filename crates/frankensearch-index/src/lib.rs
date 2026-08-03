@@ -557,23 +557,13 @@ pub struct FsviSnapshotRejected {
     pub detail: String,
 }
 
-/// Why owner-backed ANN is unavailable in this API slice.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum FsviAnnDisabledReason {
-    /// Existing HNSW APIs accept a mutable/path-opened [`VectorIndex`] and
-    /// therefore cannot prove that graph validation consumed this owner's
-    /// exact byte image.
-    OwnerBoundAdapterUnavailable,
-}
-
 /// Typed ANN disposition for one immutable FSVI owner.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case", tag = "status", content = "reason")]
+#[serde(rename_all = "snake_case", tag = "status")]
 pub enum FsviAnnAdmission {
-    /// ANN must not load or rebuild; callers must use the owner's exact-search
-    /// path until an owner-bound graph receipt and adapter are available.
-    Disabled(FsviAnnDisabledReason),
+    /// [`crate::native_hnsw::ValidatedNativeHnsw`] builds and loads only from
+    /// this retained owner and binds the graph receipt to its exact witness.
+    Enabled,
 }
 
 /// Why a recognized artifact must be rebuilt rather than adopted or relabeled.
@@ -1321,11 +1311,10 @@ impl ValidatedFsviBytes {
         ValidatedFsviRowSource { owner: self }
     }
 
-    /// ANN is explicitly disabled until HNSW load/rebuild accepts this sealed
-    /// owner and binds its graph receipt to this exact witness.
+    /// Owner-bound native HNSW can build or load only against this exact owner.
     #[must_use]
     pub const fn ann_admission(&self) -> FsviAnnAdmission {
-        FsviAnnAdmission::Disabled(FsviAnnDisabledReason::OwnerBoundAdapterUnavailable)
+        FsviAnnAdmission::Enabled
     }
 
     /// Exact top-k search over the owned image.
@@ -3832,15 +3821,42 @@ impl VectorIndexWriter {
                 file.write_all(&header)?;
             }
             file.sync_all()?;
-            if self.identity_v2.is_some() {
+            // Publication over an existing WAL sidecar is refused for EVERY
+            // format version, not just v2. A fresh v1 generation restarts at
+            // compaction_gen 1, so next_generation(1) collides with the
+            // previous generation's sidecar binding and open() would adopt the
+            // stale WAL wholesale: deleted documents resurrect and the WAL
+            // shadow suppresses the freshly rebuilt main-slab winners
+            // (bd-cnby1). Removing the sidecar here instead is not crash-safe
+            // in either order (before the rename it destroys acknowledged
+            // writes of the still-live old generation; after, a crash between
+            // rename and removal re-opens the adoption window), so the only
+            // sound contract is refusal: in-place replacement goes through
+            // install_replacement, which carries the destination generation
+            // forward and supersedes the sidecar under a real authority.
+            {
                 let wal_path = wal::wal_path_for(&self.path);
                 match fs::symlink_metadata(&wal_path) {
                     Ok(_) => {
+                        let (field, reason) = if self.identity_v2.is_some() {
+                            (
+                                "fsvi_v2.wal_sidecar",
+                                "identity-complete v2 publication refuses a target with any existing WAL sidecar",
+                            )
+                        } else {
+                            (
+                                "wal_sidecar",
+                                "publication refuses a target with an existing WAL sidecar: a fresh generation \
+                                 would collide with the sidecar's generation binding and silently adopt stale \
+                                 entries (deleted documents resurrect); replace an existing index via \
+                                 install_replacement, or remove the sidecar explicitly if discarding its \
+                                 pending writes is intended",
+                            )
+                        };
                         return Err(SearchError::InvalidConfig {
-                            field: "fsvi_v2.wal_sidecar".to_owned(),
+                            field: field.to_owned(),
                             value: wal_path.display().to_string(),
-                            reason: "identity-complete v2 publication refuses a target with any existing WAL sidecar"
-                                .to_owned(),
+                            reason: reason.to_owned(),
                         });
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -6282,10 +6298,7 @@ mod tests {
         assert_eq!(index.bytes.as_ref(), before_bytes.as_slice());
         assert_eq!(index.witness(), &before_witness);
 
-        assert_eq!(
-            index.ann_admission(),
-            FsviAnnAdmission::Disabled(FsviAnnDisabledReason::OwnerBoundAdapterUnavailable)
-        );
+        assert_eq!(index.ann_admission(), FsviAnnAdmission::Enabled);
         assert!(!wal::wal_path_for(&path).exists());
     }
 
@@ -6407,6 +6420,345 @@ mod tests {
         );
     }
 
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn sealed_owner_survives_in_place_same_size_path_rewrite() {
+        let directory = tempfile::tempdir().expect("private publication directory");
+        let path = directory.path().join("current.fsvi");
+        let replacement_path = directory.path().join("replacement.fsvi");
+        let binding = fsvi_v2_binding("same-size-rewrite", 4, Quantization::F16, 22, 0x82);
+
+        let mut original = VectorIndex::create_v2(&path, binding.clone()).expect("original writer");
+        original
+            .write_record("doc-alpha", &[1.0, 0.0, 0.0, 0.0])
+            .expect("original alpha");
+        original
+            .write_record("doc-beta", &[0.0, 1.0, 0.0, 0.0])
+            .expect("original beta");
+        original.finish().expect("finish original");
+        let owner =
+            ValidatedFsviBytes::open_published(&path, &binding).expect("admit original owner");
+        let expected_witness = owner.witness().clone();
+        let expected_hits = owner
+            .search_top_k(&[1.0, 0.0, 0.0, 0.0], 2, None)
+            .expect("search original");
+
+        let mut replacement =
+            VectorIndex::create_v2(&replacement_path, binding.clone()).expect("replacement writer");
+        replacement
+            .write_record("doc-alpha", &[0.0, 1.0, 0.0, 0.0])
+            .expect("replacement alpha");
+        replacement
+            .write_record("doc-beta", &[1.0, 0.0, 0.0, 0.0])
+            .expect("replacement beta");
+        replacement.finish().expect("finish replacement");
+
+        let replacement_bytes = fs::read(&replacement_path).expect("read replacement bytes");
+        let original_identity =
+            stable_file_identity(&fs::symlink_metadata(&path).expect("original metadata"));
+        assert_eq!(
+            usize::try_from(original_identity.size).expect("original length fits"),
+            replacement_bytes.len(),
+            "fixture must exercise an in-place rewrite at the exact old length"
+        );
+        fs::write(&path, &replacement_bytes).expect("rewrite original pathname in place");
+        assert_eq!(
+            stable_file_identity(&fs::symlink_metadata(&path).expect("rewritten metadata")).inode,
+            original_identity.inode,
+            "same-size rewrite must retain the pathname inode rather than rename a replacement"
+        );
+
+        assert_eq!(owner.witness(), &expected_witness);
+        let observed_hits = owner
+            .search_top_k(&[1.0, 0.0, 0.0, 0.0], 2, None)
+            .expect("search retained owner");
+        assert_eq!(observed_hits.len(), expected_hits.len());
+        for (observed, expected) in observed_hits.iter().zip(&expected_hits) {
+            assert_eq!(observed.index, expected.index);
+            assert_eq!(observed.doc_id, expected.doc_id);
+            assert_eq!(observed.score.to_bits(), expected.score.to_bits());
+        }
+
+        assert!(matches!(
+            ValidatedFsviBytes::reopen_exact(&path, &binding, &expected_witness),
+            Err(FsviAdmissionError::SnapshotRejected(FsviSnapshotRejected {
+                reason: FsviSnapshotRejectionReason::WitnessMismatch,
+                ..
+            }))
+        ));
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn sealed_owner_survives_post_admission_hardlink_and_fresh_open_rejects_alias() {
+        let directory = tempfile::tempdir().expect("private publication directory");
+        let path = directory.path().join("current.fsvi");
+        let hardlink_path = directory.path().join("post-admission-alias.fsvi");
+        let binding = fsvi_v2_binding("post-admission-hardlink", 4, Quantization::F16, 24, 0x84);
+
+        let mut writer = VectorIndex::create_v2(&path, binding.clone()).expect("original writer");
+        writer
+            .write_record("doc-alpha", &[1.0, 0.0, 0.0, 0.0])
+            .expect("original alpha");
+        writer
+            .write_record("doc-beta", &[0.0, 1.0, 0.0, 0.0])
+            .expect("original beta");
+        writer.finish().expect("finish original");
+
+        let owner =
+            ValidatedFsviBytes::open_published(&path, &binding).expect("admit original owner");
+        let expected_witness = owner.witness().clone();
+        let expected_hits = owner
+            .search_top_k(&[1.0, 0.0, 0.0, 0.0], 2, None)
+            .expect("search original");
+        let expected_rows: Vec<(String, Vec<u8>, FsviRecordFlags)> = (0..owner.record_count())
+            .map(|index| {
+                let row = owner.row(index).expect("original row");
+                (
+                    row.doc_id().to_owned(),
+                    row.vector_bytes().to_vec(),
+                    row.flags(),
+                )
+            })
+            .collect();
+
+        fs::hard_link(&path, &hardlink_path).expect("create post-admission hardlink alias");
+        assert_snapshot_rejection(
+            ValidatedFsviBytes::open_published(&path, &binding),
+            FsviSnapshotRejectionReason::HardLinked,
+        );
+        assert_snapshot_rejection(
+            ValidatedFsviBytes::open_published(&hardlink_path, &binding),
+            FsviSnapshotRejectionReason::HardLinked,
+        );
+
+        assert_eq!(owner.witness(), &expected_witness);
+        assert_eq!(
+            owner
+                .search_top_k(&[1.0, 0.0, 0.0, 0.0], 2, None)
+                .expect("search retained owner after hardlink alias"),
+            expected_hits
+        );
+        let observed_rows: Vec<(String, Vec<u8>, FsviRecordFlags)> = (0..owner.record_count())
+            .map(|index| {
+                let row = owner.row(index).expect("retained owner row");
+                (
+                    row.doc_id().to_owned(),
+                    row.vector_bytes().to_vec(),
+                    row.flags(),
+                )
+            })
+            .collect();
+        assert_eq!(observed_rows, expected_rows);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn sealed_owner_survives_post_admission_wal_sidecar_and_fresh_open_rejects_it() {
+        let directory = tempfile::tempdir().expect("private publication directory");
+        let path = directory.path().join("current.fsvi");
+        let binding = fsvi_v2_binding("post-admission-wal", 4, Quantization::F16, 25, 0x85);
+
+        let mut writer = VectorIndex::create_v2(&path, binding.clone()).expect("original writer");
+        writer
+            .write_record("doc-alpha", &[1.0, 0.0, 0.0, 0.0])
+            .expect("original alpha");
+        writer
+            .write_record("doc-beta", &[0.0, 1.0, 0.0, 0.0])
+            .expect("original beta");
+        writer.finish().expect("finish original");
+
+        let owner =
+            ValidatedFsviBytes::open_published(&path, &binding).expect("admit original owner");
+        let expected_witness = owner.witness().clone();
+        let expected_hits = owner
+            .search_top_k(&[1.0, 0.0, 0.0, 0.0], 2, None)
+            .expect("search original");
+        let expected_rows: Vec<(String, Vec<u8>, FsviRecordFlags)> = (0..owner.record_count())
+            .map(|index| {
+                let row = owner.row(index).expect("original row");
+                (
+                    row.doc_id().to_owned(),
+                    row.vector_bytes().to_vec(),
+                    row.flags(),
+                )
+            })
+            .collect();
+
+        let wal_path = wal::wal_path_for(&path);
+        fs::write(&wal_path, []).expect("introduce post-admission empty WAL sidecar");
+        assert_snapshot_rejection(
+            ValidatedFsviBytes::open_published(&path, &binding),
+            FsviSnapshotRejectionReason::PublishedWalPresent,
+        );
+
+        assert_eq!(owner.witness(), &expected_witness);
+        assert_eq!(
+            owner
+                .search_top_k(&[1.0, 0.0, 0.0, 0.0], 2, None)
+                .expect("search retained owner after WAL sidecar"),
+            expected_hits
+        );
+        let observed_rows: Vec<(String, Vec<u8>, FsviRecordFlags)> = (0..owner.record_count())
+            .map(|index| {
+                let row = owner.row(index).expect("retained owner row");
+                (
+                    row.doc_id().to_owned(),
+                    row.vector_bytes().to_vec(),
+                    row.flags(),
+                )
+            })
+            .collect();
+        assert_eq!(observed_rows, expected_rows);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn sealed_owner_survives_post_admission_symlink_substitution() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().expect("private publication directory");
+        let path = directory.path().join("current.fsvi");
+        let retained_path = directory.path().join("retained-original.fsvi");
+        let binding = fsvi_v2_binding("post-admission-symlink", 4, Quantization::F16, 26, 0x86);
+
+        let mut writer = VectorIndex::create_v2(&path, binding.clone()).expect("original writer");
+        writer
+            .write_record("doc-alpha", &[1.0, 0.0, 0.0, 0.0])
+            .expect("original alpha");
+        writer
+            .write_record("doc-beta", &[0.0, 1.0, 0.0, 0.0])
+            .expect("original beta");
+        writer.finish().expect("finish original");
+
+        let owner =
+            ValidatedFsviBytes::open_published(&path, &binding).expect("admit original owner");
+        let expected_witness = owner.witness().clone();
+        let expected_hits = owner
+            .search_top_k(&[1.0, 0.0, 0.0, 0.0], 2, None)
+            .expect("search original");
+        let expected_rows: Vec<(String, Vec<u8>, FsviRecordFlags)> = (0..owner.record_count())
+            .map(|index| {
+                let row = owner.row(index).expect("original row");
+                (
+                    row.doc_id().to_owned(),
+                    row.vector_bytes().to_vec(),
+                    row.flags(),
+                )
+            })
+            .collect();
+
+        fs::rename(&path, &retained_path).expect("retain admitted pathname target");
+        symlink(&retained_path, &path).expect("substitute admitted pathname with symlink");
+        assert_snapshot_rejection(
+            ValidatedFsviBytes::open_published(&path, &binding),
+            FsviSnapshotRejectionReason::SymbolicLink,
+        );
+
+        assert_eq!(owner.witness(), &expected_witness);
+        assert_eq!(
+            owner
+                .search_top_k(&[1.0, 0.0, 0.0, 0.0], 2, None)
+                .expect("search retained owner after symlink substitution"),
+            expected_hits
+        );
+        let observed_rows: Vec<(String, Vec<u8>, FsviRecordFlags)> = (0..owner.record_count())
+            .map(|index| {
+                let row = owner.row(index).expect("retained owner row");
+                (
+                    row.doc_id().to_owned(),
+                    row.vector_bytes().to_vec(),
+                    row.flags(),
+                )
+            })
+            .collect();
+        assert_eq!(observed_rows, expected_rows);
+    }
+
+    #[test]
+    fn sealed_owner_survives_path_truncation_and_extension_after_admission() {
+        let directory = tempfile::tempdir().expect("private publication directory");
+        let path = directory.path().join("current.fsvi");
+        let binding = fsvi_v2_binding("length-mutation", 4, Quantization::F16, 23, 0x83);
+
+        let mut writer = VectorIndex::create_v2(&path, binding.clone()).expect("original writer");
+        writer
+            .write_record("doc-alpha", &[1.0, 0.0, 0.0, 0.0])
+            .expect("original alpha");
+        writer
+            .write_record("doc-beta", &[0.0, 1.0, 0.0, 0.0])
+            .expect("original beta");
+        writer.finish().expect("finish original");
+
+        let owner =
+            ValidatedFsviBytes::open_published(&path, &binding).expect("admit original owner");
+        let expected_witness = owner.witness().clone();
+        let expected_hits = owner
+            .search_top_k(&[1.0, 0.0, 0.0, 0.0], 2, None)
+            .expect("search original");
+        let expected_rows: Vec<(String, Vec<u8>, FsviRecordFlags)> = (0..owner.record_count())
+            .map(|index| {
+                let row = owner.row(index).expect("original row");
+                (
+                    row.doc_id().to_owned(),
+                    row.vector_bytes().to_vec(),
+                    row.flags(),
+                )
+            })
+            .collect();
+        let original_bytes = owner.bytes.to_vec();
+
+        OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .expect("open path for truncation")
+            .set_len(0)
+            .expect("truncate admitted pathname");
+        assert!(
+            ValidatedFsviBytes::open_published(&path, &binding).is_err(),
+            "a truncated pathname must never be admitted as the retained owner"
+        );
+        assert_eq!(owner.witness(), &expected_witness);
+        assert_eq!(
+            owner
+                .search_top_k(&[1.0, 0.0, 0.0, 0.0], 2, None)
+                .expect("search retained owner after truncation"),
+            expected_hits
+        );
+
+        fs::write(&path, &original_bytes).expect("restore original pathname bytes");
+        let mut extended = OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .expect("open path for extension");
+        extended
+            .write_all(b"unexpected-trailing-bytes")
+            .expect("extend admitted pathname");
+        extended.sync_all().expect("sync extension");
+        assert!(
+            ValidatedFsviBytes::open_published(&path, &binding).is_err(),
+            "a length-extended pathname must never be admitted as the retained owner"
+        );
+        assert_eq!(owner.witness(), &expected_witness);
+        let observed_rows: Vec<(String, Vec<u8>, FsviRecordFlags)> = (0..owner.record_count())
+            .map(|index| {
+                let row = owner.row(index).expect("retained owner row");
+                (
+                    row.doc_id().to_owned(),
+                    row.vector_bytes().to_vec(),
+                    row.flags(),
+                )
+            })
+            .collect();
+        assert_eq!(observed_rows, expected_rows);
+        assert_eq!(
+            owner
+                .search_top_k(&[1.0, 0.0, 0.0, 0.0], 2, None)
+                .expect("search retained owner after extension"),
+            expected_hits
+        );
+    }
+
     #[test]
     fn same_display_strings_and_dimension_cannot_cross_open_distinct_identity_bundles() {
         let path_a = temp_index_path("v2-same-display-identity-a");
@@ -6492,10 +6844,7 @@ mod tests {
         expected_docset.update(b"live-result");
         let expected_docset: [u8; SHA256_BYTES] = expected_docset.finalize().into();
         assert_eq!(owner.witness().ordered_live_docset_digest, expected_docset);
-        assert_eq!(
-            owner.ann_admission(),
-            FsviAnnAdmission::Disabled(FsviAnnDisabledReason::OwnerBoundAdapterUnavailable)
-        );
+        assert_eq!(owner.ann_admission(), FsviAnnAdmission::Enabled);
     }
 
     #[test]
@@ -6823,6 +7172,93 @@ mod tests {
         }
     }
 
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn published_open_rejects_aliased_wal_entries_without_mutating_targets() {
+        use std::os::unix::fs::symlink;
+
+        for (alias_kind, symbolic_alias) in [("symlink", true), ("hardlink", false)] {
+            let directory = tempfile::tempdir().expect("private aliased WAL publication directory");
+            let path = directory.path().join(format!("{alias_kind}.fsvi"));
+            let backing_path = directory.path().join(format!("{alias_kind}-wal-backing"));
+            let binding = fsvi_v2_binding(
+                &format!("v2-published-{alias_kind}-wal"),
+                4,
+                Quantization::F16,
+                54,
+                0xae,
+            );
+            VectorIndex::create_v2(&path, binding.clone())
+                .expect("aliased WAL publication writer")
+                .finish()
+                .expect("finish aliased WAL publication fixture");
+            fs::write(&backing_path, b"aliased-wal-bytes").expect("write alias backing bytes");
+            let wal_path = wal::wal_path_for(&path);
+            if symbolic_alias {
+                symlink(&backing_path, &wal_path).expect("create WAL symlink");
+            } else {
+                fs::hard_link(&backing_path, &wal_path).expect("create WAL hardlink");
+            }
+
+            let index_before = stable_file_identity(
+                &fs::symlink_metadata(&path).expect("index metadata before rejection"),
+            );
+            let wal_bytes_before = fs::read(&wal_path).expect("read aliased WAL before rejection");
+            let backing_bytes_before =
+                fs::read(&backing_path).expect("read alias backing before rejection");
+            let wal_before = stable_file_identity(
+                &fs::symlink_metadata(&wal_path).expect("WAL metadata before rejection"),
+            );
+            let backing_before = stable_file_identity(
+                &fs::symlink_metadata(&backing_path).expect("backing metadata before rejection"),
+            );
+            let entries_before = directory_entry_names(directory.path());
+            let parent_before = stable_file_identity(
+                &fs::symlink_metadata(directory.path()).expect("parent metadata before rejection"),
+            );
+
+            assert_snapshot_rejection(
+                ValidatedFsviBytes::open_published(&path, &binding),
+                FsviSnapshotRejectionReason::PublishedWalPresent,
+            );
+
+            assert_eq!(
+                stable_file_identity(
+                    &fs::symlink_metadata(&path).expect("index metadata after rejection"),
+                ),
+                index_before
+            );
+            assert_eq!(
+                stable_file_identity(
+                    &fs::symlink_metadata(&wal_path).expect("WAL metadata after rejection"),
+                ),
+                wal_before
+            );
+            assert_eq!(
+                stable_file_identity(
+                    &fs::symlink_metadata(&backing_path).expect("backing metadata after rejection"),
+                ),
+                backing_before
+            );
+            assert_eq!(directory_entry_names(directory.path()), entries_before);
+            assert_eq!(
+                stable_file_identity(
+                    &fs::symlink_metadata(directory.path())
+                        .expect("parent metadata after rejection"),
+                ),
+                parent_before
+            );
+            assert_eq!(
+                fs::read(&wal_path).expect("read aliased WAL after rejection"),
+                wal_bytes_before
+            );
+            assert_eq!(
+                fs::read(&backing_path).expect("read alias backing after rejection"),
+                backing_bytes_before
+            );
+        }
+    }
+
     #[test]
     fn fsvi_v2_inspection_distinguishes_reindex_upgrade_and_corruption() {
         let legacy_path = temp_index_path("v2-inspect-legacy");
@@ -6957,6 +7393,41 @@ mod tests {
         refresh_v2_header_crc(&mut canonical_mutation);
         fs::write(&canonical_path, canonical_mutation).expect("write canonical mutation");
         assert_inspection_corrupted(&canonical_path);
+    }
+
+    #[test]
+    fn fsvi_v2_magic_version_and_crc_mutations_fail_closed() {
+        let binding = fsvi_v2_binding("v2-magic-version-crc", 4, Quantization::F16, 55, 0xaf);
+        let (source_path, expected) = write_v2_fixture("v2-magic-version-crc-source", binding);
+        let source = fs::read(&source_path).expect("read source v2");
+        let header_size = usize::try_from(u32::from_le_bytes(
+            source[6..10].try_into().expect("header size"),
+        ))
+        .expect("header size fits");
+
+        let magic_path = temp_index_path("v2-magic-corruption");
+        let mut magic = source.clone();
+        magic[0] ^= 0x01;
+        fs::write(&magic_path, magic).expect("write magic mutation");
+        assert_owned_admission_corrupted(&magic_path, &expected);
+
+        let version_path = temp_index_path("v2-version-upgrade");
+        let mut version = source.clone();
+        version[4..6].copy_from_slice(&(FSVI_V2_VERSION + 1).to_le_bytes());
+        fs::write(&version_path, version).expect("write future-version mutation");
+        assert!(matches!(
+            admit_owned_v2_fixture(&version_path, &expected),
+            Err(FsviAdmissionError::UpgradeRequired(FsviUpgradeRequired {
+                found_version,
+                supported_version: FSVI_V2_VERSION,
+            })) if found_version == FSVI_V2_VERSION + 1
+        ));
+
+        let crc_path = temp_index_path("v2-header-crc-corruption");
+        let mut crc = source;
+        crc[header_size - 1] ^= 0x01;
+        fs::write(&crc_path, crc).expect("write header CRC mutation");
+        assert_owned_admission_corrupted(&crc_path, &expected);
     }
 
     #[test]
@@ -7116,6 +7587,205 @@ mod tests {
                 sidecar_before
             );
         }
+    }
+
+    #[test]
+    fn fsvi_v2_owner_rejects_invalid_utf8_and_resealed_duplicate_document_ids() {
+        let binding = fsvi_v2_binding(
+            "v2-record-identity-corruption",
+            4,
+            Quantization::F16,
+            11,
+            0x66,
+        );
+        let path = temp_index_path("v2-record-identity-corruption");
+        let mut writer = VectorIndex::create_v2(&path, binding.clone()).expect("create v2 fixture");
+        writer
+            .write_record("aa-owner", &[1.0, 0.0, 0.0, 0.0])
+            .expect("write first equal-length id");
+        writer
+            .write_record("bb-owner", &[0.0, 1.0, 0.0, 0.0])
+            .expect("write second equal-length id");
+        writer.finish().expect("finish v2 fixture");
+
+        let source = fs::read(&path).expect("read fixture bytes");
+        let header_size = usize::try_from(u32::from_le_bytes(
+            source[6..10].try_into().expect("header size"),
+        ))
+        .expect("header size fits");
+        let strings_offset = header_size + (2 * RECORD_SIZE_BYTES);
+        let first_record = header_size;
+        let second_record = first_record + RECORD_SIZE_BYTES;
+        let first_id_offset = usize::try_from(u32::from_le_bytes(
+            source[first_record + 8..first_record + 12]
+                .try_into()
+                .expect("first id offset"),
+        ))
+        .expect("first id offset fits");
+        let second_id_offset = usize::try_from(u32::from_le_bytes(
+            source[second_record + 8..second_record + 12]
+                .try_into()
+                .expect("second id offset"),
+        ))
+        .expect("second id offset fits");
+        let first_id_len = usize::from(u16::from_le_bytes(
+            source[first_record + 12..first_record + 14]
+                .try_into()
+                .expect("first id length"),
+        ));
+        let second_id_len = usize::from(u16::from_le_bytes(
+            source[second_record + 12..second_record + 14]
+                .try_into()
+                .expect("second id length"),
+        ));
+        assert_eq!(
+            first_id_len, second_id_len,
+            "fixture must make a duplicate-ID mutation preserve the string layout"
+        );
+
+        let mut invalid_utf8 = source.clone();
+        invalid_utf8[strings_offset + first_id_offset] = 0xff;
+        assert!(matches!(
+            ValidatedFsviBytes::from_arc(Arc::<[u8]>::from(invalid_utf8), &binding),
+            Err(FsviAdmissionError::Index(
+                SearchError::IndexCorrupted { .. }
+            ))
+        ));
+
+        let mut duplicate = source;
+        let first_id = duplicate
+            [strings_offset + first_id_offset..strings_offset + first_id_offset + first_id_len]
+            .to_vec();
+        duplicate
+            [strings_offset + second_id_offset..strings_offset + second_id_offset + second_id_len]
+            .copy_from_slice(&first_id);
+        duplicate[second_record..second_record + 8]
+            .copy_from_slice(&fnv1a_hash(&first_id).to_le_bytes());
+
+        let mut docset_hasher = Sha256::new();
+        update_digest_domain(&mut docset_hasher, ORDERED_DOCSET_DIGEST_DOMAIN);
+        docset_hasher.update(2_u64.to_be_bytes());
+        for record_offset in [first_record, second_record] {
+            let id_offset = usize::try_from(u32::from_le_bytes(
+                duplicate[record_offset + 8..record_offset + 12]
+                    .try_into()
+                    .expect("duplicate id offset"),
+            ))
+            .expect("duplicate id offset fits");
+            let id_len = usize::from(u16::from_le_bytes(
+                duplicate[record_offset + 12..record_offset + 14]
+                    .try_into()
+                    .expect("duplicate id length"),
+            ));
+            docset_hasher.update(u64::try_from(id_len).expect("id length fits").to_be_bytes());
+            docset_hasher.update(
+                &duplicate[strings_offset + id_offset..strings_offset + id_offset + id_len],
+            );
+        }
+        let duplicate_docset_digest: [u8; SHA256_BYTES] = docset_hasher.finalize().into();
+        duplicate[FSVI_V2_DOCSET_DIGEST_OFFSET..FSVI_V2_DOCSET_DIGEST_OFFSET + SHA256_BYTES]
+            .copy_from_slice(&duplicate_docset_digest);
+        refresh_v2_header_crc(&mut duplicate);
+        assert_eq!(
+            &duplicate[FSVI_V2_DOCSET_DIGEST_OFFSET..FSVI_V2_DOCSET_DIGEST_OFFSET + SHA256_BYTES],
+            duplicate_docset_digest.as_slice(),
+            "fixture must preserve both the ordered docset digest and header CRC"
+        );
+
+        assert!(matches!(
+            ValidatedFsviBytes::from_arc(Arc::<[u8]>::from(duplicate), &binding),
+            Err(FsviAdmissionError::Index(
+                SearchError::IndexCorrupted { .. }
+            ))
+        ));
+    }
+
+    #[test]
+    fn fsvi_v2_owner_rejects_resealed_noncanonical_document_id_order() {
+        let binding = fsvi_v2_binding("v2-record-order-corruption", 4, Quantization::F16, 12, 0x67);
+        let path = temp_index_path("v2-record-order-corruption");
+        let mut writer = VectorIndex::create_v2(&path, binding.clone()).expect("create v2 fixture");
+        writer
+            .write_record("aa-order", &[1.0, 0.0, 0.0, 0.0])
+            .expect("write first equal-length id");
+        writer
+            .write_record("bb-order", &[0.0, 1.0, 0.0, 0.0])
+            .expect("write second equal-length id");
+        writer.finish().expect("finish v2 fixture");
+
+        let mut bytes = fs::read(&path).expect("read fixture bytes");
+        let header_size = usize::try_from(u32::from_le_bytes(
+            bytes[6..10].try_into().expect("header size"),
+        ))
+        .expect("header size fits");
+        let records_offset = header_size;
+        let strings_offset = header_size + (2 * RECORD_SIZE_BYTES);
+        let first_record = records_offset;
+        let second_record = first_record + RECORD_SIZE_BYTES;
+        let first_id_offset = usize::try_from(u32::from_le_bytes(
+            bytes[first_record + 8..first_record + 12]
+                .try_into()
+                .expect("first id offset"),
+        ))
+        .expect("first id offset fits");
+        let second_id_offset = usize::try_from(u32::from_le_bytes(
+            bytes[second_record + 8..second_record + 12]
+                .try_into()
+                .expect("second id offset"),
+        ))
+        .expect("second id offset fits");
+        let first_id_len = usize::from(u16::from_le_bytes(
+            bytes[first_record + 12..first_record + 14]
+                .try_into()
+                .expect("first id length"),
+        ));
+        let second_id_len = usize::from(u16::from_le_bytes(
+            bytes[second_record + 12..second_record + 14]
+                .try_into()
+                .expect("second id length"),
+        ));
+        assert_eq!(
+            first_id_len, second_id_len,
+            "fixture needs equal-length ids"
+        );
+
+        let first_id = bytes
+            [strings_offset + first_id_offset..strings_offset + first_id_offset + first_id_len]
+            .to_vec();
+        let second_id = bytes
+            [strings_offset + second_id_offset..strings_offset + second_id_offset + second_id_len]
+            .to_vec();
+        bytes[strings_offset + first_id_offset..strings_offset + first_id_offset + first_id_len]
+            .copy_from_slice(&second_id);
+        bytes[strings_offset + second_id_offset..strings_offset + second_id_offset + second_id_len]
+            .copy_from_slice(&first_id);
+        bytes[first_record..first_record + 8]
+            .copy_from_slice(&fnv1a_hash(&second_id).to_le_bytes());
+        bytes[second_record..second_record + 8]
+            .copy_from_slice(&fnv1a_hash(&first_id).to_le_bytes());
+
+        let mut docset_hasher = Sha256::new();
+        update_digest_domain(&mut docset_hasher, ORDERED_DOCSET_DIGEST_DOMAIN);
+        docset_hasher.update(2_u64.to_be_bytes());
+        for (id_offset, id_len) in [
+            (first_id_offset, first_id_len),
+            (second_id_offset, second_id_len),
+        ] {
+            docset_hasher.update(u64::try_from(id_len).expect("id length fits").to_be_bytes());
+            docset_hasher
+                .update(&bytes[strings_offset + id_offset..strings_offset + id_offset + id_len]);
+        }
+        let docset_digest: [u8; SHA256_BYTES] = docset_hasher.finalize().into();
+        bytes[FSVI_V2_DOCSET_DIGEST_OFFSET..FSVI_V2_DOCSET_DIGEST_OFFSET + SHA256_BYTES]
+            .copy_from_slice(&docset_digest);
+        refresh_v2_header_crc(&mut bytes);
+
+        assert!(matches!(
+            ValidatedFsviBytes::from_arc(Arc::<[u8]>::from(bytes), &binding),
+            Err(FsviAdmissionError::Index(
+                SearchError::IndexCorrupted { .. }
+            ))
+        ));
     }
 
     #[test]
@@ -8612,6 +9282,89 @@ mod tests {
         std::fs::remove_file(wal::wal_path_for(&path)).ok();
     }
 
+    /// bd-cnby1: a v1 rebuild via bare create+finish over an existing index
+    /// must be REFUSED while that index's WAL sidecar is present. Before the
+    /// fix, finish() published the fresh generation beside the old sidecar;
+    /// the fresh compaction_gen restarts at 1, next_generation(1) matches the
+    /// old sidecar's binding, and the next open() adopted every stale WAL
+    /// entry: deleted documents resurrected and the WAL shadow suppressed the
+    /// freshly rebuilt main-slab vectors.
+    #[test]
+    fn v1_rebuild_over_existing_wal_sidecar_is_refused_not_adopted() {
+        let path = temp_index_path("v1-rebuild-wal-adoption");
+        let mut writer = VectorIndex::create(&path, "old", 4).expect("writer");
+        writer
+            .write_record("kept-doc", &[1.0, 0.0, 0.0, 0.0])
+            .expect("write old main");
+        writer.finish().expect("finish old main");
+        let mut old = VectorIndex::open(&path).expect("open old generation");
+        old.append("deleted-doc", &[0.0, 1.0, 0.0, 0.0])
+            .expect("append WAL record that the rebuild intends to drop");
+        drop(old);
+
+        // Operator intent: rebuild the corpus WITHOUT "deleted-doc".
+        let mut rebuild = VectorIndex::create(&path, "old", 4).expect("rebuild writer");
+        rebuild
+            .write_record("kept-doc", &[0.9, 0.1, 0.0, 0.0])
+            .expect("write rebuilt record");
+        let refusal = rebuild.finish();
+        let Err(SearchError::InvalidConfig { field, reason, .. }) = refusal else {
+            panic!(
+                "v1 finish() over an existing WAL sidecar must refuse publication, \
+                 got {refusal:?}"
+            );
+        };
+        assert_eq!(field, "wal_sidecar");
+        assert!(
+            reason.contains("install_replacement"),
+            "refusal must route the caller to the safe replacement path: {reason}"
+        );
+
+        // The refused publication must leave the old generation fully intact —
+        // main slab AND its acknowledged WAL record.
+        let survivor = VectorIndex::open(&path).expect("old generation survives refusal");
+        assert_eq!(survivor.record_count(), 1);
+        assert_eq!(
+            survivor.wal_record_count(),
+            1,
+            "acknowledged WAL record must survive a refused rebuild"
+        );
+        drop(survivor);
+
+        // The safe route succeeds and does NOT resurrect the dropped doc.
+        let replacement_path = path.with_extension("replacement");
+        let destination_gen =
+            VectorIndex::peek_compaction_gen(&path).expect("peek destination generation");
+        let mut replacement_writer = VectorIndex::create(&replacement_path, "old", 4)
+            .expect("replacement writer")
+            .with_generation(next_generation(destination_gen));
+        replacement_writer
+            .write_record("kept-doc", &[0.9, 0.1, 0.0, 0.0])
+            .expect("write rebuilt record via safe route");
+        replacement_writer
+            .finish()
+            .expect("replacement path has no sidecar, publication proceeds");
+        let installed = VectorIndex::install_replacement(&path, &replacement_path)
+            .expect("carried-generation install");
+        assert_eq!(installed.record_count(), 1);
+        assert_eq!(
+            installed.wal_record_count(),
+            0,
+            "the dropped document's WAL entry must not be adopted by the rebuild"
+        );
+        let live = installed.live_doc_ids().expect("live ids");
+        assert!(live.contains("kept-doc"));
+        assert!(
+            !live.contains("deleted-doc"),
+            "bd-cnby1: the deliberately dropped document must stay dropped"
+        );
+        drop(installed);
+
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_file(&replacement_path).ok();
+        std::fs::remove_file(wal::wal_path_for(&path)).ok();
+    }
+
     /// A replacement whose compaction generation collides with the
     /// destination's must be refused outright: installing it would require
     /// destroying the destination's acknowledged WAL BEFORE the rename, and a
@@ -9942,9 +10695,16 @@ mod tests {
         // Close index to flush everything
         drop(index);
 
-        // Manually create the "post-compaction" main index that includes both A and B.
+        // Manually create the "post-compaction" main index that includes both
+        // A and B. It is built at a side path and renamed over `path` exactly
+        // the way compact() publishes — writer::finish() itself now refuses to
+        // publish beside a live WAL sidecar (the bd-cnby1 guard), so the
+        // crash state must be constructed at the filesystem level, which is
+        // also where the real crash window lives (between compact()'s rename
+        // and its WAL removal).
+        let staged_path = path.with_extension("compacted");
         let mut compact_writer =
-            VectorIndex::create_with_revision(&path, "test", "v1", dim, Quantization::F16)
+            VectorIndex::create_with_revision(&staged_path, "test", "v1", dim, Quantization::F16)
                 .unwrap()
                 .with_generation(2); // Simulate correct compaction increment
         compact_writer
@@ -9953,7 +10713,8 @@ mod tests {
         compact_writer
             .write_record("doc-B", &[0.0, 1.0, 0.0, 0.0])
             .unwrap();
-        compact_writer.finish().unwrap(); // Overwrites `path` with new index containing A and B.
+        compact_writer.finish().unwrap();
+        fs::rename(&staged_path, &path).unwrap(); // Publish over `path`; the old WAL survives untouched.
 
         // Restore the WAL file (because `finish` doesn't touch it, but we need to ensure it exists and has doc-B)
         // Actually, `finish` overwrites `path`. The WAL file is at `path.wal`.

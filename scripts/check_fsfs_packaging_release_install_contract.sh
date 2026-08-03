@@ -199,6 +199,79 @@ check_installer_behavior() {
     echo "[installer][FAIL] Intel macOS unsupported outcome status=$unsupported_status output=$unsupported_output"
     FAILURES=$((FAILURES + 1))
   fi
+
+  if FSFS_INSTALL_CONTRACT_TEST=1 "$installer_shell" "$installer" provision /bin/true >/dev/null; then
+    echo "[installer][OK]   staged semantic provisioning admits verified success"
+  else
+    echo "[installer][FAIL] staged semantic provisioning rejected verified success"
+    FAILURES=$((FAILURES + 1))
+  fi
+
+  if FSFS_INSTALL_CONTRACT_TEST=1 "$installer_shell" "$installer" provision /bin/false >/dev/null 2>&1; then
+    echo "[installer][FAIL] staged semantic provisioning failure unexpectedly admitted"
+    FAILURES=$((FAILURES + 1))
+  else
+    echo "[installer][OK]   staged semantic provisioning failure preserves the destination path"
+  fi
+
+  if FSFS_INSTALL_CONTRACT_TEST=1 "$installer_shell" "$installer" verify-staged /bin/true >/dev/null; then
+    echo "[installer][OK]   staged binary verification admits a runnable candidate"
+  else
+    echo "[installer][FAIL] staged binary verification rejected a runnable candidate"
+    FAILURES=$((FAILURES + 1))
+  fi
+
+  if FSFS_INSTALL_CONTRACT_TEST=1 "$installer_shell" "$installer" verify-staged /bin/false >/dev/null 2>&1; then
+    echo "[installer][FAIL] staged binary verification failure unexpectedly admitted"
+    FAILURES=$((FAILURES + 1))
+  else
+    echo "[installer][OK]   staged binary verification fails before destination replacement"
+  fi
+
+  local quiet_output no_color_output
+  quiet_output=$(NO_COLOR=1 FSFS_INSTALL_CONTRACT_TEST=1 "$installer_shell" "$installer" output-mode 1 2>&1)
+  if [[ "$quiet_output" == *"error-output" ]] \
+    && [[ "$quiet_output" != *"info-output"* ]] \
+    && [[ "$quiet_output" != *"ok-output"* ]] \
+    && [[ "$quiet_output" != *"warn-output"* ]]; then
+    echo "[installer][OK]   quiet mode suppresses routine output while retaining errors"
+  else
+    echo "[installer][FAIL] quiet mode output contract violated: ${quiet_output:-<empty>}"
+    FAILURES=$((FAILURES + 1))
+  fi
+
+  no_color_output=$(NO_COLOR=1 FSFS_INSTALL_CONTRACT_TEST=1 "$installer_shell" "$installer" output-mode 0 2>&1)
+  if [[ "$no_color_output" == *"info-output"* ]] \
+    && [[ "$no_color_output" == *"ok-output"* ]] \
+    && [[ "$no_color_output" == *"warn-output"* ]] \
+    && [[ "$no_color_output" == *"error-output"* ]] \
+    && [[ "$no_color_output" != *$'\033'* ]]; then
+    echo "[installer][OK]   NO_COLOR output is complete and escape-free"
+  else
+    echo "[installer][FAIL] NO_COLOR output contract violated"
+    FAILURES=$((FAILURES + 1))
+  fi
+
+  if python3 - "$installer" <<'PY'
+import pathlib
+import sys
+
+installer = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
+required = (
+    'if [ "$NO_COLOR_MODE" -eq 1 ]; then\n    printf \'\\nfsfs installer',
+    '&& [ "$NO_COLOR_MODE" -eq 0 ] && [ "$QUIET" -eq 0 ]; then',
+    'elif [ -t 1 ] && [ "$NO_COLOR_MODE" -eq 0 ] && [ "$QUIET" -eq 0 ]; then',
+    'if [ "$QUIET" -eq 0 ]; then\nif [ "$NO_COLOR_MODE" -eq 1 ]; then\n  printf \'\\nInstallation complete!',
+)
+missing = [marker for marker in required if marker not in installer]
+raise SystemExit(bool(missing))
+PY
+  then
+    echo "[installer][OK]   NO_COLOR covers banner, progress, and completion renderers"
+  else
+    echo "[installer][FAIL] NO_COLOR renderer routing is incomplete"
+    FAILURES=$((FAILURES + 1))
+  fi
 }
 
 check_model_features() {
@@ -478,6 +551,27 @@ require(
 require(
     "cargo build --release -p frankensearch-fsfs)" in installer,
     "ordinary source installation must exercise the loader-capable Cargo default",
+)
+provision_call = 'provision_default_semantic_models "$BIN"'
+source_install = 'install_binary "$BIN" "$DEST/${BINARY_NAME}"'
+artifact_start = installer.index('[ -x "$BIN" ] || { err "Binary not found in archive"; exit 1; }')
+artifact_section = installer[artifact_start:]
+require(
+    '"$staged_binary" download-models' in installer
+    and '"$staged_binary" download-models --verify' in installer,
+    "ordinary source installation must provision and verify registered semantic models",
+)
+require(
+    provision_call in installer
+    and source_install in installer
+    and installer.index(provision_call) < installer.index(source_install),
+    "ordinary source installation must verify semantic models before replacing the destination binary",
+)
+require(
+    provision_call in artifact_section
+    and source_install in artifact_section
+    and artifact_section.index(provision_call) < artifact_section.index(source_install),
+    "ordinary release artifact installation must verify semantic models before replacing the destination binary",
 )
 require(
     "plain build" in crate_readme

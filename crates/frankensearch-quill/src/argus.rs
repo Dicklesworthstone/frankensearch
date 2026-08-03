@@ -405,6 +405,17 @@ pub trait PostingCursor {
     /// storage invariants.
     fn advance(&mut self, target: u32) -> Result<Option<u32>, ArgusError>;
 
+    /// Whether this cursor's backing storage validates every post-move
+    /// invariant required by a term scorer.
+    ///
+    /// The default keeps defensive post-move validation enabled for custom
+    /// and Delta cursors. The sealed Quiver adapter may opt in only because
+    /// its validated codec guarantees ordered document ids and positive
+    /// frequencies for every decoded posting.
+    fn has_validated_post_move_contract(&self) -> bool {
+        false
+    }
+
     /// Fork the current position into an independent cursor suitable for
     /// competitive candidate generation.
     ///
@@ -510,6 +521,10 @@ where
 
     fn advance(&mut self, target: u32) -> Result<Option<u32>, ArgusError> {
         (**self).advance(target)
+    }
+
+    fn has_validated_post_move_contract(&self) -> bool {
+        (**self).has_validated_post_move_contract()
     }
 
     fn fork_for_pruning(&self) -> Option<Box<dyn PostingCursor + '_>> {
@@ -648,6 +663,10 @@ impl PostingCursor for CheckpointPostingCursor<'_> {
         let moved = self.inner.advance(target)?;
         self.checkpoint_move(previous)?;
         Ok(moved)
+    }
+
+    fn has_validated_post_move_contract(&self) -> bool {
+        self.inner.has_validated_post_move_contract()
     }
 
     fn fork_for_pruning(&self) -> Option<Box<dyn PostingCursor + '_>> {
@@ -878,6 +897,10 @@ impl PostingCursor for SealedPostingCursor<'_> {
                 Ok(cursor.advance(target)?.map(|posting| posting.doc_id))
             }
         }
+    }
+
+    fn has_validated_post_move_contract(&self) -> bool {
+        true
     }
 
     fn fork_for_pruning(&self) -> Option<Box<dyn PostingCursor + '_>> {
@@ -1391,6 +1414,7 @@ pub struct TermScorer<'a> {
     cost: u64,
     size_hint: u32,
     segment_num_docs: u32,
+    validated_post_move_contract: bool,
 }
 
 impl<'a> TermScorer<'a> {
@@ -1435,6 +1459,7 @@ impl<'a> TermScorer<'a> {
         let size_hint = cursor.size_hint();
         let cost = cursor.cost();
         let segment_num_docs = cursor.segment_num_docs();
+        let validated_post_move_contract = cursor.has_validated_post_move_contract();
         if u64::from(segment_num_docs) > snapshot.doc_count() {
             return Err(ArgusError::InvalidSnapshot {
                 field_ord: snapshot.field_ord(),
@@ -1510,6 +1535,7 @@ impl<'a> TermScorer<'a> {
             cost,
             size_hint,
             segment_num_docs,
+            validated_post_move_contract,
         })
     }
 
@@ -1520,8 +1546,11 @@ impl<'a> TermScorer<'a> {
     fn next(&mut self) -> Result<Option<u32>, ArgusError> {
         let previous = self.cursor.doc();
         let moved = self.cursor.next()?;
-        let moved =
-            validate_cursor_after_move(self.cursor.as_ref(), self.fieldnorms.as_ref(), moved)?;
+        let moved = if self.validated_post_move_contract {
+            moved
+        } else {
+            validate_cursor_after_move(self.cursor.as_ref(), self.fieldnorms.as_ref(), moved)?
+        };
         match (previous, moved) {
             (None, Some(_)) => Err(ArgusError::CursorInvariant(
                 "exhausted cursor resurrected during next",
@@ -1536,8 +1565,11 @@ impl<'a> TermScorer<'a> {
     fn seek(&mut self, target: u32) -> Result<Option<u32>, ArgusError> {
         let previous = self.cursor.doc();
         let moved = self.cursor.advance(target)?;
-        let moved =
-            validate_cursor_after_move(self.cursor.as_ref(), self.fieldnorms.as_ref(), moved)?;
+        let moved = if self.validated_post_move_contract {
+            moved
+        } else {
+            validate_cursor_after_move(self.cursor.as_ref(), self.fieldnorms.as_ref(), moved)?
+        };
         match (previous, moved) {
             (None, Some(_)) => Err(ArgusError::CursorInvariant(
                 "exhausted cursor resurrected during advance",
@@ -5706,6 +5738,8 @@ mod tests {
         let sealed = SealedPostingCursor::new(&list, segment_num_docs)?;
         let mut cursor = CheckpointPostingCursor::new(sealed, checkpoint_for_cursor)?;
 
+        assert!(PostingCursor::has_validated_post_move_contract(&cursor));
+
         while cursor.next()?.is_some() {}
 
         assert_eq!(
@@ -6351,6 +6385,70 @@ mod tests {
         }
     }
 
+    /// Bench-only control retaining the sealed cursor's data path while forcing
+    /// `TermScorer` through its defensive post-move validation branch.
+    #[cfg(feature = "bench-internals")]
+    struct ForcedPostMoveValidationCursor<'a> {
+        inner: SealedPostingCursor<'a>,
+    }
+
+    #[cfg(feature = "bench-internals")]
+    impl PostingCursor for ForcedPostMoveValidationCursor<'_> {
+        fn doc(&self) -> Option<u32> {
+            self.inner.doc()
+        }
+        fn freq(&self) -> Option<u32> {
+            self.inner.freq()
+        }
+        fn positions_handle(&self) -> Option<PositionsHandle<'_>> {
+            self.inner.positions_handle()
+        }
+        fn size_hint(&self) -> u32 {
+            self.inner.size_hint()
+        }
+        fn cost(&self) -> u64 {
+            self.inner.cost()
+        }
+        fn segment_num_docs(&self) -> u32 {
+            self.inner.segment_num_docs()
+        }
+        fn next(&mut self) -> Result<Option<u32>, ArgusError> {
+            self.inner.next()
+        }
+        fn advance(&mut self, target: u32) -> Result<Option<u32>, ArgusError> {
+            self.inner.advance(target)
+        }
+        fn term_score_upper_bound(
+            &self,
+            average: f32,
+            weight: f32,
+            option: TermRecordOption,
+        ) -> Option<f32> {
+            self.inner.term_score_upper_bound(average, weight, option)
+        }
+        fn supports_block_max(&self) -> bool {
+            self.inner.supports_block_max()
+        }
+        fn current_block_score_upper_bound(
+            &self,
+            average: f32,
+            weight: f32,
+            option: TermRecordOption,
+        ) -> Option<f32> {
+            self.inner
+                .current_block_score_upper_bound(average, weight, option)
+        }
+        fn current_block_last_doc(&self) -> Option<u32> {
+            self.inner.current_block_last_doc()
+        }
+        fn current_work_block(&self) -> Option<u64> {
+            self.inner.current_work_block()
+        }
+        fn work_blocks_since(&self, previous: Option<u64>) -> u64 {
+            self.inner.work_blocks_since(previous)
+        }
+    }
+
     #[cfg(feature = "bench-internals")]
     fn timed_encoded_grouped_union(
         encoded_doclens: &EncodedDocLenSection,
@@ -6363,6 +6461,35 @@ mod tests {
         limit: usize,
         group_size: usize,
         rank_pruning: bool,
+    ) -> Result<(u128, Vec<ScoredDoc>, UnionPruningStats), Box<dyn std::error::Error>> {
+        timed_encoded_grouped_union_with_contract(
+            encoded_doclens,
+            encoded_terms,
+            cached_metadata,
+            snapshot,
+            rows_by_term,
+            boosts,
+            segment_num_docs,
+            limit,
+            group_size,
+            rank_pruning,
+            true,
+        )
+    }
+
+    #[cfg(feature = "bench-internals")]
+    fn timed_encoded_grouped_union_with_contract(
+        encoded_doclens: &EncodedDocLenSection,
+        encoded_terms: &[(EncodedPostingList, EncodedBlockMax)],
+        cached_metadata: Option<&[Arc<ValidatedTermPruningMetadata>]>,
+        snapshot: &Bm25FieldSnapshot,
+        rows_by_term: &[Vec<Posting>],
+        boosts: &[f32],
+        segment_num_docs: u32,
+        limit: usize,
+        group_size: usize,
+        rank_pruning: bool,
+        trusted_post_move_contract: bool,
     ) -> Result<(u128, Vec<ScoredDoc>, UnionPruningStats), Box<dyn std::error::Error>> {
         if group_size == 0
             || encoded_terms.len() != rows_by_term.len()
@@ -6428,6 +6555,11 @@ mod tests {
                     size_hint,
                     segment_num_docs,
                 )
+            };
+            let cursor: Box<dyn PostingCursor> = if trusted_post_move_contract {
+                Box::new(cursor)
+            } else {
+                Box::new(ForcedPostMoveValidationCursor { inner: cursor })
             };
             let term = ReferenceScorer::term(TermScorer::new(
                 cursor,
@@ -6989,6 +7121,10 @@ mod tests {
             )
         };
 
+        assert!(!PostingCursor::has_validated_post_move_contract(
+            &FaultCursor::new(CursorFault::StickyNext)
+        ));
+
         let mut sticky = scorer(CursorFault::StickyNext)?;
         assert!(matches!(sticky.next(), Err(ArgusError::CursorInvariant(_))));
         let mut backward = scorer(CursorFault::BackwardNext)?;
@@ -7038,6 +7174,7 @@ mod tests {
         let positions = encoded_positions.position_list(&list)?;
         let mut cursor = SealedPostingCursor::with_positions(&positions, 3)?;
 
+        assert!(PostingCursor::has_validated_post_move_contract(&cursor));
         assert_eq!(PostingCursor::doc(&cursor), Some(3));
         assert_eq!(PostingCursor::freq(&cursor), Some(2));
         let handle = PostingCursor::positions_handle(&cursor).expect("position handle");
@@ -7067,8 +7204,55 @@ mod tests {
         assert!(PostingCursor::positions_handle(&cursor).is_none());
 
         let cursor = SealedPostingCursor::new(&list, 3)?;
+        assert!(PostingCursor::has_validated_post_move_contract(&cursor));
         assert_eq!(PostingCursor::doc(&cursor), Some(3));
         assert!(PostingCursor::positions_handle(&cursor).is_none());
+        Ok(())
+    }
+
+    #[cfg(feature = "bench-internals")]
+    #[test]
+    fn forced_post_move_validation_control_preserves_sealed_cursor_scores()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let postings = [Posting::new(0, 2), Posting::new(1, 1), Posting::new(2, 3)];
+        let encoded_postings = EncodedPostingList::encode(&postings)?;
+        let posting_list = encoded_postings.posting_list()?;
+        let lengths = [Some(8); 3];
+        let encoded_doclens =
+            EncodedDocLenSection::encode(0, 3, &[1], &[DocLenFieldInput::new(1, &lengths)])?;
+        let doclens = encoded_doclens.section(&[1])?;
+        let fieldnorms = doclens.field(1).expect("fixture field exists");
+        let snapshot = snapshot(1, 24, 3)?;
+
+        let scores = |trusted_post_move_contract| -> Result<Vec<(u32, u32)>, ArgusError> {
+            let cursor = SealedPostingCursor::new(&posting_list, 3)?;
+            let cursor: Box<dyn PostingCursor> = if trusted_post_move_contract {
+                Box::new(cursor)
+            } else {
+                Box::new(ForcedPostMoveValidationCursor { inner: cursor })
+            };
+            assert_eq!(
+                cursor.has_validated_post_move_contract(),
+                trusted_post_move_contract,
+                "the control must select the intended post-move contract"
+            );
+            let mut scorer = TermScorer::new(
+                cursor,
+                fieldnorms,
+                snapshot.clone(),
+                3,
+                TermRecordOption::WithFreqs,
+                1.0,
+            )?;
+            let mut observed = Vec::new();
+            while let Some(doc) = scorer.doc() {
+                observed.push((doc, scorer.score()?.to_bits()));
+                scorer.next()?;
+            }
+            Ok(observed)
+        };
+
+        assert_eq!(scores(true)?, scores(false)?);
         Ok(())
     }
 
@@ -10416,11 +10600,137 @@ mod tests {
                     true,
                 )?;
                 assert_hits_bit_exact(&cold_pruned.1, &cold_exhaustive.1);
+                let forced_validation_exhaustive = timed_encoded_grouped_union_with_contract(
+                    &encoded_doclens,
+                    encoded_terms,
+                    None,
+                    &snapshot,
+                    rows_by_term,
+                    boosts,
+                    num_docs,
+                    10,
+                    group_size,
+                    false,
+                    false,
+                )?;
+                assert_hits_bit_exact(&forced_validation_exhaustive.1, &cold_exhaustive.1);
                 let cached_metadata =
                     validate_encoded_pruning_metadata(&encoded_doclens, encoded_terms)?;
                 let cache_payload_bytes = cached_metadata.iter().fold(0_usize, |bytes, term| {
                     bytes.saturating_add(term.heap_bytes())
                 });
+                let cached_trusted_validation = timed_encoded_grouped_union_with_contract(
+                    &encoded_doclens,
+                    encoded_terms,
+                    Some(&cached_metadata),
+                    &snapshot,
+                    rows_by_term,
+                    boosts,
+                    num_docs,
+                    10,
+                    group_size,
+                    false,
+                    true,
+                )?;
+                let cached_forced_validation = timed_encoded_grouped_union_with_contract(
+                    &encoded_doclens,
+                    encoded_terms,
+                    Some(&cached_metadata),
+                    &snapshot,
+                    rows_by_term,
+                    boosts,
+                    num_docs,
+                    10,
+                    group_size,
+                    false,
+                    false,
+                )?;
+                assert_hits_bit_exact(&cached_trusted_validation.1, &cached_forced_validation.1);
+
+                // This is a maintenance diagnostic: both arms run the same
+                // sealed cursor and cache payload in one invocation. It
+                // controls only the redundant post-move validation branch;
+                // it does not put an incumbent in the comparison.
+                let h3_null = frankensearch_core::bench_support::paired_median_ratio(
+                    PAIRED_ROUNDS,
+                    1,
+                    || {
+                        let _ = std::hint::black_box(
+                            timed_encoded_grouped_union_with_contract(
+                                &encoded_doclens,
+                                encoded_terms,
+                                Some(&cached_metadata),
+                                &snapshot,
+                                rows_by_term,
+                                boosts,
+                                num_docs,
+                                10,
+                                group_size,
+                                false,
+                                true,
+                            )
+                            .expect("run first trusted H3 null arm"),
+                        );
+                    },
+                    || {
+                        let _ = std::hint::black_box(
+                            timed_encoded_grouped_union_with_contract(
+                                &encoded_doclens,
+                                encoded_terms,
+                                Some(&cached_metadata),
+                                &snapshot,
+                                rows_by_term,
+                                boosts,
+                                num_docs,
+                                10,
+                                group_size,
+                                false,
+                                true,
+                            )
+                            .expect("run second trusted H3 null arm"),
+                        );
+                    },
+                );
+                let h3_trusted_over_forced = frankensearch_core::bench_support::paired_median_ratio(
+                    PAIRED_ROUNDS,
+                    1,
+                    || {
+                        let _ = std::hint::black_box(
+                            timed_encoded_grouped_union_with_contract(
+                                &encoded_doclens,
+                                encoded_terms,
+                                Some(&cached_metadata),
+                                &snapshot,
+                                rows_by_term,
+                                boosts,
+                                num_docs,
+                                10,
+                                group_size,
+                                false,
+                                false,
+                            )
+                            .expect("run forced-validation H3 control arm"),
+                        );
+                    },
+                    || {
+                        let _ = std::hint::black_box(
+                            timed_encoded_grouped_union_with_contract(
+                                &encoded_doclens,
+                                encoded_terms,
+                                Some(&cached_metadata),
+                                &snapshot,
+                                rows_by_term,
+                                boosts,
+                                num_docs,
+                                10,
+                                group_size,
+                                false,
+                                true,
+                            )
+                            .expect("run trusted-validation H3 control arm"),
+                        );
+                    },
+                );
 
                 let null = frankensearch_core::bench_support::paired_median_ratio(
                     PAIRED_ROUNDS,
@@ -10605,6 +10915,9 @@ mod tests {
                      pruned_median_us={pruned_median_us} trials={TRIALS} hits={} \
                      checksum={checksum} null_median={:.6} null_p5={:.6} null_p95={:.6} \
                      lever_median={:.6} lever_p5={:.6} lever_p95={:.6} \
+                     h3_null_median={:.6} h3_null_p5={:.6} h3_null_p95={:.6} \
+                     h3_trusted_over_forced_median={:.6} \
+                     h3_trusted_over_forced_p5={:.6} h3_trusted_over_forced_p95={:.6} \
                      paired_rounds={PAIRED_ROUNDS}",
                     cold_exhaustive.0,
                     cold_pruned.0,
@@ -10616,6 +10929,12 @@ mod tests {
                     lever.median,
                     lever.p5,
                     lever.p95,
+                    h3_null.median,
+                    h3_null.p5,
+                    h3_null.p95,
+                    h3_trusted_over_forced.median,
+                    h3_trusted_over_forced.p5,
+                    h3_trusted_over_forced.p95,
                 );
             }
         }

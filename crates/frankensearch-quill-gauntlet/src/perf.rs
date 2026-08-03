@@ -16,11 +16,19 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::GauntletError;
-use crate::machine_class_registry::{
-    DefaultFlipDisposition, ExecutionCapacitySemantics, MACHINE_CLASS_REGISTRY_SCHEMA_VERSION,
-    MACHINE_CLASS_REGISTRY_SHA256, MachineClassError, MachineClassRegistry,
-    MachineExecutionProfile, MachineProfileAvailability, MachineProfileKey,
+use crate::local_perf_runner::{
+    LOCAL_PERF_ATTEMPT_RECEIPT_SCHEMA_VERSION, LOCAL_PERF_BOOKING_RECEIPT_SCHEMA_VERSION,
+    LOCAL_PERF_LEASE_RELEASE_RECEIPT_SCHEMA_VERSION, PERF_RUN_PRECOMMIT_SCHEMA_VERSION,
 };
+use crate::machine_class_registry::{
+    DefaultFlipDisposition, ExecutionCapacitySemantics, LOCAL_PERF_PRODUCER_CONTRACT_VERSION,
+    MACHINE_CLASS_REGISTRY_SCHEMA_VERSION, MACHINE_CLASS_REGISTRY_SHA256, MachineClassError,
+    MachineClassRegistry, MachineExecutionProfile, MachineProfileAvailability, MachineProfileKey,
+    RUNNER_ARTIFACT_MANIFEST_SCHEMA_VERSION, RUNNER_RECEIPT_SCHEMA_VERSION,
+};
+use crate::perf_assembly::PERF_EVIDENCE_ASSEMBLY_SCHEMA_VERSION;
+use crate::perf_evidence::PERF_EVIDENCE_SCHEMA_VERSION;
+use crate::perf_ratchet::PERF_HISTORY_POINTER_SCHEMA_VERSION;
 
 /// Version of the JSON emitted by the QG matrix harness.
 pub const PERF_ARTIFACT_SCHEMA_VERSION: &str = "quill-perf-artifact-v7";
@@ -776,6 +784,189 @@ struct PerfGateManifestIdentity {
     primary_target_cell_width: Option<u64>,
 }
 
+fn validate_perf_manifest_gate_set(
+    parsed: &toml::Value,
+    requested_gate: PerfGate,
+) -> Result<(), PerfApplicabilityPlanError> {
+    let gates = parsed
+        .get("gate")
+        .and_then(toml::Value::as_table)
+        .ok_or_else(|| PerfApplicabilityPlanError::ManifestContract {
+            gate: requested_gate,
+            detail: "manifest does not define a [gate] table".to_owned(),
+        })?;
+
+    for gate in PerfGate::ALL {
+        let label = gate.label();
+        let policy = gates
+            .get(label)
+            .and_then(toml::Value::as_table)
+            .ok_or_else(|| PerfApplicabilityPlanError::ManifestContract {
+                gate: requested_gate,
+                detail: format!("manifest gate.{label} is missing or not a table"),
+            })?;
+        for field in ["name", "fixture", "target"] {
+            if policy
+                .get(field)
+                .and_then(toml::Value::as_str)
+                .is_none_or(|value| value.trim().is_empty())
+            {
+                return Err(PerfApplicabilityPlanError::ManifestContract {
+                    gate: requested_gate,
+                    detail: format!("manifest gate.{label}.{field} is missing or empty"),
+                });
+            }
+        }
+        if policy
+            .get("activated")
+            .and_then(toml::Value::as_bool)
+            .is_none()
+        {
+            return Err(PerfApplicabilityPlanError::ManifestContract {
+                gate: requested_gate,
+                detail: format!("manifest gate.{label}.activated is missing or not boolean"),
+            });
+        }
+        if gate == PerfGate::Qg6 {
+            let query_groups = policy
+                .get("queries_per_class")
+                .and_then(toml::Value::as_integer)
+                .and_then(|count| usize::try_from(count).ok());
+            if query_groups != Some(QG6_QUERY_GROUPS) {
+                return Err(PerfApplicabilityPlanError::ManifestContract {
+                    gate: requested_gate,
+                    detail: format!(
+                        "manifest gate.{label}.queries_per_class must equal the frozen QG-6 group count {QG6_QUERY_GROUPS}"
+                    ),
+                });
+            }
+        }
+        let allowed_fields: &[&str] = match gate {
+            PerfGate::Qg1 => [
+                "name",
+                "fixture",
+                "target",
+                "primary_target_cell_width",
+                "activated",
+            ]
+            .as_slice(),
+            PerfGate::Qg6 => [
+                "name",
+                "fixture",
+                "queries_per_class",
+                "target",
+                "activated",
+            ]
+            .as_slice(),
+            _ => ["name", "fixture", "target", "activated"].as_slice(),
+        };
+        for field in policy.keys() {
+            if !allowed_fields.contains(&field.as_str()) {
+                return Err(PerfApplicabilityPlanError::ManifestContract {
+                    gate: requested_gate,
+                    detail: format!("manifest gate.{label} defines unexpected field {field}"),
+                });
+            }
+        }
+    }
+
+    let expected_labels = PerfGate::ALL
+        .iter()
+        .map(|gate| gate.label())
+        .collect::<BTreeSet<_>>();
+    for label in gates.keys() {
+        if !expected_labels.contains(label.as_str()) {
+            return Err(PerfApplicabilityPlanError::ManifestContract {
+                gate: requested_gate,
+                detail: format!("manifest defines unexpected gate.{label}"),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn validate_perf_manifest_schema_bindings(
+    parsed: &toml::Value,
+    requested_gate: PerfGate,
+) -> Result<(), PerfApplicabilityPlanError> {
+    let schemas = parsed
+        .get("schemas")
+        .and_then(toml::Value::as_table)
+        .ok_or_else(|| PerfApplicabilityPlanError::ManifestContract {
+            gate: requested_gate,
+            detail: "manifest does not define a [schemas] table".to_owned(),
+        })?;
+    for (field, expected) in [
+        ("threshold_artifact", PERF_ARTIFACT_SCHEMA_VERSION),
+        ("evidence_artifact", PERF_EVIDENCE_SCHEMA_VERSION),
+        ("evidence_assembly", PERF_EVIDENCE_ASSEMBLY_SCHEMA_VERSION),
+        ("history_pointer", PERF_HISTORY_POINTER_SCHEMA_VERSION),
+        ("machine_registry", MACHINE_CLASS_REGISTRY_SCHEMA_VERSION),
+        ("applicability_plan", PERF_APPLICABILITY_PLAN_SCHEMA_VERSION),
+        ("runner_completion_receipt", RUNNER_RECEIPT_SCHEMA_VERSION),
+        (
+            "runner_artifact_manifest",
+            RUNNER_ARTIFACT_MANIFEST_SCHEMA_VERSION,
+        ),
+        (
+            "local_producer_contract",
+            LOCAL_PERF_PRODUCER_CONTRACT_VERSION,
+        ),
+        (
+            "runner_attempt_receipt",
+            LOCAL_PERF_ATTEMPT_RECEIPT_SCHEMA_VERSION,
+        ),
+        (
+            "runner_lease_release_receipt",
+            LOCAL_PERF_LEASE_RELEASE_RECEIPT_SCHEMA_VERSION,
+        ),
+        (
+            "runner_booking_receipt",
+            LOCAL_PERF_BOOKING_RECEIPT_SCHEMA_VERSION,
+        ),
+        ("precommit_inventory", PERF_RUN_PRECOMMIT_SCHEMA_VERSION),
+    ] {
+        let found = schemas
+            .get(field)
+            .and_then(toml::Value::as_str)
+            .ok_or_else(|| PerfApplicabilityPlanError::ManifestContract {
+                gate: requested_gate,
+                detail: format!("manifest schemas.{field} is missing or not a string"),
+            })?;
+        if found != expected {
+            return Err(PerfApplicabilityPlanError::ManifestContract {
+                gate: requested_gate,
+                detail: format!("manifest schemas.{field} is {found:?}, expected {expected:?}"),
+            });
+        }
+    }
+    for field in schemas.keys() {
+        if ![
+            "threshold_artifact",
+            "evidence_artifact",
+            "evidence_assembly",
+            "machine_registry",
+            "applicability_plan",
+            "runner_completion_receipt",
+            "runner_artifact_manifest",
+            "local_producer_contract",
+            "history_pointer",
+            "runner_attempt_receipt",
+            "runner_lease_release_receipt",
+            "runner_booking_receipt",
+            "precommit_inventory",
+        ]
+        .contains(&field.as_str())
+        {
+            return Err(PerfApplicabilityPlanError::ManifestContract {
+                gate: requested_gate,
+                detail: format!("manifest schemas.{field} is unreviewed"),
+            });
+        }
+    }
+    Ok(())
+}
+
 fn perf_gate_manifest_identity(
     manifest: &str,
     gate: PerfGate,
@@ -786,24 +977,8 @@ fn perf_gate_manifest_identity(
             detail: format!("manifest is not valid TOML: {error}"),
         }
     })?;
-    let schema = parsed
-        .get("schemas")
-        .and_then(toml::Value::as_table)
-        .and_then(|schemas| schemas.get("applicability_plan"))
-        .and_then(toml::Value::as_str)
-        .ok_or_else(|| PerfApplicabilityPlanError::ManifestContract {
-            gate,
-            detail: "schemas.applicability_plan is missing or not a string".to_owned(),
-        })?;
-    if schema != PERF_APPLICABILITY_PLAN_SCHEMA_VERSION {
-        return Err(PerfApplicabilityPlanError::ManifestContract {
-            gate,
-            detail: format!(
-                "schemas.applicability_plan is {schema:?}, expected \
-                 {PERF_APPLICABILITY_PLAN_SCHEMA_VERSION:?}"
-            ),
-        });
-    }
+    validate_perf_manifest_schema_bindings(&parsed, gate)?;
+    validate_perf_manifest_gate_set(&parsed, gate)?;
     let gate_contract = parsed
         .get("gate")
         .and_then(toml::Value::as_table)
@@ -4518,6 +4693,10 @@ mod tests {
 
     #[test]
     fn qg1_profile_plans_have_frozen_exhaustive_applicability_counts() {
+        // GOLDEN-CHANGE (terminal release receipt): every sealed terminal
+        // attempt now requires a post-unlock receipt. Matrix cells and
+        // applicability counts are unchanged; only their manifest-bound plan
+        // identities advance.
         let registry = MachineClassRegistry::frozen().expect("frozen machine registry");
         let cases = [
             (
@@ -4527,7 +4706,7 @@ mod tests {
                 16,
                 Some(64),
                 Some(64),
-                "2b9d450b21a3b051a5b05a479709dbbca482d7d27f1221ddd77adaed2934f5b3",
+                "893449ea6995017d8496a62ac3bdfa34fcc18add6f2df4c268ac425024bb74f7",
             ),
             (
                 ExecutionProfileId::Smt2_128,
@@ -4536,7 +4715,7 @@ mod tests {
                 0,
                 Some(128),
                 Some(128),
-                "bb66e93d76bee49640023abbc56738361dc6d9729eb4f8739af228df9785a56e",
+                "9124b71e748ef29ed6048eea79319e2891b44670b205b9a4e9e6ba8005a3f103",
             ),
             (
                 ExecutionProfileId::Scheduler10,
@@ -4545,7 +4724,7 @@ mod tests {
                 40,
                 Some(10),
                 Some(8),
-                "24787b922c8ce58fd6166a7475def35e498986500b7fa27e88a05a566a0bbdc5",
+                "56f659889230d0f22dbb3118e4815ee6e3c823aab4ec37d38f69eae3a86d6392",
             ),
         ];
         let mut plan_hashes = BTreeSet::new();
@@ -4730,6 +4909,102 @@ mod tests {
 
     #[test]
     fn qg1_manifest_contract_rejects_missing_or_unbounded_primary_target() {
+        let missing_unrelated_gate = PERF_MANIFEST.replacen("[gate.QG-10]", "[omitted.QG-10]", 1);
+        let missing_unrelated_gate =
+            perf_gate_manifest_identity(&missing_unrelated_gate, PerfGate::Qg1).expect_err(
+                "QG-1 planning must reject a manifest missing an unrelated normative gate",
+            );
+        assert!(
+            missing_unrelated_gate
+                .to_string()
+                .contains("manifest gate.QG-10 is missing or not a table"),
+            "unexpected missing-gate error: {missing_unrelated_gate}"
+        );
+
+        let extra_gate = format!("{PERF_MANIFEST}\n[gate.QG-11]\nactivated = false\n");
+        let extra_gate = perf_gate_manifest_identity(&extra_gate, PerfGate::Qg1)
+            .expect_err("QG-1 planning must reject an unexpected normative gate");
+        assert!(
+            extra_gate
+                .to_string()
+                .contains("manifest defines unexpected gate.QG-11"),
+            "unexpected extra-gate error: {extra_gate}"
+        );
+
+        let missing_unrelated_target = PERF_MANIFEST.replacen(
+            "target = \"open() <= 50ms (manifest + lazy sections) vs oracle reader open\"",
+            "target = \"\"",
+            1,
+        );
+        let missing_unrelated_target =
+            perf_gate_manifest_identity(&missing_unrelated_target, PerfGate::Qg1).expect_err(
+                "QG-1 planning must reject an unrelated gate with an empty required field",
+            );
+        assert!(
+            missing_unrelated_target
+                .to_string()
+                .contains("manifest gate.QG-9.target is missing or empty"),
+            "unexpected empty-target error: {missing_unrelated_target}"
+        );
+
+        for (field, expected) in [
+            ("threshold_artifact", PERF_ARTIFACT_SCHEMA_VERSION),
+            ("evidence_artifact", PERF_EVIDENCE_SCHEMA_VERSION),
+            ("evidence_assembly", PERF_EVIDENCE_ASSEMBLY_SCHEMA_VERSION),
+            ("history_pointer", PERF_HISTORY_POINTER_SCHEMA_VERSION),
+            ("machine_registry", MACHINE_CLASS_REGISTRY_SCHEMA_VERSION),
+            ("runner_completion_receipt", RUNNER_RECEIPT_SCHEMA_VERSION),
+            (
+                "runner_artifact_manifest",
+                RUNNER_ARTIFACT_MANIFEST_SCHEMA_VERSION,
+            ),
+            (
+                "local_producer_contract",
+                LOCAL_PERF_PRODUCER_CONTRACT_VERSION,
+            ),
+            (
+                "runner_attempt_receipt",
+                LOCAL_PERF_ATTEMPT_RECEIPT_SCHEMA_VERSION,
+            ),
+            (
+                "runner_lease_release_receipt",
+                LOCAL_PERF_LEASE_RELEASE_RECEIPT_SCHEMA_VERSION,
+            ),
+            (
+                "runner_booking_receipt",
+                LOCAL_PERF_BOOKING_RECEIPT_SCHEMA_VERSION,
+            ),
+            ("precommit_inventory", PERF_RUN_PRECOMMIT_SCHEMA_VERSION),
+        ] {
+            let stale_schema = PERF_MANIFEST.replacen(
+                &format!("{field} = \"{expected}\""),
+                &format!("{field} = \"stale-schema\""),
+                1,
+            );
+            let stale_schema = perf_gate_manifest_identity(&stale_schema, PerfGate::Qg1)
+                .expect_err("every artifact schema declaration must match the shared validator");
+            assert!(
+                stale_schema
+                    .to_string()
+                    .contains(&format!("manifest schemas.{field} is \"stale-schema\"")),
+                "unexpected stale {field} schema error: {stale_schema}"
+            );
+        }
+
+        let unreviewed_schema = PERF_MANIFEST.replacen(
+            "precommit_inventory = \"frankensearch.perf-run-precommit.v5\"",
+            "precommit_inventory = \"frankensearch.perf-run-precommit.v5\"\nunreviewed_schema = \"unreviewed.v1\"",
+            1,
+        );
+        let unreviewed_schema = perf_gate_manifest_identity(&unreviewed_schema, PerfGate::Qg1)
+            .expect_err("every manifest schema key must be reviewed");
+        assert!(
+            unreviewed_schema
+                .to_string()
+                .contains("manifest schemas.unreviewed_schema is unreviewed"),
+            "unexpected unreviewed schema error: {unreviewed_schema}"
+        );
+
         let missing = PERF_MANIFEST.replacen("primary_target_cell_width = 8\n", "", 1);
         assert!(matches!(
             perf_gate_manifest_identity(&missing, PerfGate::Qg1),
@@ -4756,6 +5031,43 @@ mod tests {
                 "invalid primary target {invalid} must fail closed"
             );
         }
+
+        for invalid in ["0", "15", "17", "\"sixteen\""] {
+            let mutated = PERF_MANIFEST.replacen(
+                "queries_per_class = 16",
+                &format!("queries_per_class = {invalid}"),
+                1,
+            );
+            assert!(matches!(
+                perf_gate_manifest_identity(&mutated, PerfGate::Qg1),
+                Err(PerfApplicabilityPlanError::ManifestContract {
+                    gate: PerfGate::Qg1,
+                    ..
+                })
+            ));
+        }
+
+        let missing_qg6_query_groups = PERF_MANIFEST.replacen("queries_per_class = 16\n", "", 1);
+        assert!(matches!(
+            perf_gate_manifest_identity(&missing_qg6_query_groups, PerfGate::Qg1),
+            Err(PerfApplicabilityPlanError::ManifestContract {
+                gate: PerfGate::Qg1,
+                ..
+            })
+        ));
+
+        let unexpected_qg6_field = PERF_MANIFEST.replacen(
+            "queries_per_class = 16",
+            "queries_per_class = 16\nunreviewed_query_groups = 32",
+            1,
+        );
+        assert!(matches!(
+            perf_gate_manifest_identity(&unexpected_qg6_field, PerfGate::Qg1),
+            Err(PerfApplicabilityPlanError::ManifestContract {
+                gate: PerfGate::Qg1,
+                ..
+            })
+        ));
 
         let stale_schema = PERF_MANIFEST.replacen(
             "applicability_plan = \"frankensearch.quill-perf-applicability-plan.v2\"",
@@ -5226,9 +5538,12 @@ mod tests {
     fn manifest_contract_hash_ignores_only_activation_state() {
         let manifest = PERF_MANIFEST;
         assert_eq!(manifest.matches("activated = false").count(), 10);
+        // GOLDEN-CHANGE (terminal release receipt): every sealed terminal
+        // attempt now requires a post-unlock receipt bound to its exact bytes.
+        // Activation is still the sole administrative normalization exception.
         assert_eq!(
             perf_manifest_contract_sha256(manifest),
-            "404c0e24c9f3f4919e3b9c3213e722c77bcdb89ea2f991d0a66dc67eafd0fc89",
+            "593d2c447946607a6f3a29dfe17b4affe1f9ca4ffdb38f72585ad7c18ddf3ae7",
             "the normalized all-inactive manifest digest must remain frozen"
         );
         assert_eq!(

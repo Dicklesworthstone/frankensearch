@@ -26,6 +26,11 @@ use frankensearch_quill::index::ConformanceCancellationStage;
 use frankensearch_quill::index::ConformancePruningExecutionMode;
 use frankensearch_quill::index::{QuillIndex, QuillIndexError};
 use frankensearch_quill::snippet::SnippetConfig;
+#[cfg(feature = "profile-internals")]
+use frankensearch_quill::{
+    QuillProfileCacheDisposition, QuillProfileExecutionMode, QuillProfileOutcome,
+    QuillProfiledSearchOutcome, QuillSearchIndex,
+};
 
 const QUERY: &str = "alpha";
 const LIMIT: usize = 10;
@@ -57,6 +62,299 @@ async fn fixture_index(cx: &Cx) -> QuillIndex {
         .await
         .expect("commit fixture corpus");
     index
+}
+
+#[cfg(feature = "profile-internals")]
+#[test]
+fn profiled_search_sidecar_executes_through_public_durable_reader() {
+    asupersync::test_utils::run_test_with_cx(|cx| async move {
+        let directory = tempfile::tempdir().expect("profile sidecar directory");
+        let writer = QuillIndex::create(&cx, directory.path(), deterministic_config())
+            .await
+            .expect("create durable profile fixture");
+        LexicalWrite::index_document(
+            &writer,
+            &cx,
+            &IndexableDocument::new("profiled-doc", "alpha profile sidecar document"),
+        )
+        .await
+        .expect("ingest durable profile fixture");
+        LexicalWrite::commit(&writer, &cx)
+            .await
+            .expect("publish durable profile fixture");
+
+        let reader = QuillSearchIndex::open(&cx, directory.path(), deterministic_config())
+            .await
+            .expect("open public durable reader");
+        let first = reader
+            .search_paginated_with_profile(&cx, QUERY, LIMIT, 0, false)
+            .expect("first profiled public search");
+        let first_receipt = match first {
+            QuillProfiledSearchOutcome::Completed { result, receipt } => {
+                assert_eq!(
+                    result.hits.len(),
+                    1,
+                    "ordinary search must return the fixture hit"
+                );
+                receipt
+            }
+            QuillProfiledSearchOutcome::Failed { error, .. } => {
+                panic!("first profiled public search unexpectedly failed: {error}")
+            }
+        };
+        assert_eq!(first_receipt.cache(), QuillProfileCacheDisposition::Miss);
+        assert_eq!(
+            first_receipt.execution(),
+            Some(QuillProfileExecutionMode::Serial),
+            "one sealed segment must use the shipping serial branch"
+        );
+        assert_eq!(
+            first_receipt.counters().0,
+            2,
+            "the two default text fields each require a snapshot DF probe"
+        );
+        assert_eq!(
+            first_receipt.counters().1,
+            2,
+            "the two default text fields each require a global DF probe"
+        );
+        assert_eq!(
+            first_receipt.counters().2,
+            4,
+            "each default field reads the dictionary for DF and cursor lowering"
+        );
+        assert_eq!(first_receipt.counters().3, 1, "sealed lowering count");
+        assert_eq!(first_receipt.outcome(), QuillProfileOutcome::Completed);
+
+        let repeated = reader
+            .search_paginated_with_profile(&cx, QUERY, LIMIT, 0, false)
+            .expect("repeat profiled public search");
+        let repeated_receipt = match repeated {
+            QuillProfiledSearchOutcome::Completed { result, receipt } => {
+                assert_eq!(
+                    result.hits.len(),
+                    1,
+                    "cache hit must preserve ordinary result"
+                );
+                receipt
+            }
+            QuillProfiledSearchOutcome::Failed { error, .. } => {
+                panic!("repeat profiled public search unexpectedly failed: {error}")
+            }
+        };
+        assert_eq!(repeated_receipt.cache(), QuillProfileCacheDisposition::Hit);
+        assert_eq!(repeated_receipt.execution(), None);
+        assert_eq!(repeated_receipt.counters(), (0, 0, 0, 0, 0));
+        assert_eq!(repeated_receipt.outcome(), QuillProfileOutcome::Completed);
+    });
+}
+
+#[cfg(feature = "profile-internals")]
+#[test]
+fn profiled_search_public_reader_preserves_fuel_exhaustion_receipt() {
+    asupersync::test_utils::run_test_with_cx(|cx| async move {
+        let directory = tempfile::tempdir().expect("fuel profile sidecar directory");
+        let config = QuillConfig {
+            deterministic_ingest: true,
+            query_fuel_budget: 1,
+            ..QuillConfig::default()
+        };
+        let writer = QuillIndex::create(&cx, directory.path(), config.clone())
+            .await
+            .expect("create durable fuel fixture");
+        LexicalWrite::index_document(
+            &writer,
+            &cx,
+            &IndexableDocument::new("fuel-profiled-doc", "alpha fuel sidecar document"),
+        )
+        .await
+        .expect("ingest durable fuel fixture");
+        LexicalWrite::commit(&writer, &cx)
+            .await
+            .expect("publish durable fuel fixture");
+
+        let reader = QuillSearchIndex::open(&cx, directory.path(), config)
+            .await
+            .expect("open public durable fuel reader");
+        let outcome = reader
+            .search_paginated_with_profile(&cx, QUERY, LIMIT, 0, false)
+            .expect("profile admission must preserve ordinary fuel exhaustion");
+        let (error, receipt) = match outcome {
+            QuillProfiledSearchOutcome::Completed { .. } => {
+                panic!("fuel-limited profiled search unexpectedly completed")
+            }
+            QuillProfiledSearchOutcome::Failed { error, receipt } => (error, receipt),
+        };
+        assert!(matches!(
+            error,
+            QuillIndexError::QueryFuelExhausted {
+                budget: 1,
+                consumed: 1,
+                ..
+            }
+        ));
+        assert_eq!(receipt.cache(), QuillProfileCacheDisposition::Miss);
+        assert_eq!(receipt.fanout_eligible(), Some(false));
+        assert_eq!(
+            receipt.execution(),
+            Some(QuillProfileExecutionMode::Serial),
+            "one sealed segment reaches the serial branch before fuel refusal"
+        );
+        let Some((work_upper_bound, metering)) = receipt.work_plan() else {
+            panic!("fuel-limited profiled search did not bind a work plan");
+        };
+        assert!(work_upper_bound > 1);
+        assert!(metering);
+        assert_eq!(receipt.work_units().requested(), [1, 1, 0, 0]);
+        assert_eq!(receipt.work_units().admitted(), [1, 0, 0, 0]);
+        assert_eq!(receipt.work_units().refused(), [0, 1, 0, 0]);
+        assert_eq!(receipt.counters(), (1, 1, 1, 1, 1));
+        assert_eq!(receipt.cancellation_observations(), 0);
+        assert_eq!(receipt.outcome(), QuillProfileOutcome::FuelExhausted);
+    });
+}
+
+#[cfg(feature = "profile-internals")]
+#[test]
+fn profiled_search_public_reader_preserves_precheck_cancellation_receipt() {
+    asupersync::test_utils::run_test_with_cx(|cx| async move {
+        let directory = tempfile::tempdir().expect("cancelled profile sidecar directory");
+        let _writer = QuillIndex::create(&cx, directory.path(), deterministic_config())
+            .await
+            .expect("create durable cancelled fixture");
+        let reader = QuillSearchIndex::open(&cx, directory.path(), deterministic_config())
+            .await
+            .expect("open public durable cancelled reader");
+
+        let cancelled = cx.clone();
+        cancelled.set_cancel_requested(true);
+        let outcome = reader
+            .search_paginated_with_profile(&cancelled, QUERY, LIMIT, 0, false)
+            .expect("profile admission must preserve ordinary cancellation");
+        let (error, receipt) = match outcome {
+            QuillProfiledSearchOutcome::Completed { .. } => {
+                panic!("pre-cancelled profiled search unexpectedly completed")
+            }
+            QuillProfiledSearchOutcome::Failed { error, receipt } => (error, receipt),
+        };
+        assert!(matches!(error, QuillIndexError::Cancelled { phase } if phase == "search"));
+        assert_eq!(receipt.cache(), QuillProfileCacheDisposition::NotChecked);
+        assert_eq!(receipt.fanout_eligible(), None);
+        assert_eq!(receipt.execution(), None);
+        assert_eq!(receipt.work_plan(), None);
+        assert_eq!(receipt.counters(), (0, 0, 0, 0, 0));
+        assert_eq!(receipt.work_units().requested(), [0, 0, 0, 0]);
+        assert_eq!(receipt.work_units().admitted(), [0, 0, 0, 0]);
+        assert_eq!(receipt.work_units().refused(), [0, 0, 0, 0]);
+        assert_eq!(receipt.cancellation_observations(), 1);
+        assert_eq!(receipt.outcome(), QuillProfileOutcome::Cancelled);
+    });
+}
+
+#[cfg(all(feature = "profile-internals", feature = "conformance-internals"))]
+#[test]
+fn profiled_search_public_reader_records_disabled_cache_without_skipping_work() {
+    asupersync::test_utils::run_test_with_cx(|cx| async move {
+        let directory = tempfile::tempdir().expect("disabled-cache profile sidecar directory");
+        let writer = QuillIndex::create(&cx, directory.path(), deterministic_config())
+            .await
+            .expect("create durable disabled-cache fixture");
+        LexicalWrite::index_document(
+            &writer,
+            &cx,
+            &IndexableDocument::new(
+                "disabled-cache-profiled-doc",
+                "alpha cache sidecar document",
+            ),
+        )
+        .await
+        .expect("ingest durable disabled-cache fixture");
+        LexicalWrite::commit(&writer, &cx)
+            .await
+            .expect("publish durable disabled-cache fixture");
+
+        let reader = QuillSearchIndex::open(&cx, directory.path(), deterministic_config())
+            .await
+            .expect("open public durable disabled-cache reader");
+        let controller = reader.conformance_cancellation_controller();
+        controller
+            .arm(ConformanceCancellationStage::CommitPublication, 1)
+            .expect("arm unrelated checkpoint to disable ranked cache");
+        let outcome = reader
+            .search_paginated_with_profile(&cx, QUERY, LIMIT, 0, false)
+            .expect("disabled cache must not prevent ordinary profile search");
+        controller.disarm();
+        let (result, receipt) = match outcome {
+            QuillProfiledSearchOutcome::Completed { result, receipt } => (result, receipt),
+            QuillProfiledSearchOutcome::Failed { error, .. } => {
+                panic!("disabled-cache profiled search unexpectedly failed: {error}")
+            }
+        };
+        assert_eq!(result.hits.len(), 1);
+        assert_eq!(receipt.cache(), QuillProfileCacheDisposition::Disabled);
+        assert_eq!(receipt.fanout_eligible(), Some(false));
+        assert_eq!(receipt.execution(), Some(QuillProfileExecutionMode::Serial));
+        assert!(receipt.work_plan().is_some());
+        assert_eq!(receipt.counters().0, 2);
+        assert_eq!(receipt.counters().1, 2);
+        assert_eq!(receipt.counters().2, 4);
+        assert_eq!(receipt.counters().3, 1);
+        assert!(receipt.counters().4 > 0);
+        assert_eq!(receipt.outcome(), QuillProfileOutcome::Completed);
+    });
+}
+
+#[cfg(all(feature = "profile-internals", feature = "conformance-internals"))]
+#[test]
+fn profiled_search_public_reader_records_checkpoint_cancellation_prefix() {
+    asupersync::test_utils::run_test_with_cx(|cx| async move {
+        let directory = tempfile::tempdir().expect("checkpoint-cancel profile sidecar directory");
+        let writer = QuillIndex::create(&cx, directory.path(), deterministic_config())
+            .await
+            .expect("create durable checkpoint-cancel fixture");
+        LexicalWrite::index_document(
+            &writer,
+            &cx,
+            &IndexableDocument::new(
+                "checkpoint-cancel-profiled-doc",
+                "alpha checkpoint sidecar document",
+            ),
+        )
+        .await
+        .expect("ingest durable checkpoint-cancel fixture");
+        LexicalWrite::commit(&writer, &cx)
+            .await
+            .expect("publish durable checkpoint-cancel fixture");
+
+        let reader = QuillSearchIndex::open(&cx, directory.path(), deterministic_config())
+            .await
+            .expect("open public durable checkpoint-cancel reader");
+        let controller = reader.conformance_cancellation_controller();
+        controller
+            .arm(ConformanceCancellationStage::QueryCollection, 2)
+            .expect("arm cancellation at the second ordinary checkpoint");
+        let outcome = reader
+            .search_paginated_with_profile(&cx, QUERY, LIMIT, 0, false)
+            .expect("checkpoint cancellation must retain the profile receipt");
+        controller.disarm();
+        let (error, receipt) = match outcome {
+            QuillProfiledSearchOutcome::Completed { .. } => {
+                panic!("checkpoint-cancelled profiled search unexpectedly completed")
+            }
+            QuillProfiledSearchOutcome::Failed { error, receipt } => (error, receipt),
+        };
+        assert!(matches!(error, QuillIndexError::Cancelled { phase } if phase == "search"));
+        assert_eq!(receipt.cache(), QuillProfileCacheDisposition::Disabled);
+        assert_eq!(receipt.fanout_eligible(), Some(false));
+        assert_eq!(receipt.execution(), Some(QuillProfileExecutionMode::Serial));
+        assert!(receipt.work_plan().is_some());
+        assert_eq!(receipt.work_units().requested(), [1, 1, 0, 0]);
+        assert_eq!(receipt.work_units().admitted(), [1, 0, 0, 0]);
+        assert_eq!(receipt.work_units().refused(), [0, 0, 0, 0]);
+        assert_eq!(receipt.counters(), (1, 1, 1, 1, 1));
+        assert_eq!(receipt.cancellation_observations(), 1);
+        assert_eq!(receipt.outcome(), QuillProfileOutcome::Cancelled);
+    });
 }
 
 #[cfg(feature = "pruning-conformance")]

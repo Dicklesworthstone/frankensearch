@@ -6364,8 +6364,8 @@ impl WriterLockRecord {
 
 fn writer_pid_start_nonce(pid: u32, acquired_unix_s: i64) -> u64 {
     #[cfg(target_os = "linux")]
-    if let Some(nonce) = linux_process_start_nonce(pid) {
-        return nonce;
+    if let Some(start_time) = linux_process_start_time(pid) {
+        return writer_pid_start_nonce_from_linux_start_time(pid, start_time);
     }
 
     let mut identity = [0_u8; 12];
@@ -6375,12 +6375,11 @@ fn writer_pid_start_nonce(pid: u32, acquired_unix_s: i64) -> u64 {
 }
 
 #[cfg(target_os = "linux")]
-fn linux_process_start_nonce(pid: u32) -> Option<u64> {
-    let start_time = linux_process_start_time(pid)?;
+fn writer_pid_start_nonce_from_linux_start_time(pid: u32, start_time: u64) -> u64 {
     let mut identity = [0_u8; 12];
     identity[..4].copy_from_slice(&pid.to_le_bytes());
     identity[4..].copy_from_slice(&start_time.to_le_bytes());
-    Some(xxhash_rust::xxh3::xxh3_64(&identity))
+    xxhash_rust::xxh3::xxh3_64(&identity)
 }
 
 #[cfg(target_os = "linux")]
@@ -6390,26 +6389,6 @@ fn linux_process_start_time(pid: u32) -> Option<u64> {
     // The first token after the command is field 3 (`state`); starttime is
     // field 22, hence zero-based token 19 in this suffix.
     after_command.split_whitespace().nth(19)?.parse().ok()
-}
-
-#[cfg(unix)]
-fn writer_lock_record_is_live(record: WriterLockRecord) -> bool {
-    if writer_pid_is_dead(record.pid) {
-        return false;
-    }
-    #[cfg(target_os = "linux")]
-    if let Some(observed) = linux_process_start_nonce(record.pid) {
-        return observed == record.pid_start_nonce;
-    }
-    // A live pid whose start identity cannot be inspected remains a
-    // conservative live-owner result. Only a positively observed nonce
-    // mismatch proves PID reuse.
-    true
-}
-
-#[cfg(not(unix))]
-fn writer_lock_record_is_live(_: WriterLockRecord) -> bool {
-    true
 }
 
 struct WriterAdmissionInner {
@@ -6533,12 +6512,13 @@ fn acquire_writer_admission(directory: &Path) -> Result<Arc<WriterAdmissionInner
         Err(KeeperError::WriterLockCorrupted { .. }) => None,
         Err(error) => return Err(error),
     };
-    if previous.is_some_and(|previous| {
-        previous.pid != std::process::id() && writer_lock_record_is_live(previous)
-    }) {
+    if let Some(previous) = previous
+        && previous.pid != std::process::id()
+        && writer_lock_record_names_live_owner(previous)
+    {
         return Err(KeeperError::WriterBusy {
             path: lock_path,
-            owner_pid: previous.map(|record| record.pid),
+            owner_pid: Some(previous.pid),
         });
     }
 
@@ -6751,6 +6731,27 @@ fn publish_writer_lock_record(
         });
     }
     Ok((file, metadata.dev(), metadata.ino()))
+}
+
+fn writer_lock_record_names_live_owner(record: WriterLockRecord) -> bool {
+    if writer_pid_is_dead(record.pid) {
+        return false;
+    }
+
+    // A live pid whose start identity cannot be inspected remains a
+    // conservative live-owner result. Only a positively observed nonce
+    // mismatch proves PID reuse.
+    #[cfg(target_os = "linux")]
+    {
+        let Some(start_time) = linux_process_start_time(record.pid) else {
+            return true;
+        };
+        writer_pid_start_nonce_from_linux_start_time(record.pid, start_time)
+            == record.pid_start_nonce
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    true
 }
 
 #[cfg(unix)]
@@ -13219,7 +13220,7 @@ fn detect_live_writer(directory: &Path) -> bool {
     let Ok(Some(record)) = read_writer_lock_record(&lock_path, &mut file) else {
         return false;
     };
-    writer_lock_record_is_live(record)
+    writer_lock_record_names_live_owner(record)
 }
 
 impl SegmentStatsProvider for KeeperSnapshot {
@@ -18173,6 +18174,38 @@ mod tests {
         Ok(())
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn writer_admission_is_exclusive_reusable_and_repairs_torn_records() -> TestResult {
+        let directory = tempdir()?;
+        let first = acquire_writer_admission(directory.path())?;
+        let lock_path = directory.path().join("LOCK");
+        let active_bytes = std::fs::read(&lock_path)?;
+        assert_eq!(active_bytes.len(), WRITER_LOCK_RECORD_BYTES);
+        assert!(matches!(
+            acquire_writer_admission(directory.path()),
+            Err(KeeperError::WriterBusy {
+                owner_pid: Some(pid),
+                ..
+            }) if pid == std::process::id()
+        ));
+        assert_eq!(std::fs::read(&lock_path)?, active_bytes);
+        drop(first);
+        assert_eq!(std::fs::metadata(&lock_path)?.len(), 0);
+
+        let second = acquire_writer_admission(directory.path())?;
+        drop(second);
+        std::fs::write(&lock_path, b"truncated")?;
+        let repaired = acquire_writer_admission(directory.path())?;
+        assert_eq!(
+            std::fs::metadata(&lock_path)?.len(),
+            usize_to_u64(WRITER_LOCK_RECORD_BYTES)
+        );
+        drop(repaired);
+        assert_eq!(std::fs::metadata(lock_path)?.len(), 0);
+        Ok(())
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn live_reused_pid_with_a_different_start_nonce_does_not_block_takeover() -> TestResult {
@@ -18184,7 +18217,8 @@ mod tests {
 
         let pid = child.child_mut().id();
         let acquired_unix_s = 1_700_000_000;
-        let observed_nonce = linux_process_start_nonce(pid)
+        let observed_nonce = linux_process_start_time(pid)
+            .map(|start_time| writer_pid_start_nonce_from_linux_start_time(pid, start_time))
             .ok_or_else(|| io::Error::other("live child start identity is observable"))?;
         let stale = WriterLockRecord {
             pid,
@@ -18193,7 +18227,7 @@ mod tests {
         };
         std::fs::write(directory.path().join("LOCK"), stale.to_bytes())?;
         assert!(
-            !writer_lock_record_is_live(stale),
+            !writer_lock_record_names_live_owner(stale),
             "same numeric pid with a different process start must be stale"
         );
 
@@ -18206,7 +18240,7 @@ mod tests {
             acquired_unix_s,
         };
         std::fs::write(directory.path().join("LOCK"), matching.to_bytes())?;
-        assert!(writer_lock_record_is_live(matching));
+        assert!(writer_lock_record_names_live_owner(matching));
         assert!(matches!(
             acquire_writer_admission(directory.path()),
             Err(KeeperError::WriterBusy {
@@ -18219,6 +18253,44 @@ mod tests {
         child.wait_success()?;
         let after_exit = acquire_writer_admission(directory.path())?;
         drop(after_exit);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn writer_admission_replaces_a_live_pid_record_with_a_stale_start_nonce() -> TestResult {
+        let directory = tempdir()?;
+        let admission = acquire_writer_admission(directory.path())?;
+        let lock_path = directory.path().join("LOCK");
+        drop(admission);
+
+        let current = WriterLockRecord::current(&lock_path)?;
+        let stale = WriterLockRecord {
+            pid_start_nonce: current.pid_start_nonce ^ 1,
+            ..current
+        };
+        std::fs::write(&lock_path, stale.to_bytes())?;
+
+        let replacement = acquire_writer_admission(directory.path())?;
+        assert_ne!(replacement.record.pid_start_nonce, stale.pid_start_nonce);
+        drop(replacement);
+        assert_eq!(std::fs::metadata(lock_path)?.len(), 0);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stale_writer_start_nonce_is_not_reported_as_live() -> TestResult {
+        let directory = tempdir()?;
+        let lock_path = directory.path().join("LOCK");
+        let current = WriterLockRecord::current(&lock_path)?;
+        let stale = WriterLockRecord {
+            pid_start_nonce: current.pid_start_nonce ^ 1,
+            ..current
+        };
+        std::fs::write(&lock_path, stale.to_bytes())?;
+
+        assert!(!detect_live_writer(directory.path()));
         Ok(())
     }
 

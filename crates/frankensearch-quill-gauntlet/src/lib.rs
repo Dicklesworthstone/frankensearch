@@ -35,7 +35,7 @@ pub use artifact::{
     CampaignArtifactContext, GauntletProducerBuildIdentity, GauntletProducerSourceVerification,
     IntegrityCheckedCampaign, OBJECT_SCHEMA_VERSION, PreparedArtifact, RUN_MANIFEST_SCHEMA_VERSION,
     RunManifest, SerializedSchemaDisposition, classify_artifact_object_schema,
-    classify_campaign_report_schema,
+    classify_campaign_report_schema, pinned_campaign_report_v7,
 };
 pub use campaign_contract::{
     BuiltInEvidenceBindingV1, CampaignCellEvidenceV1, CampaignCellKeyV1, CampaignContractModeV1,
@@ -166,10 +166,10 @@ pub use perf_evidence::{
     load_legacy_gate_artifact_v3, required_estimand,
 };
 pub use perf_ratchet::{
-    PERF_MAX_REGRESSION_PCT, PERF_MAX_REPRODUCTION_DELTA_PCT, PERF_RATCHET_SCHEMA_VERSION,
-    PERF_REGRESSION_ROBUST_Z, PerfCellComparison, PerfEvidenceFile, PerfGateDecision,
-    PerfRatchetEvaluation, PerfRatchetMode, PerfRatchetReason, PerfRatchetRequest,
-    evaluate_perf_ratchet, is_explicit_bootstrap, is_explicit_bootstrap_for,
+    PERF_HISTORY_POINTER_SCHEMA_VERSION, PERF_MAX_REGRESSION_PCT, PERF_MAX_REPRODUCTION_DELTA_PCT,
+    PERF_RATCHET_SCHEMA_VERSION, PERF_REGRESSION_ROBUST_Z, PerfCellComparison, PerfEvidenceFile,
+    PerfGateDecision, PerfRatchetEvaluation, PerfRatchetMode, PerfRatchetReason,
+    PerfRatchetRequest, evaluate_perf_ratchet, is_explicit_bootstrap, is_explicit_bootstrap_for,
 };
 pub use qg2_contract::{
     QG2_CANONICAL_CONTRACT, QG2_CONTRACT_REPORT_SCHEMA_VERSION, QG2_LOGICAL_SURFACE_COUNT,
@@ -202,7 +202,10 @@ pub use runner::{
     DivergencePredictionEvent, DivergenceRegisterDecision, DivergenceRegisterEntry,
     DivergenceRegisterEvent, DivergenceRegisterEventHeader, DivergenceRegisterLedger,
     DivergenceRegistry, DivergenceRevisionSet, EngineIndexReceipt, GeneratedCorpusReplay,
-    LexicalMismatchGroup, LexicalSideCoverageCounts, MismatchGroup, PredictedDivergenceState,
+    LexicalMismatchGroup, LexicalSideCoverageCounts, METAMORPHIC_LAW_REGISTRY_SCHEMA_VERSION,
+    MetamorphicLawApplicability, MetamorphicLawApplicabilityEntry, MetamorphicLawDescriptor,
+    MetamorphicLawOutcome, MetamorphicLawRegistry, MetamorphicLawResult, MetamorphicLawScope,
+    MetamorphicLawSummary, MetamorphicSkipReason, MismatchGroup, PredictedDivergenceState,
     ProbeCoverageCounts, QueryClassSummary, RedactedDivergenceDiagnostic,
     SCALAR_G1A_SCHEMA_CONTRACT_PREIMAGE, SemanticContract, ShadowDivergenceRecord, ShrinkDriver,
     ShrinkEngineFactory, ShrinkError, ShrinkRequest, ShrunkReproduction, SuspectedLayer,

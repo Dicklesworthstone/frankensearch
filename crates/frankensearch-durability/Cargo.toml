@@ -18,6 +18,8 @@ tracing = { workspace = true }
 crc32fast = { workspace = true }
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 memmap2 = { workspace = true }
+rustix = { version = "1.1.4", features = ["fs"] }
+libc = "0.2"
 
 [features]
 # Engine-neutral by construction (bd-tkjm): durability primitives compose with
@@ -29,6 +31,7 @@ bench-internals = []
 
 [dev-dependencies]
 criterion = { workspace = true }
+tempfile = "3.27"
 
 [[bench]]
 name = "durability_bench"

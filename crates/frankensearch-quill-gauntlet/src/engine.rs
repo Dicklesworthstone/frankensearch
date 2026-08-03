@@ -2914,8 +2914,12 @@ mod tests {
 
     #[cfg(feature = "perf-harness")]
     fn qg_position_mode_subject(positions: bool) -> QuillSubject {
+        qg_position_mode_subject_with_config(positions, e55_config())
+    }
+
+    #[cfg(feature = "perf-harness")]
+    fn qg_position_mode_subject_with_config(positions: bool, config: QuillConfig) -> QuillSubject {
         let (producer_revision, producer_dirty) = test_producer_source();
-        let config = e55_config();
         let schema = if positions {
             frankensearch_quill::DEFAULT_SCHEMA
         } else {
@@ -2975,17 +2979,57 @@ mod tests {
         seed: u64,
         generator_id: &str,
     ) -> Vec<(String, EngineObservation, EngineObservation)> {
-        let mut subject = qg_position_mode_subject(true);
+        e63_observations_with_config(cx, documents, cases, seed, generator_id, e55_config()).await
+    }
+
+    #[cfg(feature = "perf-harness")]
+    async fn e63_observations_with_config(
+        cx: &Cx,
+        documents: &[frankensearch_core::IndexableDocument],
+        cases: &[(&str, &str)],
+        seed: u64,
+        generator_id: &str,
+        subject_config: QuillConfig,
+    ) -> Vec<(String, EngineObservation, EngineObservation)> {
+        e63_observations_with_config_and_batch_size(
+            cx,
+            documents,
+            cases,
+            seed,
+            generator_id,
+            subject_config,
+            documents.len(),
+        )
+        .await
+    }
+
+    /// E6.3 observation runner variant that fixes the ingest batch schedule.
+    /// A non-zero batch size lets lifecycle laws exercise publication
+    /// boundaries without changing the corpus or query projection.
+    #[cfg(feature = "perf-harness")]
+    async fn e63_observations_with_config_and_batch_size(
+        cx: &Cx,
+        documents: &[frankensearch_core::IndexableDocument],
+        cases: &[(&str, &str)],
+        seed: u64,
+        generator_id: &str,
+        subject_config: QuillConfig,
+        batch_size: usize,
+    ) -> Vec<(String, EngineObservation, EngineObservation)> {
+        assert!(batch_size > 0, "E6.3 ingest batch size must be non-zero");
+        let mut subject = qg_position_mode_subject_with_config(true, subject_config);
         let mut oracle = qg_position_mode_oracle(true);
         subject
             .claim_fresh_campaign()
             .expect("E6.3 claim Quill input-order campaign");
-        subject
-            .index_mut()
-            .expect("E6.3 open Quill input-order campaign")
-            .index_documents(cx, documents)
-            .await
-            .expect("E6.3 index Quill input-order fixture");
+        for batch in documents.chunks(batch_size) {
+            subject
+                .index_mut()
+                .expect("E6.3 open Quill input-order campaign")
+                .index_documents(cx, batch)
+                .await
+                .expect("E6.3 index Quill input-order fixture");
+        }
         subject
             .index_mut()
             .expect("E6.3 open Quill input-order campaign")
@@ -3054,6 +3098,78 @@ mod tests {
             permutation.swap(position, selected);
         }
         permutation
+    }
+
+    /// The replay identity includes the exact v1 LCG and Fisher-Yates swap
+    /// schedule. Determinism alone would not detect a changed generator that
+    /// silently maps a historical seed to a different ingest order.
+    #[cfg(feature = "perf-harness")]
+    #[test]
+    fn e63_input_permutation_seed_schedule_v1_is_exact_and_preserves_small_domains() {
+        assert_eq!(e63_seeded_input_permutation(0, 0), Vec::<usize>::new());
+        assert_eq!(e63_seeded_input_permutation(1, 0), vec![0]);
+        assert_eq!(
+            e63_seeded_input_permutation(5, 0xe63_1a00_5eed_0001),
+            vec![4, 1, 0, 3, 2]
+        );
+    }
+
+    #[cfg(feature = "perf-harness")]
+    fn e63_seeded_ascii_query_normalization(term: &str, seed: u64) -> String {
+        match seed % 3 {
+            0 => format!(" \t{term}\n"),
+            1 => term.to_ascii_uppercase(),
+            _ => format!("\t{}  ", term.to_ascii_uppercase()),
+        }
+    }
+
+    /// Pin the versioned query-normalization seed mapping used in replay
+    /// artifacts. The campaign already proves each transformed query is
+    /// equivalent, but a remapped seed would otherwise reproduce a different
+    /// transform under the same historical identity.
+    #[cfg(feature = "perf-harness")]
+    #[test]
+    fn e63_ascii_query_normalization_seed_schedule_v1_is_exact_and_periodic() {
+        assert_eq!(
+            e63_seeded_ascii_query_normalization("alpha", 0),
+            " \talpha\n"
+        );
+        assert_eq!(e63_seeded_ascii_query_normalization("alpha", 1), "ALPHA");
+        assert_eq!(
+            e63_seeded_ascii_query_normalization("alpha", 2),
+            "\tALPHA  "
+        );
+        assert_eq!(
+            e63_seeded_ascii_query_normalization("alpha", 3),
+            " \talpha\n"
+        );
+        assert_eq!(
+            e63_seeded_ascii_query_normalization("alpha", u64::MAX),
+            " \talpha\n"
+        );
+    }
+
+    #[cfg(feature = "perf-harness")]
+    fn e63_seeded_flush_batch_size(seed: u64) -> usize {
+        match seed % 3 {
+            0 => 1,
+            1 => 2,
+            _ => 3,
+        }
+    }
+
+    /// The v1 flush-batch generator is a three-state replay contract, not
+    /// merely a non-zero batch-size source. Pinning every residue and the
+    /// period wrap prevents a changed schedule from silently relabelling a
+    /// historical E6.3 seed.
+    #[cfg(feature = "perf-harness")]
+    #[test]
+    fn e63_flush_batch_seed_schedule_v1_is_exact_and_periodic() {
+        assert_eq!(e63_seeded_flush_batch_size(0), 1);
+        assert_eq!(e63_seeded_flush_batch_size(1), 2);
+        assert_eq!(e63_seeded_flush_batch_size(2), 3);
+        assert_eq!(e63_seeded_flush_batch_size(3), 1);
+        assert_eq!(e63_seeded_flush_batch_size(u64::MAX), 1);
     }
 
     struct CountingEngine {
@@ -6163,6 +6279,526 @@ mod tests {
         });
     }
 
+    /// E6.3 seeded property campaign for the qualified input-order law. Each
+    /// seed must replay exactly and exercise a nonidentity stable-ID
+    /// permutation; the paired single-seed law supplies the intentionally
+    /// invalid content-mutation control. This stays bounded for PR execution
+    /// while making the generator rather than one hand-picked permutation the
+    /// unit under test.
+    #[cfg(feature = "perf-harness")]
+    #[test]
+    fn e63_input_order_seed_matrix_replays_live_observations() {
+        use frankensearch_core::IndexableDocument;
+
+        const SEEDS: [u64; 3] = [
+            0xe63_1a00_5eed_0001,
+            0xe63_1a00_5eed_0002,
+            0xe63_1a00_5eed_0003,
+        ];
+        let canonical = vec![
+            IndexableDocument::new("doc-1", "alpha beta beta").with_title("guide"),
+            IndexableDocument::new("doc-2", "alpha gamma").with_title("alpha overview"),
+            IndexableDocument::new("doc-3", "beta gamma gamma gamma").with_title("alpha"),
+            IndexableDocument::new("doc-4", "alpha beta gamma delta").with_title("reference"),
+            IndexableDocument::new("doc-5", "delta epsilon").with_title("quiet"),
+        ];
+        let queries = [("bare-term", "alpha"), ("boolean-and", "alpha AND beta")];
+
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            for seed in SEEDS {
+                let permutation = e63_seeded_input_permutation(canonical.len(), seed);
+                assert_ne!(
+                    permutation,
+                    (0..canonical.len()).collect::<Vec<_>>(),
+                    "E6.3 seed {seed:#x} must exercise a real ingest-order transform",
+                );
+                assert_eq!(
+                    permutation,
+                    e63_seeded_input_permutation(canonical.len(), seed),
+                    "E6.3 seed {seed:#x} must replay byte-identically",
+                );
+                let permuted = permutation
+                    .iter()
+                    .map(|&index| canonical[index].clone())
+                    .collect::<Vec<_>>();
+                let baseline = e63_observations(
+                    &cx,
+                    &canonical,
+                    &queries,
+                    seed,
+                    "e6.3-input-order-permutation-v1",
+                )
+                .await;
+                let transformed = e63_observations(
+                    &cx,
+                    &permuted,
+                    &queries,
+                    seed,
+                    "e6.3-input-order-permutation-v1",
+                )
+                .await;
+
+                for (
+                    (baseline_id, baseline_quill, baseline_tantivy),
+                    (transformed_id, transformed_quill, transformed_tantivy),
+                ) in baseline.iter().zip(&transformed)
+                {
+                    assert_eq!(
+                        baseline_id, transformed_id,
+                        "E6.3 seed {seed:#x} replay case identity drifted"
+                    );
+                    for (engine, before, after) in [
+                        ("Quill", baseline_quill, transformed_quill),
+                        ("Tantivy", baseline_tantivy, transformed_tantivy),
+                    ] {
+                        let comparison = compare_observations(
+                            before.clone(),
+                            after.clone(),
+                            ComparatorConfig::default(),
+                        )
+                        .unwrap_or_else(|error| {
+                            panic!("E6.3 {engine} seed {seed:#x} {baseline_id} replay comparison failed: {error}")
+                        });
+                        assert!(
+                            matches!(
+                                comparison.rank_class,
+                                RankClass::RankExact | RankClass::TieOrder
+                            ) && comparison
+                                .divergences
+                                .iter()
+                                .all(|divergence| divergence.class == DivergenceClass::TieOrder),
+                            "E6.3 {engine} seed {seed:#x} {baseline_id} produced a non-tie divergence: {:?}",
+                            comparison.divergences,
+                        );
+                    }
+                }
+            }
+        });
+    }
+
+    /// E6.3 law: segment boundaries are an implementation detail when the
+    /// corpus, stable IDs, and scalar configuration contract are unchanged.
+    /// The tight budget below is intentionally small enough to exercise the
+    /// flush/segment path; it does not change analyzer, scoring, or query
+    /// policy. Changing a document payload is the invalid control, so this
+    /// does not disguise a corpus mutation as a geometry perturbation.
+    #[cfg(feature = "perf-harness")]
+    #[test]
+    fn e63_tight_segment_geometry_preserves_observations_but_content_mutation_does_not() {
+        use frankensearch_core::IndexableDocument;
+
+        const SEED: u64 = 0xe63_5e90_5eed_0001;
+        let documents = vec![
+            IndexableDocument::new("doc-1", "alpha beta beta").with_title("guide"),
+            IndexableDocument::new("doc-2", "alpha gamma").with_title("alpha overview"),
+            IndexableDocument::new("doc-3", "beta gamma gamma gamma").with_title("alpha"),
+            IndexableDocument::new("doc-4", "alpha beta gamma delta").with_title("reference"),
+            IndexableDocument::new("doc-5", "delta epsilon").with_title("quiet"),
+        ];
+        let queries = [
+            ("bare-term", "alpha"),
+            ("repeated-term", "beta"),
+            ("boolean-and", "alpha AND beta"),
+            ("negative-sentinel", "saffron"),
+        ];
+        let tight_geometry = QuillConfig {
+            scribe_shard_budget_bytes: 1,
+            delta_budget_bytes: 1,
+            tier_fanout: 2,
+            ..e55_config()
+        };
+        let mut content_mutated = documents.clone();
+        content_mutated[3] =
+            IndexableDocument::new("doc-4", "alpha beta saffron").with_title("reference");
+
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let baseline = e63_observations(
+                &cx,
+                &documents,
+                &queries,
+                SEED,
+                "e6.3-tight-segment-geometry-v1",
+            )
+            .await;
+            let transformed = e63_observations_with_config(
+                &cx,
+                &documents,
+                &queries,
+                SEED,
+                "e6.3-tight-segment-geometry-v1",
+                tight_geometry,
+            )
+            .await;
+            let invalid = e63_observations_with_config(
+                &cx,
+                &content_mutated,
+                &queries,
+                SEED,
+                "e6.3-tight-segment-geometry-v1",
+                e55_config(),
+            )
+            .await;
+
+            for (
+                (baseline_id, baseline_quill, baseline_tantivy),
+                (geometry_id, geometry_quill, geometry_tantivy),
+            ) in baseline.iter().zip(&transformed)
+            {
+                assert_eq!(
+                    baseline_id, geometry_id,
+                    "E6.3 geometry case identity drifted"
+                );
+                for (engine, before, after) in [
+                    ("Quill", baseline_quill, geometry_quill),
+                    ("Tantivy", baseline_tantivy, geometry_tantivy),
+                ] {
+                    let comparison = compare_observations(
+                        before.clone(),
+                        after.clone(),
+                        ComparatorConfig::default(),
+                    )
+                    .unwrap_or_else(|error| {
+                        panic!("E6.3 {engine} {baseline_id} geometry comparison failed: {error}")
+                    });
+                    assert!(
+                        matches!(
+                            comparison.rank_class,
+                            RankClass::RankExact | RankClass::TieOrder
+                        ) && comparison
+                            .divergences
+                            .iter()
+                            .all(|divergence| divergence.class == DivergenceClass::TieOrder),
+                        "E6.3 {engine} {baseline_id} produced a non-tie divergence under tight segment geometry: {:?}",
+                        comparison.divergences,
+                    );
+                }
+            }
+
+            let baseline_sentinel = baseline
+                .iter()
+                .find(|(case_id, _, _)| case_id == "negative-sentinel")
+                .expect("E6.3 baseline geometry negative fixture");
+            let invalid_sentinel = invalid
+                .iter()
+                .find(|(case_id, _, _)| case_id == "negative-sentinel")
+                .expect("E6.3 invalid geometry negative fixture");
+            for (engine, before, after) in [
+                ("Quill", &baseline_sentinel.1, &invalid_sentinel.1),
+                ("Tantivy", &baseline_sentinel.2, &invalid_sentinel.2),
+            ] {
+                let comparison = compare_observations(
+                    before.clone(),
+                    after.clone(),
+                    ComparatorConfig::default(),
+                )
+                .unwrap_or_else(|error| {
+                    panic!("E6.3 {engine} invalid geometry comparison failed: {error}")
+                });
+                assert_eq!(
+                    comparison.status,
+                    ComparisonStatus::Failed,
+                    "E6.3 {engine} incorrectly accepted a content mutation as segment geometry",
+                );
+            }
+        });
+    }
+
+    /// E6.3 law: bulk publication cadence changes only the intermediate
+    /// manifest schedule. With the same stable-ID corpus and scalar contract,
+    /// it must not change the committed query observation. Both arms use bulk
+    /// mode and identical tight shard budgets so the only transformed setting
+    /// is the cadence. A content mutation remains the invalid control.
+    #[cfg(feature = "perf-harness")]
+    #[test]
+    fn e63_bulk_publish_cadence_preserves_observations_but_content_mutation_does_not() {
+        use frankensearch_core::IndexableDocument;
+
+        const SEED: u64 = 0xe63_b011_5eed_0001;
+        let documents = vec![
+            IndexableDocument::new("doc-1", "alpha beta beta").with_title("guide"),
+            IndexableDocument::new("doc-2", "alpha gamma").with_title("alpha overview"),
+            IndexableDocument::new("doc-3", "beta gamma gamma gamma").with_title("alpha"),
+            IndexableDocument::new("doc-4", "alpha beta gamma delta").with_title("reference"),
+            IndexableDocument::new("doc-5", "delta epsilon").with_title("quiet"),
+        ];
+        let queries = [
+            ("bare-term", "alpha"),
+            ("repeated-term", "beta"),
+            ("boolean-and", "alpha AND beta"),
+            ("negative-sentinel", "saffron"),
+        ];
+        let baseline_config = QuillConfig {
+            scribe_shard_budget_bytes: 1,
+            delta_budget_bytes: 1,
+            tier_fanout: 2,
+            bulk_load_mode: true,
+            bulk_publish_segment_cadence: 1,
+            ..e55_config()
+        };
+        let transformed_config = QuillConfig {
+            bulk_publish_segment_cadence: 3,
+            ..baseline_config.clone()
+        };
+        let mut content_mutated = documents.clone();
+        content_mutated[3] =
+            IndexableDocument::new("doc-4", "alpha beta saffron").with_title("reference");
+
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let baseline = e63_observations_with_config_and_batch_size(
+                &cx,
+                &documents,
+                &queries,
+                SEED,
+                "e6.3-bulk-publish-cadence-v1",
+                baseline_config,
+                1,
+            )
+            .await;
+            let transformed = e63_observations_with_config_and_batch_size(
+                &cx,
+                &documents,
+                &queries,
+                SEED,
+                "e6.3-bulk-publish-cadence-v1",
+                transformed_config,
+                1,
+            )
+            .await;
+            let invalid = e63_observations_with_config_and_batch_size(
+                &cx,
+                &content_mutated,
+                &queries,
+                SEED,
+                "e6.3-bulk-publish-cadence-v1",
+                QuillConfig {
+                    scribe_shard_budget_bytes: 1,
+                    delta_budget_bytes: 1,
+                    tier_fanout: 2,
+                    bulk_load_mode: true,
+                    bulk_publish_segment_cadence: 1,
+                    ..e55_config()
+                },
+                1,
+            )
+            .await;
+
+            for (
+                (baseline_id, baseline_quill, baseline_tantivy),
+                (transformed_id, transformed_quill, transformed_tantivy),
+            ) in baseline.iter().zip(&transformed)
+            {
+                assert_eq!(
+                    baseline_id, transformed_id,
+                    "E6.3 bulk cadence case identity drifted"
+                );
+                for (engine, before, after) in [
+                    ("Quill", baseline_quill, transformed_quill),
+                    ("Tantivy", baseline_tantivy, transformed_tantivy),
+                ] {
+                    let comparison = compare_observations(
+                        before.clone(),
+                        after.clone(),
+                        ComparatorConfig::default(),
+                    )
+                    .unwrap_or_else(|error| {
+                        panic!(
+                            "E6.3 {engine} {baseline_id} bulk cadence comparison failed: {error}"
+                        )
+                    });
+                    assert!(
+                        matches!(
+                            comparison.rank_class,
+                            RankClass::RankExact | RankClass::TieOrder
+                        ) && comparison
+                            .divergences
+                            .iter()
+                            .all(|divergence| divergence.class == DivergenceClass::TieOrder),
+                        "E6.3 {engine} {baseline_id} produced a non-tie divergence under bulk cadence: {:?}",
+                        comparison.divergences,
+                    );
+                }
+            }
+
+            let baseline_sentinel = baseline
+                .iter()
+                .find(|(case_id, _, _)| case_id == "negative-sentinel")
+                .expect("E6.3 baseline bulk cadence negative fixture");
+            let invalid_sentinel = invalid
+                .iter()
+                .find(|(case_id, _, _)| case_id == "negative-sentinel")
+                .expect("E6.3 invalid bulk cadence negative fixture");
+            for (engine, before, after) in [
+                ("Quill", &baseline_sentinel.1, &invalid_sentinel.1),
+                ("Tantivy", &baseline_sentinel.2, &invalid_sentinel.2),
+            ] {
+                let comparison = compare_observations(
+                    before.clone(),
+                    after.clone(),
+                    ComparatorConfig::default(),
+                )
+                .unwrap_or_else(|error| {
+                    panic!("E6.3 {engine} invalid bulk cadence comparison failed: {error}")
+                });
+                assert_eq!(
+                    comparison.status,
+                    ComparisonStatus::Failed,
+                    "E6.3 {engine} incorrectly accepted a content mutation as bulk cadence",
+                );
+            }
+        });
+    }
+
+    /// E6.3 seeded property campaign for the qualified flush-batch schedule
+    /// law. A tight segment geometry makes every batch boundary observable to
+    /// the writer lifecycle, while the final corpus, stable IDs, query policy,
+    /// and scalar scoring contract stay fixed. The batch schedule is generated
+    /// from a replayable seed rather than selected per fixture. A changed
+    /// document payload remains an intentionally invalid control for each arm.
+    #[cfg(feature = "perf-harness")]
+    #[test]
+    fn e63_flush_batch_seed_matrix_preserves_observations_but_content_mutation_does_not() {
+        use frankensearch_core::IndexableDocument;
+
+        const SEEDS: [u64; 3] = [
+            0xe63_f1a5_5eed_0001,
+            0xe63_f1a5_5eed_0002,
+            0xe63_f1a5_5eed_0003,
+        ];
+        let documents = vec![
+            IndexableDocument::new("doc-1", "alpha beta beta").with_title("guide"),
+            IndexableDocument::new("doc-2", "alpha gamma").with_title("alpha overview"),
+            IndexableDocument::new("doc-3", "beta gamma gamma gamma").with_title("alpha"),
+            IndexableDocument::new("doc-4", "alpha beta gamma delta").with_title("reference"),
+            IndexableDocument::new("doc-5", "delta epsilon").with_title("quiet"),
+        ];
+        let queries = [
+            ("bare-term", "alpha"),
+            ("boolean-and", "alpha AND beta"),
+            ("negative-sentinel", "saffron"),
+        ];
+        let tight_geometry = QuillConfig {
+            scribe_shard_budget_bytes: 1,
+            delta_budget_bytes: 1,
+            tier_fanout: 2,
+            ..e55_config()
+        };
+        let mut content_mutated = documents.clone();
+        content_mutated[3] =
+            IndexableDocument::new("doc-4", "alpha beta saffron").with_title("reference");
+
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            for seed in SEEDS {
+                let batch_size = e63_seeded_flush_batch_size(seed);
+                assert_ne!(
+                    batch_size,
+                    documents.len(),
+                    "E6.3 seed {seed:#x} must exercise a real flush-batch transform",
+                );
+                assert_eq!(
+                    batch_size,
+                    e63_seeded_flush_batch_size(seed),
+                    "E6.3 seed {seed:#x} must replay its batch schedule byte-identically",
+                );
+                let baseline = e63_observations_with_config_and_batch_size(
+                    &cx,
+                    &documents,
+                    &queries,
+                    seed,
+                    "e6.3-flush-batch-schedule-v1",
+                    tight_geometry.clone(),
+                    documents.len(),
+                )
+                .await;
+                let transformed = e63_observations_with_config_and_batch_size(
+                    &cx,
+                    &documents,
+                    &queries,
+                    seed,
+                    "e6.3-flush-batch-schedule-v1",
+                    tight_geometry.clone(),
+                    batch_size,
+                )
+                .await;
+                let invalid = e63_observations_with_config_and_batch_size(
+                    &cx,
+                    &content_mutated,
+                    &queries,
+                    seed,
+                    "e6.3-flush-batch-schedule-v1",
+                    tight_geometry.clone(),
+                    batch_size,
+                )
+                .await;
+
+                for (
+                    (baseline_id, baseline_quill, baseline_tantivy),
+                    (transformed_id, transformed_quill, transformed_tantivy),
+                ) in baseline.iter().zip(&transformed)
+                {
+                    assert_eq!(
+                        baseline_id, transformed_id,
+                        "E6.3 seed {seed:#x} flush-batch case identity drifted"
+                    );
+                    for (engine, before, after) in [
+                        ("Quill", baseline_quill, transformed_quill),
+                        ("Tantivy", baseline_tantivy, transformed_tantivy),
+                    ] {
+                        let comparison = compare_observations(
+                            before.clone(),
+                            after.clone(),
+                            ComparatorConfig::default(),
+                        )
+                        .unwrap_or_else(|error| {
+                            panic!(
+                                "E6.3 {engine} seed {seed:#x} {baseline_id} flush-batch comparison failed: {error}"
+                            )
+                        });
+                        assert!(
+                            matches!(
+                                comparison.rank_class,
+                                RankClass::RankExact | RankClass::TieOrder
+                            ) && comparison
+                                .divergences
+                                .iter()
+                                .all(|divergence| divergence.class == DivergenceClass::TieOrder),
+                            "E6.3 {engine} seed {seed:#x} {baseline_id} produced a non-tie divergence under flush batching: {:?}",
+                            comparison.divergences,
+                        );
+                    }
+                }
+
+                let baseline_sentinel = baseline
+                    .iter()
+                    .find(|(case_id, _, _)| case_id == "negative-sentinel")
+                    .expect("E6.3 baseline flush-batch negative fixture");
+                let invalid_sentinel = invalid
+                    .iter()
+                    .find(|(case_id, _, _)| case_id == "negative-sentinel")
+                    .expect("E6.3 invalid flush-batch negative fixture");
+                for (engine, before, after) in [
+                    ("Quill", &baseline_sentinel.1, &invalid_sentinel.1),
+                    ("Tantivy", &baseline_sentinel.2, &invalid_sentinel.2),
+                ] {
+                    let comparison = compare_observations(
+                        before.clone(),
+                        after.clone(),
+                        ComparatorConfig::default(),
+                    )
+                    .unwrap_or_else(|error| {
+                        panic!(
+                            "E6.3 {engine} seed {seed:#x} invalid flush-batch comparison failed: {error}"
+                        )
+                    });
+                    assert_eq!(
+                        comparison.status,
+                        ComparisonStatus::Failed,
+                        "E6.3 {engine} seed {seed:#x} incorrectly accepted a content mutation as flush batching",
+                    );
+                }
+            }
+        });
+    }
+
     /// E6.3 law: the declared scalar G1A analyzer makes free-text case and
     /// surrounding ASCII whitespace non-observable. The projection is the
     /// normal cross-engine differential observation, and this intentionally
@@ -6269,6 +6905,844 @@ mod tests {
                     "E6.3 {engine} incorrectly accepted a changed analyzed term as normalization",
                 );
             }
+        });
+    }
+
+    /// E6.3 seeded property campaign for analyzer-declared ASCII free-text
+    /// normalization. The generator chooses one bounded whitespace/case form
+    /// per seed and every form must replay through the normal live
+    /// cross-engine observation. The paired single-fixture law keeps the
+    /// intentionally invalid analyzed-term mutation.
+    #[cfg(feature = "perf-harness")]
+    #[test]
+    fn e63_query_normalization_seed_matrix_replays_live_observations() {
+        use frankensearch_core::IndexableDocument;
+
+        const SEEDS: [u64; 3] = [
+            0xe63_c453_0001_5eed,
+            0xe63_c453_0001_5eee,
+            0xe63_c453_0001_5eef,
+        ];
+        let documents = vec![
+            IndexableDocument::new("doc-1", "alpha beta beta").with_title("guide"),
+            IndexableDocument::new("doc-2", "alpha gamma").with_title("alpha overview"),
+            IndexableDocument::new("doc-3", "beta gamma gamma gamma").with_title("alpha"),
+            IndexableDocument::new("doc-4", "alpha beta gamma delta").with_title("reference"),
+            IndexableDocument::new("doc-5", "delta epsilon").with_title("quiet"),
+        ];
+
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            for (term, seed) in [("alpha", SEEDS[0]), ("beta", SEEDS[1]), ("gamma", SEEDS[2])] {
+                let normalized = e63_seeded_ascii_query_normalization(term, seed);
+                assert_ne!(
+                    normalized, term,
+                    "E6.3 seed {seed:#x} must transform its query"
+                );
+                assert_eq!(
+                    normalized,
+                    e63_seeded_ascii_query_normalization(term, seed),
+                    "E6.3 seed {seed:#x} must replay byte-identically",
+                );
+                let canonical_cases = [("free-text", term)];
+                let normalized_cases = [("free-text", normalized.as_str())];
+                let baseline = e63_observations(
+                    &cx,
+                    &documents,
+                    &canonical_cases,
+                    seed,
+                    "e6.3-query-normalization-v1",
+                )
+                .await;
+                let transformed = e63_observations(
+                    &cx,
+                    &documents,
+                    &normalized_cases,
+                    seed,
+                    "e6.3-query-normalization-v1",
+                )
+                .await;
+                let baseline_case = baseline
+                    .first()
+                    .expect("E6.3 baseline normalization fixture");
+                let transformed_case = transformed
+                    .first()
+                    .expect("E6.3 transformed normalization fixture");
+                for (engine, before, after) in [
+                    ("Quill", &baseline_case.1, &transformed_case.1),
+                    ("Tantivy", &baseline_case.2, &transformed_case.2),
+                ] {
+                    let comparison = compare_observations(
+                        before.clone(),
+                        after.clone(),
+                        ComparatorConfig::default(),
+                    )
+                    .unwrap_or_else(|error| {
+                        panic!(
+                            "E6.3 {engine} seed {seed:#x} normalization comparison failed: {error}"
+                        )
+                    });
+                    assert!(
+                        matches!(
+                            comparison.rank_class,
+                            RankClass::RankExact | RankClass::TieOrder
+                        ) && comparison
+                            .divergences
+                            .iter()
+                            .all(|divergence| divergence.class == DivergenceClass::TieOrder),
+                        "E6.3 {engine} seed {seed:#x} produced a non-tie normalization divergence: {:?}",
+                        comparison.divergences,
+                    );
+                }
+            }
+        });
+    }
+
+    /// E6.3 law: the two distinct, unboosted positive operands of one scalar
+    /// `AND` are commutative. This deliberately excludes three-or-more clause
+    /// association, boosts, and mixed Boolean occurrences because their score
+    /// accumulation or parser shape is observable. The normal differential
+    /// observation is the projection; changing the operator to `OR` is the
+    /// intentionally invalid counterexample.
+    #[cfg(feature = "perf-harness")]
+    #[test]
+    fn e63_two_term_and_commutes_but_or_is_not_equivalent() {
+        use frankensearch_core::IndexableDocument;
+
+        const SEED: u64 = 0xe63_a11d_c0aa_5eed;
+        let documents = vec![
+            IndexableDocument::new("doc-1", "alpha beta beta").with_title("guide"),
+            IndexableDocument::new("doc-2", "alpha gamma").with_title("alpha overview"),
+            IndexableDocument::new("doc-3", "beta gamma gamma gamma").with_title("alpha"),
+            IndexableDocument::new("doc-4", "alpha beta gamma delta").with_title("reference"),
+            IndexableDocument::new("doc-5", "delta epsilon").with_title("quiet"),
+        ];
+        let canonical = [("two-term-and", "alpha AND beta")];
+        let commuted = [("two-term-and", "beta AND alpha")];
+        let operator_mutated = [("two-term-and", "alpha OR beta")];
+
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let baseline = e63_observations(
+                &cx,
+                &documents,
+                &canonical,
+                SEED,
+                "e6.3-two-term-and-commutativity-v1",
+            )
+            .await;
+            let transformed = e63_observations(
+                &cx,
+                &documents,
+                &commuted,
+                SEED,
+                "e6.3-two-term-and-commutativity-v1",
+            )
+            .await;
+            let invalid = e63_observations(
+                &cx,
+                &documents,
+                &operator_mutated,
+                SEED,
+                "e6.3-two-term-and-commutativity-v1",
+            )
+            .await;
+
+            let baseline_case = baseline.first().expect("E6.3 baseline AND fixture");
+            let commuted_case = transformed.first().expect("E6.3 commuted AND fixture");
+            assert_eq!(
+                baseline_case.0, commuted_case.0,
+                "E6.3 two-term AND case identity drifted"
+            );
+            for (engine, before, after) in [
+                ("Quill", &baseline_case.1, &commuted_case.1),
+                ("Tantivy", &baseline_case.2, &commuted_case.2),
+            ] {
+                let comparison = compare_observations(
+                    before.clone(),
+                    after.clone(),
+                    ComparatorConfig::default(),
+                )
+                .unwrap_or_else(|error| {
+                    panic!("E6.3 {engine} two-term AND comparison failed: {error}")
+                });
+                assert!(
+                    matches!(
+                        comparison.rank_class,
+                        RankClass::RankExact | RankClass::TieOrder
+                    ) && comparison
+                        .divergences
+                        .iter()
+                        .all(|divergence| divergence.class == DivergenceClass::TieOrder),
+                    "E6.3 {engine} produced a non-tie divergence under two-term AND commutation: {:?}",
+                    comparison.divergences,
+                );
+            }
+
+            let invalid_case = invalid.first().expect("E6.3 invalid OR fixture");
+            for (engine, before, after) in [
+                ("Quill", &baseline_case.1, &invalid_case.1),
+                ("Tantivy", &baseline_case.2, &invalid_case.2),
+            ] {
+                let comparison = compare_observations(
+                    before.clone(),
+                    after.clone(),
+                    ComparatorConfig::default(),
+                )
+                .unwrap_or_else(|error| {
+                    panic!("E6.3 {engine} invalid AND-to-OR comparison failed: {error}")
+                });
+                assert_eq!(
+                    comparison.status,
+                    ComparisonStatus::Failed,
+                    "E6.3 {engine} incorrectly accepted an AND-to-OR mutation as commutation",
+                );
+            }
+        });
+    }
+
+    /// E6.3 bounded replay campaign for the qualified two-distinct-term,
+    /// unboosted positive `AND` commutativity law. The paired one-fixture law
+    /// keeps the intentionally invalid `OR` operator mutation.
+    #[cfg(feature = "perf-harness")]
+    #[test]
+    fn e63_two_term_and_seed_matrix_replays_live_observations() {
+        use frankensearch_core::IndexableDocument;
+
+        const SEEDS: [u64; 3] = [
+            0xe63_a11d_c0aa_5eed,
+            0xe63_a11d_c0aa_5eee,
+            0xe63_a11d_c0aa_5eef,
+        ];
+        let documents = vec![
+            IndexableDocument::new("doc-1", "alpha beta beta").with_title("guide"),
+            IndexableDocument::new("doc-2", "alpha gamma").with_title("alpha overview"),
+            IndexableDocument::new("doc-3", "beta gamma gamma gamma").with_title("alpha"),
+            IndexableDocument::new("doc-4", "alpha beta gamma delta").with_title("reference"),
+            IndexableDocument::new("doc-5", "delta epsilon").with_title("quiet"),
+        ];
+
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            for ((left, right), seed) in [
+                (("alpha", "beta"), SEEDS[0]),
+                (("alpha", "gamma"), SEEDS[1]),
+                (("beta", "gamma"), SEEDS[2]),
+            ] {
+                let canonical = format!("{left} AND {right}");
+                let commuted = format!("{right} AND {left}");
+                assert_ne!(
+                    canonical, commuted,
+                    "E6.3 seed {seed:#x} must exercise a real operand-order transform"
+                );
+                assert_eq!(
+                    commuted,
+                    format!("{right} AND {left}"),
+                    "E6.3 seed {seed:#x} must replay its operand-order transform byte-identically",
+                );
+                let canonical_cases = [("two-term-and", canonical.as_str())];
+                let commuted_cases = [("two-term-and", commuted.as_str())];
+                let baseline = e63_observations(
+                    &cx,
+                    &documents,
+                    &canonical_cases,
+                    seed,
+                    "e6.3-two-term-and-commutativity-v1",
+                )
+                .await;
+                let transformed = e63_observations(
+                    &cx,
+                    &documents,
+                    &commuted_cases,
+                    seed,
+                    "e6.3-two-term-and-commutativity-v1",
+                )
+                .await;
+                let baseline_case = baseline.first().expect("E6.3 seed baseline AND fixture");
+                let commuted_case = transformed.first().expect("E6.3 seed commuted AND fixture");
+                assert_eq!(
+                    baseline_case.0, commuted_case.0,
+                    "E6.3 seed {seed:#x} AND case identity drifted"
+                );
+                for (engine, before, after) in [
+                    ("Quill", &baseline_case.1, &commuted_case.1),
+                    ("Tantivy", &baseline_case.2, &commuted_case.2),
+                ] {
+                    let comparison = compare_observations(
+                        before.clone(),
+                        after.clone(),
+                        ComparatorConfig::default(),
+                    )
+                    .unwrap_or_else(|error| {
+                        panic!("E6.3 {engine} seed {seed:#x} AND comparison failed: {error}")
+                    });
+                    assert!(
+                        matches!(
+                            comparison.rank_class,
+                            RankClass::RankExact | RankClass::TieOrder
+                        ) && comparison
+                            .divergences
+                            .iter()
+                            .all(|divergence| divergence.class == DivergenceClass::TieOrder),
+                        "E6.3 {engine} seed {seed:#x} produced a non-tie AND commutation divergence: {:?}",
+                        comparison.divergences,
+                    );
+                }
+            }
+        });
+    }
+
+    /// E6.3 law: the two distinct, unboosted optional operands of one scalar
+    /// `OR` are commutative. As with the `AND` law, this excludes association,
+    /// boosts, and mixed occurrences because those shapes can expose parser or
+    /// score-accumulation behavior. Changing the operator to `AND` is the
+    /// intentionally invalid counterexample.
+    #[cfg(feature = "perf-harness")]
+    #[test]
+    fn e63_two_term_or_commutes_but_and_is_not_equivalent() {
+        use frankensearch_core::IndexableDocument;
+
+        const SEED: u64 = 0xe63_0f00_c0aa_5eed;
+        let documents = vec![
+            IndexableDocument::new("doc-1", "alpha beta beta").with_title("guide"),
+            IndexableDocument::new("doc-2", "alpha gamma").with_title("alpha overview"),
+            IndexableDocument::new("doc-3", "beta gamma gamma gamma").with_title("alpha"),
+            IndexableDocument::new("doc-4", "alpha beta gamma delta").with_title("reference"),
+            IndexableDocument::new("doc-5", "delta epsilon").with_title("quiet"),
+        ];
+        let canonical = [("two-term-or", "alpha OR beta")];
+        let commuted = [("two-term-or", "beta OR alpha")];
+        let operator_mutated = [("two-term-or", "alpha AND beta")];
+
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let baseline = e63_observations(
+                &cx,
+                &documents,
+                &canonical,
+                SEED,
+                "e6.3-two-term-or-commutativity-v1",
+            )
+            .await;
+            let transformed = e63_observations(
+                &cx,
+                &documents,
+                &commuted,
+                SEED,
+                "e6.3-two-term-or-commutativity-v1",
+            )
+            .await;
+            let invalid = e63_observations(
+                &cx,
+                &documents,
+                &operator_mutated,
+                SEED,
+                "e6.3-two-term-or-commutativity-v1",
+            )
+            .await;
+
+            let baseline_case = baseline.first().expect("E6.3 baseline OR fixture");
+            let commuted_case = transformed.first().expect("E6.3 commuted OR fixture");
+            assert_eq!(
+                baseline_case.0, commuted_case.0,
+                "E6.3 two-term OR case identity drifted"
+            );
+            for (engine, before, after) in [
+                ("Quill", &baseline_case.1, &commuted_case.1),
+                ("Tantivy", &baseline_case.2, &commuted_case.2),
+            ] {
+                let comparison = compare_observations(
+                    before.clone(),
+                    after.clone(),
+                    ComparatorConfig::default(),
+                )
+                .unwrap_or_else(|error| {
+                    panic!("E6.3 {engine} two-term OR comparison failed: {error}")
+                });
+                assert!(
+                    matches!(
+                        comparison.rank_class,
+                        RankClass::RankExact | RankClass::TieOrder
+                    ) && comparison
+                        .divergences
+                        .iter()
+                        .all(|divergence| divergence.class == DivergenceClass::TieOrder),
+                    "E6.3 {engine} produced a non-tie divergence under two-term OR commutation: {:?}",
+                    comparison.divergences,
+                );
+            }
+
+            let invalid_case = invalid.first().expect("E6.3 invalid AND fixture");
+            for (engine, before, after) in [
+                ("Quill", &baseline_case.1, &invalid_case.1),
+                ("Tantivy", &baseline_case.2, &invalid_case.2),
+            ] {
+                let comparison = compare_observations(
+                    before.clone(),
+                    after.clone(),
+                    ComparatorConfig::default(),
+                )
+                .unwrap_or_else(|error| {
+                    panic!("E6.3 {engine} invalid OR-to-AND comparison failed: {error}")
+                });
+                assert_eq!(
+                    comparison.status,
+                    ComparisonStatus::Failed,
+                    "E6.3 {engine} incorrectly accepted an OR-to-AND mutation as commutation",
+                );
+            }
+        });
+    }
+
+    /// E6.3 bounded replay campaign for the qualified two-distinct-term,
+    /// unboosted optional `OR` commutativity law. The paired one-fixture law
+    /// keeps the intentionally invalid `AND` operator mutation.
+    #[cfg(feature = "perf-harness")]
+    #[test]
+    fn e63_two_term_or_seed_matrix_replays_live_observations() {
+        use frankensearch_core::IndexableDocument;
+
+        const SEEDS: [u64; 3] = [
+            0xe63_0f00_c0aa_5eed,
+            0xe63_0f00_c0aa_5eee,
+            0xe63_0f00_c0aa_5eef,
+        ];
+        let documents = vec![
+            IndexableDocument::new("doc-1", "alpha beta beta").with_title("guide"),
+            IndexableDocument::new("doc-2", "alpha gamma").with_title("alpha overview"),
+            IndexableDocument::new("doc-3", "beta gamma gamma gamma").with_title("alpha"),
+            IndexableDocument::new("doc-4", "alpha beta gamma delta").with_title("reference"),
+            IndexableDocument::new("doc-5", "delta epsilon").with_title("quiet"),
+        ];
+
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            for ((left, right), seed) in [
+                (("alpha", "beta"), SEEDS[0]),
+                (("alpha", "gamma"), SEEDS[1]),
+                (("beta", "gamma"), SEEDS[2]),
+            ] {
+                let canonical = format!("{left} OR {right}");
+                let commuted = format!("{right} OR {left}");
+                assert_ne!(
+                    canonical, commuted,
+                    "E6.3 seed {seed:#x} must exercise a real operand-order transform"
+                );
+                assert_eq!(
+                    commuted,
+                    format!("{right} OR {left}"),
+                    "E6.3 seed {seed:#x} must replay its operand-order transform byte-identically",
+                );
+                let canonical_cases = [("two-term-or", canonical.as_str())];
+                let commuted_cases = [("two-term-or", commuted.as_str())];
+                let baseline = e63_observations(
+                    &cx,
+                    &documents,
+                    &canonical_cases,
+                    seed,
+                    "e6.3-two-term-or-commutativity-v1",
+                )
+                .await;
+                let transformed = e63_observations(
+                    &cx,
+                    &documents,
+                    &commuted_cases,
+                    seed,
+                    "e6.3-two-term-or-commutativity-v1",
+                )
+                .await;
+                let baseline_case = baseline.first().expect("E6.3 seed baseline OR fixture");
+                let commuted_case = transformed.first().expect("E6.3 seed commuted OR fixture");
+                assert_eq!(
+                    baseline_case.0, commuted_case.0,
+                    "E6.3 seed {seed:#x} OR case identity drifted"
+                );
+                for (engine, before, after) in [
+                    ("Quill", &baseline_case.1, &commuted_case.1),
+                    ("Tantivy", &baseline_case.2, &commuted_case.2),
+                ] {
+                    let comparison = compare_observations(
+                        before.clone(),
+                        after.clone(),
+                        ComparatorConfig::default(),
+                    )
+                    .unwrap_or_else(|error| {
+                        panic!("E6.3 {engine} seed {seed:#x} OR comparison failed: {error}")
+                    });
+                    assert!(
+                        matches!(
+                            comparison.rank_class,
+                            RankClass::RankExact | RankClass::TieOrder
+                        ) && comparison
+                            .divergences
+                            .iter()
+                            .all(|divergence| divergence.class == DivergenceClass::TieOrder),
+                        "E6.3 {engine} seed {seed:#x} produced a non-tie OR commutation divergence: {:?}",
+                        comparison.divergences,
+                    );
+                }
+            }
+        });
+    }
+
+    /// E6.3 law: on the position-capable scalar fixture, a quoted single term
+    /// reduces to the same term query. This does not assert phrase equivalence
+    /// generally: the multi-term phrase is the intentionally invalid control,
+    /// because it reads adjacency positions and narrows the matching corpus.
+    #[cfg(feature = "perf-harness")]
+    #[test]
+    fn e63_single_term_quote_matches_bare_term_but_multi_term_phrase_does_not() {
+        use frankensearch_core::IndexableDocument;
+
+        const SEED: u64 = 0xe63_907e_5eed_0001;
+        let documents = vec![
+            IndexableDocument::new("doc-1", "alpha beta beta").with_title("guide"),
+            IndexableDocument::new("doc-2", "alpha gamma").with_title("alpha overview"),
+            IndexableDocument::new("doc-3", "beta gamma gamma gamma").with_title("alpha"),
+            IndexableDocument::new("doc-4", "alpha beta gamma delta").with_title("reference"),
+            IndexableDocument::new("doc-5", "delta epsilon").with_title("quiet"),
+        ];
+        let bare_term = [("single-term-phrase", "alpha")];
+        let quoted_term = [("single-term-phrase", "\"alpha\"")];
+        let multi_term_phrase = [("single-term-phrase", "\"alpha beta\"")];
+
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let baseline = e63_observations(
+                &cx,
+                &documents,
+                &bare_term,
+                SEED,
+                "e6.3-single-term-quote-v1",
+            )
+            .await;
+            let transformed = e63_observations(
+                &cx,
+                &documents,
+                &quoted_term,
+                SEED,
+                "e6.3-single-term-quote-v1",
+            )
+            .await;
+            let invalid = e63_observations(
+                &cx,
+                &documents,
+                &multi_term_phrase,
+                SEED,
+                "e6.3-single-term-quote-v1",
+            )
+            .await;
+
+            let baseline_case = baseline.first().expect("E6.3 bare-term fixture");
+            let quoted_case = transformed.first().expect("E6.3 quoted-term fixture");
+            assert_eq!(
+                baseline_case.0, quoted_case.0,
+                "E6.3 single-term quote case identity drifted"
+            );
+            for (engine, before, after) in [
+                ("Quill", &baseline_case.1, &quoted_case.1),
+                ("Tantivy", &baseline_case.2, &quoted_case.2),
+            ] {
+                let comparison = compare_observations(
+                    before.clone(),
+                    after.clone(),
+                    ComparatorConfig::default(),
+                )
+                .unwrap_or_else(|error| {
+                    panic!("E6.3 {engine} single-term quote comparison failed: {error}")
+                });
+                assert!(
+                    matches!(
+                        comparison.rank_class,
+                        RankClass::RankExact | RankClass::TieOrder
+                    ) && comparison
+                        .divergences
+                        .iter()
+                        .all(|divergence| divergence.class == DivergenceClass::TieOrder),
+                    "E6.3 {engine} produced a non-tie divergence under single-term quote equivalence: {:?}",
+                    comparison.divergences,
+                );
+            }
+
+            let invalid_case = invalid.first().expect("E6.3 multi-term phrase fixture");
+            for (engine, before, after) in [
+                ("Quill", &baseline_case.1, &invalid_case.1),
+                ("Tantivy", &baseline_case.2, &invalid_case.2),
+            ] {
+                let comparison = compare_observations(
+                    before.clone(),
+                    after.clone(),
+                    ComparatorConfig::default(),
+                )
+                .unwrap_or_else(|error| {
+                    panic!("E6.3 {engine} invalid phrase comparison failed: {error}")
+                });
+                assert_eq!(
+                    comparison.status,
+                    ComparisonStatus::Failed,
+                    "E6.3 {engine} incorrectly accepted a multi-term phrase as bare-term equivalence",
+                );
+            }
+        });
+    }
+
+    /// E6.3 bounded replay campaign for the qualified position-capable
+    /// single-term quote law. Each deterministic seed selects one scalar term
+    /// and must preserve the full live observation; the paired one-fixture law
+    /// above retains the intentionally invalid multi-term phrase control.
+    #[cfg(feature = "perf-harness")]
+    #[test]
+    fn e63_single_term_quote_seed_matrix_replays_live_observations() {
+        use frankensearch_core::IndexableDocument;
+
+        const SEEDS: [u64; 3] = [
+            0xe63_907e_5eed_0001,
+            0xe63_907e_5eed_0002,
+            0xe63_907e_5eed_0003,
+        ];
+        let documents = vec![
+            IndexableDocument::new("doc-1", "alpha beta beta").with_title("guide"),
+            IndexableDocument::new("doc-2", "alpha gamma").with_title("alpha overview"),
+            IndexableDocument::new("doc-3", "beta gamma gamma gamma").with_title("alpha"),
+            IndexableDocument::new("doc-4", "alpha beta gamma delta").with_title("reference"),
+            IndexableDocument::new("doc-5", "delta epsilon").with_title("quiet"),
+        ];
+
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            for (term, seed) in [("alpha", SEEDS[0]), ("beta", SEEDS[1]), ("gamma", SEEDS[2])] {
+                let quoted = format!("\"{term}\"");
+                assert_eq!(
+                    quoted,
+                    format!("\"{term}\""),
+                    "E6.3 seed {seed:#x} must replay its quote transform byte-identically",
+                );
+                let bare_cases = [("single-term-quote", term)];
+                let quoted_cases = [("single-term-quote", quoted.as_str())];
+                let baseline = e63_observations(
+                    &cx,
+                    &documents,
+                    &bare_cases,
+                    seed,
+                    "e6.3-single-term-quote-v1",
+                )
+                .await;
+                let transformed = e63_observations(
+                    &cx,
+                    &documents,
+                    &quoted_cases,
+                    seed,
+                    "e6.3-single-term-quote-v1",
+                )
+                .await;
+                let baseline_case = baseline.first().expect("E6.3 seed baseline quote fixture");
+                let quoted_case = transformed.first().expect("E6.3 seed quoted quote fixture");
+                assert_eq!(
+                    baseline_case.0, quoted_case.0,
+                    "E6.3 seed {seed:#x} quote case identity drifted"
+                );
+                for (engine, before, after) in [
+                    ("Quill", &baseline_case.1, &quoted_case.1),
+                    ("Tantivy", &baseline_case.2, &quoted_case.2),
+                ] {
+                    let comparison = compare_observations(
+                        before.clone(),
+                        after.clone(),
+                        ComparatorConfig::default(),
+                    )
+                    .unwrap_or_else(|error| {
+                        panic!("E6.3 {engine} seed {seed:#x} quote comparison failed: {error}")
+                    });
+                    assert!(
+                        matches!(
+                            comparison.rank_class,
+                            RankClass::RankExact | RankClass::TieOrder
+                        ) && comparison
+                            .divergences
+                            .iter()
+                            .all(|divergence| divergence.class == DivergenceClass::TieOrder),
+                        "E6.3 {engine} seed {seed:#x} produced a non-tie single-term quote divergence: {:?}",
+                        comparison.divergences,
+                    );
+                }
+            }
+        });
+    }
+
+    /// E6.3 capability law: a positionless schema still serves a single-term
+    /// quote because it reduces to a term query, while a multi-term phrase
+    /// must fail at the typed position-capability boundary. This is not a
+    /// cross-engine equivalence claim: the expected Quill refusal is itself
+    /// the observable, with its schema, field, operator, and capability named.
+    #[cfg(feature = "perf-harness")]
+    #[test]
+    fn e63_positionless_multi_term_phrase_is_typed_error_but_single_term_quote_is_servable() {
+        use frankensearch_core::IndexableDocument;
+        use frankensearch_quill::index::QuillIndexError;
+        use frankensearch_quill::query::{IndexCapability, QueryCapabilityError, QueryExplanation};
+
+        const SEED: u64 = 0xe63_b051_5eed_0001;
+        let documents = vec![
+            IndexableDocument::new("doc-1", "alpha beta beta").with_title("guide"),
+            IndexableDocument::new("doc-2", "alpha gamma").with_title("alpha overview"),
+        ];
+        let mut single_term =
+            DifferentialCase::new("e63-positionless-single-term", "\"alpha\"", 16);
+        single_term.snippet_max_chars = None;
+        single_term.tie_expansion_limit = 64;
+        single_term.metadata.generator_id = Some("e6.3-positionless-capability-v1".to_owned());
+        single_term.metadata.generator_seed = Some(SEED);
+        let mut multi_term =
+            DifferentialCase::new("e63-positionless-multi-term", "\"alpha beta\"", 16);
+        multi_term.snippet_max_chars = None;
+        multi_term.tie_expansion_limit = 64;
+        multi_term.metadata.generator_id = Some("e6.3-positionless-capability-v1".to_owned());
+        multi_term.metadata.generator_seed = Some(SEED);
+
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let mut subject = qg_position_mode_subject(false);
+            subject
+                .claim_fresh_campaign()
+                .expect("E6.3 claim positionless Quill campaign");
+            subject
+                .index_mut()
+                .expect("E6.3 open positionless Quill campaign")
+                .index_documents(&cx, &documents)
+                .await
+                .expect("E6.3 index positionless Quill fixture");
+            subject
+                .index_mut()
+                .expect("E6.3 open positionless Quill campaign")
+                .commit(&cx)
+                .await
+                .expect("E6.3 commit positionless Quill fixture");
+            subject
+                .mark_committed()
+                .expect("E6.3 publish positionless Quill campaign");
+
+            let single_observation = subject
+                .observe(&cx, &single_term)
+                .await
+                .expect("E6.3 single-term quote must remain servable without positions");
+            assert!(
+                !single_observation.hits.is_empty(),
+                "E6.3 positive positionless fixture"
+            );
+
+            let error = subject
+                .observe(&cx, &multi_term)
+                .await
+                .expect_err("E6.3 multi-term phrase must require positions");
+            assert!(matches!(
+                error,
+                GauntletError::Quill(QuillIndexError::QueryCapability(
+                    QueryCapabilityError::PositionsRequired {
+                        schema: "frankensearch-default-no-positions-v1",
+                        ref field,
+                        operator: QueryExplanation::Phrase,
+                        capability: IndexCapability::Positions,
+                    }
+                )) if field == "content"
+            ));
+        });
+    }
+
+    /// E6.3 lifecycle law: the scalar campaign deliberately rejects a second
+    /// live external ID instead of silently adopting the lexical upsert
+    /// contract. The rejection must leave the already-published original as
+    /// the only observable row; accepting the replacement or partially
+    /// mutating the snapshot is an invalid lifecycle transition.
+    #[cfg(feature = "perf-harness")]
+    #[test]
+    fn e63_duplicate_live_id_is_typed_rejection_and_preserves_published_original() {
+        use frankensearch_core::IndexableDocument;
+        use frankensearch_quill::index::QuillIndexError;
+
+        const SEED: u64 = 0xe63_d0e5_5eed_0001;
+        let original = IndexableDocument::new("duplicate-id", "alpha original");
+        let replacement = IndexableDocument::new("duplicate-id", "beta replacement");
+        let mut original_case = DifferentialCase::new("e63-duplicate-original", "alpha", 16);
+        original_case.snippet_max_chars = None;
+        original_case.tie_expansion_limit = 64;
+        original_case.metadata.generator_id = Some("e6.3-duplicate-id-reject-v1".to_owned());
+        original_case.metadata.generator_seed = Some(SEED);
+        let mut replacement_case = DifferentialCase::new("e63-duplicate-replacement", "beta", 16);
+        replacement_case.snippet_max_chars = None;
+        replacement_case.tie_expansion_limit = 64;
+        replacement_case.metadata.generator_id = Some("e6.3-duplicate-id-reject-v1".to_owned());
+        replacement_case.metadata.generator_seed = Some(SEED);
+
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let mut in_batch_subject = qg_position_mode_subject(true);
+            in_batch_subject
+                .claim_fresh_campaign()
+                .expect("E6.3 claim in-batch duplicate-ID Quill campaign");
+            let in_batch_error = in_batch_subject
+                .index_mut()
+                .expect("E6.3 open in-batch duplicate-ID Quill campaign")
+                .index_documents(&cx, &[original.clone(), replacement.clone()])
+                .await
+                .expect_err("E6.3 duplicate IDs in one batch must be rejected atomically");
+            assert!(matches!(
+                in_batch_error,
+                QuillIndexError::InvalidState { ref detail }
+                    if detail.contains("duplicate live document id")
+            ));
+            in_batch_subject
+                .mark_committed()
+                .expect("E6.3 publish empty rejected in-batch duplicate-ID campaign");
+            let in_batch_observation = in_batch_subject
+                .observe(&cx, &original_case)
+                .await
+                .expect("E6.3 observe atomic in-batch rejection");
+            assert_eq!(in_batch_observation.doc_count, 0);
+            assert!(
+                in_batch_observation.hits.is_empty(),
+                "E6.3 in-batch duplicate rejection must not partially admit the original"
+            );
+
+            let mut subject = qg_position_mode_subject(true);
+            subject
+                .claim_fresh_campaign()
+                .expect("E6.3 claim duplicate-ID Quill campaign");
+            subject
+                .index_mut()
+                .expect("E6.3 open duplicate-ID Quill campaign")
+                .index_documents(&cx, std::slice::from_ref(&original))
+                .await
+                .expect("E6.3 index original duplicate-ID fixture");
+            subject
+                .index_mut()
+                .expect("E6.3 open duplicate-ID Quill campaign")
+                .commit(&cx)
+                .await
+                .expect("E6.3 publish original duplicate-ID fixture");
+
+            let error = subject
+                .index_mut()
+                .expect("E6.3 reopen duplicate-ID Quill campaign")
+                .index_documents(&cx, std::slice::from_ref(&replacement))
+                .await
+                .expect_err("E6.3 duplicate live ID must be rejected");
+            assert!(matches!(
+                error,
+                QuillIndexError::InvalidState { ref detail }
+                    if detail.contains("duplicate live document id")
+            ));
+
+            subject
+                .mark_committed()
+                .expect("E6.3 preserve original duplicate-ID publication");
+            let original_observation = subject
+                .observe(&cx, &original_case)
+                .await
+                .expect("E6.3 original remains observable after rejection");
+            assert_eq!(original_observation.doc_count, 1);
+            assert_eq!(original_observation.hits.len(), 1);
+            assert_eq!(original_observation.hits[0].doc_id, "duplicate-id");
+
+            let replacement_observation = subject
+                .observe(&cx, &replacement_case)
+                .await
+                .expect("E6.3 rejected replacement query remains observable");
+            assert_eq!(replacement_observation.doc_count, 1);
+            assert!(
+                replacement_observation.hits.is_empty(),
+                "E6.3 rejected duplicate must not partially publish replacement content"
+            );
         });
     }
 

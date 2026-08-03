@@ -113,9 +113,11 @@ fn run() -> Result<FinalizeOutcome, Box<dyn Error>> {
         Ok(output) => output,
         Err(LocalPerfRunError::AttemptFailed {
             receipt_path,
+            lease_release_receipt,
             outcome,
         }) => {
             println!("attempt_receipt={}", receipt_path.display());
+            println!("lease_release_receipt={}", lease_release_receipt.display());
             println!("attempt_outcome={outcome:?}");
             return Ok(FinalizeOutcome::DurableNoClaim);
         }
@@ -126,6 +128,10 @@ fn run() -> Result<FinalizeOutcome, Box<dyn Error>> {
     println!("environment_policy={}", output.environment_policy.display());
     println!("runner_receipt={}", output.runner_receipt.display());
     println!("attempt_receipt={}", output.attempt_receipt.display());
+    println!(
+        "lease_release_receipt={}",
+        output.lease_release_receipt.display()
+    );
     println!("threshold_artifact={}", output.threshold_artifact.display());
     println!(
         "prebinding_evidence={}",
@@ -787,6 +793,37 @@ mod tests {
         assert!(full > config);
         assert!(!run_body.contains("sha256"));
         assert!(!run_body.contains("open_executing_image"));
+    }
+
+    #[test]
+    fn terminal_attempt_outcomes_report_the_bound_release_receipt_before_returning() {
+        let source = production_source();
+        let run_body = source
+            .split("fn run() -> Result<FinalizeOutcome, Box<dyn Error>>")
+            .nth(1)
+            .and_then(|suffix| suffix.split("fn parse_assembly_args").next())
+            .expect("production run body");
+        let failed_attempt = unique_marker_offset(
+            run_body,
+            "Err(LocalPerfRunError::AttemptFailed {\n            receipt_path,\n            lease_release_receipt,",
+        );
+        let failed_release = unique_marker_offset(
+            run_body,
+            "println!(\"lease_release_receipt={}\", lease_release_receipt.display());",
+        );
+        let durable_no_claim =
+            unique_marker_offset(run_body, "return Ok(FinalizeOutcome::DurableNoClaim);");
+        let successful_attempt = unique_marker_offset(
+            run_body,
+            "println!(\"attempt_receipt={}\", output.attempt_receipt.display());",
+        );
+        let successful_release = unique_marker_offset(
+            run_body,
+            "\"lease_release_receipt={}\",\n        output.lease_release_receipt.display()",
+        );
+        assert!(failed_attempt < failed_release);
+        assert!(failed_release < durable_no_claim);
+        assert!(successful_attempt < successful_release);
     }
 
     #[test]

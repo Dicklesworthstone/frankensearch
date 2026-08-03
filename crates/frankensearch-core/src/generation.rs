@@ -162,6 +162,8 @@ impl ArtifactGenerationIdentityV1 {
 
 /// Schema carried by immutable generation-authority references and slot frames.
 pub const GENERATION_AUTHORITY_SCHEMA_V1: u16 = 1;
+/// Schema for the deterministic anti-rollback floor reference provider.
+pub const ANTI_ROLLBACK_FLOOR_SCHEMA_V1: u16 = 1;
 /// Exact byte size of one physical `AUTHORITY` slot frame.
 pub const GENERATION_AUTHORITY_SLOT_BYTES_V1: usize = 4_096;
 /// Maximum canonical activation-manifest size accepted before decoding.
@@ -174,6 +176,8 @@ const AUTHORITY_SLOT_BODY_BYTES: usize =
     GENERATION_AUTHORITY_SLOT_BYTES_V1 - AUTHORITY_SLOT_DIGEST_BYTES;
 const AUTHORITY_SLOT_MAGIC_V1: [u8; 8] = *b"FSAUTH01";
 const AUTHORITY_SLOT_HEADER_BYTES: usize = 131;
+const AUTHORITY_REF_MAGIC_V1: [u8; 9] = *b"FSAUTHREF";
+const AUTHORITY_REF_BYTES_V1: usize = 108;
 const LOCK_FRAME_DIGEST_BYTES: usize = 32;
 const LOCK_FRAME_BODY_BYTES: usize = GENERATION_LOCK_FRAME_BYTES_V1 - LOCK_FRAME_DIGEST_BYTES;
 const LOCK_FRAME_MAGIC_V1: [u8; 8] = *b"FSLOCK01";
@@ -211,12 +215,53 @@ pub enum GenerationAuthorityErrorV1 {
     /// A duplicate authority was not the permitted sequence-one genesis form.
     #[error("generation authority slots contain a non-genesis duplicate")]
     NonGenesisDuplicate,
+    /// Both resolver inputs claimed the same physical authority slot.
+    #[error("generation authority resolver received one physical slot twice")]
+    DuplicatePhysicalSlot,
     /// A non-genesis authority was stored in the wrong physical slot.
     #[error("generation authority slot does not match its sequence parity")]
     SlotSequenceParity,
     /// The newer slot skipped a sequence or lacked an exact predecessor link.
     #[error("generation authority slots lack a consecutive predecessor link")]
     BrokenPredecessorLink,
+    /// A lock frame belonged to a different authority root than the slots.
+    #[error("generation authority lock root does not match the resolved authority")]
+    LockRootMismatch,
+    /// An owner lock did not attest the resolved authority head.
+    #[error("generation authority lock does not attest the resolved authority")]
+    LockAuthorityMismatch,
+    /// A valid publication attempt remains unresolved and must be reconciled.
+    #[error("generation authority publication attempt remains unresolved")]
+    UnresolvedAttempt,
+    /// The immutable authority counter cannot advance beyond `u64::MAX`.
+    #[error("generation authority sequence is exhausted")]
+    SequenceExhausted,
+    /// A selected authority is missing or predates the required external floor.
+    #[error("generation authority does not satisfy the required external floor")]
+    AuthorityBelowFloor,
+    /// A required-external profile was selected without an injected floor.
+    #[error("generation authority required-external profile has no external floor")]
+    ExternalFloorRequired,
+    /// A mutation was attempted through an inspection-only profile.
+    #[error("generation authority read-only profile forbids mutation")]
+    ReadOnlyProfile,
+    /// An anti-rollback floor compare-and-advance did not name the current
+    /// exact record.
+    #[error("generation authority anti-rollback floor compare-and-advance conflicted")]
+    FloorCompareAndAdvanceConflict,
+    /// An anti-rollback floor update did not advance its authority sequence.
+    #[error("generation authority anti-rollback floor did not advance")]
+    FloorSequenceRegression,
+    /// An idempotency key was reused for a different floor operation.
+    #[error("generation authority anti-rollback floor idempotency key conflicted")]
+    FloorIdempotencyConflict,
+    /// The deterministic reference provider's CAS version was exhausted.
+    #[error("generation authority anti-rollback floor CAS version is exhausted")]
+    FloorVersionExhausted,
+    /// The deterministic reference provider cannot safely continue after a
+    /// poisoned lock.
+    #[error("generation authority anti-rollback floor store is unavailable")]
+    FloorStoreUnavailable,
     /// The immutable activation manifest did not match its stored self-seal.
     #[error("generation activation manifest self-seal mismatch")]
     ManifestSelfSealMismatch,
@@ -323,21 +368,102 @@ impl AuthorityRefV1 {
         Ok(())
     }
 
+    /// Return the next authority sequence without allowing counter rollover.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed exhaustion error for the terminal `u64::MAX` authority
+    /// rather than permitting an ABA-like wrap to an earlier sequence.
+    pub fn next_sequence(&self) -> Result<u64, GenerationAuthorityErrorV1> {
+        self.validate()?;
+        self.sequence
+            .checked_add(1)
+            .ok_or(GenerationAuthorityErrorV1::SequenceExhausted)
+    }
+
     /// Canonical bytes used to link consecutive authority references.
     #[must_use]
-    pub fn canonical_bytes(&self) -> [u8; 99] {
-        let mut bytes = [0_u8; 99];
-        bytes[..8].copy_from_slice(b"FSAUTHREF");
-        bytes[8..10].copy_from_slice(&self.schema_version.to_be_bytes());
-        bytes[10..18].copy_from_slice(&self.sequence.to_be_bytes());
-        bytes[18..34].copy_from_slice(&self.object_id);
-        bytes[34..42].copy_from_slice(&self.manifest_len.to_be_bytes());
-        bytes[42..74].copy_from_slice(&self.manifest_sha256);
-        bytes[74] = u8::from(self.predecessor.is_some());
+    pub fn canonical_bytes(&self) -> [u8; AUTHORITY_REF_BYTES_V1] {
+        let mut bytes = [0_u8; AUTHORITY_REF_BYTES_V1];
+        bytes[..9].copy_from_slice(&AUTHORITY_REF_MAGIC_V1);
+        bytes[9..11].copy_from_slice(&self.schema_version.to_be_bytes());
+        bytes[11..19].copy_from_slice(&self.sequence.to_be_bytes());
+        bytes[19..35].copy_from_slice(&self.object_id);
+        bytes[35..43].copy_from_slice(&self.manifest_len.to_be_bytes());
+        bytes[43..75].copy_from_slice(&self.manifest_sha256);
+        bytes[75] = u8::from(self.predecessor.is_some());
         if let Some(predecessor) = self.predecessor {
-            bytes[75..].copy_from_slice(&predecessor);
+            bytes[76..].copy_from_slice(&predecessor);
         }
         bytes
+    }
+
+    /// Decode the exact fixed canonical representation of one authority
+    /// reference without allocating from caller-controlled lengths.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed error for malformed, future, or non-canonical bytes.
+    pub fn from_canonical_bytes(bytes: &[u8]) -> Result<Self, GenerationAuthorityErrorV1> {
+        if bytes.len() != AUTHORITY_REF_BYTES_V1 {
+            return Err(GenerationAuthorityErrorV1::InvalidField {
+                field: "authority_ref.canonical_bytes",
+            });
+        }
+        if !bytes[..9].eq(AUTHORITY_REF_MAGIC_V1.as_slice()) {
+            return Err(GenerationAuthorityErrorV1::InvalidField {
+                field: "authority_ref.magic",
+            });
+        }
+        let predecessor = match bytes[75] {
+            0 => {
+                if !bytes[76..].iter().all(|byte| byte.eq(&0)) {
+                    return Err(GenerationAuthorityErrorV1::NonCanonicalPadding);
+                }
+                None
+            }
+            1 => Some(bytes[76..].try_into().map_err(|_| {
+                GenerationAuthorityErrorV1::InvalidField {
+                    field: "authority_ref.predecessor",
+                }
+            })?),
+            _ => {
+                return Err(GenerationAuthorityErrorV1::InvalidField {
+                    field: "authority_ref.predecessor_present",
+                });
+            }
+        };
+        let reference = Self {
+            schema_version: u16::from_be_bytes([bytes[9], bytes[10]]),
+            sequence: u64::from_be_bytes(bytes[11..19].try_into().map_err(|_| {
+                GenerationAuthorityErrorV1::InvalidField {
+                    field: "authority_ref.sequence",
+                }
+            })?),
+            object_id: bytes[19..35].try_into().map_err(|_| {
+                GenerationAuthorityErrorV1::InvalidField {
+                    field: "authority_ref.object_id",
+                }
+            })?,
+            manifest_len: u64::from_be_bytes(bytes[35..43].try_into().map_err(|_| {
+                GenerationAuthorityErrorV1::InvalidField {
+                    field: "authority_ref.manifest_len",
+                }
+            })?),
+            manifest_sha256: bytes[43..75].try_into().map_err(|_| {
+                GenerationAuthorityErrorV1::InvalidField {
+                    field: "authority_ref.manifest_sha256",
+                }
+            })?,
+            predecessor,
+        };
+        reference.validate()?;
+        if !reference.canonical_bytes().eq(bytes) {
+            return Err(GenerationAuthorityErrorV1::InvalidField {
+                field: "authority_ref.canonical_bytes",
+            });
+        }
+        Ok(reference)
     }
 
     /// SHA-256 fingerprint of this exact canonical reference.
@@ -345,6 +471,20 @@ impl AuthorityRefV1 {
     pub fn fingerprint(&self) -> [u8; 32] {
         Sha256::digest(self.canonical_bytes()).into()
     }
+}
+
+fn predecessor_matches_authority(predecessor: Option<[u8; 32]>, authority: AuthorityRefV1) -> bool {
+    predecessor.is_some_and(|predecessor| {
+        constant_time_fingerprint_eq(&predecessor, &authority.fingerprint())
+    })
+}
+
+fn constant_time_fingerprint_eq(left: &[u8; 32], right: &[u8; 32]) -> bool {
+    let mut difference = 0_u8;
+    for index in 0..left.len() {
+        difference |= left[index] ^ right[index];
+    }
+    difference == 0
 }
 
 /// A decoded, authenticated physical authority slot.
@@ -356,6 +496,291 @@ pub struct AuthoritySlotV1 {
     pub root_id: [u8; 16],
     /// Immutable authority reference carried by the frame.
     pub authority: AuthorityRefV1,
+}
+
+/// An externally retained immutable authority that bounds acceptable recovery.
+///
+/// It is pure evidence, not a filesystem pointer: consumers may require an
+/// exact floor or its immediately predecessor-linked successor without
+/// silently accepting a stale or unprovable authority head.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct AuthorityFloorV1 {
+    /// Root identity that prevents a floor from being replayed across roots.
+    pub root_id: [u8; 16],
+    /// Exact externally retained authority reference.
+    pub authority: AuthorityRefV1,
+}
+
+impl AuthorityFloorV1 {
+    /// Construct and validate one bounded external authority floor.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed error for reserved root or authority values.
+    pub fn new(
+        root_id: [u8; 16],
+        authority: AuthorityRefV1,
+    ) -> Result<Self, GenerationAuthorityErrorV1> {
+        let floor = Self { root_id, authority };
+        floor.validate()?;
+        Ok(floor)
+    }
+
+    fn validate(&self) -> Result<(), GenerationAuthorityErrorV1> {
+        if self.root_id == [0; 16] {
+            return Err(GenerationAuthorityErrorV1::InvalidField {
+                field: "authority_floor.root_id",
+            });
+        }
+        self.authority.validate()
+    }
+}
+
+/// Explicit security posture for opening one generation root.
+///
+/// There is deliberately no `Default` implementation: a caller must choose a
+/// posture instead of silently falling back from an externally anchored root.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum GenerationRootSecurityProfileV1 {
+    /// Require a consumer-owned, externally retained authority floor before a
+    /// root can be selected for use.
+    RequiredExternal,
+    /// Permit owner-controlled local recovery while reporting that it cannot
+    /// detect a hostile whole-store rollback.
+    CooperativeLocal,
+    /// Permit inspection only; publication, repair, rollback, and garbage
+    /// collection must be rejected by the caller before mutation.
+    ReadOnlyUnanchored,
+}
+
+impl GenerationRootSecurityProfileV1 {
+    /// Whether this profile authorizes a caller to mutate a generation root.
+    #[must_use]
+    pub const fn permits_mutation(self) -> bool {
+        !matches!(self, Self::ReadOnlyUnanchored)
+    }
+
+    /// Reject a mutation through an inspection-only profile.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GenerationAuthorityErrorV1::ReadOnlyProfile`] when this is
+    /// [`Self::ReadOnlyUnanchored`].
+    pub const fn require_mutation_authorized(self) -> Result<(), GenerationAuthorityErrorV1> {
+        if self.permits_mutation() {
+            Ok(())
+        } else {
+            Err(GenerationAuthorityErrorV1::ReadOnlyProfile)
+        }
+    }
+}
+
+/// Versioned, digest-bound result of one successful anti-rollback floor CAS.
+///
+/// The record is intentionally independent of any generation-root path: its
+/// caller owns storage and replication of this receipt outside the replaceable
+/// root it anchors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct AntiRollbackFloorRecordV1 {
+    /// [`ANTI_ROLLBACK_FLOOR_SCHEMA_V1`].
+    pub schema_version: u16,
+    /// Generation root anchored by this record.
+    pub root_id: [u8; 16],
+    /// Exact externally retained authority floor.
+    pub authority: AuthorityRefV1,
+    /// Monotone successful compare-and-advance version for this root.
+    pub cas_version: u64,
+    /// SHA-256 over the canonical record fields above.
+    pub record_sha256: [u8; 32],
+}
+
+impl AntiRollbackFloorRecordV1 {
+    fn new(floor: AuthorityFloorV1, cas_version: u64) -> Result<Self, GenerationAuthorityErrorV1> {
+        floor.validate()?;
+        if cas_version == 0 {
+            return Err(GenerationAuthorityErrorV1::InvalidField {
+                field: "anti_rollback_floor.cas_version",
+            });
+        }
+        let mut record = Self {
+            schema_version: ANTI_ROLLBACK_FLOOR_SCHEMA_V1,
+            root_id: floor.root_id,
+            authority: floor.authority,
+            cas_version,
+            record_sha256: [0; 32],
+        };
+        record.record_sha256 = record.computed_record_sha256();
+        Ok(record)
+    }
+
+    fn validate(&self) -> Result<(), GenerationAuthorityErrorV1> {
+        if self.schema_version != ANTI_ROLLBACK_FLOOR_SCHEMA_V1 {
+            return Err(GenerationAuthorityErrorV1::InvalidField {
+                field: "anti_rollback_floor.schema_version",
+            });
+        }
+        AuthorityFloorV1::new(self.root_id, self.authority)?;
+        if self.cas_version == 0 {
+            return Err(GenerationAuthorityErrorV1::InvalidField {
+                field: "anti_rollback_floor.cas_version",
+            });
+        }
+        if self.record_sha256 != self.computed_record_sha256() {
+            return Err(GenerationAuthorityErrorV1::ChecksumMismatch);
+        }
+        Ok(())
+    }
+
+    fn computed_record_sha256(&self) -> [u8; 32] {
+        let mut encoder = CanonicalEncoder::new(b"frankensearch.anti-rollback-floor-record.v1");
+        encoder.u16(self.schema_version);
+        encoder.bytes(&self.root_id);
+        encoder.bytes(&self.authority.canonical_bytes());
+        encoder.u64(self.cas_version);
+        Sha256::digest(encoder.finish()).into()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AntiRollbackFloorRequestV1 {
+    root_id: [u8; 16],
+    expected_record_sha256: Option<[u8; 32]>,
+    next_authority: AuthorityRefV1,
+    result: AntiRollbackFloorRecordV1,
+}
+
+#[derive(Default)]
+struct AntiRollbackFloorStoreStateV1 {
+    records: BTreeMap<[u8; 16], AntiRollbackFloorRecordV1>,
+    requests: BTreeMap<[u8; 16], AntiRollbackFloorRequestV1>,
+}
+
+/// Deterministic, linearizable in-memory reference provider for anti-rollback
+/// floor conformance tests and consumer integration tests.
+///
+/// This provider is deliberately not a crash-durable authority. Production
+/// callers must inject a consumer-owned provider outside the generation root;
+/// this implementation makes the exact load/CAS/idempotency contract testable
+/// without selecting a storage backend.
+#[derive(Default)]
+pub struct InMemoryAntiRollbackFloorStoreV1 {
+    state: std::sync::Mutex<AntiRollbackFloorStoreStateV1>,
+}
+
+impl InMemoryAntiRollbackFloorStoreV1 {
+    /// Construct an empty deterministic reference provider.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Load the exact current floor record for one root.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GenerationAuthorityErrorV1::FloorStoreUnavailable`] when a
+    /// prior panic poisoned the reference-provider lock.
+    pub fn load(
+        &self,
+        root_id: [u8; 16],
+    ) -> Result<Option<AntiRollbackFloorRecordV1>, GenerationAuthorityErrorV1> {
+        if root_id == [0; 16] {
+            return Err(GenerationAuthorityErrorV1::InvalidField {
+                field: "anti_rollback_floor.root_id",
+            });
+        }
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| GenerationAuthorityErrorV1::FloorStoreUnavailable)?;
+        Ok(state.records.get(&root_id).copied())
+    }
+
+    /// Atomically compare and advance one root's anti-rollback floor.
+    ///
+    /// `expected` must be the exact record returned by a prior [`Self::load`]
+    /// call (or `None` for a previously unanchored root). Repeating the same
+    /// operation with the same non-zero `idempotency_key` returns the original
+    /// successful receipt; reusing that key for another operation fails closed.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed conflict, regression, idempotency, exhaustion, or store
+    /// availability error without changing the recorded floor.
+    pub fn compare_and_advance(
+        &self,
+        expected: Option<AntiRollbackFloorRecordV1>,
+        next: AuthorityFloorV1,
+        idempotency_key: [u8; 16],
+    ) -> Result<AntiRollbackFloorRecordV1, GenerationAuthorityErrorV1> {
+        next.validate()?;
+        if idempotency_key == [0; 16] {
+            return Err(GenerationAuthorityErrorV1::InvalidField {
+                field: "anti_rollback_floor.idempotency_key",
+            });
+        }
+        if let Some(expected) = expected {
+            expected.validate()?;
+            if expected.root_id != next.root_id {
+                return Err(GenerationAuthorityErrorV1::RootMismatch);
+            }
+        }
+
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| GenerationAuthorityErrorV1::FloorStoreUnavailable)?;
+        let expected_record_sha256 = expected.map(|record| record.record_sha256);
+        if let Some(previous) = state.requests.get(&idempotency_key) {
+            if previous.root_id == next.root_id
+                && previous.expected_record_sha256 == expected_record_sha256
+                && previous.next_authority == next.authority
+            {
+                return Ok(previous.result);
+            }
+            return Err(GenerationAuthorityErrorV1::FloorIdempotencyConflict);
+        }
+
+        let current = state.records.get(&next.root_id).copied();
+        if current != expected {
+            return Err(GenerationAuthorityErrorV1::FloorCompareAndAdvanceConflict);
+        }
+        match current {
+            Some(record) => {
+                let expected_sequence = record.authority.next_sequence()?;
+                if next.authority.sequence <= record.authority.sequence {
+                    return Err(GenerationAuthorityErrorV1::FloorSequenceRegression);
+                }
+                if next.authority.sequence != expected_sequence
+                    || !predecessor_matches_authority(next.authority.predecessor, record.authority)
+                {
+                    return Err(GenerationAuthorityErrorV1::BrokenPredecessorLink);
+                }
+            }
+            None if next.authority.sequence != 1 || next.authority.predecessor.is_some() => {
+                return Err(GenerationAuthorityErrorV1::BrokenPredecessorLink);
+            }
+            None => {}
+        }
+        let cas_version = current
+            .map(|record| record.cas_version)
+            .unwrap_or(0)
+            .checked_add(1)
+            .ok_or(GenerationAuthorityErrorV1::FloorVersionExhausted)?;
+        let result = AntiRollbackFloorRecordV1::new(next, cas_version)?;
+        state.records.insert(next.root_id, result);
+        state.requests.insert(
+            idempotency_key,
+            AntiRollbackFloorRequestV1 {
+                root_id: next.root_id,
+                expected_record_sha256,
+                next_authority: next.authority,
+                result,
+            },
+        );
+        drop(state);
+        Ok(result)
+    }
 }
 
 /// Kind of fixed `LOCK` frame. Owner and attempt remain distinct on disk so an
@@ -709,13 +1134,22 @@ pub fn resolve_authority_slots_v1(
     }
     match (first, second) {
         (None, None) => Ok(None),
-        (Some(slot), None) | (None, Some(slot)) => Ok(Some(slot)),
+        (Some(slot), None) | (None, Some(slot)) => {
+            if !slot_matches_authority_sequence(slot) {
+                return Err(GenerationAuthorityErrorV1::SlotSequenceParity);
+            }
+            Ok(Some(slot))
+        }
         (Some(first), Some(second)) => {
             // ubs:ignore — slot indices and root IDs are public structural identities.
             if first.root_id != second.root_id {
                 return Err(GenerationAuthorityErrorV1::InvalidField {
                     field: "authority_slot.pair",
                 });
+            }
+            // ubs:ignore — physical slot indices are public structural identities.
+            if first.slot_index == second.slot_index {
+                return Err(GenerationAuthorityErrorV1::DuplicatePhysicalSlot);
             }
             // ubs:ignore — authority sequences are public monotone counters.
             if first.authority.sequence == second.authority.sequence {
@@ -737,11 +1171,6 @@ pub fn resolve_authority_slots_v1(
             if !slot_matches_authority_sequence(older) || !slot_matches_authority_sequence(newer) {
                 return Err(GenerationAuthorityErrorV1::SlotSequenceParity);
             }
-            if older.slot_index == newer.slot_index {
-                return Err(GenerationAuthorityErrorV1::InvalidField {
-                    field: "authority_slot.pair",
-                });
-            }
             // ubs:ignore — sequence/predecessor fingerprints are public history identities.
             if newer.authority.sequence != older.authority.sequence.saturating_add(1)
                 // ubs:ignore — predecessor fingerprints are public immutable history identities.
@@ -754,11 +1183,187 @@ pub fn resolve_authority_slots_v1(
     }
 }
 
+/// Decode and resolve the two physical authority frames without filesystem
+/// access.
+///
+/// A present but malformed frame is never converted to `None`: callers must
+/// reconcile that corruption explicitly rather than treating it as one-slot
+/// survival. Only an absent physical frame may enter the survival path.
+///
+/// # Errors
+///
+/// Returns the exact bounded slot decode error for malformed, copied, or
+/// cross-root frames before attempting pair resolution.
+pub fn resolve_authority_slot_frames_v1(
+    first: Option<&[u8]>,
+    second: Option<&[u8]>,
+    expected_root_id: [u8; 16],
+) -> Result<Option<AuthoritySlotV1>, GenerationAuthorityErrorV1> {
+    let first = first
+        .map(|bytes| AuthoritySlotV1::from_authenticated_bytes(bytes, 0, expected_root_id))
+        .transpose()?;
+    let second = second
+        .map(|bytes| AuthoritySlotV1::from_authenticated_bytes(bytes, 1, expected_root_id))
+        .transpose()?;
+    resolve_authority_slots_v1(first, second)
+}
+
+/// Resolve two authority slots against one exact externally retained floor.
+///
+/// The selected authority must be the exact floor or its immediate
+/// predecessor-linked successor. A later but unprovable head is not selected;
+/// callers must supply its intervening authority evidence explicitly.
+///
+/// # Errors
+///
+/// Returns a typed error for missing/stale authorities, cross-root floors,
+/// equal-sequence divergence, gaps, or sequence exhaustion.
+pub fn resolve_authority_slots_at_floor_v1(
+    first: Option<AuthoritySlotV1>,
+    second: Option<AuthoritySlotV1>,
+    floor: AuthorityFloorV1,
+) -> Result<AuthoritySlotV1, GenerationAuthorityErrorV1> {
+    let resolved = resolve_authority_slots_v1(first, second)?
+        .ok_or(GenerationAuthorityErrorV1::AuthorityBelowFloor)?;
+    resolve_selected_authority_at_floor_v1(resolved, floor)
+}
+
+fn resolve_selected_authority_at_floor_v1(
+    resolved: AuthoritySlotV1,
+    floor: AuthorityFloorV1,
+) -> Result<AuthoritySlotV1, GenerationAuthorityErrorV1> {
+    floor.validate()?;
+    // ubs:ignore — root IDs are public structural identities.
+    if resolved.root_id != floor.root_id {
+        return Err(GenerationAuthorityErrorV1::RootMismatch);
+    }
+    if resolved.authority.sequence < floor.authority.sequence {
+        return Err(GenerationAuthorityErrorV1::AuthorityBelowFloor);
+    }
+    // ubs:ignore — authority sequences are public monotone counters.
+    if resolved.authority.sequence == floor.authority.sequence {
+        // ubs:ignore — authority references are public immutable identities.
+        if resolved.authority != floor.authority {
+            return Err(GenerationAuthorityErrorV1::EqualSequenceFork);
+        }
+        return Ok(resolved);
+    }
+    let successor = floor
+        .authority
+        .next_sequence()
+        .map_err(|_| GenerationAuthorityErrorV1::SequenceExhausted)?;
+    // ubs:ignore — authority sequences are public monotone counters.
+    if resolved.authority.sequence != successor {
+        return Err(GenerationAuthorityErrorV1::BrokenPredecessorLink);
+    }
+    // ubs:ignore — predecessor fingerprints are public immutable history identities.
+    if resolved.authority.predecessor != Some(floor.authority.fingerprint()) {
+        return Err(GenerationAuthorityErrorV1::BrokenPredecessorLink);
+    }
+    Ok(resolved)
+}
+
+/// Resolve authority slots while refusing to silently step around a valid
+/// owner/attempt `LOCK` state.
+///
+/// A persisted attempt is evidence of an outcome the caller has not yet
+/// reconciled, so it fails closed even if an older authority pair resolves.
+/// The helper performs no filesystem I/O and does not mutate either frame.
+///
+/// # Errors
+///
+/// Returns a bounded typed error when frame kind, root binding, owner binding,
+/// or a pending attempt prevents a safe selection.
+pub fn resolve_authority_slots_with_locks_v1(
+    first: Option<AuthoritySlotV1>,
+    second: Option<AuthoritySlotV1>,
+    owner: Option<GenerationLockFrameV1>,
+    attempt: Option<GenerationLockFrameV1>,
+) -> Result<Option<AuthoritySlotV1>, GenerationAuthorityErrorV1> {
+    let resolved = resolve_authority_slots_v1(first, second)?;
+    if let Some(owner) = owner {
+        owner.validate()?;
+        // ubs:ignore — lock kinds are public fixed-format state tags.
+        if owner.kind != GenerationLockFrameKindV1::Owner {
+            return Err(GenerationAuthorityErrorV1::InvalidField {
+                field: "generation_lock.owner.kind",
+            });
+        }
+    }
+    if let Some(attempt) = attempt {
+        attempt.validate()?;
+        // ubs:ignore — lock kinds are public fixed-format state tags.
+        if attempt.kind != GenerationLockFrameKindV1::Attempt {
+            return Err(GenerationAuthorityErrorV1::InvalidField {
+                field: "generation_lock.attempt.kind",
+            });
+        }
+    }
+    if let (Some(owner), Some(attempt)) = (owner, attempt) {
+        // ubs:ignore — root IDs are public structural identities.
+        if owner.root_id != attempt.root_id {
+            return Err(GenerationAuthorityErrorV1::LockRootMismatch);
+        }
+    }
+    if let Some(slot) = resolved {
+        // ubs:ignore — root IDs are public structural identities.
+        if owner.is_some_and(|frame| frame.root_id != slot.root_id) {
+            return Err(GenerationAuthorityErrorV1::LockRootMismatch);
+        }
+        // ubs:ignore — root IDs are public structural identities.
+        if attempt.is_some_and(|frame| frame.root_id != slot.root_id) {
+            return Err(GenerationAuthorityErrorV1::LockRootMismatch);
+        }
+    }
+    if attempt.is_some() {
+        return Err(GenerationAuthorityErrorV1::UnresolvedAttempt);
+    }
+    if let Some(owner) = owner {
+        let resolved = resolved.ok_or(GenerationAuthorityErrorV1::LockAuthorityMismatch)?;
+        // ubs:ignore — authority fingerprints are public immutable-integrity identities.
+        if owner.authority_fingerprint != resolved.authority.fingerprint() {
+            return Err(GenerationAuthorityErrorV1::LockAuthorityMismatch);
+        }
+    }
+    Ok(resolved)
+}
+
+/// Resolve authority slots under one explicit generation-root security profile.
+///
+/// The lock-aware resolver always runs first, so an unresolved publication
+/// attempt cannot be bypassed by selecting a weaker profile. Required external
+/// roots additionally require an injected retained floor; local and inspection
+/// profiles intentionally remain unanchored and are distinguishable to callers.
+///
+/// # Errors
+///
+/// Returns a typed error when lock reconciliation fails, an external floor is
+/// absent or not satisfied, or the underlying slots are malformed.
+pub fn resolve_authority_slots_with_profile_v1(
+    first: Option<AuthoritySlotV1>,
+    second: Option<AuthoritySlotV1>,
+    owner: Option<GenerationLockFrameV1>,
+    attempt: Option<GenerationLockFrameV1>,
+    profile: GenerationRootSecurityProfileV1,
+    external_floor: Option<AuthorityFloorV1>,
+) -> Result<Option<AuthoritySlotV1>, GenerationAuthorityErrorV1> {
+    let resolved = resolve_authority_slots_with_locks_v1(first, second, owner, attempt)?;
+    match profile {
+        GenerationRootSecurityProfileV1::RequiredExternal => {
+            let floor = external_floor.ok_or(GenerationAuthorityErrorV1::ExternalFloorRequired)?;
+            let resolved = resolved.ok_or(GenerationAuthorityErrorV1::AuthorityBelowFloor)?;
+            resolve_selected_authority_at_floor_v1(resolved, floor).map(Some)
+        }
+        GenerationRootSecurityProfileV1::CooperativeLocal
+        | GenerationRootSecurityProfileV1::ReadOnlyUnanchored => Ok(resolved),
+    }
+}
+
 fn slot_matches_authority_sequence(slot: AuthoritySlotV1) -> bool {
     if slot.authority.sequence == 1 {
         return true;
     }
-    let expected_slot = u8::try_from(slot.authority.sequence & 1).unwrap_or(u8::MAX);
+    let expected_slot = (slot.authority.sequence & 1) as u8;
     slot.slot_index == expected_slot
 }
 
@@ -3646,6 +4251,21 @@ mod tests {
             .expect("valid test lock frame")
     }
 
+    fn authority_lock(
+        kind: GenerationLockFrameKindV1,
+        authority: AuthorityRefV1,
+    ) -> GenerationLockFrameV1 {
+        GenerationLockFrameV1::new(
+            kind,
+            [0x5a; 16],
+            [0x72; 16],
+            [0x73; 16],
+            1,
+            authority.fingerprint(),
+        )
+        .expect("valid authority-bound test lock frame")
+    }
+
     fn component_receipts() -> GenerationComponentReceiptsV1 {
         GenerationComponentReceiptsV1 {
             vector: GenerationComponentReceiptV1 {
@@ -3703,6 +4323,21 @@ mod tests {
     }
 
     #[test]
+    fn authority_slot_rejects_every_single_byte_mutation() {
+        let encoded = authority_slot(0, authority_reference(1, None))
+            .encode()
+            .expect("encode slot");
+        for byte_index in 0..GENERATION_AUTHORITY_SLOT_BYTES_V1 {
+            let mut mutated = encoded;
+            mutated[byte_index] ^= 0x80;
+            assert!(
+                AuthoritySlotV1::from_authenticated_bytes(&mutated, 0, [0x5a; 16]).is_err(),
+                "single-byte mutation at offset {byte_index} must never decode"
+            );
+        }
+    }
+
+    #[test]
     fn authority_slot_rejects_recomputed_noncanonical_padding_and_copied_slot() {
         let slot = authority_slot(0, authority_reference(1, None));
         let mut noncanonical = slot.encode().expect("encode slot");
@@ -3722,6 +4357,36 @@ mod tests {
             ),
             Err(GenerationAuthorityErrorV1::SlotIndexMismatch),
             "a frame copied between physical slots must fail closed"
+        );
+    }
+
+    #[test]
+    fn fixed_authority_frames_reject_resealed_future_schemas() {
+        let slot = authority_slot(0, authority_reference(1, None));
+        let mut future_slot = slot.encode().expect("encode authority slot");
+        future_slot[8..10].copy_from_slice(&(GENERATION_AUTHORITY_SCHEMA_V1 + 1).to_be_bytes());
+        let slot_digest = Sha256::digest(&future_slot[..AUTHORITY_SLOT_BODY_BYTES]);
+        future_slot[AUTHORITY_SLOT_BODY_BYTES..].copy_from_slice(&slot_digest);
+        assert_eq!(
+            AuthoritySlotV1::from_authenticated_bytes(&future_slot, 0, [0x5a; 16]),
+            Err(GenerationAuthorityErrorV1::InvalidField {
+                field: "authority_slot.header"
+            }),
+            "a future AUTHORITY frame is rejected even with a valid checksum"
+        );
+
+        let mut future_lock = lock_frame(GenerationLockFrameKindV1::Owner)
+            .encode()
+            .expect("encode owner lock frame");
+        future_lock[8..10].copy_from_slice(&(GENERATION_AUTHORITY_SCHEMA_V1 + 1).to_be_bytes());
+        let lock_digest = Sha256::digest(&future_lock[..LOCK_FRAME_BODY_BYTES]);
+        future_lock[LOCK_FRAME_BODY_BYTES..].copy_from_slice(&lock_digest);
+        assert_eq!(
+            GenerationLockFrameV1::from_authenticated_bytes(&future_lock, [0x71; 16]),
+            Err(GenerationAuthorityErrorV1::InvalidField {
+                field: "generation_lock.header"
+            }),
+            "a future LOCK frame is rejected even with a valid checksum"
         );
     }
 
@@ -3753,6 +4418,103 @@ mod tests {
             GenerationLockFrameV1::from_authenticated_bytes(&owner_bytes, [0x75; 16]),
             Err(GenerationAuthorityErrorV1::RootMismatch),
             "a lock frame copied across roots must fail closed"
+        );
+    }
+
+    #[test]
+    fn lock_frame_rejects_every_single_byte_mutation() {
+        let encoded = lock_frame(GenerationLockFrameKindV1::Owner)
+            .encode()
+            .expect("encode owner lock frame");
+        for byte_index in 0..GENERATION_LOCK_FRAME_BYTES_V1 {
+            let mut mutated = encoded;
+            mutated[byte_index] ^= 0x80;
+            assert!(
+                GenerationLockFrameV1::from_authenticated_bytes(&mutated, [0x71; 16]).is_err(),
+                "single-byte mutation at offset {byte_index} must never decode"
+            );
+        }
+    }
+
+    #[test]
+    fn lock_aware_resolver_requires_owner_agreement_and_attempt_reconciliation() {
+        let genesis = authority_reference(1, None);
+        let successor = authority_reference(2, Some(genesis.fingerprint()));
+        let first = authority_slot(1, genesis);
+        let second = authority_slot(0, successor);
+        let owner = authority_lock(GenerationLockFrameKindV1::Owner, successor);
+        assert_eq!(
+            resolve_authority_slots_with_locks_v1(Some(first), Some(second), Some(owner), None),
+            Ok(Some(second)),
+            "a matching owner attests the resolved committed head"
+        );
+
+        let attempt = authority_lock(GenerationLockFrameKindV1::Attempt, successor);
+        assert_eq!(
+            resolve_authority_slots_with_locks_v1(
+                Some(first),
+                Some(second),
+                Some(owner),
+                Some(attempt),
+            ),
+            Err(GenerationAuthorityErrorV1::UnresolvedAttempt),
+            "an authenticated attempt blocks fallback until publisher reconciliation"
+        );
+
+        let wrong_authority = GenerationLockFrameV1::new(
+            GenerationLockFrameKindV1::Owner,
+            [0x5a; 16],
+            [0x72; 16],
+            [0x73; 16],
+            1,
+            [0x91; 32],
+        )
+        .expect("well-formed mismatched owner lock");
+        assert_eq!(
+            resolve_authority_slots_with_locks_v1(
+                Some(first),
+                Some(second),
+                Some(wrong_authority),
+                None,
+            ),
+            Err(GenerationAuthorityErrorV1::LockAuthorityMismatch),
+            "a valid lock for another authority must not select this head"
+        );
+    }
+
+    #[test]
+    fn lock_aware_resolver_rejects_wrong_roles_and_cross_root_evidence() {
+        let genesis = authority_reference(1, None);
+        let successor = authority_reference(2, Some(genesis.fingerprint()));
+        let first = authority_slot(1, genesis);
+        let second = authority_slot(0, successor);
+        let owner = authority_lock(GenerationLockFrameKindV1::Owner, successor);
+        assert_eq!(
+            resolve_authority_slots_with_locks_v1(Some(first), Some(second), None, Some(owner)),
+            Err(GenerationAuthorityErrorV1::InvalidField {
+                field: "generation_lock.attempt.kind"
+            }),
+            "owner frames cannot be reinterpreted as unresolved attempts"
+        );
+
+        let foreign_attempt = GenerationLockFrameV1::new(
+            GenerationLockFrameKindV1::Attempt,
+            [0x6b; 16],
+            [0x72; 16],
+            [0x73; 16],
+            1,
+            successor.fingerprint(),
+        )
+        .expect("well-formed foreign-root attempt");
+        assert_eq!(
+            resolve_authority_slots_with_locks_v1(
+                Some(first),
+                Some(second),
+                None,
+                Some(foreign_attempt),
+            ),
+            Err(GenerationAuthorityErrorV1::LockRootMismatch),
+            "attempt evidence from another root cannot block or select this authority"
         );
     }
 
@@ -3790,6 +4552,459 @@ mod tests {
             ),
             Err(GenerationAuthorityErrorV1::SlotSequenceParity),
             "a non-genesis authority copied into the opposite physical slot must fail"
+        );
+    }
+
+    #[test]
+    fn authority_resolver_rejects_repeated_physical_slots_and_lone_parity_tears() {
+        let genesis = authority_reference(1, None);
+        let successor = authority_reference(2, Some(genesis.fingerprint()));
+        assert_eq!(
+            resolve_authority_slots_v1(
+                Some(authority_slot(0, genesis)),
+                Some(authority_slot(0, successor)),
+            ),
+            Err(GenerationAuthorityErrorV1::DuplicatePhysicalSlot),
+            "two inputs claiming one physical slot cannot represent a recoverable pair"
+        );
+        assert_eq!(
+            resolve_authority_slots_v1(Some(authority_slot(1, successor)), None),
+            Err(GenerationAuthorityErrorV1::SlotSequenceParity),
+            "one surviving non-genesis slot must still bind its publication parity"
+        );
+        assert_eq!(
+            resolve_authority_slots_v1(
+                Some(authority_slot(0, successor)),
+                Some(authority_slot(1, genesis)),
+            ),
+            Ok(Some(authority_slot(0, successor))),
+            "resolver input order never changes the selected consecutive head"
+        );
+    }
+
+    #[test]
+    fn authority_resolver_accepts_consecutive_heads_across_slot_orientations() {
+        let mut older = authority_reference(1, None);
+        let mut older_slot_index = 1;
+        for sequence in 2..=32 {
+            let object_byte = u8::try_from(sequence).expect("bounded test sequence");
+            let newer = AuthorityRefV1::new(
+                sequence,
+                [object_byte; 16],
+                4_096 + sequence,
+                [object_byte.wrapping_add(16); 32],
+                Some(older.fingerprint()),
+            )
+            .expect("consecutive authority reference");
+            let newer_slot_index = u8::try_from(sequence & 1).expect("slot parity fits u8");
+            let older_slot = authority_slot(older_slot_index, older);
+            let newer_slot = authority_slot(newer_slot_index, newer);
+            assert_eq!(
+                resolve_authority_slots_v1(Some(older_slot), Some(newer_slot)),
+                Ok(Some(newer_slot)),
+                "sequence {sequence} resolves in old/new input order"
+            );
+            assert_eq!(
+                resolve_authority_slots_v1(Some(newer_slot), Some(older_slot)),
+                Ok(Some(newer_slot)),
+                "sequence {sequence} resolves in new/old input order"
+            );
+            older = newer;
+            older_slot_index = newer_slot_index;
+        }
+    }
+
+    #[test]
+    fn raw_authority_frame_resolver_preserves_corruption_as_an_error() {
+        let genesis = authority_reference(1, None);
+        let successor = authority_reference(2, Some(genesis.fingerprint()));
+        let first = authority_slot(0, successor)
+            .encode()
+            .expect("encode successor frame");
+        let second = authority_slot(1, genesis)
+            .encode()
+            .expect("encode genesis frame");
+        assert_eq!(
+            resolve_authority_slot_frames_v1(Some(&first), Some(&second), [0x5a; 16]),
+            Ok(Some(authority_slot(0, successor))),
+            "two valid raw physical frames resolve their linked head"
+        );
+        assert_eq!(
+            resolve_authority_slot_frames_v1(Some(&first), None, [0x5a; 16]),
+            Ok(Some(authority_slot(0, successor))),
+            "only a genuinely absent second frame permits first-slot survival"
+        );
+
+        let mut corrupt_second = second;
+        corrupt_second[200] ^= 1;
+        assert_eq!(
+            resolve_authority_slot_frames_v1(Some(&first), Some(&corrupt_second), [0x5a; 16]),
+            Err(GenerationAuthorityErrorV1::ChecksumMismatch),
+            "a present corrupt frame must not be silently treated as absent"
+        );
+    }
+
+    #[test]
+    fn raw_authority_frame_resolver_rejects_length_and_order_tears() {
+        let genesis = authority_reference(1, None);
+        let successor = authority_reference(2, Some(genesis.fingerprint()));
+        let first = authority_slot(0, successor)
+            .encode()
+            .expect("encode successor frame");
+        let second = authority_slot(1, genesis)
+            .encode()
+            .expect("encode genesis frame");
+
+        assert_eq!(
+            resolve_authority_slot_frames_v1(Some(&first[..first.len() - 1]), None, [0x5a; 16]),
+            Err(GenerationAuthorityErrorV1::InvalidSlotLength),
+            "a truncated present frame is not one-slot survival"
+        );
+        let mut extended = first.to_vec();
+        extended.push(0);
+        assert_eq!(
+            resolve_authority_slot_frames_v1(Some(&extended), None, [0x5a; 16]),
+            Err(GenerationAuthorityErrorV1::InvalidSlotLength),
+            "an extended present frame is not one-slot survival"
+        );
+        assert_eq!(
+            resolve_authority_slot_frames_v1(Some(&second), Some(&first), [0x5a; 16]),
+            Err(GenerationAuthorityErrorV1::SlotIndexMismatch),
+            "reordered physical frames cannot swap old and new authorities"
+        );
+    }
+
+    #[test]
+    fn authority_floor_resolver_rejects_stale_forked_and_gapped_heads() {
+        let genesis = authority_reference(1, None);
+        let floor = AuthorityFloorV1::new([0x5a; 16], genesis).expect("valid authority floor");
+        assert_eq!(
+            resolve_authority_slots_at_floor_v1(Some(authority_slot(0, genesis)), None, floor),
+            Ok(authority_slot(0, genesis)),
+            "the exact retained authority is selectable"
+        );
+
+        let successor = authority_reference(2, Some(genesis.fingerprint()));
+        assert_eq!(
+            resolve_authority_slots_at_floor_v1(Some(authority_slot(0, successor)), None, floor),
+            Ok(authority_slot(0, successor)),
+            "the immediate predecessor-linked successor is selectable"
+        );
+
+        let fork = AuthorityRefV1::new(1, [0x91; 16], 4_097, [0x92; 32], None)
+            .expect("well-formed forked authority");
+        assert_eq!(
+            resolve_authority_slots_at_floor_v1(Some(authority_slot(1, fork)), None, floor),
+            Err(GenerationAuthorityErrorV1::EqualSequenceFork),
+            "equal floor sequence with another immutable object is a fork"
+        );
+
+        let gap = AuthorityRefV1::new(3, [0x93; 16], 4_099, [0x94; 32], Some([0x95; 32]))
+            .expect("well-formed but unprovable authority gap");
+        assert_eq!(
+            resolve_authority_slots_at_floor_v1(Some(authority_slot(1, gap)), None, floor),
+            Err(GenerationAuthorityErrorV1::BrokenPredecessorLink),
+            "a head beyond the immediate anchored successor requires more evidence"
+        );
+
+        let mut foreign_root = authority_slot(0, successor);
+        foreign_root.root_id = [0x96; 16];
+        assert_eq!(
+            resolve_authority_slots_at_floor_v1(Some(foreign_root), None, floor),
+            Err(GenerationAuthorityErrorV1::RootMismatch),
+            "an externally retained floor cannot be replayed across roots"
+        );
+    }
+
+    #[test]
+    fn required_external_profile_never_silently_downgrades_to_local() {
+        let genesis = authority_reference(1, None);
+        let slot = authority_slot(0, genesis);
+        assert_eq!(
+            resolve_authority_slots_with_profile_v1(
+                Some(slot),
+                None,
+                None,
+                None,
+                GenerationRootSecurityProfileV1::RequiredExternal,
+                None,
+            ),
+            Err(GenerationAuthorityErrorV1::ExternalFloorRequired),
+            "a valid local authority alone is insufficient for required-external admission"
+        );
+
+        let floor = AuthorityFloorV1::new([0x5a; 16], genesis).expect("valid external floor");
+        assert_eq!(
+            resolve_authority_slots_with_profile_v1(
+                Some(slot),
+                None,
+                None,
+                None,
+                GenerationRootSecurityProfileV1::RequiredExternal,
+                Some(floor),
+            ),
+            Ok(Some(slot)),
+            "the exact retained external authority admits the root"
+        );
+    }
+
+    #[test]
+    fn local_and_inspection_profiles_keep_lock_reconciliation_mandatory() {
+        let genesis = authority_reference(1, None);
+        let slot = authority_slot(0, genesis);
+        let attempt = authority_lock(GenerationLockFrameKindV1::Attempt, genesis);
+        for profile in [
+            GenerationRootSecurityProfileV1::CooperativeLocal,
+            GenerationRootSecurityProfileV1::ReadOnlyUnanchored,
+        ] {
+            assert_eq!(
+                resolve_authority_slots_with_profile_v1(
+                    Some(slot),
+                    None,
+                    None,
+                    Some(attempt),
+                    profile,
+                    None,
+                ),
+                Err(GenerationAuthorityErrorV1::UnresolvedAttempt),
+                "{profile:?} cannot bypass an unresolved publication attempt"
+            );
+        }
+    }
+
+    #[test]
+    fn root_security_profiles_explicitly_separate_mutation_authority() {
+        assert!(GenerationRootSecurityProfileV1::RequiredExternal.permits_mutation());
+        assert!(GenerationRootSecurityProfileV1::CooperativeLocal.permits_mutation());
+        assert!(!GenerationRootSecurityProfileV1::ReadOnlyUnanchored.permits_mutation());
+        assert_eq!(
+            GenerationRootSecurityProfileV1::ReadOnlyUnanchored.require_mutation_authorized(),
+            Err(GenerationAuthorityErrorV1::ReadOnlyProfile),
+            "inspection-only admission cannot be reused for mutation"
+        );
+    }
+
+    #[test]
+    fn in_memory_anti_rollback_floor_is_exact_monotone_and_idempotent() {
+        let store = InMemoryAntiRollbackFloorStoreV1::new();
+        let genesis = authority_reference(1, None);
+        let genesis_floor =
+            AuthorityFloorV1::new([0x5a; 16], genesis).expect("valid genesis floor");
+        let first = store
+            .compare_and_advance(None, genesis_floor, [0x41; 16])
+            .expect("first floor advance");
+        assert_eq!(first.cas_version, 1);
+        assert_eq!(store.load([0x5a; 16]), Ok(Some(first)));
+        assert_eq!(
+            store.compare_and_advance(None, genesis_floor, [0x41; 16]),
+            Ok(first),
+            "repeating the exact request returns its original receipt"
+        );
+
+        let successor = authority_reference(2, Some(genesis.fingerprint()));
+        let successor_floor =
+            AuthorityFloorV1::new([0x5a; 16], successor).expect("valid successor floor");
+        let second = store
+            .compare_and_advance(Some(first), successor_floor, [0x42; 16])
+            .expect("monotone successor advance");
+        assert_eq!(second.cas_version, 2);
+        assert_eq!(store.load([0x5a; 16]), Ok(Some(second)));
+
+        assert_eq!(
+            store.compare_and_advance(Some(first), successor_floor, [0x43; 16]),
+            Err(GenerationAuthorityErrorV1::FloorCompareAndAdvanceConflict),
+            "a stale exact CAS receipt cannot overwrite a newer floor"
+        );
+        assert_eq!(
+            store.compare_and_advance(Some(second), genesis_floor, [0x44; 16]),
+            Err(GenerationAuthorityErrorV1::FloorSequenceRegression),
+            "a valid older authority cannot roll the retained floor backward"
+        );
+        assert_eq!(
+            store.compare_and_advance(Some(second), successor_floor, [0x41; 16]),
+            Err(GenerationAuthorityErrorV1::FloorIdempotencyConflict),
+            "a completed idempotency key cannot be rebound to another CAS"
+        );
+        assert_eq!(store.load([0x5a; 16]), Ok(Some(second)));
+    }
+
+    #[test]
+    fn in_memory_anti_rollback_floor_requires_genesis_and_exact_successor_linkage() {
+        let store = InMemoryAntiRollbackFloorStoreV1::new();
+        let root_id = [0x5a; 16];
+        let fabricated_prior = authority_reference(1, None);
+        let unanchored_successor = AuthorityFloorV1::new(
+            root_id,
+            authority_reference(2, Some(fabricated_prior.fingerprint())),
+        )
+        .expect("self-consistent non-genesis authority is structurally valid");
+        assert_eq!(
+            store.compare_and_advance(None, unanchored_successor, [0x45; 16]),
+            Err(GenerationAuthorityErrorV1::BrokenPredecessorLink),
+            "an unanchored root cannot claim an unobserved predecessor"
+        );
+
+        let genesis = authority_reference(1, None);
+        let first = store
+            .compare_and_advance(
+                None,
+                AuthorityFloorV1::new(root_id, genesis).expect("valid genesis floor"),
+                [0x46; 16],
+            )
+            .expect("genesis advance must succeed");
+
+        let skipped =
+            AuthorityFloorV1::new(root_id, authority_reference(3, Some(genesis.fingerprint())))
+                .expect("self-consistent skipped authority is structurally valid");
+        assert_eq!(
+            store.compare_and_advance(Some(first), skipped, [0x47; 16]),
+            Err(GenerationAuthorityErrorV1::BrokenPredecessorLink),
+            "a floor CAS cannot skip an unobserved authority sequence"
+        );
+
+        let wrong_predecessor = AuthorityFloorV1::new(
+            root_id,
+            AuthorityRefV1::new(2, [0x91; 16], 4_098, [0x92; 32], Some([0x93; 32]))
+                .expect("wrongly linked successor remains structurally valid"),
+        )
+        .expect("floor validation defers predecessor identity to CAS state");
+        assert_eq!(
+            store.compare_and_advance(Some(first), wrong_predecessor, [0x48; 16]),
+            Err(GenerationAuthorityErrorV1::BrokenPredecessorLink),
+            "a successor must bind the exact retained authority fingerprint"
+        );
+        assert_eq!(store.load(root_id), Ok(Some(first)));
+    }
+
+    #[test]
+    fn in_memory_anti_rollback_floor_reports_terminal_authority_exhaustion() {
+        let store = InMemoryAntiRollbackFloorStoreV1::new();
+        let root_id = [0x5a; 16];
+        let terminal =
+            AuthorityRefV1::new(u64::MAX, [0x81; 16], 4_096, [0x82; 32], Some([0x83; 32]))
+                .expect("terminal authority remains structurally valid");
+        let current = AntiRollbackFloorRecordV1::new(
+            AuthorityFloorV1::new(root_id, terminal).expect("valid terminal floor"),
+            7,
+        )
+        .expect("valid terminal record");
+        store
+            .state
+            .lock()
+            .expect("test reference store mutex must be available")
+            .records
+            .insert(root_id, current);
+
+        assert_eq!(
+            store.compare_and_advance(
+                Some(current),
+                AuthorityFloorV1::new(root_id, terminal).expect("valid terminal floor"),
+                [0x49; 16],
+            ),
+            Err(GenerationAuthorityErrorV1::SequenceExhausted),
+            "terminal authority cannot be reinterpreted as a stale or wrapped advance"
+        );
+        assert_eq!(store.load(root_id), Ok(Some(current)));
+    }
+
+    #[test]
+    fn in_memory_anti_rollback_floor_rejects_invalid_root_and_request_identity() {
+        let store = InMemoryAntiRollbackFloorStoreV1::new();
+        let authority = authority_reference(1, None);
+        let floor = AuthorityFloorV1::new([0x5a; 16], authority).expect("valid floor");
+        assert_eq!(
+            store.load([0; 16]),
+            Err(GenerationAuthorityErrorV1::InvalidField {
+                field: "anti_rollback_floor.root_id"
+            })
+        );
+        assert_eq!(
+            store.compare_and_advance(None, floor, [0; 16]),
+            Err(GenerationAuthorityErrorV1::InvalidField {
+                field: "anti_rollback_floor.idempotency_key"
+            })
+        );
+        assert_eq!(store.load([0x5a; 16]), Ok(None));
+    }
+
+    #[test]
+    fn in_memory_anti_rollback_floor_allows_exactly_one_same_base_publisher() {
+        let store = std::sync::Arc::new(InMemoryAntiRollbackFloorStoreV1::new());
+        let genesis = authority_reference(1, None);
+        let floor = AuthorityFloorV1::new([0x5a; 16], genesis).expect("valid floor");
+        let results = std::thread::scope(|scope| {
+            let handles = (1..=8)
+                .map(|key_byte| {
+                    let store = std::sync::Arc::clone(&store);
+                    scope.spawn(move || store.compare_and_advance(None, floor, [key_byte; 16]))
+                })
+                .collect::<Vec<_>>();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().expect("publisher thread must not panic"))
+                .collect::<Vec<_>>()
+        });
+        let successful = results
+            .into_iter()
+            .filter_map(Result::ok)
+            .collect::<Vec<_>>();
+        assert_eq!(successful.len(), 1, "exactly one empty-base CAS may win");
+        assert_eq!(successful[0].cas_version, 1);
+        assert_eq!(store.load([0x5a; 16]), Ok(Some(successful[0])));
+    }
+
+    #[test]
+    fn authority_reference_fingerprint_uses_its_full_domain_separator() {
+        let genesis = authority_reference(1, None);
+        let bytes = genesis.canonical_bytes();
+        assert_eq!(&bytes[..9], b"FSAUTHREF");
+        assert_eq!(bytes.len(), 108);
+        assert_ne!(genesis.fingerprint(), [0; 32]);
+    }
+
+    #[test]
+    fn authority_reference_codec_round_trips_and_rejects_noncanonical_forms() {
+        let genesis = authority_reference(1, None);
+        let successor = authority_reference(2, Some(genesis.fingerprint()));
+        assert_eq!(
+            AuthorityRefV1::from_canonical_bytes(&successor.canonical_bytes())
+                .expect("decode successor authority reference"),
+            successor
+        );
+
+        let mut noncanonical_genesis = genesis.canonical_bytes();
+        noncanonical_genesis[76] = 1;
+        assert_eq!(
+            AuthorityRefV1::from_canonical_bytes(&noncanonical_genesis),
+            Err(GenerationAuthorityErrorV1::NonCanonicalPadding),
+            "absent predecessors have a single all-zero representation"
+        );
+
+        let mut future_schema = successor.canonical_bytes();
+        future_schema[9..11].copy_from_slice(&(GENERATION_AUTHORITY_SCHEMA_V1 + 1).to_be_bytes());
+        assert_eq!(
+            AuthorityRefV1::from_canonical_bytes(&future_schema),
+            Err(GenerationAuthorityErrorV1::InvalidField {
+                field: "authority_ref.schema_version"
+            }),
+            "a self-consistent but unknown authority schema fails closed"
+        );
+        assert!(
+            AuthorityRefV1::from_canonical_bytes(&successor.canonical_bytes()[..99]).is_err(),
+            "truncated authority references never decode"
+        );
+    }
+
+    #[test]
+    fn authority_reference_never_rolls_over_its_sequence() {
+        assert_eq!(authority_reference(1, None).next_sequence(), Ok(2));
+        let terminal =
+            AuthorityRefV1::new(u64::MAX, [0x81; 16], 4_096, [0x82; 32], Some([0x83; 32]))
+                .expect("terminal authority reference remains decodable");
+        assert_eq!(
+            terminal.next_sequence(),
+            Err(GenerationAuthorityErrorV1::SequenceExhausted),
+            "terminal authority state must not wrap into an earlier generation"
         );
     }
 
@@ -3893,6 +5108,14 @@ mod tests {
             ActivationManifestV1::from_canonical_bytes(&bytes[..bytes.len() - 1]).is_err(),
             "a truncated self-seal must fail before selecting the manifest"
         );
+        let oversized = vec![0; GENERATION_ACTIVATION_MANIFEST_MAX_BYTES_V1 + 1];
+        assert_eq!(
+            ActivationManifestV1::from_canonical_bytes(&oversized),
+            Err(GenerationAuthorityErrorV1::InvalidField {
+                field: "activation_manifest.canonical_bytes"
+            }),
+            "the manifest ceiling is enforced before decode"
+        );
 
         let mut future = manifest;
         future.schema_version = GENERATION_AUTHORITY_SCHEMA_V1 + 1;
@@ -3904,6 +5127,19 @@ mod tests {
             }),
             "a self-consistent future schema still fails closed"
         );
+    }
+
+    #[test]
+    fn activation_manifest_rejects_every_single_byte_mutation() {
+        let encoded = activation_manifest(1, None).canonical_bytes();
+        for byte_index in 0..encoded.len() {
+            let mut mutated = encoded.clone();
+            mutated[byte_index] ^= 0x80;
+            assert!(
+                ActivationManifestV1::from_canonical_bytes(&mutated).is_err(),
+                "single-byte mutation at offset {byte_index} must never decode"
+            );
+        }
     }
 
     #[test]
@@ -3931,6 +5167,37 @@ mod tests {
             Err(GenerationAuthorityErrorV1::BrokenPredecessorLink),
             "an activation manifest may not skip an authority sequence"
         );
+    }
+
+    #[test]
+    fn rollback_uses_a_new_authority_without_reusing_artifact_identity() {
+        let genesis = activation_manifest(1, None);
+        let (genesis_len, genesis_sha256) = genesis.object_receipt();
+        let first = AuthorityRefV1::new(1, [0x41; 16], genesis_len, genesis_sha256, None)
+            .expect("first authority reference");
+        let second = AuthorityRefV1::new(
+            2,
+            [0x42; 16],
+            genesis_len,
+            genesis_sha256,
+            Some(first.fingerprint()),
+        )
+        .expect("second authority reference");
+        let rollback = ActivationManifestV1::new(
+            3,
+            Some(second),
+            GenerationAuthorityActionV1::Rollback,
+            ArtifactGenerationIdentityV1::new(7, [0x21; 16]).expect("reselected generation"),
+            [0x31; 32],
+            [0x32; 32],
+            [0x33; 32],
+            component_receipts(),
+        )
+        .expect("higher-authority rollback is canonical");
+        assert_eq!(rollback.authority_sequence, 3);
+        assert_eq!(rollback.generation.sequence, 7);
+        assert_eq!(rollback.action, GenerationAuthorityActionV1::Rollback);
+        rollback.validate().expect("rollback self-seal validates");
     }
 
     #[test]

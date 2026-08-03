@@ -25,6 +25,11 @@ use rustix::fs::{
 };
 use rustix::io::{FdFlags, fcntl_getfd, fcntl_setfd};
 use rustix::process::geteuid;
+#[cfg(target_os = "linux")]
+use rustix::process::{
+    Pid, Signal, WaitId, WaitIdOptions, child_subreaper, getpid, kill_process_group, pidfd_open,
+    pidfd_send_signal, set_child_subreaper, waitid,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -50,7 +55,14 @@ use crate::{PerfCellApplicability, PerfCellApplicabilityReason};
 const PRODUCER_CONTRACT_SCHEMA_VERSION: &str =
     "frankensearch.quill-local-perf-producer-contract.v1";
 /// Strict wire schema for one local-run process-attempt receipt.
-pub const LOCAL_PERF_ATTEMPT_RECEIPT_SCHEMA_VERSION: &str = "frankensearch.perf-runner-attempt.v5";
+pub const LOCAL_PERF_ATTEMPT_RECEIPT_SCHEMA_VERSION: &str = "frankensearch.perf-runner-attempt.v10";
+/// Strict wire schema for the post-unlock lease-release receipt.
+pub const LOCAL_PERF_LEASE_RELEASE_RECEIPT_SCHEMA_VERSION: &str =
+    "frankensearch.perf-runner-lease-release.v1";
+/// Strict wire schema for the pre-build host-global booking receipt.
+pub const LOCAL_PERF_BOOKING_RECEIPT_SCHEMA_VERSION: &str = "frankensearch.perf-runner-booking.v1";
+/// Strict schema for the diagnostic inventory retained before runner completion.
+pub const PERF_RUN_PRECOMMIT_SCHEMA_VERSION: &str = "frankensearch.perf-run-precommit.v5";
 const MAX_IDENTITY_COMPONENT_BYTES: usize = 96;
 const MAX_OUTPUT_COMPONENT_BYTES: usize = 128;
 const MIN_MEASUREMENT_RUNS: usize = 10;
@@ -117,6 +129,9 @@ impl LocalPerfRunSelection {
 /// Files emitted after a successful self-verifying finalization.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LocalPerfRunOutput {
+    /// Exact strict receipt that records the exclusive pre-build resource
+    /// booking for this invocation.
+    pub booking_receipt: PathBuf,
     /// Exact child log.
     pub run_log: PathBuf,
     /// Exact canonical compact artifact manifest.
@@ -129,6 +144,9 @@ pub struct LocalPerfRunOutput {
     /// SHA-256 of [`Self::bound_evidence`], while every failed attempt returns
     /// this same schema through [`LocalPerfRunError::AttemptFailed`].
     pub attempt_receipt: PathBuf,
+    /// Exact strict receipt emitted only after the held benchmark lease was
+    /// explicitly unlocked following durable attempt/evidence publication.
+    pub lease_release_receipt: PathBuf,
     /// Exact raw threshold artifact named by the runner artifact manifest.
     pub threshold_artifact: PathBuf,
     /// Exact pre-binding evidence artifact named by the runner manifest.
@@ -149,6 +167,18 @@ pub struct LocalPerfRunOutput {
 /// and the pre-commit inventory.
 #[derive(Debug, Error)]
 pub enum LocalPerfRunError {
+    /// The exclusive lease was acquired but its pre-build booking receipt could
+    /// not be durably published. No benchmark child was started.
+    #[error(
+        "local performance runner could not durably publish booking receipt at {}: {detail}",
+        receipt_path.display()
+    )]
+    BookingReceiptUnavailable {
+        /// Intended booking-receipt path; it may be absent or nondurable.
+        receipt_path: PathBuf,
+        /// Bounded non-secret publication diagnostic.
+        detail: String,
+    },
     /// Filesystem or process I/O failed.
     #[error("local performance runner I/O failed: {0}")]
     Io(#[from] std::io::Error),
@@ -166,12 +196,15 @@ pub enum LocalPerfRunError {
     Invalid(String),
     /// A measured child attempt reached a durable typed terminal receipt.
     #[error(
-        "local performance runner attempt ended as {outcome:?}; sealed receipt preserved at {}",
-        receipt_path.display()
+        "local performance runner attempt ended as {outcome:?}; sealed receipt preserved at {} and post-unlock release receipt at {}",
+        receipt_path.display(),
+        lease_release_receipt.display()
     )]
     AttemptFailed {
         /// Exact canonical attempt-receipt path.
         receipt_path: PathBuf,
+        /// Exact post-unlock lease-release receipt path.
+        lease_release_receipt: PathBuf,
         /// Typed terminal outcome preserved in the receipt.
         outcome: LocalPerfAttemptOutcome,
     },
@@ -190,6 +223,19 @@ pub enum LocalPerfRunError {
         /// Bounded non-secret publication diagnostic.
         detail: String,
     },
+    /// The final attempt/evidence pair was durable and the host-global lease
+    /// was released, but no durable post-release receipt could be published.
+    /// The caller receives no successful output and must not promote the run.
+    #[error(
+        "local performance runner released its lease but could not durably publish the release receipt at {}: {detail}",
+        receipt_path.display()
+    )]
+    LeaseReleaseReceiptUnavailable {
+        /// Intended release-receipt path; it may be absent or nondurable.
+        receipt_path: PathBuf,
+        /// Bounded non-secret publication diagnostic.
+        detail: String,
+    },
     /// `wait` failed and the bounded force-kill/reap recovery could not prove
     /// a terminal status. No terminal attempt receipt is emitted while the
     /// child might still mutate its log.
@@ -202,11 +248,23 @@ pub enum LocalPerfRunError {
         /// Error or bounded-deadline classification from kill/reap recovery.
         recovery_error_kind: LocalPerfIoErrorKind,
     },
+    /// The direct child exited, but bounded descendant reconciliation could
+    /// not establish that the contained benchmark tree was terminal. No
+    /// attempt receipt is emitted while a descendant might still mutate logs
+    /// or artifacts.
+    #[error(
+        "local performance runner could not prove descendant-tree quiescence after direct-child reap: {error_kind:?}"
+    )]
+    UnreapedProcessTree {
+        /// Bounded descendant reconciliation failure class.
+        error_kind: LocalPerfIoErrorKind,
+    },
 }
 
 #[derive(Debug)]
 struct CapturedBuild {
     receipt: RunnerBuild,
+    booking_receipt_sha256: String,
     revision: String,
     command: Vec<OsString>,
     measurement_environment: BTreeMap<OsString, OsString>,
@@ -238,10 +296,20 @@ struct LocalPerfProducerContract {
     producer: RunnerProducer,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct LeaseFileIdentity {
     device: String,
     inode: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LocalPerfBookingStorageSlots {
+    output_parent: LeaseFileIdentity,
+    target_directory: LeaseFileIdentity,
+    run_directory: LeaseFileIdentity,
+    artifact_directory: LeaseFileIdentity,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -367,6 +435,8 @@ pub enum LocalPerfRejectionStage {
     ExitStatusPersistence,
     FinishedTimestamp,
     EndPlatformCapture,
+    RootProcessIdentity,
+    ProcessTreeQuiescence,
     PostRunIdentity,
     ArtifactRead,
     ArtifactDurability,
@@ -421,6 +491,72 @@ pub struct LocalPerfProcessLifecycle {
     child_reaped: bool,
     run_log_synced: bool,
     run_log_captured: bool,
+    process_group_recovery: LocalPerfProcessGroupRecovery,
+    process_tree_quiescence: LocalPerfProcessTreeQuiescence,
+    descendant_processes_observed: u32,
+}
+
+/// Exact bounded recovery action after an OS wait failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LocalPerfProcessGroupRecovery {
+    /// No wait recovery was needed for this attempt.
+    NotRequired,
+    /// A revalidated dedicated child group received SIGKILL before reaping.
+    SignaledOwnedGroup,
+    /// Group identity was unavailable or changed, so only the owned child
+    /// handle received the bounded fallback signal.
+    DirectChildFallback,
+}
+
+/// Process-tree authority available from one local producer attempt.
+///
+/// The current runner owns and reaps only the direct child it spawned. It
+/// cannot infer descendant completion from that fact because descendants may
+/// outlive or be reparented after the direct child exits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LocalPerfProcessTreeQuiescence {
+    /// Only direct-child completion is available on this platform or attempt.
+    DirectChildOnly,
+    /// Linux child-subreaper containment observed no descendants after the
+    /// direct child reached a terminal state.
+    LinuxSubreaperVerifiedEmpty,
+    /// Linux child-subreaper containment found escaped descendants, terminated
+    /// them by pidfd, and reaped their terminal states. This rejects promotion:
+    /// the direct child's success did not delimit the measured process tree.
+    LinuxSubreaperReapedEscapedDescendants,
+}
+
+/// Root-process authority retained by a local producer attempt.
+///
+/// A PID on its own is never authority to signal a later process: Linux can
+/// reuse it after the original child exits. The only verified form therefore
+/// binds that PID to both a dedicated child-led process group and the kernel's
+/// `/proc/<pid>/stat` start-time tick captured immediately after spawn. Other
+/// platforms and failed captures are retained as an explicit absence, which
+/// rejects completed receipt publication.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum LocalPerfRootProcessIdentity {
+    /// `Command::spawn` did not return a child PID.
+    NotSpawned,
+    /// Linux PID, dedicated process group, and kernel-reported birth tick.
+    LinuxProcStartTime {
+        pid: u32,
+        process_group_id: u32,
+        start_time_ticks: u64,
+    },
+    /// A child was spawned, but no birth identity was safely captured.
+    Unverifiable { pid: u32 },
+}
+
+impl LocalPerfRootProcessIdentity {
+    /// Whether this value binds a PID to a non-reusable process birth identity.
+    #[must_use]
+    pub const fn has_verified_birth_identity(self) -> bool {
+        matches!(self, Self::LinuxProcStartTime { .. })
+    }
 }
 
 // This public contract is consumed by the dependent H4 assembler slice; keep
@@ -462,6 +598,34 @@ impl LocalPerfProcessLifecycle {
     #[must_use]
     pub const fn run_log_captured(self) -> bool {
         self.run_log_captured
+    }
+
+    /// Exact wait-error recovery authority observed by this receipt.
+    #[must_use]
+    pub const fn process_group_recovery(self) -> LocalPerfProcessGroupRecovery {
+        self.process_group_recovery
+    }
+
+    /// Return the strongest process-tree conclusion this receipt can prove.
+    #[must_use]
+    pub const fn process_tree_quiescence(self) -> LocalPerfProcessTreeQuiescence {
+        self.process_tree_quiescence
+    }
+
+    /// Whether this receipt proves every descendant reached a terminal state.
+    #[must_use]
+    pub const fn descendant_process_tree_quiescence_is_proven(self) -> bool {
+        matches!(
+            self.process_tree_quiescence,
+            LocalPerfProcessTreeQuiescence::LinuxSubreaperVerifiedEmpty
+        )
+    }
+
+    /// Number of descendants seen after the direct child reached a terminal
+    /// state. A completed receipt requires this to remain zero.
+    #[must_use]
+    pub const fn descendant_processes_observed(self) -> u32 {
+        self.descendant_processes_observed
     }
 }
 
@@ -554,6 +718,8 @@ pub struct LocalPerfAttemptReceipt {
     run_id: String,
     run_window: String,
     registry_sha256: String,
+    lease_file_identity: LeaseFileIdentity,
+    booking_receipt_sha256: String,
     hardware: RunnerHardware,
     execution_request: RunnerExecutionRequest,
     execution_start: RunnerExecutionSnapshot,
@@ -566,6 +732,7 @@ pub struct LocalPerfAttemptReceipt {
     outcome: LocalPerfAttemptOutcome,
     retry: LocalPerfRetryPredicate,
     process_lifecycle: LocalPerfProcessLifecycle,
+    root_process_identity: LocalPerfRootProcessIdentity,
     internal_lifecycle_gaps: LocalPerfInternalLifecycleGaps,
     unsupported_controls: Vec<LocalPerfUnsupportedControl>,
     run_log_sha256: Option<String>,
@@ -576,6 +743,207 @@ pub struct LocalPerfAttemptReceipt {
     finished_at_utc: String,
     finished_timestamp_error: Option<String>,
     seal_sha256: String,
+}
+
+/// Strict, canonical proof that a terminal attempt's host-global lease was
+/// explicitly unlocked only after its sealed attempt receipt published.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LocalPerfLeaseReleaseReceipt {
+    schema_version: String,
+    gate: String,
+    profile: MachineProfileKey,
+    run_id: String,
+    run_window: String,
+    lease_file_identity: LeaseFileIdentity,
+    attempt_receipt_sha256: String,
+    released_at_utc: String,
+    seal_sha256: String,
+}
+
+impl LocalPerfLeaseReleaseReceipt {
+    /// Parse exact canonical bytes and verify their self-seal and provenance.
+    ///
+    /// # Errors
+    ///
+    /// Rejects duplicate or unknown fields, noncanonical JSON, malformed
+    /// lease identity, stale schema, or a modified release receipt.
+    pub fn from_verified_slice(contents: &[u8]) -> Result<Self, LocalPerfRunError> {
+        let probe =
+            crate::machine_class_registry::parse_strict_json(contents).map_err(|error| {
+                LocalPerfRunError::Invalid(format!(
+                    "lease release receipt is not strict JSON: {error}"
+                ))
+            })?;
+        let receipt: Self = serde_json::from_value(probe.clone()).map_err(|error| {
+            LocalPerfRunError::Invalid(format!(
+                "lease release receipt does not decode as the current schema: {error}"
+            ))
+        })?;
+        if probe != serde_json::to_value(&receipt)?
+            || contents != receipt.to_json_bytes()?.as_slice()
+        {
+            return Err(LocalPerfRunError::Invalid(
+                "lease release receipt bytes are not the exact canonical encoding".to_owned(),
+            ));
+        }
+        receipt.verify()?;
+        Ok(receipt)
+    }
+
+    /// Canonical compact JSON bytes used for persistence and exact hashing.
+    ///
+    /// # Errors
+    ///
+    /// Returns a JSON error only if the typed schema stops being encodable.
+    pub fn to_json_bytes(&self) -> Result<Vec<u8>, LocalPerfRunError> {
+        serde_json::to_vec(self).map_err(LocalPerfRunError::from)
+    }
+
+    fn verify(&self) -> Result<(), LocalPerfRunError> {
+        if self.schema_version != LOCAL_PERF_LEASE_RELEASE_RECEIPT_SCHEMA_VERSION
+            || !is_sha256(&self.attempt_receipt_sha256)
+            || !is_sha256(&self.seal_sha256)
+        {
+            return Err(LocalPerfRunError::Invalid(
+                "lease release receipt has an invalid schema or digest".to_owned(),
+            ));
+        }
+        validate_component(&self.run_id, "lease release run ID")?;
+        validate_component(&self.run_window, "lease release run window")?;
+        validate_lease_file_identity(&self.lease_file_identity)?;
+        validate_utc_timestamp(&self.released_at_utc, "lease release")?;
+        let gate = self.gate.parse::<PerfGate>().map_err(|error| {
+            LocalPerfRunError::Invalid(format!(
+                "lease release receipt names an invalid gate: {error}"
+            ))
+        })?;
+        self.profile.latest_basename(gate.label())?;
+        let mut unsigned = self.clone();
+        let expected_seal = unsigned.seal_sha256.clone();
+        unsigned.seal_sha256.clear();
+        if sha256_hex(&serde_json::to_vec(&unsigned)?) != expected_seal {
+            return Err(LocalPerfRunError::Invalid(
+                "lease release receipt content seal does not verify".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+/// Strict, canonical proof of the exclusive resource scope booked before
+/// benchmark compilation and child spawn.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LocalPerfBookingReceipt {
+    schema_version: String,
+    gate: String,
+    profile: MachineProfileKey,
+    run_id: String,
+    run_window: String,
+    fixture_selector: Option<String>,
+    selected_cell_ids: Vec<String>,
+    lease_file_identity: LeaseFileIdentity,
+    worker_fingerprint_sha256: String,
+    effective_cpuset_sha256: String,
+    storage_slots: LocalPerfBookingStorageSlots,
+    source_git_revision: String,
+    cargo_lock_sha256: String,
+    booked_at_utc: String,
+    seal_sha256: String,
+}
+
+impl LocalPerfBookingReceipt {
+    /// Parse exact canonical bytes and verify their self-seal and booking
+    /// identity.
+    ///
+    /// # Errors
+    ///
+    /// Rejects duplicate or unknown fields, noncanonical JSON, stale schema,
+    /// malformed booked resources, or a modified booking receipt.
+    pub fn from_verified_slice(contents: &[u8]) -> Result<Self, LocalPerfRunError> {
+        let probe =
+            crate::machine_class_registry::parse_strict_json(contents).map_err(|error| {
+                LocalPerfRunError::Invalid(format!("booking receipt is not strict JSON: {error}"))
+            })?;
+        let receipt: Self = serde_json::from_value(probe.clone()).map_err(|error| {
+            LocalPerfRunError::Invalid(format!(
+                "booking receipt does not decode as the current schema: {error}"
+            ))
+        })?;
+        if probe != serde_json::to_value(&receipt)?
+            || contents != receipt.to_json_bytes()?.as_slice()
+        {
+            return Err(LocalPerfRunError::Invalid(
+                "booking receipt bytes are not the exact canonical encoding".to_owned(),
+            ));
+        }
+        receipt.verify()?;
+        Ok(receipt)
+    }
+
+    /// Load and independently verify one exact booking receipt.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed I/O or receipt-verification error.
+    pub fn load_verified(path: &Path) -> Result<Self, LocalPerfRunError> {
+        Self::from_verified_slice(&fs::read(path)?)
+    }
+
+    /// Canonical compact JSON bytes used for durable booking persistence.
+    ///
+    /// # Errors
+    ///
+    /// Returns a JSON error only if the typed schema stops being encodable.
+    pub fn to_json_bytes(&self) -> Result<Vec<u8>, LocalPerfRunError> {
+        serde_json::to_vec(self).map_err(LocalPerfRunError::from)
+    }
+
+    fn verify(&self) -> Result<(), LocalPerfRunError> {
+        if self.schema_version != LOCAL_PERF_BOOKING_RECEIPT_SCHEMA_VERSION
+            || !is_sha256(&self.worker_fingerprint_sha256)
+            || !is_sha256(&self.effective_cpuset_sha256)
+            || !is_git_revision(&self.source_git_revision)
+            || !is_sha256(&self.cargo_lock_sha256)
+            || !is_sha256(&self.seal_sha256)
+        {
+            return Err(LocalPerfRunError::Invalid(
+                "booking receipt has an invalid schema or digest".to_owned(),
+            ));
+        }
+        validate_component(&self.run_id, "booking run ID")?;
+        validate_component(&self.run_window, "booking run window")?;
+        validate_lease_file_identity(&self.lease_file_identity)?;
+        validate_booking_storage_slots(&self.storage_slots)?;
+        validate_utc_timestamp(&self.booked_at_utc, "booking")?;
+        let gate = self.gate.parse::<PerfGate>().map_err(|error| {
+            LocalPerfRunError::Invalid(format!("booking receipt names an invalid gate: {error}"))
+        })?;
+        self.profile.latest_basename(gate.label())?;
+        if let Some(fixture) = &self.fixture_selector {
+            validate_fixture_selector_syntax(fixture)?;
+        }
+        if self.selected_cell_ids.is_empty()
+            || self
+                .selected_cell_ids
+                .iter()
+                .any(|cell| cell.is_empty() || cell.trim() != cell || !cell.is_ascii())
+        {
+            return Err(LocalPerfRunError::Invalid(
+                "booking receipt has malformed selected-cell identifiers".to_owned(),
+            ));
+        }
+        let mut unsigned = self.clone();
+        let expected_seal = unsigned.seal_sha256.clone();
+        unsigned.seal_sha256.clear();
+        if sha256_hex(&serde_json::to_vec(&unsigned)?) != expected_seal {
+            return Err(LocalPerfRunError::Invalid(
+                "booking receipt content seal does not verify".to_owned(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 // Same-crate H4 consumption lands separately on the protected train.
@@ -695,6 +1063,70 @@ impl LocalPerfAttemptReceipt {
             )
         })?;
         self.verify_completed_runner_identity(identity)?;
+        Ok(())
+    }
+
+    /// Prove that exact pre-build booking-receipt bytes describe the same
+    /// worker, resource scope, and typed invocation as this attempt.
+    ///
+    /// # Errors
+    ///
+    /// Rejects substituted, noncanonical, or identity-mismatched booking
+    /// evidence, including a booking from another otherwise valid run.
+    pub fn verify_booking_receipt(
+        &self,
+        booking_receipt_bytes: &[u8],
+    ) -> Result<(), LocalPerfRunError> {
+        if sha256_hex(booking_receipt_bytes) != self.booking_receipt_sha256 {
+            return Err(LocalPerfRunError::Invalid(
+                "booking receipt bytes differ from the sealed process receipt".to_owned(),
+            ));
+        }
+        let booking = LocalPerfBookingReceipt::from_verified_slice(booking_receipt_bytes)?;
+        if booking.gate != self.gate
+            || booking.profile != self.profile
+            || booking.run_id != self.run_id
+            || booking.run_window != self.run_window
+            || booking.fixture_selector != self.fixture_selector
+            || booking.selected_cell_ids != self.selected_cell_ids
+            || booking.lease_file_identity != self.lease_file_identity
+            || booking.worker_fingerprint_sha256 != self.hardware.fingerprint_sha256
+            || booking.effective_cpuset_sha256 != self.execution_start.effective_cpuset_sha256
+            || booking.source_git_revision != self.build.git_revision
+            || booking.cargo_lock_sha256 != self.build.cargo_lock_sha256
+        {
+            return Err(LocalPerfRunError::Invalid(
+                "booking receipt identity differs from the sealed process receipt".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Prove that exact post-unlock lease-release receipt bytes name this
+    /// terminal process attempt and were issued no earlier than its finish.
+    ///
+    /// # Errors
+    ///
+    /// Rejects a substituted or noncanonical release receipt, or a receipt
+    /// from another invocation.
+    pub fn verify_lease_release_receipt(
+        &self,
+        lease_release_receipt_bytes: &[u8],
+    ) -> Result<(), LocalPerfRunError> {
+        let release =
+            LocalPerfLeaseReleaseReceipt::from_verified_slice(lease_release_receipt_bytes)?;
+        if release.attempt_receipt_sha256 != self.exact_sha256()?
+            || release.gate != self.gate
+            || release.profile != self.profile
+            || release.run_id != self.run_id
+            || release.run_window != self.run_window
+            || release.lease_file_identity != self.lease_file_identity
+            || release.released_at_utc < self.finished_at_utc
+        {
+            return Err(LocalPerfRunError::Invalid(
+                "lease-release receipt identity differs from the sealed process receipt".to_owned(),
+            ));
+        }
         Ok(())
     }
 
@@ -837,6 +1269,12 @@ impl LocalPerfAttemptReceipt {
         self.process_lifecycle
     }
 
+    /// Root PID/birth identity captured immediately after spawn.
+    #[must_use]
+    pub const fn root_process_identity(&self) -> LocalPerfRootProcessIdentity {
+        self.root_process_identity
+    }
+
     /// Explicit gaps for engine-internal facts the outer runner cannot prove.
     #[must_use]
     pub const fn internal_lifecycle_gaps(&self) -> LocalPerfInternalLifecycleGaps {
@@ -887,6 +1325,7 @@ impl LocalPerfAttemptReceipt {
         if self.schema_version != LOCAL_PERF_ATTEMPT_RECEIPT_SCHEMA_VERSION
             || self.mode != "measurement"
             || self.registry_sha256 != MACHINE_CLASS_REGISTRY_SHA256
+            || !is_sha256(&self.booking_receipt_sha256)
             || self
                 .run_log_sha256
                 .as_deref()
@@ -899,6 +1338,7 @@ impl LocalPerfAttemptReceipt {
         }
         validate_component(&self.run_id, "attempt run ID")?;
         validate_component(&self.run_window, "attempt run window")?;
+        validate_lease_file_identity(&self.lease_file_identity)?;
         let gate = self.gate.parse::<PerfGate>().map_err(|error| {
             LocalPerfRunError::Invalid(format!("attempt receipt names an invalid gate: {error}"))
         })?;
@@ -1049,6 +1489,12 @@ impl LocalPerfAttemptReceipt {
                 self.run_log_sha256.is_some(),
             )
             .is_err()
+            || validate_root_process_identity(
+                self.outcome,
+                self.process_lifecycle,
+                self.root_process_identity,
+            )
+            .is_err()
             || self.internal_lifecycle_gaps != expected_gaps
             || self.unsupported_controls
                 != [
@@ -1177,6 +1623,58 @@ fn run_local_perf_command_inner(
     let producer_before = capture_validated_producer(&source_before)?;
     let run_directories = create_run_directories(config, &external_paths.output_parent)?;
     let artifact_dir = benchmark_artifact_directory_path(&run_directories.artifacts)?;
+    let booking_receipt_name = format!("{}.booking.json", config.gate.label());
+    let booking_receipt_path = config.output_dir.join(&booking_receipt_name);
+    let booking_platform = capture_platform(config)?;
+    let booking_receipt_bytes = utc_now()
+        .and_then(|booked_at_utc| {
+            booking_receipt_bytes(
+                config,
+                &run_selection,
+                &lease_identity,
+                &booking_platform,
+                &external_paths,
+                &run_directories,
+                &source_before,
+                &booked_at_utc,
+            )
+        })
+        .map_err(|error| LocalPerfRunError::BookingReceiptUnavailable {
+            receipt_path: booking_receipt_path.clone(),
+            detail: bounded_diagnostic(&error),
+        })?;
+    write_new_sync_at(
+        &run_directories.run.handle,
+        &booking_receipt_name,
+        &booking_receipt_bytes,
+    )
+    .and_then(|()| {
+        run_directories
+            .run
+            .handle
+            .sync_all()
+            .map_err(LocalPerfRunError::from)
+    })
+    .map_err(|error| LocalPerfRunError::BookingReceiptUnavailable {
+        receipt_path: booking_receipt_path.clone(),
+        detail: bounded_diagnostic(&error),
+    })?;
+    let persisted_booking = read_file_at(&run_directories.run.handle, &booking_receipt_name)
+        .map_err(|error| LocalPerfRunError::BookingReceiptUnavailable {
+            receipt_path: booking_receipt_path.clone(),
+            detail: bounded_diagnostic(&error),
+        })?;
+    if persisted_booking != booking_receipt_bytes {
+        return Err(LocalPerfRunError::BookingReceiptUnavailable {
+            receipt_path: booking_receipt_path,
+            detail: "persisted booking receipt bytes differ from the sealed publication".to_owned(),
+        });
+    }
+    LocalPerfBookingReceipt::load_verified(&config.output_dir.join(&booking_receipt_name))
+        .map_err(|error| LocalPerfRunError::BookingReceiptUnavailable {
+            receipt_path: config.output_dir.join(&booking_receipt_name),
+            detail: bounded_diagnostic(&error),
+        })?;
     let environments = controlled_environments(
         config,
         &run_selection,
@@ -1188,6 +1686,7 @@ fn run_local_perf_command_inner(
         &source_before,
         &producer_before,
         &external_paths.target,
+        sha256_hex(&booking_receipt_bytes),
         environments,
     )?;
 
@@ -1228,6 +1727,7 @@ fn run_local_perf_command_inner(
     let run_log = create_new_file_at(&run_directories.run.handle, "run.log")?;
     let run_log_sync = run_log.try_clone()?;
     let run_log_stderr = run_log.try_clone()?;
+    let mut descendant_scope = LocalPerfDescendantScope::enter()?;
     let mut child = Command::new(descriptor_path(&captured_build.executable)?);
     child
         .arg0(&captured_build.command[0])
@@ -1236,9 +1736,13 @@ fn run_local_perf_command_inner(
         .stdout(Stdio::from(run_log))
         .stderr(Stdio::from(run_log_stderr));
     configure_benchmark_child(&mut child, &captured_build.measurement_environment);
-    let mut child = match child.spawn() {
-        Ok(child) => child,
+    let (mut child, root_process_identity) = match child.spawn() {
+        Ok(child) => {
+            let root_process_identity = capture_root_process_identity(&child);
+            (child, root_process_identity)
+        }
         Err(error) => {
+            descendant_scope.restore()?;
             let run_log_synced = run_log_sync.sync_all().is_ok();
             let run_log_bytes = read_file_at(&run_directories.run.handle, "run.log").ok();
             let _ = write_new_sync_at(
@@ -1256,6 +1760,9 @@ fn run_local_perf_command_inner(
                 child_reaped: false,
                 run_log_synced,
                 run_log_captured: run_log_bytes.is_some(),
+                process_group_recovery: LocalPerfProcessGroupRecovery::NotRequired,
+                process_tree_quiescence: LocalPerfProcessTreeQuiescence::DirectChildOnly,
+                descendant_processes_observed: 0,
             };
             let attempt_path = write_failed_attempt_receipt(
                 config,
@@ -1267,23 +1774,31 @@ fn run_local_perf_command_inner(
                 &producer_before,
                 &external_paths,
                 &start,
+                &lease_identity,
                 outcome,
                 process_lifecycle,
+                LocalPerfRootProcessIdentity::NotSpawned,
                 run_log_bytes.as_deref(),
                 &started_at_utc,
             )?;
-            return Err(LocalPerfRunError::AttemptFailed {
-                receipt_path: attempt_path,
+            return Err(failed_attempt_error_after_release(
+                config,
+                &lease_file,
+                &lease_identity,
+                &run_directories,
+                attempt_path,
                 outcome,
-            });
+            )?);
         }
     };
-    let (status, recovered_wait_error) = match child.wait() {
-        Ok(status) => (status, None),
+    let (status, recovered_wait_error, process_group_recovery) = match child.wait() {
+        Ok(status) => (status, None, LocalPerfProcessGroupRecovery::NotRequired),
         Err(error) => {
             let wait_error_kind = local_perf_io_error_kind(&error);
-            match force_kill_and_reap(&mut child) {
-                Ok(status) => (status, Some(wait_error_kind)),
+            match force_kill_and_reap(&mut child, root_process_identity) {
+                Ok((status, process_group_recovery)) => {
+                    (status, Some(wait_error_kind), process_group_recovery)
+                }
                 Err(recovery_error_kind) => {
                     return Err(LocalPerfRunError::UnreapedChild {
                         wait_error_kind,
@@ -1293,6 +1808,10 @@ fn run_local_perf_command_inner(
             }
         }
     };
+    let (process_tree_quiescence, descendant_processes_observed) =
+        LocalPerfDescendantScope::reconcile_after_root_exit()
+            .map_err(|error_kind| LocalPerfRunError::UnreapedProcessTree { error_kind })?;
+    descendant_scope.restore()?;
     let run_log_synced = run_log_sync.sync_all().is_ok();
     let run_log_result = read_file_at(&run_directories.run.handle, "run.log");
     let process_lifecycle = LocalPerfProcessLifecycle {
@@ -1302,6 +1821,9 @@ fn run_local_perf_command_inner(
         child_reaped: true,
         run_log_synced,
         run_log_captured: run_log_result.is_ok(),
+        process_group_recovery,
+        process_tree_quiescence,
+        descendant_processes_observed,
     };
     if !run_log_synced {
         let outcome = LocalPerfAttemptOutcome::PostExitRejected {
@@ -1317,15 +1839,21 @@ fn run_local_perf_command_inner(
             &producer_before,
             &external_paths,
             &start,
+            &lease_identity,
             outcome,
             process_lifecycle,
+            root_process_identity,
             run_log_result.as_deref().ok(),
             &started_at_utc,
         )?;
-        return Err(LocalPerfRunError::AttemptFailed {
-            receipt_path: attempt_path,
+        return Err(failed_attempt_error_after_release(
+            config,
+            &lease_file,
+            &lease_identity,
+            &run_directories,
+            attempt_path,
             outcome,
-        });
+        )?);
     }
     let run_log_bytes = match run_log_result {
         Ok(bytes) => bytes,
@@ -1343,15 +1871,21 @@ fn run_local_perf_command_inner(
                 &producer_before,
                 &external_paths,
                 &start,
+                &lease_identity,
                 outcome,
                 process_lifecycle,
+                root_process_identity,
                 None,
                 &started_at_utc,
             )?;
-            return Err(LocalPerfRunError::AttemptFailed {
-                receipt_path: attempt_path,
+            return Err(failed_attempt_error_after_release(
+                config,
+                &lease_file,
+                &lease_identity,
+                &run_directories,
+                attempt_path,
                 outcome,
-            });
+            )?);
         }
     };
     let exit_code = status.code().map_or(-1, i64::from);
@@ -1375,15 +1909,21 @@ fn run_local_perf_command_inner(
             &producer_before,
             &external_paths,
             &start,
+            &lease_identity,
             outcome,
             process_lifecycle,
+            root_process_identity,
             Some(&run_log_bytes),
             &started_at_utc,
         )?;
-        return Err(LocalPerfRunError::AttemptFailed {
-            receipt_path: attempt_path,
+        return Err(failed_attempt_error_after_release(
+            config,
+            &lease_file,
+            &lease_identity,
+            &run_directories,
+            attempt_path,
             outcome,
-        });
+        )?);
     }
     if let Some(error_kind) = recovered_wait_error {
         let outcome = LocalPerfAttemptOutcome::WaitRecoveredByKill { error_kind };
@@ -1397,15 +1937,21 @@ fn run_local_perf_command_inner(
             &producer_before,
             &external_paths,
             &start,
+            &lease_identity,
             outcome,
             process_lifecycle,
+            root_process_identity,
             Some(&run_log_bytes),
             &started_at_utc,
         )?;
-        return Err(LocalPerfRunError::AttemptFailed {
-            receipt_path: attempt_path,
+        return Err(failed_attempt_error_after_release(
+            config,
+            &lease_file,
+            &lease_identity,
+            &run_directories,
+            attempt_path,
             outcome,
-        });
+        )?);
     }
     if !status.success() {
         let outcome = status.code().map_or_else(
@@ -1430,15 +1976,21 @@ fn run_local_perf_command_inner(
             &producer_before,
             &external_paths,
             &start,
+            &lease_identity,
             outcome,
             process_lifecycle,
+            root_process_identity,
             Some(&run_log_bytes),
             &started_at_utc,
         )?;
-        return Err(LocalPerfRunError::AttemptFailed {
-            receipt_path: attempt_path,
+        return Err(failed_attempt_error_after_release(
+            config,
+            &lease_file,
+            &lease_identity,
+            &run_directories,
+            attempt_path,
             outcome,
-        });
+        )?);
     }
 
     let post_exit_rejection = |stage| -> Result<LocalPerfRunError, LocalPerfRunError> {
@@ -1453,16 +2005,27 @@ fn run_local_perf_command_inner(
             &producer_before,
             &external_paths,
             &start,
+            &lease_identity,
             outcome,
             process_lifecycle,
+            root_process_identity,
             Some(&run_log_bytes),
             &started_at_utc,
         )?;
-        Ok(LocalPerfRunError::AttemptFailed {
+        failed_attempt_error_after_release(
+            config,
+            &lease_file,
+            &lease_identity,
+            &run_directories,
             receipt_path,
             outcome,
-        })
+        )
     };
+    if !process_lifecycle.descendant_process_tree_quiescence_is_proven() {
+        return Err(post_exit_rejection(
+            LocalPerfRejectionStage::ProcessTreeQuiescence,
+        )?);
+    }
     let end = match capture_platform(config) {
         Ok(end) => end,
         Err(_) => {
@@ -1471,6 +2034,11 @@ fn run_local_perf_command_inner(
             )?);
         }
     };
+    if !root_process_identity.has_verified_birth_identity() {
+        return Err(post_exit_rejection(
+            LocalPerfRejectionStage::RootProcessIdentity,
+        )?);
+    }
     let finished_at_utc = match utc_now() {
         Ok(timestamp) => timestamp,
         Err(_) => {
@@ -1663,7 +2231,7 @@ fn run_local_perf_command_inner(
         .join(format!("{}.bound.evidence.json", config.gate.label()));
     let inventory_path = config.output_dir.join("PRECOMMIT.json");
     let inventory = PrecommitInventory {
-        schema_version: "frankensearch.perf-run-precommit.v5".to_owned(),
+        schema_version: PERF_RUN_PRECOMMIT_SCHEMA_VERSION.to_owned(),
         gate: config.gate.label().to_owned(),
         profile: config.profile,
         execution_capacity: run_profile.execution_capacity,
@@ -1698,8 +2266,11 @@ fn run_local_perf_command_inner(
         &captured_build,
         &start,
         &end,
+        &lease_identity,
         &bound_evidence_bytes,
         &run_log_bytes,
+        process_lifecycle,
+        root_process_identity,
         &started_at_utc,
         &finished_at_utc,
     ) {
@@ -1897,13 +2468,22 @@ fn run_local_perf_command_inner(
         });
     }
 
+    let release_receipt_path = publish_terminal_lease_release_receipt(
+        config,
+        &lease_file,
+        &lease_identity,
+        &run_directories,
+        &completed_attempt_bytes,
+    )?;
     drop(lease_file);
     Ok(LocalPerfRunOutput {
+        booking_receipt: booking_receipt_path,
         run_log: run_log_path,
         artifact_manifest: manifest_path,
         environment_policy: environment_policy_path,
         runner_receipt: receipt_path,
         attempt_receipt: attempt_receipt_path,
+        lease_release_receipt: release_receipt_path,
         threshold_artifact: threshold_path,
         prebinding_evidence: prebinding_evidence_path,
         bound_evidence: bound_evidence_path,
@@ -3064,6 +3644,7 @@ fn prepare_benchmark(
     source_before: &CleanSourceSnapshot,
     producer_before: &ExecutingProducer,
     target: &PinnedDirectory,
+    booking_receipt_sha256: String,
     environments: ControlledEnvironments,
 ) -> Result<CapturedBuild, LocalPerfRunError> {
     verify_pinned_directory(target)?;
@@ -3186,6 +3767,7 @@ fn prepare_benchmark(
             environment_sha256: environments.policy_sha256,
             producer: producer_after,
         },
+        booking_receipt_sha256,
         revision: source_after.revision,
         command,
         measurement_environment: environments.measurement,
@@ -3293,7 +3875,7 @@ fn verify_benchmark_path(
 }
 
 fn configure_benchmark_child(child: &mut Command, environment: &BTreeMap<OsString, OsString>) {
-    child.env_clear().envs(environment);
+    child.env_clear().envs(environment).process_group(0);
 }
 
 fn capture_platform(config: &LocalPerfRunConfig) -> Result<PlatformCapture, LocalPerfRunError> {
@@ -3401,6 +3983,51 @@ fn checked_lease_identity(lease_file: &impl AsFd) -> Result<LeaseFileIdentity, L
         device: stat.st_dev.to_string(),
         inode: stat.st_ino.to_string(),
     })
+}
+
+fn receipt_file_identity(identity: &FileIdentity) -> LeaseFileIdentity {
+    LeaseFileIdentity {
+        device: identity.device.to_string(),
+        inode: identity.inode.to_string(),
+    }
+}
+
+fn booking_storage_slots(
+    external_paths: &ExternalRunPaths,
+    run_directories: &RunDirectories,
+) -> LocalPerfBookingStorageSlots {
+    LocalPerfBookingStorageSlots {
+        output_parent: receipt_file_identity(&external_paths.output_parent.identity),
+        target_directory: receipt_file_identity(&external_paths.target.identity),
+        run_directory: receipt_file_identity(&run_directories.run.identity),
+        artifact_directory: receipt_file_identity(&run_directories.artifacts.identity),
+    }
+}
+
+fn validate_booking_storage_slots(
+    slots: &LocalPerfBookingStorageSlots,
+) -> Result<(), LocalPerfRunError> {
+    for identity in [
+        &slots.output_parent,
+        &slots.target_directory,
+        &slots.run_directory,
+        &slots.artifact_directory,
+    ] {
+        validate_lease_file_identity(identity)?;
+    }
+    Ok(())
+}
+
+fn validate_lease_file_identity(identity: &LeaseFileIdentity) -> Result<(), LocalPerfRunError> {
+    for (label, value) in [("device", &identity.device), ("inode", &identity.inode)] {
+        if value.is_empty() || value.len() > 20 || !value.bytes().all(|byte| byte.is_ascii_digit())
+        {
+            return Err(LocalPerfRunError::Invalid(format!(
+                "attempt receipt lease {label} identity is not a bounded decimal value"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn verify_family_lease_path(
@@ -4086,8 +4713,10 @@ fn write_failed_attempt_receipt(
     producer: &ExecutingProducer,
     paths: &ExternalRunPaths,
     start: &PlatformCapture,
+    lease_file_identity: &LeaseFileIdentity,
     outcome: LocalPerfAttemptOutcome,
     process_lifecycle: LocalPerfProcessLifecycle,
+    root_process_identity: LocalPerfRootProcessIdentity,
     run_log_bytes: Option<&[u8]>,
     started_at_utc: &str,
 ) -> Result<PathBuf, LocalPerfRunError> {
@@ -4159,6 +4788,7 @@ fn write_failed_attempt_receipt(
         directories,
         build,
         start,
+        lease_file_identity,
         execution_end,
         end_capture_error,
         post_run_identity_verified,
@@ -4166,6 +4796,7 @@ fn write_failed_attempt_receipt(
         outcome,
         run_selection,
         process_lifecycle,
+        root_process_identity,
         run_log_bytes,
         None,
         started_at_utc,
@@ -4179,6 +4810,38 @@ fn write_failed_attempt_receipt(
     })
 }
 
+fn failed_attempt_error_after_release(
+    config: &LocalPerfRunConfig,
+    lease_file: &OwnedFd,
+    lease_file_identity: &LeaseFileIdentity,
+    directories: &RunDirectories,
+    receipt_path: PathBuf,
+    outcome: LocalPerfAttemptOutcome,
+) -> Result<LocalPerfRunError, LocalPerfRunError> {
+    let receipt_name = format!("{}.attempt.json", config.gate.label());
+    let attempt_receipt_bytes =
+        read_file_at(&directories.run.handle, &receipt_name).map_err(|error| {
+            LocalPerfRunError::LeaseReleaseReceiptUnavailable {
+                receipt_path: config
+                    .output_dir
+                    .join(format!("{}.lease-release.json", config.gate.label())),
+                detail: bounded_diagnostic(&error),
+            }
+        })?;
+    let lease_release_receipt = publish_terminal_lease_release_receipt(
+        config,
+        lease_file,
+        lease_file_identity,
+        directories,
+        &attempt_receipt_bytes,
+    )?;
+    Ok(LocalPerfRunError::AttemptFailed {
+        receipt_path,
+        lease_release_receipt,
+        outcome,
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn completed_attempt_receipt_bytes(
     config: &LocalPerfRunConfig,
@@ -4188,8 +4851,11 @@ fn completed_attempt_receipt_bytes(
     build: &CapturedBuild,
     start: &PlatformCapture,
     end: &PlatformCapture,
+    lease_file_identity: &LeaseFileIdentity,
     bound_evidence_bytes: &[u8],
     run_log_bytes: &[u8],
+    process_lifecycle: LocalPerfProcessLifecycle,
+    root_process_identity: LocalPerfRootProcessIdentity,
     started_at_utc: &str,
     finished_at_utc: &str,
 ) -> Result<Vec<u8>, LocalPerfRunError> {
@@ -4230,20 +4896,15 @@ fn completed_attempt_receipt_bytes(
         durability,
         build,
         start,
+        lease_file_identity,
         Some(end.snapshot.clone()),
         None,
         true,
         None,
         LocalPerfAttemptOutcome::Completed,
         run_selection,
-        LocalPerfProcessLifecycle {
-            spawn_attempted: true,
-            spawn_succeeded: true,
-            wait_completed: true,
-            child_reaped: true,
-            run_log_synced: true,
-            run_log_captured: true,
-        },
+        process_lifecycle,
+        root_process_identity,
         Some(run_log_bytes),
         Some(bound_evidence_bytes),
         started_at_utc,
@@ -4260,6 +4921,7 @@ fn persist_attempt_receipt(
     directories: &RunDirectories,
     build: &CapturedBuild,
     start: &PlatformCapture,
+    lease_file_identity: &LeaseFileIdentity,
     execution_end: Option<RunnerExecutionSnapshot>,
     end_capture_error: Option<String>,
     post_run_identity_verified: bool,
@@ -4267,6 +4929,7 @@ fn persist_attempt_receipt(
     outcome: LocalPerfAttemptOutcome,
     run_selection: &ResolvedRunSelection,
     process_lifecycle: LocalPerfProcessLifecycle,
+    root_process_identity: LocalPerfRootProcessIdentity,
     run_log_bytes: Option<&[u8]>,
     completed_bound_evidence: Option<&[u8]>,
     started_at_utc: &str,
@@ -4279,6 +4942,7 @@ fn persist_attempt_receipt(
         durability,
         build,
         start,
+        lease_file_identity,
         execution_end,
         end_capture_error,
         post_run_identity_verified,
@@ -4286,6 +4950,7 @@ fn persist_attempt_receipt(
         outcome,
         run_selection,
         process_lifecycle,
+        root_process_identity,
         run_log_bytes,
         completed_bound_evidence,
         started_at_utc,
@@ -4310,6 +4975,7 @@ fn build_attempt_receipt_bytes(
     durability: &RunnerDurability,
     build: &CapturedBuild,
     start: &PlatformCapture,
+    lease_file_identity: &LeaseFileIdentity,
     execution_end: Option<RunnerExecutionSnapshot>,
     end_capture_error: Option<String>,
     post_run_identity_verified: bool,
@@ -4317,6 +4983,7 @@ fn build_attempt_receipt_bytes(
     outcome: LocalPerfAttemptOutcome,
     run_selection: &ResolvedRunSelection,
     process_lifecycle: LocalPerfProcessLifecycle,
+    root_process_identity: LocalPerfRootProcessIdentity,
     run_log_bytes: Option<&[u8]>,
     completed_bound_evidence: Option<&[u8]>,
     started_at_utc: &str,
@@ -4356,6 +5023,8 @@ fn build_attempt_receipt_bytes(
         run_id: config.run_id.clone(),
         run_window: config.run_window.clone(),
         registry_sha256: MACHINE_CLASS_REGISTRY_SHA256.to_owned(),
+        lease_file_identity: lease_file_identity.clone(),
+        booking_receipt_sha256: build.booking_receipt_sha256.clone(),
         hardware: start.hardware.clone(),
         execution_request: start.request.clone(),
         execution_start: start.snapshot.clone(),
@@ -4368,6 +5037,7 @@ fn build_attempt_receipt_bytes(
         outcome,
         retry,
         process_lifecycle,
+        root_process_identity,
         internal_lifecycle_gaps: LocalPerfInternalLifecycleGaps {
             actual_work: unavailable,
             queue: unavailable,
@@ -4520,19 +5190,248 @@ fn local_perf_io_error_kind(error: &std::io::Error) -> LocalPerfIoErrorKind {
     }
 }
 
-fn force_kill_and_reap(child: &mut Child) -> Result<ExitStatus, LocalPerfIoErrorKind> {
-    let kill_error = child
-        .kill()
-        .err()
-        .map(|error| local_perf_io_error_kind(&error));
+/// Scoped authority for the process tree rooted at one benchmark child.
+///
+/// Linux subreaper mode makes a benchmark's orphaned descendants children of
+/// this runner rather than silently handing them to the host init process. The
+/// runner starts only when it has no pre-existing children, so every child
+/// observed during the scope belongs to the benchmark tree. This is the
+/// containment boundary that the direct `Child::wait` handle alone cannot
+/// provide.
+struct LocalPerfDescendantScope {
+    #[cfg(target_os = "linux")]
+    linux: LinuxSubreaperScope,
+}
+
+impl LocalPerfDescendantScope {
+    fn enter() -> Result<Self, LocalPerfRunError> {
+        #[cfg(target_os = "linux")]
+        {
+            Ok(Self {
+                linux: LinuxSubreaperScope::enter()?,
+            })
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            Ok(Self {})
+        }
+    }
+
+    fn reconcile_after_root_exit()
+    -> Result<(LocalPerfProcessTreeQuiescence, u32), LocalPerfIoErrorKind> {
+        #[cfg(target_os = "linux")]
+        {
+            LinuxSubreaperScope::reconcile_after_root_exit()
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            Ok((LocalPerfProcessTreeQuiescence::DirectChildOnly, 0))
+        }
+    }
+
+    fn restore(&mut self) -> Result<(), LocalPerfRunError> {
+        #[cfg(target_os = "linux")]
+        {
+            self.linux.restore()?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "linux")]
+struct LinuxSubreaperScope {
+    was_subreaper: bool,
+    restored: bool,
+}
+
+#[cfg(target_os = "linux")]
+impl LinuxSubreaperScope {
+    fn enter() -> Result<Self, LocalPerfRunError> {
+        if !linux_descendant_pids()?.is_empty() {
+            return Err(LocalPerfRunError::Invalid(
+                "benchmark runner cannot establish descendant containment with pre-existing children"
+                    .to_owned(),
+            ));
+        }
+        let was_subreaper = child_subreaper().map_err(std::io::Error::from)?.is_some();
+        set_child_subreaper(Some(getpid())).map_err(std::io::Error::from)?;
+        if !linux_descendant_pids()?.is_empty() {
+            set_child_subreaper(was_subreaper.then_some(getpid())).map_err(std::io::Error::from)?;
+            return Err(LocalPerfRunError::Invalid(
+                "benchmark runner observed a child while establishing descendant containment"
+                    .to_owned(),
+            ));
+        }
+        Ok(Self {
+            was_subreaper,
+            restored: false,
+        })
+    }
+
+    fn reconcile_after_root_exit()
+    -> Result<(LocalPerfProcessTreeQuiescence, u32), LocalPerfIoErrorKind> {
+        reap_linux_descendants()?;
+        let descendants =
+            linux_descendant_pids().map_err(|error| local_perf_io_error_kind(&error))?;
+        if descendants.is_empty() {
+            return Ok((
+                LocalPerfProcessTreeQuiescence::LinuxSubreaperVerifiedEmpty,
+                0,
+            ));
+        }
+
+        let observed = u32::try_from(descendants.len()).map_err(|_| LocalPerfIoErrorKind::Other)?;
+        for pid in descendants {
+            let pid = i32::try_from(pid)
+                .ok()
+                .and_then(Pid::from_raw)
+                .ok_or(LocalPerfIoErrorKind::Other)?;
+            let pidfd = pidfd_open(pid, rustix::process::PidfdFlags::empty())
+                .map_err(|error| local_perf_io_error_kind(&std::io::Error::from(error)))?;
+            pidfd_send_signal(&pidfd, Signal::KILL)
+                .map_err(|error| local_perf_io_error_kind(&std::io::Error::from(error)))?;
+        }
+        for _ in 0..WAIT_RECOVERY_POLL_ATTEMPTS {
+            reap_linux_descendants()?;
+            if linux_descendant_pids()
+                .map_err(|error| local_perf_io_error_kind(&error))?
+                .is_empty()
+            {
+                return Ok((
+                    LocalPerfProcessTreeQuiescence::LinuxSubreaperReapedEscapedDescendants,
+                    observed,
+                ));
+            }
+            std::thread::sleep(WAIT_RECOVERY_POLL_INTERVAL);
+        }
+        Err(LocalPerfIoErrorKind::ResourceBusy)
+    }
+
+    fn restore(&mut self) -> Result<(), LocalPerfRunError> {
+        if !self.restored {
+            set_child_subreaper(self.was_subreaper.then_some(getpid()))
+                .map_err(std::io::Error::from)?;
+            self.restored = true;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for LinuxSubreaperScope {
+    fn drop(&mut self) {
+        let _ = self.restore();
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn reap_linux_descendants() -> Result<(), LocalPerfIoErrorKind> {
+    loop {
+        match waitid(WaitId::All, WaitIdOptions::NOHANG | WaitIdOptions::EXITED) {
+            Ok(Some(_)) => {}
+            Ok(None) => return Ok(()),
+            Err(error) if error == rustix::io::Errno::CHILD => return Ok(()),
+            Err(error) => {
+                return Err(local_perf_io_error_kind(&std::io::Error::from(error)));
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_descendant_pids() -> Result<BTreeSet<u32>, std::io::Error> {
+    let current_pid = u32::try_from(getpid().as_raw_nonzero().get()).map_err(|_| {
+        std::io::Error::other("current process identifier does not fit the /proc namespace")
+    })?;
+    let mut children_by_parent = BTreeMap::<u32, BTreeSet<u32>>::new();
+    for entry in fs::read_dir("/proc")? {
+        let entry = entry?;
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<u32>().ok())
+            .filter(|pid| *pid > 0)
+        else {
+            continue;
+        };
+        let stat_path = entry.path().join("stat");
+        let Ok(stat) = fs::read_to_string(stat_path) else {
+            continue;
+        };
+        let Some(parent_pid) = parse_linux_proc_parent_pid(&stat) else {
+            continue;
+        };
+        children_by_parent
+            .entry(parent_pid)
+            .or_default()
+            .insert(pid);
+    }
+
+    let mut descendants = BTreeSet::new();
+    let mut pending = vec![current_pid];
+    while let Some(parent_pid) = pending.pop() {
+        if let Some(children) = children_by_parent.get(&parent_pid) {
+            for child_pid in children {
+                if descendants.insert(*child_pid) {
+                    pending.push(*child_pid);
+                }
+            }
+        }
+    }
+    Ok(descendants)
+}
+
+#[cfg(target_os = "linux")]
+fn parse_linux_proc_parent_pid(stat: &str) -> Option<u32> {
+    let (_, suffix) = stat.rsplit_once(')')?;
+    let mut fields = suffix.split_ascii_whitespace();
+    let _state = fields.next()?;
+    fields.next()?.parse::<u32>().ok().filter(|pid| *pid > 0)
+}
+
+fn force_kill_and_reap(
+    child: &mut Child,
+    root_process_identity: LocalPerfRootProcessIdentity,
+) -> Result<(ExitStatus, LocalPerfProcessGroupRecovery), LocalPerfIoErrorKind> {
+    let (process_group_recovery, kill_error) =
+        match signal_owned_process_group(child, root_process_identity) {
+            Ok(()) => (LocalPerfProcessGroupRecovery::SignaledOwnedGroup, None),
+            Err(_) => (
+                LocalPerfProcessGroupRecovery::DirectChildFallback,
+                child
+                    .kill()
+                    .err()
+                    .map(|error| local_perf_io_error_kind(&error)),
+            ),
+        };
     for _ in 0..WAIT_RECOVERY_POLL_ATTEMPTS {
         match child.try_wait() {
-            Ok(Some(status)) => return Ok(status),
+            Ok(Some(status)) => return Ok((status, process_group_recovery)),
             Ok(None) => std::thread::sleep(WAIT_RECOVERY_POLL_INTERVAL),
             Err(error) => return Err(local_perf_io_error_kind(&error)),
         }
     }
     Err(kill_error.unwrap_or(LocalPerfIoErrorKind::ResourceBusy))
+}
+
+#[cfg(target_os = "linux")]
+fn signal_owned_process_group(
+    child: &Child,
+    root_process_identity: LocalPerfRootProcessIdentity,
+) -> Result<(), LocalPerfIoErrorKind> {
+    if capture_root_process_identity(child) != root_process_identity {
+        return Err(LocalPerfIoErrorKind::Other);
+    }
+    kill_process_group(Pid::from_child(child), Signal::KILL)
+        .map_err(|error| local_perf_io_error_kind(&std::io::Error::from(error)))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn signal_owned_process_group(
+    _child: &Child,
+    _root_process_identity: LocalPerfRootProcessIdentity,
+) -> Result<(), LocalPerfIoErrorKind> {
+    Err(LocalPerfIoErrorKind::Other)
 }
 
 fn attempt_derived_facts(
@@ -4634,7 +5533,114 @@ fn validate_process_lifecycle(
             "attempt process lifecycle disagrees with its typed terminal outcome".to_owned(),
         ));
     }
+    let tree_matches_outcome = match lifecycle.process_tree_quiescence {
+        LocalPerfProcessTreeQuiescence::DirectChildOnly => {
+            lifecycle.descendant_processes_observed == 0
+        }
+        LocalPerfProcessTreeQuiescence::LinuxSubreaperVerifiedEmpty => {
+            lifecycle.spawn_succeeded && lifecycle.descendant_processes_observed == 0
+        }
+        LocalPerfProcessTreeQuiescence::LinuxSubreaperReapedEscapedDescendants => {
+            lifecycle.spawn_succeeded && lifecycle.descendant_processes_observed > 0
+        }
+    };
+    if !tree_matches_outcome
+        || (outcome == LocalPerfAttemptOutcome::Completed
+            && !lifecycle.descendant_process_tree_quiescence_is_proven())
+    {
+        return Err(LocalPerfRunError::Invalid(
+            "attempt process lifecycle lacks a completed descendant-tree quiescence proof"
+                .to_owned(),
+        ));
+    }
+    let recovery_matches_outcome = match outcome {
+        LocalPerfAttemptOutcome::WaitRecoveredByKill { .. } => matches!(
+            lifecycle.process_group_recovery,
+            LocalPerfProcessGroupRecovery::SignaledOwnedGroup
+                | LocalPerfProcessGroupRecovery::DirectChildFallback
+        ),
+        _ => lifecycle.process_group_recovery == LocalPerfProcessGroupRecovery::NotRequired,
+    };
+    if !recovery_matches_outcome {
+        return Err(LocalPerfRunError::Invalid(
+            "attempt process-group recovery authority disagrees with its terminal outcome"
+                .to_owned(),
+        ));
+    }
     Ok(())
+}
+
+fn validate_root_process_identity(
+    outcome: LocalPerfAttemptOutcome,
+    lifecycle: LocalPerfProcessLifecycle,
+    root_process_identity: LocalPerfRootProcessIdentity,
+) -> Result<(), LocalPerfRunError> {
+    let identity_matches_spawn = match (lifecycle.spawn_succeeded, root_process_identity) {
+        (false, LocalPerfRootProcessIdentity::NotSpawned) => true,
+        (
+            true,
+            LocalPerfRootProcessIdentity::LinuxProcStartTime {
+                pid,
+                process_group_id,
+                start_time_ticks,
+            },
+        ) => pid > 0 && process_group_id == pid && start_time_ticks > 0,
+        (true, LocalPerfRootProcessIdentity::Unverifiable { pid }) => pid > 0,
+        _ => false,
+    };
+    if !identity_matches_spawn
+        || (outcome == LocalPerfAttemptOutcome::Completed
+            && !root_process_identity.has_verified_birth_identity())
+    {
+        return Err(LocalPerfRunError::Invalid(
+            "attempt root-process identity contradicts spawn state or completed receipt authority"
+                .to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn capture_root_process_identity(child: &Child) -> LocalPerfRootProcessIdentity {
+    let pid = child.id();
+    let stat_path = format!("/proc/{pid}/stat");
+    let identity = fs::read_to_string(stat_path)
+        .ok()
+        .and_then(|stat| parse_linux_proc_process_identity(&stat))
+        .and_then(|(process_group_id, start_time_ticks)| {
+            (process_group_id == pid).then_some(LocalPerfRootProcessIdentity::LinuxProcStartTime {
+                pid,
+                process_group_id,
+                start_time_ticks,
+            })
+        });
+    identity.unwrap_or(LocalPerfRootProcessIdentity::Unverifiable { pid })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn capture_root_process_identity(child: &Child) -> LocalPerfRootProcessIdentity {
+    LocalPerfRootProcessIdentity::Unverifiable { pid: child.id() }
+}
+
+#[cfg(target_os = "linux")]
+fn parse_linux_proc_process_identity(stat: &str) -> Option<(u32, u64)> {
+    // `/proc/<pid>/stat`'s second field is parenthesized and may itself carry
+    // spaces or parentheses. Split from its final close-paren so field 22
+    // (the start-time tick) stays positional even for adversarial comm values.
+    let (_, suffix) = stat.rsplit_once(')')?;
+    let mut fields = suffix.split_ascii_whitespace();
+    let _state = fields.next()?;
+    let _parent_pid = fields.next()?;
+    let process_group_id = fields
+        .next()?
+        .parse::<u32>()
+        .ok()
+        .filter(|process_group_id| *process_group_id > 0)?;
+    let start_time_ticks = fields
+        .nth(16)
+        .and_then(|start_time_ticks| start_time_ticks.parse::<u64>().ok())
+        .filter(|start_time_ticks| *start_time_ticks > 0)?;
+    Some((process_group_id, start_time_ticks))
 }
 
 fn validate_attempt_build(build: &RunnerBuild) -> Result<(), LocalPerfRunError> {
@@ -4719,6 +5725,160 @@ fn bounded_diagnostic<T: std::fmt::Display + ?Sized>(value: &T) -> String {
     message
 }
 
+fn booking_receipt_bytes(
+    config: &LocalPerfRunConfig,
+    selection: &ResolvedRunSelection,
+    lease_file_identity: &LeaseFileIdentity,
+    platform: &PlatformCapture,
+    external_paths: &ExternalRunPaths,
+    run_directories: &RunDirectories,
+    source: &CleanSourceSnapshot,
+    booked_at_utc: &str,
+) -> Result<Vec<u8>, LocalPerfRunError> {
+    validate_utc_timestamp(booked_at_utc, "booking")?;
+    let receipt = LocalPerfBookingReceipt {
+        schema_version: LOCAL_PERF_BOOKING_RECEIPT_SCHEMA_VERSION.to_owned(),
+        gate: config.gate.label().to_owned(),
+        profile: config.profile,
+        run_id: config.run_id.clone(),
+        run_window: config.run_window.clone(),
+        fixture_selector: selection.fixture.clone(),
+        selected_cell_ids: selection.selected_cell_ids.clone(),
+        lease_file_identity: lease_file_identity.clone(),
+        worker_fingerprint_sha256: platform.hardware.fingerprint_sha256.clone(),
+        effective_cpuset_sha256: platform.snapshot.effective_cpuset_sha256.clone(),
+        storage_slots: booking_storage_slots(external_paths, run_directories),
+        source_git_revision: source.revision.clone(),
+        cargo_lock_sha256: source.cargo_lock_sha256.clone(),
+        booked_at_utc: booked_at_utc.to_owned(),
+        seal_sha256: String::new(),
+    };
+    let receipt_bytes = seal_booking_receipt(receipt)?;
+    LocalPerfBookingReceipt::from_verified_slice(&receipt_bytes)?;
+    Ok(receipt_bytes)
+}
+
+fn seal_booking_receipt(
+    mut receipt: LocalPerfBookingReceipt,
+) -> Result<Vec<u8>, LocalPerfRunError> {
+    receipt.seal_sha256.clear();
+    let preimage = serde_json::to_vec(&receipt)?;
+    receipt.seal_sha256 = sha256_hex(&preimage);
+    serde_json::to_vec(&receipt).map_err(LocalPerfRunError::from)
+}
+
+fn terminal_lease_release_receipt_bytes(
+    config: &LocalPerfRunConfig,
+    lease_file_identity: &LeaseFileIdentity,
+    attempt_receipt_bytes: &[u8],
+    released_at_utc: &str,
+) -> Result<Vec<u8>, LocalPerfRunError> {
+    let attempt = LocalPerfAttemptReceipt::from_verified_slice(attempt_receipt_bytes)?;
+    validate_utc_timestamp(released_at_utc, "lease release")?;
+    if attempt.gate != config.gate.label()
+        || attempt.profile != config.profile
+        || attempt.run_id != config.run_id
+        || attempt.run_window != config.run_window
+        || attempt.lease_file_identity != *lease_file_identity
+    {
+        return Err(LocalPerfRunError::Invalid(
+            "lease release receipt differs from its terminal attempt identity".to_owned(),
+        ));
+    }
+    if released_at_utc < attempt.finished_at_utc.as_str() {
+        return Err(LocalPerfRunError::Invalid(
+            "lease release timestamp precedes its completed attempt finish".to_owned(),
+        ));
+    }
+    let receipt = LocalPerfLeaseReleaseReceipt {
+        schema_version: LOCAL_PERF_LEASE_RELEASE_RECEIPT_SCHEMA_VERSION.to_owned(),
+        gate: config.gate.label().to_owned(),
+        profile: config.profile,
+        run_id: config.run_id.clone(),
+        run_window: config.run_window.clone(),
+        lease_file_identity: lease_file_identity.clone(),
+        attempt_receipt_sha256: sha256_hex(attempt_receipt_bytes),
+        released_at_utc: released_at_utc.to_owned(),
+        seal_sha256: String::new(),
+    };
+    let receipt_bytes = seal_lease_release_receipt(receipt)?;
+    LocalPerfLeaseReleaseReceipt::from_verified_slice(&receipt_bytes)?;
+    Ok(receipt_bytes)
+}
+
+fn publish_terminal_lease_release_receipt(
+    config: &LocalPerfRunConfig,
+    lease_file: &OwnedFd,
+    lease_file_identity: &LeaseFileIdentity,
+    run_directories: &RunDirectories,
+    attempt_receipt_bytes: &[u8],
+) -> Result<PathBuf, LocalPerfRunError> {
+    let release_receipt_name = format!("{}.lease-release.json", config.gate.label());
+    let release_receipt_path = config.output_dir.join(&release_receipt_name);
+    flock(lease_file, FlockOperation::Unlock).map_err(|error| {
+        LocalPerfRunError::LeaseReleaseReceiptUnavailable {
+            receipt_path: release_receipt_path.clone(),
+            detail: bounded_diagnostic(&std::io::Error::from(error)),
+        }
+    })?;
+    let release_receipt_bytes = utc_now()
+        .and_then(|released_at_utc| {
+            terminal_lease_release_receipt_bytes(
+                config,
+                lease_file_identity,
+                attempt_receipt_bytes,
+                &released_at_utc,
+            )
+        })
+        .map_err(|error| LocalPerfRunError::LeaseReleaseReceiptUnavailable {
+            receipt_path: release_receipt_path.clone(),
+            detail: bounded_diagnostic(&error),
+        })?;
+    write_new_sync_at(
+        &run_directories.run.handle,
+        &release_receipt_name,
+        &release_receipt_bytes,
+    )
+    .and_then(|()| {
+        run_directories
+            .run
+            .handle
+            .sync_all()
+            .map_err(LocalPerfRunError::from)
+    })
+    .map_err(|error| LocalPerfRunError::LeaseReleaseReceiptUnavailable {
+        receipt_path: release_receipt_path.clone(),
+        detail: bounded_diagnostic(&error),
+    })?;
+    let persisted_release = read_file_at(&run_directories.run.handle, &release_receipt_name)
+        .map_err(|error| LocalPerfRunError::LeaseReleaseReceiptUnavailable {
+            receipt_path: release_receipt_path.clone(),
+            detail: bounded_diagnostic(&error),
+        })?;
+    if persisted_release != release_receipt_bytes {
+        return Err(LocalPerfRunError::LeaseReleaseReceiptUnavailable {
+            receipt_path: release_receipt_path.clone(),
+            detail: "persisted release receipt bytes differ from the sealed publication".to_owned(),
+        });
+    }
+    LocalPerfLeaseReleaseReceipt::from_verified_slice(&persisted_release).map_err(|error| {
+        LocalPerfRunError::LeaseReleaseReceiptUnavailable {
+            receipt_path: release_receipt_path.clone(),
+            detail: bounded_diagnostic(&error),
+        }
+    })?;
+    Ok(release_receipt_path)
+}
+
+fn seal_lease_release_receipt(
+    mut receipt: LocalPerfLeaseReleaseReceipt,
+) -> Result<Vec<u8>, LocalPerfRunError> {
+    receipt.seal_sha256.clear();
+    let preimage = serde_json::to_vec(&receipt)?;
+    receipt.seal_sha256 = sha256_hex(&preimage);
+    serde_json::to_vec(&receipt).map_err(LocalPerfRunError::from)
+}
+
 fn seal_attempt_receipt(
     mut receipt: LocalPerfAttemptReceipt,
 ) -> Result<Vec<u8>, LocalPerfRunError> {
@@ -4787,6 +5947,11 @@ pub fn completed_attempt_receipt_for_test(
         run_id: artifact.provenance.run_id.clone(),
         run_window: artifact.provenance.run_window.clone(),
         registry_sha256: MACHINE_CLASS_REGISTRY_SHA256.to_owned(),
+        lease_file_identity: LeaseFileIdentity {
+            device: "1".to_owned(),
+            inode: "2".to_owned(),
+        },
+        booking_receipt_sha256: "b".repeat(64),
         hardware: runner.hardware,
         execution_request: runner.execution.request,
         execution_start: runner.execution.start,
@@ -4805,6 +5970,14 @@ pub fn completed_attempt_receipt_for_test(
             child_reaped: true,
             run_log_synced: true,
             run_log_captured: true,
+            process_group_recovery: LocalPerfProcessGroupRecovery::NotRequired,
+            process_tree_quiescence: LocalPerfProcessTreeQuiescence::LinuxSubreaperVerifiedEmpty,
+            descendant_processes_observed: 0,
+        },
+        root_process_identity: LocalPerfRootProcessIdentity::LinuxProcStartTime {
+            pid: 37,
+            process_group_id: 37,
+            start_time_ticks: 81,
         },
         internal_lifecycle_gaps: LocalPerfInternalLifecycleGaps {
             actual_work: unavailable,
@@ -4995,6 +6168,9 @@ mod tests {
                 child_reaped: false,
                 run_log_synced: true,
                 run_log_captured: true,
+                process_group_recovery: LocalPerfProcessGroupRecovery::NotRequired,
+                process_tree_quiescence: LocalPerfProcessTreeQuiescence::DirectChildOnly,
+                descendant_processes_observed: 0,
             },
             LocalPerfAttemptOutcome::WaitRecoveredByKill { .. } => LocalPerfProcessLifecycle {
                 spawn_attempted: true,
@@ -5003,6 +6179,9 @@ mod tests {
                 child_reaped: true,
                 run_log_synced: true,
                 run_log_captured: true,
+                process_group_recovery: LocalPerfProcessGroupRecovery::SignaledOwnedGroup,
+                process_tree_quiescence: LocalPerfProcessTreeQuiescence::DirectChildOnly,
+                descendant_processes_observed: 0,
             },
             LocalPerfAttemptOutcome::PostExitRejected {
                 stage: LocalPerfRejectionStage::RunLogSync,
@@ -5013,6 +6192,9 @@ mod tests {
                 child_reaped: true,
                 run_log_synced: false,
                 run_log_captured: true,
+                process_group_recovery: LocalPerfProcessGroupRecovery::NotRequired,
+                process_tree_quiescence: LocalPerfProcessTreeQuiescence::DirectChildOnly,
+                descendant_processes_observed: 0,
             },
             LocalPerfAttemptOutcome::PostExitRejected {
                 stage: LocalPerfRejectionStage::RunLogRead,
@@ -5023,6 +6205,9 @@ mod tests {
                 child_reaped: true,
                 run_log_synced: true,
                 run_log_captured: false,
+                process_group_recovery: LocalPerfProcessGroupRecovery::NotRequired,
+                process_tree_quiescence: LocalPerfProcessTreeQuiescence::DirectChildOnly,
+                descendant_processes_observed: 0,
             },
             _ => LocalPerfProcessLifecycle {
                 spawn_attempted: true,
@@ -5031,9 +6216,25 @@ mod tests {
                 child_reaped: true,
                 run_log_synced: true,
                 run_log_captured: true,
+                process_group_recovery: LocalPerfProcessGroupRecovery::NotRequired,
+                process_tree_quiescence: if outcome == LocalPerfAttemptOutcome::Completed {
+                    LocalPerfProcessTreeQuiescence::LinuxSubreaperVerifiedEmpty
+                } else {
+                    LocalPerfProcessTreeQuiescence::DirectChildOnly
+                },
+                descendant_processes_observed: 0,
             },
         };
         let completed = outcome == LocalPerfAttemptOutcome::Completed;
+        let root_process_identity = if process_lifecycle.spawn_succeeded {
+            LocalPerfRootProcessIdentity::LinuxProcStartTime {
+                pid: 37,
+                process_group_id: 37,
+                start_time_ticks: 81,
+            }
+        } else {
+            LocalPerfRootProcessIdentity::NotSpawned
+        };
         let manifest_sha256 = identity
             .artifact_manifest()
             .expect("artifact-bound runner fixture")
@@ -5072,6 +6273,11 @@ mod tests {
             run_id: "attempt-1".to_owned(),
             run_window: "window-1".to_owned(),
             registry_sha256: MACHINE_CLASS_REGISTRY_SHA256.to_owned(),
+            lease_file_identity: LeaseFileIdentity {
+                device: "1".to_owned(),
+                inode: "2".to_owned(),
+            },
+            booking_receipt_sha256: "b".repeat(64),
             hardware: runner.hardware,
             execution_request: runner.execution.request,
             execution_start: runner.execution.start,
@@ -5084,6 +6290,7 @@ mod tests {
             outcome,
             retry,
             process_lifecycle,
+            root_process_identity,
             internal_lifecycle_gaps: LocalPerfInternalLifecycleGaps {
                 actual_work: unavailable,
                 queue: unavailable,
@@ -5346,7 +6553,10 @@ mod tests {
             source,
             "create_new_file_at(&run_directories.run.handle, \"run.log\")",
         );
-        let child_spawn = unique_marker_offset(source, "let mut child = match child.spawn()");
+        let child_spawn = unique_marker_offset(
+            source,
+            "let (mut child, root_process_identity) = match child.spawn()",
+        );
         assert!(preflight < log_creation);
         assert!(log_creation < child_spawn);
     }
@@ -5468,6 +6678,47 @@ mod tests {
     }
 
     #[test]
+    fn lease_collision_helper() {
+        let Some(path) = std::env::var_os("QUILL_PERF_TEST_LEASE_COLLISION_PATH") else {
+            return;
+        };
+        let error = acquire_family_lease(Path::new(&path))
+            .expect_err("lease contender must not acquire a held family lease");
+        assert!(
+            matches!(
+                &error,
+                LocalPerfRunError::Io(error) if matches!(error.kind(), std::io::ErrorKind::WouldBlock)
+            ),
+            "lease contender failed with an unexpected error: {error}"
+        );
+        println!("lease-collision-observed");
+    }
+
+    #[test]
+    fn lease_release_probe_helper() {
+        let Some(path) = std::env::var_os("QUILL_PERF_TEST_LEASE_RELEASE_PATH") else {
+            return;
+        };
+        let (_lease, _identity) =
+            acquire_family_lease(Path::new(&path)).expect("release probe acquires unlocked lease");
+        println!("lease-release-observed");
+    }
+
+    #[test]
+    fn lease_crash_recovery_helper() {
+        let Some(path) = std::env::var_os("QUILL_PERF_TEST_CRASH_LEASE_PATH") else {
+            return;
+        };
+        let (_lease, _identity) =
+            acquire_family_lease(Path::new(&path)).expect("helper acquires crash-test lease");
+        println!("crash-lease-ready");
+        std::io::stdout()
+            .flush()
+            .expect("flush crash helper readiness");
+        std::process::exit(42);
+    }
+
+    #[test]
     fn lease_inherited_fd_child_helper() {
         if std::env::var_os("QUILL_PERF_TEST_INHERITED_LEASE_CHILD").is_none() {
             return;
@@ -5553,15 +6804,19 @@ mod tests {
             }
         }
 
+        let collision_helper_name = "local_perf_runner::tests::lease_collision_helper";
         let contender = Command::new(&current_test)
-            .args(["--exact", helper_name, "--nocapture"])
-            .env("QUILL_PERF_TEST_LEASE_PATH", &lease_path)
+            .args(["--exact", collision_helper_name, "--nocapture"])
+            .env("QUILL_PERF_TEST_LEASE_COLLISION_PATH", &lease_path)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status()
             .expect("run lease contender");
-        assert!(!contender.success(), "second process acquired held lease");
+        assert!(
+            contender.success(),
+            "second process did not report the expected held-lease collision"
+        );
 
         drop(holder.stdin.take());
         assert!(holder.wait().expect("wait for lease holder").success());
@@ -5569,6 +6824,50 @@ mod tests {
         holder_output
             .read_to_string(&mut remainder)
             .expect("drain holder output");
+    }
+
+    #[test]
+    fn explicit_lease_unlock_allows_a_real_contender_before_descriptor_drop() {
+        let directory = tempfile::tempdir().expect("lease release test directory");
+        let lease_path = directory.path().join("release.lock");
+        let (lease, _identity) = acquire_family_lease(&lease_path).expect("acquire held lease");
+
+        flock(&lease, FlockOperation::Unlock).expect("explicitly unlock held lease");
+        let current_test = std::env::current_exe().expect("current test executable");
+        let helper_name = "local_perf_runner::tests::lease_release_probe_helper";
+        let output = Command::new(current_test)
+            .args(["--exact", helper_name, "--nocapture"])
+            .env("QUILL_PERF_TEST_LEASE_RELEASE_PATH", &lease_path)
+            .output()
+            .expect("spawn release contender");
+        assert!(
+            output.status.success(),
+            "release contender failed: {output:?}"
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("lease-release-observed"),
+            "release contender did not prove acquisition after explicit unlock"
+        );
+    }
+
+    #[test]
+    fn family_lease_recovers_after_holder_process_crash() {
+        let directory = tempfile::tempdir().expect("lease crash recovery directory");
+        let lease_path = directory.path().join("crash-recovery.lock");
+        let current_test = std::env::current_exe().expect("current test executable");
+        let helper_name = "local_perf_runner::tests::lease_crash_recovery_helper";
+        let output = Command::new(&current_test)
+            .args(["--exact", helper_name, "--nocapture"])
+            .env("QUILL_PERF_TEST_CRASH_LEASE_PATH", &lease_path)
+            .output()
+            .expect("run crash recovery lease holder");
+        assert_eq!(output.status.code(), Some(42), "crash helper exit status");
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("crash-lease-ready"),
+            "crash helper must prove it acquired the lease before exiting"
+        );
+        let (_reacquired, _identity) = acquire_family_lease(&lease_path)
+            .expect("lease must recover after holder process exits");
     }
 
     #[test]
@@ -5875,7 +7174,7 @@ mod tests {
     }
 
     #[test]
-    fn process_receipts_cover_completed_and_every_supported_failure_outcome() {
+    fn process_receipts_and_terminal_release_cover_completed_and_every_supported_failure_outcome() {
         let bound = b"exact completed bound evidence";
         let outcomes = [
             LocalPerfAttemptOutcome::Completed,
@@ -5893,6 +7192,9 @@ mod tests {
             },
             LocalPerfAttemptOutcome::PostExitRejected {
                 stage: LocalPerfRejectionStage::FinishedTimestamp,
+            },
+            LocalPerfAttemptOutcome::PostExitRejected {
+                stage: LocalPerfRejectionStage::RootProcessIdentity,
             },
             LocalPerfAttemptOutcome::PostExitRejected {
                 stage: LocalPerfRejectionStage::PostRunIdentity,
@@ -5921,6 +7223,20 @@ mod tests {
                 sha256_hex(&bytes)
             );
             receipt.verify_run_log(&run_log).expect("exact run log");
+            let mut config = policy_config(PerfGate::Qg1);
+            config.profile = receipt.profile;
+            config.run_id = receipt.run_id.clone();
+            config.run_window = receipt.run_window.clone();
+            let release = terminal_lease_release_receipt_bytes(
+                &config,
+                &receipt.lease_file_identity,
+                &bytes,
+                "2026-08-03T15:30:00Z",
+            )
+            .expect("seal terminal attempt release receipt");
+            receipt
+                .verify_lease_release_receipt(&release)
+                .expect("release receipt binds every sealed terminal outcome");
             let lifecycle = receipt.process_lifecycle();
             assert!(lifecycle.spawn_attempted());
             assert_eq!(
@@ -5998,6 +7314,11 @@ mod tests {
         let bytes = seal_attempt_receipt(binding_tamper).expect("reseal binding tamper");
         assert!(LocalPerfAttemptReceipt::from_verified_slice(&bytes).is_err());
 
+        let mut booking_tamper = receipt.clone();
+        booking_tamper.booking_receipt_sha256 = "not-a-sha256".to_owned();
+        let bytes = seal_attempt_receipt(booking_tamper).expect("reseal booking tamper");
+        assert!(LocalPerfAttemptReceipt::from_verified_slice(&bytes).is_err());
+
         let mut missing_end = receipt.clone();
         missing_end.execution_end = None;
         missing_end.end_capture_error = Some("capture failed".to_owned());
@@ -6028,6 +7349,12 @@ mod tests {
         let bytes = seal_attempt_receipt(timestamp_tamper).expect("reseal timestamp tamper");
         assert!(LocalPerfAttemptReceipt::from_verified_slice(&bytes).is_err());
 
+        let mut lease_identity_tamper = receipt.clone();
+        lease_identity_tamper.lease_file_identity.inode = "not-an-inode".to_owned();
+        let bytes =
+            seal_attempt_receipt(lease_identity_tamper).expect("reseal lease identity tamper");
+        assert!(LocalPerfAttemptReceipt::from_verified_slice(&bytes).is_err());
+
         let mut window_tamper = receipt;
         window_tamper.run_window = "x".repeat(MAX_IDENTITY_COMPONENT_BYTES + 1);
         let bytes = seal_attempt_receipt(window_tamper).expect("reseal window tamper");
@@ -6041,6 +7368,133 @@ mod tests {
         ] {
             assert!(attempt_derived_facts(outcome).is_err());
         }
+    }
+
+    #[test]
+    fn lease_release_receipt_binds_only_one_completed_attempt_after_unlock() {
+        let (attempt, attempt_bytes, _) =
+            attempt_fixture(LocalPerfAttemptOutcome::Completed, Some(b"bound"));
+        let mut config = policy_config(PerfGate::Qg1);
+        config.profile = attempt.profile;
+        config.run_id = attempt.run_id.clone();
+        config.run_window = attempt.run_window.clone();
+        let bytes = terminal_lease_release_receipt_bytes(
+            &config,
+            &attempt.lease_file_identity,
+            &attempt_bytes,
+            "2026-08-03T15:30:00Z",
+        )
+        .expect("seal completed attempt release receipt");
+        let receipt = LocalPerfLeaseReleaseReceipt::from_verified_slice(&bytes)
+            .expect("verify completed attempt release receipt");
+        assert_eq!(
+            receipt.attempt_receipt_sha256,
+            sha256_hex(&attempt_bytes),
+            "release receipt must bind the exact completed attempt bytes"
+        );
+        attempt
+            .verify_lease_release_receipt(&bytes)
+            .expect("release receipt matches completed attempt");
+
+        let mut mismatched = receipt.clone();
+        mismatched.run_window = "other-window".to_owned();
+        let mismatched_bytes =
+            seal_lease_release_receipt(mismatched).expect("reseal release identity mismatch");
+        assert!(
+            attempt
+                .verify_lease_release_receipt(&mismatched_bytes)
+                .is_err()
+        );
+
+        let mut tampered = receipt.clone();
+        tampered.released_at_utc = "not-a-timestamp".to_owned();
+        let bytes = seal_lease_release_receipt(tampered).expect("reseal timestamp tamper");
+        assert!(LocalPerfLeaseReleaseReceipt::from_verified_slice(&bytes).is_err());
+
+        let (failed_attempt, failed_attempt_bytes, _) =
+            attempt_fixture(LocalPerfAttemptOutcome::ExitedNonzero { code: 17 }, None);
+        let failure_release = terminal_lease_release_receipt_bytes(
+            &config,
+            &attempt.lease_file_identity,
+            &failed_attempt_bytes,
+            "2026-08-03T15:30:00Z",
+        )
+        .expect("seal terminal failed-attempt release receipt");
+        failed_attempt
+            .verify_lease_release_receipt(&failure_release)
+            .expect("release receipt matches failed terminal attempt");
+        assert!(
+            terminal_lease_release_receipt_bytes(
+                &config,
+                &attempt.lease_file_identity,
+                &attempt_bytes,
+                "0001-01-01T00:00:00Z",
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn booking_receipt_binds_exclusive_worker_cpuset_storage_and_fixture_scope() {
+        let (mut attempt, _, _) =
+            attempt_fixture(LocalPerfAttemptOutcome::Completed, Some(b"bound"));
+        let receipt = LocalPerfBookingReceipt {
+            schema_version: LOCAL_PERF_BOOKING_RECEIPT_SCHEMA_VERSION.to_owned(),
+            gate: attempt.gate.clone(),
+            profile: attempt.profile,
+            run_id: attempt.run_id.clone(),
+            run_window: attempt.run_window.clone(),
+            fixture_selector: attempt.fixture_selector.clone(),
+            selected_cell_ids: attempt.selected_cell_ids.clone(),
+            lease_file_identity: attempt.lease_file_identity.clone(),
+            worker_fingerprint_sha256: attempt.hardware.fingerprint_sha256.clone(),
+            effective_cpuset_sha256: attempt.execution_start.effective_cpuset_sha256.clone(),
+            storage_slots: LocalPerfBookingStorageSlots {
+                output_parent: LeaseFileIdentity {
+                    device: "1".to_owned(),
+                    inode: "2".to_owned(),
+                },
+                target_directory: LeaseFileIdentity {
+                    device: "3".to_owned(),
+                    inode: "4".to_owned(),
+                },
+                run_directory: LeaseFileIdentity {
+                    device: "5".to_owned(),
+                    inode: "6".to_owned(),
+                },
+                artifact_directory: LeaseFileIdentity {
+                    device: "7".to_owned(),
+                    inode: "8".to_owned(),
+                },
+            },
+            source_git_revision: attempt.build.git_revision.clone(),
+            cargo_lock_sha256: attempt.build.cargo_lock_sha256.clone(),
+            booked_at_utc: attempt.started_at_utc.clone(),
+            seal_sha256: String::new(),
+        };
+        let bytes = seal_booking_receipt(receipt).expect("seal booking receipt");
+        let verified =
+            LocalPerfBookingReceipt::from_verified_slice(&bytes).expect("verify booking receipt");
+        attempt.booking_receipt_sha256 = sha256_hex(&bytes);
+        attempt
+            .verify_booking_receipt(&bytes)
+            .expect("booking receipt matches attempt");
+        assert_eq!(verified.profile, attempt.profile);
+        assert_eq!(
+            verified.effective_cpuset_sha256,
+            attempt.execution_start.effective_cpuset_sha256
+        );
+
+        let mut tampered = verified.clone();
+        tampered.storage_slots.run_directory.inode = "not-a-decimal-inode".to_owned();
+        let bytes = seal_booking_receipt(tampered).expect("reseal storage tamper");
+        assert!(LocalPerfBookingReceipt::from_verified_slice(&bytes).is_err());
+
+        let mut mismatched = verified;
+        mismatched.run_window = "other-window".to_owned();
+        let bytes = seal_booking_receipt(mismatched).expect("reseal run mismatch");
+        attempt.booking_receipt_sha256 = sha256_hex(&bytes);
+        assert!(attempt.verify_booking_receipt(&bytes).is_err());
     }
 
     #[test]
@@ -6339,6 +7793,7 @@ mod tests {
     #[test]
     fn completed_shard_syncs_inputs_then_publishes_verified_attempt_evidence_pair_last() {
         let source = production_source();
+        let booking_publish = unique_marker_offset(source, "&booking_receipt_bytes,");
         let child_inputs_durable = unique_marker_offset(
             source,
             "let durable_child_artifacts = match read_and_sync_child_artifacts(",
@@ -6358,11 +7813,17 @@ mod tests {
             source,
             "let persisted_attempt =\n        read_file_at(&run_directories.run.handle",
         );
+        let lease_unlock =
+            unique_marker_offset(source, "flock(lease_file, FlockOperation::Unlock)");
+        let release_publish = unique_marker_offset(source, "&release_receipt_bytes,");
+        assert!(booking_publish < child_inputs_durable);
         assert!(child_inputs_durable < nested_runner);
         assert!(nested_runner < bound_write);
         assert!(bound_write < bound_reload);
         assert!(bound_reload < final_attempt_publish);
         assert!(final_attempt_publish < final_pair_reload);
+        assert!(final_pair_reload < lease_unlock);
+        assert!(lease_unlock < release_publish);
     }
 
     #[test]
@@ -6419,7 +7880,7 @@ mod tests {
         let source = production_source();
         let wait_start = unique_marker_offset(
             source,
-            "let (status, recovered_wait_error) = match child.wait()",
+            "let (status, recovered_wait_error, process_group_recovery) = match child.wait()",
         );
         let wait_tail = &source[wait_start..];
         let log_capture = wait_start
@@ -6430,9 +7891,16 @@ mod tests {
         let wait_slice = &source[wait_start..log_capture];
         assert_eq!(
             wait_slice
-                .matches("force_kill_and_reap(&mut child)")
+                .matches("force_kill_and_reap(&mut child, root_process_identity)")
                 .count(),
             1
+        );
+        assert_eq!(
+            wait_slice
+                .matches("LocalPerfDescendantScope::reconcile_after_root_exit()")
+                .count(),
+            1,
+            "root recovery must still reconcile adopted descendants before logs are sealed"
         );
         assert_eq!(
             wait_slice
@@ -6455,12 +7923,227 @@ mod tests {
             child_reaped: true,
             run_log_synced: true,
             run_log_captured: true,
+            process_group_recovery: LocalPerfProcessGroupRecovery::SignaledOwnedGroup,
+            process_tree_quiescence: LocalPerfProcessTreeQuiescence::DirectChildOnly,
+            descendant_processes_observed: 0,
         };
         assert!(validate_process_lifecycle(recovered, reaped, true).is_ok());
+        assert_eq!(
+            reaped.process_tree_quiescence(),
+            LocalPerfProcessTreeQuiescence::DirectChildOnly,
+            "a reaped direct child must never be relabeled as descendant-tree quiescence"
+        );
         let mut unreaped = reaped;
         unreaped.wait_completed = false;
         unreaped.child_reaped = false;
         assert!(validate_process_lifecycle(recovered, unreaped, true).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_root_birth_identity_uses_the_final_proc_comm_delimiter() {
+        let stat = "37 (benchmark) worker)) R 1 37 1 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 81";
+        assert_eq!(parse_linux_proc_process_identity(stat), Some((37, 81)));
+        assert_eq!(
+            parse_linux_proc_process_identity("37 (benchmark) R 1 2"),
+            None
+        );
+    }
+
+    #[test]
+    fn root_birth_identity_is_captured_before_the_child_can_be_reaped() {
+        let source = production_source();
+        let spawned = unique_marker_offset(
+            source,
+            "let (mut child, root_process_identity) = match child.spawn()",
+        );
+        let captured = unique_marker_offset(
+            source,
+            "let root_process_identity = capture_root_process_identity(&child);",
+        );
+        let waited = unique_marker_offset(
+            source,
+            "let (status, recovered_wait_error, process_group_recovery) = match child.wait()",
+        );
+        assert!(spawned < captured);
+        assert!(captured < waited);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn configured_benchmark_child_leads_a_dedicated_process_group() {
+        let mut command = Command::new("/bin/sh");
+        command
+            .args(["-c", "exec sleep 60"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        configure_benchmark_child(&mut command, &BTreeMap::new());
+        let mut child = command
+            .spawn()
+            .expect("spawn dedicated process-group child");
+        let root_process_identity = capture_root_process_identity(&child);
+        assert!(matches!(
+            root_process_identity,
+            LocalPerfRootProcessIdentity::LinuxProcStartTime {
+                pid,
+                process_group_id,
+                ..
+            } if pid == child.id() && process_group_id == pid
+        ));
+        let (_, recovery) = force_kill_and_reap(&mut child, root_process_identity)
+            .expect("reap dedicated process-group child");
+        assert_eq!(recovery, LocalPerfProcessGroupRecovery::SignaledOwnedGroup);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_subreaper_scope_e2e_runs_in_a_dedicated_test_process() {
+        let mut unrelated_canary = Command::new("/bin/sh")
+            .args(["-c", "exec sleep 60"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn unrelated canary");
+        let status = Command::new(std::env::current_exe().expect("current test executable"))
+            .args([
+                "local_perf_runner::tests::linux_subreaper_scope_isolated_probe",
+                "--exact",
+                "--ignored",
+                "--test-threads=1",
+            ])
+            .status()
+            .expect("run isolated subreaper probe");
+        let canary_survived = unrelated_canary
+            .try_wait()
+            .expect("inspect unrelated canary")
+            .is_none();
+        let _ = unrelated_canary.kill();
+        let _ = unrelated_canary.wait();
+        assert!(status.success(), "isolated subreaper probe must pass");
+        assert!(
+            canary_survived,
+            "descendant cleanup must not signal a sibling process canary"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "must not toggle process-wide subreaper state in the shared unit-test process"]
+    fn linux_subreaper_scope_isolated_probe() {
+        let mut scope =
+            LocalPerfDescendantScope::enter().expect("establish empty descendant scope");
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", "exit 0"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn zero-descendant child");
+        assert!(child.wait().expect("wait zero-descendant child").success());
+        let (quiescence, observed) = LocalPerfDescendantScope::reconcile_after_root_exit()
+            .expect("reconcile empty descendant tree");
+        scope.restore().expect("restore subreaper state");
+        assert_eq!(
+            quiescence,
+            LocalPerfProcessTreeQuiescence::LinuxSubreaperVerifiedEmpty
+        );
+        assert_eq!(observed, 0);
+
+        let mut scope =
+            LocalPerfDescendantScope::enter().expect("establish empty descendant scope");
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", "sleep 60 & exit 0"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn background-descendant child");
+        assert!(child.wait().expect("wait root child").success());
+        let (quiescence, observed) =
+            LocalPerfDescendantScope::reconcile_after_root_exit().expect("reap adopted descendant");
+        scope.restore().expect("restore subreaper state");
+        assert_eq!(
+            quiescence,
+            LocalPerfProcessTreeQuiescence::LinuxSubreaperReapedEscapedDescendants
+        );
+        assert!(observed >= 1);
+        assert!(
+            linux_descendant_pids()
+                .expect("scan post-reap child tree")
+                .is_empty()
+        );
+
+        let mut scope =
+            LocalPerfDescendantScope::enter().expect("establish empty descendant scope");
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", "sleep 60 & exit 7"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn failed root with background descendant");
+        assert_eq!(
+            child
+                .wait()
+                .expect("wait failed root with background descendant")
+                .code(),
+            Some(7),
+            "the root must retain its nonzero terminal status"
+        );
+        let (quiescence, observed) = LocalPerfDescendantScope::reconcile_after_root_exit()
+            .expect("reap descendant after failed root");
+        scope.restore().expect("restore subreaper state");
+        assert_eq!(
+            quiescence,
+            LocalPerfProcessTreeQuiescence::LinuxSubreaperReapedEscapedDescendants
+        );
+        assert!(observed >= 1);
+        assert!(
+            linux_descendant_pids()
+                .expect("scan failed-root post-reap child tree")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn completed_receipt_rejects_an_unverifiable_root_pid() {
+        let (receipt, _, _) = attempt_fixture(LocalPerfAttemptOutcome::Completed, Some(b"bound"));
+        let mut receipt = receipt;
+        receipt.root_process_identity = LocalPerfRootProcessIdentity::Unverifiable { pid: 37 };
+        let bytes = seal_attempt_receipt(receipt).expect("reseal root-identity mutation");
+        assert!(LocalPerfAttemptReceipt::from_verified_slice(&bytes).is_err());
+    }
+
+    #[test]
+    fn completed_receipt_rejects_a_non_dedicated_root_process_group() {
+        let (receipt, _, _) = attempt_fixture(LocalPerfAttemptOutcome::Completed, Some(b"bound"));
+        let mut receipt = receipt;
+        receipt.root_process_identity = LocalPerfRootProcessIdentity::LinuxProcStartTime {
+            pid: 37,
+            process_group_id: 36,
+            start_time_ticks: 81,
+        };
+        let bytes = seal_attempt_receipt(receipt).expect("reseal process-group mutation");
+        assert!(LocalPerfAttemptReceipt::from_verified_slice(&bytes).is_err());
+    }
+
+    #[test]
+    fn completed_receipt_rejects_direct_child_only_or_escaped_tree_claims() {
+        let (receipt, _, _) = attempt_fixture(LocalPerfAttemptOutcome::Completed, Some(b"bound"));
+        let mut direct_child_only = receipt.clone();
+        direct_child_only.process_lifecycle.process_tree_quiescence =
+            LocalPerfProcessTreeQuiescence::DirectChildOnly;
+        let bytes = seal_attempt_receipt(direct_child_only).expect("reseal direct-child mutation");
+        assert!(LocalPerfAttemptReceipt::from_verified_slice(&bytes).is_err());
+
+        let mut escaped = receipt;
+        escaped.process_lifecycle.process_tree_quiescence =
+            LocalPerfProcessTreeQuiescence::LinuxSubreaperReapedEscapedDescendants;
+        escaped.process_lifecycle.descendant_processes_observed = 1;
+        let bytes = seal_attempt_receipt(escaped).expect("reseal escaped-tree mutation");
+        assert!(LocalPerfAttemptReceipt::from_verified_slice(&bytes).is_err());
     }
 
     #[test]
@@ -6472,8 +8155,14 @@ mod tests {
             .stderr(Stdio::null())
             .spawn()
             .expect("spawn wait-recovery child");
-        let status = force_kill_and_reap(&mut child).expect("bounded kill and reap");
+        let child_pid = child.id();
+        let (status, recovery) = force_kill_and_reap(
+            &mut child,
+            LocalPerfRootProcessIdentity::Unverifiable { pid: child_pid },
+        )
+        .expect("bounded kill and reap");
         assert!(!status.success());
+        assert_eq!(recovery, LocalPerfProcessGroupRecovery::DirectChildFallback);
         assert!(child.try_wait().expect("post-recovery try_wait").is_some());
     }
 

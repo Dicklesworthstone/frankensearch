@@ -6908,6 +6908,10 @@ pub enum CountState {
 pub enum ScoreEpsilonReason {
     OracleSegmentGeometry,
     PlatformLibm,
+    /// The fused Quill multi-field scorer and the pinned oracle associate
+    /// equivalent finite additions differently. This permits only the
+    /// reviewed two-ULP DIV-007 envelope, never the generic relative epsilon.
+    SummationAssociation,
 }
 
 /// Comparator configuration encoded without JSON floating-point ambiguity.
@@ -7114,12 +7118,8 @@ fn compare_observations_validated_v7(
     validate_observation("subject", &subject)?;
     validate_observation("oracle", &oracle)?;
 
-    let (rank_class, rank_divergence) = classify_rank(
-        &subject,
-        &oracle,
-        epsilon,
-        config.score_epsilon_reason.is_some(),
-    );
+    let (rank_class, rank_divergence) =
+        classify_rank(&subject, &oracle, epsilon, config.score_epsilon_reason);
     let mut divergences = Vec::new();
     if let Some(divergence) = rank_divergence {
         divergences.push(divergence);
@@ -7332,7 +7332,7 @@ fn classify_rank(
     subject: &EngineObservation,
     oracle: &EngineObservation,
     epsilon: f32,
-    score_epsilon_allowed: bool,
+    score_epsilon_reason: Option<ScoreEpsilonReason>,
 ) -> (RankClass, Option<Divergence>) {
     if sequence_is_exact(&subject.hits, &oracle.hits) {
         return (RankClass::RankExact, None);
@@ -7354,7 +7354,9 @@ fn classify_rank(
         );
     }
 
-    if score_epsilon_allowed && is_score_epsilon_equivalent(&subject.hits, &oracle.hits, epsilon) {
+    if let Some(reason) = score_epsilon_reason
+        && is_score_epsilon_equivalent(&subject.hits, &oracle.hits, epsilon, reason)
+    {
         return (
             RankClass::ScoreEpsilon,
             Some(rank_divergence(
@@ -7595,7 +7597,12 @@ fn is_proven_mixed_tie_equivalence(
             .all(explained_by_boundary)
 }
 
-fn is_score_epsilon_equivalent(subject: &[RankedHit], oracle: &[RankedHit], epsilon: f32) -> bool {
+fn is_score_epsilon_equivalent(
+    subject: &[RankedHit],
+    oracle: &[RankedHit],
+    epsilon: f32,
+    reason: ScoreEpsilonReason,
+) -> bool {
     if subject.len() != oracle.len() || subject.is_empty() {
         return false;
     }
@@ -7615,14 +7622,38 @@ fn is_score_epsilon_equivalent(subject: &[RankedHit], oracle: &[RankedHit], epsi
         oracle_scores
             .get(hit.doc_id.as_str())
             .is_none_or(|oracle_bits| {
-                !within_relative_epsilon(hit.score(), f32::from_bits(*oracle_bits), epsilon)
+                !scores_within_epsilon(hit.score_bits, *oracle_bits, epsilon, reason)
             })
     }) {
         return false;
     }
 
-    let groups = epsilon_group_map(oracle, epsilon);
+    let groups = group_map(oracle, |left, right| {
+        scores_within_epsilon(left, right, epsilon, reason)
+    });
     groups_are_nondecreasing(subject, &groups)
+}
+
+const SUMMATION_ASSOCIATION_MAX_ULPS: u32 = 2;
+
+fn scores_within_epsilon(left: u32, right: u32, epsilon: f32, reason: ScoreEpsilonReason) -> bool {
+    match reason {
+        ScoreEpsilonReason::SummationAssociation => {
+            ordered_f32_bits(left).abs_diff(ordered_f32_bits(right))
+                <= SUMMATION_ASSOCIATION_MAX_ULPS
+        }
+        ScoreEpsilonReason::OracleSegmentGeometry | ScoreEpsilonReason::PlatformLibm => {
+            within_relative_epsilon(f32::from_bits(left), f32::from_bits(right), epsilon)
+        }
+    }
+}
+
+const fn ordered_f32_bits(bits: u32) -> u32 {
+    if bits & (1 << 31) == 0 {
+        bits | (1 << 31)
+    } else {
+        !bits
+    }
 }
 
 fn score_map(hits: &[RankedHit]) -> Option<BTreeMap<&str, u32>> {
@@ -7635,12 +7666,6 @@ fn score_map(hits: &[RankedHit]) -> Option<BTreeMap<&str, u32>> {
 
 fn exact_group_map(hits: &[RankedHit]) -> BTreeMap<&str, usize> {
     group_map(hits, scores_exact)
-}
-
-fn epsilon_group_map(hits: &[RankedHit], epsilon: f32) -> BTreeMap<&str, usize> {
-    group_map(hits, |left, right| {
-        within_relative_epsilon(f32::from_bits(left), f32::from_bits(right), epsilon)
-    })
 }
 
 fn group_map(hits: &[RankedHit], adjacent: impl Fn(u32, u32) -> bool) -> BTreeMap<&str, usize> {
@@ -9835,6 +9860,92 @@ mod tests {
     }
 
     #[test]
+    fn summation_association_is_explicit_and_bounded_to_two_ulps() {
+        let one = 1.0_f32.to_bits();
+        let oracle = observation(vec![
+            tantivy_hit("a", f32::from_bits(one), 1),
+            tantivy_hit("b", f32::from_bits(one - 4), 2),
+        ]);
+        let subject = observation(vec![
+            quill_hit("a", f32::from_bits(one + 2), 1),
+            quill_hit("b", f32::from_bits(one - 4), 2),
+        ]);
+
+        let default_report =
+            compare_observations(subject.clone(), oracle.clone(), ComparatorConfig::default())
+                .expect("default comparison");
+        assert_eq!(default_report.rank_class, RankClass::RankMismatch);
+        assert_eq!(default_report.score_epsilon_reason, None);
+
+        let admitted = compare_observations(
+            subject,
+            oracle.clone(),
+            ComparatorConfig::default()
+                .with_score_epsilon_reason(ScoreEpsilonReason::SummationAssociation),
+        )
+        .expect("two-ULP summation association comparison");
+        assert_eq!(admitted.rank_class, RankClass::ScoreEpsilon);
+        assert_eq!(
+            admitted.score_epsilon_reason,
+            Some(ScoreEpsilonReason::SummationAssociation)
+        );
+
+        let outside = observation(vec![
+            quill_hit("a", f32::from_bits(one + 3), 1),
+            quill_hit("b", f32::from_bits(one - 4), 2),
+        ]);
+        let rejected = compare_observations(
+            outside,
+            oracle,
+            ComparatorConfig::default()
+                .with_score_epsilon_reason(ScoreEpsilonReason::SummationAssociation),
+        )
+        .expect("three-ULP summation association comparison");
+        assert_eq!(rejected.rank_class, RankClass::RankMismatch);
+        assert_eq!(rejected.score_epsilon_reason, None);
+    }
+
+    #[test]
+    fn boosted_group_negation_oracle_bug_never_becomes_score_epsilon() {
+        let one = 1.0_f32.to_bits();
+        let mut subject = observation(vec![
+            quill_hit("a", f32::from_bits(one + 1), 1),
+            quill_hit("subject-only", 0.5, 2),
+        ]);
+        subject.ast_differences.push(AstDifference {
+            kind: AstLoweringKind::OracleBug,
+            oracle: "boosted group lenient fallback dropped negation".to_owned(),
+            subject: "Quill retained the negated clause".to_owned(),
+        });
+        let oracle = observation(vec![
+            tantivy_hit("a", 1.0, 1),
+            tantivy_hit("oracle-only", 0.5, 2),
+        ]);
+
+        let report = compare_observations(
+            subject,
+            oracle,
+            ComparatorConfig::default()
+                .with_score_epsilon_reason(ScoreEpsilonReason::SummationAssociation),
+        )
+        .expect("membership divergence remains observable");
+        assert_eq!(report.rank_class, RankClass::RankMismatch);
+        assert_eq!(report.score_epsilon_reason, None);
+        assert!(
+            report
+                .divergences
+                .iter()
+                .any(|divergence| divergence.class == DivergenceClass::OracleBug)
+        );
+        assert!(
+            report
+                .divergences
+                .iter()
+                .all(|divergence| divergence.class != DivergenceClass::ScoreEpsilon)
+        );
+    }
+
+    #[test]
     fn rank_exact_rejects_out_of_order_native_tie_keys() {
         let subject = observation(vec![quill_hit("a", 1.0, 2), quill_hit("b", 1.0, 1)]);
         let oracle = observation(vec![tantivy_hit("a", 1.0, 1), tantivy_hit("b", 1.0, 2)]);
@@ -11615,5 +11726,58 @@ mod tests {
                 report.first_mismatch
             );
         });
+    }
+
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct StoredV7RankCorpusCase {
+        name: String,
+        subject: EngineObservation,
+        oracle: EngineObservation,
+        config: ComparatorConfig,
+        expected: ComparisonReport,
+    }
+
+    fn load_pinned_stored_v7_rank_corpus(
+        bytes: &[u8],
+    ) -> Result<Vec<StoredV7RankCorpusCase>, String> {
+        const PINNED_SHA256: &str =
+            "7499b43d0b6fd0d024266ae793a9f9a6690b054cfee292b1ba872354d77996a1";
+        match lower_hex(&Sha256::digest(bytes)).as_str() {
+            PINNED_SHA256 => {}
+            _ => {
+                return Err("stored V7 rank corpus bytes differ from the pinned SHA-256".to_owned());
+            }
+        }
+        serde_json::from_slice(bytes).map_err(|error| error.to_string())
+    }
+
+    #[test]
+    fn pinned_stored_v7_rank_corpus_replays_without_live_creation() {
+        const PINNED_BYTES: &[u8] =
+            include_bytes!("../fixtures/campaign-report-v7-rank-corpus.json");
+        let cases = load_pinned_stored_v7_rank_corpus(PINNED_BYTES)
+            .expect("stored V7 rank corpus must decode");
+        assert_eq!(cases.len(), 2, "bounded corpus cardinality");
+
+        for case in cases {
+            let actual = compare_observations_stored_v7(case.subject, case.oracle, case.config)
+                .expect("stored V7 comparison must replay");
+            assert_eq!(
+                actual, case.expected,
+                "stored V7 case {} drifted",
+                case.name
+            );
+        }
+
+        let mut substituted = PINNED_BYTES.to_vec();
+        let Some(first_byte) = substituted.first_mut() else {
+            return;
+        };
+        *first_byte ^= 1;
+        assert!(
+            load_pinned_stored_v7_rank_corpus(&substituted).is_err(),
+            "a regenerated or substituted rank corpus must be refused before replay"
+        );
     }
 }
