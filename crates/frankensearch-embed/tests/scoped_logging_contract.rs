@@ -6,6 +6,7 @@
 //! processes, with bounded concurrent stdout/stderr drains.
 
 use std::{
+    ffi::OsString,
     io::Read,
     process::{Child, Command, ExitStatus, Stdio},
     sync::mpsc::{self, RecvTimeoutError},
@@ -155,7 +156,7 @@ fn read_bounded_child(mut child: Child) -> ChildOutput {
     }
 }
 
-fn run_child(case: &str, rust_log: Option<&str>) -> ChildOutput {
+fn run_child_with_rust_log(case: &str, rust_log: Option<OsString>) -> ChildOutput {
     let mut command = Command::new(std::env::current_exe().expect("test binary must exist"));
     command
         .arg(CHILD_TEST)
@@ -177,6 +178,17 @@ fn run_child(case: &str, rust_log: Option<&str>) -> ChildOutput {
     )
 }
 
+fn run_child(case: &str, rust_log: Option<&str>) -> ChildOutput {
+    run_child_with_rust_log(case, rust_log.map(OsString::from))
+}
+
+#[cfg(unix)]
+fn run_child_with_non_unicode_rust_log(case: &str) -> ChildOutput {
+    use std::os::unix::ffi::OsStringExt;
+
+    run_child_with_rust_log(case, Some(OsString::from_vec(vec![b't', 0x80])))
+}
+
 fn assert_child_passed(case: &str, output: &ChildOutput) -> String {
     let text = String::from_utf8_lossy(&output.bytes).into_owned();
     assert!(
@@ -187,30 +199,39 @@ fn assert_child_passed(case: &str, output: &ChildOutput) -> String {
     text
 }
 
+fn assert_marker_is_suppressed(case: &str, output: &ChildOutput) {
+    let output = assert_child_passed(case, output);
+    assert!(
+        !output.contains(TOKENIZERS_TRACE_MARKER),
+        "{case} must not expose tokenizers TRACE records:\n{output}"
+    );
+}
+
 #[test]
 fn real_tokenizers_log_output_requires_explicit_bridge_and_trace() {
     let default_child = run_child("default", None);
-    let default = assert_child_passed("default", &default_child);
-    assert!(
-        !default.contains(TOKENIZERS_TRACE_MARKER),
-        "safe default must not bridge tokenizers log records:\n{default}"
-    );
+    assert_marker_is_suppressed("default", &default_child);
 
     let valid_without_bridge_child = run_child("valid-trace-without-bridge", Some("trace"));
-    let valid_without_bridge =
-        assert_child_passed("valid-trace-without-bridge", &valid_without_bridge_child);
-    assert!(
-        !valid_without_bridge.contains(TOKENIZERS_TRACE_MARKER),
-        "TRACE alone must not bridge tokenizers log records:\n{valid_without_bridge}"
-    );
+    assert_marker_is_suppressed("valid-trace-without-bridge", &valid_without_bridge_child);
+
+    let empty_filter_child = run_child("empty-rust-log", Some(""));
+    assert_marker_is_suppressed("empty-rust-log", &empty_filter_child);
+
+    let malformed_filter_child = run_child("malformed-rust-log", Some("["));
+    assert_marker_is_suppressed("malformed-rust-log", &malformed_filter_child);
+
+    #[cfg(unix)]
+    {
+        let non_unicode_filter_child = run_child_with_non_unicode_rust_log("nonunicode-rust-log");
+        assert_marker_is_suppressed("nonunicode-rust-log", &non_unicode_filter_child);
+    }
 
     let bridge_without_trace_child = run_child("bridge-without-trace", Some("warn"));
-    let bridge_without_trace =
-        assert_child_passed("bridge-without-trace", &bridge_without_trace_child);
-    assert!(
-        !bridge_without_trace.contains(TOKENIZERS_TRACE_MARKER),
-        "the explicit bridge must still respect a non-TRACE filter:\n{bridge_without_trace}"
-    );
+    assert_marker_is_suppressed("bridge-without-trace", &bridge_without_trace_child);
+
+    let bridge_off_child = run_child("bridge-off", Some("off"));
+    assert_marker_is_suppressed("bridge-off", &bridge_off_child);
 
     let explicit_child = run_child("explicit-bridge", Some("trace"));
     let explicit = assert_child_passed("explicit-bridge", &explicit_child);
@@ -227,8 +248,12 @@ fn fresh_process_child() {
     };
 
     match case.as_str() {
-        "default" | "valid-trace-without-bridge" => exercise_real_tokenizer(),
-        "bridge-without-trace" | "explicit-bridge" => {
+        "default"
+        | "valid-trace-without-bridge"
+        | "empty-rust-log"
+        | "malformed-rust-log"
+        | "nonunicode-rust-log" => exercise_real_tokenizer(),
+        "bridge-without-trace" | "bridge-off" | "explicit-bridge" => {
             install_global_test_log_bridge()
                 .expect("fresh child must permit an explicit global LogTracer");
             exercise_real_tokenizer();
