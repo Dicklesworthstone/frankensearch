@@ -4752,7 +4752,7 @@ impl LinuxSubreaperScope {
         let was_subreaper = child_subreaper().map_err(std::io::Error::from)?.is_some();
         set_child_subreaper(Some(getpid())).map_err(std::io::Error::from)?;
         if !linux_descendant_pids()?.is_empty() {
-            let _ = set_child_subreaper(was_subreaper.then_some(getpid()));
+            set_child_subreaper(was_subreaper.then_some(getpid())).map_err(std::io::Error::from)?;
             return Err(LocalPerfRunError::Invalid(
                 "benchmark runner observed a child while establishing descendant containment"
                     .to_owned(),
