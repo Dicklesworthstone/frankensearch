@@ -629,6 +629,29 @@ fn fast_only_explanations_are_present_on_both_sides() {
 }
 
 #[test]
+fn refined_explanations_are_present_on_both_sides() {
+    let config = TwoTierConfig {
+        explain: true,
+        ..TwoTierConfig::default()
+    };
+    let query = normalize(vec![1.0, 0.0, 0.0, 0.0]);
+    let (sync_results, sync_metrics) = run_sync(&config, &query, 4);
+    let (async_results, async_metrics) = run_async("refined-explain", &config, &query, 4);
+    assert_result_parity("refined-explain", &sync_results, &async_results);
+    assert_metric_parity("refined-explain", &sync_metrics, &async_metrics);
+    assert!(
+        sync_results
+            .iter()
+            .all(|result| result.explanation.is_some())
+    );
+    assert!(
+        async_results
+            .iter()
+            .all(|result| result.explanation.is_some())
+    );
+}
+
+#[test]
 fn quality_index_unavailable_agrees_and_skips_phase_two_on_both_sides() {
     let config = TwoTierConfig::default();
     let query = normalize(vec![1.0, 0.0, 0.0, 0.0]);
@@ -707,6 +730,55 @@ fn lexical_rrf_agrees_on_ordered_results_and_metrics() {
     let (async_results, async_metrics) = run_async_with_lexical(&config, &query, 3);
     assert_result_parity("lexical-rrf", &sync_results, &async_results);
     assert_metric_parity("lexical-rrf", &sync_metrics, &async_metrics);
+}
+
+#[test]
+fn lexical_refined_explanations_are_present_on_both_sides() {
+    let config = TwoTierConfig {
+        candidate_multiplier: 3,
+        explain: true,
+        ..TwoTierConfig::default()
+    };
+    let query = normalize(vec![1.0, 0.0, 0.0, 0.0]);
+    let (sync_results, sync_metrics) = run_sync_with_lexical(&config, &query, 3);
+    let (async_results, async_metrics) = run_async_with_lexical(&config, &query, 3);
+    assert_result_parity("lexical-refined-explain", &sync_results, &async_results);
+    assert_metric_parity("lexical-refined-explain", &sync_metrics, &async_metrics);
+    assert!(
+        sync_results
+            .iter()
+            .all(|result| result.explanation.is_some())
+    );
+    assert!(
+        async_results
+            .iter()
+            .all(|result| result.explanation.is_some())
+    );
+}
+
+#[test]
+fn lexical_fast_only_explanations_are_present_on_both_sides() {
+    let config = TwoTierConfig {
+        candidate_multiplier: 3,
+        fast_only: true,
+        explain: true,
+        ..TwoTierConfig::default()
+    };
+    let query = normalize(vec![1.0, 0.0, 0.0, 0.0]);
+    let (sync_results, sync_metrics) = run_sync_with_lexical(&config, &query, 3);
+    let (async_results, async_metrics) = run_async_with_lexical(&config, &query, 3);
+    assert_result_parity("lexical-fast-only-explain", &sync_results, &async_results);
+    assert_metric_parity("lexical-fast-only-explain", &sync_metrics, &async_metrics);
+    assert!(
+        sync_results
+            .iter()
+            .all(|result| result.explanation.is_some())
+    );
+    assert!(
+        async_results
+            .iter()
+            .all(|result| result.explanation.is_some())
+    );
 }
 
 #[test]

@@ -15,7 +15,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use frankensearch_core::explanation::{
-    ExplainedSource, ExplanationPhase, HitExplanation, ScoreComponent,
+    ExplainedSource, ExplanationPhase, HitExplanation, RankMovement, ScoreComponent,
 };
 use frankensearch_core::filter::SearchFilter;
 use frankensearch_core::{
@@ -546,6 +546,7 @@ impl SyncTwoTierSearcher {
                         },
                     ),
                     k,
+                    &self.config,
                 )
             },
         );
@@ -647,6 +648,7 @@ impl SyncTwoTierSearcher {
                     },
                 ),
                 k,
+                &self.config,
             )
         } else {
             unique_vector_hits_to_scored_results_aligned_owned(
@@ -670,6 +672,33 @@ impl SyncTwoTierSearcher {
             {
                 result.fast_score = Some(fast_score);
                 result.quality_score = quality_score;
+            }
+        }
+
+        if self.config.explain {
+            let initial_ranks = initial_results
+                .iter()
+                .enumerate()
+                .map(|(rank, result)| (result.doc_id.as_str(), rank))
+                .collect::<AHashMap<_, _>>();
+            let (fast_min, fast_max) = finite_score_bounds(fast_hits.iter().map(|hit| hit.score));
+            let (quality_min, quality_max) =
+                finite_score_bounds(quality_scores.iter().flatten().copied());
+            let quality_weight = saturating_f64_to_f32(self.config.quality_weight);
+            for (rank, result) in refined_results.iter_mut().enumerate() {
+                result.explanation = Some(Box::new(build_refined_explanation(
+                    result.score,
+                    rank,
+                    result.doc_id.as_str(),
+                    result.fast_score,
+                    result.quality_score,
+                    &initial_ranks,
+                    fast_min,
+                    fast_max,
+                    quality_min,
+                    quality_max,
+                    quality_weight,
+                )));
             }
         }
 
@@ -844,6 +873,96 @@ fn saturating_f64_to_f32(value: f64) -> f32 {
     value.clamp(f64::from(f32::MIN), f64::from(f32::MAX)) as f32
 }
 
+fn finite_score_bounds(scores: impl IntoIterator<Item = f32>) -> (f32, f32) {
+    scores
+        .into_iter()
+        .filter(|score| score.is_finite())
+        .fold((f32::INFINITY, f32::NEG_INFINITY), |(min, max), score| {
+            (min.min(score), max.max(score))
+        })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_refined_explanation(
+    final_score: f32,
+    rank: usize,
+    doc_id: &str,
+    fast_score: Option<f32>,
+    quality_score: Option<f32>,
+    initial_ranks: &AHashMap<&str, usize>,
+    fast_min: f32,
+    fast_max: f32,
+    quality_min: f32,
+    quality_max: f32,
+    quality_weight: f32,
+) -> HitExplanation {
+    let normalize = |score: f32, min: f32, max: f32| {
+        if !score.is_finite() {
+            return 0.0;
+        }
+        let range = max - min;
+        if range > 0.01 {
+            f64::from(((score - min) / range).clamp(0.0, 1.0))
+        } else {
+            f64::from(score.clamp(0.0, 1.0))
+        }
+    };
+    let mut components = Vec::with_capacity(2);
+    if let Some(score) = fast_score {
+        components.push(ScoreComponent {
+            source: ExplainedSource::SemanticFast {
+                embedder: "sync-fast-query".to_owned(),
+                cosine_sim: f64::from(score),
+            },
+            raw_score: f64::from(score),
+            normalized_score: normalize(score, fast_min, fast_max),
+            rrf_contribution: 0.0,
+            weight: 1.0 - f64::from(quality_weight),
+        });
+    }
+    if let Some(score) = quality_score {
+        components.push(ScoreComponent {
+            source: ExplainedSource::SemanticQuality {
+                embedder: "sync-quality-query".to_owned(),
+                cosine_sim: f64::from(score),
+            },
+            raw_score: f64::from(score),
+            normalized_score: normalize(score, quality_min, quality_max),
+            rrf_contribution: 0.0,
+            weight: f64::from(quality_weight),
+        });
+    }
+    let rank_movement = initial_ranks.get(doc_id).map(|&initial_rank| {
+        let refined_rank = i64::try_from(rank).unwrap_or(i64::MAX);
+        let initial_rank_i64 = i64::try_from(initial_rank).unwrap_or(i64::MAX);
+        let delta_i64 = refined_rank - initial_rank_i64;
+        let delta = i32::try_from(delta_i64).unwrap_or_else(|_| {
+            if delta_i64.is_negative() {
+                i32::MIN
+            } else {
+                i32::MAX
+            }
+        });
+        let reason = match delta.cmp(&0) {
+            std::cmp::Ordering::Less => "promoted",
+            std::cmp::Ordering::Greater => "demoted",
+            std::cmp::Ordering::Equal => "stable",
+        };
+        RankMovement {
+            initial_rank,
+            refined_rank: rank,
+            delta,
+            reason: reason.to_owned(),
+        }
+    });
+    HitExplanation {
+        final_score: f64::from(final_score),
+        components,
+        phase: ExplanationPhase::Refined,
+        rank_movement,
+    }
+}
+
 fn filter_lexical_hits(
     hits: Vec<ScoredResult>,
     filter: Option<&dyn SearchFilter>,
@@ -856,25 +975,76 @@ fn filter_lexical_hits(
         .collect()
 }
 
-fn fused_hits_to_scored_results(hits: Vec<FusedHit>, k: usize) -> Vec<ScoredResult> {
+fn fused_hits_to_scored_results(
+    hits: Vec<FusedHit>,
+    k: usize,
+    config: &TwoTierConfig,
+) -> Vec<ScoredResult> {
     // Take the `rrf_fuse` result by value and move each `doc_id` into the
     // `ScoredResult` instead of cloning it; the `FusedHit`s are a fresh
     // temporary here, so there is no need to keep them alive.
     hits.into_iter()
         .take(k)
-        .map(|hit| ScoredResult {
-            doc_id: hit.doc_id,
-            score: saturating_f64_to_f32(hit.rrf_score),
-            source: ScoreSource::Hybrid,
-            index: hit.semantic_index,
-            fast_score: hit.semantic_score,
-            quality_score: None,
-            lexical_score: hit.lexical_score,
-            rerank_score: None,
-            explanation: None,
-            metadata: None,
+        .map(|hit| {
+            let score = saturating_f64_to_f32(hit.rrf_score);
+            let explanation = config.explain.then(|| {
+                let mut components = Vec::with_capacity(2);
+                if let (Some(rank), Some(raw_score)) = (hit.lexical_rank, hit.lexical_score) {
+                    components.push(ScoreComponent {
+                        source: ExplainedSource::LexicalBm25 {
+                            matched_terms: Vec::new(),
+                            tf: 0.0,
+                            idf: 0.0,
+                        },
+                        raw_score: f64::from(raw_score),
+                        normalized_score: f64::from(raw_score),
+                        rrf_contribution: rrf_rank_contribution(config.rrf_k, rank),
+                        weight: 1.0,
+                    });
+                }
+                if let (Some(rank), Some(raw_score)) = (hit.semantic_rank, hit.semantic_score) {
+                    components.push(ScoreComponent {
+                        source: ExplainedSource::SemanticFast {
+                            embedder: "sync-fast-query".to_owned(),
+                            cosine_sim: f64::from(raw_score),
+                        },
+                        raw_score: f64::from(raw_score),
+                        normalized_score: f64::from(raw_score),
+                        rrf_contribution: rrf_rank_contribution(config.rrf_k, rank),
+                        weight: 1.0,
+                    });
+                }
+                Box::new(HitExplanation {
+                    final_score: f64::from(score),
+                    components,
+                    phase: ExplanationPhase::Initial,
+                    rank_movement: None,
+                })
+            });
+            ScoredResult {
+                doc_id: hit.doc_id,
+                score,
+                source: ScoreSource::Hybrid,
+                index: hit.semantic_index,
+                fast_score: hit.semantic_score,
+                quality_score: None,
+                lexical_score: hit.lexical_score,
+                rerank_score: None,
+                explanation,
+                metadata: None,
+            }
         })
         .collect()
+}
+
+fn rrf_rank_contribution(rrf_k: f64, rank: usize) -> f64 {
+    let rank = u32::try_from(rank).unwrap_or(u32::MAX);
+    let rrf_k = if rrf_k.is_finite() && rrf_k >= 0.0 {
+        rrf_k
+    } else {
+        60.0
+    };
+    1.0 / (rrf_k + f64::from(rank) + 1.0)
 }
 
 fn vector_hits_to_scored_results(
