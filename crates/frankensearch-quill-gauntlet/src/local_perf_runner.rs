@@ -7159,6 +7159,38 @@ mod tests {
                 .expect("scan post-reap child tree")
                 .is_empty()
         );
+
+        let mut scope =
+            LocalPerfDescendantScope::enter().expect("establish empty descendant scope");
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", "sleep 60 & exit 7"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn failed root with background descendant");
+        assert_eq!(
+            child
+                .wait()
+                .expect("wait failed root with background descendant")
+                .code(),
+            Some(7),
+            "the root must retain its nonzero terminal status"
+        );
+        let (quiescence, observed) = scope
+            .reconcile_after_root_exit()
+            .expect("reap descendant after failed root");
+        scope.restore().expect("restore subreaper state");
+        assert_eq!(
+            quiescence,
+            LocalPerfProcessTreeQuiescence::LinuxSubreaperReapedEscapedDescendants
+        );
+        assert!(observed >= 1);
+        assert!(
+            linux_descendant_pids()
+                .expect("scan failed-root post-reap child tree")
+                .is_empty()
+        );
     }
 
     #[test]
