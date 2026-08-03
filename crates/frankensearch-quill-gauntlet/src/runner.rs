@@ -517,6 +517,15 @@ pub struct MetamorphicLawResult {
     pub outcome: Option<MetamorphicLawOutcome>,
 }
 
+/// One deterministic cell in the runner's E6.3 applicability matrix.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MetamorphicLawApplicabilityEntry {
+    pub law_id: String,
+    pub scope: MetamorphicLawScope,
+    pub applicability: MetamorphicLawApplicability,
+}
+
 /// Aggregate accounting for a bounded metamorphic campaign.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -850,6 +859,34 @@ impl MetamorphicLawRegistry {
 
     fn law(&self, law_id: &str) -> Option<&MetamorphicLawDescriptor> {
         self.laws.iter().find(|law| law.id == law_id)
+    }
+
+    /// Expands each registered law into its deterministic runner scope cells.
+    ///
+    /// This is the single applicability plan PR and nightly executors consume;
+    /// skip cells remain present for audit and cannot disappear by omission.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the registry declaration itself is invalid.
+    pub fn applicability_matrix(
+        &self,
+    ) -> Result<Vec<MetamorphicLawApplicabilityEntry>, GauntletError> {
+        self.validate()?;
+        Ok(self
+            .laws
+            .iter()
+            .flat_map(|law| {
+                law.scopes
+                    .iter()
+                    .copied()
+                    .map(|scope| MetamorphicLawApplicabilityEntry {
+                        law_id: law.id.clone(),
+                        scope,
+                        applicability: law.applicability,
+                    })
+            })
+            .collect())
     }
 
     /// Validates and summarizes runner-recorded law results.
@@ -8835,6 +8872,16 @@ mod tests {
     #[test]
     fn e63_metamorphic_accounting_excludes_skips_from_passes() {
         let registry = MetamorphicLawRegistry::scalar_g1a_v1();
+        let matrix = registry
+            .applicability_matrix()
+            .expect("valid E6.3 applicability matrix");
+        assert!(matrix.iter().any(|entry| {
+            entry.law_id == "e6.3-tombstone-compaction-v1"
+                && entry.applicability
+                    == MetamorphicLawApplicability::SkipWithReason {
+                        reason: MetamorphicSkipReason::ScoreSensitiveCorpusStatistics,
+                    }
+        }));
         let results = [
             MetamorphicLawResult {
                 law_id: "e6.3-input-order-permutation-v1".to_owned(),
