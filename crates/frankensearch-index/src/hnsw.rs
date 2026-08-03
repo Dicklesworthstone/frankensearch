@@ -12,8 +12,9 @@
 //! change. Format v5 records the exact
 //! generation directory and basename selected during atomic publication, so no
 //! save truncates the pair named by installed metadata. A persistent advisory
-//! save lock and durable in-generation READY receipt serialize writers and let
-//! publication retries reuse complete generations without deleting them.
+//! save lock and durable in-generation READY receipt serialize writers, let
+//! publication retries reuse complete generations, and reclaim generations
+//! superseded by a successful metadata publication.
 //! Format v6 attests the native graph's point and layer topology, invalidating
 //! graphs produced by `hnsw_rs` versions that could misfile reverse edges.
 //! Legacy sidecars and any load failure fall back to the
@@ -632,6 +633,7 @@ impl HnswIndex {
             sync_hnsw_directory(parent)?;
             let metadata_bytes = serialize_hnsw_metadata(&meta)?;
             publish_metadata(path, parent, &metadata_bytes)?;
+            gc_superseded_hnsw_generations(parent, &requested_basename, &meta)?;
             return Ok(());
         }
 
@@ -692,6 +694,7 @@ impl HnswIndex {
 
         let metadata_bytes = serialize_hnsw_metadata(&meta)?;
         publish_metadata(path, parent, &metadata_bytes)?;
+        gc_superseded_hnsw_generations(parent, &requested_basename, &meta)?;
 
         Ok(())
     }
@@ -2342,6 +2345,54 @@ fn sync_hnsw_directory(directory: &Path) -> SearchResult<()> {
 
 fn publish_hnsw_metadata(path: &Path, parent: &Path, bytes: &[u8]) -> SearchResult<()> {
     install_hnsw_metadata(path, parent, bytes)?;
+    sync_hnsw_directory(parent)
+}
+
+/// Remove stale native HNSW generations after metadata has durably selected a
+/// replacement.
+///
+/// The save lock is held by the caller for the complete publication and
+/// cleanup sequence.  A failed or interrupted metadata publication never
+/// reaches this function, preserving READY generations for a retry.  Only
+/// sibling directories in this metadata role's private generation namespace
+/// are eligible; symlinks and unrelated filesystem entries are left intact.
+fn gc_superseded_hnsw_generations(
+    parent: &Path,
+    requested_basename: &str,
+    published_metadata: &HnswMeta,
+) -> SearchResult<()> {
+    let retained_generation = published_metadata
+        .sidecar_generation
+        .as_deref()
+        .ok_or_else(|| ann_corrupted(parent, "published HNSW metadata has no generation"))?;
+    let generation_prefix = format!(".{requested_basename}.generation-");
+
+    for entry in std::fs::read_dir(parent).map_err(SearchError::Io)? {
+        let entry = entry.map_err(SearchError::Io)?;
+        let file_name = entry.file_name();
+        let Some(file_name) = file_name.to_str() else {
+            continue;
+        };
+        if file_name == retained_generation || !file_name.starts_with(&generation_prefix) {
+            continue;
+        }
+
+        let file_type = entry.file_type().map_err(SearchError::Io)?;
+        if file_type.is_symlink() || !file_type.is_dir() {
+            continue;
+        }
+
+        std::fs::remove_dir_all(entry.path()).map_err(|error| {
+            SearchError::Io(std::io::Error::new(
+                error.kind(),
+                format!(
+                    "failed to remove superseded HNSW generation '{}': {error}",
+                    entry.path().display()
+                ),
+            ))
+        })?;
+    }
+
     sync_hnsw_directory(parent)
 }
 
@@ -5120,19 +5171,8 @@ mod tests {
             .sidecar_generation
             .as_deref()
             .expect("original generation");
-        let original_basename = original_meta
-            .sidecar_basename
-            .as_deref()
-            .expect("original basename");
         let destination_parent = destination.parent().expect("destination parent");
         let original_sidecar_parent = destination_parent.join(original_generation);
-        let original_graph_path =
-            original_sidecar_parent.join(format!("{original_basename}.hnsw.graph"));
-        let original_data_path =
-            original_sidecar_parent.join(format!("{original_basename}.hnsw.data"));
-        let original_graph = std::fs::read(&original_graph_path).expect("original graph bytes");
-        let original_data = std::fs::read(&original_data_path).expect("original data bytes");
-
         // Load a graph over the same IDs/count/dimension but different vectors.
         // hnsw_rs marks every loaded graph as mmap-backed. Saving this value
         // over occupied metadata must publish a fresh generation without
@@ -5192,15 +5232,14 @@ mod tests {
                 .join(format!("{published}.hnsw.data"))
                 .is_file()
         );
-        assert_eq!(
-            std::fs::read(&original_graph_path).expect("retained original graph"),
-            original_graph,
-            "resave must not truncate the graph named by old metadata"
+        assert!(
+            !original_sidecar_parent.exists(),
+            "a successfully published replacement must reclaim its superseded generation"
         );
         assert_eq!(
-            std::fs::read(&original_data_path).expect("retained original data"),
-            original_data,
-            "resave must not truncate the data named by old metadata"
+            ready_generation_paths(&destination, changed_loaded.vector_fingerprint),
+            vec![published_parent.clone()],
+            "the published metadata generation must be the only retained generation for this vector state"
         );
 
         let native = HnswIndex::try_load_native_graph(&destination, &meta, &changed_source)

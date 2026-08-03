@@ -451,8 +451,9 @@ impl TwoTierIndex {
     /// # Errors
     ///
     /// Returns `SearchError::IndexCandidatesNotFound` if neither fast-tier
-    /// candidate exists, and propagates index parse/corruption errors from
-    /// `VectorIndex::open`.
+    /// candidate exists, and propagates fast-tier parse/corruption errors from
+    /// `VectorIndex::open`. A discovered quality-tier file is optional: an
+    /// unavailable or corrupt one degrades this constructor to fast-only.
     pub fn open(dir: &Path, config: TwoTierConfig) -> SearchResult<Self> {
         let fast_path = resolve_fast_path(dir)?;
         let quality_path = dir.join(VECTOR_INDEX_QUALITY_FILENAME);
@@ -467,7 +468,7 @@ impl TwoTierIndex {
                 paths = paths.with_quality_ann(dir.join(VECTOR_ANN_QUALITY_FILENAME));
             }
         }
-        Self::open_with_paths(&paths, config)
+        Self::open_with_paths_inner(&paths, config, true)
     }
 
     /// Open a two-tier index from explicit consumer-owned paths.
@@ -486,6 +487,15 @@ impl TwoTierIndex {
     /// directory before validation and opening.
     #[allow(clippy::too_many_lines)]
     pub fn open_with_paths(paths: &TwoTierIndexPaths, config: TwoTierConfig) -> SearchResult<Self> {
+        Self::open_with_paths_inner(paths, config, false)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn open_with_paths_inner(
+        paths: &TwoTierIndexPaths,
+        config: TwoTierConfig,
+        degrade_discovered_quality_errors: bool,
+    ) -> SearchResult<Self> {
         let paths = paths.clone().into_absolute()?;
         validate_index_paths(&paths)?;
         let fast_index = VectorIndex::open(paths.fast_index())?;
@@ -497,17 +507,28 @@ impl TwoTierIndex {
         // silently launders vectors from different corpus states (bd-miio8).
         // Legacy pre-nonce pairs read 0 == 0 and remain accepted.
         let paired_quality = if let Some(quality_path) = paths.quality_index() {
-            let quality = VectorIndex::open(quality_path)?;
-            if quality.publication_nonce() == fast_index.publication_nonce() {
-                Some(quality)
-            } else {
-                warn!(
-                    fast_nonce = fast_index.publication_nonce(),
-                    quality_nonce = quality.publication_nonce(),
-                    "fast/quality publication identities disagree (mixed-generation pair, \
-                     likely a crash between tier installs); degrading to fast-only"
-                );
-                None
+            match VectorIndex::open(quality_path) {
+                Ok(quality) if quality.publication_nonce() == fast_index.publication_nonce() => {
+                    Some(quality)
+                }
+                Ok(quality) => {
+                    warn!(
+                        fast_nonce = fast_index.publication_nonce(),
+                        quality_nonce = quality.publication_nonce(),
+                        "fast/quality publication identities disagree (mixed-generation pair, \
+                         likely a crash between tier installs); degrading to fast-only"
+                    );
+                    None
+                }
+                Err(error) if degrade_discovered_quality_errors => {
+                    warn!(
+                        path = %quality_path.display(),
+                        ?error,
+                        "discovered optional quality index is unavailable; degrading to fast-only"
+                    );
+                    None
+                }
+                Err(error) => return Err(error),
             }
         } else {
             None
@@ -2082,6 +2103,57 @@ mod tests {
         assert!(
             !reopened.has_quality_index(),
             "a mixed-publication pair must degrade to fast-only, not blend tiers"
+        );
+    }
+
+    #[test]
+    fn open_degrades_to_fast_only_when_discovered_quality_index_is_corrupt() {
+        let dir = temp_index_dir("corrupt-discovered-quality-degrade");
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let fast_path = dir.join(VECTOR_INDEX_FAST_FILENAME);
+        write_index_file(
+            &fast_path,
+            &[("doc-a", &[1.0, 0.0]), ("doc-b", &[0.0, 1.0])],
+        )
+        .expect("write fast index");
+        fs::write(dir.join(VECTOR_INDEX_QUALITY_FILENAME), b"not an FSVI file")
+            .expect("write corrupt optional quality index");
+
+        let opened = TwoTierIndex::open(&dir, TwoTierConfig::default())
+            .expect("a corrupt discovered optional quality tier must not block fast-only open");
+
+        assert_eq!(opened.doc_count(), 2);
+        assert!(
+            !opened.has_quality_index(),
+            "a corrupt discovered quality tier must degrade to fast-only"
+        );
+        assert_eq!(
+            opened
+                .search_fast(&[1.0, 0.0], 1)
+                .expect("fast search after quality degradation")[0]
+                .doc_id,
+            "doc-a"
+        );
+    }
+
+    #[test]
+    fn open_with_paths_rejects_a_corrupt_explicit_quality_index() {
+        let dir = temp_index_dir("corrupt-explicit-quality-reject");
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let fast_path = dir.join("fast.fsvi");
+        let quality_path = dir.join("quality.fsvi");
+        write_index_file(&fast_path, &[("doc-a", &[1.0, 0.0])]).expect("write fast index");
+        fs::write(&quality_path, b"not an FSVI file").expect("write corrupt quality index");
+
+        let error = TwoTierIndex::open_with_paths(
+            &TwoTierIndexPaths::new(&fast_path).with_quality_index(&quality_path),
+            TwoTierConfig::default(),
+        )
+        .expect_err("an explicit corrupt quality path must remain an error");
+
+        assert!(
+            !matches!(error, SearchError::IndexNotFound { .. }),
+            "the corrupt explicit path must not be reported as absent: {error:?}"
         );
     }
 
