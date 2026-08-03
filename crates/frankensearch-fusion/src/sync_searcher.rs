@@ -461,6 +461,16 @@ impl SyncTwoTierSearcher {
         } else {
             Vec::new()
         };
+        // Match the async progressive contract: zero requested results is a
+        // successful no-op, not a request to scan the corpus and discard the
+        // candidate pool afterwards (bd-k3089).
+        if k == 0 {
+            return Ok(SyncSearchOutcome {
+                phases,
+                final_results: Vec::new(),
+                metrics,
+            });
+        }
         let fetch = candidate_count(k, 0, self.config.candidate_multiplier.max(1)).max(k);
 
         let phase1_started = Instant::now();
