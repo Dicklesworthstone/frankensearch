@@ -17,6 +17,44 @@ Conventions:
 - A generic proxy, stored baseline, separate invocation, previous commit,
   `HEAD`, `OLD`, or in-repo `ORIG` arm is not an incumbent win.
 
+### 2026-07-31 — Tokenizer HYBRID fused-emit length dispatch WASH / no ship (`bd-ljw1u`, SandyGrove)
+
+- **Hypothesis:** retain the frozen fused ASCII-emitter's short-token benefit
+  while routing the settled long-token regression to the shipping bulk path.
+  The HYBRID arm used the pre-registered 16-byte threshold: lengths at most 15
+  bytes use fused emit; lengths 24 bytes and above use bulk. This is an
+  internal BASE/HYBRID comparison, not an external-incumbent result.
+- **Immutable receipt and method:** committed card
+  [`tok-emit-hybrid-three-arm-20260731.md`](evidence/e8h/tok-emit-hybrid-three-arm-20260731.md)
+  at `86857994aacc104b3e3287d70095cc92d44cad4d` (card SHA-256
+  `acc2b69d5139ca75c394327558e18b4c7be4589db3a82a661155618e2cd626cf`)
+  records a single-worktree, three-checkout, 16-round rotated BASE/PURE/HYBRID
+  invocation on `taskset -c 37`. The HYBRID ELF was
+  `2806975660b553eed31fb355ec1c50f6980706598b792b44597eefaaaf504570`;
+  BASE was `7ce38d9a1bac3fa8029f09d747d6d156a956a81ce0c7557b2d78a09dd121c280`.
+  The receipt includes same-invocation shipping-vs-shipping A/A controls for
+  each arm and corpus; the pre-registered admissibility band was p5..p95
+  within `[0.97, 1.03]` for a majority of runs.
+- **Result:** HYBRID versus BASE was **1.0288** on the short corpus (95% CI
+  `[1.0206, 1.0318]`) and **0.9832** on the long corpus (95% CI
+  `[0.9711, 0.9877]`). The HYBRID A/A controls failed: short p5..p95
+  `[0.9687, 1.0219]`, 3/16 runs in band; long `[0.9731, 1.0370]`, 6/16.
+  The full run's load rose from 9.94 to 42.38, but the receipt already treats
+  that as a caveat rather than an excuse. HYBRID fully recovered PURE's
+  settled long regression (HYBRID/PURE 1.3896) without a measurable short
+  dispatch cost (HYBRID/PURE 0.9954); neither fact converts the BASE comparison
+  into a KEEP.
+- **Decision:** **REJECT / WASH; branch remains banked, no retraction
+  narrative.** The short result misses the hard `>= 1.03` bar by 0.1%, the
+  long result is inside its failed null band, and the all-arm null gate made
+  the run VOID for KEEP purposes. No performance, campaign, activation, or
+  incumbent claim may cite this result.
+- **Retry predicate:** rerun the same rotated three-arm protocol only during a
+  window with load below about 10 for the full run and a majority of all six
+  arm-by-corpus same-invocation A/A controls within `[0.97, 1.03]`; HYBRID may
+  be considered only if it then reaches `>= 1.03` on both corpora with CIs
+  clear of the null floor.
+
 ### 2026-07-17 — Quiver global `wide::u32x8` postings unpack policy (`bd-quill-e2-grimoire-quiver-accg.2`, BeigeHorse)
 
 - **Hypothesis:** routing every canonical FSLX bitpacked doc-delta and frequency payload through the portable eight-lane `wide::u32x8` unpacker would beat the scalar reservoir for the complete width domain without changing bytes or decoded values.
