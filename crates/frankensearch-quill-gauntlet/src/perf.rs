@@ -18,10 +18,12 @@ use thiserror::Error;
 use crate::GauntletError;
 use crate::local_perf_runner::LOCAL_PERF_ATTEMPT_RECEIPT_SCHEMA_VERSION;
 use crate::machine_class_registry::{
-    DefaultFlipDisposition, ExecutionCapacitySemantics, MACHINE_CLASS_REGISTRY_SCHEMA_VERSION,
-    MACHINE_CLASS_REGISTRY_SHA256, MachineClassError, MachineClassRegistry,
-    MachineExecutionProfile, MachineProfileAvailability, MachineProfileKey,
+    DefaultFlipDisposition, ExecutionCapacitySemantics, LOCAL_PERF_PRODUCER_CONTRACT_VERSION,
+    MACHINE_CLASS_REGISTRY_SCHEMA_VERSION, MACHINE_CLASS_REGISTRY_SHA256, MachineClassError,
+    MachineClassRegistry, MachineExecutionProfile, MachineProfileAvailability, MachineProfileKey,
+    RUNNER_ARTIFACT_MANIFEST_SCHEMA_VERSION, RUNNER_RECEIPT_SCHEMA_VERSION,
 };
+use crate::perf_assembly::PERF_EVIDENCE_ASSEMBLY_SCHEMA_VERSION;
 use crate::perf_evidence::PERF_EVIDENCE_SCHEMA_VERSION;
 
 /// Version of the JSON emitted by the QG matrix harness.
@@ -893,7 +895,18 @@ fn validate_perf_manifest_schema_bindings(
     for (field, expected) in [
         ("threshold_artifact", PERF_ARTIFACT_SCHEMA_VERSION),
         ("evidence_artifact", PERF_EVIDENCE_SCHEMA_VERSION),
+        ("evidence_assembly", PERF_EVIDENCE_ASSEMBLY_SCHEMA_VERSION),
+        ("machine_registry", MACHINE_CLASS_REGISTRY_SCHEMA_VERSION),
         ("applicability_plan", PERF_APPLICABILITY_PLAN_SCHEMA_VERSION),
+        ("runner_completion_receipt", RUNNER_RECEIPT_SCHEMA_VERSION),
+        (
+            "runner_artifact_manifest",
+            RUNNER_ARTIFACT_MANIFEST_SCHEMA_VERSION,
+        ),
+        (
+            "local_producer_contract",
+            LOCAL_PERF_PRODUCER_CONTRACT_VERSION,
+        ),
         (
             "runner_attempt_receipt",
             LOCAL_PERF_ATTEMPT_RECEIPT_SCHEMA_VERSION,
@@ -4893,6 +4906,17 @@ mod tests {
         for (field, expected) in [
             ("threshold_artifact", PERF_ARTIFACT_SCHEMA_VERSION),
             ("evidence_artifact", PERF_EVIDENCE_SCHEMA_VERSION),
+            ("evidence_assembly", PERF_EVIDENCE_ASSEMBLY_SCHEMA_VERSION),
+            ("machine_registry", MACHINE_CLASS_REGISTRY_SCHEMA_VERSION),
+            ("runner_completion_receipt", RUNNER_RECEIPT_SCHEMA_VERSION),
+            (
+                "runner_artifact_manifest",
+                RUNNER_ARTIFACT_MANIFEST_SCHEMA_VERSION,
+            ),
+            (
+                "local_producer_contract",
+                LOCAL_PERF_PRODUCER_CONTRACT_VERSION,
+            ),
             (
                 "runner_attempt_receipt",
                 LOCAL_PERF_ATTEMPT_RECEIPT_SCHEMA_VERSION,
