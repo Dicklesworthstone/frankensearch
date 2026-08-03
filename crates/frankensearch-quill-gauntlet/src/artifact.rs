@@ -3890,31 +3890,53 @@ mod tests {
 
     #[test]
     fn artifactstore_v4_build_snapshot_binds_exact_build_input_bytes() {
-        let mut inputs = vec![
-            ArtifactStoreV4BuildInput {
-                key: "cargo.profile".to_owned(),
-                kind: ArtifactStoreV4BuildInputKind::Profile,
-                canonical_bytes: b"release".to_vec(),
-                sha256: lower_hex(&Sha256::digest(b"release")),
-            },
-            ArtifactStoreV4BuildInput {
-                key: "cargo.rustflags".to_owned(),
-                kind: ArtifactStoreV4BuildInputKind::Rustflags,
-                canonical_bytes: b"-Ctarget-cpu=native".to_vec(),
-                sha256: lower_hex(&Sha256::digest(b"-Ctarget-cpu=native")),
-            },
+        let kinds = [
+            ArtifactStoreV4BuildInputKind::CargoLock,
+            ArtifactStoreV4BuildInputKind::RegistryChecksum,
+            ArtifactStoreV4BuildInputKind::GitDependency,
+            ArtifactStoreV4BuildInputKind::Toolchain,
+            ArtifactStoreV4BuildInputKind::Compiler,
+            ArtifactStoreV4BuildInputKind::Linker,
+            ArtifactStoreV4BuildInputKind::TargetConfig,
+            ArtifactStoreV4BuildInputKind::CargoConfig,
+            ArtifactStoreV4BuildInputKind::Environment,
+            ArtifactStoreV4BuildInputKind::BuildScriptInput,
+            ArtifactStoreV4BuildInputKind::BuildScriptOutput,
+            ArtifactStoreV4BuildInputKind::GeneratedSource,
+            ArtifactStoreV4BuildInputKind::FeatureSelection,
+            ArtifactStoreV4BuildInputKind::Profile,
+            ArtifactStoreV4BuildInputKind::Rustflags,
+            ArtifactStoreV4BuildInputKind::Executable,
+            ArtifactStoreV4BuildInputKind::DebugMetadata,
         ];
+        let inputs: Vec<ArtifactStoreV4BuildInput> = kinds
+            .into_iter()
+            .enumerate()
+            .map(|(index, kind)| {
+                let canonical_bytes =
+                    format!("exact compiler-visible input {index:02}").into_bytes();
+                ArtifactStoreV4BuildInput {
+                    key: format!("build-input-{index:02}"),
+                    kind,
+                    sha256: lower_hex(&Sha256::digest(&canonical_bytes)),
+                    canonical_bytes,
+                }
+            })
+            .collect();
         let snapshot = ArtifactStoreV4BuildSnapshot::new("d".repeat(64), inputs.clone())
             .expect("construct canonical Build snapshot");
         snapshot
             .validate()
             .expect("validate constructed Build snapshot");
 
-        inputs[1].canonical_bytes.push(b' ');
-        assert!(matches!(
-            ArtifactStoreV4BuildSnapshot::new("d".repeat(64), inputs),
-            Err(GauntletError::InvalidPreparedArtifact { .. })
-        ));
+        for index in 0..inputs.len() {
+            let mut tampered_inputs = inputs.clone();
+            tampered_inputs[index].canonical_bytes.push(b'!');
+            assert!(matches!(
+                ArtifactStoreV4BuildSnapshot::new("d".repeat(64), tampered_inputs),
+                Err(GauntletError::InvalidPreparedArtifact { .. })
+            ));
+        }
     }
 
     #[test]
