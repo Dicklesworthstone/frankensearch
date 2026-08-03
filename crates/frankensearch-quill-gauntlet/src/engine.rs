@@ -6903,6 +6903,96 @@ mod tests {
         });
     }
 
+    /// E6.3 bounded replay campaign for the qualified two-distinct-term,
+    /// unboosted optional `OR` commutativity law. The paired one-fixture law
+    /// keeps the intentionally invalid `AND` operator mutation.
+    #[cfg(feature = "perf-harness")]
+    #[test]
+    fn e63_two_term_or_seed_matrix_replays_live_observations() {
+        use frankensearch_core::IndexableDocument;
+
+        const SEEDS: [u64; 3] = [
+            0xe63_0f00_c0aa_5eed,
+            0xe63_0f00_c0aa_5eee,
+            0xe63_0f00_c0aa_5eef,
+        ];
+        let documents = vec![
+            IndexableDocument::new("doc-1", "alpha beta beta").with_title("guide"),
+            IndexableDocument::new("doc-2", "alpha gamma").with_title("alpha overview"),
+            IndexableDocument::new("doc-3", "beta gamma gamma gamma").with_title("alpha"),
+            IndexableDocument::new("doc-4", "alpha beta gamma delta").with_title("reference"),
+            IndexableDocument::new("doc-5", "delta epsilon").with_title("quiet"),
+        ];
+
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            for ((left, right), seed) in [
+                (("alpha", "beta"), SEEDS[0]),
+                (("alpha", "gamma"), SEEDS[1]),
+                (("beta", "gamma"), SEEDS[2]),
+            ] {
+                let canonical = format!("{left} OR {right}");
+                let commuted = format!("{right} OR {left}");
+                assert_ne!(
+                    canonical, commuted,
+                    "E6.3 seed {seed:#x} must exercise a real operand-order transform"
+                );
+                assert_eq!(
+                    commuted,
+                    format!("{right} OR {left}"),
+                    "E6.3 seed {seed:#x} must replay its operand-order transform byte-identically",
+                );
+                let canonical_cases = [("two-term-or", canonical.as_str())];
+                let commuted_cases = [("two-term-or", commuted.as_str())];
+                let baseline = e63_observations(
+                    &cx,
+                    &documents,
+                    &canonical_cases,
+                    seed,
+                    "e6.3-two-term-or-commutativity-v1",
+                )
+                .await;
+                let transformed = e63_observations(
+                    &cx,
+                    &documents,
+                    &commuted_cases,
+                    seed,
+                    "e6.3-two-term-or-commutativity-v1",
+                )
+                .await;
+                let baseline_case = baseline.first().expect("E6.3 seed baseline OR fixture");
+                let commuted_case = transformed.first().expect("E6.3 seed commuted OR fixture");
+                assert_eq!(
+                    baseline_case.0, commuted_case.0,
+                    "E6.3 seed {seed:#x} OR case identity drifted"
+                );
+                for (engine, before, after) in [
+                    ("Quill", &baseline_case.1, &commuted_case.1),
+                    ("Tantivy", &baseline_case.2, &commuted_case.2),
+                ] {
+                    let comparison = compare_observations(
+                        before.clone(),
+                        after.clone(),
+                        ComparatorConfig::default(),
+                    )
+                    .unwrap_or_else(|error| {
+                        panic!("E6.3 {engine} seed {seed:#x} OR comparison failed: {error}")
+                    });
+                    assert!(
+                        matches!(
+                            comparison.rank_class,
+                            RankClass::RankExact | RankClass::TieOrder
+                        ) && comparison
+                            .divergences
+                            .iter()
+                            .all(|divergence| divergence.class == DivergenceClass::TieOrder),
+                        "E6.3 {engine} seed {seed:#x} produced a non-tie OR commutation divergence: {:?}",
+                        comparison.divergences,
+                    );
+                }
+            }
+        });
+    }
+
     /// E6.3 law: on the position-capable scalar fixture, a quoted single term
     /// reduces to the same term query. This does not assert phrase equivalence
     /// generally: the multi-term phrase is the intentionally invalid control,
