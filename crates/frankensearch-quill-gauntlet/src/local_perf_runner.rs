@@ -347,6 +347,14 @@ struct RunDirectories {
     artifacts: PinnedDirectory,
 }
 
+/// Canonically ordered exclusive locks for every resource recorded by a
+/// pre-build booking receipt. The held descriptors intentionally survive exec
+/// with the benchmark child, just like the host-global lease.
+#[derive(Debug)]
+struct BookingResourceLeases {
+    files: Vec<OwnedFd>,
+}
+
 #[derive(Debug, Clone)]
 struct PlatformCapture {
     hardware: RunnerHardware,
@@ -1626,6 +1634,14 @@ fn run_local_perf_command_inner(
     let booking_receipt_name = format!("{}.booking.json", config.gate.label());
     let booking_receipt_path = config.output_dir.join(&booking_receipt_name);
     let booking_platform = capture_platform(config)?;
+    let booking_resource_keys = booking_resource_lease_keys(
+        config,
+        &run_selection,
+        &booking_platform,
+        &external_paths,
+        &run_directories,
+    );
+    let booking_resource_leases = acquire_booking_resource_leases(&booking_resource_keys)?;
     let booking_receipt_bytes = utc_now()
         .and_then(|booked_at_utc| {
             booking_receipt_bytes(
@@ -1784,6 +1800,7 @@ fn run_local_perf_command_inner(
             return Err(failed_attempt_error_after_release(
                 config,
                 &lease_file,
+                &booking_resource_leases,
                 &lease_identity,
                 &run_directories,
                 attempt_path,
@@ -1849,6 +1866,7 @@ fn run_local_perf_command_inner(
         return Err(failed_attempt_error_after_release(
             config,
             &lease_file,
+            &booking_resource_leases,
             &lease_identity,
             &run_directories,
             attempt_path,
@@ -1881,6 +1899,7 @@ fn run_local_perf_command_inner(
             return Err(failed_attempt_error_after_release(
                 config,
                 &lease_file,
+                &booking_resource_leases,
                 &lease_identity,
                 &run_directories,
                 attempt_path,
@@ -1919,6 +1938,7 @@ fn run_local_perf_command_inner(
         return Err(failed_attempt_error_after_release(
             config,
             &lease_file,
+            &booking_resource_leases,
             &lease_identity,
             &run_directories,
             attempt_path,
@@ -1947,6 +1967,7 @@ fn run_local_perf_command_inner(
         return Err(failed_attempt_error_after_release(
             config,
             &lease_file,
+            &booking_resource_leases,
             &lease_identity,
             &run_directories,
             attempt_path,
@@ -1986,6 +2007,7 @@ fn run_local_perf_command_inner(
         return Err(failed_attempt_error_after_release(
             config,
             &lease_file,
+            &booking_resource_leases,
             &lease_identity,
             &run_directories,
             attempt_path,
@@ -2015,6 +2037,7 @@ fn run_local_perf_command_inner(
         failed_attempt_error_after_release(
             config,
             &lease_file,
+            &booking_resource_leases,
             &lease_identity,
             &run_directories,
             receipt_path,
@@ -2471,6 +2494,7 @@ fn run_local_perf_command_inner(
     let release_receipt_path = publish_terminal_lease_release_receipt(
         config,
         &lease_file,
+        &booking_resource_leases,
         &lease_identity,
         &run_directories,
         &completed_attempt_bytes,
@@ -4018,6 +4042,117 @@ fn validate_booking_storage_slots(
     Ok(())
 }
 
+fn booking_resource_lease_keys(
+    config: &LocalPerfRunConfig,
+    selection: &ResolvedRunSelection,
+    platform: &PlatformCapture,
+    external_paths: &ExternalRunPaths,
+    run_directories: &RunDirectories,
+) -> Vec<String> {
+    let slots = booking_storage_slots(external_paths, run_directories);
+    let selection_scope = format!(
+        "{}:{}",
+        selection.fixture.as_deref().unwrap_or("<all-fixtures>"),
+        selection.selected_cell_ids.join(",")
+    );
+    let resources = [
+        (
+            "profile",
+            format!(
+                "{}.{}",
+                config.profile.hardware_class_id().as_str(),
+                config.profile.execution_profile_id().as_str()
+            ),
+        ),
+        ("worker", platform.hardware.fingerprint_sha256.clone()),
+        ("cpuset", platform.snapshot.effective_cpuset_sha256.clone()),
+        ("selection", selection_scope),
+        (
+            "output-parent",
+            format!(
+                "{}:{}",
+                slots.output_parent.device, slots.output_parent.inode
+            ),
+        ),
+        (
+            "target-directory",
+            format!(
+                "{}:{}",
+                slots.target_directory.device, slots.target_directory.inode
+            ),
+        ),
+        (
+            "run-directory",
+            format!(
+                "{}:{}",
+                slots.run_directory.device, slots.run_directory.inode
+            ),
+        ),
+        (
+            "artifact-directory",
+            format!(
+                "{}:{}",
+                slots.artifact_directory.device, slots.artifact_directory.inode
+            ),
+        ),
+    ];
+    resources
+        .into_iter()
+        .map(|(kind, value)| {
+            sha256_hex(
+                format!("frankensearch-perf-booking-resource-v1\0{kind}\0{value}").as_bytes(),
+            )
+        })
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+fn booking_resource_lease_path(root: &Path, key: &str) -> Result<PathBuf, LocalPerfRunError> {
+    if !is_sha256(key) {
+        return Err(LocalPerfRunError::Invalid(
+            "booking resource lease key is not a SHA-256 digest".to_owned(),
+        ));
+    }
+    Ok(root.join(format!("frankensearch-perf-booking-resource-{key}.lock")))
+}
+
+fn acquire_booking_resource_leases_at(
+    root: &Path,
+    keys: &[String],
+) -> Result<BookingResourceLeases, LocalPerfRunError> {
+    if keys.is_empty()
+        || keys.windows(2).any(|pair| pair[0] >= pair[1])
+        || keys.iter().any(|key| !is_sha256(key))
+    {
+        return Err(LocalPerfRunError::Invalid(
+            "booking resource leases must be nonempty, unique, sorted SHA-256 keys".to_owned(),
+        ));
+    }
+    let mut files = Vec::with_capacity(keys.len());
+    for key in keys {
+        let path = booking_resource_lease_path(root, key)?;
+        let (file, _) = acquire_family_lease(&path)?;
+        files.push(file);
+    }
+    Ok(BookingResourceLeases { files })
+}
+
+fn acquire_booking_resource_leases(
+    keys: &[String],
+) -> Result<BookingResourceLeases, LocalPerfRunError> {
+    acquire_booking_resource_leases_at(Path::new("/tmp"), keys)
+}
+
+fn release_booking_resource_leases(
+    leases: &BookingResourceLeases,
+) -> Result<(), LocalPerfRunError> {
+    for file in leases.files.iter().rev() {
+        flock(file, FlockOperation::Unlock).map_err(std::io::Error::from)?;
+    }
+    Ok(())
+}
+
 fn validate_lease_file_identity(identity: &LeaseFileIdentity) -> Result<(), LocalPerfRunError> {
     for (label, value) in [("device", &identity.device), ("inode", &identity.inode)] {
         if value.is_empty() || value.len() > 20 || !value.bytes().all(|byte| byte.is_ascii_digit())
@@ -4813,6 +4948,7 @@ fn write_failed_attempt_receipt(
 fn failed_attempt_error_after_release(
     config: &LocalPerfRunConfig,
     lease_file: &OwnedFd,
+    booking_resource_leases: &BookingResourceLeases,
     lease_file_identity: &LeaseFileIdentity,
     directories: &RunDirectories,
     receipt_path: PathBuf,
@@ -4831,6 +4967,7 @@ fn failed_attempt_error_after_release(
     let lease_release_receipt = publish_terminal_lease_release_receipt(
         config,
         lease_file,
+        booking_resource_leases,
         lease_file_identity,
         directories,
         &attempt_receipt_bytes,
@@ -5809,12 +5946,19 @@ fn terminal_lease_release_receipt_bytes(
 fn publish_terminal_lease_release_receipt(
     config: &LocalPerfRunConfig,
     lease_file: &OwnedFd,
+    booking_resource_leases: &BookingResourceLeases,
     lease_file_identity: &LeaseFileIdentity,
     run_directories: &RunDirectories,
     attempt_receipt_bytes: &[u8],
 ) -> Result<PathBuf, LocalPerfRunError> {
     let release_receipt_name = format!("{}.lease-release.json", config.gate.label());
     let release_receipt_path = config.output_dir.join(&release_receipt_name);
+    release_booking_resource_leases(booking_resource_leases).map_err(|error| {
+        LocalPerfRunError::LeaseReleaseReceiptUnavailable {
+            receipt_path: release_receipt_path.clone(),
+            detail: bounded_diagnostic(&error),
+        }
+    })?;
     flock(lease_file, FlockOperation::Unlock).map_err(|error| {
         LocalPerfRunError::LeaseReleaseReceiptUnavailable {
             receipt_path: release_receipt_path.clone(),
@@ -6660,6 +6804,33 @@ mod tests {
         let error =
             acquire_family_lease(&lease_path).expect_err("permissive lease inode must reject");
         assert!(error.to_string().contains("effective-user-owned 0600"));
+    }
+
+    #[test]
+    fn booking_resource_leases_are_sorted_exclusive_and_releasable() {
+        let directory = tempfile::tempdir().expect("booking resource lease directory");
+        let mut keys = vec![sha256_hex(b"target-directory"), sha256_hex(b"worker")];
+        keys.sort();
+        let held = acquire_booking_resource_leases_at(directory.path(), &keys)
+            .expect("acquire every canonical booking resource lease");
+        let collision = acquire_booking_resource_leases_at(directory.path(), &keys)
+            .expect_err("a second booking must not acquire held resource leases");
+        assert!(
+            matches!(
+                collision,
+                LocalPerfRunError::Io(ref error) if error.kind() == std::io::ErrorKind::WouldBlock
+            ),
+            "booking resource collision returned a non-contention error: {collision}"
+        );
+        release_booking_resource_leases(&held).expect("release every booking resource lease");
+        let _reacquired = acquire_booking_resource_leases_at(directory.path(), &keys)
+            .expect("released booking resources become available to the next booking");
+
+        keys.reverse();
+        assert!(
+            acquire_booking_resource_leases_at(directory.path(), &keys).is_err(),
+            "noncanonical resource-lock order must reject before taking any lock"
+        );
     }
 
     #[test]

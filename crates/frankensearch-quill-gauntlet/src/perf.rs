@@ -4704,7 +4704,7 @@ mod tests {
                 16,
                 Some(64),
                 Some(64),
-                "893449ea6995017d8496a62ac3bdfa34fcc18add6f2df4c268ac425024bb74f7",
+                "02bdb2c12f434296c64007e9a19f0b260810d90aab2fdcc825303ab39f59a85f",
             ),
             (
                 ExecutionProfileId::Smt2_128,
@@ -4713,7 +4713,7 @@ mod tests {
                 0,
                 Some(128),
                 Some(128),
-                "9124b71e748ef29ed6048eea79319e2891b44670b205b9a4e9e6ba8005a3f103",
+                "5190eab2b7efb661211563de20f91b777b94fe79dbfbbaabcda4121b9ecb2f1a",
             ),
             (
                 ExecutionProfileId::Scheduler10,
@@ -4722,7 +4722,7 @@ mod tests {
                 40,
                 Some(10),
                 Some(8),
-                "56f659889230d0f22dbb3118e4815ee6e3c823aab4ec37d38f69eae3a86d6392",
+                "df51edc2e6ef1f162bd44931503073148c8f1683255bef30ece9807a376e8fb1",
             ),
         ];
         let mut plan_hashes = BTreeSet::new();
@@ -5536,12 +5536,13 @@ mod tests {
     fn manifest_contract_hash_ignores_only_activation_state() {
         let manifest = PERF_MANIFEST;
         assert_eq!(manifest.matches("activated = false").count(), 10);
-        // GOLDEN-CHANGE (terminal release receipt): every sealed terminal
-        // attempt now requires a post-unlock receipt bound to its exact bytes.
+        // GOLDEN-CHANGE (composite booking locks): every booked profile,
+        // worker, cpuset, fixture/cell scope, and storage slot now holds a
+        // canonical resource lock through terminal release.
         // Activation is still the sole administrative normalization exception.
         assert_eq!(
             perf_manifest_contract_sha256(manifest),
-            "593d2c447946607a6f3a29dfe17b4affe1f9ca4ffdb38f72585ad7c18ddf3ae7",
+            "99ecc8b62e9f3bbad875a4d2fc0c176656890e0fee1dec9d4ebd80deec45b9d8",
             "the normalized all-inactive manifest digest must remain frozen"
         );
         assert_eq!(
