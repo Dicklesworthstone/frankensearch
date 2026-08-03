@@ -11727,4 +11727,41 @@ mod tests {
             );
         });
     }
+
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct StoredV7RankCorpusCase {
+        name: String,
+        subject: EngineObservation,
+        oracle: EngineObservation,
+        config: ComparatorConfig,
+        expected: ComparisonReport,
+    }
+
+    #[test]
+    fn pinned_stored_v7_rank_corpus_replays_without_live_creation() {
+        const PINNED_BYTES: &[u8] =
+            include_bytes!("../fixtures/campaign-report-v7-rank-corpus.json");
+        const PINNED_SHA256: &str =
+            "7499b43d0b6fd0d024266ae793a9f9a6690b054cfee292b1ba872354d77996a1";
+
+        assert_eq!(
+            lower_hex(&Sha256::digest(PINNED_BYTES)),
+            PINNED_SHA256,
+            "stored V7 rank corpus bytes must remain pinned"
+        );
+        let cases = serde_json::from_slice::<Vec<StoredV7RankCorpusCase>>(PINNED_BYTES)
+            .expect("stored V7 rank corpus must decode");
+        assert_eq!(cases.len(), 2, "bounded corpus cardinality");
+
+        for case in cases {
+            let actual = compare_observations_stored_v7(case.subject, case.oracle, case.config)
+                .expect("stored V7 comparison must replay");
+            assert_eq!(
+                actual, case.expected,
+                "stored V7 case {} drifted",
+                case.name
+            );
+        }
+    }
 }
