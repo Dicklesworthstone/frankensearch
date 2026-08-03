@@ -776,6 +776,66 @@ struct PerfGateManifestIdentity {
     primary_target_cell_width: Option<u64>,
 }
 
+fn validate_perf_manifest_gate_set(
+    parsed: &toml::Value,
+    requested_gate: PerfGate,
+) -> Result<(), PerfApplicabilityPlanError> {
+    let gates = parsed
+        .get("gate")
+        .and_then(toml::Value::as_table)
+        .ok_or_else(|| PerfApplicabilityPlanError::ManifestContract {
+            gate: requested_gate,
+            detail: "manifest does not define a [gate] table".to_owned(),
+        })?;
+
+    for gate in PerfGate::ALL {
+        let label = gate.label();
+        let policy = gates
+            .get(label)
+            .and_then(toml::Value::as_table)
+            .ok_or_else(|| PerfApplicabilityPlanError::ManifestContract {
+                gate: requested_gate,
+                detail: format!("manifest gate.{label} is missing or not a table"),
+            })?;
+        for field in ["name", "fixture", "target"] {
+            if policy
+                .get(field)
+                .and_then(toml::Value::as_str)
+                .is_none_or(|value| value.trim().is_empty())
+            {
+                return Err(PerfApplicabilityPlanError::ManifestContract {
+                    gate: requested_gate,
+                    detail: format!("manifest gate.{label}.{field} is missing or empty"),
+                });
+            }
+        }
+        if policy
+            .get("activated")
+            .and_then(toml::Value::as_bool)
+            .is_none()
+        {
+            return Err(PerfApplicabilityPlanError::ManifestContract {
+                gate: requested_gate,
+                detail: format!("manifest gate.{label}.activated is missing or not boolean"),
+            });
+        }
+    }
+
+    let expected_labels = PerfGate::ALL
+        .iter()
+        .map(|gate| gate.label())
+        .collect::<BTreeSet<_>>();
+    for label in gates.keys() {
+        if !expected_labels.contains(label.as_str()) {
+            return Err(PerfApplicabilityPlanError::ManifestContract {
+                gate: requested_gate,
+                detail: format!("manifest defines unexpected gate.{label}"),
+            });
+        }
+    }
+    Ok(())
+}
+
 fn perf_gate_manifest_identity(
     manifest: &str,
     gate: PerfGate,
@@ -804,6 +864,7 @@ fn perf_gate_manifest_identity(
             ),
         });
     }
+    validate_perf_manifest_gate_set(&parsed, gate)?;
     let gate_contract = parsed
         .get("gate")
         .and_then(toml::Value::as_table)
@@ -4728,6 +4789,44 @@ mod tests {
 
     #[test]
     fn qg1_manifest_contract_rejects_missing_or_unbounded_primary_target() {
+        let missing_unrelated_gate = PERF_MANIFEST.replacen("[gate.QG-10]", "[omitted.QG-10]", 1);
+        let missing_unrelated_gate =
+            perf_gate_manifest_identity(&missing_unrelated_gate, PerfGate::Qg1).expect_err(
+                "QG-1 planning must reject a manifest missing an unrelated normative gate",
+            );
+        assert!(
+            missing_unrelated_gate
+                .to_string()
+                .contains("manifest gate.QG-10 is missing or not a table"),
+            "unexpected missing-gate error: {missing_unrelated_gate}"
+        );
+
+        let extra_gate = format!("{PERF_MANIFEST}\n[gate.QG-11]\nactivated = false\n");
+        let extra_gate = perf_gate_manifest_identity(&extra_gate, PerfGate::Qg1)
+            .expect_err("QG-1 planning must reject an unexpected normative gate");
+        assert!(
+            extra_gate
+                .to_string()
+                .contains("manifest defines unexpected gate.QG-11"),
+            "unexpected extra-gate error: {extra_gate}"
+        );
+
+        let missing_unrelated_target = PERF_MANIFEST.replacen(
+            "target = \"open() <= 50ms (manifest + lazy sections) vs oracle reader open\"",
+            "target = \"\"",
+            1,
+        );
+        let missing_unrelated_target =
+            perf_gate_manifest_identity(&missing_unrelated_target, PerfGate::Qg1).expect_err(
+                "QG-1 planning must reject an unrelated gate with an empty required field",
+            );
+        assert!(
+            missing_unrelated_target
+                .to_string()
+                .contains("manifest gate.QG-9.target is missing or empty"),
+            "unexpected empty-target error: {missing_unrelated_target}"
+        );
+
         let missing = PERF_MANIFEST.replacen("primary_target_cell_width = 8\n", "", 1);
         assert!(matches!(
             perf_gate_manifest_identity(&missing, PerfGate::Qg1),
