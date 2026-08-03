@@ -211,6 +211,9 @@ pub enum GenerationAuthorityErrorV1 {
     /// A duplicate authority was not the permitted sequence-one genesis form.
     #[error("generation authority slots contain a non-genesis duplicate")]
     NonGenesisDuplicate,
+    /// A non-genesis authority was stored in the wrong physical slot.
+    #[error("generation authority slot does not match its sequence parity")]
+    SlotSequenceParity,
     /// The newer slot skipped a sequence or lacked an exact predecessor link.
     #[error("generation authority slots lack a consecutive predecessor link")]
     BrokenPredecessorLink,
@@ -709,7 +712,7 @@ pub fn resolve_authority_slots_v1(
         (Some(slot), None) | (None, Some(slot)) => Ok(Some(slot)),
         (Some(first), Some(second)) => {
             // ubs:ignore — slot indices and root IDs are public structural identities.
-            if first.slot_index == second.slot_index || first.root_id != second.root_id {
+            if first.root_id != second.root_id {
                 return Err(GenerationAuthorityErrorV1::InvalidField {
                     field: "authority_slot.pair",
                 });
@@ -731,6 +734,14 @@ pub fn resolve_authority_slots_v1(
             } else {
                 (second, first)
             };
+            if !slot_matches_authority_sequence(older) || !slot_matches_authority_sequence(newer) {
+                return Err(GenerationAuthorityErrorV1::SlotSequenceParity);
+            }
+            if older.slot_index == newer.slot_index {
+                return Err(GenerationAuthorityErrorV1::InvalidField {
+                    field: "authority_slot.pair",
+                });
+            }
             // ubs:ignore — sequence/predecessor fingerprints are public history identities.
             if newer.authority.sequence != older.authority.sequence.saturating_add(1)
                 // ubs:ignore — predecessor fingerprints are public immutable history identities.
@@ -741,6 +752,14 @@ pub fn resolve_authority_slots_v1(
             Ok(Some(newer))
         }
     }
+}
+
+fn slot_matches_authority_sequence(slot: AuthoritySlotV1) -> bool {
+    if slot.authority.sequence == 1 {
+        return true;
+    }
+    let expected_slot = u8::try_from(slot.authority.sequence & 1).unwrap_or(u8::MAX);
+    slot.slot_index == expected_slot
 }
 
 /// The transition that created an immutable activation manifest.
@@ -3742,8 +3761,8 @@ mod tests {
         let first = authority_reference(1, None);
         let second = authority_reference(2, Some(first.fingerprint()));
         let resolved = resolve_authority_slots_v1(
-            Some(authority_slot(0, first)),
-            Some(authority_slot(1, second)),
+            Some(authority_slot(1, first)),
+            Some(authority_slot(0, second)),
         )
         .expect("linked authority slots resolve")
         .expect("at least one authority");
@@ -3752,11 +3771,25 @@ mod tests {
         let unlinked = authority_reference(2, Some([0x11; 32]));
         assert_eq!(
             resolve_authority_slots_v1(
-                Some(authority_slot(0, first)),
-                Some(authority_slot(1, unlinked)),
+                Some(authority_slot(1, first)),
+                Some(authority_slot(0, unlinked)),
             ),
             Err(GenerationAuthorityErrorV1::BrokenPredecessorLink),
             "a newer authority without the exact predecessor fingerprint is not selectable"
+        );
+    }
+
+    #[test]
+    fn authority_resolver_rejects_non_genesis_slot_parity_violation() {
+        let genesis = authority_reference(1, None);
+        let successor = authority_reference(2, Some(genesis.fingerprint()));
+        assert_eq!(
+            resolve_authority_slots_v1(
+                Some(authority_slot(0, genesis)),
+                Some(authority_slot(1, successor)),
+            ),
+            Err(GenerationAuthorityErrorV1::SlotSequenceParity),
+            "a non-genesis authority copied into the opposite physical slot must fail"
         );
     }
 
