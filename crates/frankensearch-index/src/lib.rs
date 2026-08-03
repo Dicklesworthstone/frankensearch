@@ -3825,15 +3825,42 @@ impl VectorIndexWriter {
                 file.write_all(&header)?;
             }
             file.sync_all()?;
-            if self.identity_v2.is_some() {
+            // Publication over an existing WAL sidecar is refused for EVERY
+            // format version, not just v2. A fresh v1 generation restarts at
+            // compaction_gen 1, so next_generation(1) collides with the
+            // previous generation's sidecar binding and open() would adopt the
+            // stale WAL wholesale: deleted documents resurrect and the WAL
+            // shadow suppresses the freshly rebuilt main-slab winners
+            // (bd-cnby1). Removing the sidecar here instead is not crash-safe
+            // in either order (before the rename it destroys acknowledged
+            // writes of the still-live old generation; after, a crash between
+            // rename and removal re-opens the adoption window), so the only
+            // sound contract is refusal: in-place replacement goes through
+            // install_replacement, which carries the destination generation
+            // forward and supersedes the sidecar under a real authority.
+            {
                 let wal_path = wal::wal_path_for(&self.path);
                 match fs::symlink_metadata(&wal_path) {
                     Ok(_) => {
+                        let (field, reason) = if self.identity_v2.is_some() {
+                            (
+                                "fsvi_v2.wal_sidecar",
+                                "identity-complete v2 publication refuses a target with any existing WAL sidecar",
+                            )
+                        } else {
+                            (
+                                "wal_sidecar",
+                                "publication refuses a target with an existing WAL sidecar: a fresh generation \
+                                 would collide with the sidecar's generation binding and silently adopt stale \
+                                 entries (deleted documents resurrect); replace an existing index via \
+                                 install_replacement, or remove the sidecar explicitly if discarding its \
+                                 pending writes is intended",
+                            )
+                        };
                         return Err(SearchError::InvalidConfig {
-                            field: "fsvi_v2.wal_sidecar".to_owned(),
+                            field: field.to_owned(),
                             value: wal_path.display().to_string(),
-                            reason: "identity-complete v2 publication refuses a target with any existing WAL sidecar"
-                                .to_owned(),
+                            reason: reason.to_owned(),
                         });
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -8596,6 +8623,89 @@ mod tests {
         std::fs::remove_file(wal::wal_path_for(&path)).ok();
     }
 
+    /// bd-cnby1: a v1 rebuild via bare create+finish over an existing index
+    /// must be REFUSED while that index's WAL sidecar is present. Before the
+    /// fix, finish() published the fresh generation beside the old sidecar;
+    /// the fresh compaction_gen restarts at 1, next_generation(1) matches the
+    /// old sidecar's binding, and the next open() adopted every stale WAL
+    /// entry: deleted documents resurrected and the WAL shadow suppressed the
+    /// freshly rebuilt main-slab vectors.
+    #[test]
+    fn v1_rebuild_over_existing_wal_sidecar_is_refused_not_adopted() {
+        let path = temp_index_path("v1-rebuild-wal-adoption");
+        let mut writer = VectorIndex::create(&path, "old", 4).expect("writer");
+        writer
+            .write_record("kept-doc", &[1.0, 0.0, 0.0, 0.0])
+            .expect("write old main");
+        writer.finish().expect("finish old main");
+        let mut old = VectorIndex::open(&path).expect("open old generation");
+        old.append("deleted-doc", &[0.0, 1.0, 0.0, 0.0])
+            .expect("append WAL record that the rebuild intends to drop");
+        drop(old);
+
+        // Operator intent: rebuild the corpus WITHOUT "deleted-doc".
+        let mut rebuild = VectorIndex::create(&path, "old", 4).expect("rebuild writer");
+        rebuild
+            .write_record("kept-doc", &[0.9, 0.1, 0.0, 0.0])
+            .expect("write rebuilt record");
+        let refusal = rebuild.finish();
+        let Err(SearchError::InvalidConfig { field, reason, .. }) = refusal else {
+            panic!(
+                "v1 finish() over an existing WAL sidecar must refuse publication, \
+                 got {refusal:?}"
+            );
+        };
+        assert_eq!(field, "wal_sidecar");
+        assert!(
+            reason.contains("install_replacement"),
+            "refusal must route the caller to the safe replacement path: {reason}"
+        );
+
+        // The refused publication must leave the old generation fully intact —
+        // main slab AND its acknowledged WAL record.
+        let survivor = VectorIndex::open(&path).expect("old generation survives refusal");
+        assert_eq!(survivor.record_count(), 1);
+        assert_eq!(
+            survivor.wal_record_count(),
+            1,
+            "acknowledged WAL record must survive a refused rebuild"
+        );
+        drop(survivor);
+
+        // The safe route succeeds and does NOT resurrect the dropped doc.
+        let replacement_path = path.with_extension("replacement");
+        let destination_gen =
+            VectorIndex::peek_compaction_gen(&path).expect("peek destination generation");
+        let mut replacement_writer = VectorIndex::create(&replacement_path, "old", 4)
+            .expect("replacement writer")
+            .with_generation(next_generation(destination_gen));
+        replacement_writer
+            .write_record("kept-doc", &[0.9, 0.1, 0.0, 0.0])
+            .expect("write rebuilt record via safe route");
+        replacement_writer
+            .finish()
+            .expect("replacement path has no sidecar, publication proceeds");
+        let installed = VectorIndex::install_replacement(&path, &replacement_path)
+            .expect("carried-generation install");
+        assert_eq!(installed.record_count(), 1);
+        assert_eq!(
+            installed.wal_record_count(),
+            0,
+            "the dropped document's WAL entry must not be adopted by the rebuild"
+        );
+        let live = installed.live_doc_ids().expect("live ids");
+        assert!(live.contains("kept-doc"));
+        assert!(
+            !live.contains("deleted-doc"),
+            "bd-cnby1: the deliberately dropped document must stay dropped"
+        );
+        drop(installed);
+
+        std::fs::remove_file(&path).ok();
+        std::fs::remove_file(&replacement_path).ok();
+        std::fs::remove_file(wal::wal_path_for(&path)).ok();
+    }
+
     /// A replacement whose compaction generation collides with the
     /// destination's must be refused outright: installing it would require
     /// destroying the destination's acknowledged WAL BEFORE the rename, and a
@@ -9926,9 +10036,16 @@ mod tests {
         // Close index to flush everything
         drop(index);
 
-        // Manually create the "post-compaction" main index that includes both A and B.
+        // Manually create the "post-compaction" main index that includes both
+        // A and B. It is built at a side path and renamed over `path` exactly
+        // the way compact() publishes — writer::finish() itself now refuses to
+        // publish beside a live WAL sidecar (the bd-cnby1 guard), so the
+        // crash state must be constructed at the filesystem level, which is
+        // also where the real crash window lives (between compact()'s rename
+        // and its WAL removal).
+        let staged_path = path.with_extension("compacted");
         let mut compact_writer =
-            VectorIndex::create_with_revision(&path, "test", "v1", dim, Quantization::F16)
+            VectorIndex::create_with_revision(&staged_path, "test", "v1", dim, Quantization::F16)
                 .unwrap()
                 .with_generation(2); // Simulate correct compaction increment
         compact_writer
@@ -9937,7 +10054,8 @@ mod tests {
         compact_writer
             .write_record("doc-B", &[0.0, 1.0, 0.0, 0.0])
             .unwrap();
-        compact_writer.finish().unwrap(); // Overwrites `path` with new index containing A and B.
+        compact_writer.finish().unwrap();
+        fs::rename(&staged_path, &path).unwrap(); // Publish over `path`; the old WAL survives untouched.
 
         // Restore the WAL file (because `finish` doesn't touch it, but we need to ensure it exists and has doc-B)
         // Actually, `finish` overwrites `path`. The WAL file is at `path.wal`.
