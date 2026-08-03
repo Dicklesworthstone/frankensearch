@@ -7380,6 +7380,41 @@ mod tests {
     }
 
     #[test]
+    fn fsvi_v2_magic_version_and_crc_mutations_fail_closed() {
+        let binding = fsvi_v2_binding("v2-magic-version-crc", 4, Quantization::F16, 55, 0xaf);
+        let (source_path, expected) = write_v2_fixture("v2-magic-version-crc-source", binding);
+        let source = fs::read(&source_path).expect("read source v2");
+        let header_size = usize::try_from(u32::from_le_bytes(
+            source[6..10].try_into().expect("header size"),
+        ))
+        .expect("header size fits");
+
+        let magic_path = temp_index_path("v2-magic-corruption");
+        let mut magic = source.clone();
+        magic[0] ^= 0x01;
+        fs::write(&magic_path, magic).expect("write magic mutation");
+        assert_owned_admission_corrupted(&magic_path, &expected);
+
+        let version_path = temp_index_path("v2-version-upgrade");
+        let mut version = source.clone();
+        version[4..6].copy_from_slice(&(FSVI_V2_VERSION + 1).to_le_bytes());
+        fs::write(&version_path, version).expect("write future-version mutation");
+        assert!(matches!(
+            admit_owned_v2_fixture(&version_path, &expected),
+            Err(FsviAdmissionError::UpgradeRequired(FsviUpgradeRequired {
+                found_version,
+                supported_version: FSVI_V2_VERSION,
+            })) if found_version == FSVI_V2_VERSION + 1
+        ));
+
+        let crc_path = temp_index_path("v2-header-crc-corruption");
+        let mut crc = source;
+        crc[header_size - 1] ^= 0x01;
+        fs::write(&crc_path, crc).expect("write header CRC mutation");
+        assert_owned_admission_corrupted(&crc_path, &expected);
+    }
+
+    #[test]
     fn fsvi_v2_complete_space_parser_rejects_suffix_and_dimension_drift() {
         let binding = fsvi_v2_binding("v2-complete-space", 4, Quantization::F16, 9, 0x45);
         let path = temp_index_path("v2-complete-space");
