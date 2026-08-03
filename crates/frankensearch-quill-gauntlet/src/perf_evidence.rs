@@ -5101,6 +5101,13 @@ mod tests {
     fn qg6_incomplete_gate_selection_is_durable_but_forced_to_no_claim() {
         let mut artifact = provisional_artifact();
         assert!(artifact.ratchet_admissible());
+        artifact
+            .apply_gate_decision(EvidenceDecisionStatus::Quarantine)
+            .expect("eligible evidence accepts a terminal decision before its scope changes");
+        assert_eq!(
+            artifact.gate_decision,
+            Some(EvidenceDecisionStatus::Quarantine)
+        );
 
         artifact.force_no_claim(
             "evidence.incomplete_gate_selection",
@@ -5108,6 +5115,7 @@ mod tests {
         );
 
         assert_eq!(artifact.gate_status, EvidenceDecisionStatus::NoDecision);
+        assert_eq!(artifact.gate_decision, None);
         assert!(!artifact.ratchet_admissible());
         assert!(matches!(
             artifact.machine_class,
