@@ -41,6 +41,39 @@ struct ChildOutput {
 }
 
 #[derive(Debug)]
+struct ReceiptIdentity {
+    cargo_lock_sha256: String,
+    cargo_manifest_sha256: String,
+    contract_source_sha256: String,
+    executable_sha256: String,
+}
+
+#[derive(Debug)]
+enum TerminalCause {
+    Exited,
+    OutputLimit,
+    Timeout,
+}
+
+#[derive(Debug)]
+struct SealedChildReceipt {
+    case: String,
+    terminal_cause: TerminalCause,
+    exit_code: Option<i32>,
+    termination_signal: Option<i32>,
+    filter_sha256: String,
+    output_sha256: String,
+    output_tail_sha256: String,
+    output_tail_bytes: usize,
+    observed_bytes: usize,
+    observed_lines: usize,
+    max_output_bytes: usize,
+    max_output_lines: usize,
+    timeout_millis: u128,
+    identity: ReceiptIdentity,
+}
+
+#[derive(Debug)]
 enum ChildFailure {
     OutputLimit {
         bytes: usize,
@@ -76,6 +109,12 @@ fn assert_sha256_digest(digest: &str) {
         digest.bytes().all(|byte| byte.is_ascii_hexdigit()),
         "output digest must be hexadecimal"
     );
+}
+
+fn sha256_file(path: &std::path::Path) -> String {
+    let bytes = std::fs::read(path)
+        .unwrap_or_else(|error| panic!("receipt identity must read {}: {error}", path.display()));
+    output_sha256(&bytes, &[])
 }
 
 fn output_tail(bytes: &[u8], trailing: &[u8]) -> String {
@@ -396,6 +435,179 @@ fn workspace_root() -> PathBuf {
         .to_path_buf()
 }
 
+impl ReceiptIdentity {
+    fn capture() -> Self {
+        let root = workspace_root();
+        Self {
+            cargo_lock_sha256: sha256_file(&root.join("Cargo.lock")),
+            cargo_manifest_sha256: sha256_file(&root.join("Cargo.toml")),
+            contract_source_sha256: sha256_file(
+                &root.join("crates/frankensearch-embed/tests/scoped_logging_contract.rs"),
+            ),
+            executable_sha256: sha256_file(
+                &std::env::current_exe().expect("fresh-process test binary must exist"),
+            ),
+        }
+    }
+}
+
+fn filter_sha256(rust_log: Option<&std::ffi::OsStr>) -> String {
+    let bytes = match rust_log {
+        Some(filter) => {
+            #[cfg(unix)]
+            use std::os::unix::ffi::OsStrExt;
+
+            #[cfg(unix)]
+            {
+                filter.as_bytes().to_vec()
+            }
+            #[cfg(not(unix))]
+            {
+                filter.to_string_lossy().into_owned().into_bytes()
+            }
+        }
+        None => b"<unset>".to_vec(),
+    };
+    output_sha256(&bytes, &[])
+}
+
+fn termination_signal(status: &ExitStatus) -> Option<i32> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+
+        status.signal()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = status;
+        None
+    }
+}
+
+impl SealedChildReceipt {
+    fn from_output(case: &str, rust_log: Option<&std::ffi::OsStr>, output: &ChildOutput) -> Self {
+        let tail = output_tail(&output.bytes, &[]);
+        Self {
+            case: case.to_owned(),
+            terminal_cause: TerminalCause::Exited,
+            exit_code: output.status.code(),
+            termination_signal: termination_signal(&output.status),
+            filter_sha256: filter_sha256(rust_log),
+            output_sha256: output.output_sha256.clone(),
+            output_tail_sha256: output_sha256(tail.as_bytes(), &[]),
+            output_tail_bytes: tail.len(),
+            observed_bytes: output.bytes.len(),
+            observed_lines: output.lines,
+            max_output_bytes: MAX_OUTPUT_BYTES,
+            max_output_lines: MAX_OUTPUT_LINES,
+            timeout_millis: CHILD_TIMEOUT.as_millis(),
+            identity: ReceiptIdentity::capture(),
+        }
+    }
+
+    fn from_failure(
+        case: &str,
+        rust_log: Option<&std::ffi::OsStr>,
+        failure: &ChildFailure,
+    ) -> Self {
+        let (terminal_cause, status, output_digest, output_tail, observed_bytes, observed_lines) =
+            match failure {
+                ChildFailure::OutputLimit {
+                    bytes,
+                    lines,
+                    status,
+                    output_sha256,
+                    output_tail,
+                } => (
+                    TerminalCause::OutputLimit,
+                    status,
+                    output_sha256,
+                    output_tail,
+                    *bytes,
+                    *lines,
+                ),
+                ChildFailure::Timeout {
+                    status,
+                    output_sha256,
+                    output_tail,
+                } => (
+                    TerminalCause::Timeout,
+                    status,
+                    output_sha256,
+                    output_tail,
+                    0,
+                    0,
+                ),
+            };
+        Self {
+            case: case.to_owned(),
+            terminal_cause,
+            exit_code: status.code(),
+            termination_signal: termination_signal(status),
+            filter_sha256: filter_sha256(rust_log),
+            output_sha256: output_digest.clone(),
+            output_tail_sha256: output_sha256(output_tail.as_bytes(), &[]),
+            output_tail_bytes: output_tail.len(),
+            observed_bytes,
+            observed_lines,
+            max_output_bytes: MAX_OUTPUT_BYTES,
+            max_output_lines: MAX_OUTPUT_LINES,
+            timeout_millis: CHILD_TIMEOUT.as_millis(),
+            identity: ReceiptIdentity::capture(),
+        }
+    }
+}
+
+fn assert_sealed_receipt(receipt: &SealedChildReceipt, expected_case: &str) {
+    assert_eq!(receipt.case, expected_case, "receipt case must be exact");
+    assert_sha256_digest(&receipt.filter_sha256);
+    assert_sha256_digest(&receipt.output_sha256);
+    assert_sha256_digest(&receipt.output_tail_sha256);
+    assert!(
+        receipt.output_tail_bytes <= MAX_RECEIPT_TAIL_BYTES,
+        "receipt must retain only a bounded output tail"
+    );
+    assert_eq!(receipt.max_output_bytes, MAX_OUTPUT_BYTES);
+    assert_eq!(receipt.max_output_lines, MAX_OUTPUT_LINES);
+    assert_eq!(receipt.timeout_millis, CHILD_TIMEOUT.as_millis());
+    assert!(
+        receipt.exit_code.is_some() || receipt.termination_signal.is_some(),
+        "receipt must bind an exit code or terminating signal"
+    );
+    match receipt.terminal_cause {
+        TerminalCause::Exited => {
+            assert!(receipt.observed_bytes <= MAX_OUTPUT_BYTES);
+            assert!(receipt.observed_lines <= MAX_OUTPUT_LINES);
+        }
+        TerminalCause::OutputLimit => {
+            assert!(
+                receipt.observed_bytes > MAX_OUTPUT_BYTES
+                    || receipt.observed_lines > MAX_OUTPUT_LINES,
+                "output-limit receipt must name the exceeded bound"
+            );
+        }
+        TerminalCause::Timeout => {
+            assert_eq!(
+                receipt.observed_bytes, 0,
+                "timeout receipts retain no payload"
+            );
+            assert_eq!(
+                receipt.observed_lines, 0,
+                "timeout receipts retain no payload"
+            );
+        }
+    }
+    for digest in [
+        &receipt.identity.cargo_lock_sha256,
+        &receipt.identity.cargo_manifest_sha256,
+        &receipt.identity.contract_source_sha256,
+        &receipt.identity.executable_sha256,
+    ] {
+        assert_sha256_digest(digest);
+    }
+}
+
 fn lock_package_block<'a>(lock: &'a str, name: &str, version: &str) -> &'a str {
     lock.split("\n[[package]]")
         .find(|block| {
@@ -437,6 +649,34 @@ fn fresh_process_contract_binds_pinned_dependency_and_source_identities() {
         root.join("crates/frankensearch-embed/tests/scoped_logging_contract.rs")
             .is_file(),
         "fresh-process contract source must be present"
+    );
+}
+
+#[test]
+fn fresh_process_receipts_are_bounded_identity_bound_and_filter_redacted() {
+    let output = run_passing_child("default", None);
+    let successful = SealedChildReceipt::from_output("default", None, &output);
+    assert_sealed_receipt(&successful, "default");
+
+    let secret_bearing_filter = OsString::from("api_token=do-not-persist");
+    let redacted = SealedChildReceipt::from_output(
+        "default",
+        Some(secret_bearing_filter.as_os_str()),
+        &output,
+    );
+    let rendered = format!("{redacted:?}");
+    assert!(
+        !rendered.contains("api_token=do-not-persist"),
+        "receipt must store only a digest of the caller filter"
+    );
+
+    let failure = run_child("line-overflow", None)
+        .expect_err("infinite line output must produce a bounded failure receipt");
+    let limited = SealedChildReceipt::from_failure("line-overflow", None, &failure);
+    assert_sealed_receipt(&limited, "line-overflow");
+    assert!(
+        matches!(limited.terminal_cause, TerminalCause::OutputLimit),
+        "line-overflow must seal an output-limit terminal cause"
     );
 }
 
