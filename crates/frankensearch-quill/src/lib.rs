@@ -13,6 +13,11 @@
 //! assert_ne!(DEFAULT_SCHEMA.schema_id().unwrap(), 0);
 //! ```
 
+#[cfg(all(feature = "bench-internals", feature = "profile-internals"))]
+compile_error!(
+    "profile-internals is a diagnostic-sidecar feature and must not be linked into a Quill timing build"
+);
+
 pub mod argus;
 pub mod config;
 pub mod contract;
