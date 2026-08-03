@@ -6374,6 +6374,106 @@ mod tests {
         });
     }
 
+    /// E6.3 law: on the position-capable scalar fixture, a quoted single term
+    /// reduces to the same term query. This does not assert phrase equivalence
+    /// generally: the multi-term phrase is the intentionally invalid control,
+    /// because it reads adjacency positions and narrows the matching corpus.
+    #[cfg(feature = "perf-harness")]
+    #[test]
+    fn e63_single_term_quote_matches_bare_term_but_multi_term_phrase_does_not() {
+        use frankensearch_core::IndexableDocument;
+
+        const SEED: u64 = 0xe63_907e_5eed_0001;
+        let documents = vec![
+            IndexableDocument::new("doc-1", "alpha beta beta").with_title("guide"),
+            IndexableDocument::new("doc-2", "alpha gamma").with_title("alpha overview"),
+            IndexableDocument::new("doc-3", "beta gamma gamma gamma").with_title("alpha"),
+            IndexableDocument::new("doc-4", "alpha beta gamma delta").with_title("reference"),
+            IndexableDocument::new("doc-5", "delta epsilon").with_title("quiet"),
+        ];
+        let bare_term = [("single-term-phrase", "alpha")];
+        let quoted_term = [("single-term-phrase", "\"alpha\"")];
+        let multi_term_phrase = [("single-term-phrase", "\"alpha beta\"")];
+
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let baseline = e63_observations(
+                &cx,
+                &documents,
+                &bare_term,
+                SEED,
+                "e6.3-single-term-quote-v1",
+            )
+            .await;
+            let transformed = e63_observations(
+                &cx,
+                &documents,
+                &quoted_term,
+                SEED,
+                "e6.3-single-term-quote-v1",
+            )
+            .await;
+            let invalid = e63_observations(
+                &cx,
+                &documents,
+                &multi_term_phrase,
+                SEED,
+                "e6.3-single-term-quote-v1",
+            )
+            .await;
+
+            let baseline_case = baseline.first().expect("E6.3 bare-term fixture");
+            let quoted_case = transformed.first().expect("E6.3 quoted-term fixture");
+            assert_eq!(
+                baseline_case.0, quoted_case.0,
+                "E6.3 single-term quote case identity drifted"
+            );
+            for (engine, before, after) in [
+                ("Quill", &baseline_case.1, &quoted_case.1),
+                ("Tantivy", &baseline_case.2, &quoted_case.2),
+            ] {
+                let comparison = compare_observations(
+                    before.clone(),
+                    after.clone(),
+                    ComparatorConfig::default(),
+                )
+                .unwrap_or_else(|error| {
+                    panic!("E6.3 {engine} single-term quote comparison failed: {error}")
+                });
+                assert!(
+                    matches!(
+                        comparison.rank_class,
+                        RankClass::RankExact | RankClass::TieOrder
+                    ) && comparison
+                        .divergences
+                        .iter()
+                        .all(|divergence| divergence.class == DivergenceClass::TieOrder),
+                    "E6.3 {engine} produced a non-tie divergence under single-term quote equivalence: {:?}",
+                    comparison.divergences,
+                );
+            }
+
+            let invalid_case = invalid.first().expect("E6.3 multi-term phrase fixture");
+            for (engine, before, after) in [
+                ("Quill", &baseline_case.1, &invalid_case.1),
+                ("Tantivy", &baseline_case.2, &invalid_case.2),
+            ] {
+                let comparison = compare_observations(
+                    before.clone(),
+                    after.clone(),
+                    ComparatorConfig::default(),
+                )
+                .unwrap_or_else(|error| {
+                    panic!("E6.3 {engine} invalid phrase comparison failed: {error}")
+                });
+                assert_eq!(
+                    comparison.status,
+                    ComparisonStatus::Failed,
+                    "E6.3 {engine} incorrectly accepted a multi-term phrase as bare-term equivalence",
+                );
+            }
+        });
+    }
+
     #[cfg(feature = "tantivy-oracle")]
     #[test]
     fn e410_controlled_public_search_semantics_match_oracle() {
