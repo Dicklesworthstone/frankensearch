@@ -251,6 +251,27 @@ check_installer_behavior() {
     echo "[installer][FAIL] NO_COLOR output contract violated"
     FAILURES=$((FAILURES + 1))
   fi
+
+  if python3 - "$installer" <<'PY'
+import pathlib
+import sys
+
+installer = pathlib.Path(sys.argv[1]).read_text(encoding="utf-8")
+required = (
+    'if [ "$NO_COLOR_MODE" -eq 1 ]; then\n    printf \'\\nfsfs installer',
+    '&& [ "$NO_COLOR_MODE" -eq 0 ] && [ "$QUIET" -eq 0 ]; then',
+    'elif [ -t 1 ] && [ "$NO_COLOR_MODE" -eq 0 ] && [ "$QUIET" -eq 0 ]; then',
+    'if [ "$QUIET" -eq 0 ]; then\nif [ "$NO_COLOR_MODE" -eq 1 ]; then\n  printf \'\\nInstallation complete!',
+)
+missing = [marker for marker in required if marker not in installer]
+raise SystemExit(bool(missing))
+PY
+  then
+    echo "[installer][OK]   NO_COLOR covers banner, progress, and completion renderers"
+  else
+    echo "[installer][FAIL] NO_COLOR renderer routing is incomplete"
+    FAILURES=$((FAILURES + 1))
+  fi
 }
 
 check_model_features() {

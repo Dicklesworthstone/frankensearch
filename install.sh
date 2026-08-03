@@ -319,7 +319,7 @@ fi
 run_with_spinner() {
   local title="$1"
   shift
-  if [ "$HAS_GUM" -eq 1 ] && [ "$NO_GUM" -eq 0 ] && [ "$QUIET" -eq 0 ]; then
+  if [ "$HAS_GUM" -eq 1 ] && [ "$NO_GUM" -eq 0 ] && [ "$NO_COLOR_MODE" -eq 0 ] && [ "$QUIET" -eq 0 ]; then
     gum spin --spinner dot --title "$title" -- "$@"
   else
     info "$title"
@@ -442,7 +442,9 @@ done
 
 # Show header
 if [ "$QUIET" -eq 0 ]; then
-  if [ "$HAS_GUM" -eq 1 ] && [ "$NO_GUM" -eq 0 ]; then
+  if [ "$NO_COLOR_MODE" -eq 1 ]; then
+    printf '\nfsfs installer\nTwo-tier hybrid local search\n\n'
+  elif [ "$HAS_GUM" -eq 1 ] && [ "$NO_GUM" -eq 0 ]; then
     gum style \
       --border rounded \
       --border-foreground 39 \
@@ -556,7 +558,7 @@ download_with_progress() {
     fi
   fi
 
-  if [ "$HAS_GUM" -eq 1 ] && [ "$NO_GUM" -eq 0 ] && [ "$QUIET" -eq 0 ]; then
+  if [ "$HAS_GUM" -eq 1 ] && [ "$NO_GUM" -eq 0 ] && [ "$NO_COLOR_MODE" -eq 0 ] && [ "$QUIET" -eq 0 ]; then
     # ── gum: rich styled output ──
     if [ -n "$size_human" ]; then
       gum style --foreground 39 "$(printf '↓ %s  %s  (%s)' "$label" "$(gum style --faint --italic "$(basename "$url")")" \
@@ -568,7 +570,7 @@ download_with_progress() {
     if ! curl -fL --progress-bar --connect-timeout 30 --max-time 1800 "$url" -o "$dest"; then
       return 1
     fi
-  elif [ -t 1 ] && [ "$QUIET" -eq 0 ]; then
+  elif [ -t 1 ] && [ "$NO_COLOR_MODE" -eq 0 ] && [ "$QUIET" -eq 0 ]; then
     # ── Interactive terminal: styled ANSI progress ──
     if [ -n "$size_human" ]; then
       printf '\033[1;36m↓\033[0m %s \033[2m%s\033[0m  \033[1;35m%s\033[0m\n' \
@@ -754,7 +756,20 @@ if [ "$VERIFY" -eq 1 ]; then
   ok "Self-test complete: $SELF_TEST_OUTPUT"
 fi
 
-if [ "$HAS_GUM" -eq 1 ] && [ "$NO_GUM" -eq 0 ]; then
+if [ "$QUIET" -eq 0 ]; then
+if [ "$NO_COLOR_MODE" -eq 1 ]; then
+  printf '\nInstallation complete!\n'
+  printf 'Binary: %s\n' "$DEST/${BINARY_NAME}"
+  printf 'Version: %s\n\n' "$VERSION"
+  printf '%s\n' 'Quick start:'
+  printf '%s\n' '  fsfs download-models potion-multilingual-128m'
+  printf '%s\n' '  fsfs download-models all-minilm-l6-v2'
+  printf '%s\n' '  fsfs download-models potion-multilingual-128m --verify'
+  printf '%s\n' '  fsfs download-models all-minilm-l6-v2 --verify'
+  printf '%s\n' '  fsfs index /path/to/files   Index a directory'
+  printf '%s\n' '  fsfs search "your query"    Search your index'
+  printf '%s\n\n' '  fsfs                        Interactive TUI'
+elif [ "$HAS_GUM" -eq 1 ] && [ "$NO_GUM" -eq 0 ]; then
   echo ""
   gum style \
     --border rounded \
@@ -800,4 +815,5 @@ else
   echo -e "  \033[1;32m│\033[0m  \033[0;90m$ fsfs\033[0m  \033[2m(interactive TUI)\033[0m          \033[1;32m│\033[0m"
   echo -e "  \033[1;32m╰─────────────────────────────────────────╯\033[0m"
   echo ""
+fi
 fi
