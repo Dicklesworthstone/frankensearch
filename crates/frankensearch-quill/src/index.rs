@@ -18586,7 +18586,7 @@ mod tests {
                 }) if field == "content"
             ));
         };
-        for query in ["\"alpha beta\"", "\"alpha beta\"~2"] {
+        for query in ["\"alpha beta\"", "\"alpha beta\"~2", "\"alpha beta\"*"] {
             let ranked = index
                 .search_paginated(&cx, query, 10, 0, true)
                 .expect_err("a position-dependent phrase must fail before query execution");
