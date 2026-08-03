@@ -133,6 +133,7 @@ use crate::stream_protocol::{
     StreamEvent, StreamFrame, StreamProgressEvent, StreamResultEvent, StreamStartedEvent,
     is_retryable_error, terminal_event_completed, terminal_event_from_error,
 };
+use crate::tracing_setup::current_unicode_environment;
 use crate::watcher::{FsWatcher, WatchIngestOp, WatchIngestPipeline};
 
 /// Supported fsfs interfaces.
@@ -6422,7 +6423,7 @@ impl FsfsRuntime {
         query: &str,
         limit: usize,
     ) -> SearchResult<Vec<SearchPayload>> {
-        let env_map: HashMap<String, String> = std::env::vars().collect();
+        let env_map = current_unicode_environment();
         let query_for_expansion = query.to_owned();
         let expansion =
             spawn_blocking(move || query_expansion::expand_query(&query_for_expansion, &env_map))
@@ -19377,6 +19378,9 @@ mod tests {
     #[test]
     fn async_query_expansion_offloads_blocking_llm_http() {
         let source = include_str!("runtime.rs");
+        let (production_source, _) = source
+            .split_once("#[cfg(test)]\nmod tests")
+            .expect("runtime.rs must preserve the exact test-module boundary");
         let direct_call = [
             "let expansion = ",
             "query_expansion",
@@ -19398,6 +19402,11 @@ mod tests {
         assert!(
             source.contains(&required_offload),
             "execute_expanded_search should offload blocking query expansion with spawn_blocking"
+        );
+        assert!(
+            production_source.contains("let env_map = current_unicode_environment();")
+                && !production_source.contains("std::env::vars()"),
+            "query expansion must use the OS-safe Unicode environment projection"
         );
         assert!(
             !source.contains(&stale_comment),
