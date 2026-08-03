@@ -222,6 +222,15 @@ pub enum GenerationAuthorityErrorV1 {
     /// The newer slot skipped a sequence or lacked an exact predecessor link.
     #[error("generation authority slots lack a consecutive predecessor link")]
     BrokenPredecessorLink,
+    /// A lock frame belonged to a different authority root than the slots.
+    #[error("generation authority lock root does not match the resolved authority")]
+    LockRootMismatch,
+    /// An owner lock did not attest the resolved authority head.
+    #[error("generation authority lock does not attest the resolved authority")]
+    LockAuthorityMismatch,
+    /// A valid publication attempt remains unresolved and must be reconciled.
+    #[error("generation authority publication attempt remains unresolved")]
+    UnresolvedAttempt,
     /// The immutable activation manifest did not match its stored self-seal.
     #[error("generation activation manifest self-seal mismatch")]
     ManifestSelfSealMismatch,
@@ -829,6 +838,71 @@ pub fn resolve_authority_slots_v1(
             Ok(Some(newer))
         }
     }
+}
+
+/// Resolve authority slots while refusing to silently step around a valid
+/// owner/attempt `LOCK` state.
+///
+/// A persisted attempt is evidence of an outcome the caller has not yet
+/// reconciled, so it fails closed even if an older authority pair resolves.
+/// The helper performs no filesystem I/O and does not mutate either frame.
+///
+/// # Errors
+///
+/// Returns a bounded typed error when frame kind, root binding, owner binding,
+/// or a pending attempt prevents a safe selection.
+pub fn resolve_authority_slots_with_locks_v1(
+    first: Option<AuthoritySlotV1>,
+    second: Option<AuthoritySlotV1>,
+    owner: Option<GenerationLockFrameV1>,
+    attempt: Option<GenerationLockFrameV1>,
+) -> Result<Option<AuthoritySlotV1>, GenerationAuthorityErrorV1> {
+    let resolved = resolve_authority_slots_v1(first, second)?;
+    if let Some(owner) = owner {
+        owner.validate()?;
+        // ubs:ignore — lock kinds are public fixed-format state tags.
+        if owner.kind != GenerationLockFrameKindV1::Owner {
+            return Err(GenerationAuthorityErrorV1::InvalidField {
+                field: "generation_lock.owner.kind",
+            });
+        }
+    }
+    if let Some(attempt) = attempt {
+        attempt.validate()?;
+        // ubs:ignore — lock kinds are public fixed-format state tags.
+        if attempt.kind != GenerationLockFrameKindV1::Attempt {
+            return Err(GenerationAuthorityErrorV1::InvalidField {
+                field: "generation_lock.attempt.kind",
+            });
+        }
+    }
+    if let (Some(owner), Some(attempt)) = (owner, attempt) {
+        // ubs:ignore — root IDs are public structural identities.
+        if owner.root_id != attempt.root_id {
+            return Err(GenerationAuthorityErrorV1::LockRootMismatch);
+        }
+    }
+    if let Some(slot) = resolved {
+        // ubs:ignore — root IDs are public structural identities.
+        if owner.is_some_and(|frame| frame.root_id != slot.root_id) {
+            return Err(GenerationAuthorityErrorV1::LockRootMismatch);
+        }
+        // ubs:ignore — root IDs are public structural identities.
+        if attempt.is_some_and(|frame| frame.root_id != slot.root_id) {
+            return Err(GenerationAuthorityErrorV1::LockRootMismatch);
+        }
+    }
+    if attempt.is_some() {
+        return Err(GenerationAuthorityErrorV1::UnresolvedAttempt);
+    }
+    if let Some(owner) = owner {
+        let resolved = resolved.ok_or(GenerationAuthorityErrorV1::LockAuthorityMismatch)?;
+        // ubs:ignore — authority fingerprints are public immutable-integrity identities.
+        if owner.authority_fingerprint != resolved.authority.fingerprint() {
+            return Err(GenerationAuthorityErrorV1::LockAuthorityMismatch);
+        }
+    }
+    Ok(resolved)
 }
 
 fn slot_matches_authority_sequence(slot: AuthoritySlotV1) -> bool {
@@ -3723,6 +3797,21 @@ mod tests {
             .expect("valid test lock frame")
     }
 
+    fn authority_lock(
+        kind: GenerationLockFrameKindV1,
+        authority: AuthorityRefV1,
+    ) -> GenerationLockFrameV1 {
+        GenerationLockFrameV1::new(
+            kind,
+            [0x5a; 16],
+            [0x72; 16],
+            [0x73; 16],
+            1,
+            authority.fingerprint(),
+        )
+        .expect("valid authority-bound test lock frame")
+    }
+
     fn component_receipts() -> GenerationComponentReceiptsV1 {
         GenerationComponentReceiptsV1 {
             vector: GenerationComponentReceiptV1 {
@@ -3861,6 +3950,52 @@ mod tests {
                 "single-byte mutation at offset {byte_index} must never decode"
             );
         }
+    }
+
+    #[test]
+    fn lock_aware_resolver_requires_owner_agreement_and_attempt_reconciliation() {
+        let genesis = authority_reference(1, None);
+        let successor = authority_reference(2, Some(genesis.fingerprint()));
+        let first = authority_slot(1, genesis);
+        let second = authority_slot(0, successor);
+        let owner = authority_lock(GenerationLockFrameKindV1::Owner, successor);
+        assert_eq!(
+            resolve_authority_slots_with_locks_v1(Some(first), Some(second), Some(owner), None),
+            Ok(Some(second)),
+            "a matching owner attests the resolved committed head"
+        );
+
+        let attempt = authority_lock(GenerationLockFrameKindV1::Attempt, successor);
+        assert_eq!(
+            resolve_authority_slots_with_locks_v1(
+                Some(first),
+                Some(second),
+                Some(owner),
+                Some(attempt),
+            ),
+            Err(GenerationAuthorityErrorV1::UnresolvedAttempt),
+            "an authenticated attempt blocks fallback until publisher reconciliation"
+        );
+
+        let wrong_authority = GenerationLockFrameV1::new(
+            GenerationLockFrameKindV1::Owner,
+            [0x5a; 16],
+            [0x72; 16],
+            [0x73; 16],
+            1,
+            [0x91; 32],
+        )
+        .expect("well-formed mismatched owner lock");
+        assert_eq!(
+            resolve_authority_slots_with_locks_v1(
+                Some(first),
+                Some(second),
+                Some(wrong_authority),
+                None,
+            ),
+            Err(GenerationAuthorityErrorV1::LockAuthorityMismatch),
+            "a valid lock for another authority must not select this head"
+        );
     }
 
     #[test]

@@ -132,7 +132,8 @@ pub use generation::{
     RepairDescriptor, TrustedProducerConformanceContextV1, VECTOR_STORAGE_IDENTITY_SCHEMA_V1,
     ValidationFinding, ValidationResult, VectorArtifact, VectorStorageIdentityV1,
     VerifiedGoldenConformanceManifestV1, compute_manifest_hash, require_valid,
-    resolve_authority_slots_v1, validate_manifest, verify_authority_manifest_reference_v1,
+    resolve_authority_slots_v1, resolve_authority_slots_with_locks_v1, validate_manifest,
+    verify_authority_manifest_reference_v1,
 };
 pub use graph::{DocumentGraph, EdgeType, GraphDocId, GraphEdge};
 pub use host_adapter::{
