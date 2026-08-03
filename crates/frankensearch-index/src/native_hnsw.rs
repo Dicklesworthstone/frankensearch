@@ -4233,6 +4233,72 @@ mod tests {
         );
     }
 
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn owner_bound_ann_remains_on_admitted_bytes_after_pathname_replacement() {
+        let directory = tempfile::tempdir().expect("temporary FSVI owner directory");
+        let current_path = directory.path().join("current.fsvi");
+        let replacement_path = directory.path().join("replacement.fsvi");
+        let retained_path = directory.path().join("retained-original.fsvi");
+        let binding = fsvi_v2_binding(82, 0x82, "ann-path-replacement", 4);
+
+        let mut original =
+            VectorIndex::create_v2(&current_path, binding.clone()).expect("create original FSVI");
+        original
+            .write_record("doc-alpha", &[1.0, 0.0, 0.0, 0.0])
+            .expect("write original alpha");
+        original
+            .write_record("doc-beta", &[0.0, 1.0, 0.0, 0.0])
+            .expect("write original beta");
+        original.finish().expect("finish original FSVI");
+
+        let owner = Arc::new(
+            ValidatedFsviBytes::open_published(&current_path, &binding)
+                .expect("admit original published FSVI"),
+        );
+        let bound = ValidatedNativeHnsw::build(Arc::clone(&owner), params(), 82)
+            .expect("build graph from admitted owner");
+        assert_eq!(
+            bound
+                .search(&[1.0, 0.0, 0.0, 0.0], 1, Some(owner.record_count()))
+                .expect("search original owner through ANN")[0]
+                .doc_id(),
+            "doc-alpha"
+        );
+
+        let mut replacement = VectorIndex::create_v2(&replacement_path, binding.clone())
+            .expect("create replacement FSVI");
+        replacement
+            .write_record("doc-alpha", &[0.0, 1.0, 0.0, 0.0])
+            .expect("write replacement alpha");
+        replacement
+            .write_record("doc-beta", &[1.0, 0.0, 0.0, 0.0])
+            .expect("write replacement beta");
+        replacement.finish().expect("finish replacement FSVI");
+        std::fs::rename(&current_path, &retained_path).expect("retain original pathname target");
+        std::fs::rename(&replacement_path, &current_path)
+            .expect("publish semantically different replacement");
+
+        let fresh_owner = ValidatedFsviBytes::open_published(&current_path, &binding)
+            .expect("fresh admission observes replacement bytes");
+        assert_eq!(
+            fresh_owner
+                .search_top_k(&[1.0, 0.0, 0.0, 0.0], 1, None)
+                .expect("exact search replacement owner")[0]
+                .doc_id,
+            "doc-beta",
+            "the substituted pathname must expose replacement semantics to fresh admission"
+        );
+        assert_eq!(
+            bound
+                .search(&[1.0, 0.0, 0.0, 0.0], 1, Some(owner.record_count()))
+                .expect("search retained owner-bound ANN")[0]
+                .doc_id(),
+            "doc-alpha",
+            "the owner-built graph must resolve through its retained admitted bytes"
+        );
+    }
+
     #[test]
     fn validated_handle_retains_loaded_owner_after_caller_scope_end() {
         let owner = generation_owner(81, 0x81, "retained-load-owner", 4, 16);
