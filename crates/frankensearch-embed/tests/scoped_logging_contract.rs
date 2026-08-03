@@ -7,7 +7,7 @@
 
 use std::{
     ffi::OsString,
-    io::Read,
+    io::{Read, Write},
     process::{Child, Command, ExitStatus, Stdio},
     sync::mpsc::{self, RecvTimeoutError},
     thread,
@@ -381,6 +381,35 @@ fn fresh_process_output_limit_reaps_noisy_child() {
 }
 
 #[test]
+fn fresh_process_byte_limit_reaps_noisy_child() {
+    match run_child("byte-overflow", None) {
+        Err(ChildFailure::OutputLimit {
+            bytes,
+            lines,
+            status,
+        }) => {
+            assert!(bytes > MAX_OUTPUT_BYTES, "byte limit did not trigger");
+            assert!(
+                lines <= MAX_OUTPUT_LINES,
+                "byte-only child reached the line cap before the byte cap"
+            );
+            assert!(
+                !status.success(),
+                "overflowing child must be terminated rather than succeed"
+            );
+        }
+        Err(ChildFailure::Timeout { status }) => {
+            panic!("byte-only child hit wall-time bound instead of byte cap: {status:?}");
+        }
+        Ok(output) => panic!(
+            "byte-only child unexpectedly passed after {} bytes and {} lines",
+            output.bytes.len(),
+            output.lines,
+        ),
+    }
+}
+
+#[test]
 fn fresh_process_child() {
     let Ok(case) = std::env::var(CHILD_CASE_ENV) else {
         return;
@@ -416,6 +445,18 @@ fn fresh_process_child() {
         "line-overflow" => loop {
             println!("bounded-child-output-overflow");
         },
+        "byte-overflow" => {
+            let mut stdout = std::io::stdout().lock();
+            let chunk = [b'x'; 8_192];
+            loop {
+                stdout
+                    .write_all(&chunk)
+                    .expect("byte-overflow child must write stdout");
+                stdout
+                    .flush()
+                    .expect("byte-overflow child must flush stdout");
+            }
+        }
         other => panic!("unknown fresh-process logging child case {other:?}"),
     }
 }
