@@ -1,0 +1,13 @@
+=== MUTATION M2 (FINAL bytes): admit_attested_tier producer gate disabled ===
+date: 2026-07-31T16:05:58-04:00
+pristine sha256: 33d9e386e5210a572381505071e0b31bc2007ac4ef49520696a2393be1466fc8
+mutated sha256: 4a729b5f8352a4758c298b4056fbd1e64c99451857a58d6c659a52232d13283e
+
+failures:
+    refresh::tests::certified_sibling_producer_refused_attestation_unavailable
+    refresh::tests::copied_certificate_foreign_producer_rejects
+
+test result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 931 filtered out; finished in 0.08s
+
+error: test failed, to rerun pass `-p frankensearch-fusion --lib`
+EXIT_STATUS=101

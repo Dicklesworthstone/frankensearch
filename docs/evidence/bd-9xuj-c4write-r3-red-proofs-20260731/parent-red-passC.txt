@@ -1,0 +1,60 @@
+== PARENT-RED pass C (compile-red) @ 7095b1da: spy test legacy_crash_state_generation_collision_refuses_pre_drain_without_embedding + assert helper ported verbatim ==
+== cmd: cargo test -p frankensearch-fusion --lib -- refresh::tests::legacy_crash_state ==
+   Compiling frankensearch-embed v0.2.1 (/data/tmp/claude-1000/-data-projects-frankensearch/6ba18fed-10c5-4855-b287-a7067faf4133/scratchpad/c4r3-parent-worktree/crates/frankensearch-embed)
+   Compiling frankensearch-core v0.2.1 (/data/tmp/claude-1000/-data-projects-frankensearch/6ba18fed-10c5-4855-b287-a7067faf4133/scratchpad/c4r3-parent-worktree/crates/frankensearch-core)
+   Compiling frankensearch-index v0.2.1 (/data/tmp/claude-1000/-data-projects-frankensearch/6ba18fed-10c5-4855-b287-a7067faf4133/scratchpad/c4r3-parent-worktree/crates/frankensearch-index)
+warning: use of deprecated method `wide::i16x8::mul_widen`: renamed to `widening_mul`
+    --> crates/frankensearch-index/src/simd.rs:1268:28
+     |
+1268 |         acc0 += w8::<0>(s).mul_widen(w8::<0>(q));
+     |                            ^^^^^^^^^
+     |
+     = note: `#[warn(deprecated)]` on by default
+
+warning: use of deprecated method `wide::i16x8::mul_widen`: renamed to `widening_mul`
+    --> crates/frankensearch-index/src/simd.rs:1269:28
+     |
+1269 |         acc1 += w8::<8>(s).mul_widen(w8::<8>(q));
+     |                            ^^^^^^^^^
+
+warning: use of deprecated method `wide::i16x8::mul_widen`: renamed to `widening_mul`
+    --> crates/frankensearch-index/src/simd.rs:1270:29
+     |
+1270 |         acc2 += w8::<16>(s).mul_widen(w8::<16>(q));
+     |                             ^^^^^^^^^
+
+warning: use of deprecated method `wide::i16x8::mul_widen`: renamed to `widening_mul`
+    --> crates/frankensearch-index/src/simd.rs:1271:29
+     |
+1271 |         acc3 += w8::<24>(s).mul_widen(w8::<24>(q));
+     |                             ^^^^^^^^^
+
+warning: use of deprecated method `wide::i16x8::mul_widen`: renamed to `widening_mul`
+    --> crates/frankensearch-index/src/simd.rs:1279:46
+     |
+1279 |         sum += i16x8::from(s.map(i16::from)).mul_widen(i16x8::from(q.map(i16::from)));
+     |                                              ^^^^^^^^^
+
+warning: `frankensearch-index` (lib) generated 5 warnings
+   Compiling frankensearch-fusion v0.2.1 (/data/tmp/claude-1000/-data-projects-frankensearch/6ba18fed-10c5-4855-b287-a7067faf4133/scratchpad/c4r3-parent-worktree/crates/frankensearch-fusion)
+error[E0599]: no method named `embed_invocations` found for reference `&refresh::tests::StubEmbedder` in the current scope
+    --> crates/frankensearch-fusion/src/refresh.rs:4147:22
+     |
+4147 |             embedder.embed_invocations(),
+     |                      ^^^^^^^^^^^^^^^^^ method not found in `&refresh::tests::StubEmbedder`
+
+error[E0308]: mismatched types
+    --> crates/frankensearch-fusion/src/refresh.rs:4170:17
+     |
+4170 |             let (worker, cache, embedder) = make_worker(queue.clone(), &dir, 256);
+     |                 ^^^^^^^^^^^^^^^^^^^^^^^^^   ------------------------------------- this expression has type `(refresh::RefreshWorker, std::sync::Arc<cache::IndexCache>)`
+     |                 |
+     |                 expected a tuple with 2 elements, found one with 3 elements
+     |
+     = note: expected tuple `(refresh::RefreshWorker, std::sync::Arc<cache::IndexCache>)`
+                found tuple `(_, _, _)`
+
+Some errors have detailed explanations: E0308, E0599.
+For more information about an error, try `rustc --explain E0308`.
+error: could not compile `frankensearch-fusion` (lib test) due to 2 previous errors
+EXIT_STATUS=101

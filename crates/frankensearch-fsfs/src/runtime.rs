@@ -1800,7 +1800,9 @@ impl EmbeddingVectorSink for LiveVectorSink {
             .vector_index
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        vi.soft_delete(doc_id)?;
+        // `VectorIndex::append` is the atomic replacement primitive: it
+        // durably logs the new value before superseding older resident copies.
+        // Deleting first would turn a failed WAL append into durable data loss.
         vi.append(doc_id, embedding)?;
         drop(vi);
         Ok(())
@@ -2012,18 +2014,16 @@ impl LiveIngestPipeline {
         Ok((canonical, rel_key))
     }
 
-    fn soft_delete_vector(&self, rel_key: &str) {
+    fn soft_delete_vector(&self, rel_key: &str) -> SearchResult<()> {
         let mut vi = self
             .vector_index
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Err(error) = vi.soft_delete(rel_key) {
-            tracing::debug!(
-                file_key = %rel_key,
-                error = %error,
-                "soft_delete_vector: ignored (doc may not exist yet)"
-            );
-        }
+        // Missing documents are `Ok(false)`; an error is a real durability or
+        // integrity failure and must not be reported as a successful delete.
+        let _was_present = vi.soft_delete(rel_key)?;
+        drop(vi);
+        Ok(())
     }
 
     async fn prune_indexes(&self, cx: &Cx, rel_key: &str) -> frankensearch_core::SearchResult<()> {
@@ -2034,7 +2034,7 @@ impl LiveIngestPipeline {
             "watch_delete",
         )];
         self.apply_lexical_mutations(cx, &mutations).await?;
-        self.soft_delete_vector(rel_key);
+        self.soft_delete_vector(rel_key)?;
         Ok(())
     }
 
@@ -2187,7 +2187,7 @@ impl LiveIngestPipeline {
                         reason_code = %vector_plan.reason_code,
                         "watcher ingest: tombstoning stale vector for revision invalidation"
                     );
-                    self.soft_delete_vector(rel_key);
+                    self.soft_delete_vector(rel_key)?;
                 }
                 VectorIndexWriteAction::AppendFast { .. } => {
                     match self.embedder.embed(cx, canonical).await {
@@ -2196,9 +2196,8 @@ impl LiveIngestPipeline {
                                 .vector_index
                                 .lock()
                                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-                            // soft_delete returns Ok(false) if doc doesn't exist, so Err is a real failure
-                            // (IO/corruption) that must prevent appending.
-                            vi.soft_delete(rel_key)?;
+                            // Append is log-before-supersede. Never tombstone
+                            // the old vector until the replacement is durable.
                             vi.append(rel_key, &embedding)?;
                         }
                         Err(error) => {
@@ -2222,7 +2221,7 @@ impl LiveIngestPipeline {
                 }
                 VectorIndexWriteAction::MarkLexicalFallback { .. }
                 | VectorIndexWriteAction::Skip { .. } => {
-                    self.soft_delete_vector(rel_key);
+                    self.soft_delete_vector(rel_key)?;
                 }
             }
         }
@@ -2361,7 +2360,7 @@ impl LiveIngestPipeline {
                     .await?;
             }
         } else {
-            self.soft_delete_vector(&rel_key);
+            self.soft_delete_vector(&rel_key)?;
             Self::purge_storage_document(storage_ctx, &rel_key)?;
         }
 
@@ -2439,7 +2438,7 @@ impl LiveIngestPipeline {
             self.apply_live_vector_actions(cx, &rel_key, revision, &canonical, &vector_plan)
                 .await?;
         } else {
-            self.soft_delete_vector(&rel_key);
+            self.soft_delete_vector(&rel_key)?;
         }
 
         Ok(true)
@@ -4047,7 +4046,15 @@ impl FsfsRuntime {
     #[must_use]
     pub fn vector_index_write_actions(plan: &VectorPipelinePlan) -> Vec<VectorIndexWriteAction> {
         let mut actions = Vec::new();
-        if let Some(revision) = plan.invalidate_revisions_through {
+        // When the plan publishes a replacement vector, `VectorIndex::append`
+        // supersedes the stale revision durably (log-before-supersede); a
+        // separate tombstone first would destroy the old vector if the append
+        // fails. Invalidate explicitly only when no replacement is published.
+        let publishes_replacement = matches!(
+            plan.tier,
+            VectorSchedulingTier::FastAndQuality | VectorSchedulingTier::FastOnly
+        );
+        if !publishes_replacement && let Some(revision) = plan.invalidate_revisions_through {
             actions.push(VectorIndexWriteAction::InvalidateRevisionsThrough {
                 file_key: plan.file_key.clone(),
                 revision,
@@ -5778,6 +5785,7 @@ impl FsfsRuntime {
 
     #[cfg(unix)]
     fn spawn_search_daemon(&self, socket_path: &Path) -> SearchResult<()> {
+        #[cfg(any(target_os = "linux", target_os = "android"))]
         use std::os::unix::process::CommandExt;
 
         if let Some(parent) = socket_path.parent()
@@ -5846,6 +5854,7 @@ impl FsfsRuntime {
         // async-signal-safety of whatever the caller puts in there; the
         // two calls we make — `prctl` and `getppid` — are both on the
         // signal-safe list (see signal-safety(7)).
+        #[cfg(any(target_os = "linux", target_os = "android"))]
         #[allow(unsafe_code)]
         unsafe {
             command.pre_exec(|| {
@@ -8120,7 +8129,7 @@ impl FsfsRuntime {
         if !vector_path.exists() {
             return Err(SearchError::IndexNotFound { path: vector_path });
         }
-        let _publication_lease = crate::lifecycle::PublicationLease::acquire(&index_root)?;
+        let publication_lease = crate::lifecycle::PublicationLease::acquire(&index_root)?;
 
         let embedder = self.resolve_fast_embedder()?;
         let dimension = embedder.dimension();
@@ -8217,7 +8226,9 @@ impl FsfsRuntime {
             entries.push((id.clone(), embedding));
         }
 
-        // Open index and append.
+        // Open index and append, refencing the held lease at the publication
+        // boundary so a substituted lock file aborts before any WAL mutation.
+        publication_lease.fence("append-batch WAL publication")?;
         let mut index = VectorIndex::open(&vector_path)?;
         index.append_batch(&entries)?;
 
@@ -8385,8 +8396,9 @@ impl FsfsRuntime {
         if !vector_path.exists() {
             return Err(SearchError::IndexNotFound { path: vector_path });
         }
-        let _publication_lease = crate::lifecycle::PublicationLease::acquire(&index_root)?;
+        let publication_lease = crate::lifecycle::PublicationLease::acquire(&index_root)?;
 
+        publication_lease.fence("delete WAL publication")?;
         let mut index = VectorIndex::open(&vector_path)?;
         let ids = &self.cli_input.delete_ids;
 
@@ -8480,8 +8492,9 @@ impl FsfsRuntime {
         if !vector_path.exists() {
             return Err(SearchError::IndexNotFound { path: vector_path });
         }
-        let _publication_lease = crate::lifecycle::PublicationLease::acquire(&index_root)?;
+        let publication_lease = crate::lifecycle::PublicationLease::acquire(&index_root)?;
 
+        publication_lease.fence("explicit vector compaction")?;
         let mut index = VectorIndex::open(&vector_path)?;
 
         // First compact WAL into main index.
@@ -8557,7 +8570,7 @@ impl FsfsRuntime {
         }
         // Held for the daemon's whole lifetime: its WAL-triggered compactions
         // are mutually exclusive with every other mutating fsfs process.
-        let _publication_lease = crate::lifecycle::PublicationLease::acquire(&index_root)?;
+        let publication_lease = crate::lifecycle::PublicationLease::acquire(&index_root)?;
 
         let poll_ms = self.cli_input.daemon_poll_ms.unwrap_or(1000);
         let wal_sidecar = frankensearch_index::wal_path_for(&vector_path);
@@ -8616,6 +8629,10 @@ impl FsfsRuntime {
                     );
                 }
 
+                // A fence failure means the long-held lease no longer proves
+                // exclusivity (lock file substituted); abort rather than
+                // compact alongside a possible second publisher.
+                publication_lease.fence("daemon vector compaction")?;
                 match VectorIndex::open(&vector_path) {
                     Ok(mut index) => match index.compact() {
                         Ok(stats) => {
@@ -10187,7 +10204,10 @@ impl FsfsRuntime {
         let index_root = self.resolve_index_root(&target_root)?;
         // One-shot and watch-mode indexing mutate checkpoint + FSVI + sentinel
         // state; exclude every other mutating fsfs process for the duration.
-        let _publication_lease = crate::lifecycle::PublicationLease::acquire(&index_root)?;
+        // The held lease is refenced immediately before every publication
+        // boundary below so a substituted lock file aborts the publication.
+        let publication_lease = crate::lifecycle::PublicationLease::acquire(&index_root)?;
+        publication_lease.fence("one-shot index entry")?;
 
         let root_decision = self.config.discovery.evaluate_root(&target_root, None);
         if !root_decision.include() {
@@ -10323,6 +10343,7 @@ impl FsfsRuntime {
         Self::ensure_semantic_embedder_admissible(embedder.as_ref(), cfg!(test))?;
         Self::probe_indexing_embedder(cx, embedder.as_ref()).await?;
 
+        publication_lease.fence("one-shot index artifact directories")?;
         fs::create_dir_all(index_root.join("vector"))?;
         fs::create_dir_all(index_root.join("cache"))?;
 
@@ -10401,6 +10422,7 @@ impl FsfsRuntime {
             .as_ref()
             .filter(|_| checkpoint_metadata_valid)
             .map_or_else(pressure_timestamp_ms, |previous| previous.started_at_ms);
+        publication_lease.fence("one-shot initial checkpoint publication")?;
         write_indexing_checkpoint(
             &index_root,
             &IndexingCheckpoint {
@@ -10467,6 +10489,7 @@ impl FsfsRuntime {
             None
         };
         if vector_index.is_none() {
+            publication_lease.fence("one-shot vector generation replacement")?;
             vector_index = Some(VectorIndex::replace_with_empty(
                 &vector_path,
                 embedder.id(),
@@ -10481,6 +10504,7 @@ impl FsfsRuntime {
             HashSet::new()
         };
 
+        publication_lease.fence("one-shot lexical generation planning")?;
         let lexical_plan = Self::plan_lexical_build(&index_root)?;
         let lexical_path = lexical_plan.engine_dir.clone();
         let lexical_manifest_path = if lexical_plan.lexical_root == index_root {
@@ -10503,6 +10527,7 @@ impl FsfsRuntime {
         // One-shot construction uses Quill's routed shard set and suppresses
         // ordinary tier merges until the final bulk concat. Watch sessions use
         // the deterministic singleton policy in `build_live_ingest_pipeline`.
+        publication_lease.fence("one-shot lexical writer admission")?;
         let lexical_index = QuillIndex::create(
             cx,
             &lexical_path,
@@ -10513,6 +10538,7 @@ impl FsfsRuntime {
         )
         .await?;
         if discard_undurable_lexical_generation {
+            publication_lease.fence("one-shot undurable lexical generation reset")?;
             lexical_index.delete_all(cx).await?;
         }
 
@@ -10585,6 +10611,7 @@ impl FsfsRuntime {
             .map(String::as_str)
             .collect::<Vec<_>>();
         if !stale_vector_ids.is_empty() {
+            publication_lease.fence("one-shot stale vector tombstones")?;
             vector_index.soft_delete_batch(&stale_vector_ids)?;
         }
 
@@ -10660,6 +10687,7 @@ impl FsfsRuntime {
         for chunk in candidates.chunks(BATCH_SIZE) {
             checkpoint.artifacts_durable = false;
             checkpoint.updated_at_ms = pressure_timestamp_ms();
+            publication_lease.fence("one-shot batch checkpoint publication")?;
             write_indexing_checkpoint(&index_root, &checkpoint)?;
             let mut chunk_docs = Vec::with_capacity(chunk.len());
 
@@ -10825,9 +10853,11 @@ impl FsfsRuntime {
                 })
                 .collect::<Vec<_>>();
             if !lexical_batch.is_empty() {
+                publication_lease.fence("one-shot lexical batch mutation")?;
                 let backend = QuillLexicalBackend::new(&lexical_index);
                 let mut pipeline = LexicalPipeline::new(backend);
                 let _stats = pipeline.apply_initial(&lexical_batch)?;
+                publication_lease.fence("one-shot lexical batch resumable flush")?;
                 let resume_stats = pipeline.backend_mut().flush_resumable(cx).await?;
                 lexical_resume_absent = lexical_resume_absent.saturating_add(resume_stats.absent);
                 lexical_resume_unchanged =
@@ -10922,6 +10952,7 @@ impl FsfsRuntime {
                             .zip(embeddings)
                             .map(|(pending, embedding)| (pending.document.id.clone(), embedding))
                             .collect::<Vec<_>>();
+                        publication_lease.fence("one-shot vector WAL append")?;
                         vector_index.append_batch(&vector_batch)?;
                         semantic_succeeded_this_chunk
                             .extend(semantic_docs.iter().map(|pending| pending.file_key.clone()));
@@ -10985,16 +11016,19 @@ impl FsfsRuntime {
 
             batch_counter = batch_counter.saturating_add(1);
             if batch_counter % CHECKPOINT_PERSIST_INTERVAL == 0 && remaining_reused_semantic == 0 {
+                publication_lease.fence("one-shot incremental generation publication")?;
                 checkpoint.artifacts_durable = false;
                 checkpoint.updated_at_ms = pressure_timestamp_ms();
                 write_indexing_checkpoint(&index_root, &checkpoint)?;
 
                 let lexical_commit_start = Instant::now();
+                publication_lease.fence("one-shot incremental lexical commit")?;
                 lexical_index.commit(cx).await?;
                 lexical_elapsed_ms =
                     lexical_elapsed_ms.saturating_add(lexical_commit_start.elapsed().as_millis());
 
                 let vector_compact_start = Instant::now();
+                publication_lease.fence("one-shot incremental vector reconciliation")?;
                 reconcile_vector_generation(&mut vector_index, &checkpoint)?;
                 vector_elapsed_ms =
                     vector_elapsed_ms.saturating_add(vector_compact_start.elapsed().as_millis());
@@ -11006,6 +11040,8 @@ impl FsfsRuntime {
                 checkpoint.skipped_files = stats
                     .discovered_files
                     .saturating_sub(published_manifests.len());
+                publication_lease
+                    .fence("one-shot incremental manifest and sentinel publication")?;
                 self.write_index_artifacts(
                     &index_root,
                     &lexical_manifest_path,
@@ -11033,6 +11069,7 @@ impl FsfsRuntime {
                     },
                 )?;
                 checkpoint.artifacts_durable = true;
+                publication_lease.fence("one-shot incremental durable checkpoint publication")?;
                 write_indexing_checkpoint(&index_root, &checkpoint)?;
             }
 
@@ -11075,9 +11112,11 @@ impl FsfsRuntime {
                     )
                 })
                 .collect::<Vec<_>>();
+            publication_lease.fence("one-shot stale lexical reconciliation")?;
             let backend = QuillLexicalBackend::new(&lexical_index);
             let mut pipeline = LexicalPipeline::new(backend);
             let _stats = pipeline.apply_initial(&mutations)?;
+            publication_lease.fence("one-shot stale lexical reconciliation flush")?;
             pipeline.backend_mut().flush_resumable(cx).await?.deleted
         };
         info!(
@@ -11116,15 +11155,18 @@ impl FsfsRuntime {
 
         // 4. Publish the final durable generation. The checkpoint is always
         // last, so every row it advertises is already represented on disk.
+        publication_lease.fence("final generation checkpoint publication")?;
         checkpoint.artifacts_durable = false;
         checkpoint.updated_at_ms = pressure_timestamp_ms();
         write_indexing_checkpoint(&index_root, &checkpoint)?;
         let lexical_commit_start = Instant::now();
+        publication_lease.fence("final lexical bulk-load publication")?;
         lexical_index.finish_bulk_load(cx).await?;
         lexical_elapsed_ms =
             lexical_elapsed_ms.saturating_add(lexical_commit_start.elapsed().as_millis());
 
         let vector_finish_start = Instant::now();
+        publication_lease.fence("final vector generation reconciliation")?;
         reconcile_vector_generation(&mut vector_index, &checkpoint)?;
         vector_elapsed_ms =
             vector_elapsed_ms.saturating_add(vector_finish_start.elapsed().as_millis());
@@ -11138,6 +11180,7 @@ impl FsfsRuntime {
         });
         let reason_codes = observed_reason_codes.into_iter().collect::<Vec<_>>();
 
+        publication_lease.fence("final paired manifest publication")?;
         self.write_index_artifacts(&index_root, &lexical_manifest_path, &manifests)?;
         let generation_complete = semantic_generation_complete(semantic_deferred_files);
         let sentinel = IndexSentinel {
@@ -11167,6 +11210,7 @@ impl FsfsRuntime {
         let final_stage = indexing_final_stage(embedder_degraded, generation_complete);
 
         if let Some(pointer) = lexical_plan.publish_pointer.as_ref() {
+            publication_lease.fence("final lexical CURRENT publication")?;
             publish_current(&lexical_plan.lexical_root, pointer).map_err(|source| {
                 SearchError::SubsystemError {
                     subsystem: "fsfs.lexical.current",
@@ -11188,7 +11232,9 @@ impl FsfsRuntime {
         // checkpoint remains an admission lock across the entire publication
         // window, so a concurrent search cannot combine the successor vector
         // generation with the predecessor lexical CURRENT.
+        publication_lease.fence("final generation admission publication")?;
         self.write_index_sentinel(&index_root, &sentinel)?;
+        publication_lease.fence("final checkpoint admission transition")?;
         if generation_complete {
             remove_indexing_checkpoint(&index_root)?;
         } else {
@@ -18587,7 +18633,7 @@ mod tests {
     use std::collections::{BTreeMap, HashMap};
     use std::fs;
     use std::future::{Future, poll_fn};
-    use std::io::Write as _;
+    use std::io::{ErrorKind, Write as _};
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
@@ -18624,12 +18670,13 @@ mod tests {
         FSFS_TUI_SEMANTIC_DEBOUNCE_MIN_MS, FSFS_TUI_SEMANTIC_DEBOUNCE_MS, FsfsConfigStatus,
         FsfsFlushAck, FsfsFlushRequest, FsfsIndexStatus, FsfsModelStatus, FsfsRuntime,
         FsfsRuntimeStatus, FsfsStatusPayload, IndexStoragePaths, IndexingBatchEmbeddingOutcome,
-        InterfaceMode, LiveIngestPipeline, SearchCacheRecord, SearchDashboardState,
+        InterfaceMode, LiveIngestPipeline, LiveVectorSink, SearchCacheRecord, SearchDashboardState,
         SearchExecutionFlags, SearchExecutionMode, SearchExecutionResources, SearchServeRequest,
         SemanticGateDecisionInput, SemanticRecallDecisionInput, VectorIndexWriteAction,
-        VectorPipelineInput, VectorSchedulingTier, degradation_controller_config_for_profile,
-        detect_context_preview_format, is_likely_html_fragment,
-        normalize_html_fragment_for_markdown, read_durable_json, render_status_table,
+        VectorPipelineInput, VectorPipelinePlan, VectorSchedulingTier,
+        degradation_controller_config_for_profile, detect_context_preview_format,
+        is_likely_html_fragment, normalize_html_fragment_for_markdown, read_durable_json,
+        render_status_table,
     };
     use crate::adapters::cli::{CliCommand, CliInput, CompletionShell, OutputFormat};
     use crate::catalog::bootstrap_catalog_schema;
@@ -18655,6 +18702,14 @@ mod tests {
         TOON_STREAM_RECORD_SEPARATOR_BYTE, decode_stream_frame_ndjson, decode_stream_frame_toon,
     };
     use crate::watcher::{WatchIngestOp, WatchIngestPipeline};
+    use frankensearch_storage::EmbeddingVectorSink;
+
+    use std::process::{Command, Output, Stdio};
+
+    const PUBLICATION_LEASE_RUNTIME_HELPER_ROOT_ENV: &str =
+        "FSFS_RUNTIME_PUBLICATION_LEASE_TEST_ROOT";
+    const PUBLICATION_LEASE_RUNTIME_HELPER_OPERATION_ENV: &str =
+        "FSFS_RUNTIME_PUBLICATION_LEASE_TEST_OPERATION";
 
     async fn create_test_quill(cx: &Cx, path: &Path) -> QuillIndex {
         QuillIndex::create(
@@ -18668,6 +18723,97 @@ mod tests {
         )
         .await
         .expect("create Quill index")
+    }
+
+    fn publication_lease_runtime_helper_command(index_root: &Path, operation: &str) -> Command {
+        let mut command = Command::new(std::env::current_exe().expect("current test binary"));
+        command
+            .arg("publication_lease_runtime_subprocess_helper")
+            .arg("--nocapture")
+            .arg("--test-threads=1")
+            .env(PUBLICATION_LEASE_RUNTIME_HELPER_ROOT_ENV, index_root)
+            .env(PUBLICATION_LEASE_RUNTIME_HELPER_OPERATION_ENV, operation);
+        command
+    }
+
+    fn assert_publication_lease_runtime_helper_output(output: &Output, token: &str) {
+        assert!(
+            output.status.success(),
+            "runtime publication-lease helper failed: status={:?}, stdout={}, stderr={}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains(token),
+            "runtime publication-lease helper omitted {token}: stdout={}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+    }
+
+    fn publication_lease_test_checkpoint(
+        index_root: &Path,
+        generation: &str,
+        artifacts_durable: bool,
+    ) -> super::IndexingCheckpoint {
+        super::IndexingCheckpoint {
+            schema_version: super::INDEXING_CHECKPOINT_SCHEMA_VERSION,
+            target_root: index_root
+                .parent()
+                .unwrap_or(index_root)
+                .display()
+                .to_string(),
+            index_root: index_root.display().to_string(),
+            started_at_ms: 1,
+            updated_at_ms: 2,
+            embedder_id: "publication-lease-test".to_owned(),
+            embedder_dimension: 4,
+            embedder_is_hash_fallback: false,
+            artifacts_durable,
+            source_hash_hex: generation.to_owned(),
+            reason_codes: vec!["test.publication_lease.paired_generation".to_owned()],
+            files: BTreeMap::from([(
+                generation.to_owned(),
+                super::CheckpointFileEntry {
+                    revision: 1,
+                    ingestion_class: super::ingestion_class_label(
+                        IngestionClass::FullSemanticLexical,
+                    )
+                    .to_owned(),
+                    canonical_bytes: 16,
+                    reason_code: "test.publication_lease.paired_generation".to_owned(),
+                    lexical_indexed: true,
+                    semantic_indexed: true,
+                    content_hash_hex: generation.to_owned(),
+                },
+            )]),
+            discovered_files: 1,
+            skipped_files: 0,
+        }
+    }
+
+    fn publication_lease_test_sentinel(
+        index_root: &Path,
+        generation: &str,
+    ) -> super::IndexSentinel {
+        super::IndexSentinel {
+            schema_version: 1,
+            generation_complete: true,
+            generated_at_ms: super::pressure_timestamp_ms(),
+            command: "publication-lease-test".to_owned(),
+            target_root: index_root
+                .parent()
+                .unwrap_or(index_root)
+                .display()
+                .to_string(),
+            index_root: index_root.display().to_string(),
+            discovered_files: 1,
+            indexed_files: 1,
+            skipped_files: 0,
+            reason_codes: vec!["test.publication_lease.paired_generation".to_owned()],
+            total_canonical_bytes: 16,
+            source_hash_hex: generation.to_owned(),
+        }
     }
 
     async fn open_test_quill(cx: &Cx, path: &Path) -> QuillIndex {
@@ -19414,12 +19560,29 @@ mod tests {
         );
     }
 
+    static NEXT_UNIQUE_TEST_DIR: AtomicUsize = AtomicUsize::new(0);
+
     fn unique_test_dir(label: &str) -> PathBuf {
         let nanos = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos();
-        std::env::temp_dir().join(format!("fsfs_test_{label}_{nanos}"))
+        let sequence = NEXT_UNIQUE_TEST_DIR.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!(
+            "fsfs_test_{label}_{}_{nanos}_{sequence}",
+            std::process::id()
+        ))
+    }
+
+    fn reserve_unique_test_dir(label: &str) -> std::io::Result<PathBuf> {
+        loop {
+            let path = unique_test_dir(label);
+            match fs::create_dir(&path) {
+                Ok(()) => return Ok(path),
+                Err(error) if error.kind() == ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(error),
+            }
+        }
     }
 
     fn with_test_backup_dir<F, T>(label: &str, f: F) -> T
@@ -21563,6 +21726,416 @@ mod tests {
     }
 
     #[test]
+    fn live_vector_sink_preserves_old_vector_on_append_failure() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let index_root = temp.path().join("index");
+        fs::create_dir_all(&index_root).expect("create index root");
+        let vector_path = index_root.join(super::FSFS_VECTOR_INDEX_FILE);
+        fs::create_dir_all(vector_path.parent().expect("vector parent"))
+            .expect("create vector artifact directory");
+        let old_vector = [1.0_f32, 0.0, 0.0, 0.0];
+        let new_vector = [0.0_f32, 1.0, 0.0, 0.0];
+        let mut writer =
+            VectorIndex::create(&vector_path, "publication-lease-test", old_vector.len())
+                .expect("create vector index");
+        writer
+            .write_record("doc.md", &old_vector)
+            .expect("write old vector");
+        writer.finish().expect("finish vector index");
+
+        let sink = LiveVectorSink {
+            vector_index: Arc::new(Mutex::new(
+                VectorIndex::open(&vector_path).expect("open live vector index"),
+            )),
+        };
+        let wal_path = frankensearch_index::wal_path_for(&vector_path);
+        fs::create_dir(&wal_path).expect("block WAL creation with a directory");
+
+        sink.persist("doc.md", "publication-lease-test", &new_vector)
+            .expect_err("blocked WAL append must fail");
+
+        let displaced_wal = index_root.join("blocked-vector-wal");
+        fs::rename(&wal_path, &displaced_wal).expect("preserve and displace WAL blocker");
+        let mut live = sink
+            .vector_index
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut durable = VectorIndex::open(&vector_path).expect("reopen durable vector index");
+        for (label, index) in [("live handle", &mut *live), ("fresh open", &mut durable)] {
+            let hits = index
+                .search_top_k(&old_vector, 1, None)
+                .expect("search old vector");
+            assert_eq!(hits.len(), 1, "{label}");
+            assert_eq!(hits[0].doc_id, "doc.md", "{label}");
+            assert!(hits[0].score > 0.99, "{label}: old vector changed");
+            assert!(
+                !index.is_deleted(0),
+                "{label}: failed replacement tombstoned the old vector"
+            );
+        }
+    }
+
+    #[test]
+    fn watcher_preserves_old_vector_on_append_failure() {
+        run_test_with_cx(|cx| async move {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let target_root = temp.path().join("project");
+            let index_root = temp.path().join("index");
+            fs::create_dir_all(&target_root).expect("create target root");
+            fs::create_dir_all(&index_root).expect("create index root");
+            let vector_path = index_root.join(super::FSFS_VECTOR_INDEX_FILE);
+            fs::create_dir_all(vector_path.parent().expect("vector parent"))
+                .expect("create vector artifact directory");
+            let lexical_path = index_root.join("lexical");
+            let old_vector = {
+                let mut vector = vec![0.0_f32; 256];
+                vector[0] = 1.0;
+                vector
+            };
+            let mut writer = VectorIndex::create(&vector_path, "hash", old_vector.len())
+                .expect("create vector index");
+            writer
+                .write_record("doc.md", &old_vector)
+                .expect("write old vector");
+            writer.finish().expect("finish vector index");
+            let pipeline = LiveIngestPipeline::new(
+                target_root,
+                create_test_quill(&cx, &lexical_path).await,
+                VectorIndex::open(&vector_path).expect("open live vector index"),
+                Arc::new(HashEmbedder::default_256()),
+            );
+            let plan = VectorPipelinePlan {
+                file_key: "doc.md".to_owned(),
+                revision: 2,
+                chunk_count: 1,
+                batch_size: 1,
+                tier: VectorSchedulingTier::FastOnly,
+                invalidate_revisions_through: Some(1),
+                reason_code: "vector.plan.fast_only_quality_unavailable".to_owned(),
+            };
+            let wal_path = frankensearch_index::wal_path_for(&vector_path);
+            fs::create_dir(&wal_path).expect("block WAL creation with a directory");
+
+            pipeline
+                .apply_live_vector_actions(&cx, "doc.md", 2, "replacement text", &plan)
+                .await
+                .expect_err("blocked watcher WAL append must fail");
+
+            fs::rename(&wal_path, index_root.join("blocked-watcher-wal"))
+                .expect("preserve and displace WAL blocker");
+            let mut live = pipeline
+                .vector_index
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut durable = VectorIndex::open(&vector_path).expect("reopen durable vector index");
+            for (label, index) in [("live handle", &mut *live), ("fresh open", &mut durable)] {
+                let hits = index
+                    .search_top_k(&old_vector, 1, None)
+                    .expect("search old vector");
+                assert_eq!(hits.len(), 1, "{label}");
+                assert_eq!(hits[0].doc_id, "doc.md", "{label}");
+                assert!(hits[0].score > 0.99, "{label}: old vector changed");
+                assert!(
+                    !index.is_deleted(0),
+                    "{label}: failed watcher replacement tombstoned the old vector"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn publication_lease_acceptance_rejects_b_a_then_admits_b_b() {
+        run_test_with_cx(|cx| async move {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let index_root = temp.path().join("index");
+            fs::create_dir_all(&index_root).expect("create index root");
+            let lexical_path = index_root.join("lexical");
+            let vector_path = index_root.join(super::FSFS_VECTOR_INDEX_FILE);
+            fs::create_dir_all(vector_path.parent().expect("vector parent"))
+                .expect("create vector artifact directory");
+
+            let seed_lease = crate::lifecycle::PublicationLease::acquire(&index_root)
+                .expect("seed generation lease");
+            let lexical = create_test_quill(&cx, &lexical_path).await;
+            lexical
+                .index_document(
+                    &cx,
+                    &IndexableDocument::new("generation-a", "alphaonlytoken"),
+                )
+                .await
+                .expect("stage lexical generation A");
+            lexical
+                .commit(&cx)
+                .await
+                .expect("publish lexical generation A");
+            let mut vector = VectorIndex::create(&vector_path, "publication-lease-test", 4)
+                .expect("create vector generation A");
+            vector
+                .write_record("generation-a", &[1.0, 0.0, 0.0, 0.0])
+                .expect("write vector generation A");
+            vector.finish().expect("finish vector generation A");
+            super::write_indexing_checkpoint(
+                &index_root,
+                &publication_lease_test_checkpoint(&index_root, "generation-a", true),
+            )
+            .expect("publish generation A checkpoint");
+            FsfsRuntime::new(FsfsConfig::default())
+                .write_index_sentinel(
+                    &index_root,
+                    &publication_lease_test_sentinel(&index_root, "generation-a"),
+                )
+                .expect("publish generation A sentinel");
+            seed_lease
+                .fence("generation A complete")
+                .expect("fence generation A");
+            drop(seed_lease);
+            drop(lexical);
+
+            assert_publication_lease_runtime_helper_output(
+                &publication_lease_runtime_helper_command(&index_root, "resolve")
+                    .output()
+                    .expect("resolve generation A in fresh process"),
+                "FSFS_RUNTIME_RESOLVER_PAIR:generation-a:generation-a",
+            );
+
+            let mut publisher_command =
+                publication_lease_runtime_helper_command(&index_root, "publish-generation-b");
+            publisher_command
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            let publisher = publisher_command
+                .spawn()
+                .expect("spawn generation B publisher");
+            for _ in 0..400 {
+                if index_root.join("generation-b-midpoint-ready").is_file() {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
+            assert!(
+                index_root.join("generation-b-midpoint-ready").is_file(),
+                "publisher must pause after lexical B and before vector/sentinel B"
+            );
+
+            assert_publication_lease_runtime_helper_output(
+                &publication_lease_runtime_helper_command(&index_root, "probe-second-publisher")
+                    .output()
+                    .expect("probe deterministic second publisher"),
+                "FSFS_RUNTIME_SECOND_PUBLISHER_BUSY",
+            );
+            assert!(
+                !index_root.join("second-publisher-mutated").exists(),
+                "a second publisher must not mutate while generation B owns the lease"
+            );
+            assert_publication_lease_runtime_helper_output(
+                &publication_lease_runtime_helper_command(&index_root, "resolve")
+                    .output()
+                    .expect("resolve lexical/vector midpoint in fresh process"),
+                "FSFS_RUNTIME_RESOLVER_INCOMPLETE",
+            );
+
+            fs::write(index_root.join("generation-b-release"), b"release")
+                .expect("release generation B publisher");
+            assert_publication_lease_runtime_helper_output(
+                &publisher
+                    .wait_with_output()
+                    .expect("wait generation B publisher"),
+                "FSFS_RUNTIME_PUBLISH_B_OK",
+            );
+            assert_publication_lease_runtime_helper_output(
+                &publication_lease_runtime_helper_command(&index_root, "resolve")
+                    .output()
+                    .expect("resolve generation B in fresh process"),
+                "FSFS_RUNTIME_RESOLVER_PAIR:generation-b:generation-b",
+            );
+        });
+    }
+
+    #[test]
+    fn publication_lease_runtime_subprocess_helper() {
+        let Some(index_root) =
+            std::env::var_os(PUBLICATION_LEASE_RUNTIME_HELPER_ROOT_ENV).map(PathBuf::from)
+        else {
+            return;
+        };
+        let operation = std::env::var(PUBLICATION_LEASE_RUNTIME_HELPER_OPERATION_ENV)
+            .expect("runtime helper operation");
+        match operation.as_str() {
+            "resolve" => {
+                let runtime = FsfsRuntime::new(FsfsConfig::default()).with_cli_input(CliInput {
+                    index_dir: Some(index_root.clone()),
+                    ..CliInput::default()
+                });
+                let test_runtime = RuntimeBuilder::current_thread()
+                    .build()
+                    .expect("build resolver runtime");
+                let cx = Cx::for_request();
+                match test_runtime.block_on(
+                    runtime.prepare_search_execution_resources_at_root_with_modes(
+                        &cx,
+                        &index_root,
+                        SearchExecutionMode::Full,
+                        SearchExecutionMode::Full,
+                    ),
+                ) {
+                    Err(error) => {
+                        assert!(
+                            error.to_string().contains("incomplete"),
+                            "resolver failed for a reason other than typed incomplete generation: {error}"
+                        );
+                        println!("FSFS_RUNTIME_RESOLVER_INCOMPLETE");
+                    }
+                    Ok(resources) => {
+                        let lexical = resources
+                            .lexical_index
+                            .as_ref()
+                            .expect("resolver lexical resource");
+                        let lexical_a = test_runtime
+                            .block_on(frankensearch_core::LexicalRead::search(
+                                lexical,
+                                &cx,
+                                "alphaonlytoken",
+                                5,
+                            ))
+                            .expect("search lexical A")
+                            .iter()
+                            .any(|hit| hit.doc_id == "generation-a");
+                        let lexical_b = test_runtime
+                            .block_on(frankensearch_core::LexicalRead::search(
+                                lexical,
+                                &cx,
+                                "betaonlytoken",
+                                5,
+                            ))
+                            .expect("search lexical B")
+                            .iter()
+                            .any(|hit| hit.doc_id == "generation-b");
+                        let lexical_generation = match (lexical_a, lexical_b) {
+                            (true, false) => "generation-a",
+                            (false, true) => "generation-b",
+                            _ => "mixed-or-missing",
+                        };
+                        let vector_ids = super::vector_live_doc_ids(
+                            resources
+                                .vector_index
+                                .as_ref()
+                                .expect("resolver vector resource"),
+                        )
+                        .expect("read resolved vector ids");
+                        let vector_generation = match (
+                            vector_ids.contains("generation-a"),
+                            vector_ids.contains("generation-b"),
+                        ) {
+                            (true, false) => "generation-a",
+                            (false, true) => "generation-b",
+                            _ => "mixed-or-missing",
+                        };
+                        println!(
+                            "FSFS_RUNTIME_RESOLVER_PAIR:{lexical_generation}:{vector_generation}"
+                        );
+                    }
+                }
+            }
+            "publish-generation-b" => {
+                let lease = crate::lifecycle::PublicationLease::acquire(&index_root)
+                    .expect("acquire generation B lease");
+                let mut checkpoint = super::read_indexing_checkpoint(&index_root)
+                    .expect("read generation A checkpoint")
+                    .expect("generation A checkpoint exists");
+                checkpoint.artifacts_durable = false;
+                checkpoint.updated_at_ms = super::pressure_timestamp_ms();
+                lease
+                    .fence("generation B incomplete checkpoint")
+                    .expect("fence incomplete checkpoint");
+                super::write_indexing_checkpoint(&index_root, &checkpoint)
+                    .expect("publish incomplete checkpoint before B artifacts");
+
+                let lexical_path = index_root.join("lexical");
+                let test_runtime = RuntimeBuilder::current_thread()
+                    .build()
+                    .expect("build publisher runtime");
+                let cx = Cx::for_request();
+                let lexical = test_runtime
+                    .block_on(QuillIndex::open(&cx, &lexical_path, QuillConfig::default()))
+                    .expect("open lexical generation A");
+                lease
+                    .fence("generation B lexical mutation")
+                    .expect("fence lexical B");
+                test_runtime
+                    .block_on(lexical.delete_document(&cx, "generation-a"))
+                    .expect("delete lexical generation A");
+                test_runtime
+                    .block_on(lexical.index_document(
+                        &cx,
+                        &IndexableDocument::new("generation-b", "betaonlytoken"),
+                    ))
+                    .expect("stage lexical generation B");
+                test_runtime
+                    .block_on(lexical.commit(&cx))
+                    .expect("publish lexical generation B");
+                fs::write(index_root.join("generation-b-midpoint-ready"), b"ready")
+                    .expect("publish B midpoint handshake");
+                for _ in 0..400 {
+                    if index_root.join("generation-b-release").is_file() {
+                        break;
+                    }
+                    thread::sleep(Duration::from_millis(5));
+                }
+                assert!(
+                    index_root.join("generation-b-release").is_file(),
+                    "timed out waiting to release generation B midpoint"
+                );
+
+                lease
+                    .fence("generation B vector append")
+                    .expect("fence vector B");
+                let mut vector = VectorIndex::open(&index_root.join(super::FSFS_VECTOR_INDEX_FILE))
+                    .expect("open vector generation A");
+                vector
+                    .append("generation-b", &[0.0, 1.0, 0.0, 0.0])
+                    .expect("log vector generation B");
+                vector
+                    .soft_delete("generation-a")
+                    .expect("retire vector generation A");
+                lease
+                    .fence("generation B sentinel publication")
+                    .expect("fence sentinel B");
+                FsfsRuntime::new(FsfsConfig::default())
+                    .write_index_sentinel(
+                        &index_root,
+                        &publication_lease_test_sentinel(&index_root, "generation-b"),
+                    )
+                    .expect("publish sentinel B last");
+                super::remove_indexing_checkpoint(&index_root)
+                    .expect("retire incomplete checkpoint after sentinel B");
+                println!("FSFS_RUNTIME_PUBLISH_B_OK");
+            }
+            "probe-second-publisher" => {
+                match crate::lifecycle::PublicationLease::acquire(&index_root) {
+                    Err(SearchError::SubsystemError { subsystem, source })
+                        if subsystem == "publication-lease"
+                            && source
+                                .downcast_ref::<crate::lifecycle::PublicationLeaseBusy>()
+                                .is_some() =>
+                    {
+                        println!("FSFS_RUNTIME_SECOND_PUBLISHER_BUSY");
+                    }
+                    Err(error) => panic!("unexpected second-publisher admission error: {error}"),
+                    Ok(lease) => {
+                        lease
+                            .fence("unexpected second publisher")
+                            .expect("fence unexpected publisher");
+                        fs::write(index_root.join("second-publisher-mutated"), b"mutated")
+                            .expect("record unexpected second-publisher mutation");
+                        println!("FSFS_RUNTIME_SECOND_PUBLISHER_MUTATED");
+                    }
+                }
+            }
+            other => panic!("unknown runtime publication-lease helper operation {other}"),
+        }
+    }
+
+    #[test]
     fn live_ingest_pipeline_wires_storage_runner_for_semantic_upserts() {
         run_test_with_cx(|cx| async move {
             let temp = tempfile::tempdir().expect("tempdir");
@@ -22244,16 +22817,9 @@ mod tests {
             .expect("plan");
 
         let actions = FsfsRuntime::vector_index_write_actions(&plan);
-        assert_eq!(actions.len(), 3);
+        assert_eq!(actions.len(), 2);
         assert_eq!(
             actions[0],
-            VectorIndexWriteAction::InvalidateRevisionsThrough {
-                file_key: "doc/a.md".to_owned(),
-                revision: 10
-            }
-        );
-        assert_eq!(
-            actions[1],
             VectorIndexWriteAction::AppendFast {
                 file_key: "doc/a.md".to_owned(),
                 revision: 12,
@@ -22261,12 +22827,48 @@ mod tests {
             }
         );
         assert_eq!(
-            actions[2],
+            actions[1],
             VectorIndexWriteAction::AppendQuality {
                 file_key: "doc/a.md".to_owned(),
                 revision: 12,
                 chunk_count: 2
             }
+        );
+        assert!(
+            actions.iter().all(|action| !matches!(
+                action,
+                VectorIndexWriteAction::InvalidateRevisionsThrough { .. }
+            )),
+            "replacement plans must log the successor before superseding the old vector"
+        );
+    }
+
+    #[test]
+    fn vector_index_actions_invalidate_only_when_policy_publishes_no_replacement() {
+        let plan = VectorPipelinePlan {
+            file_key: "doc/no-semantic.md".to_owned(),
+            revision: 12,
+            chunk_count: 0,
+            batch_size: 1,
+            tier: VectorSchedulingTier::LexicalFallback,
+            invalidate_revisions_through: Some(10),
+            reason_code: "vector.plan.lexical_fallback".to_owned(),
+        };
+
+        let actions = FsfsRuntime::vector_index_write_actions(&plan);
+        assert_eq!(
+            actions,
+            vec![
+                VectorIndexWriteAction::InvalidateRevisionsThrough {
+                    file_key: "doc/no-semantic.md".to_owned(),
+                    revision: 10,
+                },
+                VectorIndexWriteAction::MarkLexicalFallback {
+                    file_key: "doc/no-semantic.md".to_owned(),
+                    revision: 12,
+                    reason_code: "vector.plan.lexical_fallback".to_owned(),
+                },
+            ]
         );
     }
 
@@ -25799,6 +26401,48 @@ mod tests {
     }
 
     #[test]
+    fn doctor_writability_checks_are_observational_and_create_no_probe_or_lease() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let index_root = temp.path().join("index");
+        let model_root = temp.path().join("models");
+        fs::create_dir_all(&index_root).expect("create index root");
+        fs::create_dir_all(&model_root).expect("create model root");
+        fs::write(index_root.join("stable-index-byte"), b"index").expect("seed stable index byte");
+        fs::write(model_root.join("stable-model-byte"), b"model").expect("seed stable model byte");
+        let index_before = snapshot_directory(&index_root);
+        let model_before = snapshot_directory(&model_root);
+
+        let mut config = FsfsConfig::default();
+        config.storage.index_dir = index_root.display().to_string();
+        config.indexing.model_dir = model_root.display().to_string();
+        let runtime = FsfsRuntime::new(config).with_cli_input(CliInput {
+            command: CliCommand::Doctor,
+            index_dir: Some(index_root.clone()),
+            ..CliInput::default()
+        });
+        let _payload = runtime
+            .collect_doctor_payload()
+            .expect("collect observational doctor payload");
+
+        assert_eq!(
+            snapshot_directory(&index_root),
+            index_before,
+            "doctor must not mutate the admitted index root"
+        );
+        assert_eq!(
+            snapshot_directory(&model_root),
+            model_before,
+            "doctor must not create and delete model-directory probes"
+        );
+        assert!(
+            !index_root
+                .join(crate::lifecycle::PUBLICATION_LOCK_FILE_NAME)
+                .exists(),
+            "doctor must not manufacture a publication lease"
+        );
+    }
+
+    #[test]
     fn doctor_warns_when_semantic_generation_is_incomplete() {
         let temp = tempfile::tempdir().expect("tempdir");
         let index_root = temp.path().join("index");
@@ -27939,9 +28583,8 @@ mod tests {
     fn verify_new_binary_uses_version_subcommand_not_flag() {
         // Create a fake binary that succeeds on `version` subcommand
         // but fails on `--version` flag, proving we use the subcommand.
-        let dir =
-            std::env::temp_dir().join(format!("fsfs_test_version_subcmd_{}", std::process::id()));
-        let _ = fs::create_dir_all(&dir);
+        let dir = reserve_unique_test_dir("version_subcmd")
+            .expect("version-subcommand fixture directory should be atomically reservable");
         let binary = dir.join("fsfs-verify-subcmd");
         fs::write(
             &binary,
@@ -27966,16 +28609,13 @@ mod tests {
             version_out.contains("fsfs"),
             "version output should contain binary name"
         );
-
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[cfg(unix)]
     #[test]
     fn verify_binary_returning_valid_version_output_passes() {
-        let dir =
-            std::env::temp_dir().join(format!("fsfs_test_valid_version_{}", std::process::id()));
-        let _ = fs::create_dir_all(&dir);
+        let dir = reserve_unique_test_dir("valid_version")
+            .expect("valid-version fixture directory should be atomically reservable");
         let binary = dir.join("fsfs-valid");
         fs::write(&binary, b"#!/bin/sh\necho \"fsfs 1.2.3\"\n").unwrap();
 
@@ -27989,16 +28629,13 @@ mod tests {
         assert!(verify.status.success());
         let stdout = String::from_utf8_lossy(&verify.stdout);
         assert!(stdout.contains("1.2.3"));
-
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[cfg(unix)]
     #[test]
     fn verify_binary_returning_error_fails_gracefully() {
-        let dir =
-            std::env::temp_dir().join(format!("fsfs_test_error_version_{}", std::process::id()));
-        let _ = fs::create_dir_all(&dir);
+        let dir = reserve_unique_test_dir("error_version")
+            .expect("error-version fixture directory should be atomically reservable");
         let binary = dir.join("fsfs-broken");
         fs::write(&binary, b"#!/bin/sh\necho \"segfault\" >&2\nexit 139\n").unwrap();
 
@@ -28018,8 +28655,6 @@ mod tests {
             stderr.contains("segfault"),
             "error output should be captured: got {stderr}"
         );
-
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -28215,15 +28850,15 @@ mod tests {
         let triples = [
             (
                 "x86_64-unknown-linux-musl",
-                "fsfs-1.0.0-x86_64-unknown-linux-musl.tar.xz",
+                "fsfs-lite-1.0.0-x86_64-unknown-linux-musl.tar.xz",
             ),
             (
                 "aarch64-unknown-linux-musl",
-                "fsfs-1.0.0-aarch64-unknown-linux-musl.tar.xz",
+                "fsfs-lite-1.0.0-aarch64-unknown-linux-musl.tar.xz",
             ),
             (
                 "x86_64-apple-darwin",
-                "fsfs-1.0.0-x86_64-apple-darwin.tar.xz",
+                "fsfs-lite-1.0.0-x86_64-apple-darwin.tar.xz",
             ),
             (
                 "aarch64-apple-darwin",
@@ -28255,7 +28890,7 @@ mod tests {
             "should not double-prefix the version"
         );
         assert!(
-            filename.starts_with("fsfs-2.3.4-"),
+            filename.starts_with("fsfs-lite-2.3.4-"),
             "version in filename should have v stripped: {filename}"
         );
     }

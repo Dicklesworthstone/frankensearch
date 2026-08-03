@@ -33,6 +33,7 @@ Usage:
   scripts/check_ledger_null_control.sh [--staged | --since <ref> | --all]
   scripts/check_ledger_null_control.sh --selfcheck
   scripts/check_ledger_null_control.sh --leakcheck
+  scripts/check_ledger_null_control.sh --gatecheck
   scripts/check_ledger_null_control.sh --mergecheck
   scripts/check_ledger_null_control.sh --install-hook
 
@@ -46,11 +47,15 @@ Options:
   --since <ref>       Gate rows added between merge-base(ref, HEAD) and HEAD.
   --all               Mechanical whole-ledger report; never blocks.
   --selfcheck         Exercise fail-closed synthetic contract cases
-                      (also runs --leakcheck and --mergecheck).
+                      (also runs --leakcheck, --gatecheck, and --mergecheck).
   --leakcheck         Regression-check per-entry flag leakage across mixed
                       history (the 79d999ad bug) via a temp-repo staged
                       simulation. LEDGER_LEAKCHECK_TARGET=<path> substitutes
                       the script under test (RED-proofing old versions).
+  --gatecheck         Regression-check the bd-z4lqq fail-open bypasses through
+                      the real staged/--since Git path in temp repos.
+                      LEDGER_LEAKCHECK_TARGET=<path> substitutes the script
+                      under test (RED-proofing old versions).
   --mergecheck        Regression-check merge blindness: a temp-repo merge
                       must admit second-parent ledger history while still
                       blocking a row present in neither parent.
@@ -116,6 +121,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --leakcheck)
       MODE="leakcheck"
+      shift
+      ;;
+    --gatecheck)
+      MODE="gatecheck"
       shift
       ;;
     --mergecheck)
@@ -319,7 +328,11 @@ blob_stream() {
       # --since describes the committed range merge-base(ref, HEAD)..HEAD.
       # Its hunk line numbers must be read against the matching HEAD blob, not
       # a mutable worktree that may have inserted lines before those hunks.
-      git -C "${ROOT_DIR}" show "HEAD:${rel}"
+      # A ledger absent at HEAD is an error, not empty (fail-closed;
+      # bd-z4lqq --since line-map desync).
+      if ! git -C "${ROOT_DIR}" show "HEAD:${rel}" 2>/dev/null; then
+        return 64
+      fi
       ;;
     all)
       command cat "${abs}"
@@ -898,6 +911,129 @@ run_leakcheck() {
   echo "[ledger-leakcheck] OK: 2/2 leak-regression cases"
 }
 
+# --- gatecheck: real-repo regression coverage for the bd-z4lqq bypasses ---
+# The awk fixture selfcheck cannot reach the bash-level stream materialization,
+# so these run the real staged/--since Git path. A gate that is fail-closed
+# blocks each fraudulent input (exit 2) or errors on a broken invocation (exit
+# 64); the conformant control (exit 0) proves the harness exercises the linter
+# so it can never pass vacuously.
+run_gatecheck_once() {
+  # $1 = script under test (abs); $2 = variant. Prints nothing; returns the
+  # linter exit code, or 64 on a harness/setup failure.
+  local target="$1" variant="$2" repo rc=0
+  repo="$(mktemp -d "${TMPDIR:-/tmp}/ledger-gatecheck.XXXXXX")" || return 64
+  GATECHECK_LAST_DIR="${repo}"
+  leakcheck_env git -C "${repo}" init -q -b main || return 64
+  mkdir -p "${repo}/docs" "${repo}/scripts"
+  cp "${target}" "${repo}/scripts/check_ledger_null_control.sh"
+  chmod +x "${repo}/scripts/check_ledger_null_control.sh"
+  printf '# PERF_LEDGER (gatecheck)\n' > "${repo}/docs/PERF_LEDGER.md"
+  printf '# NEGATIVE_EVIDENCE (gatecheck)\n' > "${repo}/docs/NEGATIVE_EVIDENCE.md"
+  local gc="leakcheck_env git -C ${repo} -c user.name=gc -c user.email=gc@local"
+  ${gc} add -A || return 64
+  ${gc} commit -q -m base || return 64
+
+  case "${variant}" in
+    unclassified)
+      cat >> "${repo}/docs/PERF_LEDGER.md" <<'ROW'
+
+## 2099-03-01 — adopted, promote to default path
+Verdict: ADOPTED — promote everywhere.
+ROW
+      ${gc} add -A || return 64
+      leakcheck_env "${repo}/scripts/check_ledger_null_control.sh" --staged >/dev/null 2>&1 || rc=$?
+      ;;
+    bodyonly)
+      cat >> "${repo}/docs/NEGATIVE_EVIDENCE.md" <<'ROW'
+
+## 2099-03-02 — historical reject
+A/A null: 1.000 [0.98,1.02], same invocation
+Decision: REJECT — reverted.
+ROW
+      ${gc} add -A || return 64
+      ${gc} commit -q -m "historical reject" || return 64
+      # Edit the BODY only; the heading line is untouched.
+      leakcheck_env sed -i 's/Decision: REJECT — reverted./Decision: KEEP — reclassified in place./' \
+        "${repo}/docs/NEGATIVE_EVIDENCE.md" || return 64
+      ${gc} add -A || return 64
+      leakcheck_env "${repo}/scripts/check_ledger_null_control.sh" --staged >/dev/null 2>&1 || rc=$?
+      ;;
+    nomergebase)
+      # An orphan commit shares no history with HEAD, so `git diff O...HEAD`
+      # is fatal; a fail-closed gate must error (64), never pass vacuously.
+      cat >> "${repo}/docs/PERF_LEDGER.md" <<'ROW'
+
+## 2099-03-03 — bogus reject with no evidence
+Verdict: REJECT.
+ROW
+      ${gc} add -A || return 64
+      ${gc} commit -q -m "bogus reject" || return 64
+      leakcheck_env git -C "${repo}" checkout -q --orphan orphanb || return 64
+      leakcheck_env git -C "${repo}" reset -q --hard || true
+      printf 'x\n' > "${repo}/unrelated.txt"
+      ${gc} add unrelated.txt || return 64
+      ${gc} commit -q -m orphan || return 64
+      local orphan
+      orphan="$(leakcheck_env git -C "${repo}" rev-parse HEAD)" || return 64
+      leakcheck_env git -C "${repo}" checkout -q main || return 64
+      leakcheck_env "${repo}/scripts/check_ledger_null_control.sh" --since "${orphan}" >/dev/null 2>&1 || rc=$?
+      ;;
+    control)
+      cat >> "${repo}/docs/PERF_LEDGER.md" <<'ROW'
+
+## 2099-03-04 — conformant maintenance keep
+Comparison class: SELF-SPEEDUP
+ELF sha256: 3333333333333333333333333333333333333333333333333333333333333333
+Verdict: KEEP.
+ROW
+      ${gc} add -A || return 64
+      leakcheck_env "${repo}/scripts/check_ledger_null_control.sh" --staged >/dev/null 2>&1 || rc=$?
+      ;;
+    *) return 64 ;;
+  esac
+  return "${rc}"
+}
+
+run_gatecheck() {
+  local target="${LEDGER_LEAKCHECK_TARGET:-${BASH_SOURCE[0]}}"
+  if [[ "${target}" != /* ]]; then
+    target="$(cd "$(dirname "${target}")" && pwd)/$(basename "${target}")"
+  fi
+  local failed=0 rc dir
+  # variant : expected-exit : description
+  local cases=(
+    "unclassified:2:unclassified PERF verdict is blocked (fail-open verdict allowlist)"
+    "bodyonly:2:body-only flip of a historical entry is gated"
+    "nomergebase:64:no-merge-base --since errors instead of passing vacuously"
+    "control:0:conformant KEEP is admitted (harness exercises the linter)"
+  )
+  local entry variant want desc
+  for entry in "${cases[@]}"; do
+    variant="${entry%%:*}"; entry="${entry#*:}"
+    want="${entry%%:*}"; desc="${entry#*:}"
+    GATECHECK_LAST_DIR=""
+    rc=0
+    run_gatecheck_once "${target}" "${variant}" || rc=$?
+    dir="${GATECHECK_LAST_DIR}"
+    if [[ ${rc} -eq ${want} ]]; then
+      echo "[ledger-gatecheck] PASS ${desc}: exit ${rc}"
+    else
+      echo "[ledger-gatecheck] BLOCKED ${desc}: expected exit ${want}, got ${rc}" >&2
+      failed=1
+    fi
+    if [[ -n "${dir}" && -d "${dir}" && "${dir}" == *ledger-gatecheck* && ${rc} -ne ${want} ]]; then
+      echo "[ledger-gatecheck] retained temp repo: ${dir}" >&2
+    else
+      rm -rf "${dir}" 2>/dev/null || true
+    fi
+  done
+  if [[ ${failed} -ne 0 ]]; then
+    echo "[ledger-gatecheck] BLOCKED: bypass regression detected" >&2
+    return 2
+  fi
+  echo "[ledger-gatecheck] OK: ${#cases[@]}/${#cases[@]} bypass-regression cases"
+}
+
 # --- mergecheck: regression coverage for merge blindness ---
 # `--staged` reads `git diff --cached`, which compares the index against the
 # FIRST parent only; during a merge commit, every ledger row inherited from
@@ -1034,11 +1170,15 @@ case "${MODE}" in
     LEDGER_GATE_STATUS=0
     if ! run_selfcheck; then LEDGER_GATE_STATUS=2; fi
     if ! run_leakcheck; then LEDGER_GATE_STATUS=2; fi
+    if ! run_gatecheck; then LEDGER_GATE_STATUS=2; fi
     if ! run_mergecheck; then LEDGER_GATE_STATUS=2; fi
     exit "${LEDGER_GATE_STATUS}"
     ;;
   leakcheck)
     run_leakcheck
+    ;;
+  gatecheck)
+    run_gatecheck
     ;;
   mergecheck)
     run_mergecheck

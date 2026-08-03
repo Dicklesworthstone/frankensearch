@@ -27,13 +27,14 @@ use std::sync::OnceLock;
 use ahash::AHashMap;
 use frankensearch_core::config::{ZeroSignalReason, ZeroSignalState};
 use frankensearch_core::filter::{BuildIdentityHasherU64, SearchFilter, fnv1a_hash};
+use frankensearch_core::generation::EmbeddingSpaceIdentityV1;
 use frankensearch_core::{SearchError, SearchResult, VectorHit};
 use half::f16;
 use rayon::prelude::*;
 
-use crate::VectorIndex;
 use crate::search::{ClassifiedHits, PARALLEL_CHUNK_SIZE, SearchParams};
 use crate::simd::{dot_4bit_prepared, dot_i8_i8, dot_product_f16_f32, prepare_4bit_query};
+use crate::{ValidatedFsviBytes, VectorIndex};
 
 /// Fully-resident in-memory vector index with f16 quantization.
 ///
@@ -76,6 +77,42 @@ pub struct InMemoryVectorIndex {
     /// stays correct). Built on first selective-filter search; other callers pay
     /// neither the build nor its footprint.
     hash_to_pos: OnceLock<Option<HashMap<u64, usize, BuildIdentityHasherU64>>>,
+    /// Lowercase hex SHA-256 fingerprint of the mathematical embedding space
+    /// this index's vectors were produced in, when known (bd-9xuj T2-C3).
+    ///
+    /// `Some` only when the source declared it: an FSVI v2 file's validated
+    /// identity header ([`Self::from_fsvi`]) or an explicit caller-supplied
+    /// space ([`Self::from_vectors_with_identity`]). `None` is the typed
+    /// legacy-unidentified state (v1 files, [`Self::from_vectors`]) — it is
+    /// never fabricated from a default, and downstream seams route it as
+    /// legacy rather than failing closed.
+    space_fingerprint_hex: Option<String>,
+    /// Embedder id recorded by the source that produced this index's vectors
+    /// (bd-9xuj T2-C2): the FSVI header's `embedder_id` on the file-backed
+    /// load paths, or the declared space's `logical_model_id` on
+    /// [`Self::from_vectors_with_identity`]. Diagnostics only — compatibility
+    /// decisions join on [`Self::space_fingerprint_hex`], never on this
+    /// string. `None` means the source carried none ([`Self::from_vectors`]);
+    /// absence stays typed, never defaulted.
+    embedder_id: Option<String>,
+    /// Embedder revision recorded by the source, captured under the same
+    /// rules as [`Self::embedder_id`] (bd-9xuj T2-C2). Kept verbatim: a v1
+    /// header's empty revision is preserved as `Some("")`, distinct from the
+    /// `None` of a source with no header at all.
+    embedder_revision: Option<String>,
+    /// Whether [`Self::space_fingerprint_hex`] was derived from a validated
+    /// FSVI v2 identity HEADER — i.e. read out of the artifact's own bytes
+    /// through exact admission — rather than declared by a caller
+    /// (bd-9xuj T2-C4-write, admission guards 2+8).
+    ///
+    /// `true` only on the [`Self::from_admitted_v2`] load path (the sole way
+    /// a v2 header reaches this type: [`VectorIndex::open`] is strictly v1).
+    /// A caller-supplied space on [`Self::from_vectors_with_identity`] is a
+    /// DECLARED identity: retained for joins and diagnostics, but it is a
+    /// claim by the constructing process, not an attestation persisted in an
+    /// artifact header, so it stays `false`. Attested-only seams (the refresh
+    /// identity-bound merge) admit against attested identity exclusively.
+    space_identity_attested: bool,
     /// Vector dimensionality.
     dimension: usize,
 }
@@ -143,6 +180,12 @@ fn pack_4bit_slab(vectors_f16: &[f16], dim: usize) -> Vec<u8> {
 impl InMemoryVectorIndex {
     /// Build from pre-computed f32 vectors, quantizing to f16.
     ///
+    /// The resulting index carries no embedding-space identity
+    /// ([`Self::space_fingerprint_hex`] returns `None`): nothing about a bare
+    /// `Vec<f32>` proves which space produced it, and fabricating an identity
+    /// here would defeat the space verifier. Callers that know the producing
+    /// space should use [`Self::from_vectors_with_identity`].
+    ///
     /// # Errors
     ///
     /// Returns `SearchError::DimensionMismatch` if any vector's length does not
@@ -188,8 +231,60 @@ impl InMemoryVectorIndex {
             doc_id_hashes: OnceLock::new(),
             doc_id_index: OnceLock::new(),
             hash_to_pos: OnceLock::new(),
+            space_fingerprint_hex: None,
+            embedder_id: None,
+            embedder_revision: None,
+            space_identity_attested: false,
             dimension,
         })
+    }
+
+    /// Build from pre-computed f32 vectors that are known to have been
+    /// produced in `space`, binding the index to that embedding space
+    /// (bd-9xuj T2-C3).
+    ///
+    /// The space's fingerprint becomes this index's
+    /// [`Self::space_fingerprint_hex`], the index-side join key for
+    /// [`frankensearch_core::BoundQueryEmbedding::verify_space_identity`].
+    /// The claim is checked before it is stored: `space` must itself
+    /// validate, and its declared dimension must equal `dimension` — an
+    /// index must never carry an identity that does not describe its
+    /// vectors.
+    ///
+    /// # Errors
+    ///
+    /// Everything [`Self::from_vectors`] returns, plus
+    /// `SearchError::InvalidConfig` when `space` fails validation or its
+    /// dimension does not match `dimension`.
+    pub fn from_vectors_with_identity(
+        doc_ids: Vec<String>,
+        vectors: Vec<Vec<f32>>,
+        dimension: usize,
+        space: &EmbeddingSpaceIdentityV1,
+    ) -> SearchResult<Self> {
+        space.validate()?;
+        if usize::try_from(space.dimension).ok() != Some(dimension) {
+            return Err(SearchError::InvalidConfig {
+                field: "space_identity.dimension".to_owned(),
+                value: space.dimension.to_string(),
+                reason: format!(
+                    "embedding-space dimension must equal the index dimension ({dimension}); \
+                     refusing to bind an identity that does not describe this index's vectors"
+                ),
+            });
+        }
+        let mut index = Self::from_vectors(doc_ids, vectors, dimension)?;
+        index.space_fingerprint_hex = Some(space.fingerprint());
+        // The validated space also names its producing model; retain that as
+        // the diagnostic embedder identity (bd-9xuj T2-C2). The join key
+        // above stays the only compatibility authority.
+        index.embedder_id = Some(space.logical_model_id.clone());
+        index.embedder_revision = Some(space.immutable_revision.clone());
+        // A caller-supplied space is a DECLARED identity, not one attested by
+        // an artifact header (bd-9xuj T2-C4-write): the discriminator stays
+        // false, and attested-only seams must not admit against it.
+        index.space_identity_attested = false;
+        Ok(index)
     }
 
     /// Load from an existing FSVI file, reading all data into memory.
@@ -202,6 +297,32 @@ impl InMemoryVectorIndex {
     /// Returns errors from [`VectorIndex::open`] or vector decoding failures.
     pub fn from_fsvi(path: &Path) -> SearchResult<Self> {
         let index = VectorIndex::open(path)?;
+        Self::from_open_index(&index)
+    }
+
+    /// Build from a fully admitted immutable FSVI v2 artifact, preserving its
+    /// validated embedding-space identity (bd-9xuj T2-C3).
+    ///
+    /// [`VectorIndex::open`] — and therefore [`Self::from_fsvi`] — reads
+    /// legacy v1 files only; identity-complete v2 artifacts are opened
+    /// exclusively through exact admission
+    /// ([`VectorIndex::open_admitted_v2`]). This constructor is the in-memory
+    /// load for that path: the resulting index always carries the artifact's
+    /// validated space fingerprint in [`Self::space_fingerprint_hex`].
+    ///
+    /// # Errors
+    ///
+    /// Returns vector decoding failures from the admitted artifact.
+    pub fn from_admitted_v2(source: &ValidatedFsviBytes) -> SearchResult<Self> {
+        Self::from_open_index(&source.index)
+    }
+
+    /// Shared load path: read every live row (and any WAL tail) of an opened
+    /// index into memory, preserving the embedding-space identity the source
+    /// declares. An admitted v2 source carries a validated space fingerprint;
+    /// a legacy v1 source carries none, and that absence is kept as the typed
+    /// `None` state — never papered over with a fabricated identity.
+    fn from_open_index(index: &VectorIndex) -> SearchResult<Self> {
         let count = index.record_count();
         let dimension = index.dimension();
         let mut doc_ids = Vec::with_capacity(count);
@@ -226,6 +347,28 @@ impl InMemoryVectorIndex {
             flat.extend_from_slice(&f16_vec);
         }
 
+        // Capture the source's embedding-space identity before the backing
+        // `VectorIndex` drops (bd-9xuj T2-C3). On the admitted-v2 path this
+        // is the validated space fingerprint from the artifact's identity
+        // header; on the legacy v1 `open` path `identity_v2()` is
+        // structurally `None`, which is preserved as the typed absent state —
+        // never substituted with a fabricated identity.
+        let space_fingerprint_hex = index
+            .identity_v2()
+            .map(|identity| crate::fingerprint_hex(&identity.space_fingerprint));
+        // The attested bit derives from WHERE the identity came from
+        // (bd-9xuj T2-C4-write): `identity_v2()` is populated exclusively by
+        // the v2 header parse inside exact admission (`VectorIndex::open` is
+        // strictly v1), so its presence here means the fingerprint above was
+        // read out of the artifact's own validated header bytes.
+        let space_identity_attested = index.identity_v2().is_some();
+        // Every FSVI header (v1 and v2) carries the embedder id/revision
+        // strings; retain them verbatim instead of discarding them at load
+        // (bd-9xuj T2-C2). A v1 header's empty revision stays `Some("")` —
+        // that is what the header says, not a fabrication.
+        let embedder_id = Some(index.embedder_id().to_owned());
+        let embedder_revision = Some(index.embedder_revision().to_owned());
+
         Ok(Self {
             doc_ids,
             vectors: flat,
@@ -234,6 +377,10 @@ impl InMemoryVectorIndex {
             doc_id_hashes: OnceLock::new(),
             doc_id_index: OnceLock::new(),
             hash_to_pos: OnceLock::new(),
+            space_fingerprint_hex,
+            embedder_id,
+            embedder_revision,
+            space_identity_attested,
             dimension,
         })
     }
@@ -248,6 +395,61 @@ impl InMemoryVectorIndex {
     #[must_use]
     pub const fn dimension(&self) -> usize {
         self.dimension
+    }
+
+    /// Lowercase hex SHA-256 fingerprint of the embedding space this index's
+    /// vectors were produced in, when known (bd-9xuj T2-C3).
+    ///
+    /// This is the index-side join key for
+    /// [`frankensearch_core::BoundQueryEmbedding::verify_space_identity`]:
+    /// a bound query embedding is admissible against this index exactly when
+    /// its space fingerprint equals this value. `None` means the source
+    /// carried no identity (legacy v1 FSVI file, or the identity-less
+    /// [`Self::from_vectors`] constructor); that absence is a legal, typed
+    /// state which downstream seams route as legacy-unidentified — it must
+    /// never be papered over with a fabricated fingerprint.
+    #[must_use]
+    pub fn space_fingerprint_hex(&self) -> Option<&str> {
+        self.space_fingerprint_hex.as_deref()
+    }
+
+    /// Whether this index's space identity is FSVI-v2-HEADER-attested rather
+    /// than builder/caller-declared (bd-9xuj T2-C4-write, guards 2+8).
+    ///
+    /// `true` exactly when the index was loaded through
+    /// [`Self::from_admitted_v2`] from an artifact whose validated v2 header
+    /// carried the identity — i.e. the fingerprint in
+    /// [`Self::space_fingerprint_hex`] was read out of the artifact's own
+    /// bytes. A `Some` fingerprint with `false` here is a DECLARED identity
+    /// ([`Self::from_vectors_with_identity`]): usable for diagnostics and
+    /// query-side joins, but never sufficient for an attested-only admission
+    /// seam such as the refresh identity-bound merge.
+    #[must_use]
+    pub const fn space_identity_is_attested(&self) -> bool {
+        self.space_identity_attested
+    }
+
+    /// Embedder id recorded by this index's source, when the source carried
+    /// one (bd-9xuj T2-C2): the FSVI header string on the file-backed load
+    /// paths, or the declared space's `logical_model_id` on
+    /// [`Self::from_vectors_with_identity`].
+    ///
+    /// Diagnostics only. Compatibility joins on
+    /// [`Self::space_fingerprint_hex`]; an id string must never admit or
+    /// reject a pairing. `None` means the source declared nothing
+    /// ([`Self::from_vectors`]) — typed absence, never a default.
+    #[must_use]
+    pub fn embedder_id(&self) -> Option<&str> {
+        self.embedder_id.as_deref()
+    }
+
+    /// Embedder revision recorded by this index's source, under the same
+    /// retention rules as [`Self::embedder_id`] (bd-9xuj T2-C2). A v1
+    /// header's empty revision is preserved as `Some("")`, distinct from the
+    /// `None` of a source with no header at all.
+    #[must_use]
+    pub fn embedder_revision(&self) -> Option<&str> {
+        self.embedder_revision.as_deref()
     }
 
     /// Get the document ID at position `index`.
@@ -1199,6 +1401,81 @@ impl InMemoryTwoTierIndex {
     pub const fn quality_index(&self) -> Option<&InMemoryVectorIndex> {
         self.quality_index.as_ref()
     }
+
+    /// Space fingerprint of the fast tier, when known
+    /// (see [`InMemoryVectorIndex::space_fingerprint_hex`]).
+    #[must_use]
+    pub fn fast_space_fingerprint_hex(&self) -> Option<&str> {
+        self.fast_index.space_fingerprint_hex()
+    }
+
+    /// Space fingerprint of the quality tier, when known.
+    ///
+    /// `None` both when no quality index is loaded and when the loaded one
+    /// carries no identity; either way there is no quality-tier space to
+    /// verify a query embedding against
+    /// (see [`InMemoryVectorIndex::space_fingerprint_hex`]).
+    #[must_use]
+    pub fn quality_space_fingerprint_hex(&self) -> Option<&str> {
+        self.quality_index
+            .as_ref()
+            .and_then(InMemoryVectorIndex::space_fingerprint_hex)
+    }
+
+    /// Whether the fast tier's space identity is FSVI-v2-HEADER-attested
+    /// rather than declared
+    /// (see [`InMemoryVectorIndex::space_identity_is_attested`];
+    /// bd-9xuj T2-C4-write, guards 2+8).
+    #[must_use]
+    pub const fn fast_identity_is_attested(&self) -> bool {
+        self.fast_index.space_identity_is_attested()
+    }
+
+    /// Whether the quality tier's space identity is FSVI-v2-HEADER-attested.
+    ///
+    /// `false` both when no quality index is loaded and when the loaded one's
+    /// identity was declared rather than read from a validated v2 header
+    /// (see [`InMemoryVectorIndex::space_identity_is_attested`];
+    /// bd-9xuj T2-C4-write, guards 2+8).
+    #[must_use]
+    pub fn quality_identity_is_attested(&self) -> bool {
+        self.quality_index
+            .as_ref()
+            .is_some_and(InMemoryVectorIndex::space_identity_is_attested)
+    }
+
+    /// Embedder id retained by the fast tier, when its source carried one
+    /// (see [`InMemoryVectorIndex::embedder_id`]; bd-9xuj T2-C2).
+    #[must_use]
+    pub fn fast_embedder_id(&self) -> Option<&str> {
+        self.fast_index.embedder_id()
+    }
+
+    /// Embedder revision retained by the fast tier, when its source carried
+    /// one (see [`InMemoryVectorIndex::embedder_revision`]; bd-9xuj T2-C2).
+    #[must_use]
+    pub fn fast_embedder_revision(&self) -> Option<&str> {
+        self.fast_index.embedder_revision()
+    }
+
+    /// Embedder id retained by the quality tier: `None` both when no quality
+    /// index is loaded and when the loaded one's source carried no id
+    /// (bd-9xuj T2-C2).
+    #[must_use]
+    pub fn quality_embedder_id(&self) -> Option<&str> {
+        self.quality_index
+            .as_ref()
+            .and_then(InMemoryVectorIndex::embedder_id)
+    }
+
+    /// Embedder revision retained by the quality tier, under the same rules
+    /// as [`Self::quality_embedder_id`] (bd-9xuj T2-C2).
+    #[must_use]
+    pub fn quality_embedder_revision(&self) -> Option<&str> {
+        self.quality_index
+            .as_ref()
+            .and_then(InMemoryVectorIndex::embedder_revision)
+    }
 }
 
 /// Selectivity threshold for the gather fast-path: take it only when the filter's
@@ -1323,7 +1600,11 @@ mod tests {
     )]
 
     use super::*;
-    use crate::Quantization;
+    use crate::{FsviV2IdentityBinding, Quantization};
+    use frankensearch_core::BoundQueryEmbedding;
+    use frankensearch_core::generation::{
+        ArtifactGenerationIdentityV1, EmbeddingIdentityBundleV1, QuantizationFormat,
+    };
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
@@ -1439,6 +1720,459 @@ mod tests {
         assert_eq!(recovered.len(), dim);
 
         cleanup(&path);
+    }
+
+    // ─── Embedding-space identity (bd-9xuj T2-C3) ───────────────────────────
+
+    /// Write a real FSVI v2 file at `path` whose identity binds
+    /// `explicit_test_model(model_id, dimension)` with fsvi-v2 storage.
+    /// Returns the exact identity binding (needed for admission) and the
+    /// core-side space fingerprint the file's header preserves.
+    fn write_fsvi_v2_fixture(
+        path: &Path,
+        model_id: &str,
+        dimension: usize,
+        generation_sequence: u64,
+        rows: &[(String, Vec<f32>)],
+    ) -> (FsviV2IdentityBinding, String) {
+        let mut identity = EmbeddingIdentityBundleV1::explicit_test_model(
+            model_id,
+            u32::try_from(dimension).expect("test dimension fits u32"),
+        );
+        identity.storage.format = "fsvi-v2".to_owned();
+        identity.storage.quantization = QuantizationFormat::F16;
+        identity.storage.endianness = "little-endian".to_owned();
+        let space_fingerprint = identity.space.fingerprint();
+        let generation = ArtifactGenerationIdentityV1::new(generation_sequence, [0x5c; 16])
+            .expect("valid test generation");
+        let binding =
+            FsviV2IdentityBinding::new(generation, identity.freeze().expect("freeze identity"))
+                .expect("valid FSVI v2 identity binding");
+        let mut writer =
+            crate::VectorIndex::create_v2(path, binding.clone()).expect("create v2 writer");
+        for (doc_id, vector) in rows {
+            writer.write_record(doc_id, vector).expect("write v2 row");
+        }
+        writer.finish().expect("finish v2 fixture");
+        (binding, space_fingerprint)
+    }
+
+    fn identity_rows(dim: usize, count: usize) -> (Vec<String>, Vec<Vec<f32>>) {
+        let doc_ids = (0..count).map(|i| format!("doc-{i}")).collect();
+        let vectors = (0..count)
+            .map(|i| make_normalized_vec(dim, (i + 1) as f32))
+            .collect();
+        (doc_ids, vectors)
+    }
+
+    #[test]
+    fn from_vectors_with_identity_exposes_space_fingerprint() {
+        let dim = 8;
+        let bundle = EmbeddingIdentityBundleV1::explicit_test_model("mem-space-a", 8);
+        let (doc_ids, vectors) = identity_rows(dim, 3);
+        let index =
+            InMemoryVectorIndex::from_vectors_with_identity(doc_ids, vectors, dim, &bundle.space)
+                .expect("build identified index");
+        assert_eq!(
+            index.space_fingerprint_hex(),
+            Some(bundle.space.fingerprint().as_str()),
+            "the index must expose exactly the space fingerprint it was built with"
+        );
+        assert_eq!(index.record_count(), 3);
+        assert!(
+            !index.space_identity_is_attested(),
+            "a caller-declared space is DECLARED, never header-attested (C4-write guards 2+8)"
+        );
+
+        // The identity-less constructor stays typed-absent: no fabrication.
+        let (doc_ids, vectors) = identity_rows(dim, 3);
+        let legacy = InMemoryVectorIndex::from_vectors(doc_ids, vectors, dim).expect("build");
+        assert_eq!(
+            legacy.space_fingerprint_hex(),
+            None,
+            "an identity-less build must never fabricate a space fingerprint"
+        );
+        assert!(!legacy.space_identity_is_attested());
+    }
+
+    #[test]
+    fn from_vectors_with_identity_rejects_dimension_mismatch() -> Result<(), String> {
+        // A 16-dim space cannot describe an 8-dim index: the identity claim
+        // is checked before it is stored, never trusted on assertion alone.
+        let bundle = EmbeddingIdentityBundleV1::explicit_test_model("mem-space-mismatch", 16);
+        let (doc_ids, vectors) = identity_rows(8, 2);
+        let error =
+            InMemoryVectorIndex::from_vectors_with_identity(doc_ids, vectors, 8, &bundle.space)
+                .expect_err("16-dim space must not bind an 8-dim index");
+        let rendered = format!("{error:?}");
+        let SearchError::InvalidConfig { field, value, .. } = error else {
+            return Err(format!("expected InvalidConfig, got {rendered}"));
+        };
+        assert_eq!(field, "space_identity.dimension");
+        assert_eq!(value, "16");
+        Ok(())
+    }
+
+    #[test]
+    fn admitted_v2_load_preserves_space_identity() {
+        // Readiness map §3.3(3), adapted to the only v2 open path that
+        // exists: `VectorIndex::open` is v1-only by design, so an
+        // identity-complete v2 artifact reaches memory through exact
+        // admission. The in-memory index must preserve the admitted space
+        // fingerprint, and its hex must equal the core-side
+        // `EmbeddingSpaceIdentityV1::fingerprint()` that produced the file —
+        // one join key across crates and codecs.
+        //
+        // The fixture lives in its OWN directory: since 58726e26 admission
+        // snapshots the containing directory and fails closed with
+        // `DirectoryChangedDuringRead` when sibling test files churn it, so
+        // the shared test temp dir is not a legal admission site.
+        let dir = std::env::temp_dir()
+            .join("frankensearch_in_memory_tests")
+            .join("admitted_v2_space_identity_dir");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create isolated admission dir");
+        let path = dir.join("admitted_v2_space_identity.fsvi");
+        let dim = 8;
+        let (doc_ids, vectors) = identity_rows(dim, 4);
+        let rows: Vec<(String, Vec<f32>)> = doc_ids.into_iter().zip(vectors).collect();
+        let (binding, expected) = write_fsvi_v2_fixture(&path, "fsvi-space-model", dim, 11, &rows);
+
+        let admitted = crate::VectorIndex::open_admitted_v2(&path, &binding)
+            .expect("exact admission of the v2 fixture");
+        let index = InMemoryVectorIndex::from_admitted_v2(&admitted)
+            .expect("load admitted v2 artifact into memory");
+        assert_eq!(index.record_count(), 4);
+        assert_eq!(
+            index.space_fingerprint_hex(),
+            Some(expected.as_str()),
+            "the in-memory index must preserve the admitted space identity"
+        );
+        assert!(
+            index.space_identity_is_attested(),
+            "an identity read out of a validated v2 header through exact admission is ATTESTED \
+             (C4-write guards 2+8)"
+        );
+        let two_tier = InMemoryTwoTierIndex::new(index, None);
+        assert!(two_tier.fast_identity_is_attested());
+        assert!(
+            !two_tier.quality_identity_is_attested(),
+            "no quality tier means no attested quality identity"
+        );
+
+        // Sanity pin: the legacy pathname loader cannot read v2 at all, so
+        // the admitted path above is not optional for identified artifacts.
+        let error = InMemoryVectorIndex::from_fsvi(&path)
+            .expect_err("VectorIndex::open must reject v2 bytes");
+        assert!(matches!(error, SearchError::IndexVersionMismatch { .. }));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn from_fsvi_legacy_v1_stays_unidentified() {
+        // Legacy v1 files carry no identity bundle. Absence must survive the
+        // load as the typed None state (the C4 seams route it as
+        // LegacyUnidentified) — never a fabricated fingerprint.
+        let path = temp_index_path("from_fsvi_legacy_v1");
+        cleanup(&path);
+        let dim = 8;
+        let mut writer = crate::VectorIndex::create(&path, "legacy-embedder", dim)
+            .expect("create legacy v1 writer");
+        writer
+            .write_record("doc-0", &make_normalized_vec(dim, 1.0))
+            .expect("write v1 row");
+        writer.finish().expect("finish v1 file");
+
+        let index = InMemoryVectorIndex::from_fsvi(&path).expect("load v1 file into memory");
+        assert_eq!(
+            index.space_fingerprint_hex(),
+            None,
+            "legacy v1 absence must stay typed, never fabricated"
+        );
+        assert!(
+            !index.space_identity_is_attested(),
+            "a v1 header attests nothing (C4-write guards 2+8)"
+        );
+        cleanup(&path);
+    }
+
+    #[test]
+    fn from_fsvi_preserves_embedder_identity_strings() {
+        // bd-9xuj T2-C2: from_fsvi used to keep only the dimension and drop
+        // the header's embedder id/revision on the floor. Both must survive
+        // the load verbatim — including a v1 header's EMPTY revision, which
+        // stays `Some("")` (what the header says), distinct from the `None`
+        // of a bare-vector build (no header at all).
+        let path = temp_index_path("from_fsvi_embedder_identity");
+        cleanup(&path);
+        let dim = 8;
+        let mut writer = crate::VectorIndex::create_with_revision(
+            &path,
+            "kept-embedder",
+            "kept-revision-v7",
+            dim,
+            Quantization::F16,
+        )
+        .expect("create v1 writer with revision");
+        writer
+            .write_record("doc-0", &make_normalized_vec(dim, 1.0))
+            .expect("write v1 row");
+        writer.finish().expect("finish v1 file");
+
+        let index = InMemoryVectorIndex::from_fsvi(&path).expect("load v1 file into memory");
+        assert_eq!(index.embedder_id(), Some("kept-embedder"));
+        assert_eq!(index.embedder_revision(), Some("kept-revision-v7"));
+        assert_eq!(
+            index.space_fingerprint_hex(),
+            None,
+            "id strings never synthesize a space identity"
+        );
+        cleanup(&path);
+
+        // Empty-revision v1 header: kept verbatim as Some("").
+        let path = temp_index_path("from_fsvi_empty_revision");
+        cleanup(&path);
+        let mut writer = crate::VectorIndex::create(&path, "legacy-embedder", dim)
+            .expect("create legacy v1 writer");
+        writer
+            .write_record("doc-0", &make_normalized_vec(dim, 1.0))
+            .expect("write v1 row");
+        writer.finish().expect("finish v1 file");
+        let index = InMemoryVectorIndex::from_fsvi(&path).expect("load v1 file into memory");
+        assert_eq!(index.embedder_id(), Some("legacy-embedder"));
+        assert_eq!(
+            index.embedder_revision(),
+            Some(""),
+            "an empty header revision is the header's content, not absence"
+        );
+        cleanup(&path);
+    }
+
+    #[test]
+    fn constructor_embedder_identity_rules() {
+        // Bare vectors: no source header, no declared space — both stay the
+        // typed None (nothing to retain, nothing fabricated).
+        let dim = 8;
+        let (doc_ids, vectors) = identity_rows(dim, 2);
+        let bare = InMemoryVectorIndex::from_vectors(doc_ids, vectors, dim).expect("build");
+        assert_eq!(bare.embedder_id(), None);
+        assert_eq!(bare.embedder_revision(), None);
+
+        // Declared space: the same id/revision rule the production v2 writer
+        // uses (`create_v2` writes logical_model_id / immutable_revision).
+        let bundle = EmbeddingIdentityBundleV1::explicit_test_model("declared-model", 8);
+        let (doc_ids, vectors) = identity_rows(dim, 2);
+        let declared =
+            InMemoryVectorIndex::from_vectors_with_identity(doc_ids, vectors, dim, &bundle.space)
+                .expect("build identified index");
+        assert_eq!(declared.embedder_id(), Some("declared-model"));
+        assert_eq!(
+            declared.embedder_revision(),
+            Some(bundle.space.immutable_revision.as_str())
+        );
+    }
+
+    #[test]
+    fn admitted_v2_load_preserves_embedder_identity_strings() {
+        // The admitted-v2 in-memory load must retain the artifact header's
+        // id/revision strings alongside the space fingerprint C3 already
+        // preserves. Own directory: admission fails closed with
+        // DirectoryChangedDuringRead when sibling test files churn the dir.
+        let dir = std::env::temp_dir()
+            .join("frankensearch_in_memory_tests")
+            .join("admitted_v2_embedder_identity_dir");
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create isolated admission dir");
+        let path = dir.join("admitted_v2_embedder_identity.fsvi");
+        let dim = 8;
+        let (doc_ids, vectors) = identity_rows(dim, 3);
+        let rows: Vec<(String, Vec<f32>)> = doc_ids.into_iter().zip(vectors).collect();
+        let (binding, expected_space) =
+            write_fsvi_v2_fixture(&path, "v2-embedder-model", dim, 13, &rows);
+
+        let admitted = crate::VectorIndex::open_admitted_v2(&path, &binding)
+            .expect("exact admission of the v2 fixture");
+        let index = InMemoryVectorIndex::from_admitted_v2(&admitted)
+            .expect("load admitted v2 artifact into memory");
+        // create_v2 writes logical_model_id / immutable_revision as the
+        // header strings; explicit_test_model pins the revision value.
+        assert_eq!(index.embedder_id(), Some("v2-embedder-model"));
+        assert_eq!(index.embedder_revision(), Some("explicit-test-v1"));
+        assert_eq!(index.space_fingerprint_hex(), Some(expected_space.as_str()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn in_memory_two_tier_exposes_per_tier_embedder_identity() {
+        let dim = 8;
+        let fast_bundle = EmbeddingIdentityBundleV1::explicit_test_model("tier-fast-model", 8);
+        let (doc_ids, vectors) = identity_rows(dim, 2);
+        let fast = InMemoryVectorIndex::from_vectors_with_identity(
+            doc_ids,
+            vectors,
+            dim,
+            &fast_bundle.space,
+        )
+        .expect("build fast tier");
+        let (doc_ids, vectors) = identity_rows(dim, 2);
+        let quality = InMemoryVectorIndex::from_vectors(doc_ids, vectors, dim).expect("build");
+
+        // Identified fast + identity-less quality: each tier reports its own
+        // state; the identified tier never bleeds into the absent one.
+        let two_tier = InMemoryTwoTierIndex::new(fast, Some(quality));
+        assert_eq!(two_tier.fast_embedder_id(), Some("tier-fast-model"));
+        assert_eq!(
+            two_tier.fast_embedder_revision(),
+            Some(fast_bundle.space.immutable_revision.as_str())
+        );
+        assert_eq!(two_tier.quality_embedder_id(), None);
+        assert_eq!(two_tier.quality_embedder_revision(), None);
+
+        // No quality tier at all: same typed absence.
+        let (doc_ids, vectors) = identity_rows(dim, 2);
+        let fast_only = InMemoryVectorIndex::from_vectors(doc_ids, vectors, dim).expect("build");
+        let composed = InMemoryTwoTierIndex::new(fast_only, None);
+        assert_eq!(composed.fast_embedder_id(), None);
+        assert_eq!(composed.quality_embedder_id(), None);
+        assert_eq!(composed.quality_embedder_revision(), None);
+    }
+
+    /// First production-shaped consumer of T2-C1's `verify_space_identity`:
+    /// an in-memory index built WITH identity supplies the index-side join
+    /// key, a query embedding bound through `BoundQueryEmbedding` supplies
+    /// the query side, and the verifier decides admission before the real
+    /// search path runs.
+    #[test]
+    fn bound_query_joins_in_memory_space_identity_through_verifier() -> Result<(), String> {
+        let dim = 8;
+        let fast_bundle = EmbeddingIdentityBundleV1::explicit_test_model("consumer-fast-model", 8);
+        let other_bundle =
+            EmbeddingIdentityBundleV1::explicit_test_model("consumer-quality-model", 8);
+
+        let (doc_ids, vectors) = identity_rows(dim, 3);
+        let index = InMemoryVectorIndex::from_vectors_with_identity(
+            doc_ids,
+            vectors,
+            dim,
+            &fast_bundle.space,
+        )
+        .expect("build fast-space index");
+        let (doc_ids, vectors) = identity_rows(dim, 3);
+        let wrong_space_index = InMemoryVectorIndex::from_vectors_with_identity(
+            doc_ids,
+            vectors,
+            dim,
+            &other_bundle.space,
+        )
+        .expect("build quality-space index");
+
+        // Query side: bind the vector to the space that produced it (C1).
+        let query = make_normalized_vec(dim, 1.0);
+        let bound = BoundQueryEmbedding::new(query, fast_bundle).expect("bind query embedding");
+
+        // Matching space: the verifier admits, then the REAL search path runs.
+        let fingerprint = index
+            .space_fingerprint_hex()
+            .expect("identified index exposes its space");
+        bound
+            .verify_space_identity(fingerprint, "fast")
+            .expect("same space must verify");
+        let hits = index
+            .search_top_k(bound.vector(), 1, None)
+            .expect("search admitted query");
+        assert_eq!(hits[0].doc_id, "doc-0", "query equals doc-0's vector");
+
+        // The trap this slice exists for: the raw path CANNOT detect a
+        // same-dimension wrong-space vector — it searches happily...
+        let raw_hits = wrong_space_index
+            .search_top_k(bound.vector(), 1, None)
+            .expect("raw path accepts same-dimension wrong-space silently");
+        assert!(!raw_hits.is_empty());
+
+        // ...and the space-fingerprint join is what closes exactly that hole.
+        let wrong_fingerprint = wrong_space_index
+            .space_fingerprint_hex()
+            .expect("identified index exposes its space");
+        let error = bound
+            .verify_space_identity(wrong_fingerprint, "quality")
+            .expect_err("wrong space at equal dimension must reject");
+        let rendered = format!("{error:?}");
+        let SearchError::InvalidConfig { field, .. } = error else {
+            return Err(format!("expected InvalidConfig, got {rendered}"));
+        };
+        assert_eq!(field, "query_embedding.quality.space_identity");
+        Ok(())
+    }
+
+    #[test]
+    fn in_memory_two_tier_exposes_per_tier_space_identity() {
+        let dim = 8;
+
+        // Composed: each tier built with its own space identity exposes its
+        // own, distinct fingerprint through the two-tier wrapper.
+        let fast_bundle = EmbeddingIdentityBundleV1::explicit_test_model("two-tier-fast-model", 8);
+        let quality_bundle =
+            EmbeddingIdentityBundleV1::explicit_test_model("two-tier-quality-model", 8);
+        let (doc_ids, vectors) = identity_rows(dim, 3);
+        let fast = InMemoryVectorIndex::from_vectors_with_identity(
+            doc_ids,
+            vectors,
+            dim,
+            &fast_bundle.space,
+        )
+        .expect("build fast tier");
+        let (doc_ids, vectors) = identity_rows(dim, 3);
+        let quality = InMemoryVectorIndex::from_vectors_with_identity(
+            doc_ids,
+            vectors,
+            dim,
+            &quality_bundle.space,
+        )
+        .expect("build quality tier");
+        let two_tier = InMemoryTwoTierIndex::new(fast, Some(quality));
+        assert_eq!(
+            two_tier.fast_space_fingerprint_hex(),
+            Some(fast_bundle.space.fingerprint().as_str())
+        );
+        assert_eq!(
+            two_tier.quality_space_fingerprint_hex(),
+            Some(quality_bundle.space.fingerprint().as_str())
+        );
+        assert_ne!(
+            two_tier.fast_space_fingerprint_hex(),
+            two_tier.quality_space_fingerprint_hex(),
+            "distinct models must expose distinct per-tier spaces"
+        );
+
+        // from_dir loads through the v1-only pathname loader: absence stays
+        // typed through the directory path — no tier identity is fabricated.
+        static DIR_NONCE: AtomicU64 = AtomicU64::new(0);
+        let nonce = DIR_NONCE.fetch_add(1, AtomicOrdering::Relaxed);
+        let dir = std::env::temp_dir()
+            .join("frankensearch_in_memory_tests")
+            .join(format!("two_tier_space_identity-{nonce}"));
+        // Scrub any stale state a previously interrupted run left behind.
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create two-tier dir");
+        let fast_path = dir.join(crate::two_tier::VECTOR_INDEX_FAST_FILENAME);
+        let mut writer = crate::VectorIndex::create(&fast_path, "legacy-fast", dim)
+            .expect("create legacy v1 fast tier");
+        writer
+            .write_record("doc-0", &make_normalized_vec(dim, 1.0))
+            .expect("write v1 row");
+        writer.finish().expect("finish v1 fast tier");
+        let loaded = InMemoryTwoTierIndex::from_dir(&dir).expect("load v1 two-tier dir");
+        assert_eq!(loaded.fast_space_fingerprint_hex(), None);
+        assert_eq!(loaded.quality_space_fingerprint_hex(), None);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // new(): a composed two-tier without a quality index has no
+        // quality-tier space to verify against — typed absence again.
+        let (doc_ids, vectors) = identity_rows(dim, 2);
+        let fast_only = InMemoryVectorIndex::from_vectors(doc_ids, vectors, dim).expect("build");
+        let composed = InMemoryTwoTierIndex::new(fast_only, None);
+        assert_eq!(composed.fast_space_fingerprint_hex(), None);
+        assert_eq!(composed.quality_space_fingerprint_hex(), None);
     }
 
     #[test]

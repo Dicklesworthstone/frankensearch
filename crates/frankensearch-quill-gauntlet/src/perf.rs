@@ -3125,6 +3125,7 @@ fn host_cpu_topology() -> Option<(usize, usize)> {
     }
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn parse_linux_cpu_topology(cpuinfo: &str) -> Option<(usize, usize)> {
     let mut logical_threads = 0_usize;
     let mut cores = BTreeSet::new();
@@ -3803,6 +3804,7 @@ pub fn parse_macos_time_max_rss_bytes(report: &str) -> Option<u64> {
     })
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn parse_linux_vmhwm_bytes(status: &str) -> Option<u64> {
     let line = status.lines().find(|line| line.starts_with("VmHWM:"))?;
     let mut fields = line.split_ascii_whitespace();

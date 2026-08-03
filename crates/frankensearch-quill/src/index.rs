@@ -5,6 +5,8 @@
 //! their composite statistics, scorer adapters, and seal transaction are
 //! assembled here; later mixed-state beads wire them into the public writer loop.
 
+#[cfg(feature = "pruning-conformance")]
+use std::collections::HashMap;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::{Bound, Deref};
 use std::path::{Path, PathBuf};
@@ -14,6 +16,8 @@ use std::sync::atomic::AtomicU8;
 use std::sync::atomic::{AtomicU64, Ordering};
 #[cfg(any(feature = "conformance-internals", feature = "profile-internals"))]
 use std::sync::{Mutex as StdMutex, atomic::AtomicBool};
+#[cfg(feature = "pruning-conformance")]
+use std::thread::ThreadId;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use arc_swap::{ArcSwap, ArcSwapOption};
@@ -43,7 +47,10 @@ use crate::argus::{
     TermRecordOption, TermScorer, TopDocsCollector,
 };
 #[cfg(feature = "pruning-conformance")]
-use crate::argus::{ConformanceUnionRefill, ConformanceUnionRefillStrategy};
+use crate::argus::{
+    ConformanceQueryWorkContext, ConformanceQueryWorkPhase, ConformanceUnionRefill,
+    ConformanceUnionRefillStrategy,
+};
 use crate::config::QuillConfig;
 use crate::delta::DeltaSnapshot;
 use crate::error::QuillError;
@@ -2784,6 +2791,10 @@ impl ConformancePruningTraceSession {
         Ok(recorded_receipts)
     }
 
+    #[allow(
+        clippy::significant_drop_tightening,
+        reason = "the trace state must remain locked from extraction through the terminal Completed transition"
+    )]
     fn complete(&self) -> Result<ConformancePruningTraceReceipt, QuillIndexError> {
         let mut state = self
             .state
@@ -3036,6 +3047,91 @@ impl ConformanceCancellationStage {
     }
 }
 
+/// Exact competitive-union location where a conformance-only query was
+/// interrupted by deterministic cancellation or fuel exhaustion.
+#[cfg(feature = "pruning-conformance")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConformanceQueryInterruptionLocation {
+    refill_ordinal: u64,
+    window_start: u32,
+    phase: ConformanceQueryWorkPhase,
+    candidate_doc: Option<u32>,
+    candidate_scored: bool,
+    work_kind: QueryWorkKind,
+    units: u64,
+    consumed_before: u64,
+}
+
+#[cfg(feature = "pruning-conformance")]
+impl ConformanceQueryInterruptionLocation {
+    const fn new(
+        context: ConformanceQueryWorkContext,
+        work_kind: QueryWorkKind,
+        units: u64,
+        consumed_before: u64,
+    ) -> Self {
+        Self {
+            refill_ordinal: context.refill_ordinal,
+            window_start: context.window_start,
+            phase: context.phase,
+            candidate_doc: context.candidate_doc,
+            candidate_scored: context.candidate_scored,
+            work_kind,
+            units,
+            consumed_before,
+        }
+    }
+
+    /// One-based refill ordinal, including the initial exhaustive refill.
+    #[must_use]
+    pub const fn refill_ordinal(self) -> u64 {
+        self.refill_ordinal
+    }
+
+    /// Inclusive document at the start of the interrupted refill window.
+    #[must_use]
+    pub const fn window_start(self) -> u32 {
+        self.window_start
+    }
+
+    /// Competitive-union operation surrounding the interrupted admission.
+    #[must_use]
+    pub const fn phase(self) -> ConformanceQueryWorkPhase {
+        self.phase
+    }
+
+    /// Selected candidate, if the phase had one.
+    #[must_use]
+    pub const fn candidate_doc(self) -> Option<u32> {
+        self.candidate_doc
+    }
+
+    /// Whether that candidate's score contribution completed before the
+    /// interrupted admission.
+    #[must_use]
+    pub const fn candidate_scored(self) -> bool {
+        self.candidate_scored
+    }
+
+    /// Coarse work class being admitted at the interruption boundary.
+    #[must_use]
+    pub const fn work_kind(self) -> QueryWorkKind {
+        self.work_kind
+    }
+
+    /// Work units requested by the interrupted admission.
+    #[must_use]
+    pub const fn units(self) -> u64 {
+        self.units
+    }
+
+    /// Successfully admitted query-fuel units before this admission.
+    #[must_use]
+    pub const fn consumed_before(self) -> u64 {
+        self.consumed_before
+    }
+}
+
 /// Per-index deterministic cancellation requester for live conformance tests.
 ///
 /// This type, its atomics, and every call site are absent unless the dedicated
@@ -3052,6 +3148,8 @@ pub struct ConformanceCancellationController {
     recorded_pruning_receipts_at_fire: AtomicU64,
     #[cfg(feature = "pruning-conformance")]
     pruning_trace_execution_mode_at_fire: AtomicU8,
+    #[cfg(feature = "pruning-conformance")]
+    query_interruption_location: StdMutex<Option<ConformanceQueryInterruptionLocation>>,
     discarded_pruning_trace_sessions: AtomicU64,
     fired: AtomicBool,
 }
@@ -3104,6 +3202,8 @@ impl ConformanceCancellationController {
         #[cfg(feature = "pruning-conformance")]
         self.pruning_trace_execution_mode_at_fire
             .store(0, Ordering::Relaxed);
+        #[cfg(feature = "pruning-conformance")]
+        self.reset_query_interruption_location();
         self.discarded_pruning_trace_sessions
             .store(0, Ordering::Relaxed);
         self.fired.store(false, Ordering::Relaxed);
@@ -3165,8 +3265,48 @@ impl ConformanceCancellationController {
         self.stage.load(Ordering::Acquire) != Self::DISARMED
     }
 
+    /// Exact competitive-union interruption most recently captured for this
+    /// controller, or `None` before a qualifying interruption.
+    #[cfg(feature = "pruning-conformance")]
+    #[must_use]
+    pub fn query_interruption_location(&self) -> Option<ConformanceQueryInterruptionLocation> {
+        *self
+            .query_interruption_location
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    #[cfg(feature = "pruning-conformance")]
+    fn reset_query_interruption_location(&self) {
+        *self
+            .query_interruption_location
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    }
+
+    #[cfg(feature = "pruning-conformance")]
+    fn record_query_interruption_location(&self, location: ConformanceQueryInterruptionLocation) {
+        let mut recorded = self
+            .query_interruption_location
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if recorded.is_none() {
+            *recorded = Some(location);
+        }
+    }
+
     fn checkpoint(&self, stage: ConformanceCancellationStage, cx: &Cx) {
-        self.checkpoint_with_pruning_receipts(stage, cx, None, None);
+        let _ = self.checkpoint_with_pruning_receipts(stage, cx, None, None);
+    }
+
+    #[cfg(feature = "pruning-conformance")]
+    fn checkpoint_query_collection(&self, cx: &Cx) -> bool {
+        self.checkpoint_with_pruning_receipts(
+            ConformanceCancellationStage::QueryCollection,
+            cx,
+            None,
+            None,
+        )
     }
 
     #[cfg(feature = "pruning-conformance")]
@@ -3194,7 +3334,7 @@ impl ConformanceCancellationController {
         {
             return Ok(());
         }
-        self.checkpoint_with_pruning_receipts(
+        let _ = self.checkpoint_with_pruning_receipts(
             ConformanceCancellationStage::PruningTraceSegmentRecorded,
             cx,
             Some(recorded_receipts),
@@ -3209,16 +3349,16 @@ impl ConformanceCancellationController {
         cx: &Cx,
         recorded_receipts: Option<u64>,
         pruning_execution_mode_code: Option<u8>,
-    ) {
+    ) -> bool {
         if self.stage.load(Ordering::Acquire) != stage.code() {
-            return;
+            return false;
         }
         let ordinal = self
             .observed_checkpoints
             .fetch_add(1, Ordering::AcqRel)
             .saturating_add(1);
         if ordinal != self.trigger_ordinal.load(Ordering::Acquire) {
-            return;
+            return false;
         }
         if let Some(recorded_receipts) = recorded_receipts {
             self.recorded_pruning_receipts_at_fire
@@ -3240,6 +3380,7 @@ impl ConformanceCancellationController {
             "deterministic conformance checkpoint requested cancellation on the real Cx"
         );
         cx.set_cancel_requested(true);
+        true
     }
 
     #[cfg(feature = "pruning-conformance")]
@@ -3275,6 +3416,8 @@ struct QueryCheckpoint<'a> {
     profile: Option<&'a QuillProfileSession>,
     #[cfg(feature = "conformance-internals")]
     conformance_controller: Arc<ConformanceCancellationController>,
+    #[cfg(feature = "pruning-conformance")]
+    conformance_query_work_contexts: StdMutex<HashMap<ThreadId, ConformanceQueryWorkContext>>,
 }
 
 impl<'a> QueryCheckpoint<'a> {
@@ -3290,6 +3433,8 @@ impl<'a> QueryCheckpoint<'a> {
             profile: None,
             #[cfg(feature = "conformance-internals")]
             conformance_controller: Arc::default(),
+            #[cfg(feature = "pruning-conformance")]
+            conformance_query_work_contexts: StdMutex::new(HashMap::new()),
         })
     }
 
@@ -3301,6 +3446,8 @@ impl<'a> QueryCheckpoint<'a> {
         upper_bound: u64,
         conformance_controller: Arc<ConformanceCancellationController>,
     ) -> Arc<Self> {
+        #[cfg(feature = "pruning-conformance")]
+        conformance_controller.reset_query_interruption_location();
         Arc::new(Self {
             cx,
             phase,
@@ -3310,6 +3457,8 @@ impl<'a> QueryCheckpoint<'a> {
             #[cfg(feature = "profile-internals")]
             profile: None,
             conformance_controller,
+            #[cfg(feature = "pruning-conformance")]
+            conformance_query_work_contexts: StdMutex::new(HashMap::new()),
         })
     }
 
@@ -3348,6 +3497,8 @@ impl<'a> QueryCheckpoint<'a> {
             state: QueryFuelState::default(),
             profile: Some(profile),
             conformance_controller,
+            #[cfg(feature = "pruning-conformance")]
+            conformance_query_work_contexts: StdMutex::new(HashMap::new()),
         })
     }
 
@@ -3402,11 +3553,53 @@ impl<'a> QueryCheckpoint<'a> {
             position_docs,
         }
     }
+
+    #[cfg(feature = "pruning-conformance")]
+    fn conformance_query_work_context(&self) -> Option<ConformanceQueryWorkContext> {
+        self.conformance_query_work_contexts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&std::thread::current().id())
+            .copied()
+    }
+
+    #[cfg(feature = "pruning-conformance")]
+    fn record_query_interruption(
+        &self,
+        context: Option<ConformanceQueryWorkContext>,
+        kind: QueryWorkKind,
+        units: u64,
+        consumed_before: u64,
+    ) {
+        if let Some(context) = context {
+            self.conformance_controller
+                .record_query_interruption_location(ConformanceQueryInterruptionLocation::new(
+                    context,
+                    kind,
+                    units,
+                    consumed_before,
+                ));
+        }
+    }
 }
 
 impl QueryWorkCheckpoint for QueryCheckpoint<'_> {
     fn admit(&self, kind: QueryWorkKind, units: u64) -> Result<(), ArgusError> {
-        #[cfg(feature = "conformance-internals")]
+        #[cfg(feature = "pruning-conformance")]
+        {
+            let consumed_before = self.state.consumed.load(Ordering::Acquire);
+            let context = self.conformance_query_work_context();
+            if self
+                .conformance_controller
+                .checkpoint_query_collection(self.cx)
+            {
+                self.record_query_interruption(context, kind, units, consumed_before);
+            }
+        }
+        #[cfg(all(
+            feature = "conformance-internals",
+            not(feature = "pruning-conformance")
+        ))]
         self.conformance_controller
             .checkpoint(ConformanceCancellationStage::QueryCollection, self.cx);
         if units == 0 {
@@ -3442,6 +3635,13 @@ impl QueryWorkCheckpoint for QueryCheckpoint<'_> {
         let previous = match admitted {
             Ok(previous) => previous,
             Err(consumed) => {
+                #[cfg(feature = "pruning-conformance")]
+                self.record_query_interruption(
+                    self.conformance_query_work_context(),
+                    kind,
+                    units,
+                    consumed,
+                );
                 #[cfg(feature = "profile-internals")]
                 if let Some(profile) = self.profile {
                     profile.record_work_refused(kind, units);
@@ -3463,6 +3663,20 @@ impl QueryWorkCheckpoint for QueryCheckpoint<'_> {
             profile.record_work_admitted(kind, units);
         }
         Ok(())
+    }
+
+    #[cfg(feature = "pruning-conformance")]
+    fn set_conformance_query_work_context(&self, context: Option<ConformanceQueryWorkContext>) {
+        let thread_id = std::thread::current().id();
+        let mut contexts = self
+            .conformance_query_work_contexts
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(context) = context {
+            contexts.insert(thread_id, context);
+        } else {
+            contexts.remove(&thread_id);
+        }
     }
 }
 
@@ -10614,13 +10828,27 @@ enum QueryLoweringMode {
     Unscored,
 }
 
-fn lower_boolean(
-    clauses: Vec<ScorerClause<'_>>,
+// `'a` is load-bearing under `pruning-conformance`, where the checkpoint
+// parameter shares it; elision only type-checks with the feature off.
+#[allow(clippy::elidable_lifetime_names)]
+fn lower_boolean<'a>(
+    clauses: Vec<ScorerClause<'a>>,
     mode: QueryLoweringMode,
     topdocs_root: bool,
-) -> Result<ReferenceScorer<'_>, QuillIndexError> {
+    #[cfg(feature = "pruning-conformance")] checkpoint: Option<&QueryCheckpointHandle<'a>>,
+) -> Result<ReferenceScorer<'a>, QuillIndexError> {
     match mode {
-        QueryLoweringMode::Scored if topdocs_root => ReferenceScorer::boolean_topdocs(clauses),
+        QueryLoweringMode::Scored if topdocs_root => {
+            #[cfg(feature = "pruning-conformance")]
+            if let Some(checkpoint) = checkpoint {
+                return ReferenceScorer::boolean_topdocs_with_checkpoint(
+                    clauses,
+                    Arc::clone(checkpoint),
+                )
+                .map_err(QuillIndexError::from);
+            }
+            ReferenceScorer::boolean_topdocs(clauses)
+        }
         QueryLoweringMode::Scored => ReferenceScorer::boolean(clauses),
         QueryLoweringMode::Unscored => ReferenceScorer::boolean_unscored(clauses),
     }
@@ -10668,7 +10896,13 @@ fn lower_query_with_mode<'a>(
                     checkpoint,
                 )?));
             }
-            lower_boolean(clauses, mode, topdocs_root)
+            lower_boolean(
+                clauses,
+                mode,
+                topdocs_root,
+                #[cfg(feature = "pruning-conformance")]
+                Some(checkpoint),
+            )
         }
         Query::Phrase {
             fields,
@@ -10696,7 +10930,13 @@ fn lower_query_with_mode<'a>(
                         checkpoint,
                     )?));
                 }
-                return lower_boolean(clauses, mode, topdocs_root);
+                return lower_boolean(
+                    clauses,
+                    mode,
+                    topdocs_root,
+                    #[cfg(feature = "pruning-conformance")]
+                    Some(checkpoint),
+                );
             }
             let mut clauses = Vec::new();
             for field in fields {
@@ -10770,7 +11010,13 @@ fn lower_query_with_mode<'a>(
                 };
                 clauses.push(ScorerClause::should(ReferenceScorer::phrase(scorer)));
             }
-            lower_boolean(clauses, mode, topdocs_root)
+            lower_boolean(
+                clauses,
+                mode,
+                topdocs_root,
+                #[cfg(feature = "pruning-conformance")]
+                Some(checkpoint),
+            )
         }
         Query::Boolean { clauses, .. } => {
             let mut lowered = Vec::new();
@@ -10795,7 +11041,13 @@ fn lower_query_with_mode<'a>(
                     )?,
                 ));
             }
-            lower_boolean(lowered, mode, topdocs_root)
+            lower_boolean(
+                lowered,
+                mode,
+                topdocs_root,
+                #[cfg(feature = "pruning-conformance")]
+                Some(checkpoint),
+            )
         }
         Query::Boost { query, factor } => {
             let boost = inherited_boost * *factor;
@@ -11413,7 +11665,13 @@ fn lower_numeric_field_set<'a>(
             document_count,
         )?));
     }
-    let matching = lower_boolean(clauses, QueryLoweringMode::Unscored, false)?;
+    let matching = lower_boolean(
+        clauses,
+        QueryLoweringMode::Unscored,
+        false,
+        #[cfg(feature = "pruning-conformance")]
+        None,
+    )?;
     match mode {
         QueryLoweringMode::Scored => {
             ReferenceScorer::constant_score(matching, boost).map_err(QuillIndexError::from)
@@ -11441,7 +11699,13 @@ fn lower_leaf_string_predicate<'a>(
             leaf, snapshot, schema, field_ord, &term, 1.0, false, checkpoint,
         )?));
     }
-    let matching = lower_boolean(clauses, QueryLoweringMode::Unscored, false)?;
+    let matching = lower_boolean(
+        clauses,
+        QueryLoweringMode::Unscored,
+        false,
+        #[cfg(feature = "pruning-conformance")]
+        Some(checkpoint),
+    )?;
     match mode {
         QueryLoweringMode::Scored => {
             ReferenceScorer::constant_score(matching, boost).map_err(QuillIndexError::from)
@@ -11479,7 +11743,13 @@ fn lower_leaf_glob<'a>(
         )?;
         fields.push(ScorerClause::should(field_scorer));
     }
-    lower_boolean(fields, mode, false)
+    lower_boolean(
+        fields,
+        mode,
+        false,
+        #[cfg(feature = "pruning-conformance")]
+        Some(checkpoint),
+    )
 }
 
 fn snapshot_glob_terms(
@@ -13152,6 +13422,55 @@ mod tests {
                 report.invariant_violations
             );
         }
+    }
+
+    #[cfg(feature = "pruning-conformance")]
+    #[test]
+    fn query_interruption_location_is_absent_outside_a_competitive_union() {
+        let cx = Cx::for_testing();
+        let controller = Arc::new(ConformanceCancellationController::default());
+        assert_eq!(controller.query_interruption_location(), None);
+
+        let exhausted = QueryCheckpoint::new_with_controller(
+            &cx,
+            "location_edge_fuel",
+            0,
+            1,
+            Arc::clone(&controller),
+        );
+        assert!(matches!(
+            exhausted.admit(QueryWorkKind::Segment, 1),
+            Err(ArgusError::QueryFuelExhausted {
+                budget: 0,
+                consumed: 0,
+                segments_touched: 0,
+                dictionary_blocks: 0,
+                posting_blocks: 0,
+                position_docs: 0,
+            })
+        ));
+        assert_eq!(controller.query_interruption_location(), None);
+
+        controller
+            .arm(ConformanceCancellationStage::QueryCollection, 1)
+            .expect("arm non-union cancellation edge");
+        let cancelled = QueryCheckpoint::new_with_controller(
+            &cx,
+            "location_edge_cancel",
+            u64::MAX,
+            0,
+            Arc::clone(&controller),
+        );
+        assert!(matches!(
+            cancelled.admit(QueryWorkKind::Segment, 0),
+            Err(ArgusError::QueryCancelled {
+                phase: "location_edge_cancel"
+            })
+        ));
+        assert!(controller.fired());
+        assert_eq!(controller.query_interruption_location(), None);
+        controller.disarm();
+        cx.set_cancel_requested(false);
     }
 
     const E3_9_PINNED_SEEDS: [u64; 4] = [

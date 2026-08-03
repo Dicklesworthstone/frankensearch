@@ -1,4 +1,4 @@
-# E8-H P1 — does the INCUMBENT pay the same copy toll? Tantivy vs Quill, one host, one binary, one corpus (2026-07-29)
+# E8-H P1 — historical diagnostic: does the INCUMBENT pay the same copy toll? Tantivy vs Quill, one host, one binary, one corpus (2026-07-29)
 
 **Task:** the Round-1 memmove row (`p1-trj-qg2-round0.md` rank 3) and the local
 attribution card (`p1-local-qg2-memmove-attribution-20260729.md`) measured
@@ -7,10 +7,21 @@ and concluded "data-copy-shaped, not allocator-shaped". That number was
 **meaningless on its own** because the incumbent's equivalent was never
 measured. This card measures it.
 
-**Method delta that makes this card stronger than a cross-citation:** both arms
-are profiled from the **same ELF, in the same session, on the same host, over
-the same corpus**. The earlier Quill numbers came from a *different* binary
-(see Provenance), so this card re-measures Quill rather than citing it.
+## Disposition
+
+`HISTORICAL-DIAGNOSTIC / NO FORMAL VERDICT`. Both arms use one ELF, one host,
+one corpus, and one profiling session, but they ran in separate process
+invocations and this experiment has no same-invocation A/A null. The host is
+also outside the registered campaign classes. The card may therefore guide
+hotspot prioritization and bound the size of the copy family; it may not
+activate a gate, move a ratchet, publish a competitive ratio, or serve as a
+formal KEEP/REJECT decision.
+
+**Method delta that makes this card stronger than a cross-citation for
+attribution:** both arms are profiled from the **same ELF, in the same session,
+on the same host, over the same corpus**. The earlier Quill numbers came from a
+*different* binary (see Provenance), so this card re-measures Quill rather than
+citing it.
 
 ## Machine-class fingerprint (Law 6: not comparable to trj-zen3-* or m4-macos)
 
@@ -207,11 +218,11 @@ structural shape as Quill:
 
 ## CONCLUSION (one sentence)
 
-**Tantivy pays the same copy toll — 5.79% memmove / 0.08% memset / 0.30% realloc
-against Quill's 7.11% / 0.22% / 0.37%, or 6.3–6.8% versus 8.0% once each is
-normalized to its own engine's CPU — so the per-document data copy is NOT where
-the gap lives, and eliminating Quill's entire copy excess would return 1.1% of
-CPU.**
+**As a diagnostic attribution, Tantivy pays the same copy toll — 5.79% memmove
+/ 0.08% memset / 0.30% realloc against Quill's 7.11% / 0.22% / 0.37%, or
+6.3–6.8% versus 8.0% once each is normalized to its own engine's CPU — so the
+per-document data-copy family is unlikely to contain more than 1.1% of CPU
+recovery on this fixture.**
 
 ## Scope correction that must travel with this card
 
@@ -237,8 +248,10 @@ about it.
 
 Round-1's lever queue ranked: (1) canonical-encode fast path ~12-15%,
 (2) u64-map hasher swap ~4.8%, (3) memmove attribution 8.32%, (4) interner.
-Row 3 is now **closed as a REJECT** by the table above. The re-ranking this
-card forces:
+Row 3 is **diagnostically deprioritized** by the table above, not formally
+rejected: current evidence admission requires a same-invocation control that
+this historical profiling session did not execute. The re-ranking this card
+supports for follow-up profiling is:
 
 1. **`threads=1` pin asymmetry — promote to rank 1, and it is a HARNESS
    fairness bug before it is a Quill lever.** Tantivy gets 1.83× CPU

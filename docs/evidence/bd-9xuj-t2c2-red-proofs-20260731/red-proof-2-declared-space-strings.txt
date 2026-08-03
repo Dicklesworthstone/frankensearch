@@ -1,0 +1,15 @@
+RED PROOF 2: from_vectors_with_identity embedder id/revision retention DISABLED (declared-space capture removed)
+mutation applied to crates/frankensearch-index/src/in_memory.rs at commit e5693265b11c31cb98ba4864a6fa8ff21524a643
+expected RED: constructor_embedder_identity_rules, in_memory_two_tier_exposes_per_tier_embedder_identity
+test in_memory::tests::constructor_embedder_identity_rules ... FAILED
+test in_memory::tests::in_memory_two_tier_exposes_per_tier_embedder_identity ... FAILED
+thread 'in_memory::tests::constructor_embedder_identity_rules' (1911152) panicked at crates/frankensearch-index/src/in_memory.rs:1883:9:
+assertion `left == right` failed
+  left: None
+ right: Some("declared-model")
+thread 'in_memory::tests::in_memory_two_tier_exposes_per_tier_embedder_identity' (1911154) panicked at crates/frankensearch-index/src/in_memory.rs:1938:9:
+assertion `left == right` failed
+  left: None
+ right: Some("tier-fast-model")
+test result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 525 filtered out; finished in 0.00s
+EXIT_STATUS=101

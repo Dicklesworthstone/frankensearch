@@ -1,0 +1,22 @@
+=== RED-PROOF 3: verify_producer_conformance uncertified-rejection replaced with unconditional admit (same-space-is-sufficient resurrected) — working-tree mutation on top of HEAD 890e64c44a559ece8a7a26995a384614471ff7ef (branch codex/sandygrove-t2c1r2-20260731) ===
+ crates/frankensearch-core/src/types.rs | 4 ++++
+ 1 file changed, 4 insertions(+)
+running 1 test
+test types::tests::foreign_producer_admission_requires_conformance_certificate ... FAILED
+
+failures:
+
+---- types::tests::foreign_producer_admission_requires_conformance_certificate stdout ----
+
+thread 'types::tests::foreign_producer_admission_requires_conformance_certificate' (2122026) panicked at crates/frankensearch-core/src/types.rs:1041:14:
+uncertified foreign producer must be rejected: SameProducer
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    types::tests::foreign_producer_admission_requires_conformance_certificate
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1000 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p frankensearch-core --lib`
+EXIT_STATUS=101

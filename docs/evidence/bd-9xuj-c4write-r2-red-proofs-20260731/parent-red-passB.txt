@@ -1,0 +1,74 @@
+# Parent-red pass B — compile-red proof on frozen tip 868c0801
+#
+# Same git-archive tree as pass A, restored pristine, then ONLY the test
+# staged_generation_retains_admission_owners appended to the refresh.rs test
+# module. Command:
+#   cargo test -p frankensearch-fusion --lib -- --exact \
+#     refresh::tests::staged_generation_retains_admission_owners
+#
+# EXPECTED on the parent: E0599 — StagedIdentityBoundGeneration has no
+# fast_admitted_owner there because the r1 open peeled validated.index and
+# dropped the ValidatedFsviBytes owner (NO-GO item 3).
+
+warning: use of deprecated method `wide::i16x8::mul_widen`: renamed to `widening_mul`
+    --> crates/frankensearch-index/src/simd.rs:1268:28
+     |
+1268 |         acc0 += w8::<0>(s).mul_widen(w8::<0>(q));
+     |                            ^^^^^^^^^
+     |
+     = note: `#[warn(deprecated)]` on by default
+
+warning: use of deprecated method `wide::i16x8::mul_widen`: renamed to `widening_mul`
+    --> crates/frankensearch-index/src/simd.rs:1269:28
+     |
+1269 |         acc1 += w8::<8>(s).mul_widen(w8::<8>(q));
+     |                            ^^^^^^^^^
+
+warning: use of deprecated method `wide::i16x8::mul_widen`: renamed to `widening_mul`
+    --> crates/frankensearch-index/src/simd.rs:1270:29
+     |
+1270 |         acc2 += w8::<16>(s).mul_widen(w8::<16>(q));
+     |                             ^^^^^^^^^
+
+warning: use of deprecated method `wide::i16x8::mul_widen`: renamed to `widening_mul`
+    --> crates/frankensearch-index/src/simd.rs:1271:29
+     |
+1271 |         acc3 += w8::<24>(s).mul_widen(w8::<24>(q));
+     |                             ^^^^^^^^^
+
+warning: use of deprecated method `wide::i16x8::mul_widen`: renamed to `widening_mul`
+    --> crates/frankensearch-index/src/simd.rs:1279:46
+     |
+1279 |         sum += i16x8::from(s.map(i16::from)).mul_widen(i16x8::from(q.map(i16::from)));
+     |                                              ^^^^^^^^^
+
+warning: `frankensearch-index` (lib) generated 5 warnings
+   Compiling frankensearch-fusion v0.2.1 (/data/tmp/claude-1000/-data-projects-frankensearch/6ba18fed-10c5-4855-b287-a7067faf4133/scratchpad/parent-868c0801/crates/frankensearch-fusion)
+error[E0599]: no method named `fast_admitted_owner` found for struct `StagedIdentityBoundGeneration` in the current scope
+    --> crates/frankensearch-fusion/src/refresh.rs:3506:18
+     |
+ 639 |   pub struct StagedIdentityBoundGeneration {
+     |   ---------------------------------------- method `fast_admitted_owner` not found for this struct
+...
+3505 |               let owner = staged
+     |  _________________________-
+3506 | |                 .fast_admitted_owner()
+     | |                 -^^^^^^^^^^^^^^^^^^^ method not found in `StagedIdentityBoundGeneration`
+     | |_________________|
+     |
+
+error[E0599]: no method named `fast_admitted_owner` found for struct `StagedIdentityBoundGeneration` in the current scope
+    --> crates/frankensearch-fusion/src/refresh.rs:3525:18
+     |
+ 639 |   pub struct StagedIdentityBoundGeneration {
+     |   ---------------------------------------- method `fast_admitted_owner` not found for this struct
+...
+3524 |               let owner = staged
+     |  _________________________-
+3525 | |                 .fast_admitted_owner()
+     | |                 -^^^^^^^^^^^^^^^^^^^ method not found in `StagedIdentityBoundGeneration`
+     | |_________________|
+     |
+
+For more information about this error, try `rustc --explain E0599`.
+error: could not compile `frankensearch-fusion` (lib test) due to 2 previous errors

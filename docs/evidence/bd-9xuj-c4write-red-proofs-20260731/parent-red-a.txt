@@ -1,0 +1,64 @@
+=== bd-9xuj C4-write PARENT-RED transcript ===
+date: 2026-07-31T15:35:09-04:00
+tree: c73dbe8eabbd39774b0d096a24fe274401c8e4ea (feat(index): bd-9xuj C4-write — attested-vs-declared identity discriminator + )
+worktree status:
+?? crates/frankensearch-fusion/tests/c4write_parent_red.rs
+command: c4write-cargo.sh test -p frankensearch-fusion --test c4write_parent_red -- --nocapture
+   Compiling tracing-test-macro v0.2.6
+   Compiling frankensearch-embed v0.2.1 (/data/tmp/claude-1000/-data-projects-frankensearch/6ba18fed-10c5-4855-b287-a7067faf4133/scratchpad/t2-worktree/crates/frankensearch-embed)
+   Compiling frankensearch-core v0.2.1 (/data/tmp/claude-1000/-data-projects-frankensearch/6ba18fed-10c5-4855-b287-a7067faf4133/scratchpad/t2-worktree/crates/frankensearch-core)
+   Compiling tracing-test v0.2.6
+   Compiling frankensearch-index v0.2.1 (/data/tmp/claude-1000/-data-projects-frankensearch/6ba18fed-10c5-4855-b287-a7067faf4133/scratchpad/t2-worktree/crates/frankensearch-index)
+warning: use of deprecated method `wide::i16x8::mul_widen`: renamed to `widening_mul`
+    --> crates/frankensearch-index/src/simd.rs:1268:28
+     |
+1268 |         acc0 += w8::<0>(s).mul_widen(w8::<0>(q));
+     |                            ^^^^^^^^^
+     |
+     = note: `#[warn(deprecated)]` on by default
+
+warning: use of deprecated method `wide::i16x8::mul_widen`: renamed to `widening_mul`
+    --> crates/frankensearch-index/src/simd.rs:1269:28
+     |
+1269 |         acc1 += w8::<8>(s).mul_widen(w8::<8>(q));
+     |                            ^^^^^^^^^
+
+warning: use of deprecated method `wide::i16x8::mul_widen`: renamed to `widening_mul`
+    --> crates/frankensearch-index/src/simd.rs:1270:29
+     |
+1270 |         acc2 += w8::<16>(s).mul_widen(w8::<16>(q));
+     |                             ^^^^^^^^^
+
+warning: use of deprecated method `wide::i16x8::mul_widen`: renamed to `widening_mul`
+    --> crates/frankensearch-index/src/simd.rs:1271:29
+     |
+1271 |         acc3 += w8::<24>(s).mul_widen(w8::<24>(q));
+     |                             ^^^^^^^^^
+
+warning: use of deprecated method `wide::i16x8::mul_widen`: renamed to `widening_mul`
+    --> crates/frankensearch-index/src/simd.rs:1279:46
+     |
+1279 |         sum += i16x8::from(s.map(i16::from)).mul_widen(i16x8::from(q.map(i16::from)));
+     |                                              ^^^^^^^^^
+
+   Compiling frankensearch-fusion v0.2.1 (/data/tmp/claude-1000/-data-projects-frankensearch/6ba18fed-10c5-4855-b287-a7067faf4133/scratchpad/t2-worktree/crates/frankensearch-fusion)
+warning: `frankensearch-index` (lib) generated 5 warnings
+warning: constant `TELEMETRY_TIMESTAMP_FALLBACK_RFC3339` is never used
+    --> crates/frankensearch-fusion/src/searcher.rs:2833:7
+     |
+2833 | const TELEMETRY_TIMESTAMP_FALLBACK_RFC3339: &str = "1970-01-01T00:00:00Z";
+     |       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: `frankensearch-fusion` (lib) generated 1 warning
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 23.38s
+     Running tests/c4write_parent_red.rs (/data/projects/frankensearch/target/debug/deps/c4write_parent_red-dee1d334c57c0c2d)
+
+running 1 test
+PARENT-RED refusal: IndexVersionMismatch { expected: 1, found: 2 }
+test same_producer_live_v2_generation_is_refused_pre_slice ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.20s
+
+EXIT_STATUS=0

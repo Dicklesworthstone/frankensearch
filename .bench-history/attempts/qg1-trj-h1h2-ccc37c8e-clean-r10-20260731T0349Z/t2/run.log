@@ -1,0 +1,854 @@
+bench_elf_sha256=53ab4c0975f0ad2148e37f35641dfd56e78acd8048d01cdb8b1194aa8ab9b637 (84321352 bytes) /tmp/frankensearch-qg1-ccc37c8e/bin/perf_matrix-clean-53ab4c0975f0ad21
+[quill-perf-oracle] incumbent=tantivy linked_runtime=tantivy v0.26.1, index_format v7 contract_version=0.26.1 lexical=frankensearch-lexical@0.2.1 lexical_git=062a5e5b2d41653b1c8b07888eda1a765e421f49
+[qg-fixture-preflight] manifest=docs/contracts/quill-perf-gates.toml fixture=bulk/xlarge/2/positions_on schema=frankensearch-default-v1 operator=bare_term positions=positions_on threads=2 status=ok hits=2
+[quill-perf-policy] warmup_rounds=1
+[quill-perf-timing-mode] mode=continuous
+[quill-work-receipts] mode=on
+[quill-perf-execution-provenance] {"host_identity":"threadripperje","producer_os":"linux","physical_cores":64,"logical_threads":128,"process_available_threads":128,"configured_engine_thread_widths":[2],"runtime_detected_isa":["aes","avx2","bmi2","fma","vaes"],"cpu_affinity_allowed_list":"0-127","affinity_or_cpuset_cap":null}
+[qg1-continuous-corpus] fixture=bulk/xlarge/2/positions_on identity=qg1-native/prepared-prefix-v1/b9840b4df07535f8908563bfc6b9c627f7e27edbafd6cbc6483a32a70d3c9f76 docs=1000000 bytes=1168088519 xxh3=b2b049593f55d93a
+[qg1-work-receipt] run_id=qg1-trj-h1h2-ccc37c8e-clean-r10-20260731T0349Z-t2 pid=2838905 ppid=2810628 machine=linux-x86_64-thr profile=release-perf elf=53ab4c0975f0ad21 git=ccc37c8e611cd313 gate=QG-1 fixture=bulk/xlarge/2/positions_on metric=docs_per_second arm=tantivy mode=continuous corpus=0a77def1cf79d6e5 wall_ns=10014892677 configured=2 roles=bench_caller:1,tantivy_index_worker:4,tantivy_segment_updater:1,tantivy_merge_worker:4,tantivy_docstore_compressor:4,asupersync_runtime:1 mean_active=2618m queue=unobservable join=tantivy_workers_joined drained=true pending_zero=true terminal=completed retryable=false digest=fe6afe929072df95
+[qg-commit-parity] gate=QG-1 fixture=bulk/xlarge/2/positions_on arm=tantivy cadence_ms=1000 periodic_commits=6 terminal_commit_calls=1 durability=in_memory timing_mode=continuous
+[qg1-continuous] fixture=bulk/xlarge/2/positions_on arm=tantivy docs=1000000 accepted_bytes=1168088519 processed_bytes=1168088519 window_ns=10014892677 percall_sum_ns=9924141780 feed_calls=200 periodic_commits=6 committed=1000000 searchable=1000000 probe=singleton probe_hits=1 quiescence=tantivy_merging_threads_joined manifest_sha256=0a77def1cf79d6e576bf782250158b09ac49a824796b5ce6e8cee84b4a231d70 indexed_content_sha256=b9840b4df07535f8908563bfc6b9c627f7e27edbafd6cbc6483a32a70d3c9f76
+[qg1-work-receipt] run_id=qg1-trj-h1h2-ccc37c8e-clean-r10-20260731T0349Z-t2 pid=2838905 ppid=2810628 machine=linux-x86_64-thr profile=release-perf elf=53ab4c0975f0ad21 git=ccc37c8e611cd313 gate=QG-1 fixture=bulk/xlarge/2/positions_on metric=docs_per_second arm=tantivy mode=continuous corpus=0a77def1cf79d6e5 wall_ns=8975211208 configured=2 roles=bench_caller:1,tantivy_index_worker:4,tantivy_segment_updater:1,tantivy_merge_worker:4,tantivy_docstore_compressor:3,asupersync_runtime:1,unattributed:1 mean_active=2838m queue=unobservable join=tantivy_workers_joined drained=true pending_zero=true terminal=completed retryable=false digest=3ce37c1d9fe3e9b9
+[qg-commit-parity] gate=QG-1 fixture=bulk/xlarge/2/positions_on arm=tantivy cadence_ms=1000 periodic_commits=6 terminal_commit_calls=1 durability=in_memory timing_mode=continuous
+[qg1-continuous] fixture=bulk/xlarge/2/positions_on arm=tantivy docs=1000000 accepted_bytes=1168088519 processed_bytes=1168088519 window_ns=8975211208 percall_sum_ns=8885202854 feed_calls=200 periodic_commits=6 committed=1000000 searchable=1000000 probe=singleton probe_hits=1 quiescence=tantivy_merging_threads_joined manifest_sha256=0a77def1cf79d6e576bf782250158b09ac49a824796b5ce6e8cee84b4a231d70 indexed_content_sha256=b9840b4df07535f8908563bfc6b9c627f7e27edbafd6cbc6483a32a70d3c9f76
+[qg1-work-receipt] run_id=qg1-trj-h1h2-ccc37c8e-clean-r10-20260731T0349Z-t2 pid=2838905 ppid=2810628 machine=linux-x86_64-thr profile=release-perf elf=53ab4c0975f0ad21 git=ccc37c8e611cd313 gate=QG-1 fixture=bulk/xlarge/2/positions_on metric=docs_per_second arm=tantivy mode=continuous corpus=0a77def1cf79d6e5 wall_ns=9489009955 configured=2 roles=bench_caller:1,tantivy_index_worker:4,tantivy_segment_updater:1,tantivy_merge_worker:4,tantivy_docstore_compressor:3,asupersync_runtime:1,unattributed:2 mean_active=2675m queue=unobservable join=tantivy_workers_joined drained=true pending_zero=true terminal=completed retryable=false digest=ea9e78316d3ed273
+[qg-commit-parity] gate=QG-1 fixture=bulk/xlarge/2/positions_on arm=tantivy cadence_ms=1000 periodic_commits=6 terminal_commit_calls=1 durability=in_memory timing_mode=continuous
+[qg1-continuous] fixture=bulk/xlarge/2/positions_on arm=tantivy docs=1000000 accepted_bytes=1168088519 processed_bytes=1168088519 window_ns=9489009955 percall_sum_ns=9349236301 feed_calls=200 periodic_commits=6 committed=1000000 searchable=1000000 probe=singleton probe_hits=1 quiescence=tantivy_merging_threads_joined manifest_sha256=0a77def1cf79d6e576bf782250158b09ac49a824796b5ce6e8cee84b4a231d70 indexed_content_sha256=b9840b4df07535f8908563bfc6b9c627f7e27edbafd6cbc6483a32a70d3c9f76
+[qg1-work-receipt] run_id=qg1-trj-h1h2-ccc37c8e-clean-r10-20260731T0349Z-t2 pid=2838905 ppid=2810628 machine=linux-x86_64-thr profile=release-perf elf=53ab4c0975f0ad21 git=ccc37c8e611cd313 gate=QG-1 fixture=bulk/xlarge/2/positions_on metric=docs_per_second arm=tantivy mode=continuous corpus=0a77def1cf79d6e5 wall_ns=9531906493 configured=2 roles=bench_caller:1,tantivy_index_worker:4,tantivy_segment_updater:1,tantivy_merge_worker:4,tantivy_docstore_compressor:3,asupersync_runtime:1,unattributed:2 mean_active=2666m queue=unobservable join=tantivy_workers_joined drained=true pending_zero=true terminal=completed retryable=false digest=ff2ef77a371b32b6
+[qg-commit-parity] gate=QG-1 fixture=bulk/xlarge/2/positions_on arm=tantivy cadence_ms=1000 periodic_commits=6 terminal_commit_calls=1 durability=in_memory timing_mode=continuous
+[qg1-continuous] fixture=bulk/xlarge/2/positions_on arm=tantivy docs=1000000 accepted_bytes=1168088519 processed_bytes=1168088519 window_ns=9531906493 percall_sum_ns=9443297639 feed_calls=200 periodic_commits=6 committed=1000000 searchable=1000000 probe=singleton probe_hits=1 quiescence=tantivy_merging_threads_joined manifest_sha256=0a77def1cf79d6e576bf782250158b09ac49a824796b5ce6e8cee84b4a231d70 indexed_content_sha256=b9840b4df07535f8908563bfc6b9c627f7e27edbafd6cbc6483a32a70d3c9f76
+[qg1-work-receipt] run_id=qg1-trj-h1h2-ccc37c8e-clean-r10-20260731T0349Z-t2 pid=2838905 ppid=2810628 machine=linux-x86_64-thr profile=release-perf elf=53ab4c0975f0ad21 git=ccc37c8e611cd313 gate=QG-1 fixture=bulk/xlarge/2/positions_on metric=docs_per_second arm=tantivy mode=continuous corpus=0a77def1cf79d6e5 wall_ns=9270336023 configured=2 roles=bench_caller:1,tantivy_index_worker:4,tantivy_segment_updater:1,tantivy_merge_worker:4,tantivy_docstore_compressor:4,asupersync_runtime:1,unattributed:1 mean_active=2751m queue=unobservable join=tantivy_workers_joined drained=true pending_zero=true terminal=completed retryable=false digest=f8d9baa19ff9494a
+[qg-commit-parity] gate=QG-1 fixture=bulk/xlarge/2/positions_on arm=tantivy cadence_ms=1000 periodic_commits=6 terminal_commit_calls=1 durability=in_memory timing_mode=continuous
+[qg1-continuous] fixture=bulk/xlarge/2/positions_on arm=tantivy docs=1000000 accepted_bytes=1168088519 processed_bytes=1168088519 window_ns=9270336023 percall_sum_ns=9138753235 feed_calls=200 periodic_commits=6 committed=1000000 searchable=1000000 probe=singleton probe_hits=1 quiescence=tantivy_merging_threads_joined manifest_sha256=0a77def1cf79d6e576bf782250158b09ac49a824796b5ce6e8cee84b4a231d70 indexed_content_sha256=b9840b4df07535f8908563bfc6b9c627f7e27edbafd6cbc6483a32a70d3c9f76
+[qg1-work-receipt] run_id=qg1-trj-h1h2-ccc37c8e-clean-r10-20260731T0349Z-t2 pid=2838905 ppid=2810628 machine=linux-x86_64-thr profile=release-perf elf=53ab4c0975f0ad21 git=ccc37c8e611cd313 gate=QG-1 fixture=bulk/xlarge/2/positions_on metric=docs_per_second arm=tantivy mode=continuous corpus=0a77def1cf79d6e5 wall_ns=10474980848 configured=2 roles=bench_caller:1,tantivy_index_worker:4,tantivy_segment_updater:1,tantivy_merge_worker:4,tantivy_docstore_compressor:4,asupersync_runtime:1,unattributed:1 mean_active=2595m queue=unobservable join=tantivy_workers_joined drained=true pending_zero=true terminal=completed retryable=false digest=cdc278c9b7c69a8e
+[qg-commit-parity] gate=QG-1 fixture=bulk/xlarge/2/positions_on arm=tantivy cadence_ms=1000 periodic_commits=6 terminal_commit_calls=1 durability=in_memory timing_mode=continuous
+[qg1-continuous] fixture=bulk/xlarge/2/positions_on arm=tantivy docs=1000000 accepted_bytes=1168088519 processed_bytes=1168088519 window_ns=10474980848 percall_sum_ns=10386810142 feed_calls=200 periodic_commits=6 committed=1000000 searchable=1000000 probe=singleton probe_hits=1 quiescence=tantivy_merging_threads_joined manifest_sha256=0a77def1cf79d6e576bf782250158b09ac49a824796b5ce6e8cee84b4a231d70 indexed_content_sha256=b9840b4df07535f8908563bfc6b9c627f7e27edbafd6cbc6483a32a70d3c9f76
+[qg1-work-receipt] run_id=qg1-trj-h1h2-ccc37c8e-clean-r10-20260731T0349Z-t2 pid=2838905 ppid=2810628 machine=linux-x86_64-thr profile=release-perf elf=53ab4c0975f0ad21 git=ccc37c8e611cd313 gate=QG-1 fixture=bulk/xlarge/2/positions_on metric=docs_per_second arm=tantivy mode=continuous corpus=0a77def1cf79d6e5 wall_ns=9368427884 configured=2 roles=bench_caller:1,tantivy_index_worker:4,tantivy_segment_updater:1,tantivy_merge_worker:4,tantivy_docstore_compressor:3,asupersync_runtime:1,unattributed:1 mean_active=2714m queue=unobservable join=tantivy_workers_joined drained=true pending_zero=true terminal=completed retryable=false digest=b7d412f429e50799
+[qg-commit-parity] gate=QG-1 fixture=bulk/xlarge/2/positions_on arm=tantivy cadence_ms=1000 periodic_commits=6 terminal_commit_calls=1 durability=in_memory timing_mode=continuous
+[qg1-continuous] fixture=bulk/xlarge/2/positions_on arm=tantivy docs=1000000 accepted_bytes=1168088519 processed_bytes=1168088519 window_ns=9368427884 percall_sum_ns=9235188778 feed_calls=200 periodic_commits=6 committed=1000000 searchable=1000000 probe=singleton probe_hits=1 quiescence=tantivy_merging_threads_joined manifest_sha256=0a77def1cf79d6e576bf782250158b09ac49a824796b5ce6e8cee84b4a231d70 indexed_content_sha256=b9840b4df07535f8908563bfc6b9c627f7e27edbafd6cbc6483a32a70d3c9f76
+[qg1-work-receipt] run_id=qg1-trj-h1h2-ccc37c8e-clean-r10-20260731T0349Z-t2 pid=2838905 ppid=2810628 machine=linux-x86_64-thr profile=release-perf elf=53ab4c0975f0ad21 git=ccc37c8e611cd313 gate=QG-1 fixture=bulk/xlarge/2/positions_on metric=docs_per_second arm=tantivy mode=continuous corpus=0a77def1cf79d6e5 wall_ns=9939556842 configured=2 roles=bench_caller:1,tantivy_index_worker:4,tantivy_segment_updater:1,tantivy_merge_worker:4,tantivy_docstore_compressor:4,asupersync_runtime:1,unattributed:2 mean_active=2596m queue=unobservable join=tantivy_workers_joined drained=true pending_zero=true terminal=completed retryable=false digest=c479112173f93feb
+[qg-commit-parity] gate=QG-1 fixture=bulk/xlarge/2/positions_on arm=tantivy cadence_ms=1000 periodic_commits=6 terminal_commit_calls=1 durability=in_memory timing_mode=continuous
+[qg1-continuous] fixture=bulk/xlarge/2/positions_on arm=tantivy docs=1000000 accepted_bytes=1168088519 processed_bytes=1168088519 window_ns=9939556842 percall_sum_ns=9798849275 feed_calls=200 periodic_commits=6 committed=1000000 searchable=1000000 probe=singleton probe_hits=1 quiescence=tantivy_merging_threads_joined manifest_sha256=0a77def1cf79d6e576bf782250158b09ac49a824796b5ce6e8cee84b4a231d70 indexed_content_sha256=b9840b4df07535f8908563bfc6b9c627f7e27edbafd6cbc6483a32a70d3c9f76
+[qg1-work-receipt] run_id=qg1-trj-h1h2-ccc37c8e-clean-r10-20260731T0349Z-t2 pid=2838905 ppid=2810628 machine=linux-x86_64-thr profile=release-perf elf=53ab4c0975f0ad21 git=ccc37c8e611cd313 gate=QG-1 fixture=bulk/xlarge/2/positions_on metric=docs_per_second arm=tantivy mode=continuous corpus=0a77def1cf79d6e5 wall_ns=9789181976 configured=2 roles=bench_caller:1,tantivy_index_worker:4,tantivy_segment_updater:1,tantivy_merge_worker:4,tantivy_docstore_compressor:4,asupersync_runtime:1,unattributed:1 mean_active=2635m queue=unobservable join=tantivy_workers_joined drained=true pending_zero=true terminal=completed retryable=false digest=0660451047d6c73f
+[qg-commit-parity] gate=QG-1 fixture=bulk/xlarge/2/positions_on arm=tantivy cadence_ms=1000 periodic_commits=6 terminal_commit_calls=1 durability=in_memory timing_mode=continuous
+[qg1-continuous] fixture=bulk/xlarge/2/positions_on arm=tantivy docs=1000000 accepted_bytes=1168088519 processed_bytes=1168088519 window_ns=9789181976 percall_sum_ns=9699647339 feed_calls=200 periodic_commits=6 committed=1000000 searchable=1000000 probe=singleton probe_hits=1 quiescence=tantivy_merging_threads_joined manifest_sha256=0a77def1cf79d6e576bf782250158b09ac49a824796b5ce6e8cee84b4a231d70 indexed_content_sha256=b9840b4df07535f8908563bfc6b9c627f7e27edbafd6cbc6483a32a70d3c9f76
+[qg1-work-receipt] run_id=qg1-trj-h1h2-ccc37c8e-clean-r10-20260731T0349Z-t2 pid=2838905 ppid=2810628 machine=linux-x86_64-thr profile=release-perf elf=53ab4c0975f0ad21 git=ccc37c8e611cd313 gate=QG-1 fixture=bulk/xlarge/2/positions_on metric=docs_per_second arm=tantivy mode=continuous corpus=0a77def1cf79d6e5 wall_ns=9480538161 configured=2 roles=bench_caller:1,tantivy_index_worker:4,tantivy_segment_updater:1,tantivy_merge_worker:4,tantivy_docstore_compressor:3,asupersync_runtime:1,unattributed:1 mean_active=2690m queue=unobservable join=tantivy_workers_joined drained=true pending_zero=true terminal=completed retryable=false digest=9f7a0f1f73d1170d
+[qg-commit-parity] gate=QG-1 fixture=bulk/xlarge/2/positions_on arm=tantivy cadence_ms=1000 periodic_commits=6 terminal_commit_calls=1 durability=in_memory timing_mode=continuous
+[qg1-continuous] fixture=bulk/xlarge/2/positions_on arm=tantivy docs=1000000 accepted_bytes=1168088519 processed_bytes=1168088519 window_ns=9480538161 percall_sum_ns=9390796266 feed_calls=200 periodic_commits=6 committed=1000000 searchable=1000000 probe=singleton probe_hits=1 quiescence=tantivy_merging_threads_joined manifest_sha256=0a77def1cf79d6e576bf782250158b09ac49a824796b5ce6e8cee84b4a231d70 indexed_content_sha256=b9840b4df07535f8908563bfc6b9c627f7e27edbafd6cbc6483a32a70d3c9f76
+[qg1-work-receipt] run_id=qg1-trj-h1h2-ccc37c8e-clean-r10-20260731T0349Z-t2 pid=2838905 ppid=2810628 machine=linux-x86_64-thr profile=release-perf elf=53ab4c0975f0ad21 git=ccc37c8e611cd313 gate=QG-1 fixture=bulk/xlarge/2/positions_on metric=docs_per_second arm=tantivy mode=continuous corpus=0a77def1cf79d6e5 wall_ns=10160649560 configured=2 roles=bench_caller:1,tantivy_index_worker:4,tantivy_segment_updater:1,tantivy_merge_worker:4,tantivy_docstore_compressor:3,asupersync_runtime:1,unattributed:1 mean_active=2628m queue=unobservable join=tantivy_workers_joined drained=true pending_zero=true terminal=completed retryable=false digest=5a0398f08c414b57
+[qg-commit-parity] gate=QG-1 fixture=bulk/xlarge/2/positions_on arm=tantivy cadence_ms=1000 periodic_commits=6 terminal_commit_calls=1 durability=in_memory timing_mode=continuous
+[qg1-continuous] fixture=bulk/xlarge/2/positions_on arm=tantivy docs=1000000 accepted_bytes=1168088519 processed_bytes=1168088519 window_ns=10160649560 percall_sum_ns=10021856269 feed_calls=200 periodic_commits=6 committed=1000000 searchable=1000000 probe=singleton probe_hits=1 quiescence=tantivy_merging_threads_joined manifest_sha256=0a77def1cf79d6e576bf782250158b09ac49a824796b5ce6e8cee84b4a231d70 indexed_content_sha256=b9840b4df07535f8908563bfc6b9c627f7e27edbafd6cbc6483a32a70d3c9f76
+[qg1-work-receipt] run_id=qg1-trj-h1h2-ccc37c8e-clean-r10-20260731T0349Z-t2 pid=2838905 ppid=2810628 machine=linux-x86_64-thr profile=release-perf elf=53ab4c0975f0ad21 git=ccc37c8e611cd313 gate=QG-1 fixture=bulk/xlarge/2/positions_on metric=docs_per_second arm=tantivy mode=continuous corpus=0a77def1cf79d6e5 wall_ns=9754067111 configured=2 roles=bench_caller:1,tantivy_index_worker:4,tantivy_segment_updater:1,tantivy_merge_worker:4,tantivy_docstore_compressor:2,asupersync_runtime:1 mean_active=2632m queue=unobservable join=tantivy_workers_joined drained=true pending_zero=true terminal=completed retryable=false digest=b47f357caf279544
+[qg-commit-parity] gate=QG-1 fixture=bulk/xlarge/2/positions_on arm=tantivy cadence_ms=1000 periodic_commits=6 terminal_commit_calls=1 durability=in_memory timing_mode=continuous
+[qg1-continuous] fixture=bulk/xlarge/2/positions_on arm=tantivy docs=1000000 accepted_bytes=1168088519 processed_bytes=1168088519 window_ns=9754067111 percall_sum_ns=9665471944 feed_calls=200 periodic_commits=6 committed=1000000 searchable=1000000 probe=singleton probe_hits=1 quiescence=tantivy_merging_threads_joined manifest_sha256=0a77def1cf79d6e576bf782250158b09ac49a824796b5ce6e8cee84b4a231d70 indexed_content_sha256=b9840b4df07535f8908563bfc6b9c627f7e27edbafd6cbc6483a32a70d3c9f76
+[qg1-work-receipt] run_id=qg1-trj-h1h2-ccc37c8e-clean-r10-20260731T0349Z-t2 pid=2838905 ppid=2810628 machine=linux-x86_64-thr profile=release-perf elf=53ab4c0975f0ad21 git=ccc37c8e611cd313 gate=QG-1 fixture=bulk/xlarge/2/positions_on metric=docs_per_second arm=tantivy mode=continuous corpus=0a77def1cf79d6e5 wall_ns=10144796282 configured=2 roles=bench_caller:1,tantivy_index_worker:4,tantivy_segment_updater:1,tantivy_merge_worker:4,tantivy_docstore_compressor:4,asupersync_runtime:1,unattributed:1 mean_active=2638m queue=unobservable join=tantivy_workers_joined drained=true pending_zero=true terminal=completed retryable=false digest=6dde81c9f034e134
+[qg-commit-parity] gate=QG-1 fixture=bulk/xlarge/2/positions_on arm=tantivy cadence_ms=1000 periodic_commits=6 terminal_commit_calls=1 durability=in_memory timing_mode=continuous
+[qg1-continuous] fixture=bulk/xlarge/2/positions_on arm=tantivy docs=1000000 accepted_bytes=1168088519 processed_bytes=1168088519 window_ns=10144796282 percall_sum_ns=10016200017 feed_calls=200 periodic_commits=6 committed=1000000 searchable=1000000 probe=singleton probe_hits=1 quiescence=tantivy_merging_threads_joined manifest_sha256=0a77def1cf79d6e576bf782250158b09ac49a824796b5ce6e8cee84b4a231d70 indexed_content_sha256=b9840b4df07535f8908563bfc6b9c627f7e27edbafd6cbc6483a32a70d3c9f76
+[qg1-work-receipt] run_id=qg1-trj-h1h2-ccc37c8e-clean-r10-20260731T0349Z-t2 pid=2838905 ppid=2810628 machine=linux-x86_64-thr profile=release-perf elf=53ab4c0975f0ad21 git=ccc37c8e611cd313 gate=QG-1 fixture=bulk/xlarge/2/positions_on metric=docs_per_second arm=tantivy mode=continuous corpus=0a77def1cf79d6e5 wall_ns=9751942645 configured=2 roles=bench_caller:1,tantivy_index_worker:4,tantivy_segment_updater:1,tantivy_merge_worker:4,tantivy_docstore_compressor:3,asupersync_runtime:1,unattributed:1 mean_active=2665m queue=unobservable join=tantivy_workers_joined drained=true pending_zero=true terminal=completed retryable=false digest=f7c6dfcc15add552
+[qg-commit-parity] gate=QG-1 fixture=bulk/xlarge/2/positions_on arm=tantivy cadence_ms=1000 periodic_commits=6 terminal_commit_calls=1 durability=in_memory timing_mode=continuous
+[qg1-continuous] fixture=bulk/xlarge/2/positions_on arm=tantivy docs=1000000 accepted_bytes=1168088519 processed_bytes=1168088519 window_ns=9751942645 percall_sum_ns=9661039848 feed_calls=200 periodic_commits=6 committed=1000000 searchable=1000000 probe=singleton probe_hits=1 quiescence=tantivy_merging_threads_joined manifest_sha256=0a77def1cf79d6e576bf782250158b09ac49a824796b5ce6e8cee84b4a231d70 indexed_content_sha256=b9840b4df07535f8908563bfc6b9c627f7e27edbafd6cbc6483a32a70d3c9f76
+[qg1-work-receipt] run_id=qg1-trj-h1h2-ccc37c8e-clean-r10-20260731T0349Z-t2 pid=2838905 ppid=2810628 machine=linux-x86_64-thr profile=release-perf elf=53ab4c0975f0ad21 git=ccc37c8e611cd313 gate=QG-1 fixture=bulk/xlarge/2/positions_on metric=docs_per_second arm=tantivy mode=continuous corpus=0a77def1cf79d6e5 wall_ns=10151398548 configured=2 roles=bench_caller:1,tantivy_index_worker:4,tantivy_segment_updater:1,tantivy_merge_worker:4,tantivy_docstore_compressor:4,asupersync_runtime:1,unattributed:2 mean_active=2540m queue=unobservable join=tantivy_workers_joined drained=true pending_zero=true terminal=completed retryable=false digest=abcc24cac133ef3e
+[qg-commit-parity] gate=QG-1 fixture=bulk/xlarge/2/positions_on arm=tantivy cadence_ms=1000 periodic_commits=6 terminal_commit_calls=1 durability=in_memory timing_mode=continuous
+[qg1-continuous] fixture=bulk/xlarge/2/positions_on arm=tantivy docs=1000000 accepted_bytes=1168088519 processed_bytes=1168088519 window_ns=10151398548 percall_sum_ns=10020927942 feed_calls=200 periodic_commits=6 committed=1000000 searchable=1000000 probe=singleton probe_hits=1 quiescence=tantivy_merging_threads_joined manifest_sha256=0a77def1cf79d6e576bf782250158b09ac49a824796b5ce6e8cee84b4a231d70 indexed_content_sha256=b9840b4df07535f8908563bfc6b9c627f7e27edbafd6cbc6483a32a70d3c9f76
+[qg1-work-receipt] run_id=qg1-trj-h1h2-ccc37c8e-clean-r10-20260731T0349Z-t2 pid=2838905 ppid=2810628 machine=linux-x86_64-thr profile=release-perf elf=53ab4c0975f0ad21 git=ccc37c8e611cd313 gate=QG-1 fixture=bulk/xlarge/2/positions_on metric=docs_per_second arm=tantivy mode=continuous corpus=0a77def1cf79d6e5 wall_ns=9794212660 configured=2 roles=bench_caller:1,tantivy_index_worker:4,tantivy_segment_updater:1,tantivy_merge_worker:4,tantivy_docstore_compressor:4,asupersync_runtime:1,unattributed:1 mean_active=2642m queue=unobservable join=tantivy_workers_joined drained=true pending_zero=true terminal=completed retryable=false digest=c9a43f83bd79ce1b
+[qg-commit-parity] gate=QG-1 fixture=bulk/xlarge/2/positions_on arm=tantivy cadence_ms=1000 periodic_commits=6 terminal_commit_calls=1 durability=in_memory timing_mode=continuous
+[qg1-continuous] fixture=bulk/xlarge/2/positions_on arm=tantivy docs=1000000 accepted_bytes=1168088519 processed_bytes=1168088519 window_ns=9794212660 percall_sum_ns=9665703072 feed_calls=200 periodic_commits=6 committed=1000000 searchable=1000000 probe=singleton probe_hits=1 quiescence=tantivy_merging_threads_joined manifest_sha256=0a77def1cf79d6e576bf782250158b09ac49a824796b5ce6e8cee84b4a231d70 indexed_content_sha256=b9840b4df07535f8908563bfc6b9c627f7e27edbafd6cbc6483a32a70d3c9f76
+[qg1-work-receipt] run_id=qg1-trj-h1h2-ccc37c8e-clean-r10-20260731T0349Z-t2 pid=2838905 ppid=2810628 machine=linux-x86_64-thr profile=release-perf elf=53ab4c0975f0ad21 git=ccc37c8e611cd313 gate=QG-1 fixture=bulk/xlarge/2/positions_on metric=docs_per_second arm=tantivy mode=continuous corpus=0a77def1cf79d6e5 wall_ns=9516892486 configured=2 roles=bench_caller:1,tantivy_index_worker:4,tantivy_segment_updater:1,tantivy_merge_worker:4,tantivy_docstore_compressor:4,asupersync_runtime:1,unattributed:1 mean_active=2727m queue=unobservable join=tantivy_workers_joined drained=true pending_zero=true terminal=completed retryable=false digest=40b4719534f0539e
+[qg-commit-parity] gate=QG-1 fixture=bulk/xlarge/2/positions_on arm=tantivy cadence_ms=1000 periodic_commits=6 terminal_commit_calls=1 durability=in_memory timing_mode=continuous
+[qg1-continuous] fixture=bulk/xlarge/2/positions_on arm=tantivy docs=1000000 accepted_bytes=1168088519 processed_bytes=1168088519 window_ns=9516892486 percall_sum_ns=9380534049 feed_calls=200 periodic_commits=6 committed=1000000 searchable=1000000 probe=singleton probe_hits=1 quiescence=tantivy_merging_threads_joined manifest_sha256=0a77def1cf79d6e576bf782250158b09ac49a824796b5ce6e8cee84b4a231d70 indexed_content_sha256=b9840b4df07535f8908563bfc6b9c627f7e27edbafd6cbc6483a32a70d3c9f76
+[qg1-work-receipt] run_id=qg1-trj-h1h2-ccc37c8e-clean-r10-20260731T0349Z-t2 pid=2838905 ppid=2810628 machine=linux-x86_64-thr profile=release-perf elf=53ab4c0975f0ad21 git=ccc37c8e611cd313 gate=QG-1 fixture=bulk/xlarge/2/positions_on metric=docs_per_second arm=tantivy mode=continuous corpus=0a77def1cf79d6e5 wall_ns=10184809914 configured=2 roles=bench_caller:1,tantivy_index_worker:4,tantivy_segment_updater:1,tantivy_merge_worker:4,tantivy_docstore_compressor:4,asupersync_runtime:1,unattributed:1 mean_active=2592m queue=unobservable join=tantivy_workers_joined drained=true pending_zero=true terminal=completed retryable=false digest=26078fbf6fbc0108
+[qg-commit-parity] gate=QG-1 fixture=bulk/xlarge/2/positions_on arm=tantivy cadence_ms=1000 periodic_commits=6 terminal_commit_calls=1 durability=in_memory timing_mode=continuous
+[qg1-continuous] fixture=bulk/xlarge/2/positions_on arm=tantivy docs=1000000 accepted_bytes=1168088519 processed_bytes=1168088519 window_ns=10184809914 percall_sum_ns=10095513237 feed_calls=200 periodic_commits=6 committed=1000000 searchable=1000000 probe=singleton probe_hits=1 quiescence=tantivy_merging_threads_joined manifest_sha256=0a77def1cf79d6e576bf782250158b09ac49a824796b5ce6e8cee84b4a231d70 indexed_content_sha256=b9840b4df07535f8908563bfc6b9c627f7e27edbafd6cbc6483a32a70d3c9f76
+[qg1-work-receipt] run_id=qg1-trj-h1h2-ccc37c8e-clean-r10-20260731T0349Z-t2 pid=2838905 ppid=2810628 machine=linux-x86_64-thr profile=release-perf elf=53ab4c0975f0ad21 git=ccc37c8e611cd313 gate=QG-1 fixture=bulk/xlarge/2/positions_on metric=docs_per_second arm=tantivy mode=continuous corpus=0a77def1cf79d6e5 wall_ns=9813441145 configured=2 roles=bench_caller:1,tantivy_index_worker:4,tantivy_segment_updater:1,tantivy_merge_worker:4,tantivy_docstore_compressor:2,asupersync_runtime:1 mean_active=2691m queue=unobservable join=tantivy_workers_joined drained=true pending_zero=true terminal=completed retryable=false digest=c2496c3ddc1557cb
+[qg-commit-parity] gate=QG-1 fixture=bulk/xlarge/2/positions_on arm=tantivy cadence_ms=1000 periodic_commits=6 terminal_commit_calls=1 durability=in_memory timing_mode=continuous
+[qg1-continuous] fixture=bulk/xlarge/2/positions_on arm=tantivy docs=1000000 accepted_bytes=1168088519 processed_bytes=1168088519 window_ns=9813441145 percall_sum_ns=9679960892 feed_calls=200 periodic_commits=6 committed=1000000 searchable=1000000 probe=singleton probe_hits=1 quiescence=tantivy_merging_threads_joined manifest_sha256=0a77def1cf79d6e576bf782250158b09ac49a824796b5ce6e8cee84b4a231d70 indexed_content_sha256=b9840b4df07535f8908563bfc6b9c627f7e27edbafd6cbc6483a32a70d3c9f76
+[qg1-work-receipt] run_id=qg1-trj-h1h2-ccc37c8e-clean-r10-20260731T0349Z-t2 pid=2838905 ppid=2810628 machine=linux-x86_64-thr profile=release-perf elf=53ab4c0975f0ad21 git=ccc37c8e611cd313 gate=QG-1 fixture=bulk/xlarge/2/positions_on metric=docs_per_second arm=tantivy mode=continuous corpus=0a77def1cf79d6e5 wall_ns=9923870205 configured=2 roles=bench_caller:1,tantivy_index_worker:4,tantivy_segment_updater:1,tantivy_merge_worker:4,tantivy_docstore_compressor:4,asupersync_runtime:1,unattributed:2 mean_active=2588m queue=unobservable join=tantivy_workers_joined drained=true pending_zero=true terminal=completed retryable=false digest=00ff45ca0690aa02
+[qg-commit-parity] gate=QG-1 fixture=bulk/xlarge/2/positions_on arm=tantivy cadence_ms=1000 periodic_commits=6 terminal_commit_calls=1 durability=in_memory timing_mode=continuous
+[qg1-continuous] fixture=bulk/xlarge/2/positions_on arm=tantivy docs=1000000 accepted_bytes=1168088519 processed_bytes=1168088519 window_ns=9923870205 percall_sum_ns=9790357847 feed_calls=200 periodic_commits=6 committed=1000000 searchable=1000000 probe=singleton probe_hits=1 quiescence=tantivy_merging_threads_joined manifest_sha256=0a77def1cf79d6e576bf782250158b09ac49a824796b5ce6e8cee84b4a231d70 indexed_content_sha256=b9840b4df07535f8908563bfc6b9c627f7e27edbafd6cbc6483a32a70d3c9f76
+[qg1-work-receipt] run_id=qg1-trj-h1h2-ccc37c8e-clean-r10-20260731T0349Z-t2 pid=2838905 ppid=2810628 machine=linux-x86_64-thr profile=release-perf elf=53ab4c0975f0ad21 git=ccc37c8e611cd313 gate=QG-1 fixture=bulk/xlarge/2/positions_on metric=docs_per_second arm=tantivy mode=continuous corpus=0a77def1cf79d6e5 wall_ns=10047149523 configured=2 roles=bench_caller:1,tantivy_index_worker:4,tantivy_segment_updater:1,tantivy_merge_worker:4,tantivy_docstore_compressor:4,asupersync_runtime:1,unattributed:1 mean_active=2574m queue=unobservable join=tantivy_workers_joined drained=true pending_zero=true terminal=completed retryable=false digest=c8149a2082d90a93
+[qg-commit-parity] gate=QG-1 fixture=bulk/xlarge/2/positions_on arm=tantivy cadence_ms=1000 periodic_commits=6 terminal_commit_calls=1 durability=in_memory timing_mode=continuous
+[qg1-continuous] fixture=bulk/xlarge/2/positions_on arm=tantivy docs=1000000 accepted_bytes=1168088519 processed_bytes=1168088519 window_ns=10047149523 percall_sum_ns=9921138099 feed_calls=200 periodic_commits=6 committed=1000000 searchable=1000000 probe=singleton probe_hits=1 quiescence=tantivy_merging_threads_joined manifest_sha256=0a77def1cf79d6e576bf782250158b09ac49a824796b5ce6e8cee84b4a231d70 indexed_content_sha256=b9840b4df07535f8908563bfc6b9c627f7e27edbafd6cbc6483a32a70d3c9f76
+[qg1-work-receipt] run_id=qg1-trj-h1h2-ccc37c8e-clean-r10-20260731T0349Z-t2 pid=2838905 ppid=2810628 machine=linux-x86_64-thr profile=release-perf elf=53ab4c0975f0ad21 git=ccc37c8e611cd313 gate=QG-1 fixture=bulk/xlarge/2/positions_on metric=docs_per_second arm=tantivy mode=continuous corpus=0a77def1cf79d6e5 wall_ns=10556149019 configured=2 roles=bench_caller:1,tantivy_index_worker:4,tantivy_segment_updater:1,tantivy_merge_worker:4,tantivy_docstore_compressor:4,asupersync_runtime:1,unattributed:1 mean_active=2526m queue=unobservable join=tantivy_workers_joined drained=true pending_zero=true terminal=completed retryable=false digest=ad0a567714871b7c
+[qg-commit-parity] gate=QG-1 fixture=bulk/xlarge/2/positions_on arm=tantivy cadence_ms=1000 periodic_commits=6 terminal_commit_calls=1 durability=in_memory timing_mode=continuous
+[qg1-continuous] fixture=bulk/xlarge/2/positions_on arm=tantivy docs=1000000 accepted_bytes=1168088519 processed_bytes=1168088519 window_ns=10556149019 percall_sum_ns=10420002538 feed_calls=200 periodic_commits=6 committed=1000000 searchable=1000000 probe=singleton probe_hits=1 quiescence=tantivy_merging_threads_joined manifest_sha256=0a77def1cf79d6e576bf782250158b09ac49a824796b5ce6e8cee84b4a231d70 indexed_content_sha256=b9840b4df07535f8908563bfc6b9c627f7e27edbafd6cbc6483a32a70d3c9f76
+[qg1-work-receipt] run_id=qg1-trj-h1h2-ccc37c8e-clean-r10-20260731T0349Z-t2 pid=2838905 ppid=2810628 machine=linux-x86_64-thr profile=release-perf elf=53ab4c0975f0ad21 git=ccc37c8e611cd313 gate=QG-1 fixture=bulk/xlarge/2/positions_on metric=docs_per_second arm=quill mode=continuous corpus=0a77def1cf79d6e5 wall_ns=28038174504 configured=2 roles=bench_caller:1,rayon_worker:1,asupersync_runtime:1,unattributed:1 mean_active=999m queue=sync_no_queue join=quill_synchronous_commit drained=true pending_zero=true terminal=completed retryable=false digest=9b04319a35b1e9e8
+[qg-commit-parity] gate=QG-1 fixture=bulk/xlarge/2/positions_on arm=quill cadence_ms=1000 periodic_commits=19 terminal_commit_calls=1 durability=in_memory timing_mode=continuous
+[qg1-continuous] fixture=bulk/xlarge/2/positions_on arm=quill docs=1000000 accepted_bytes=1168088519 processed_bytes=1168088519 window_ns=28038174504 percall_sum_ns=27916810625 feed_calls=200 periodic_commits=19 committed=1000000 searchable=1000000 probe=singleton probe_hits=1 quiescence=quill_sealed_synchronous_commit manifest_sha256=0a77def1cf79d6e576bf782250158b09ac49a824796b5ce6e8cee84b4a231d70 indexed_content_sha256=b9840b4df07535f8908563bfc6b9c627f7e27edbafd6cbc6483a32a70d3c9f76
+[qg1-work-receipt] run_id=qg1-trj-h1h2-ccc37c8e-clean-r10-20260731T0349Z-t2 pid=2838905 ppid=2810628 machine=linux-x86_64-thr profile=release-perf elf=53ab4c0975f0ad21 git=ccc37c8e611cd313 gate=QG-1 fixture=bulk/xlarge/2/positions_on metric=docs_per_second arm=quill mode=continuous corpus=0a77def1cf79d6e5 wall_ns=28277057868 configured=2 roles=bench_caller:1,rayon_worker:1,asupersync_runtime:1,unattributed:1 mean_active=999m queue=sync_no_queue join=quill_synchronous_commit drained=true pending_zero=true terminal=completed retryable=false digest=e602a0c437471864
+[qg-commit-parity] gate=QG-1 fixture=bulk/xlarge/2/positions_on arm=quill cadence_ms=1000 periodic_commits=20 terminal_commit_calls=1 durability=in_memory timing_mode=continuous
+[qg1-continuous] fixture=bulk/xlarge/2/positions_on arm=quill docs=1000000 accepted_bytes=1168088519 processed_bytes=1168088519 window_ns=28277057868 percall_sum_ns=28154940830 feed_calls=200 periodic_commits=20 committed=1000000 searchable=1000000 probe=singleton probe_hits=1 quiescence=quill_sealed_synchronous_commit manifest_sha256=0a77def1cf79d6e576bf782250158b09ac49a824796b5ce6e8cee84b4a231d70 indexed_content_sha256=b9840b4df07535f8908563bfc6b9c627f7e27edbafd6cbc6483a32a70d3c9f76
+[qg1-work-receipt] run_id=qg1-trj-h1h2-ccc37c8e-clean-r10-20260731T0349Z-t2 pid=2838905 ppid=2810628 machine=linux-x86_64-thr profile=release-perf elf=53ab4c0975f0ad21 git=ccc37c8e611cd313 gate=QG-1 fixture=bulk/xlarge/2/positions_on metric=docs_per_second arm=quill mode=continuous corpus=0a77def1cf79d6e5 wall_ns=28665472678 configured=2 roles=bench_caller:1,rayon_worker:1,asupersync_runtime:1,unattributed:1 mean_active=999m queue=sync_no_queue join=quill_synchronous_commit drained=true pending_zero=true terminal=completed retryable=false digest=bac3fe64e303b47d
+[qg-commit-parity] gate=QG-1 fixture=bulk/xlarge/2/positions_on arm=quill cadence_ms=1000 periodic_commits=20 terminal_commit_calls=1 durability=in_memory timing_mode=continuous
+[qg1-continuous] fixture=bulk/xlarge/2/positions_on arm=quill docs=1000000 accepted_bytes=1168088519 processed_bytes=1168088519 window_ns=28665472678 percall_sum_ns=28543301757 feed_calls=200 periodic_commits=20 committed=1000000 searchable=1000000 probe=singleton probe_hits=1 quiescence=quill_sealed_synchronous_commit manifest_sha256=0a77def1cf79d6e576bf782250158b09ac49a824796b5ce6e8cee84b4a231d70 indexed_content_sha256=b9840b4df07535f8908563bfc6b9c627f7e27edbafd6cbc6483a32a70d3c9f76
+[qg1-work-receipt] run_id=qg1-trj-h1h2-ccc37c8e-clean-r10-20260731T0349Z-t2 pid=2838905 ppid=2810628 machine=linux-x86_64-thr profile=release-perf elf=53ab4c0975f0ad21 git=ccc37c8e611cd313 gate=QG-1 fixture=bulk/xlarge/2/positions_on metric=docs_per_second arm=quill mode=continuous corpus=0a77def1cf79d6e5 wall_ns=28057302571 configured=2 roles=bench_caller:1,rayon_worker:1,asupersync_runtime:1,unattributed:1 mean_active=999m queue=sync_no_queue join=quill_synchronous_commit drained=true pending_zero=true terminal=completed retryable=false digest=2fbab1d4607ec851
+[qg-commit-parity] gate=QG-1 fixture=bulk/xlarge/2/positions_on arm=quill cadence_ms=1000 periodic_commits=20 terminal_commit_calls=1 durability=in_memory timing_mode=continuous
+[qg1-continuous] fixture=bulk/xlarge/2/positions_on arm=quill docs=1000000 accepted_bytes=1168088519 processed_bytes=1168088519 window_ns=28057302571 percall_sum_ns=27934303627 feed_calls=200 periodic_commits=20 committed=1000000 searchable=1000000 probe=singleton probe_hits=1 quiescence=quill_sealed_synchronous_commit manifest_sha256=0a77def1cf79d6e576bf782250158b09ac49a824796b5ce6e8cee84b4a231d70 indexed_content_sha256=b9840b4df07535f8908563bfc6b9c627f7e27edbafd6cbc6483a32a70d3c9f76
+[qg1-work-receipt] run_id=qg1-trj-h1h2-ccc37c8e-clean-r10-20260731T0349Z-t2 pid=2838905 ppid=2810628 machine=linux-x86_64-thr profile=release-perf elf=53ab4c0975f0ad21 git=ccc37c8e611cd313 gate=QG-1 fixture=bulk/xlarge/2/positions_on metric=docs_per_second arm=quill mode=continuous corpus=0a77def1cf79d6e5 wall_ns=27583910972 configured=2 roles=bench_caller:1,rayon_worker:1,asupersync_runtime:1,unattributed:1 mean_active=999m queue=sync_no_queue join=quill_synchronous_commit drained=true pending_zero=true terminal=completed retryable=false digest=ac6796be669e7e7c
+[qg-commit-parity] gate=QG-1 fixture=bulk/xlarge/2/positions_on arm=quill cadence_ms=1000 periodic_commits=19 terminal_commit_calls=1 durability=in_memory timing_mode=continuous
+[qg1-continuous] fixture=bulk/xlarge/2/positions_on arm=quill docs=1000000 accepted_bytes=1168088519 processed_bytes=1168088519 window_ns=27583910972 percall_sum_ns=27462328817 feed_calls=200 periodic_commits=19 committed=1000000 searchable=1000000 probe=singleton probe_hits=1 quiescence=quill_sealed_synchronous_commit manifest_sha256=0a77def1cf79d6e576bf782250158b09ac49a824796b5ce6e8cee84b4a231d70 indexed_content_sha256=b9840b4df07535f8908563bfc6b9c627f7e27edbafd6cbc6483a32a70d3c9f76
+[qg1-work-receipt] run_id=qg1-trj-h1h2-ccc37c8e-clean-r10-20260731T0349Z-t2 pid=2838905 ppid=2810628 machine=linux-x86_64-thr profile=release-perf elf=53ab4c0975f0ad21 git=ccc37c8e611cd313 gate=QG-1 fixture=bulk/xlarge/2/positions_on metric=docs_per_second arm=quill mode=continuous corpus=0a77def1cf79d6e5 wall_ns=28704555538 configured=2 roles=bench_caller:1,rayon_worker:1,asupersync_runtime:1,unattributed:1 mean_active=999m queue=sync_no_queue join=quill_synchronous_commit drained=true pending_zero=true terminal=completed retryable=false digest=387ac8d25e94c0ff
+[qg-commit-parity] gate=QG-1 fixture=bulk/xlarge/2/positions_on arm=quill cadence_ms=1000 periodic_commits=20 terminal_commit_calls=1 durability=in_memory timing_mode=continuous
+[qg1-continuous] fixture=bulk/xlarge/2/positions_on arm=quill docs=1000000 accepted_bytes=1168088519 processed_bytes=1168088519 window_ns=28704555538 percall_sum_ns=28583432826 feed_calls=200 periodic_commits=20 committed=1000000 searchable=1000000 probe=singleton probe_hits=1 quiescence=quill_sealed_synchronous_commit manifest_sha256=0a77def1cf79d6e576bf782250158b09ac49a824796b5ce6e8cee84b4a231d70 indexed_content_sha256=b9840b4df07535f8908563bfc6b9c627f7e27edbafd6cbc6483a32a70d3c9f76
+[qg1-work-receipt] run_id=qg1-trj-h1h2-ccc37c8e-clean-r10-20260731T0349Z-t2 pid=2838905 ppid=2810628 machine=linux-x86_64-thr profile=release-perf elf=53ab4c0975f0ad21 git=ccc37c8e611cd313 gate=QG-1 fixture=bulk/xlarge/2/positions_on metric=docs_per_second arm=quill mode=continuous corpus=0a77def1cf79d6e5 wall_ns=28229397013 configured=2 roles=bench_caller:1,rayon_worker:1,asupersync_runtime:1,unattributed:1 mean_active=999m queue=sync_no_queue join=quill_synchronous_commit drained=true pending_zero=true terminal=completed retryable=false digest=285990e46f0fbec4
+[qg-commit-parity] gate=QG-1 fixture=bulk/xlarge/2/positions_on arm=quill cadence_ms=1000 periodic_commits=20 terminal_commit_calls=1 durability=in_memory timing_mode=continuous
+[qg1-continuous] fixture=bulk/xlarge/2/positions_on arm=quill docs=1000000 accepted_bytes=1168088519 processed_bytes=1168088519 window_ns=28229397013 percall_sum_ns=28109710360 feed_calls=200 periodic_commits=20 committed=1000000 searchable=1000000 probe=singleton probe_hits=1 quiescence=quill_sealed_synchronous_commit manifest_sha256=0a77def1cf79d6e576bf782250158b09ac49a824796b5ce6e8cee84b4a231d70 indexed_content_sha256=b9840b4df07535f8908563bfc6b9c627f7e27edbafd6cbc6483a32a70d3c9f76
+[qg1-work-receipt] run_id=qg1-trj-h1h2-ccc37c8e-clean-r10-20260731T0349Z-t2 pid=2838905 ppid=2810628 machine=linux-x86_64-thr profile=release-perf elf=53ab4c0975f0ad21 git=ccc37c8e611cd313 gate=QG-1 fixture=bulk/xlarge/2/positions_on metric=docs_per_second arm=quill mode=continuous corpus=0a77def1cf79d6e5 wall_ns=28069034747 configured=2 roles=bench_caller:1,rayon_worker:1,asupersync_runtime:1,unattributed:1 mean_active=999m queue=sync_no_queue join=quill_synchronous_commit drained=true pending_zero=true terminal=completed retryable=false digest=710df475e034b596
+[qg-commit-parity] gate=QG-1 fixture=bulk/xlarge/2/positions_on arm=quill cadence_ms=1000 periodic_commits=18 terminal_commit_calls=1 durability=in_memory timing_mode=continuous
+[qg1-continuous] fixture=bulk/xlarge/2/positions_on arm=quill docs=1000000 accepted_bytes=1168088519 processed_bytes=1168088519 window_ns=28069034747 percall_sum_ns=27946585949 feed_calls=200 periodic_commits=18 committed=1000000 searchable=1000000 probe=singleton probe_hits=1 quiescence=quill_sealed_synchronous_commit manifest_sha256=0a77def1cf79d6e576bf782250158b09ac49a824796b5ce6e8cee84b4a231d70 indexed_content_sha256=b9840b4df07535f8908563bfc6b9c627f7e27edbafd6cbc6483a32a70d3c9f76
+[qg1-work-receipt] run_id=qg1-trj-h1h2-ccc37c8e-clean-r10-20260731T0349Z-t2 pid=2838905 ppid=2810628 machine=linux-x86_64-thr profile=release-perf elf=53ab4c0975f0ad21 git=ccc37c8e611cd313 gate=QG-1 fixture=bulk/xlarge/2/positions_on metric=docs_per_second arm=quill mode=continuous corpus=0a77def1cf79d6e5 wall_ns=27451388938 configured=2 roles=bench_caller:1,rayon_worker:1,asupersync_runtime:1,unattributed:1 mean_active=999m queue=sync_no_queue join=quill_synchronous_commit drained=true pending_zero=true terminal=completed retryable=false digest=63c3e92ce419eaff
+[qg-commit-parity] gate=QG-1 fixture=bulk/xlarge/2/positions_on arm=quill cadence_ms=1000 periodic_commits=19 terminal_commit_calls=1 durability=in_memory timing_mode=continuous
+[qg1-continuous] fixture=bulk/xlarge/2/positions_on arm=quill docs=1000000 accepted_bytes=1168088519 processed_bytes=1168088519 window_ns=27451388938 percall_sum_ns=27332000329 feed_calls=200 periodic_commits=19 committed=1000000 searchable=1000000 probe=singleton probe_hits=1 quiescence=quill_sealed_synchronous_commit manifest_sha256=0a77def1cf79d6e576bf782250158b09ac49a824796b5ce6e8cee84b4a231d70 indexed_content_sha256=b9840b4df07535f8908563bfc6b9c627f7e27edbafd6cbc6483a32a70d3c9f76
+[qg1-work-receipt] run_id=qg1-trj-h1h2-ccc37c8e-clean-r10-20260731T0349Z-t2 pid=2838905 ppid=2810628 machine=linux-x86_64-thr profile=release-perf elf=53ab4c0975f0ad21 git=ccc37c8e611cd313 gate=QG-1 fixture=bulk/xlarge/2/positions_on metric=docs_per_second arm=quill mode=continuous corpus=0a77def1cf79d6e5 wall_ns=27499137195 configured=2 roles=bench_caller:1,rayon_worker:1,asupersync_runtime:1,unattributed:1 mean_active=999m queue=sync_no_queue join=quill_synchronous_commit drained=true pending_zero=true terminal=completed retryable=false digest=c8f11b825d043af8
+[qg-commit-parity] gate=QG-1 fixture=bulk/xlarge/2/positions_on arm=quill cadence_ms=1000 periodic_commits=19 terminal_commit_calls=1 durability=in_memory timing_mode=continuous
+[qg1-continuous] fixture=bulk/xlarge/2/positions_on arm=quill docs=1000000 accepted_bytes=1168088519 processed_bytes=1168088519 window_ns=27499137195 percall_sum_ns=27379285355 feed_calls=200 periodic_commits=19 committed=1000000 searchable=1000000 probe=singleton probe_hits=1 quiescence=quill_sealed_synchronous_commit manifest_sha256=0a77def1cf79d6e576bf782250158b09ac49a824796b5ce6e8cee84b4a231d70 indexed_content_sha256=b9840b4df07535f8908563bfc6b9c627f7e27edbafd6cbc6483a32a70d3c9f76
+[qg1-work-receipt] run_id=qg1-trj-h1h2-ccc37c8e-clean-r10-20260731T0349Z-t2 pid=2838905 ppid=2810628 machine=linux-x86_64-thr profile=release-perf elf=53ab4c0975f0ad21 git=ccc37c8e611cd313 gate=QG-1 fixture=bulk/xlarge/2/positions_on metric=docs_per_second arm=quill mode=continuous corpus=0a77def1cf79d6e5 wall_ns=27569480568 configured=2 roles=bench_caller:1,rayon_worker:1,asupersync_runtime:1,unattributed:1 mean_active=999m queue=sync_no_queue join=quill_synchronous_commit drained=true pending_zero=true terminal=completed retryable=false digest=05d9897d1e8528d5
+[qg-commit-parity] gate=QG-1 fixture=bulk/xlarge/2/positions_on arm=quill cadence_ms=1000 periodic_commits=19 terminal_commit_calls=1 durability=in_memory timing_mode=continuous
+[qg1-continuous] fixture=bulk/xlarge/2/positions_on arm=quill docs=1000000 accepted_bytes=1168088519 processed_bytes=1168088519 window_ns=27569480568 percall_sum_ns=27447340085 feed_calls=200 periodic_commits=19 committed=1000000 searchable=1000000 probe=singleton probe_hits=1 quiescence=quill_sealed_synchronous_commit manifest_sha256=0a77def1cf79d6e576bf782250158b09ac49a824796b5ce6e8cee84b4a231d70 indexed_content_sha256=b9840b4df07535f8908563bfc6b9c627f7e27edbafd6cbc6483a32a70d3c9f76
+[qg1-work-receipt] run_id=qg1-trj-h1h2-ccc37c8e-clean-r10-20260731T0349Z-t2 pid=2838905 ppid=2810628 machine=linux-x86_64-thr profile=release-perf elf=53ab4c0975f0ad21 git=ccc37c8e611cd313 gate=QG-1 fixture=bulk/xlarge/2/positions_on metric=docs_per_second arm=quill mode=continuous corpus=0a77def1cf79d6e5 wall_ns=28590980500 configured=2 roles=bench_caller:1,rayon_worker:1,asupersync_runtime:1,unattributed:1 mean_active=999m queue=sync_no_queue join=quill_synchronous_commit drained=true pending_zero=true terminal=completed retryable=false digest=16b0bf63a2f77344
+[qg-commit-parity] gate=QG-1 fixture=bulk/xlarge/2/positions_on arm=quill cadence_ms=1000 periodic_commits=20 terminal_commit_calls=1 durability=in_memory timing_mode=continuous
+[qg1-continuous] fixture=bulk/xlarge/2/positions_on arm=quill docs=1000000 accepted_bytes=1168088519 processed_bytes=1168088519 window_ns=28590980500 percall_sum_ns=28469531450 feed_calls=200 periodic_commits=20 committed=1000000 searchable=1000000 probe=singleton probe_hits=1 quiescence=quill_sealed_synchronous_commit manifest_sha256=0a77def1cf79d6e576bf782250158b09ac49a824796b5ce6e8cee84b4a231d70 indexed_content_sha256=b9840b4df07535f8908563bfc6b9c627f7e27edbafd6cbc6483a32a70d3c9f76
+[qg1-work-receipt] run_id=qg1-trj-h1h2-ccc37c8e-clean-r10-20260731T0349Z-t2 pid=2838905 ppid=2810628 machine=linux-x86_64-thr profile=release-perf elf=53ab4c0975f0ad21 git=ccc37c8e611cd313 gate=QG-1 fixture=bulk/xlarge/2/positions_on metric=docs_per_second arm=quill mode=continuous corpus=0a77def1cf79d6e5 wall_ns=28717292274 configured=2 roles=bench_caller:1,rayon_worker:1,asupersync_runtime:1,unattributed:1 mean_active=999m queue=sync_no_queue join=quill_synchronous_commit drained=true pending_zero=true terminal=completed retryable=false digest=e836f8cdf965cc52
+[qg-commit-parity] gate=QG-1 fixture=bulk/xlarge/2/positions_on arm=quill cadence_ms=1000 periodic_commits=20 terminal_commit_calls=1 durability=in_memory timing_mode=continuous
+[qg1-continuous] fixture=bulk/xlarge/2/positions_on arm=quill docs=1000000 accepted_bytes=1168088519 processed_bytes=1168088519 window_ns=28717292274 percall_sum_ns=28596035549 feed_calls=200 periodic_commits=20 committed=1000000 searchable=1000000 probe=singleton probe_hits=1 quiescence=quill_sealed_synchronous_commit manifest_sha256=0a77def1cf79d6e576bf782250158b09ac49a824796b5ce6e8cee84b4a231d70 indexed_content_sha256=b9840b4df07535f8908563bfc6b9c627f7e27edbafd6cbc6483a32a70d3c9f76
+[qg1-work-receipt] run_id=qg1-trj-h1h2-ccc37c8e-clean-r10-20260731T0349Z-t2 pid=2838905 ppid=2810628 machine=linux-x86_64-thr profile=release-perf elf=53ab4c0975f0ad21 git=ccc37c8e611cd313 gate=QG-1 fixture=bulk/xlarge/2/positions_on metric=docs_per_second arm=quill mode=continuous corpus=0a77def1cf79d6e5 wall_ns=29870525878 configured=2 roles=bench_caller:1,rayon_worker:1,asupersync_runtime:1,unattributed:1 mean_active=999m queue=sync_no_queue join=quill_synchronous_commit drained=true pending_zero=true terminal=completed retryable=false digest=95f54b9ed607df7e
+[qg-commit-parity] gate=QG-1 fixture=bulk/xlarge/2/positions_on arm=quill cadence_ms=1000 periodic_commits=20 terminal_commit_calls=1 durability=in_memory timing_mode=continuous
+[qg1-continuous] fixture=bulk/xlarge/2/positions_on arm=quill docs=1000000 accepted_bytes=1168088519 processed_bytes=1168088519 window_ns=29870525878 percall_sum_ns=29746925295 feed_calls=200 periodic_commits=20 committed=1000000 searchable=1000000 probe=singleton probe_hits=1 quiescence=quill_sealed_synchronous_commit manifest_sha256=0a77def1cf79d6e576bf782250158b09ac49a824796b5ce6e8cee84b4a231d70 indexed_content_sha256=b9840b4df07535f8908563bfc6b9c627f7e27edbafd6cbc6483a32a70d3c9f76
+[qg1-work-receipt] run_id=qg1-trj-h1h2-ccc37c8e-clean-r10-20260731T0349Z-t2 pid=2838905 ppid=2810628 machine=linux-x86_64-thr profile=release-perf elf=53ab4c0975f0ad21 git=ccc37c8e611cd313 gate=QG-1 fixture=bulk/xlarge/2/positions_on metric=docs_per_second arm=quill mode=continuous corpus=0a77def1cf79d6e5 wall_ns=28140741942 configured=2 roles=bench_caller:1,rayon_worker:1,asupersync_runtime:1,unattributed:1 mean_active=999m queue=sync_no_queue join=quill_synchronous_commit drained=true pending_zero=true terminal=completed retryable=false digest=155bc0c8122496e1
+[qg-commit-parity] gate=QG-1 fixture=bulk/xlarge/2/positions_on arm=quill cadence_ms=1000 periodic_commits=20 terminal_commit_calls=1 durability=in_memory timing_mode=continuous
+[qg1-continuous] fixture=bulk/xlarge/2/positions_on arm=quill docs=1000000 accepted_bytes=1168088519 processed_bytes=1168088519 window_ns=28140741942 percall_sum_ns=28019526891 feed_calls=200 periodic_commits=20 committed=1000000 searchable=1000000 probe=singleton probe_hits=1 quiescence=quill_sealed_synchronous_commit manifest_sha256=0a77def1cf79d6e576bf782250158b09ac49a824796b5ce6e8cee84b4a231d70 indexed_content_sha256=b9840b4df07535f8908563bfc6b9c627f7e27edbafd6cbc6483a32a70d3c9f76
+[qg1-work-receipt] run_id=qg1-trj-h1h2-ccc37c8e-clean-r10-20260731T0349Z-t2 pid=2838905 ppid=2810628 machine=linux-x86_64-thr profile=release-perf elf=53ab4c0975f0ad21 git=ccc37c8e611cd313 gate=QG-1 fixture=bulk/xlarge/2/positions_on metric=docs_per_second arm=quill mode=continuous corpus=0a77def1cf79d6e5 wall_ns=28660480255 configured=2 roles=bench_caller:1,rayon_worker:1,asupersync_runtime:1,unattributed:1 mean_active=999m queue=sync_no_queue join=quill_synchronous_commit drained=true pending_zero=true terminal=completed retryable=false digest=859680a4c252a5af
+[qg-commit-parity] gate=QG-1 fixture=bulk/xlarge/2/positions_on arm=quill cadence_ms=1000 periodic_commits=20 terminal_commit_calls=1 durability=in_memory timing_mode=continuous
+[qg1-continuous] fixture=bulk/xlarge/2/positions_on arm=quill docs=1000000 accepted_bytes=1168088519 processed_bytes=1168088519 window_ns=28660480255 percall_sum_ns=28540446571 feed_calls=200 periodic_commits=20 committed=1000000 searchable=1000000 probe=singleton probe_hits=1 quiescence=quill_sealed_synchronous_commit manifest_sha256=0a77def1cf79d6e576bf782250158b09ac49a824796b5ce6e8cee84b4a231d70 indexed_content_sha256=b9840b4df07535f8908563bfc6b9c627f7e27edbafd6cbc6483a32a70d3c9f76
+[qg1-work-receipt] run_id=qg1-trj-h1h2-ccc37c8e-clean-r10-20260731T0349Z-t2 pid=2838905 ppid=2810628 machine=linux-x86_64-thr profile=release-perf elf=53ab4c0975f0ad21 git=ccc37c8e611cd313 gate=QG-1 fixture=bulk/xlarge/2/positions_on metric=docs_per_second arm=quill mode=continuous corpus=0a77def1cf79d6e5 wall_ns=27627538359 configured=2 roles=bench_caller:1,rayon_worker:1,asupersync_runtime:1,unattributed:1 mean_active=999m queue=sync_no_queue join=quill_synchronous_commit drained=true pending_zero=true terminal=completed retryable=false digest=78e204cb4a0a361c
+[qg-commit-parity] gate=QG-1 fixture=bulk/xlarge/2/positions_on arm=quill cadence_ms=1000 periodic_commits=19 terminal_commit_calls=1 durability=in_memory timing_mode=continuous
+[qg1-continuous] fixture=bulk/xlarge/2/positions_on arm=quill docs=1000000 accepted_bytes=1168088519 processed_bytes=1168088519 window_ns=27627538359 percall_sum_ns=27505912864 feed_calls=200 periodic_commits=19 committed=1000000 searchable=1000000 probe=singleton probe_hits=1 quiescence=quill_sealed_synchronous_commit manifest_sha256=0a77def1cf79d6e576bf782250158b09ac49a824796b5ce6e8cee84b4a231d70 indexed_content_sha256=b9840b4df07535f8908563bfc6b9c627f7e27edbafd6cbc6483a32a70d3c9f76
+[qg1-work-receipt] run_id=qg1-trj-h1h2-ccc37c8e-clean-r10-20260731T0349Z-t2 pid=2838905 ppid=2810628 machine=linux-x86_64-thr profile=release-perf elf=53ab4c0975f0ad21 git=ccc37c8e611cd313 gate=QG-1 fixture=bulk/xlarge/2/positions_on metric=docs_per_second arm=quill mode=continuous corpus=0a77def1cf79d6e5 wall_ns=28708837471 configured=2 roles=bench_caller:1,rayon_worker:1,asupersync_runtime:1,unattributed:1 mean_active=999m queue=sync_no_queue join=quill_synchronous_commit drained=true pending_zero=true terminal=completed retryable=false digest=62d739b7c6588cf5
+[qg-commit-parity] gate=QG-1 fixture=bulk/xlarge/2/positions_on arm=quill cadence_ms=1000 periodic_commits=20 terminal_commit_calls=1 durability=in_memory timing_mode=continuous
+[qg1-continuous] fixture=bulk/xlarge/2/positions_on arm=quill docs=1000000 accepted_bytes=1168088519 processed_bytes=1168088519 window_ns=28708837471 percall_sum_ns=28587976548 feed_calls=200 periodic_commits=20 committed=1000000 searchable=1000000 probe=singleton probe_hits=1 quiescence=quill_sealed_synchronous_commit manifest_sha256=0a77def1cf79d6e576bf782250158b09ac49a824796b5ce6e8cee84b4a231d70 indexed_content_sha256=b9840b4df07535f8908563bfc6b9c627f7e27edbafd6cbc6483a32a70d3c9f76
+[qg1-work-receipt] run_id=qg1-trj-h1h2-ccc37c8e-clean-r10-20260731T0349Z-t2 pid=2838905 ppid=2810628 machine=linux-x86_64-thr profile=release-perf elf=53ab4c0975f0ad21 git=ccc37c8e611cd313 gate=QG-1 fixture=bulk/xlarge/2/positions_on metric=docs_per_second arm=quill mode=continuous corpus=0a77def1cf79d6e5 wall_ns=28194801420 configured=2 roles=bench_caller:1,rayon_worker:1,asupersync_runtime:1,unattributed:1 mean_active=999m queue=sync_no_queue join=quill_synchronous_commit drained=true pending_zero=true terminal=completed retryable=false digest=42a32b895f8f8433
+[qg-commit-parity] gate=QG-1 fixture=bulk/xlarge/2/positions_on arm=quill cadence_ms=1000 periodic_commits=20 terminal_commit_calls=1 durability=in_memory timing_mode=continuous
+[qg1-continuous] fixture=bulk/xlarge/2/positions_on arm=quill docs=1000000 accepted_bytes=1168088519 processed_bytes=1168088519 window_ns=28194801420 percall_sum_ns=28075418633 feed_calls=200 periodic_commits=20 committed=1000000 searchable=1000000 probe=singleton probe_hits=1 quiescence=quill_sealed_synchronous_commit manifest_sha256=0a77def1cf79d6e576bf782250158b09ac49a824796b5ce6e8cee84b4a231d70 indexed_content_sha256=b9840b4df07535f8908563bfc6b9c627f7e27edbafd6cbc6483a32a70d3c9f76
+[qg1-work-receipt] run_id=qg1-trj-h1h2-ccc37c8e-clean-r10-20260731T0349Z-t2 pid=2838905 ppid=2810628 machine=linux-x86_64-thr profile=release-perf elf=53ab4c0975f0ad21 git=ccc37c8e611cd313 gate=QG-1 fixture=bulk/xlarge/2/positions_on metric=docs_per_second arm=quill mode=continuous corpus=0a77def1cf79d6e5 wall_ns=27353176500 configured=2 roles=bench_caller:1,rayon_worker:1,asupersync_runtime:1,unattributed:1 mean_active=999m queue=sync_no_queue join=quill_synchronous_commit drained=true pending_zero=true terminal=completed retryable=false digest=3d01405f66920e1b
+[qg-commit-parity] gate=QG-1 fixture=bulk/xlarge/2/positions_on arm=quill cadence_ms=1000 periodic_commits=19 terminal_commit_calls=1 durability=in_memory timing_mode=continuous
+[qg1-continuous] fixture=bulk/xlarge/2/positions_on arm=quill docs=1000000 accepted_bytes=1168088519 processed_bytes=1168088519 window_ns=27353176500 percall_sum_ns=27229975911 feed_calls=200 periodic_commits=19 committed=1000000 searchable=1000000 probe=singleton probe_hits=1 quiescence=quill_sealed_synchronous_commit manifest_sha256=0a77def1cf79d6e576bf782250158b09ac49a824796b5ce6e8cee84b4a231d70 indexed_content_sha256=b9840b4df07535f8908563bfc6b9c627f7e27edbafd6cbc6483a32a70d3c9f76
+[qg1-work-receipt] run_id=qg1-trj-h1h2-ccc37c8e-clean-r10-20260731T0349Z-t2 pid=2838905 ppid=2810628 machine=linux-x86_64-thr profile=release-perf elf=53ab4c0975f0ad21 git=ccc37c8e611cd313 gate=QG-1 fixture=bulk/xlarge/2/positions_on metric=docs_per_second arm=quill mode=continuous corpus=0a77def1cf79d6e5 wall_ns=27102777316 configured=2 roles=bench_caller:1,rayon_worker:1,asupersync_runtime:1,unattributed:1 mean_active=999m queue=sync_no_queue join=quill_synchronous_commit drained=true pending_zero=true terminal=completed retryable=false digest=6ab357b53d4a9b02
+[qg-commit-parity] gate=QG-1 fixture=bulk/xlarge/2/positions_on arm=quill cadence_ms=1000 periodic_commits=19 terminal_commit_calls=1 durability=in_memory timing_mode=continuous
+[qg1-continuous] fixture=bulk/xlarge/2/positions_on arm=quill docs=1000000 accepted_bytes=1168088519 processed_bytes=1168088519 window_ns=27102777316 percall_sum_ns=26981814825 feed_calls=200 periodic_commits=19 committed=1000000 searchable=1000000 probe=singleton probe_hits=1 quiescence=quill_sealed_synchronous_commit manifest_sha256=0a77def1cf79d6e576bf782250158b09ac49a824796b5ce6e8cee84b4a231d70 indexed_content_sha256=b9840b4df07535f8908563bfc6b9c627f7e27edbafd6cbc6483a32a70d3c9f76
+[qg1-work-receipt] run_id=qg1-trj-h1h2-ccc37c8e-clean-r10-20260731T0349Z-t2 pid=2838905 ppid=2810628 machine=linux-x86_64-thr profile=release-perf elf=53ab4c0975f0ad21 git=ccc37c8e611cd313 gate=QG-1 fixture=bulk/xlarge/2/positions_on metric=docs_per_second arm=quill mode=continuous corpus=0a77def1cf79d6e5 wall_ns=27003692165 configured=2 roles=bench_caller:1,rayon_worker:1,asupersync_runtime:1,unattributed:1 mean_active=999m queue=sync_no_queue join=quill_synchronous_commit drained=true pending_zero=true terminal=completed retryable=false digest=d0d831d7c869fa62
+[qg-commit-parity] gate=QG-1 fixture=bulk/xlarge/2/positions_on arm=quill cadence_ms=1000 periodic_commits=19 terminal_commit_calls=1 durability=in_memory timing_mode=continuous
+[qg1-continuous] fixture=bulk/xlarge/2/positions_on arm=quill docs=1000000 accepted_bytes=1168088519 processed_bytes=1168088519 window_ns=27003692165 percall_sum_ns=26882338713 feed_calls=200 periodic_commits=19 committed=1000000 searchable=1000000 probe=singleton probe_hits=1 quiescence=quill_sealed_synchronous_commit manifest_sha256=0a77def1cf79d6e576bf782250158b09ac49a824796b5ce6e8cee84b4a231d70 indexed_content_sha256=b9840b4df07535f8908563bfc6b9c627f7e27edbafd6cbc6483a32a70d3c9f76
+[qg1-work-receipt] run_id=qg1-trj-h1h2-ccc37c8e-clean-r10-20260731T0349Z-t2 pid=2838905 ppid=2810628 machine=linux-x86_64-thr profile=release-perf elf=53ab4c0975f0ad21 git=ccc37c8e611cd313 gate=QG-1 fixture=bulk/xlarge/2/positions_on metric=docs_per_second arm=tantivy mode=continuous corpus=0a77def1cf79d6e5 wall_ns=9129889387 configured=2 roles=bench_caller:1,tantivy_index_worker:4,tantivy_segment_updater:1,tantivy_merge_worker:4,tantivy_docstore_compressor:4,asupersync_runtime:1,unattributed:2 mean_active=2777m queue=unobservable join=tantivy_workers_joined drained=true pending_zero=true terminal=completed retryable=false digest=bf47a40f602e4deb
+[qg-commit-parity] gate=QG-1 fixture=bulk/xlarge/2/positions_on arm=tantivy cadence_ms=1000 periodic_commits=6 terminal_commit_calls=1 durability=in_memory timing_mode=continuous
+[qg1-continuous] fixture=bulk/xlarge/2/positions_on arm=tantivy docs=1000000 accepted_bytes=1168088519 processed_bytes=1168088519 window_ns=9129889387 percall_sum_ns=9040628400 feed_calls=200 periodic_commits=6 committed=1000000 searchable=1000000 probe=singleton probe_hits=1 quiescence=tantivy_merging_threads_joined manifest_sha256=0a77def1cf79d6e576bf782250158b09ac49a824796b5ce6e8cee84b4a231d70 indexed_content_sha256=b9840b4df07535f8908563bfc6b9c627f7e27edbafd6cbc6483a32a70d3c9f76
+[qg1-work-receipt] run_id=qg1-trj-h1h2-ccc37c8e-clean-r10-20260731T0349Z-t2 pid=2838905 ppid=2810628 machine=linux-x86_64-thr profile=release-perf elf=53ab4c0975f0ad21 git=ccc37c8e611cd313 gate=QG-1 fixture=bulk/xlarge/2/positions_on metric=docs_per_second arm=quill mode=continuous corpus=0a77def1cf79d6e5 wall_ns=27222171273 configured=2 roles=bench_caller:1,rayon_worker:1,asupersync_runtime:1,unattributed:1 mean_active=1001m queue=sync_no_queue join=quill_synchronous_commit drained=true pending_zero=true terminal=completed retryable=false digest=32ac72d16d2abb43
+[qg-commit-parity] gate=QG-1 fixture=bulk/xlarge/2/positions_on arm=quill cadence_ms=1000 periodic_commits=19 terminal_commit_calls=1 durability=in_memory timing_mode=continuous
+[qg1-continuous] fixture=bulk/xlarge/2/positions_on arm=quill docs=1000000 accepted_bytes=1168088519 processed_bytes=1168088519 window_ns=27222171273 percall_sum_ns=27101476418 feed_calls=200 periodic_commits=19 committed=1000000 searchable=1000000 probe=singleton probe_hits=1 quiescence=quill_sealed_synchronous_commit manifest_sha256=0a77def1cf79d6e576bf782250158b09ac49a824796b5ce6e8cee84b4a231d70 indexed_content_sha256=b9840b4df07535f8908563bfc6b9c627f7e27edbafd6cbc6483a32a70d3c9f76
+[qg1-work-receipt] run_id=qg1-trj-h1h2-ccc37c8e-clean-r10-20260731T0349Z-t2 pid=2838905 ppid=2810628 machine=linux-x86_64-thr profile=release-perf elf=53ab4c0975f0ad21 git=ccc37c8e611cd313 gate=QG-1 fixture=bulk/xlarge/2/positions_on metric=docs_per_second arm=quill mode=continuous corpus=0a77def1cf79d6e5 wall_ns=27074291427 configured=2 roles=bench_caller:1,rayon_worker:1,asupersync_runtime:1,unattributed:1 mean_active=999m queue=sync_no_queue join=quill_synchronous_commit drained=true pending_zero=true terminal=completed retryable=false digest=2deaf0fe60910b12
+[qg-commit-parity] gate=QG-1 fixture=bulk/xlarge/2/positions_on arm=quill cadence_ms=1000 periodic_commits=19 terminal_commit_calls=1 durability=in_memory timing_mode=continuous
+[qg1-continuous] fixture=bulk/xlarge/2/positions_on arm=quill docs=1000000 accepted_bytes=1168088519 processed_bytes=1168088519 window_ns=27074291427 percall_sum_ns=26951681295 feed_calls=200 periodic_commits=19 committed=1000000 searchable=1000000 probe=singleton probe_hits=1 quiescence=quill_sealed_synchronous_commit manifest_sha256=0a77def1cf79d6e576bf782250158b09ac49a824796b5ce6e8cee84b4a231d70 indexed_content_sha256=b9840b4df07535f8908563bfc6b9c627f7e27edbafd6cbc6483a32a70d3c9f76
+[qg1-work-receipt] run_id=qg1-trj-h1h2-ccc37c8e-clean-r10-20260731T0349Z-t2 pid=2838905 ppid=2810628 machine=linux-x86_64-thr profile=release-perf elf=53ab4c0975f0ad21 git=ccc37c8e611cd313 gate=QG-1 fixture=bulk/xlarge/2/positions_on metric=docs_per_second arm=tantivy mode=continuous corpus=0a77def1cf79d6e5 wall_ns=8288200137 configured=2 roles=bench_caller:1,tantivy_index_worker:4,tantivy_segment_updater:1,tantivy_merge_worker:4,tantivy_docstore_compressor:2,asupersync_runtime:1 mean_active=2872m queue=unobservable join=tantivy_workers_joined drained=true pending_zero=true terminal=completed retryable=false digest=f30188da21702748
+[qg-commit-parity] gate=QG-1 fixture=bulk/xlarge/2/positions_on arm=tantivy cadence_ms=1000 periodic_commits=5 terminal_commit_calls=1 durability=in_memory timing_mode=continuous
+[qg1-continuous] fixture=bulk/xlarge/2/positions_on arm=tantivy docs=1000000 accepted_bytes=1168088519 processed_bytes=1168088519 window_ns=8288200137 percall_sum_ns=8163665999 feed_calls=200 periodic_commits=5 committed=1000000 searchable=1000000 probe=singleton probe_hits=1 quiescence=tantivy_merging_threads_joined manifest_sha256=0a77def1cf79d6e576bf782250158b09ac49a824796b5ce6e8cee84b4a231d70 indexed_content_sha256=b9840b4df07535f8908563bfc6b9c627f7e27edbafd6cbc6483a32a70d3c9f76
+[qg1-work-receipt] run_id=qg1-trj-h1h2-ccc37c8e-clean-r10-20260731T0349Z-t2 pid=2838905 ppid=2810628 machine=linux-x86_64-thr profile=release-perf elf=53ab4c0975f0ad21 git=ccc37c8e611cd313 gate=QG-1 fixture=bulk/xlarge/2/positions_on metric=docs_per_second arm=tantivy mode=continuous corpus=0a77def1cf79d6e5 wall_ns=8734709717 configured=2 roles=bench_caller:1,tantivy_index_worker:4,tantivy_segment_updater:1,tantivy_merge_worker:4,tantivy_docstore_compressor:1,asupersync_runtime:1 mean_active=2835m queue=unobservable join=tantivy_workers_joined drained=true pending_zero=true terminal=completed retryable=false digest=a18595d6b159a9df
+[qg-commit-parity] gate=QG-1 fixture=bulk/xlarge/2/positions_on arm=tantivy cadence_ms=1000 periodic_commits=6 terminal_commit_calls=1 durability=in_memory timing_mode=continuous
+[qg1-continuous] fixture=bulk/xlarge/2/positions_on arm=tantivy docs=1000000 accepted_bytes=1168088519 processed_bytes=1168088519 window_ns=8734709717 percall_sum_ns=8609621732 feed_calls=200 periodic_commits=6 committed=1000000 searchable=1000000 probe=singleton probe_hits=1 quiescence=tantivy_merging_threads_joined manifest_sha256=0a77def1cf79d6e576bf782250158b09ac49a824796b5ce6e8cee84b4a231d70 indexed_content_sha256=b9840b4df07535f8908563bfc6b9c627f7e27edbafd6cbc6483a32a70d3c9f76
+[qg1-work-receipt] run_id=qg1-trj-h1h2-ccc37c8e-clean-r10-20260731T0349Z-t2 pid=2838905 ppid=2810628 machine=linux-x86_64-thr profile=release-perf elf=53ab4c0975f0ad21 git=ccc37c8e611cd313 gate=QG-1 fixture=bulk/xlarge/2/positions_on metric=docs_per_second arm=quill mode=continuous corpus=0a77def1cf79d6e5 wall_ns=27411400532 configured=2 roles=bench_caller:1,rayon_worker:1,asupersync_runtime:1,unattributed:1 mean_active=999m queue=sync_no_queue join=quill_synchronous_commit drained=true pending_zero=true terminal=completed retryable=false digest=4cc14771eba59de7
+[qg-commit-parity] gate=QG-1 fixture=bulk/xlarge/2/positions_on arm=quill cadence_ms=1000 periodic_commits=19 terminal_commit_calls=1 durability=in_memory timing_mode=continuous
+[qg1-continuous] fixture=bulk/xlarge/2/positions_on arm=quill docs=1000000 accepted_bytes=1168088519 processed_bytes=1168088519 window_ns=27411400532 percall_sum_ns=27290884939 feed_calls=200 periodic_commits=19 committed=1000000 searchable=1000000 probe=singleton probe_hits=1 quiescence=quill_sealed_synchronous_commit manifest_sha256=0a77def1cf79d6e576bf782250158b09ac49a824796b5ce6e8cee84b4a231d70 indexed_content_sha256=b9840b4df07535f8908563bfc6b9c627f7e27edbafd6cbc6483a32a70d3c9f76
+[qg1-work-receipt] run_id=qg1-trj-h1h2-ccc37c8e-clean-r10-20260731T0349Z-t2 pid=2838905 ppid=2810628 machine=linux-x86_64-thr profile=release-perf elf=53ab4c0975f0ad21 git=ccc37c8e611cd313 gate=QG-1 fixture=bulk/xlarge/2/positions_on metric=docs_per_second arm=quill mode=continuous corpus=0a77def1cf79d6e5 wall_ns=27652559062 configured=2 roles=bench_caller:1,rayon_worker:1,asupersync_runtime:1,unattributed:1 mean_active=999m queue=sync_no_queue join=quill_synchronous_commit drained=true pending_zero=true terminal=completed retryable=false digest=7ca11667e3a6e641
+[qg-commit-parity] gate=QG-1 fixture=bulk/xlarge/2/positions_on arm=quill cadence_ms=1000 periodic_commits=18 terminal_commit_calls=1 durability=in_memory timing_mode=continuous
+[qg1-continuous] fixture=bulk/xlarge/2/positions_on arm=quill docs=1000000 accepted_bytes=1168088519 processed_bytes=1168088519 window_ns=27652559062 percall_sum_ns=27530081813 feed_calls=200 periodic_commits=18 committed=1000000 searchable=1000000 probe=singleton probe_hits=1 quiescence=quill_sealed_synchronous_commit manifest_sha256=0a77def1cf79d6e576bf782250158b09ac49a824796b5ce6e8cee84b4a231d70 indexed_content_sha256=b9840b4df07535f8908563bfc6b9c627f7e27edbafd6cbc6483a32a70d3c9f76
+[qg1-work-receipt] run_id=qg1-trj-h1h2-ccc37c8e-clean-r10-20260731T0349Z-t2 pid=2838905 ppid=2810628 machine=linux-x86_64-thr profile=release-perf elf=53ab4c0975f0ad21 git=ccc37c8e611cd313 gate=QG-1 fixture=bulk/xlarge/2/positions_on metric=docs_per_second arm=tantivy mode=continuous corpus=0a77def1cf79d6e5 wall_ns=8852869956 configured=2 roles=bench_caller:1,tantivy_index_worker:4,tantivy_segment_updater:1,tantivy_merge_worker:4,tantivy_docstore_compressor:4,asupersync_runtime:1,unattributed:2 mean_active=2775m queue=unobservable join=tantivy_workers_joined drained=true pending_zero=true terminal=completed retryable=false digest=a9969d7f81722406
+[qg-commit-parity] gate=QG-1 fixture=bulk/xlarge/2/positions_on arm=tantivy cadence_ms=1000 periodic_commits=6 terminal_commit_calls=1 durability=in_memory timing_mode=continuous
+[qg1-continuous] fixture=bulk/xlarge/2/positions_on arm=tantivy docs=1000000 accepted_bytes=1168088519 processed_bytes=1168088519 window_ns=8852869956 percall_sum_ns=8763427705 feed_calls=200 periodic_commits=6 committed=1000000 searchable=1000000 probe=singleton probe_hits=1 quiescence=tantivy_merging_threads_joined manifest_sha256=0a77def1cf79d6e576bf782250158b09ac49a824796b5ce6e8cee84b4a231d70 indexed_content_sha256=b9840b4df07535f8908563bfc6b9c627f7e27edbafd6cbc6483a32a70d3c9f76
+[qg1-work-receipt] run_id=qg1-trj-h1h2-ccc37c8e-clean-r10-20260731T0349Z-t2 pid=2838905 ppid=2810628 machine=linux-x86_64-thr profile=release-perf elf=53ab4c0975f0ad21 git=ccc37c8e611cd313 gate=QG-1 fixture=bulk/xlarge/2/positions_on metric=docs_per_second arm=quill mode=continuous corpus=0a77def1cf79d6e5 wall_ns=27553505802 configured=2 roles=bench_caller:1,rayon_worker:1,asupersync_runtime:1,unattributed:1 mean_active=999m queue=sync_no_queue join=quill_synchronous_commit drained=true pending_zero=true terminal=completed retryable=false digest=5b5fe92d5b60b513
+[qg-commit-parity] gate=QG-1 fixture=bulk/xlarge/2/positions_on arm=quill cadence_ms=1000 periodic_commits=19 terminal_commit_calls=1 durability=in_memory timing_mode=continuous
+[qg1-continuous] fixture=bulk/xlarge/2/positions_on arm=quill docs=1000000 accepted_bytes=1168088519 processed_bytes=1168088519 window_ns=27553505802 percall_sum_ns=27432790651 feed_calls=200 periodic_commits=19 committed=1000000 searchable=1000000 probe=singleton probe_hits=1 quiescence=quill_sealed_synchronous_commit manifest_sha256=0a77def1cf79d6e576bf782250158b09ac49a824796b5ce6e8cee84b4a231d70 indexed_content_sha256=b9840b4df07535f8908563bfc6b9c627f7e27edbafd6cbc6483a32a70d3c9f76
+[qg1-work-receipt] run_id=qg1-trj-h1h2-ccc37c8e-clean-r10-20260731T0349Z-t2 pid=2838905 ppid=2810628 machine=linux-x86_64-thr profile=release-perf elf=53ab4c0975f0ad21 git=ccc37c8e611cd313 gate=QG-1 fixture=bulk/xlarge/2/positions_on metric=docs_per_second arm=tantivy mode=continuous corpus=0a77def1cf79d6e5 wall_ns=8459771532 configured=2 roles=bench_caller:1,tantivy_index_worker:4,tantivy_segment_updater:1,tantivy_merge_worker:4,tantivy_docstore_compressor:2,asupersync_runtime:1,unattributed:1 mean_active=2855m queue=unobservable join=tantivy_workers_joined drained=true pending_zero=true terminal=completed retryable=false digest=52c6f57a9655c37e
+[qg-commit-parity] gate=QG-1 fixture=bulk/xlarge/2/positions_on arm=tantivy cadence_ms=1000 periodic_commits=6 terminal_commit_calls=1 durability=in_memory timing_mode=continuous
+[qg1-continuous] fixture=bulk/xlarge/2/positions_on arm=tantivy docs=1000000 accepted_bytes=1168088519 processed_bytes=1168088519 window_ns=8459771532 percall_sum_ns=8347394154 feed_calls=200 periodic_commits=6 committed=1000000 searchable=1000000 probe=singleton probe_hits=1 quiescence=tantivy_merging_threads_joined manifest_sha256=0a77def1cf79d6e576bf782250158b09ac49a824796b5ce6e8cee84b4a231d70 indexed_content_sha256=b9840b4df07535f8908563bfc6b9c627f7e27edbafd6cbc6483a32a70d3c9f76
+[qg1-work-receipt] run_id=qg1-trj-h1h2-ccc37c8e-clean-r10-20260731T0349Z-t2 pid=2838905 ppid=2810628 machine=linux-x86_64-thr profile=release-perf elf=53ab4c0975f0ad21 git=ccc37c8e611cd313 gate=QG-1 fixture=bulk/xlarge/2/positions_on metric=docs_per_second arm=tantivy mode=continuous corpus=0a77def1cf79d6e5 wall_ns=8722724601 configured=2 roles=bench_caller:1,tantivy_index_worker:4,tantivy_segment_updater:1,tantivy_merge_worker:4,tantivy_docstore_compressor:1,asupersync_runtime:1,unattributed:2 mean_active=2788m queue=unobservable join=tantivy_workers_joined drained=true pending_zero=true terminal=completed retryable=false digest=f4bf0c25be781232
+[qg-commit-parity] gate=QG-1 fixture=bulk/xlarge/2/positions_on arm=tantivy cadence_ms=1000 periodic_commits=6 terminal_commit_calls=1 durability=in_memory timing_mode=continuous
+[qg1-continuous] fixture=bulk/xlarge/2/positions_on arm=tantivy docs=1000000 accepted_bytes=1168088519 processed_bytes=1168088519 window_ns=8722724601 percall_sum_ns=8633586759 feed_calls=200 periodic_commits=6 committed=1000000 searchable=1000000 probe=singleton probe_hits=1 quiescence=tantivy_merging_threads_joined manifest_sha256=0a77def1cf79d6e576bf782250158b09ac49a824796b5ce6e8cee84b4a231d70 indexed_content_sha256=b9840b4df07535f8908563bfc6b9c627f7e27edbafd6cbc6483a32a70d3c9f76
+[qg1-work-receipt] run_id=qg1-trj-h1h2-ccc37c8e-clean-r10-20260731T0349Z-t2 pid=2838905 ppid=2810628 machine=linux-x86_64-thr profile=release-perf elf=53ab4c0975f0ad21 git=ccc37c8e611cd313 gate=QG-1 fixture=bulk/xlarge/2/positions_on metric=docs_per_second arm=quill mode=continuous corpus=0a77def1cf79d6e5 wall_ns=27093142372 configured=2 roles=bench_caller:1,rayon_worker:1,asupersync_runtime:1,unattributed:1 mean_active=1000m queue=sync_no_queue join=quill_synchronous_commit drained=true pending_zero=true terminal=completed retryable=false digest=3eaeb1240ff6f41a
+[qg-commit-parity] gate=QG-1 fixture=bulk/xlarge/2/positions_on arm=quill cadence_ms=1000 periodic_commits=19 terminal_commit_calls=1 durability=in_memory timing_mode=continuous
+[qg1-continuous] fixture=bulk/xlarge/2/positions_on arm=quill docs=1000000 accepted_bytes=1168088519 processed_bytes=1168088519 window_ns=27093142372 percall_sum_ns=26971815141 feed_calls=200 periodic_commits=19 committed=1000000 searchable=1000000 probe=singleton probe_hits=1 quiescence=quill_sealed_synchronous_commit manifest_sha256=0a77def1cf79d6e576bf782250158b09ac49a824796b5ce6e8cee84b4a231d70 indexed_content_sha256=b9840b4df07535f8908563bfc6b9c627f7e27edbafd6cbc6483a32a70d3c9f76
+[qg1-work-receipt] run_id=qg1-trj-h1h2-ccc37c8e-clean-r10-20260731T0349Z-t2 pid=2838905 ppid=2810628 machine=linux-x86_64-thr profile=release-perf elf=53ab4c0975f0ad21 git=ccc37c8e611cd313 gate=QG-1 fixture=bulk/xlarge/2/positions_on metric=docs_per_second arm=tantivy mode=continuous corpus=0a77def1cf79d6e5 wall_ns=8434661850 configured=2 roles=bench_caller:1,tantivy_index_worker:4,tantivy_segment_updater:1,tantivy_merge_worker:4,tantivy_docstore_compressor:2,asupersync_runtime:1,unattributed:1 mean_active=2869m queue=unobservable join=tantivy_workers_joined drained=true pending_zero=true terminal=completed retryable=false digest=36a056a83e53e945
+[qg-commit-parity] gate=QG-1 fixture=bulk/xlarge/2/positions_on arm=tantivy cadence_ms=1000 periodic_commits=6 terminal_commit_calls=1 durability=in_memory timing_mode=continuous
+[qg1-continuous] fixture=bulk/xlarge/2/positions_on arm=tantivy docs=1000000 accepted_bytes=1168088519 processed_bytes=1168088519 window_ns=8434661850 percall_sum_ns=8313417607 feed_calls=200 periodic_commits=6 committed=1000000 searchable=1000000 probe=singleton probe_hits=1 quiescence=tantivy_merging_threads_joined manifest_sha256=0a77def1cf79d6e576bf782250158b09ac49a824796b5ce6e8cee84b4a231d70 indexed_content_sha256=b9840b4df07535f8908563bfc6b9c627f7e27edbafd6cbc6483a32a70d3c9f76
+[qg1-work-receipt] run_id=qg1-trj-h1h2-ccc37c8e-clean-r10-20260731T0349Z-t2 pid=2838905 ppid=2810628 machine=linux-x86_64-thr profile=release-perf elf=53ab4c0975f0ad21 git=ccc37c8e611cd313 gate=QG-1 fixture=bulk/xlarge/2/positions_on metric=docs_per_second arm=quill mode=continuous corpus=0a77def1cf79d6e5 wall_ns=27499989836 configured=2 roles=bench_caller:1,rayon_worker:1,asupersync_runtime:1,unattributed:1 mean_active=999m queue=sync_no_queue join=quill_synchronous_commit drained=true pending_zero=true terminal=completed retryable=false digest=96d5f3dc11f6a4c6
+[qg-commit-parity] gate=QG-1 fixture=bulk/xlarge/2/positions_on arm=quill cadence_ms=1000 periodic_commits=18 terminal_commit_calls=1 durability=in_memory timing_mode=continuous
+[qg1-continuous] fixture=bulk/xlarge/2/positions_on arm=quill docs=1000000 accepted_bytes=1168088519 processed_bytes=1168088519 window_ns=27499989836 percall_sum_ns=27379504208 feed_calls=200 periodic_commits=18 committed=1000000 searchable=1000000 probe=singleton probe_hits=1 quiescence=quill_sealed_synchronous_commit manifest_sha256=0a77def1cf79d6e576bf782250158b09ac49a824796b5ce6e8cee84b4a231d70 indexed_content_sha256=b9840b4df07535f8908563bfc6b9c627f7e27edbafd6cbc6483a32a70d3c9f76
+[qg1-work-receipt] run_id=qg1-trj-h1h2-ccc37c8e-clean-r10-20260731T0349Z-t2 pid=2838905 ppid=2810628 machine=linux-x86_64-thr profile=release-perf elf=53ab4c0975f0ad21 git=ccc37c8e611cd313 gate=QG-1 fixture=bulk/xlarge/2/positions_on metric=docs_per_second arm=quill mode=continuous corpus=0a77def1cf79d6e5 wall_ns=27406822242 configured=2 roles=bench_caller:1,rayon_worker:1,asupersync_runtime:1,unattributed:1 mean_active=999m queue=sync_no_queue join=quill_synchronous_commit drained=true pending_zero=true terminal=completed retryable=false digest=a8378d66efb1ba91
+[qg-commit-parity] gate=QG-1 fixture=bulk/xlarge/2/positions_on arm=quill cadence_ms=1000 periodic_commits=19 terminal_commit_calls=1 durability=in_memory timing_mode=continuous
+[qg1-continuous] fixture=bulk/xlarge/2/positions_on arm=quill docs=1000000 accepted_bytes=1168088519 processed_bytes=1168088519 window_ns=27406822242 percall_sum_ns=27284710551 feed_calls=200 periodic_commits=19 committed=1000000 searchable=1000000 probe=singleton probe_hits=1 quiescence=quill_sealed_synchronous_commit manifest_sha256=0a77def1cf79d6e576bf782250158b09ac49a824796b5ce6e8cee84b4a231d70 indexed_content_sha256=b9840b4df07535f8908563bfc6b9c627f7e27edbafd6cbc6483a32a70d3c9f76
+[qg1-work-receipt] run_id=qg1-trj-h1h2-ccc37c8e-clean-r10-20260731T0349Z-t2 pid=2838905 ppid=2810628 machine=linux-x86_64-thr profile=release-perf elf=53ab4c0975f0ad21 git=ccc37c8e611cd313 gate=QG-1 fixture=bulk/xlarge/2/positions_on metric=docs_per_second arm=tantivy mode=continuous corpus=0a77def1cf79d6e5 wall_ns=8780576656 configured=2 roles=bench_caller:1,tantivy_index_worker:4,tantivy_segment_updater:1,tantivy_merge_worker:4,tantivy_docstore_compressor:1,asupersync_runtime:1,unattributed:2 mean_active=2739m queue=unobservable join=tantivy_workers_joined drained=true pending_zero=true terminal=completed retryable=false digest=f152c025596898cb
+[qg-commit-parity] gate=QG-1 fixture=bulk/xlarge/2/positions_on arm=tantivy cadence_ms=1000 periodic_commits=6 terminal_commit_calls=1 durability=in_memory timing_mode=continuous
+[qg1-continuous] fixture=bulk/xlarge/2/positions_on arm=tantivy docs=1000000 accepted_bytes=1168088519 processed_bytes=1168088519 window_ns=8780576656 percall_sum_ns=8663707405 feed_calls=200 periodic_commits=6 committed=1000000 searchable=1000000 probe=singleton probe_hits=1 quiescence=tantivy_merging_threads_joined manifest_sha256=0a77def1cf79d6e576bf782250158b09ac49a824796b5ce6e8cee84b4a231d70 indexed_content_sha256=b9840b4df07535f8908563bfc6b9c627f7e27edbafd6cbc6483a32a70d3c9f76
+[qg1-work-receipt] run_id=qg1-trj-h1h2-ccc37c8e-clean-r10-20260731T0349Z-t2 pid=2838905 ppid=2810628 machine=linux-x86_64-thr profile=release-perf elf=53ab4c0975f0ad21 git=ccc37c8e611cd313 gate=QG-1 fixture=bulk/xlarge/2/positions_on metric=docs_per_second arm=tantivy mode=continuous corpus=0a77def1cf79d6e5 wall_ns=8397062857 configured=2 roles=bench_caller:1,tantivy_index_worker:4,tantivy_segment_updater:1,tantivy_merge_worker:4,tantivy_docstore_compressor:3,asupersync_runtime:1 mean_active=2880m queue=unobservable join=tantivy_workers_joined drained=true pending_zero=true terminal=completed retryable=false digest=0d23f4b4a5e39fd6
+[qg-commit-parity] gate=QG-1 fixture=bulk/xlarge/2/positions_on arm=tantivy cadence_ms=1000 periodic_commits=5 terminal_commit_calls=1 durability=in_memory timing_mode=continuous
+[qg1-continuous] fixture=bulk/xlarge/2/positions_on arm=tantivy docs=1000000 accepted_bytes=1168088519 processed_bytes=1168088519 window_ns=8397062857 percall_sum_ns=8285510483 feed_calls=200 periodic_commits=5 committed=1000000 searchable=1000000 probe=singleton probe_hits=1 quiescence=tantivy_merging_threads_joined manifest_sha256=0a77def1cf79d6e576bf782250158b09ac49a824796b5ce6e8cee84b4a231d70 indexed_content_sha256=b9840b4df07535f8908563bfc6b9c627f7e27edbafd6cbc6483a32a70d3c9f76
+[qg1-work-receipt] run_id=qg1-trj-h1h2-ccc37c8e-clean-r10-20260731T0349Z-t2 pid=2838905 ppid=2810628 machine=linux-x86_64-thr profile=release-perf elf=53ab4c0975f0ad21 git=ccc37c8e611cd313 gate=QG-1 fixture=bulk/xlarge/2/positions_on metric=docs_per_second arm=quill mode=continuous corpus=0a77def1cf79d6e5 wall_ns=27379179572 configured=2 roles=bench_caller:1,rayon_worker:1,asupersync_runtime:1,unattributed:1 mean_active=999m queue=sync_no_queue join=quill_synchronous_commit drained=true pending_zero=true terminal=completed retryable=false digest=97c401791d1a6817
+[qg-commit-parity] gate=QG-1 fixture=bulk/xlarge/2/positions_on arm=quill cadence_ms=1000 periodic_commits=19 terminal_commit_calls=1 durability=in_memory timing_mode=continuous
+[qg1-continuous] fixture=bulk/xlarge/2/positions_on arm=quill docs=1000000 accepted_bytes=1168088519 processed_bytes=1168088519 window_ns=27379179572 percall_sum_ns=27258647499 feed_calls=200 periodic_commits=19 committed=1000000 searchable=1000000 probe=singleton probe_hits=1 quiescence=quill_sealed_synchronous_commit manifest_sha256=0a77def1cf79d6e576bf782250158b09ac49a824796b5ce6e8cee84b4a231d70 indexed_content_sha256=b9840b4df07535f8908563bfc6b9c627f7e27edbafd6cbc6483a32a70d3c9f76
+[qg1-work-receipt] run_id=qg1-trj-h1h2-ccc37c8e-clean-r10-20260731T0349Z-t2 pid=2838905 ppid=2810628 machine=linux-x86_64-thr profile=release-perf elf=53ab4c0975f0ad21 git=ccc37c8e611cd313 gate=QG-1 fixture=bulk/xlarge/2/positions_on metric=docs_per_second arm=tantivy mode=continuous corpus=0a77def1cf79d6e5 wall_ns=8116810813 configured=2 roles=bench_caller:1,tantivy_index_worker:4,tantivy_segment_updater:1,tantivy_merge_worker:4,tantivy_docstore_compressor:2,asupersync_runtime:1,unattributed:1 mean_active=2955m queue=unobservable join=tantivy_workers_joined drained=true pending_zero=true terminal=completed retryable=false digest=2085e157e985c345
+[qg-commit-parity] gate=QG-1 fixture=bulk/xlarge/2/positions_on arm=tantivy cadence_ms=1000 periodic_commits=5 terminal_commit_calls=1 durability=in_memory timing_mode=continuous
+[qg1-continuous] fixture=bulk/xlarge/2/positions_on arm=tantivy docs=1000000 accepted_bytes=1168088519 processed_bytes=1168088519 window_ns=8116810813 percall_sum_ns=8028673204 feed_calls=200 periodic_commits=5 committed=1000000 searchable=1000000 probe=singleton probe_hits=1 quiescence=tantivy_merging_threads_joined manifest_sha256=0a77def1cf79d6e576bf782250158b09ac49a824796b5ce6e8cee84b4a231d70 indexed_content_sha256=b9840b4df07535f8908563bfc6b9c627f7e27edbafd6cbc6483a32a70d3c9f76
+[qg1-work-receipt] run_id=qg1-trj-h1h2-ccc37c8e-clean-r10-20260731T0349Z-t2 pid=2838905 ppid=2810628 machine=linux-x86_64-thr profile=release-perf elf=53ab4c0975f0ad21 git=ccc37c8e611cd313 gate=QG-1 fixture=bulk/xlarge/2/positions_on metric=docs_per_second arm=quill mode=continuous corpus=0a77def1cf79d6e5 wall_ns=26994152572 configured=2 roles=bench_caller:1,rayon_worker:1,asupersync_runtime:1,unattributed:1 mean_active=1000m queue=sync_no_queue join=quill_synchronous_commit drained=true pending_zero=true terminal=completed retryable=false digest=0abc3043f676013f
+[qg-commit-parity] gate=QG-1 fixture=bulk/xlarge/2/positions_on arm=quill cadence_ms=1000 periodic_commits=19 terminal_commit_calls=1 durability=in_memory timing_mode=continuous
+[qg1-continuous] fixture=bulk/xlarge/2/positions_on arm=quill docs=1000000 accepted_bytes=1168088519 processed_bytes=1168088519 window_ns=26994152572 percall_sum_ns=26873095511 feed_calls=200 periodic_commits=19 committed=1000000 searchable=1000000 probe=singleton probe_hits=1 quiescence=quill_sealed_synchronous_commit manifest_sha256=0a77def1cf79d6e576bf782250158b09ac49a824796b5ce6e8cee84b4a231d70 indexed_content_sha256=b9840b4df07535f8908563bfc6b9c627f7e27edbafd6cbc6483a32a70d3c9f76
+[qg1-work-receipt] run_id=qg1-trj-h1h2-ccc37c8e-clean-r10-20260731T0349Z-t2 pid=2838905 ppid=2810628 machine=linux-x86_64-thr profile=release-perf elf=53ab4c0975f0ad21 git=ccc37c8e611cd313 gate=QG-1 fixture=bulk/xlarge/2/positions_on metric=docs_per_second arm=quill mode=continuous corpus=0a77def1cf79d6e5 wall_ns=27147942224 configured=2 roles=bench_caller:1,rayon_worker:1,asupersync_runtime:1,unattributed:1 mean_active=999m queue=sync_no_queue join=quill_synchronous_commit drained=true pending_zero=true terminal=completed retryable=false digest=edca2bcb714fd68d
+[qg-commit-parity] gate=QG-1 fixture=bulk/xlarge/2/positions_on arm=quill cadence_ms=1000 periodic_commits=19 terminal_commit_calls=1 durability=in_memory timing_mode=continuous
+[qg1-continuous] fixture=bulk/xlarge/2/positions_on arm=quill docs=1000000 accepted_bytes=1168088519 processed_bytes=1168088519 window_ns=27147942224 percall_sum_ns=27025858441 feed_calls=200 periodic_commits=19 committed=1000000 searchable=1000000 probe=singleton probe_hits=1 quiescence=quill_sealed_synchronous_commit manifest_sha256=0a77def1cf79d6e576bf782250158b09ac49a824796b5ce6e8cee84b4a231d70 indexed_content_sha256=b9840b4df07535f8908563bfc6b9c627f7e27edbafd6cbc6483a32a70d3c9f76
+[qg1-work-receipt] run_id=qg1-trj-h1h2-ccc37c8e-clean-r10-20260731T0349Z-t2 pid=2838905 ppid=2810628 machine=linux-x86_64-thr profile=release-perf elf=53ab4c0975f0ad21 git=ccc37c8e611cd313 gate=QG-1 fixture=bulk/xlarge/2/positions_on metric=docs_per_second arm=tantivy mode=continuous corpus=0a77def1cf79d6e5 wall_ns=8783304271 configured=2 roles=bench_caller:1,tantivy_index_worker:4,tantivy_segment_updater:1,tantivy_merge_worker:4,tantivy_docstore_compressor:3,asupersync_runtime:1,unattributed:1 mean_active=2809m queue=unobservable join=tantivy_workers_joined drained=true pending_zero=true terminal=completed retryable=false digest=a9d02387239c73fe
+[qg-commit-parity] gate=QG-1 fixture=bulk/xlarge/2/positions_on arm=tantivy cadence_ms=1000 periodic_commits=6 terminal_commit_calls=1 durability=in_memory timing_mode=continuous
+[qg1-continuous] fixture=bulk/xlarge/2/positions_on arm=tantivy docs=1000000 accepted_bytes=1168088519 processed_bytes=1168088519 window_ns=8783304271 percall_sum_ns=8666807132 feed_calls=200 periodic_commits=6 committed=1000000 searchable=1000000 probe=singleton probe_hits=1 quiescence=tantivy_merging_threads_joined manifest_sha256=0a77def1cf79d6e576bf782250158b09ac49a824796b5ce6e8cee84b4a231d70 indexed_content_sha256=b9840b4df07535f8908563bfc6b9c627f7e27edbafd6cbc6483a32a70d3c9f76
+[quill-perf-paired] fixture=bulk/xlarge/2/positions_on tantivy_null_median=1.038377 tantivy_null_ci95=[0.986496,1.060963] tantivy_null_cv_pct=4.866 quill_null_median=1.012091 quill_null_ci95=[0.986909,1.037052] quill_null_cv_pct=2.599 ab_median=0.312842 ab_ci95=[0.306422,0.321050] ab_cv_pct=2.558 checksum=38baec52b122f4c2
+[tantivy-lifecycle] receipts=33 sha256=97f588f438c94692d69669f91d8553708d21c2fb5b85c699b658e3795b447807 path=/tmp/frankensearch-qg1-ccc37c8e/rows/qg1-trj-h1h2-ccc37c8e-clean-r10-20260731T0349Z/t2/tantivy-lifecycle.jsonl
+[qg1-work-receipts] receipts=66 sha256=d20ce285d0fb53645eb661414d0610be632ca79a919a5e7999371b6a83f62ac9 path=/tmp/frankensearch-qg1-ccc37c8e/rows/qg1-trj-h1h2-ccc37c8e-clean-r10-20260731T0349Z/t2/work-receipts.jsonl
+[qg1-continuous-summary] gate=QG-1 timing_mode=continuous cells=1
+[qg1-work-receipt-summary] gate=QG-1 mode=on cells=1
+[quill-evidence] gate=QG-1 status=no_decision ratchet_admissible=false json=/tmp/frankensearch-qg1-ccc37c8e/rows/qg1-trj-h1h2-ccc37c8e-clean-r10-20260731T0349Z/t2/QG-1.evidence.json table=/tmp/frankensearch-qg1-ccc37c8e/rows/qg1-trj-h1h2-ccc37c8e-clean-r10-20260731T0349Z/t2/QG-1.evidence.md
+host=threadripperje | physical_cores=64 | logical_threads=128 | process_available_threads=128 | configured_engine_thread_widths=[2] | runtime_detected_isa=["aes", "avx2", "bmi2", "fma", "vaes"] | cpu_affinity_allowed_list=0-127 | affinity_or_cpuset_cap=none
+fixture | engine | metric | p50 | median_ci95 | p95 | p99 | cv_pct (provenance) | runs | admission
+--- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---
+bulk/xlarge/2/positions_on | quill | docs_per_second (docs/s) | 36505.684718 | [36363.649804, 36909.708969] | 37045.059938 | 37045.059938 | 0.790 | 10 | sampled
+bulk/xlarge/2/positions_on | tantivy | docs_per_second (docs/s) | 116424.790153 | [113887.736441, 119429.979540] | 123201.097455 | 123201.097455 | 2.808 | 10 | sampled
+bulk/xlarge/2/positions_on | paired_ab | docs_per_second_quill_over_tantivy (ratio) | 0.312842 | [0.306422, 0.321050] | 0.323535 | 0.323535 | 2.558 | 10 | sampled
+bulk/xlarge/2/positions_on | paired_null | docs_per_second_tantivy_over_tantivy (ratio) | 1.038377 | [0.986496, 1.060963] | 1.129946 | 1.129946 | 4.866 | 10 | sampled
+bulk/xlarge/2/positions_on | paired_null_quill | docs_per_second_quill_over_quill (ratio) | 1.012091 | [0.986909, 1.037052] | 1.040158 | 1.040158 | 2.599 | 10 | sampled
+
+[quill-perf-json-begin] gate=QG-1
+{
+  "schema_version": "quill-perf-artifact-v5",
+  "gate": "Qg1",
+  "bench_elf_sha256": "53ab4c0975f0ad2148e37f35641dfd56e78acd8048d01cdb8b1194aa8ab9b637",
+  "machine_fingerprint": "linux-x86_64-threadripperje-128thread-AMD_Ryzen_Threadripper_PRO_5995WX_64-Cores",
+  "execution": {
+    "host_identity": "threadripperje",
+    "producer_os": "linux",
+    "physical_cores": 64,
+    "logical_threads": 128,
+    "process_available_threads": 128,
+    "configured_engine_thread_widths": [
+      2
+    ],
+    "runtime_detected_isa": [
+      "aes",
+      "avx2",
+      "bmi2",
+      "fma",
+      "vaes"
+    ],
+    "cpu_affinity_allowed_list": "0-127",
+    "affinity_or_cpuset_cap": null
+  },
+  "git_rev": "ccc37c8e611cd313201108ffe9260376a977b4bd",
+  "run_window": "qg1-trj-h1h2-ccc37c8e-clean-r10-20260731",
+  "run_id": "qg1-trj-h1h2-ccc37c8e-clean-r10-20260731T0349Z-t2",
+  "corpus_manifest_hash": "d69b8cfbae8755f0449e54be8be3592fd73354d11eeb264cfadb2af7334ea80a",
+  "manifest_sha256": "bc7b97c1b5cbf07e46fdbd662f490290f60e3fa94f4c0cddc93020ed36cc0592",
+  "cells": [
+    {
+      "fixture": "bulk/xlarge/2/positions_on",
+      "metric": "docs_per_second",
+      "engine": "quill",
+      "unit": "docs/s",
+      "value": 36505.68471753171,
+      "p50": 36505.68471753171,
+      "median_ci95_low": 36363.64980364133,
+      "median_ci95_high": 36909.708968771076,
+      "p95": 37045.05993780526,
+      "p99": 37045.05993780526,
+      "mad": 271.0910435013866,
+      "cv_pct": 0.7895861596459778,
+      "runs": 10
+    },
+    {
+      "fixture": "bulk/xlarge/2/positions_on",
+      "metric": "docs_per_second",
+      "engine": "tantivy",
+      "unit": "docs/s",
+      "value": 116424.79015259397,
+      "p50": 116424.79015259397,
+      "median_ci95_low": 113887.73644116797,
+      "median_ci95_high": 119429.97953961405,
+      "p95": 123201.09745546684,
+      "p99": 123201.09745546684,
+      "mad": 2554.7373694576672,
+      "cv_pct": 2.807857384341539,
+      "runs": 10
+    },
+    {
+      "fixture": "bulk/xlarge/2/positions_on",
+      "metric": "docs_per_second_quill_over_tantivy",
+      "engine": "paired_ab",
+      "unit": "ratio",
+      "value": 0.31284155933161106,
+      "p50": 0.31284155933161106,
+      "median_ci95_low": 0.30642157166005796,
+      "median_ci95_high": 0.321049862427893,
+      "p95": 0.3235348078512988,
+      "p99": 0.3235348078512988,
+      "mad": 0.0070092224117769,
+      "cv_pct": 2.558223775665145,
+      "runs": 10
+    },
+    {
+      "fixture": "bulk/xlarge/2/positions_on",
+      "metric": "docs_per_second_tantivy_over_tantivy",
+      "engine": "paired_null",
+      "unit": "ratio",
+      "value": 1.0383768651974674,
+      "p50": 1.0383768651974674,
+      "median_ci95_low": 0.9864957918050096,
+      "median_ci95_high": 1.060963158928235,
+      "p95": 1.129946187712208,
+      "p99": 1.129946187712208,
+      "mad": 0.03283082390721748,
+      "cv_pct": 4.865998559123077,
+      "runs": 10
+    },
+    {
+      "fixture": "bulk/xlarge/2/positions_on",
+      "metric": "docs_per_second_quill_over_quill",
+      "engine": "paired_null_quill",
+      "unit": "ratio",
+      "value": 1.012091192433651,
+      "p50": 1.012091192433651,
+      "median_ci95_low": 0.9869094802511154,
+      "median_ci95_high": 1.0370518381541676,
+      "p95": 1.04015815951576,
+      "p99": 1.04015815951576,
+      "mad": 0.019394096443184627,
+      "cv_pct": 2.599246879683712,
+      "runs": 10
+    }
+  ],
+  "laws_attested": false,
+  "continuous_timing": {
+    "schema_version": "qg1-continuous-timing-v1",
+    "timing_mode": "continuous",
+    "cells": [
+      {
+        "schema_version": "qg1-continuous-timing-v1",
+        "fixture": "bulk/xlarge/2/positions_on",
+        "timing_mode": "continuous",
+        "corpus": {
+          "schema_version": "qg1-continuous-timing-v1",
+          "identity": "qg1-native/prepared-prefix-v1/b9840b4df07535f8908563bfc6b9c627f7e27edbafd6cbc6483a32a70d3c9f76",
+          "generator_seed": 5860671082139239762,
+          "positions": "positions_on",
+          "doc_count": 1000000,
+          "id_bytes": 18000000,
+          "title_bytes": 24888890,
+          "content_bytes": 875330940,
+          "metadata_bytes": 249868689,
+          "total_bytes": 1168088519,
+          "titled_docs": 1000000,
+          "metadata_entries": 11000000,
+          "corpus_xxh3": "b2b049593f55d93a"
+        },
+        "rounds_quill": 33,
+        "rounds_tantivy": 33,
+        "last_quill_receipt": {
+          "schema_version": "qg1-continuous-timing-v1",
+          "engine": "quill",
+          "timing_source": "continuous_monotonic_window",
+          "quiescence": "quill_sealed_synchronous_commit",
+          "feed_calls": 200,
+          "accepted_docs": 1000000,
+          "processed_docs": 1000000,
+          "committed_docs": 1000000,
+          "searchable_docs": 1000000,
+          "accepted_bytes": 1168088519,
+          "processed_bytes": 1168088519,
+          "committed_bytes": {
+            "structurally_unobservable": {
+              "seam": "LexicalRead exposes doc_count only; engine-side committed/searchable byte totals await the H2 actual-work receipts seam"
+            }
+          },
+          "searchable_bytes": {
+            "structurally_unobservable": {
+              "seam": "LexicalRead exposes doc_count only; engine-side committed/searchable byte totals await the H2 actual-work receipts seam"
+            }
+          },
+          "periodic_commits": 19,
+          "percall_sum_ns": 27025858441,
+          "timeline": {
+            "feed_complete_ns": 27108061671,
+            "commit_complete_ns": 27108238452,
+            "searchable_verified_ns": 27147777345,
+            "quiescence_joined_ns": 27147942224,
+            "window_total_ns": 27147942224
+          },
+          "terminal_probe_query": "singleton",
+          "terminal_probe_hits": 1
+        },
+        "last_tantivy_receipt": {
+          "schema_version": "qg1-continuous-timing-v1",
+          "engine": "tantivy",
+          "timing_source": "continuous_monotonic_window",
+          "quiescence": "tantivy_merging_threads_joined",
+          "feed_calls": 200,
+          "accepted_docs": 1000000,
+          "processed_docs": 1000000,
+          "committed_docs": 1000000,
+          "searchable_docs": 1000000,
+          "accepted_bytes": 1168088519,
+          "processed_bytes": 1168088519,
+          "committed_bytes": {
+            "structurally_unobservable": {
+              "seam": "LexicalRead exposes doc_count only; engine-side committed/searchable byte totals await the H2 actual-work receipts seam"
+            }
+          },
+          "searchable_bytes": {
+            "structurally_unobservable": {
+              "seam": "LexicalRead exposes doc_count only; engine-side committed/searchable byte totals await the H2 actual-work receipts seam"
+            }
+          },
+          "periodic_commits": 6,
+          "percall_sum_ns": 8666807132,
+          "timeline": {
+            "feed_complete_ns": 8444565204,
+            "commit_complete_ns": 8512190448,
+            "searchable_verified_ns": 8512322335,
+            "quiescence_joined_ns": 8783304271,
+            "window_total_ns": 8783304271
+          },
+          "terminal_probe_query": "singleton",
+          "terminal_probe_hits": 1
+        },
+        "all_windows_validated": true
+      }
+    ]
+  },
+  "work_receipts": {
+    "schema_version": "qg1-work-receipt-v1",
+    "mode": "on",
+    "cells": [
+      {
+        "schema_version": "qg1-work-receipt-v1",
+        "fixture": "bulk/xlarge/2/positions_on",
+        "rounds_quill": 33,
+        "rounds_tantivy": 33,
+        "last_quill_receipt": {
+          "schema_version": "qg1-work-receipt-v1",
+          "binding": {
+            "run_id": "qg1-trj-h1h2-ccc37c8e-clean-r10-20260731T0349Z-t2",
+            "pid": 2838905,
+            "parent_pid": 2810628,
+            "machine_fingerprint": "linux-x86_64-threadripperje-128thread-AMD_Ryzen_Threadripper_PRO_5995WX_64-Cores",
+            "build_profile": "release-perf",
+            "executable_sha256": "53ab4c0975f0ad2148e37f35641dfd56e78acd8048d01cdb8b1194aa8ab9b637",
+            "git_rev": "ccc37c8e611cd313201108ffe9260376a977b4bd",
+            "gate": "QG-1",
+            "fixture": "bulk/xlarge/2/positions_on",
+            "metric": "docs_per_second",
+            "engine": "quill",
+            "timing_mode": "continuous",
+            "corpus_identity": "qg1-native/prepared-prefix-v1/b9840b4df07535f8908563bfc6b9c627f7e27edbafd6cbc6483a32a70d3c9f76",
+            "corpus_manifest_sha256": "0a77def1cf79d6e576bf782250158b09ac49a824796b5ce6e8cee84b4a231d70",
+            "window_started_ns": 1196813305958,
+            "window_ended_ns": 1223961248182
+          },
+          "counters": {
+            "feed_calls": 200,
+            "accepted_docs": 1000000,
+            "processed_docs": 1000000,
+            "committed_docs": 1000000,
+            "searchable_docs": 1000000,
+            "accepted_bytes": 1168088519,
+            "processed_bytes": 1168088519,
+            "committed_corpus_bytes": {
+              "structurally_unobservable": {
+                "seam": "no engine seam retains fed corpus bytes; LexicalRead exposes doc_count and segment stats expose serialized sizes, a different quantity recorded under index footprint"
+              }
+            },
+            "searchable_corpus_bytes": {
+              "structurally_unobservable": {
+                "seam": "no engine seam retains fed corpus bytes; LexicalRead exposes doc_count and segment stats expose serialized sizes, a different quantity recorded under index footprint"
+              }
+            },
+            "periodic_commits": 19,
+            "terminal_commit_calls": 1
+          },
+          "footprint": {
+            "committed_index_bytes": {
+              "observed": {
+                "bytes": 1623421676,
+                "seam": "quill KeeperSnapshot::loaded_manifest().manifest.segments[].file_len (exact FSLX lengths, backend-independent)"
+              }
+            },
+            "committed_segment_count": {
+              "observed": {
+                "bytes": 2,
+                "seam": "quill KeeperSnapshot::loaded_manifest().manifest.segments.len()"
+              }
+            }
+          },
+          "queue": {
+            "synchronous_no_queue": {
+              "seam": "QuillIndex::index_documents/commit are synchronous; the ingest hand-off has no queue"
+            }
+          },
+          "concurrency": {
+            "configured_threads": 2,
+            "observed_width": {
+              "observed": {
+                "threads": 2,
+                "seam": "rayon::current_num_threads inside the bench-pinned Quill pool"
+              }
+            },
+            "wall_ns": 27147942224,
+            "process_cpu": {
+              "observed": {
+                "cpu_ns": 27140000000,
+                "seam": "linux:/proc/self/stat utime+stime"
+              }
+            },
+            "active_concurrency_integral": {
+              "derived_from_process_cpu_identity": {
+                "integral_thread_ns": 27140000000,
+                "mean_active_millithreads": 999
+              }
+            },
+            "role_cpu_ns": {
+              "asupersync_runtime": 0,
+              "bench_caller": 27120000000,
+              "rayon_worker": 0,
+              "unattributed": 0
+            },
+            "unattributed_cpu_ns": 20000000,
+            "live_thread_census": {
+              "sampled": {
+                "platform": "linux",
+                "seam": "linux:/proc/self/task/<tid>/{stat,comm}",
+                "clock_tick_hz": 100,
+                "threads": [
+                  {
+                    "tid": 2838905,
+                    "name": "perf_matrix-cle",
+                    "role": "unattributed",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 2838918,
+                    "name": "asupersync-work",
+                    "role": "asupersync_runtime",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 2880003,
+                    "name": "qg-rayon-0",
+                    "role": "bench_caller",
+                    "window_cpu_ns": 27120000000
+                  },
+                  {
+                    "tid": 2880004,
+                    "name": "qg-rayon-1",
+                    "role": "rayon_worker",
+                    "window_cpu_ns": 0
+                  }
+                ],
+                "truncated": false,
+                "caveats": [
+                  {
+                    "clock_tick_granularity": {
+                      "tick_ns": 10000000
+                    }
+                  },
+                  "exited_thread_cpu_unattributed"
+                ]
+              }
+            },
+            "measured_call_sum_ns": 27025858441
+          },
+          "phases": [
+            {
+              "phase": "first_feed",
+              "window_elapsed_ns": 0
+            },
+            {
+              "phase": "feed_complete",
+              "window_elapsed_ns": 27108061671
+            },
+            {
+              "phase": "commit_complete",
+              "window_elapsed_ns": 27108238452
+            },
+            {
+              "phase": "searchable_verified",
+              "window_elapsed_ns": 27147777345
+            },
+            {
+              "phase": "quiescence_joined",
+              "window_elapsed_ns": 27147942224
+            }
+          ],
+          "terminal": {
+            "join": "quill_synchronous_commit",
+            "drained": true,
+            "pending_docs_zero": true,
+            "terminal_reason": "completed",
+            "retryable": false
+          },
+          "collection_overhead": {
+            "calibrated_census_sample_ns": 159058,
+            "census_samples_in_window": 3,
+            "bounded_symmetric": true
+          },
+          "receipt_xxh3": "edca2bcb714fd68d"
+        },
+        "last_tantivy_receipt": {
+          "schema_version": "qg1-work-receipt-v1",
+          "binding": {
+            "run_id": "qg1-trj-h1h2-ccc37c8e-clean-r10-20260731T0349Z-t2",
+            "pid": 2838905,
+            "parent_pid": 2810628,
+            "machine_fingerprint": "linux-x86_64-threadripperje-128thread-AMD_Ryzen_Threadripper_PRO_5995WX_64-Cores",
+            "build_profile": "release-perf",
+            "executable_sha256": "53ab4c0975f0ad2148e37f35641dfd56e78acd8048d01cdb8b1194aa8ab9b637",
+            "git_rev": "ccc37c8e611cd313201108ffe9260376a977b4bd",
+            "gate": "QG-1",
+            "fixture": "bulk/xlarge/2/positions_on",
+            "metric": "docs_per_second",
+            "engine": "tantivy",
+            "timing_mode": "continuous",
+            "corpus_identity": "qg1-native/prepared-prefix-v1/b9840b4df07535f8908563bfc6b9c627f7e27edbafd6cbc6483a32a70d3c9f76",
+            "corpus_manifest_sha256": "0a77def1cf79d6e576bf782250158b09ac49a824796b5ce6e8cee84b4a231d70",
+            "window_started_ns": 1224064166513,
+            "window_ended_ns": 1232847470784
+          },
+          "counters": {
+            "feed_calls": 200,
+            "accepted_docs": 1000000,
+            "processed_docs": 1000000,
+            "committed_docs": 1000000,
+            "searchable_docs": 1000000,
+            "accepted_bytes": 1168088519,
+            "processed_bytes": 1168088519,
+            "committed_corpus_bytes": {
+              "structurally_unobservable": {
+                "seam": "no engine seam retains fed corpus bytes; LexicalRead exposes doc_count and segment stats expose serialized sizes, a different quantity recorded under index footprint"
+              }
+            },
+            "searchable_corpus_bytes": {
+              "structurally_unobservable": {
+                "seam": "no engine seam retains fed corpus bytes; LexicalRead exposes doc_count and segment stats expose serialized sizes, a different quantity recorded under index footprint"
+              }
+            },
+            "periodic_commits": 6,
+            "terminal_commit_calls": 1
+          },
+          "footprint": {
+            "committed_index_bytes": {
+              "observed": {
+                "bytes": 603350559,
+                "seam": "TantivyIndex::benchmark_index_layout (managed segment files via Directory::open_read)"
+              }
+            },
+            "committed_segment_count": {
+              "observed": {
+                "bytes": 18,
+                "seam": "TantivyIndex::benchmark_index_layout searchable segment count"
+              }
+            }
+          },
+          "queue": {
+            "structurally_unobservable": {
+              "seam": "tantivy 0.26.1 IndexWriter AddOperation channel (crossbeam bounded(10_000)) exposes no depth accessor; observing occupancy requires patching tantivy"
+            }
+          },
+          "concurrency": {
+            "configured_threads": 2,
+            "observed_width": {
+              "observed": {
+                "threads": 2,
+                "seam": "TantivyIndex::benchmark_materialized_writer_threads"
+              }
+            },
+            "wall_ns": 8783304271,
+            "process_cpu": {
+              "observed": {
+                "cpu_ns": 24680000000,
+                "seam": "linux:/proc/self/stat utime+stime"
+              }
+            },
+            "active_concurrency_integral": {
+              "derived_from_process_cpu_identity": {
+                "integral_thread_ns": 24680000000,
+                "mean_active_millithreads": 2809
+              }
+            },
+            "role_cpu_ns": {
+              "asupersync_runtime": 0,
+              "bench_caller": 4190000000,
+              "tantivy_docstore_compressor": 10000000,
+              "tantivy_index_worker": 90000000,
+              "tantivy_merge_worker": 3310000000,
+              "tantivy_segment_updater": 1400000000,
+              "unattributed": 0
+            },
+            "unattributed_cpu_ns": 15680000000,
+            "live_thread_census": {
+              "sampled": {
+                "platform": "linux",
+                "seam": "linux:/proc/self/task/<tid>/{stat,comm}",
+                "clock_tick_hz": 100,
+                "threads": [
+                  {
+                    "tid": 2838905,
+                    "name": "perf_matrix-cle",
+                    "role": "bench_caller",
+                    "window_cpu_ns": 4190000000
+                  },
+                  {
+                    "tid": 2838918,
+                    "name": "asupersync-work",
+                    "role": "asupersync_runtime",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 2880526,
+                    "name": "segment_updater",
+                    "role": "tantivy_segment_updater",
+                    "window_cpu_ns": 1400000000
+                  },
+                  {
+                    "tid": 2880527,
+                    "name": "merge_thread_0",
+                    "role": "tantivy_merge_worker",
+                    "window_cpu_ns": 3310000000
+                  },
+                  {
+                    "tid": 2880528,
+                    "name": "merge_thread_1",
+                    "role": "tantivy_merge_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 2880529,
+                    "name": "merge_thread_2",
+                    "role": "tantivy_merge_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 2880530,
+                    "name": "merge_thread_3",
+                    "role": "tantivy_merge_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 2880707,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 50000000
+                  },
+                  {
+                    "tid": 2880709,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 40000000
+                  },
+                  {
+                    "tid": 2880712,
+                    "name": "docstore-compre",
+                    "role": "tantivy_docstore_compressor",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 2880724,
+                    "name": "docstore-compre",
+                    "role": "tantivy_docstore_compressor",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 2880725,
+                    "name": "docstore-compre",
+                    "role": "tantivy_docstore_compressor",
+                    "window_cpu_ns": 10000000
+                  },
+                  {
+                    "tid": 2880726,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 2880727,
+                    "name": "thrd-tantivy-in",
+                    "role": "tantivy_index_worker",
+                    "window_cpu_ns": 0
+                  },
+                  {
+                    "tid": 2880728,
+                    "name": "watch-callbacks",
+                    "role": "unattributed",
+                    "window_cpu_ns": 0
+                  }
+                ],
+                "truncated": false,
+                "caveats": [
+                  {
+                    "clock_tick_granularity": {
+                      "tick_ns": 10000000
+                    }
+                  },
+                  "exited_thread_cpu_unattributed"
+                ]
+              }
+            },
+            "measured_call_sum_ns": 8666807132
+          },
+          "phases": [
+            {
+              "phase": "first_feed",
+              "window_elapsed_ns": 0
+            },
+            {
+              "phase": "feed_complete",
+              "window_elapsed_ns": 8444565204
+            },
+            {
+              "phase": "commit_complete",
+              "window_elapsed_ns": 8512190448
+            },
+            {
+              "phase": "searchable_verified",
+              "window_elapsed_ns": 8512322335
+            },
+            {
+              "phase": "quiescence_joined",
+              "window_elapsed_ns": 8783304271
+            }
+          ],
+          "terminal": {
+            "join": {
+              "tantivy_workers_joined": {
+                "join_elapsed_ns": 240969601,
+                "searchable_segments_before": 18,
+                "searchable_segments_after": 11,
+                "writer_rearmed": false
+              }
+            },
+            "drained": true,
+            "pending_docs_zero": true,
+            "terminal_reason": "completed",
+            "retryable": false
+          },
+          "collection_overhead": {
+            "calibrated_census_sample_ns": 90599,
+            "census_samples_in_window": 3,
+            "bounded_symmetric": true
+          },
+          "receipt_xxh3": "a9d02387239c73fe"
+        },
+        "all_receipts_validated": true
+      }
+    ]
+  }
+}
+[quill-perf-json-end] gate=QG-1
+[quill-perf] gate=QG-1 json=/tmp/frankensearch-qg1-ccc37c8e/rows/qg1-trj-h1h2-ccc37c8e-clean-r10-20260731T0349Z/t2/QG-1.json table=/tmp/frankensearch-qg1-ccc37c8e/rows/qg1-trj-h1h2-ccc37c8e-clean-r10-20260731T0349Z/t2/QG-1.md

@@ -294,6 +294,53 @@ pub enum QueryWorkKind {
     PositionDocument,
 }
 
+/// Exact competitive-union phase surrounding one conformance-only query-work
+/// admission.
+#[cfg(feature = "pruning-conformance")]
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ConformanceQueryWorkPhase {
+    /// Shadow cursors are discovering competitive documents for this refill.
+    Discovery,
+    /// A real scorer cursor is seeking to a selected candidate or horizon.
+    Seek,
+    /// A scored candidate contribution is complete and its real cursor is
+    /// being drained or advanced.
+    Drain,
+}
+
+/// Per-query location installed by the competitive-union scorer around an
+/// exact conformance-only work admission.
+#[cfg(feature = "pruning-conformance")]
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ConformanceQueryWorkContext {
+    pub(crate) refill_ordinal: u64,
+    pub(crate) window_start: u32,
+    pub(crate) phase: ConformanceQueryWorkPhase,
+    pub(crate) candidate_doc: Option<u32>,
+    pub(crate) candidate_scored: bool,
+}
+
+#[cfg(feature = "pruning-conformance")]
+impl ConformanceQueryWorkContext {
+    const fn new(
+        refill_ordinal: u64,
+        window_start: u32,
+        phase: ConformanceQueryWorkPhase,
+        candidate_doc: Option<u32>,
+        candidate_scored: bool,
+    ) -> Self {
+        Self {
+            refill_ordinal,
+            window_start,
+            phase,
+            candidate_doc,
+            candidate_scored,
+        }
+    }
+}
+
 /// Cancel-aware deterministic query-work admission.
 ///
 /// Implementations must be thread-safe because ordinary, comfortably
@@ -308,6 +355,12 @@ pub trait QueryWorkCheckpoint: Send + Sync {
     /// Returns [`ArgusError::QueryCancelled`] or
     /// [`ArgusError::QueryFuelExhausted`] before the guarded work begins.
     fn admit(&self, kind: QueryWorkKind, units: u64) -> Result<(), ArgusError>;
+
+    /// Install or clear the exact competitive-refill location surrounding
+    /// subsequent admissions. Normal builds do not contain this hook.
+    #[cfg(feature = "pruning-conformance")]
+    #[doc(hidden)]
+    fn set_conformance_query_work_context(&self, _context: Option<ConformanceQueryWorkContext>) {}
 }
 
 /// Forward-only posting access shared by sealed and future delta segments.
@@ -2780,7 +2833,13 @@ impl<'a> ReferenceScorer<'a> {
     /// Returns a typed error if bounded scorer buffers cannot be allocated or
     /// initial cursor alignment detects malformed state.
     pub fn boolean(clauses: Vec<ScorerClause<'a>>) -> Result<Self, ArgusError> {
-        Self::boolean_with_mode(clauses, BooleanMode::Scored, false)
+        Self::boolean_with_mode(
+            clauses,
+            BooleanMode::Scored,
+            false,
+            #[cfg(feature = "pruning-conformance")]
+            None,
+        )
     }
 
     /// Lower a ranked root Boolean through Tantivy's frequency-term `TopDocs`
@@ -2795,7 +2854,23 @@ impl<'a> ReferenceScorer<'a> {
     /// Returns the same typed allocation, cursor-alignment, and scorer-shape
     /// failures as [`Self::boolean`].
     pub(crate) fn boolean_topdocs(clauses: Vec<ScorerClause<'a>>) -> Result<Self, ArgusError> {
-        Self::boolean_with_mode(clauses, BooleanMode::Scored, true)
+        Self::boolean_with_mode(
+            clauses,
+            BooleanMode::Scored,
+            true,
+            #[cfg(feature = "pruning-conformance")]
+            None,
+        )
+    }
+
+    /// Lower a ranked root Boolean while attaching exact interruption-location
+    /// context to conformance-only query-work admissions.
+    #[cfg(feature = "pruning-conformance")]
+    pub(crate) fn boolean_topdocs_with_checkpoint(
+        clauses: Vec<ScorerClause<'a>>,
+        checkpoint: Arc<dyn QueryWorkCheckpoint + 'a>,
+    ) -> Result<Self, ArgusError> {
+        Self::boolean_with_mode(clauses, BooleanMode::Scored, true, Some(checkpoint))
     }
 
     /// Lower Boolean clauses into a genuinely scoreless matching tree.
@@ -2810,13 +2885,22 @@ impl<'a> ReferenceScorer<'a> {
     /// Rejects a child tree containing a scored buffered union, or any ordinary
     /// allocation and cursor-alignment failure.
     pub fn boolean_unscored(clauses: Vec<ScorerClause<'a>>) -> Result<Self, ArgusError> {
-        Self::boolean_with_mode(clauses, BooleanMode::Unscored, false)
+        Self::boolean_with_mode(
+            clauses,
+            BooleanMode::Unscored,
+            false,
+            #[cfg(feature = "pruning-conformance")]
+            None,
+        )
     }
 
     fn boolean_with_mode(
         clauses: Vec<ScorerClause<'a>>,
         mode: BooleanMode,
         topdocs_root: bool,
+        #[cfg(feature = "pruning-conformance")] conformance_checkpoint: Option<
+            Arc<dyn QueryWorkCheckpoint + 'a>,
+        >,
     ) -> Result<Self, ArgusError> {
         if mode == BooleanMode::Unscored
             && clauses
@@ -2878,7 +2962,12 @@ impl<'a> ReferenceScorer<'a> {
                 if should.is_empty() || mode == BooleanMode::Unscored {
                     required
                 } else {
-                    let optional = scorer_union(should, false)?;
+                    let optional = scorer_union(
+                        should,
+                        false,
+                        #[cfg(feature = "pruning-conformance")]
+                        None,
+                    )?;
                     Self {
                         node: ScorerNode::RequiredOptional(RequiredOptionalScorer::new(
                             required, optional,
@@ -2892,12 +2981,25 @@ impl<'a> ReferenceScorer<'a> {
                 (Some(all), BooleanMode::Scored) => {
                     // Preserve Tantivy's nested score order: first aggregate
                     // the ordinary SHOULD scorers, then union one AllScorer.
-                    let ordinary_should = scorer_union(should, false)?;
-                    scorer_union(vec![ordinary_should, all], false)?
+                    let ordinary_should = scorer_union(
+                        should,
+                        false,
+                        #[cfg(feature = "pruning-conformance")]
+                        None,
+                    )?;
+                    scorer_union(
+                        vec![ordinary_should, all],
+                        false,
+                        #[cfg(feature = "pruning-conformance")]
+                        None,
+                    )?
                 }
-                (None, BooleanMode::Scored) => {
-                    scorer_union(should, topdocs_root && excluded.is_empty())?
-                }
+                (None, BooleanMode::Scored) => scorer_union(
+                    should,
+                    topdocs_root && excluded.is_empty(),
+                    #[cfg(feature = "pruning-conformance")]
+                    conformance_checkpoint,
+                )?,
                 (None, BooleanMode::Unscored) => scorer_union_unscored(should)?,
             },
         };
@@ -3266,17 +3368,28 @@ fn scorer_intersection(
     }
 }
 
-fn scorer_union(
-    mut scorers: Vec<ReferenceScorer<'_>>,
+// `'a` is load-bearing under `pruning-conformance`, where the checkpoint
+// parameter shares it; elision only type-checks with the feature off.
+#[allow(clippy::elidable_lifetime_names)]
+fn scorer_union<'a>(
+    mut scorers: Vec<ReferenceScorer<'a>>,
     topdocs_root: bool,
-) -> Result<ReferenceScorer<'_>, ArgusError> {
+    #[cfg(feature = "pruning-conformance")] conformance_checkpoint: Option<
+        Arc<dyn QueryWorkCheckpoint + 'a>,
+    >,
+) -> Result<ReferenceScorer<'a>, ArgusError> {
     match scorers.len() {
         0 => Ok(ReferenceScorer::empty()),
         1 => scorers.pop().ok_or(ArgusError::CursorInvariant(
             "optional scorer count changed during lowering",
         )),
         _ => Ok(ReferenceScorer {
-            node: ScorerNode::Union(BufferedUnionScorer::new(scorers, topdocs_root)?),
+            node: ScorerNode::Union(BufferedUnionScorer::new(
+                scorers,
+                topdocs_root,
+                #[cfg(feature = "pruning-conformance")]
+                conformance_checkpoint,
+            )?),
         }),
     }
 }
@@ -3958,6 +4071,8 @@ struct BufferedUnionScorer<'a> {
     pruning_stats: UnionPruningStats,
     #[cfg(any(test, feature = "pruning-conformance"))]
     conformance_refills: Vec<ConformanceUnionRefill>,
+    #[cfg(feature = "pruning-conformance")]
+    conformance_checkpoint: Option<Arc<dyn QueryWorkCheckpoint + 'a>>,
     /// Whole-group score ceiling captured once at construction, before the
     /// first refill drains any child into [`Self::score_window`].
     ///
@@ -3975,7 +4090,13 @@ struct BufferedUnionScorer<'a> {
 }
 
 impl<'a> BufferedUnionScorer<'a> {
-    fn new(mut scorers: Vec<ReferenceScorer<'a>>, topdocs_root: bool) -> Result<Self, ArgusError> {
+    fn new(
+        mut scorers: Vec<ReferenceScorer<'a>>,
+        topdocs_root: bool,
+        #[cfg(feature = "pruning-conformance")] conformance_checkpoint: Option<
+            Arc<dyn QueryWorkCheckpoint + 'a>,
+        >,
+    ) -> Result<Self, ArgusError> {
         let segment_num_docs = shared_segment_num_docs(&scorers)?;
         scorers.retain(|scorer| scorer.doc().is_some());
         let tantivy_topdocs_term_union = topdocs_root
@@ -4016,6 +4137,8 @@ impl<'a> BufferedUnionScorer<'a> {
             pruning_stats: UnionPruningStats::default(),
             #[cfg(any(test, feature = "pruning-conformance"))]
             conformance_refills: Vec::new(),
+            #[cfg(feature = "pruning-conformance")]
+            conformance_checkpoint,
             group_ceiling,
         };
         if scorer.refill()? {
@@ -4047,6 +4170,37 @@ impl<'a> BufferedUnionScorer<'a> {
         self.scan_offset = 0;
         self.current = None;
         self.current_score = 0.0;
+    }
+
+    #[cfg(feature = "pruning-conformance")]
+    fn set_conformance_query_work_context(
+        &self,
+        phase: ConformanceQueryWorkPhase,
+        candidate_doc: Option<u32>,
+        candidate_scored: bool,
+    ) {
+        let (Some(checkpoint), Some(window_start)) =
+            (&self.conformance_checkpoint, self.window_start)
+        else {
+            return;
+        };
+        let refill_ordinal = u64::try_from(self.conformance_refills.len())
+            .unwrap_or(u64::MAX)
+            .saturating_add(1);
+        checkpoint.set_conformance_query_work_context(Some(ConformanceQueryWorkContext::new(
+            refill_ordinal,
+            window_start,
+            phase,
+            candidate_doc,
+            candidate_scored,
+        )));
+    }
+
+    #[cfg(feature = "pruning-conformance")]
+    fn clear_conformance_query_work_context(&self) {
+        if let Some(checkpoint) = &self.conformance_checkpoint {
+            checkpoint.set_conformance_query_work_context(None);
+        }
     }
 
     fn refill(&mut self) -> Result<bool, ArgusError> {
@@ -4081,6 +4235,8 @@ impl<'a> BufferedUnionScorer<'a> {
     }
 
     fn refill_with_cutoff(&mut self, cutoff: Option<f32>) -> Result<bool, ArgusError> {
+        #[cfg(feature = "pruning-conformance")]
+        self.clear_conformance_query_work_context();
         self.clear_buffer();
         let Some(window_start) = self.active.iter().filter_map(ReferenceScorer::doc).min() else {
             self.window_start = None;
@@ -4088,6 +4244,14 @@ impl<'a> BufferedUnionScorer<'a> {
         };
         self.window_start = Some(window_start);
         let horizon_end = u64::from(window_start) + UNION_HORIZON_U64;
+        #[cfg(feature = "pruning-conformance")]
+        if cutoff.is_some_and(f32::is_finite) {
+            self.set_conformance_query_work_context(
+                ConformanceQueryWorkPhase::Discovery,
+                None,
+                false,
+            );
+        }
         if let Some(cutoff) = cutoff
             && cutoff.is_finite()
             && let Some(candidates) =
@@ -4119,6 +4283,8 @@ impl<'a> BufferedUnionScorer<'a> {
             #[cfg(any(test, feature = "pruning-conformance"))]
             let candidate_docs = u64::try_from(candidates.docs.len()).unwrap_or(u64::MAX);
             self.fill_candidate_window(window_start, horizon_end, &candidates.docs)?;
+            #[cfg(feature = "pruning-conformance")]
+            self.clear_conformance_query_work_context();
             #[cfg(any(test, feature = "pruning-conformance"))]
             self.record_conformance_refill(
                 window_start,
@@ -4129,6 +4295,8 @@ impl<'a> BufferedUnionScorer<'a> {
             );
             return Ok(true);
         }
+        #[cfg(feature = "pruning-conformance")]
+        self.clear_conformance_query_work_context();
         self.fill_exhaustive_window(window_start, horizon_end)?;
         #[cfg(any(test, feature = "pruning-conformance"))]
         self.record_conformance_refill(
@@ -4674,6 +4842,12 @@ impl<'a> BufferedUnionScorer<'a> {
                 }
                 let candidate_index = candidates.partition_point(|candidate| *candidate < doc);
                 let Some(&candidate) = candidates.get(candidate_index) else {
+                    #[cfg(feature = "pruning-conformance")]
+                    self.set_conformance_query_work_context(
+                        ConformanceQueryWorkPhase::Seek,
+                        None,
+                        false,
+                    );
                     Self::advance_scorer_to_horizon(&mut self.active[index], horizon_end)?;
                     if self.active[index].doc().is_none() {
                         self.active.swap_remove(index);
@@ -4683,6 +4857,12 @@ impl<'a> BufferedUnionScorer<'a> {
                     break;
                 };
                 if doc < candidate {
+                    #[cfg(feature = "pruning-conformance")]
+                    self.set_conformance_query_work_context(
+                        ConformanceQueryWorkPhase::Seek,
+                        Some(candidate),
+                        false,
+                    );
                     self.active[index].advance(candidate)?;
                     continue;
                 }
@@ -4691,6 +4871,12 @@ impl<'a> BufferedUnionScorer<'a> {
                 let contribution = self.active[index].score()?;
                 let total = self.score_window[offset].unwrap_or(0.0) + contribution;
                 self.score_window[offset] = Some(finite_score(total, doc)?);
+                #[cfg(feature = "pruning-conformance")]
+                self.set_conformance_query_work_context(
+                    ConformanceQueryWorkPhase::Drain,
+                    Some(doc),
+                    true,
+                );
                 self.active[index].next()?;
                 if self.active[index].doc().is_none() {
                     self.active.swap_remove(index);

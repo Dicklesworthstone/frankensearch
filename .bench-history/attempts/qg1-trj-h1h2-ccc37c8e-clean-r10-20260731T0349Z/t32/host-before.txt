@@ -1,0 +1,103 @@
+2026-07-31T05:43:30Z
+threadripperje
+Linux threadripperje 6.17.0-41-generic #41-Ubuntu SMP PREEMPT_DYNAMIC Sat Jun 20 18:01:40 UTC 2026 x86_64 GNU/Linux
+boot_id=b107a2c6-9fac-40df-a637-c3a772b0ad57
+ 01:43:30 up 6 days, 59 min,  3 users,  load average: 2.56, 2.60, 2.83
+remote_shell_pid=2810628 remote_shell_ppid=2810627
+Cpus_allowed_list:	0-127
+Mems_allowed_list:	0
+Architecture:                            x86_64
+CPU op-mode(s):                          32-bit, 64-bit
+Address sizes:                           48 bits physical, 48 bits virtual
+Byte Order:                              Little Endian
+CPU(s):                                  128
+On-line CPU(s) list:                     0-127
+Vendor ID:                               AuthenticAMD
+Model name:                              AMD Ryzen Threadripper PRO 5995WX 64-Cores
+CPU family:                              25
+Model:                                   8
+Thread(s) per core:                      2
+Core(s) per socket:                      64
+Socket(s):                               1
+Stepping:                                2
+Frequency boost:                         enabled
+CPU(s) scaling MHz:                      37%
+CPU max MHz:                             4575.1641
+CPU min MHz:                             413.4190
+BogoMIPS:                                5389.94
+Flags:                                   fpu vme de pse tsc msr pae mce cx8 apic sep mtrr pge mca cmov pat pse36 clflush mmx fxsr sse sse2 ht syscall nx mmxext fxsr_opt pdpe1gb rdtscp lm constant_tsc rep_good nopl xtopology nonstop_tsc cpuid extd_apicid aperfmperf rapl pni pclmulqdq monitor ssse3 fma cx16 pcid sse4_1 sse4_2 x2apic movbe popcnt aes xsave avx f16c rdrand lahf_lm cmp_legacy svm extapic cr8_legacy abm sse4a misalignsse 3dnowprefetch osvw ibs skinit wdt tce topoext perfctr_core perfctr_nb bpext perfctr_llc mwaitx cpb cat_l3 cdp_l3 hw_pstate ssbd mba ibrs ibpb stibp vmmcall fsgsbase bmi1 avx2 smep bmi2 erms invpcid cqm rdt_a rdseed adx smap clflushopt clwb sha_ni xsaveopt xsavec xgetbv1 xsaves cqm_llc cqm_occup_llc cqm_mbm_total cqm_mbm_local user_shstk clzero irperf xsaveerptr rdpru wbnoinvd amd_ppin brs arat npt lbrv svm_lock nrip_save tsc_scale vmcb_clean flushbyasid decodeassists pausefilter pfthreshold avic v_vmsave_vmload vgif v_spec_ctrl umip pku ospke vaes vpclmulqdq rdpid overflow_recov succor smca fsrm debug_swap
+Virtualization:                          AMD-V
+L1d cache:                               2 MiB (64 instances)
+L1i cache:                               2 MiB (64 instances)
+L2 cache:                                32 MiB (64 instances)
+L3 cache:                                256 MiB (8 instances)
+NUMA node(s):                            1
+NUMA node0 CPU(s):                       0-127
+Vulnerability Gather data sampling:      Not affected
+Vulnerability Ghostwrite:                Not affected
+Vulnerability Indirect target selection: Not affected
+Vulnerability Itlb multihit:             Not affected
+Vulnerability L1tf:                      Not affected
+Vulnerability Mds:                       Not affected
+Vulnerability Meltdown:                  Not affected
+Vulnerability Mmio stale data:           Not affected
+Vulnerability Old microcode:             Not affected
+Vulnerability Reg file data sampling:    Not affected
+Vulnerability Retbleed:                  Not affected
+Vulnerability Spec rstack overflow:      Mitigation; Safe RET
+Vulnerability Spec store bypass:         Mitigation; Speculative Store Bypass disabled via prctl
+Vulnerability Spectre v1:                Mitigation; usercopy/swapgs barriers and __user pointer sanitization
+Vulnerability Spectre v2:                Mitigation; Retpolines; IBPB conditional; IBRS_FW; STIBP always-on; RSB filling; PBRSB-eIBRS Not affected; BHI Not affected
+Vulnerability Srbds:                     Not affected
+Vulnerability Tsa:                       Mitigation; Clear CPU buffers
+Vulnerability Tsx async abort:           Not affected
+Vulnerability Vmscape:                   Mitigation; IBPB before exit to userspace
+               total        used        free      shared  buff/cache   available
+Mem:     536069869568 27424731136 199891120128  2370826240 321813569536 508645138432
+Swap:    137438945280    15179776 137423765504
+Filesystem         1B-blocks         Used    Available Use% Mounted on
+/dev/nvme0n1p6 1048576000000 874990211072 160928034816  85% /
+tmpfs           137438953472    927498240 136511455232   1% /tmp
+    128 performance
+    PID    PPID STAT COMMAND         PSR %CPU %MEM ELAPSED COMMAND
+2576076       1 Ssl  sbh              39  3.2  0.0  443622 /usr/local/bin/sbh daemon --config /etc/sbh/config.toml
+   5274    5110 Ssl  frankenterm-mux  33  2.4  0.0  521956 /home/ubuntu/.local/bin/frankenterm-mux-server --daemonize=false --config-file=/home/ubuntu/.config/frankenterm/frankenterm.lua
+   4437       1 S<sl ananicy-cpp      16  1.9  0.0  521958 /usr/local/bin/ananicy-cpp start
+1671018       1 S<sl tailscaled       72  1.6  0.0  164438 /usr/sbin/tailscaled --state=/var/lib/tailscale/tailscaled.state --socket=/run/tailscale/tailscaled.sock --port=41641
+2491768       1 Ssl  vault            63  0.3  0.0  298488 /usr/bin/vault server -config=/etc/vault.d/vault.hcl
+   5048       1 SNsl containerd      125  0.3  0.0  521956 /usr/bin/containerd
+3010185       2 I    kworker/u512:1- 120  0.2  0.0      10 [kworker/u512:1-atlantic]
+   9653       1 SNsl dockerd          55  0.2  0.0  521838 /usr/bin/dockerd -H fd:// --containerd=/run/containerd/containerd.sock
+  39137    5110 Ssl  am              120  0.2  0.0  389045 /home/ubuntu/mcp_agent_mail/am serve-http --host 127.0.0.1 --port 8765 --no-tui
+  12114   10460 SNl  node             59  0.2  0.0  521837 node dist/server/server.js
+   5017       1 Ssl  redis-server     39  0.1  0.0  521956 /usr/bin/redis-server 127.0.0.1:6379
+     15       2 I    rcu_preempt      70  0.1  0.0  521965 [rcu_preempt]
+      1       0 Ss   systemd           4  0.0  0.0  521965 /usr/lib/systemd/systemd --switched-root --system --deserialize=48 splash
+1654736    5110 Ssl  rchd            115  0.0  0.0   52107 /home/ubuntu/.local/bin/rchd --foreground --workers-config /home/ubuntu/.config/rch/workers.toml
+   9160       2 S    btrfs-transacti  96  0.0  0.0  521885 [btrfs-transaction]
+  14664    9650 SNl  gunicorn         39  0.0  0.0  521828 /data/projects/bulk_youtube_transcript_optimizer/.venv/bin/python3 /data/projects/bulk_youtube_transcript_optimizer/.venv/bin/gunicorn api:app -w 2 -k uvicorn.workers.UvicornWorker --bind 0.0.0.0:8000 --timeout 500000 --preload
+  14638    9650 SNl  gunicorn         38  0.0  0.0  521828 /data/projects/bulk_youtube_transcript_optimizer/.venv/bin/python3 /data/projects/bulk_youtube_transcript_optimizer/.venv/bin/gunicorn api:app -w 2 -k uvicorn.workers.UvicornWorker --bind 0.0.0.0:8000 --timeout 500000 --preload
+2539689       1 S<s  systemd-journal  39  0.0  0.0  445490 /usr/lib/systemd/systemd-journald
+   1458       2 S    btrfs-transacti  40  0.0  0.0  521961 [btrfs-transaction]
+   4550       1 Ssl  rsyslogd        102  0.0  0.0  521958 /usr/sbin/rsyslogd -n -iNONE
+  10399   10101 SNsl postgrest       102  0.0  0.1  521837 /bin/postgrest
+  10103       1 SNl  containerd-shim  79  0.0  0.0  521837 /usr/bin/containerd-shim-runc-v2 -namespace moby -id 907dfd07c32f8745f128f42111ead5482446be0d82d1212cb4fec905442c26d3 -address /run/containerd/containerd.sock
+  10227       1 SNl  containerd-shim 123  0.0  0.0  521837 /usr/bin/containerd-shim-runc-v2 -namespace moby -id d307edbe79a1eff2b9633983d3f22956a1d001da05612596d6ad7380fb89db4c -address /run/containerd/containerd.sock
+  10231       1 SNl  containerd-shim 123  0.0  0.0  521837 /usr/bin/containerd-shim-runc-v2 -namespace moby -id 816b609035e6668051e8f5abea23e0323c982bd1f9559f4c0b795d77b916bcb0 -address /run/containerd/containerd.sock
+  14140       1 SNl  containerd-shim  62  0.0  0.0  521833 /usr/bin/containerd-shim-runc-v2 -namespace moby -id a383cec29bd14c097f8bfbc1123250775575de406e4dd4254235b2f9edb198c9 -address /run/containerd/containerd.sock
+2962772       2 I    kworker/33:0-mm  33  0.0  0.0    1358 [kworker/33:0-mm_percpu_wq]
+   4758    4756 S<   bash             39  0.0  0.0  521958 bash /home/ubuntu/bin/rch-sibling-linker.sh
+   5110       1 Ss   systemd           3  0.0  0.0  521956 /usr/lib/systemd/systemd --user
+2992945       2 I    kworker/u512:0- 127  0.0  0.0     579 [kworker/u512:0-btrfs-discard]
+  13027       1 S<s  cargo-io-enforc   6  0.0  0.0  521837 /bin/bash /home/ubuntu/.local/bin/cargo-io-enforcer
+2641766    5110 S<s  bash             11  0.0  0.0  439825 bash /home/ubuntu/.local/bin/resource-watchdog --warn-threads 100000 --kill-threads 500000
+   5526    5110 SNsl xdg-document-po   3  0.0  0.0  521956 /usr/libexec/xdg-document-portal
+   1578       1 Ss   systemd-oomd     38  0.0  0.0  521960 /usr/lib/systemd/systemd-oomd
+2951941       2 I    kworker/u517:6-  97  0.0  0.0    1678 [kworker/u517:6-kvfree_rcu_reclaim]
+2907114       2 I    kworker/u517:11 100  0.0  0.0    3142 [kworker/u517:11-writeback]
+2987018       2 I    kworker/u512:2- 120  0.0  0.0     900 [kworker/u512:2-btrfs-discard]
+2849692       2 I    kworker/u517:8-  35  0.0  0.0    4504 [kworker/u517:8-flush-btrfs-1]
+2874413       2 I    kworker/u517:1- 103  0.0  0.0    4038 [kworker/u517:1-flush-btrfs-1]
+  14165   14140 SNsl auth             44  0.0  0.0  521833 auth
+53ab4c0975f0ad2148e37f35641dfd56e78acd8048d01cdb8b1194aa8ab9b637  /tmp/frankensearch-qg1-ccc37c8e/bin/perf_matrix-clean-53ab4c0975f0ad21
+84321352 -rwxrwxr-x /tmp/frankensearch-qg1-ccc37c8e/bin/perf_matrix-clean-53ab4c0975f0ad21

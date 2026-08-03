@@ -1,0 +1,122 @@
+{
+  "schema_version": "frankensearch.quill-qg2-contract-report.v1",
+  "status": "pass",
+  "contract": {
+    "contract": "BINDING Q2C COMPARATOR CONTRACT 2026-07-31: QG-2 compares both arms symmetrically in memory with no durable storage. Continuous timing begins at the first document feed and ends only after terminal searchable visibility plus complete worker, merge, and queue quiescence. Commit is the searchable-visibility boundary, not durable publication. QG-2 excludes fsync, F_FULLFSYNC, crash recovery, durable publication, and on-disk-byte measurements. Durable gates and production-source durability nonregression remain mandatory outside QG-2.",
+    "storage_topology": "symmetric_in_memory",
+    "durability_scope": "non_durable",
+    "timing_start": "first_document_feed",
+    "timing_end": "terminal_searchable_visibility_and_complete_worker_merge_queue_quiescence",
+    "commit_boundary": "searchable_visibility_not_durable_publication",
+    "excluded_operations": [
+      "fsync",
+      "F_FULLFSYNC",
+      "crash_recovery",
+      "durable_publication",
+      "on_disk_bytes"
+    ],
+    "source_nonregression": "durable_gates_and_production_source_durability_remain_mandatory"
+  },
+  "stale_history": {
+    "issue_id": "bd-quill-e8-hyperopt-nyps.1",
+    "issue_count": 1,
+    "disposition": "append_only_superseded_diagnostic",
+    "supersession_count": 1,
+    "stale_phrase_count": 1,
+    "preserved_values": [
+      {
+        "value": "0.349775",
+        "count": 1
+      },
+      {
+        "value": "0.345546",
+        "count": 1
+      }
+    ],
+    "supersession_precedes_stale": true,
+    "valid": true
+  },
+  "topology": {
+    "expected_logical_surfaces": 6,
+    "discovered_logical_surfaces": 6,
+    "expected_physical_locators": 7,
+    "discovered_physical_locators": 7,
+    "validated_physical_locators": 7
+  },
+  "manifest_sha256": "d3fb1833221504765cdc119e1cf2f50f013c3916f0faf70bb743665f5ab5ed79",
+  "sentinels": {
+    "expected": 10,
+    "discovered": 10,
+    "validated": 10
+  },
+  "surfaces": [
+    {
+      "logical_surface": "performance_gate_law_1",
+      "locator": "perf_gate_law_1",
+      "path": "docs/contracts/quill-perf-gates.md",
+      "discovered": true,
+      "marker_count": 1,
+      "content_sha256": "8c3561997c0b181687fadd89ee1826f7228a237828fa79c6d21391b6bc88f0b1",
+      "valid": true
+    },
+    {
+      "logical_surface": "comprehensive_plan_qg2",
+      "locator": "comprehensive_plan_qg2_row",
+      "path": "COMPREHENSIVE_PLAN_FOR_THE_QUILL_LEXICAL_ENGINE.md",
+      "discovered": true,
+      "marker_count": 1,
+      "content_sha256": "693f426e52fc87f4182206c2767301adf258ee85c42acb4a356aa39a4c8eb8dc",
+      "valid": true
+    },
+    {
+      "logical_surface": "machine_manifest_qg2",
+      "locator": "perf_manifest_qg2_contract",
+      "path": "docs/contracts/quill-perf-gates.toml",
+      "discovered": true,
+      "marker_count": 1,
+      "content_sha256": "d89ea442030cec65e6b11061e2992da68421638b0f18c801c622739049a4c183",
+      "valid": true
+    },
+    {
+      "logical_surface": "hyperopt_law_7_and_epic",
+      "locator": "hyperopt_law_7",
+      "path": "docs/contracts/quill-hyperopt-campaign.md",
+      "discovered": true,
+      "marker_count": 1,
+      "content_sha256": "b0018a985b1efb699358258419639ecab82a63ea7f411909df19f5af35b592a5",
+      "valid": true
+    },
+    {
+      "logical_surface": "hyperopt_law_7_and_epic",
+      "locator": "hyperopt_epic_active_contract",
+      "path": ".beads/issues.jsonl",
+      "issue_id": "bd-quill-e8-hyperopt-nyps",
+      "discovered": true,
+      "marker_count": 1,
+      "content_sha256": "189be4dc7007d21f1b3d80b2fbc6b893236452ea66fa4091288da568e5301c20",
+      "valid": true
+    },
+    {
+      "logical_surface": "qg2_r1_quarantine",
+      "locator": "qg2_r1_active_contract",
+      "path": ".beads/issues.jsonl",
+      "issue_id": "bd-quill-e8-perf-doctrine-x4e4.5.5",
+      "discovered": true,
+      "marker_count": 1,
+      "content_sha256": "189be4dc7007d21f1b3d80b2fbc6b893236452ea66fa4091288da568e5301c20",
+      "valid": true
+    },
+    {
+      "logical_surface": "gate_activation_scope",
+      "locator": "gate_activation_active_contract",
+      "path": ".beads/issues.jsonl",
+      "issue_id": "bd-h6eh",
+      "discovered": true,
+      "marker_count": 1,
+      "content_sha256": "189be4dc7007d21f1b3d80b2fbc6b893236452ea66fa4091288da568e5301c20",
+      "valid": true
+    }
+  ],
+  "divergences": [],
+  "dropped_divergences": 0
+}

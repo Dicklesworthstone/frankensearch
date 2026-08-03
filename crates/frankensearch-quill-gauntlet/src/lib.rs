@@ -10,6 +10,7 @@
 //! subject used by the G1a default-syntax campaign.
 
 mod artifact;
+mod campaign_contract;
 mod comparator;
 mod engine;
 mod generator;
@@ -19,6 +20,7 @@ mod perf;
 mod perf_assembly;
 mod perf_evidence;
 mod perf_ratchet;
+mod qg2_contract;
 mod qg6_prepared;
 mod runner;
 mod version_contract;
@@ -34,6 +36,18 @@ pub use artifact::{
     IntegrityCheckedCampaign, OBJECT_SCHEMA_VERSION, PreparedArtifact, RUN_MANIFEST_SCHEMA_VERSION,
     RunManifest, SerializedSchemaDisposition, classify_artifact_object_schema,
     classify_campaign_report_schema, pinned_campaign_report_v7,
+};
+pub use campaign_contract::{
+    BuiltInEvidenceBindingV1, CampaignCellEvidenceV1, CampaignCellKeyV1, CampaignContractModeV1,
+    CampaignContractValueError, CampaignCorpusV1, CampaignEvidenceRole, CampaignExecutionProfileV1,
+    CampaignHardwareClassV1, CampaignMachineProfileV1, CampaignNightV1, CampaignProfileV1,
+    CampaignReplayV1, CampaignSeedBundleV1, CampaignSeedScheduleV1, CampaignSeedSlotV1,
+    CampaignSha256V1, CampaignTopologyV1, REPLACEMENT_COMPLETENESS_EXPECTED_CELL_COUNT,
+    REPLACEMENT_COMPLETENESS_POLICY_SCHEMA_VERSION, ReplacementCompletenessError,
+    ReplacementCompletenessPolicyV1, UnexpectedCampaignCellReasonV1, frozen_replacement_cell_keys,
+    frozen_replacement_completeness_policy, frozen_replacement_seed_bundle,
+    frozen_replacement_seed_schedule, replacement_completeness_policy_sha256,
+    validate_replacement_completeness,
 };
 #[cfg(feature = "tantivy-oracle")]
 pub use comparator::observe_tantivy_cass_profile;
@@ -158,6 +172,14 @@ pub use perf_ratchet::{
     PERF_RATCHET_SCHEMA_VERSION, PERF_REGRESSION_ROBUST_Z, PerfCellComparison, PerfEvidenceFile,
     PerfGateDecision, PerfRatchetEvaluation, PerfRatchetMode, PerfRatchetReason,
     PerfRatchetRequest, evaluate_perf_ratchet, is_explicit_bootstrap, is_explicit_bootstrap_for,
+};
+pub use qg2_contract::{
+    QG2_CANONICAL_CONTRACT, QG2_CONTRACT_REPORT_SCHEMA_VERSION, QG2_LOGICAL_SURFACE_COUNT,
+    QG2_PHYSICAL_LOCATOR_COUNT, QG2_SENTINEL_COUNT, Qg2CommitBoundary, Qg2ComparatorContract,
+    Qg2ContractDivergence, Qg2ContractReport, Qg2ContractStatus, Qg2DurabilityScope,
+    Qg2ExcludedOperation, Qg2PreservedValueReceipt, Qg2SentinelSummary, Qg2SourceNonregression,
+    Qg2StaleHistoryDisposition, Qg2StaleHistoryReceipt, Qg2StorageTopology, Qg2SurfaceReceipt,
+    Qg2TimingEnd, Qg2TimingStart, Qg2TopologySummary, validate_qg2_contract,
 };
 pub use qg6_prepared::{
     Qg6ArmLifecycle, Qg6ArmRole, Qg6Comparison, Qg6ExperimentIdentity, Qg6FourArmResultReceipts,

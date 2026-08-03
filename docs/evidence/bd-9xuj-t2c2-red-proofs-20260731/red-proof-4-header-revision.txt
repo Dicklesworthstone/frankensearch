@@ -1,0 +1,16 @@
+RED PROOF 4: fast-tier header revision write DISABLED (finish passes "" instead of the declared immutable_revision)
+mutation applied to crates/frankensearch-index/src/two_tier.rs at commit e5693265b11c31cb98ba4864a6fa8ff21524a643
+expected RED: builder_finish_retains_declared_typed_identity (index crate), build_threads_typed_identity_into_persisted_headers (facade)
+test index_builder::tests::build_threads_typed_identity_into_persisted_headers ... FAILED
+thread 'index_builder::tests::build_threads_typed_identity_into_persisted_headers' (2380939) panicked at frankensearch/src/index_builder.rs:1420:13:
+assertion `left == right` failed: the fast header must carry the identity's immutable revision, which only exists if build threaded the typed identity through
+  left: ""
+ right: "explicit-test-v1"
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 32 filtered out; finished in 0.04s
+test two_tier::tests::builder_finish_retains_declared_typed_identity ... FAILED
+thread 'two_tier::tests::builder_finish_retains_declared_typed_identity' (2381290) panicked at crates/frankensearch-index/src/two_tier.rs:4382:9:
+assertion `left == right` failed
+  left: ""
+ right: "explicit-test-v1"
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 526 filtered out; finished in 0.04s
+EXIT_STATUS=101
