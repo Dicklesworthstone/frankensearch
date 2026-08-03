@@ -96,6 +96,72 @@
       }
     },
     {
+      "name": "rejects_source_with_build_service_role",
+      "expect_valid": false,
+      "instance": {
+        "schema_version": 4,
+        "object_kind": "source",
+        "principal_role": "build_service",
+        "identity_scheme": "sha256-domain-separated-v1",
+        "object_identity": "sha256:3131313131313131313131313131313131313131313131313131313131313131",
+        "authentication": "integrity_only",
+        "admission": "unadmitted",
+        "decision": "no_decision",
+        "release": "not_qualified",
+        "coverage": "incomplete",
+        "privacy": "public",
+        "redaction_witness": "sha256:3232323232323232323232323232323232323232323232323232323232323232",
+        "issued_at_unix_ns": 32,
+        "source_digest": "sha256:3333333333333333333333333333333333333333333333333333333333333333"
+      }
+    },
+    {
+      "name": "rejects_build_with_execution_supervisor_role",
+      "expect_valid": false,
+      "instance": {
+        "schema_version": 4,
+        "object_kind": "build",
+        "principal_role": "execution_supervisor",
+        "identity_scheme": "sha256-domain-separated-v1",
+        "object_identity": "sha256:4141414141414141414141414141414141414141414141414141414141414141",
+        "predecessor_identity": "sha256:0101010101010101010101010101010101010101010101010101010101010101",
+        "authentication": "integrity_only",
+        "admission": "unadmitted",
+        "decision": "no_decision",
+        "release": "not_qualified",
+        "coverage": "incomplete",
+        "privacy": "restricted",
+        "redaction_witness": "sha256:4242424242424242424242424242424242424242424242424242424242424242",
+        "issued_at_unix_ns": 33,
+        "source_digest": "sha256:0303030303030303030303030303030303030303030303030303030303030303",
+        "cargo_lock_digest": "sha256:4343434343434343434343434343434343434343434343434343434343434343",
+        "executable_digest": "sha256:4444444444444444444444444444444444444444444444444444444444444444"
+      }
+    },
+    {
+      "name": "rejects_execution_with_completion_issuer_role",
+      "expect_valid": false,
+      "instance": {
+        "schema_version": 4,
+        "object_kind": "execution",
+        "principal_role": "completion_issuer",
+        "identity_scheme": "sha256-domain-separated-v1",
+        "object_identity": "sha256:5151515151515151515151515151515151515151515151515151515151515151",
+        "predecessor_identity": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        "authentication": "integrity_only",
+        "admission": "no_decision",
+        "decision": "no_decision",
+        "release": "not_qualified",
+        "coverage": "incomplete",
+        "privacy": "restricted",
+        "redaction_witness": "sha256:5252525252525252525252525252525252525252525252525252525252525252",
+        "issued_at_unix_ns": 34,
+        "execution_nonce": "abcdef0123456789abcdef0123456789",
+        "nonce_expires_at_unix_ns": 35,
+        "command_digest": "sha256:5353535353535353535353535353535353535353535353535353535353535353"
+      }
+    },
+    {
       "name": "verified_admitted_complete_miss_remains_authentic",
       "expect_valid": true,
       "instance": {
