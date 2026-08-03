@@ -676,11 +676,24 @@ impl SyncTwoTierSearcher {
         }
 
         if self.config.explain {
-            let initial_ranks = initial_results
-                .iter()
-                .enumerate()
-                .map(|(rank, result)| (result.doc_id.as_str(), rank))
-                .collect::<AHashMap<_, _>>();
+            // Async refinement measures semantic-only movement against the
+            // full Phase-1 candidate pool, while lexical re-fusion measures
+            // against the displayed fused order. Mirroring that distinction
+            // keeps promoted candidates explainable even when they were below
+            // the initial top-k display cutoff.
+            let initial_ranks = if lexical_hits.is_some() {
+                initial_results
+                    .iter()
+                    .enumerate()
+                    .map(|(rank, result)| (result.doc_id.as_str(), rank))
+                    .collect::<AHashMap<_, _>>()
+            } else {
+                fast_hits
+                    .iter()
+                    .enumerate()
+                    .map(|(rank, hit)| (hit.doc_id.as_str(), rank))
+                    .collect::<AHashMap<_, _>>()
+            };
             let (fast_min, fast_max) = finite_score_bounds(fast_hits.iter().map(|hit| hit.score));
             let (quality_min, quality_max) =
                 finite_score_bounds(quality_scores.iter().flatten().copied());

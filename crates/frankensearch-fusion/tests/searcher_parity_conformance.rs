@@ -33,12 +33,18 @@ enum KnownDivergence {
     QueryClass,
     /// The sync API intentionally does not compute a timing-independent tau.
     KendallTau,
+    /// The synchronous in-memory fixture and serialized FSVI fixture can use
+    /// different physical row positions for the same document. Result order
+    /// and doc_id are the portable rank identity; index is covered by the
+    /// shared four-document fixture where both layouts are intentionally equal.
+    IndexIdentity,
 }
 
 const KNOWN_DIVERGENCES: &[KnownDivergence] = &[
     KnownDivergence::EmbedderIdentity,
     KnownDivergence::QueryClass,
     KnownDivergence::KendallTau,
+    KnownDivergence::IndexIdentity,
 ];
 
 fn is_known_divergence(divergence: KnownDivergence) -> bool {
@@ -257,6 +263,111 @@ fn run_sync_with_quality_index(
         .expect("sync search_collect")
 }
 
+const SEEDED_DIM: usize = 8;
+
+fn seeded_unit_vector(state: &mut u64) -> Vec<f32> {
+    let values = (0..SEEDED_DIM)
+        .map(|_| {
+            *state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            let high = u16::try_from(*state >> 48).expect("upper 16 bits fit u16");
+            (f32::from(high) / f32::from(u16::MAX)) * 2.0 - 1.0
+        })
+        .collect();
+    normalize(values)
+}
+
+fn seeded_corpus() -> (Vec<(String, Vec<f32>, Vec<f32>)>, Vec<f32>) {
+    let mut state = 0x4d59_5df4_d0f3_3173_u64;
+    let docs = (0..32)
+        .map(|index| {
+            let fast = seeded_unit_vector(&mut state);
+            let quality = seeded_unit_vector(&mut state);
+            (format!("seeded-{index:02}"), fast, quality)
+        })
+        .collect();
+    (docs, seeded_unit_vector(&mut state))
+}
+
+fn seeded_sync_search(
+    docs: &[(String, Vec<f32>, Vec<f32>)],
+    query: &[f32],
+    config: &TwoTierConfig,
+    k: usize,
+) -> (Vec<ScoredResult>, TwoTierMetrics) {
+    let ids: Vec<String> = docs.iter().map(|(id, _, _)| id.clone()).collect();
+    let fast = InMemoryVectorIndex::from_vectors(
+        ids.clone(),
+        docs.iter().map(|(_, fast, _)| fast.clone()).collect(),
+        SEEDED_DIM,
+    )
+    .expect("seeded fast index");
+    let quality = InMemoryVectorIndex::from_vectors(
+        ids,
+        docs.iter().map(|(_, _, quality)| quality.clone()).collect(),
+        SEEDED_DIM,
+    )
+    .expect("seeded quality index");
+    SyncTwoTierSearcher::new(
+        Arc::new(InMemoryTwoTierIndex::new(fast, Some(quality))),
+        config.clone(),
+    )
+    .search_collect(query, k)
+    .expect("seeded sync search_collect")
+}
+
+fn seeded_async_search(
+    docs: &[(String, Vec<f32>, Vec<f32>)],
+    query: &[f32],
+    config: &TwoTierConfig,
+    k: usize,
+) -> (Vec<ScoredResult>, TwoTierMetrics) {
+    let dir = std::env::temp_dir().join(format!(
+        "fsx-parity-seeded-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    let mut builder = TwoTierIndex::create(&dir, TwoTierConfig::default()).expect("create index");
+    builder.set_fast_embedder_id("parity-fast");
+    builder.set_quality_embedder_id("parity-quality");
+    for (id, fast, quality) in docs {
+        builder
+            .add_fast_record(id.clone(), fast)
+            .expect("add seeded fast record");
+        builder
+            .add_quality_record(id.clone(), quality)
+            .expect("add seeded quality record");
+    }
+    let index = Arc::new(builder.finish().expect("finish seeded index"));
+    let fast: Arc<dyn Embedder> = Arc::new(FixedVecEmbedder {
+        id: "parity-fast",
+        vector: query.to_vec(),
+    });
+    let quality: Arc<dyn Embedder> = Arc::new(FixedVecEmbedder {
+        id: "parity-quality",
+        vector: query.to_vec(),
+    });
+    let config = config.clone();
+    let mut out = None;
+    asupersync::test_utils::run_test_with_cx(|cx| {
+        let slot = &mut out;
+        async move {
+            let searcher = TwoTierSearcher::new(index, fast, config).with_quality_embedder(quality);
+            *slot = Some(
+                searcher
+                    .search_collect(&cx, "seeded corpus parity query", k)
+                    .await
+                    .expect("seeded async search_collect"),
+            );
+        }
+    });
+    out.expect("seeded async search ran")
+}
+
 fn run_async_with_lexical(
     config: &TwoTierConfig,
     query_vec: &[f32],
@@ -457,6 +568,24 @@ fn phase_labels(
 }
 
 fn assert_result_parity(case: &str, sync_r: &[ScoredResult], async_r: &[ScoredResult]) {
+    assert_result_parity_with_index_policy(case, sync_r, async_r, true);
+}
+
+fn assert_result_parity_allowing_index_identity(
+    case: &str,
+    sync_r: &[ScoredResult],
+    async_r: &[ScoredResult],
+) {
+    assert!(is_known_divergence(KnownDivergence::IndexIdentity));
+    assert_result_parity_with_index_policy(case, sync_r, async_r, false);
+}
+
+fn assert_result_parity_with_index_policy(
+    case: &str,
+    sync_r: &[ScoredResult],
+    async_r: &[ScoredResult],
+    compare_index: bool,
+) {
     let sync_ids = sync_r.iter().map(|r| r.doc_id.as_str()).collect::<Vec<_>>();
     let async_ids = async_r
         .iter()
@@ -473,11 +602,13 @@ fn assert_result_parity(case: &str, sync_r: &[ScoredResult], async_r: &[ScoredRe
             "[{case}] {}: ScoreSource diverges",
             s.doc_id
         );
-        assert_eq!(
-            s.index, a.index,
-            "[{case}] {}: vector index diverges",
-            s.doc_id
-        );
+        if compare_index {
+            assert_eq!(
+                s.index, a.index,
+                "[{case}] {}: vector index diverges",
+                s.doc_id
+            );
+        }
         assert_scores_close(case, &s.doc_id, "fast_score", s.fast_score, a.fast_score);
         assert_scores_close(
             case,
@@ -769,6 +900,27 @@ fn zero_norm_query_agrees_on_typed_zero_signal_and_skips_refinement() {
 }
 
 #[test]
+fn seeded_corpus_agrees_on_non_lattice_rankings_and_metrics() {
+    let (docs, query) = seeded_corpus();
+    let config = TwoTierConfig {
+        candidate_multiplier: 4,
+        quality_weight: 0.65,
+        explain: true,
+        ..TwoTierConfig::default()
+    };
+    let (sync_results, sync_metrics) = seeded_sync_search(&docs, &query, &config, 8);
+    let (async_results, async_metrics) = seeded_async_search(&docs, &query, &config, 8);
+    assert_result_parity_allowing_index_identity("seeded-corpus", &sync_results, &async_results);
+    assert_metric_parity("seeded-corpus", &sync_metrics, &async_metrics);
+    assert!(
+        sync_results
+            .iter()
+            .all(|result| result.explanation.is_some()),
+        "sync explain mode must survive the seeded corpus"
+    );
+}
+
+#[test]
 fn fast_only_agrees_and_skips_phase_two_on_both_sides() {
     let config = TwoTierConfig {
         fast_only: true,
@@ -1043,7 +1195,7 @@ fn lexical_fast_only_explanations_are_present_on_both_sides() {
 
 #[test]
 fn phase1_vectors_searched_reports_the_evaluated_corpus_at_small_k() {
-    assert_eq!(KNOWN_DIVERGENCES.len(), 3);
+    assert_eq!(KNOWN_DIVERGENCES.len(), 4);
     let config = TwoTierConfig::default();
     let k = 1;
     let query = normalize(vec![1.0, 0.0, 0.0, 0.0]);
