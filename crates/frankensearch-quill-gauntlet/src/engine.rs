@@ -3072,6 +3072,15 @@ mod tests {
         permutation
     }
 
+    #[cfg(feature = "perf-harness")]
+    fn e63_seeded_ascii_query_normalization(term: &str, seed: u64) -> String {
+        match seed % 3 {
+            0 => format!(" \t{term}\n"),
+            1 => term.to_ascii_uppercase(),
+            _ => format!("\t{}  ", term.to_ascii_uppercase()),
+        }
+    }
+
     struct CountingEngine {
         descriptor: EngineDescriptor,
         observe_calls: Arc<AtomicUsize>,
@@ -6508,6 +6517,95 @@ mod tests {
                     ComparisonStatus::Failed,
                     "E6.3 {engine} incorrectly accepted a changed analyzed term as normalization",
                 );
+            }
+        });
+    }
+
+    /// E6.3 seeded property campaign for analyzer-declared ASCII free-text
+    /// normalization. The generator chooses one bounded whitespace/case form
+    /// per seed and every form must replay through the normal live
+    /// cross-engine observation. The paired single-fixture law keeps the
+    /// intentionally invalid analyzed-term mutation.
+    #[cfg(feature = "perf-harness")]
+    #[test]
+    fn e63_query_normalization_seed_matrix_replays_live_observations() {
+        use frankensearch_core::IndexableDocument;
+
+        const SEEDS: [u64; 3] = [
+            0xe63_c453_0001_5eed,
+            0xe63_c453_0001_5eee,
+            0xe63_c453_0001_5eef,
+        ];
+        let documents = vec![
+            IndexableDocument::new("doc-1", "alpha beta beta").with_title("guide"),
+            IndexableDocument::new("doc-2", "alpha gamma").with_title("alpha overview"),
+            IndexableDocument::new("doc-3", "beta gamma gamma gamma").with_title("alpha"),
+            IndexableDocument::new("doc-4", "alpha beta gamma delta").with_title("reference"),
+            IndexableDocument::new("doc-5", "delta epsilon").with_title("quiet"),
+        ];
+
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            for (term, seed) in [("alpha", SEEDS[0]), ("beta", SEEDS[1]), ("gamma", SEEDS[2])] {
+                let normalized = e63_seeded_ascii_query_normalization(term, seed);
+                assert_ne!(
+                    normalized, term,
+                    "E6.3 seed {seed:#x} must transform its query"
+                );
+                assert_eq!(
+                    normalized,
+                    e63_seeded_ascii_query_normalization(term, seed),
+                    "E6.3 seed {seed:#x} must replay byte-identically",
+                );
+                let canonical_cases = [("free-text", term)];
+                let normalized_cases = [("free-text", normalized.as_str())];
+                let baseline = e63_observations(
+                    &cx,
+                    &documents,
+                    &canonical_cases,
+                    seed,
+                    "e6.3-query-normalization-v1",
+                )
+                .await;
+                let transformed = e63_observations(
+                    &cx,
+                    &documents,
+                    &normalized_cases,
+                    seed,
+                    "e6.3-query-normalization-v1",
+                )
+                .await;
+                let baseline_case = baseline
+                    .first()
+                    .expect("E6.3 baseline normalization fixture");
+                let transformed_case = transformed
+                    .first()
+                    .expect("E6.3 transformed normalization fixture");
+                for (engine, before, after) in [
+                    ("Quill", &baseline_case.1, &transformed_case.1),
+                    ("Tantivy", &baseline_case.2, &transformed_case.2),
+                ] {
+                    let comparison = compare_observations(
+                        before.clone(),
+                        after.clone(),
+                        ComparatorConfig::default(),
+                    )
+                    .unwrap_or_else(|error| {
+                        panic!(
+                            "E6.3 {engine} seed {seed:#x} normalization comparison failed: {error}"
+                        )
+                    });
+                    assert!(
+                        matches!(
+                            comparison.rank_class,
+                            RankClass::RankExact | RankClass::TieOrder
+                        ) && comparison
+                            .divergences
+                            .iter()
+                            .all(|divergence| divergence.class == DivergenceClass::TieOrder),
+                        "E6.3 {engine} seed {seed:#x} produced a non-tie normalization divergence: {:?}",
+                        comparison.divergences,
+                    );
+                }
             }
         });
     }
