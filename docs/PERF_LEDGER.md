@@ -8552,6 +8552,30 @@ and the corresponding negative-evidence entry for full provenance. The public
 CHANGELOG therefore carries no fastest or external-performance claim for this
 primitive.
 
+## 2026-08-03 — CORRECTION: hostless FSVI int8/4-bit self ratios are historical, not portable (`bd-fourbit-self-ratio-not-portable-1eqce`)
+
+Rows 817, 825, 826, 827, and 828 retain their original raw timing values, but
+they do not name an executing host, CPU/core topology, or executing ELF hash.
+They are therefore historical `SELF-SPEEDUP / MAINTENANCE` observations only;
+their 1.94x, 2.56x, 3.22x, 3.09x, and 2.36x multipliers must not be read as
+portable ratios or used for a current performance, target-distance, or product
+claim. The missing original host cannot be reconstructed from the rows, so no
+host is inferred or backfilled here.
+
+The later strict-remote conversion card measured the row-825/827-style
+candidate-versus-flat context at 1.05x on worker vmi1152480 (10-core AMD EPYC)
+with a self-reported ELF, while explicitly documenting that this single host
+cannot establish a replacement range. This is evidence that the historical
+multipliers are host-conditional, not a remeasurement of their unknown source
+host. See [`fsvi-4bit-vs-incumbent-20260731.md`](evidence/fsvi-4bit-vs-incumbent-20260731.md)
+and [`claim-coverage-audit-20260730.md`](evidence/claim-coverage-audit-20260730.md).
+
+**Retry predicate:** obtain two admissible strict-remote hosts with distinct
+core topologies; on each, run the same-invocation self-comparison with an
+admissible null and self-reported host, CPU, observed threads, and ELF SHA-256.
+Only then may a bounded host-conditional range be published. Until then these
+rows remain retained history, not current cross-host evidence.
+
 ## 2026-08-03 — CORRECTION: QG-1 TRJ width sweep is structurally invalid / diagnostic only (`bd-qg1-invalid-sweep-quarantine-h4sqj`)
 
 The retained historical sweep committed as `193d2e3f` (with clean-source
