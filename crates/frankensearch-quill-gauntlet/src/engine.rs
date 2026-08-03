@@ -2914,8 +2914,12 @@ mod tests {
 
     #[cfg(feature = "perf-harness")]
     fn qg_position_mode_subject(positions: bool) -> QuillSubject {
+        qg_position_mode_subject_with_config(positions, e55_config())
+    }
+
+    #[cfg(feature = "perf-harness")]
+    fn qg_position_mode_subject_with_config(positions: bool, config: QuillConfig) -> QuillSubject {
         let (producer_revision, producer_dirty) = test_producer_source();
-        let config = e55_config();
         let schema = if positions {
             frankensearch_quill::DEFAULT_SCHEMA
         } else {
@@ -2975,7 +2979,19 @@ mod tests {
         seed: u64,
         generator_id: &str,
     ) -> Vec<(String, EngineObservation, EngineObservation)> {
-        let mut subject = qg_position_mode_subject(true);
+        e63_observations_with_config(cx, documents, cases, seed, generator_id, e55_config()).await
+    }
+
+    #[cfg(feature = "perf-harness")]
+    async fn e63_observations_with_config(
+        cx: &Cx,
+        documents: &[frankensearch_core::IndexableDocument],
+        cases: &[(&str, &str)],
+        seed: u64,
+        generator_id: &str,
+        subject_config: QuillConfig,
+    ) -> Vec<(String, EngineObservation, EngineObservation)> {
+        let mut subject = qg_position_mode_subject_with_config(true, subject_config);
         let mut oracle = qg_position_mode_oracle(true);
         subject
             .claim_fresh_campaign()
@@ -6158,6 +6174,133 @@ mod tests {
                     comparison.status,
                     ComparisonStatus::Failed,
                     "E6.3 {engine} incorrectly accepted a content mutation as an input-order permutation",
+                );
+            }
+        });
+    }
+
+    /// E6.3 law: segment boundaries are an implementation detail when the
+    /// corpus, stable IDs, and scalar configuration contract are unchanged.
+    /// The tight budget below is intentionally small enough to exercise the
+    /// flush/segment path; it does not change analyzer, scoring, or query
+    /// policy. Changing a document payload is the invalid control, so this
+    /// does not disguise a corpus mutation as a geometry perturbation.
+    #[cfg(feature = "perf-harness")]
+    #[test]
+    fn e63_tight_segment_geometry_preserves_observations_but_content_mutation_does_not() {
+        use frankensearch_core::IndexableDocument;
+
+        const SEED: u64 = 0xe63_5e90_5eed_0001;
+        let documents = vec![
+            IndexableDocument::new("doc-1", "alpha beta beta").with_title("guide"),
+            IndexableDocument::new("doc-2", "alpha gamma").with_title("alpha overview"),
+            IndexableDocument::new("doc-3", "beta gamma gamma gamma").with_title("alpha"),
+            IndexableDocument::new("doc-4", "alpha beta gamma delta").with_title("reference"),
+            IndexableDocument::new("doc-5", "delta epsilon").with_title("quiet"),
+        ];
+        let queries = [
+            ("bare-term", "alpha"),
+            ("repeated-term", "beta"),
+            ("boolean-and", "alpha AND beta"),
+            ("negative-sentinel", "saffron"),
+        ];
+        let tight_geometry = QuillConfig {
+            scribe_shard_budget_bytes: 1,
+            delta_budget_bytes: 1,
+            tier_fanout: 2,
+            ..e55_config()
+        };
+        let mut content_mutated = documents.clone();
+        content_mutated[3] =
+            IndexableDocument::new("doc-4", "alpha beta saffron").with_title("reference");
+
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let baseline = e63_observations(
+                &cx,
+                &documents,
+                &queries,
+                SEED,
+                "e6.3-tight-segment-geometry-v1",
+            )
+            .await;
+            let transformed = e63_observations_with_config(
+                &cx,
+                &documents,
+                &queries,
+                SEED,
+                "e6.3-tight-segment-geometry-v1",
+                tight_geometry,
+            )
+            .await;
+            let invalid = e63_observations_with_config(
+                &cx,
+                &content_mutated,
+                &queries,
+                SEED,
+                "e6.3-tight-segment-geometry-v1",
+                e55_config(),
+            )
+            .await;
+
+            for (
+                (baseline_id, baseline_quill, baseline_tantivy),
+                (geometry_id, geometry_quill, geometry_tantivy),
+            ) in baseline.iter().zip(&transformed)
+            {
+                assert_eq!(
+                    baseline_id, geometry_id,
+                    "E6.3 geometry case identity drifted"
+                );
+                for (engine, before, after) in [
+                    ("Quill", baseline_quill, geometry_quill),
+                    ("Tantivy", baseline_tantivy, geometry_tantivy),
+                ] {
+                    let comparison = compare_observations(
+                        before.clone(),
+                        after.clone(),
+                        ComparatorConfig::default(),
+                    )
+                    .unwrap_or_else(|error| {
+                        panic!("E6.3 {engine} {baseline_id} geometry comparison failed: {error}")
+                    });
+                    assert!(
+                        matches!(
+                            comparison.rank_class,
+                            RankClass::RankExact | RankClass::TieOrder
+                        ) && comparison
+                            .divergences
+                            .iter()
+                            .all(|divergence| divergence.class == DivergenceClass::TieOrder),
+                        "E6.3 {engine} {baseline_id} produced a non-tie divergence under tight segment geometry: {:?}",
+                        comparison.divergences,
+                    );
+                }
+            }
+
+            let baseline_sentinel = baseline
+                .iter()
+                .find(|(case_id, _, _)| case_id == "negative-sentinel")
+                .expect("E6.3 baseline geometry negative fixture");
+            let invalid_sentinel = invalid
+                .iter()
+                .find(|(case_id, _, _)| case_id == "negative-sentinel")
+                .expect("E6.3 invalid geometry negative fixture");
+            for (engine, before, after) in [
+                ("Quill", &baseline_sentinel.1, &invalid_sentinel.1),
+                ("Tantivy", &baseline_sentinel.2, &invalid_sentinel.2),
+            ] {
+                let comparison = compare_observations(
+                    before.clone(),
+                    after.clone(),
+                    ComparatorConfig::default(),
+                )
+                .unwrap_or_else(|error| {
+                    panic!("E6.3 {engine} invalid geometry comparison failed: {error}")
+                });
+                assert_eq!(
+                    comparison.status,
+                    ComparisonStatus::Failed,
+                    "E6.3 {engine} incorrectly accepted a content mutation as segment geometry",
                 );
             }
         });
