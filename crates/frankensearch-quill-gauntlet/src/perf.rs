@@ -21,6 +21,7 @@ use crate::machine_class_registry::{
     MACHINE_CLASS_REGISTRY_SHA256, MachineClassError, MachineClassRegistry,
     MachineExecutionProfile, MachineProfileAvailability, MachineProfileKey,
 };
+use crate::perf_evidence::PERF_EVIDENCE_SCHEMA_VERSION;
 
 /// Version of the JSON emitted by the QG matrix harness.
 pub const PERF_ARTIFACT_SCHEMA_VERSION: &str = "quill-perf-artifact-v7";
@@ -836,6 +837,39 @@ fn validate_perf_manifest_gate_set(
     Ok(())
 }
 
+fn validate_perf_manifest_schema_bindings(
+    parsed: &toml::Value,
+    requested_gate: PerfGate,
+) -> Result<(), PerfApplicabilityPlanError> {
+    let schemas = parsed
+        .get("schemas")
+        .and_then(toml::Value::as_table)
+        .ok_or_else(|| PerfApplicabilityPlanError::ManifestContract {
+            gate: requested_gate,
+            detail: "manifest does not define a [schemas] table".to_owned(),
+        })?;
+    for (field, expected) in [
+        ("threshold_artifact", PERF_ARTIFACT_SCHEMA_VERSION),
+        ("evidence_artifact", PERF_EVIDENCE_SCHEMA_VERSION),
+        ("applicability_plan", PERF_APPLICABILITY_PLAN_SCHEMA_VERSION),
+    ] {
+        let found = schemas
+            .get(field)
+            .and_then(toml::Value::as_str)
+            .ok_or_else(|| PerfApplicabilityPlanError::ManifestContract {
+                gate: requested_gate,
+                detail: format!("manifest schemas.{field} is missing or not a string"),
+            })?;
+        if found != expected {
+            return Err(PerfApplicabilityPlanError::ManifestContract {
+                gate: requested_gate,
+                detail: format!("manifest schemas.{field} is {found:?}, expected {expected:?}"),
+            });
+        }
+    }
+    Ok(())
+}
+
 fn perf_gate_manifest_identity(
     manifest: &str,
     gate: PerfGate,
@@ -846,24 +880,7 @@ fn perf_gate_manifest_identity(
             detail: format!("manifest is not valid TOML: {error}"),
         }
     })?;
-    let schema = parsed
-        .get("schemas")
-        .and_then(toml::Value::as_table)
-        .and_then(|schemas| schemas.get("applicability_plan"))
-        .and_then(toml::Value::as_str)
-        .ok_or_else(|| PerfApplicabilityPlanError::ManifestContract {
-            gate,
-            detail: "schemas.applicability_plan is missing or not a string".to_owned(),
-        })?;
-    if schema != PERF_APPLICABILITY_PLAN_SCHEMA_VERSION {
-        return Err(PerfApplicabilityPlanError::ManifestContract {
-            gate,
-            detail: format!(
-                "schemas.applicability_plan is {schema:?}, expected \
-                 {PERF_APPLICABILITY_PLAN_SCHEMA_VERSION:?}"
-            ),
-        });
-    }
+    validate_perf_manifest_schema_bindings(&parsed, gate)?;
     validate_perf_manifest_gate_set(&parsed, gate)?;
     let gate_contract = parsed
         .get("gate")
@@ -4826,6 +4843,25 @@ mod tests {
                 .contains("manifest gate.QG-9.target is missing or empty"),
             "unexpected empty-target error: {missing_unrelated_target}"
         );
+
+        for (field, expected) in [
+            ("threshold_artifact", PERF_ARTIFACT_SCHEMA_VERSION),
+            ("evidence_artifact", PERF_EVIDENCE_SCHEMA_VERSION),
+        ] {
+            let stale_schema = PERF_MANIFEST.replacen(
+                &format!("{field} = \"{expected}\""),
+                &format!("{field} = \"stale-schema\""),
+                1,
+            );
+            let stale_schema = perf_gate_manifest_identity(&stale_schema, PerfGate::Qg1)
+                .expect_err("every artifact schema declaration must match the shared validator");
+            assert!(
+                stale_schema
+                    .to_string()
+                    .contains(&format!("manifest schemas.{field} is \"stale-schema\"")),
+                "unexpected stale {field} schema error: {stale_schema}"
+            );
+        }
 
         let missing = PERF_MANIFEST.replacen("primary_target_cell_width = 8\n", "", 1);
         assert!(matches!(
