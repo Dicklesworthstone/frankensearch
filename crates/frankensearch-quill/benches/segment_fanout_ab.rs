@@ -95,6 +95,9 @@ const VOCABULARY: [&str; 24] = [
 // make the declared `Shape` commit boundary explicit. This is setup only: the
 // measured serial and fanned reader paths consume the same sealed snapshot.
 const SCALAR_FIXTURE_INGEST_CHUNK_DOCS: usize = 63;
+/// Larger than the largest declared shape so an explicit fixture commit stays
+/// one observable leaf rather than becoming an unrequested tier merge.
+const FIXTURE_TIER_FANOUT: usize = 9;
 
 fn xorshift(state: &mut u64) -> u64 {
     *state ^= *state << 13;
@@ -113,6 +116,7 @@ async fn build_index(cx: &Cx, shape: &Shape, seed: u64) -> QuillIndex {
         // the serial/fanned parity check. Explicit `commit` calls below are
         // the only fixture publication boundaries.
         max_visibility_lag_ms: u64::MAX,
+        tier_fanout: FIXTURE_TIER_FANOUT,
         ..QuillConfig::default()
     };
     let index = QuillIndex::in_memory(config).expect("in-memory bench index");
