@@ -820,6 +820,20 @@ fn validate_perf_manifest_gate_set(
                 detail: format!("manifest gate.{label}.activated is missing or not boolean"),
             });
         }
+        if gate == PerfGate::Qg6 {
+            let query_groups = policy
+                .get("queries_per_class")
+                .and_then(toml::Value::as_integer)
+                .and_then(|count| usize::try_from(count).ok());
+            if query_groups != Some(QG6_QUERY_GROUPS) {
+                return Err(PerfApplicabilityPlanError::ManifestContract {
+                    gate: requested_gate,
+                    detail: format!(
+                        "manifest gate.{label}.queries_per_class must equal the frozen QG-6 group count {QG6_QUERY_GROUPS}"
+                    ),
+                });
+            }
+        }
     }
 
     let expected_labels = PerfGate::ALL
@@ -4889,6 +4903,30 @@ mod tests {
                 "invalid primary target {invalid} must fail closed"
             );
         }
+
+        for invalid in ["0", "15", "17", "\"sixteen\""] {
+            let mutated = PERF_MANIFEST.replacen(
+                "queries_per_class = 16",
+                &format!("queries_per_class = {invalid}"),
+                1,
+            );
+            assert!(matches!(
+                perf_gate_manifest_identity(&mutated, PerfGate::Qg1),
+                Err(PerfApplicabilityPlanError::ManifestContract {
+                    gate: PerfGate::Qg1,
+                    ..
+                })
+            ));
+        }
+
+        let missing_qg6_query_groups = PERF_MANIFEST.replacen("queries_per_class = 16\n", "", 1);
+        assert!(matches!(
+            perf_gate_manifest_identity(&missing_qg6_query_groups, PerfGate::Qg1),
+            Err(PerfApplicabilityPlanError::ManifestContract {
+                gate: PerfGate::Qg1,
+                ..
+            })
+        ));
 
         let stale_schema = PERF_MANIFEST.replacen(
             "applicability_plan = \"frankensearch.quill-perf-applicability-plan.v2\"",
