@@ -1533,7 +1533,7 @@ fn initial_then_refined_lanes_always_produce_phase2() {
         );
 
         for lane in refined_lanes {
-            let (searcher, _) = build_searcher_for_lane(lane);
+            let (searcher, _) = build_searcher_for_lane(lane, None);
             let queries = queries_for_lane(lane);
             if let Some(fq) = queries.first() {
                 let query = fq.query_for_lane(lane.query_slice.include_negated);
@@ -1578,7 +1578,7 @@ fn maybe_refined_lanes_tolerate_both_outcomes() {
         );
 
         for lane in maybe_lanes {
-            let (searcher, _) = build_searcher_for_lane(lane);
+            let (searcher, _) = build_searcher_for_lane(lane, None);
             let queries = queries_for_lane(lane);
             if let Some(fq) = queries.first() {
                 let query = fq.query_for_lane(lane.query_slice.include_negated);
