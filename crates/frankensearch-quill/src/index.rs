@@ -15001,9 +15001,13 @@ mod tests {
                 panic!("profiled ordinary query did not bind its work plan");
             };
             assert!(work_upper_bound > 0);
-            assert_eq!(receipt.counters().0, 1);
-            assert_eq!(receipt.counters().1, 1);
-            assert_eq!(receipt.counters().2, 2);
+            assert_eq!(
+                receipt.counters().0,
+                2,
+                "the default parser expands a bare term over both default text fields"
+            );
+            assert_eq!(receipt.counters().1, 2);
+            assert_eq!(receipt.counters().2, 4);
             assert!(
                 receipt.counters().4 > 0,
                 "profiled ordinary query did not record any accepted work checkpoints"

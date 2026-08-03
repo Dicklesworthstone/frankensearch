@@ -26,6 +26,11 @@ use frankensearch_quill::index::ConformanceCancellationStage;
 use frankensearch_quill::index::ConformancePruningExecutionMode;
 use frankensearch_quill::index::{QuillIndex, QuillIndexError};
 use frankensearch_quill::snippet::SnippetConfig;
+#[cfg(feature = "profile-internals")]
+use frankensearch_quill::{
+    QuillProfileCacheDisposition, QuillProfileExecutionMode, QuillProfileOutcome,
+    QuillProfiledSearchOutcome, QuillSearchIndex,
+};
 
 const QUERY: &str = "alpha";
 const LIMIT: usize = 10;
@@ -57,6 +62,91 @@ async fn fixture_index(cx: &Cx) -> QuillIndex {
         .await
         .expect("commit fixture corpus");
     index
+}
+
+#[cfg(feature = "profile-internals")]
+#[test]
+fn profiled_search_sidecar_executes_through_public_durable_reader() {
+    asupersync::test_utils::run_test_with_cx(|cx| async move {
+        let directory = tempfile::tempdir().expect("profile sidecar directory");
+        let writer = QuillIndex::create(&cx, directory.path(), deterministic_config())
+            .await
+            .expect("create durable profile fixture");
+        LexicalWrite::index_document(
+            &writer,
+            &cx,
+            &IndexableDocument::new("profiled-doc", "alpha profile sidecar document"),
+        )
+        .await
+        .expect("ingest durable profile fixture");
+        LexicalWrite::commit(&writer, &cx)
+            .await
+            .expect("publish durable profile fixture");
+
+        let reader = QuillSearchIndex::open(&cx, directory.path(), deterministic_config())
+            .await
+            .expect("open public durable reader");
+        let first = reader
+            .search_paginated_with_profile(&cx, QUERY, LIMIT, 0, false)
+            .expect("first profiled public search");
+        let first_receipt = match first {
+            QuillProfiledSearchOutcome::Completed { result, receipt } => {
+                assert_eq!(
+                    result.hits.len(),
+                    1,
+                    "ordinary search must return the fixture hit"
+                );
+                receipt
+            }
+            QuillProfiledSearchOutcome::Failed { error, .. } => {
+                panic!("first profiled public search unexpectedly failed: {error}")
+            }
+        };
+        assert_eq!(first_receipt.cache(), QuillProfileCacheDisposition::Miss);
+        assert_eq!(
+            first_receipt.execution(),
+            Some(QuillProfileExecutionMode::Serial),
+            "one sealed segment must use the shipping serial branch"
+        );
+        assert_eq!(
+            first_receipt.counters().0,
+            2,
+            "the two default text fields each require a snapshot DF probe"
+        );
+        assert_eq!(
+            first_receipt.counters().1,
+            2,
+            "the two default text fields each require a global DF probe"
+        );
+        assert_eq!(
+            first_receipt.counters().2,
+            4,
+            "each default field reads the dictionary for DF and cursor lowering"
+        );
+        assert_eq!(first_receipt.counters().3, 1, "sealed lowering count");
+        assert_eq!(first_receipt.outcome(), QuillProfileOutcome::Completed);
+
+        let repeated = reader
+            .search_paginated_with_profile(&cx, QUERY, LIMIT, 0, false)
+            .expect("repeat profiled public search");
+        let repeated_receipt = match repeated {
+            QuillProfiledSearchOutcome::Completed { result, receipt } => {
+                assert_eq!(
+                    result.hits.len(),
+                    1,
+                    "cache hit must preserve ordinary result"
+                );
+                receipt
+            }
+            QuillProfiledSearchOutcome::Failed { error, .. } => {
+                panic!("repeat profiled public search unexpectedly failed: {error}")
+            }
+        };
+        assert_eq!(repeated_receipt.cache(), QuillProfileCacheDisposition::Hit);
+        assert_eq!(repeated_receipt.execution(), None);
+        assert_eq!(repeated_receipt.counters(), (0, 0, 0, 0, 0));
+        assert_eq!(repeated_receipt.outcome(), QuillProfileOutcome::Completed);
+    });
 }
 
 #[cfg(feature = "pruning-conformance")]
