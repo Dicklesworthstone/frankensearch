@@ -8235,6 +8235,17 @@ impl QuillSearchIndex {
         self.reader.published_snapshot.load().live_doc_count()
     }
 
+    /// Clone the deterministic real-`Cx` cancellation requester used by the
+    /// method-bound conformance harness.
+    ///
+    /// This read-only conformance seam does not exist in normal builds.
+    #[cfg(feature = "conformance-internals")]
+    #[must_use]
+    #[doc(hidden)]
+    pub fn conformance_cancellation_controller(&self) -> Arc<ConformanceCancellationController> {
+        Arc::clone(&self.reader.conformance_controller)
+    }
+
     /// Durable MANIFEST generation pinned by the currently published snapshot.
     #[must_use]
     pub fn keeper_generation(&self) -> u64 {
@@ -15059,6 +15070,55 @@ mod tests {
             assert_eq!(receipt.work_units(), QuillProfileWorkUnits::default());
             assert_eq!(receipt.cancellation_observations(), 1);
             assert_eq!(receipt.outcome(), QuillProfileOutcome::Cancelled);
+        });
+    }
+
+    #[cfg(all(feature = "profile-internals", feature = "conformance-internals"))]
+    #[test]
+    fn profiled_search_records_disabled_cache_without_skipping_ordinary_work() {
+        run_with_cx(|cx| async move {
+            let directory = tempfile::tempdir().expect("disabled-cache profile directory");
+            let writer = QuillIndex::create(&cx, directory.path(), deterministic_config())
+                .await
+                .expect("create disabled-cache profile writer");
+            LexicalSearch::index_document(
+                &writer,
+                &cx,
+                &IndexableDocument::new("first", "profiled alpha"),
+            )
+            .await
+            .expect("stage disabled-cache profile document");
+            LexicalSearch::commit(&writer, &cx)
+                .await
+                .expect("publish disabled-cache profile segment");
+            let reader = QuillSearchIndex::open(&cx, directory.path(), deterministic_config())
+                .await
+                .expect("open disabled-cache profile reader");
+            let controller = reader.conformance_cancellation_controller();
+            controller
+                .arm(ConformanceCancellationStage::CommitPublication, 1)
+                .expect("arm unrelated conformance stage to disable ranked cache");
+            let outcome = reader
+                .search_paginated_with_profile(&cx, "alpha", 10, 0, false)
+                .expect("disabled-cache profiled search");
+            controller.disarm();
+            let (result, receipt) = match outcome {
+                QuillProfiledSearchOutcome::Completed { result, receipt } => (result, receipt),
+                QuillProfiledSearchOutcome::Failed { error, .. } => {
+                    panic!("disabled-cache profiled search unexpectedly failed: {error}")
+                }
+            };
+            assert_eq!(result.hits.len(), 1);
+            assert_eq!(receipt.cache(), QuillProfileCacheDisposition::Disabled);
+            assert_eq!(receipt.fanout_eligible(), Some(false));
+            assert_eq!(receipt.execution(), Some(QuillProfileExecutionMode::Serial));
+            assert!(receipt.work_plan().is_some());
+            assert_eq!(receipt.counters().0, 1);
+            assert_eq!(receipt.counters().1, 1);
+            assert_eq!(receipt.counters().2, 2);
+            assert_eq!(receipt.counters().3, 1);
+            assert!(receipt.counters().4 > 0);
+            assert_eq!(receipt.outcome(), QuillProfileOutcome::Completed);
         });
     }
 
