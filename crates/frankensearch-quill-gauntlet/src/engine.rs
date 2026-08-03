@@ -6718,6 +6718,84 @@ mod tests {
         });
     }
 
+    /// E6.3 capability law: a positionless schema still serves a single-term
+    /// quote because it reduces to a term query, while a multi-term phrase
+    /// must fail at the typed position-capability boundary. This is not a
+    /// cross-engine equivalence claim: the expected Quill refusal is itself
+    /// the observable, with its schema, field, operator, and capability named.
+    #[cfg(feature = "perf-harness")]
+    #[test]
+    fn e63_positionless_multi_term_phrase_is_typed_error_but_single_term_quote_is_servable() {
+        use frankensearch_core::IndexableDocument;
+        use frankensearch_quill::index::QuillIndexError;
+        use frankensearch_quill::query::{IndexCapability, QueryCapabilityError, QueryExplanation};
+
+        const SEED: u64 = 0xe63_b051_5eed_0001;
+        let documents = vec![
+            IndexableDocument::new("doc-1", "alpha beta beta").with_title("guide"),
+            IndexableDocument::new("doc-2", "alpha gamma").with_title("alpha overview"),
+        ];
+        let mut single_term =
+            DifferentialCase::new("e63-positionless-single-term", "\"alpha\"", 16);
+        single_term.snippet_max_chars = None;
+        single_term.tie_expansion_limit = 64;
+        single_term.metadata.generator_id = Some("e6.3-positionless-capability-v1".to_owned());
+        single_term.metadata.generator_seed = Some(SEED);
+        let mut multi_term =
+            DifferentialCase::new("e63-positionless-multi-term", "\"alpha beta\"", 16);
+        multi_term.snippet_max_chars = None;
+        multi_term.tie_expansion_limit = 64;
+        multi_term.metadata.generator_id = Some("e6.3-positionless-capability-v1".to_owned());
+        multi_term.metadata.generator_seed = Some(SEED);
+
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let mut subject = qg_position_mode_subject(false);
+            subject
+                .claim_fresh_campaign()
+                .expect("E6.3 claim positionless Quill campaign");
+            subject
+                .index_mut()
+                .expect("E6.3 open positionless Quill campaign")
+                .index_documents(&cx, &documents)
+                .await
+                .expect("E6.3 index positionless Quill fixture");
+            subject
+                .index_mut()
+                .expect("E6.3 open positionless Quill campaign")
+                .commit(&cx)
+                .await
+                .expect("E6.3 commit positionless Quill fixture");
+            subject
+                .mark_committed()
+                .expect("E6.3 publish positionless Quill campaign");
+
+            let single_observation = subject
+                .observe(&cx, &single_term)
+                .await
+                .expect("E6.3 single-term quote must remain servable without positions");
+            assert!(
+                !single_observation.hits.is_empty(),
+                "E6.3 positive positionless fixture"
+            );
+
+            let error = subject
+                .observe(&cx, &multi_term)
+                .await
+                .expect_err("E6.3 multi-term phrase must require positions");
+            assert!(matches!(
+                error,
+                GauntletError::Quill(QuillIndexError::QueryCapability(
+                    QueryCapabilityError::PositionsRequired {
+                        schema: "frankensearch-default-no-positions-v1",
+                        ref field,
+                        operator: QueryExplanation::Phrase,
+                        capability: IndexCapability::Positions,
+                    }
+                )) if field == "content"
+            ));
+        });
+    }
+
     #[cfg(feature = "tantivy-oracle")]
     #[test]
     fn e410_controlled_public_search_semantics_match_oracle() {
