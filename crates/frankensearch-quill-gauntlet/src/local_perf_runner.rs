@@ -423,6 +423,17 @@ pub struct LocalPerfProcessLifecycle {
     run_log_captured: bool,
 }
 
+/// Process-tree authority available from one local producer attempt.
+///
+/// The current runner owns and reaps only the direct child it spawned. It
+/// cannot infer descendant completion from that fact because descendants may
+/// outlive or be reparented after the direct child exits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LocalPerfProcessTreeQuiescence {
+    DirectChildOnly,
+}
+
 // This public contract is consumed by the dependent H4 assembler slice; keep
 // the isolated H2 commit warning-clean before that re-export lands.
 #[allow(dead_code)]
@@ -462,6 +473,12 @@ impl LocalPerfProcessLifecycle {
     #[must_use]
     pub const fn run_log_captured(self) -> bool {
         self.run_log_captured
+    }
+
+    /// Return the strongest process-tree conclusion this receipt can prove.
+    #[must_use]
+    pub const fn process_tree_quiescence(self) -> LocalPerfProcessTreeQuiescence {
+        LocalPerfProcessTreeQuiescence::DirectChildOnly
     }
 }
 
@@ -6457,6 +6474,11 @@ mod tests {
             run_log_captured: true,
         };
         assert!(validate_process_lifecycle(recovered, reaped, true).is_ok());
+        assert_eq!(
+            reaped.process_tree_quiescence(),
+            LocalPerfProcessTreeQuiescence::DirectChildOnly,
+            "a reaped direct child must never be relabeled as descendant-tree quiescence"
+        );
         let mut unreaped = reaped;
         unreaped.wait_completed = false;
         unreaped.child_reaped = false;
