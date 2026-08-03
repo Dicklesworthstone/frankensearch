@@ -15121,9 +15121,9 @@ mod tests {
             assert_eq!(receipt.fanout_eligible(), Some(false));
             assert_eq!(receipt.execution(), Some(QuillProfileExecutionMode::Serial));
             assert!(receipt.work_plan().is_some());
-            assert_eq!(receipt.counters().0, 1);
-            assert_eq!(receipt.counters().1, 1);
-            assert_eq!(receipt.counters().2, 2);
+            assert_eq!(receipt.counters().0, 2);
+            assert_eq!(receipt.counters().1, 2);
+            assert_eq!(receipt.counters().2, 4);
             assert_eq!(receipt.counters().3, 1);
             assert!(receipt.counters().4 > 0);
             assert_eq!(receipt.outcome(), QuillProfileOutcome::Completed);

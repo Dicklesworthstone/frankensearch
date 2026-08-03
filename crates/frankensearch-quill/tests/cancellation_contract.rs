@@ -251,6 +251,59 @@ fn profiled_search_public_reader_preserves_precheck_cancellation_receipt() {
     });
 }
 
+#[cfg(all(feature = "profile-internals", feature = "conformance-internals"))]
+#[test]
+fn profiled_search_public_reader_records_disabled_cache_without_skipping_work() {
+    asupersync::test_utils::run_test_with_cx(|cx| async move {
+        let directory = tempfile::tempdir().expect("disabled-cache profile sidecar directory");
+        let writer = QuillIndex::create(&cx, directory.path(), deterministic_config())
+            .await
+            .expect("create durable disabled-cache fixture");
+        LexicalWrite::index_document(
+            &writer,
+            &cx,
+            &IndexableDocument::new(
+                "disabled-cache-profiled-doc",
+                "alpha cache sidecar document",
+            ),
+        )
+        .await
+        .expect("ingest durable disabled-cache fixture");
+        LexicalWrite::commit(&writer, &cx)
+            .await
+            .expect("publish durable disabled-cache fixture");
+
+        let reader = QuillSearchIndex::open(&cx, directory.path(), deterministic_config())
+            .await
+            .expect("open public durable disabled-cache reader");
+        let controller = reader.conformance_cancellation_controller();
+        controller
+            .arm(ConformanceCancellationStage::CommitPublication, 1)
+            .expect("arm unrelated checkpoint to disable ranked cache");
+        let outcome = reader
+            .search_paginated_with_profile(&cx, QUERY, LIMIT, 0, false)
+            .expect("disabled cache must not prevent ordinary profile search");
+        controller.disarm();
+        let (result, receipt) = match outcome {
+            QuillProfiledSearchOutcome::Completed { result, receipt } => (result, receipt),
+            QuillProfiledSearchOutcome::Failed { error, .. } => {
+                panic!("disabled-cache profiled search unexpectedly failed: {error}")
+            }
+        };
+        assert_eq!(result.hits.len(), 1);
+        assert_eq!(receipt.cache(), QuillProfileCacheDisposition::Disabled);
+        assert_eq!(receipt.fanout_eligible(), Some(false));
+        assert_eq!(receipt.execution(), Some(QuillProfileExecutionMode::Serial));
+        assert!(receipt.work_plan().is_some());
+        assert_eq!(receipt.counters().0, 2);
+        assert_eq!(receipt.counters().1, 2);
+        assert_eq!(receipt.counters().2, 4);
+        assert_eq!(receipt.counters().3, 1);
+        assert!(receipt.counters().4 > 0);
+        assert_eq!(receipt.outcome(), QuillProfileOutcome::Completed);
+    });
+}
+
 #[cfg(feature = "pruning-conformance")]
 async fn two_segment_pruning_trace_fixture(cx: &Cx) -> QuillIndex {
     let index = QuillIndex::in_memory(deterministic_config()).expect("in-memory index");
