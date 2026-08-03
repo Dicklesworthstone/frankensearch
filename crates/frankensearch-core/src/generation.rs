@@ -4499,6 +4499,19 @@ mod tests {
     }
 
     #[test]
+    fn activation_manifest_rejects_every_single_byte_mutation() {
+        let encoded = activation_manifest(1, None).canonical_bytes();
+        for byte_index in 0..encoded.len() {
+            let mut mutated = encoded.clone();
+            mutated[byte_index] ^= 0x80;
+            assert!(
+                ActivationManifestV1::from_canonical_bytes(&mutated).is_err(),
+                "single-byte mutation at offset {byte_index} must never decode"
+            );
+        }
+    }
+
+    #[test]
     fn activation_manifest_requires_the_exact_preceding_authority_sequence() {
         let genesis = activation_manifest(1, None);
         let (manifest_len, manifest_sha256) = genesis.object_receipt();
