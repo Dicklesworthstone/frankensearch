@@ -233,6 +233,9 @@ fn real_tokenizers_log_output_requires_explicit_bridge_and_trace() {
     let bridge_off_child = run_child("bridge-off", Some("off"));
     assert_marker_is_suppressed("bridge-off", &bridge_off_child);
 
+    let panic_restoration_child = run_child("panic-restoration", Some("trace"));
+    assert_marker_is_suppressed("panic-restoration", &panic_restoration_child);
+
     let explicit_child = run_child("explicit-bridge", Some("trace"));
     let explicit = assert_child_passed("explicit-bridge", &explicit_child);
     assert!(
@@ -256,6 +259,20 @@ fn fresh_process_child() {
         "bridge-without-trace" | "bridge-off" | "explicit-bridge" => {
             install_global_test_log_bridge()
                 .expect("fresh child must permit an explicit global LogTracer");
+            exercise_real_tokenizer();
+        }
+        "panic-restoration" => {
+            let panic_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                run_test_with_cx(|_cx| async { panic!("scoped dispatcher panic probe") });
+            }));
+            assert!(panic_result.is_err(), "panic probe unexpectedly returned");
+            let restored = tracing::dispatcher::get_default(|dispatch| {
+                dispatch.is::<tracing::subscriber::NoSubscriber>()
+            });
+            assert!(
+                restored,
+                "run_test_with_cx leaked its dispatcher after panic"
+            );
             exercise_real_tokenizer();
         }
         other => panic!("unknown fresh-process logging child case {other:?}"),
