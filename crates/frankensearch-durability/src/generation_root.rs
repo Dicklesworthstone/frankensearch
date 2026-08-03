@@ -517,6 +517,28 @@ mod tests {
             ),
             "mode policy is enforced from the retained descriptor, not path metadata"
         );
+        assert!(matches!(
+            root.read_regular_file(
+                OsStr::new("AUTHORITY"),
+                GenerationRootFilePolicyV1 {
+                    expected_uid: metadata.uid().saturating_add(1),
+                    expected_mode: 0o600,
+                    max_bytes: 4_096,
+                },
+            ),
+            Err(GenerationRootAdmissionErrorV1::OwnerMismatch)
+        ));
+        assert!(matches!(
+            root.read_regular_file(
+                OsStr::new("AUTHORITY"),
+                GenerationRootFilePolicyV1 {
+                    expected_uid: metadata.uid(),
+                    expected_mode: 0o600,
+                    max_bytes: 24,
+                },
+            ),
+            Err(GenerationRootAdmissionErrorV1::FileTooLarge)
+        ));
     }
 
     #[cfg(target_os = "linux")]
