@@ -15122,6 +15122,55 @@ mod tests {
         });
     }
 
+    #[cfg(all(feature = "profile-internals", feature = "conformance-internals"))]
+    #[test]
+    fn profiled_search_reports_exact_prefix_on_checkpoint_cancellation() {
+        run_with_cx(|cx| async move {
+            let directory = tempfile::tempdir().expect("checkpoint-cancel profile directory");
+            let writer = QuillIndex::create(&cx, directory.path(), deterministic_config())
+                .await
+                .expect("create checkpoint-cancel profile writer");
+            LexicalSearch::index_document(
+                &writer,
+                &cx,
+                &IndexableDocument::new("first", "profiled alpha"),
+            )
+            .await
+            .expect("stage checkpoint-cancel profile document");
+            LexicalSearch::commit(&writer, &cx)
+                .await
+                .expect("publish checkpoint-cancel profile segment");
+            let reader = QuillSearchIndex::open(&cx, directory.path(), deterministic_config())
+                .await
+                .expect("open checkpoint-cancel profile reader");
+            let controller = reader.conformance_cancellation_controller();
+            controller
+                .arm(ConformanceCancellationStage::QueryCollection, 2)
+                .expect("arm cancellation at the second ordinary checkpoint");
+            let outcome = reader
+                .search_paginated_with_profile(&cx, "alpha", 10, 0, false)
+                .expect("checkpoint cancellation must retain profile receipt");
+            controller.disarm();
+            let (error, receipt) = match outcome {
+                QuillProfiledSearchOutcome::Completed { .. } => {
+                    panic!("checkpoint-cancelled profiled search unexpectedly completed")
+                }
+                QuillProfiledSearchOutcome::Failed { error, receipt } => (error, receipt),
+            };
+            assert!(matches!(error, QuillIndexError::Cancelled { phase } if phase == "search"));
+            assert_eq!(receipt.cache(), QuillProfileCacheDisposition::Disabled);
+            assert_eq!(receipt.fanout_eligible(), Some(false));
+            assert_eq!(receipt.execution(), Some(QuillProfileExecutionMode::Serial));
+            assert!(receipt.work_plan().is_some());
+            assert_eq!(receipt.work_units().requested(), [1, 1, 0, 0]);
+            assert_eq!(receipt.work_units().admitted(), [1, 0, 0, 0]);
+            assert_eq!(receipt.work_units().refused(), [0, 0, 0, 0]);
+            assert_eq!(receipt.counters(), (1, 1, 1, 1, 1));
+            assert_eq!(receipt.cancellation_observations(), 1);
+            assert_eq!(receipt.outcome(), QuillProfileOutcome::Cancelled);
+        });
+    }
+
     #[cfg(feature = "profile-internals")]
     #[test]
     fn profiled_search_returns_fuel_exhaustion_with_work_disposition() {
