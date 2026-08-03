@@ -33,20 +33,29 @@ Usage:
   scripts/check_ledger_null_control.sh [--staged | --since <ref> | --all]
   scripts/check_ledger_null_control.sh --selfcheck
   scripts/check_ledger_null_control.sh --leakcheck
+  scripts/check_ledger_null_control.sh --mergecheck
   scripts/check_ledger_null_control.sh --install-hook
 
 Options:
   --candidate <text>  Search NEGATIVE_EVIDENCE before proposing a lever.
   --surface <text>    Function/path/target surface paired with --candidate.
   --staged            Gate newly added staged rows (default; pre-commit).
+                      Merge-aware: while MERGE_HEAD exists, a row is "new"
+                      only if it is absent from BOTH parents, so committed
+                      second-parent history is never re-gated.
   --since <ref>       Gate rows added between merge-base(ref, HEAD) and HEAD.
   --all               Mechanical whole-ledger report; never blocks.
   --selfcheck         Exercise fail-closed synthetic contract cases
-                      (also runs --leakcheck).
+                      (also runs --leakcheck and --mergecheck).
   --leakcheck         Regression-check per-entry flag leakage across mixed
                       history (the 79d999ad bug) via a temp-repo staged
                       simulation. LEDGER_LEAKCHECK_TARGET=<path> substitutes
                       the script under test (RED-proofing old versions).
+  --mergecheck        Regression-check merge blindness: a temp-repo merge
+                      must admit second-parent ledger history while still
+                      blocking a row present in neither parent.
+                      LEDGER_MERGECHECK_TARGET=<path> substitutes the script
+                      under test (RED-proofing old versions).
   --ledger <path>     Override the default ledger set (test/diagnostic use).
   --install-hook      Point this checkout at the tracked .githooks directory.
 
@@ -107,6 +116,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --leakcheck)
       MODE="leakcheck"
+      shift
+      ;;
+    --mergecheck)
+      MODE="mergecheck"
       shift
       ;;
     --ledger)
@@ -227,13 +240,49 @@ candidate_preflight() {
   ' "${LEDGER_ABS}"
 }
 
+# Print the staged blob's +line numbers that are additions relative to the
+# given commit. Only hunk headers are consumed downstream, so content lines
+# are discarded here.
+staged_added_lines_vs() {
+  local base="$1"
+  local rel="$2"
+  git -C "${ROOT_DIR}" diff --cached -U0 "${base}" -- "${rel}" \
+    | awk '/^@@ /{
+        hunk = $0
+        sub(/^@@ -[^ ]+ [+]/, "", hunk)
+        sub(/ .*/, "", hunk)
+        split(hunk, range, ",")
+        first = range[1] + 0
+        count = (length(range[2]) ? range[2] + 0 : 1)
+        for (i = 0; i < count; i++) print first + i
+      }'
+}
+
 diff_stream() {
   local rel="$1"
   # A sentinel avoids the empty-first-file FNR==NR trap in awk.
   printf '%s\n' "__FRANKENSEARCH_DIFF_SENTINEL__"
   case "${MODE}" in
     staged)
-      git -C "${ROOT_DIR}" diff --cached -U0 -- "${rel}"
+      local merge_head
+      merge_head="$(git -C "${ROOT_DIR}" rev-parse -q --verify MERGE_HEAD 2>/dev/null || true)"
+      if [[ -n "${merge_head}" ]]; then
+        # Merge in progress: `diff --cached` compares against the FIRST
+        # parent only, so every ledger row inherited from the second
+        # parent's committed history reads as newly added (12 false blocks
+        # on the 2026-08-02 harmonization merge). A row is genuinely new
+        # only if it is an addition relative to BOTH parents; emit the
+        # intersection as synthetic header-only hunks, the same form the
+        # selfcheck lane feeds the gate awk.
+        comm -12 \
+          <(staged_added_lines_vs "HEAD" "${rel}" | sort | uniq) \
+          <(staged_added_lines_vs "${merge_head}" "${rel}" | sort | uniq) \
+          | while IFS= read -r added_line; do
+              printf '@@ -0,0 +%s @@\n' "${added_line}"
+            done
+      else
+        git -C "${ROOT_DIR}" diff --cached -U0 -- "${rel}"
+      fi
       ;;
     since)
       git -C "${ROOT_DIR}" diff -U0 "${SINCE_REF}...HEAD" -- "${rel}"
@@ -849,6 +898,131 @@ run_leakcheck() {
   echo "[ledger-leakcheck] OK: 2/2 leak-regression cases"
 }
 
+# --- mergecheck: regression coverage for merge blindness ---
+# `--staged` reads `git diff --cached`, which compares the index against the
+# FIRST parent only; during a merge commit, every ledger row inherited from
+# the second parent's committed history therefore read as newly added and was
+# re-gated (12 false blocks on the 2026-08-02 harmonization merge, all rows
+# pre-existing on a parent). The probe proves second-parent history is
+# admitted; the control proves a row present in NEITHER parent is still
+# blocked, so the merge path cannot be used to smuggle ungated rows.
+
+run_mergecheck_once() {
+  # $1 = script under test (abs path); $2 = variant: probe | control
+  # Returns the linter's exit code.
+  local target="$1" variant="$2"
+  local repo
+  repo="$(mktemp -d "${TMPDIR:-/tmp}/ledger-mergecheck.XXXXXX")" || return 64
+  MERGECHECK_LAST_DIR="${repo}"
+
+  leakcheck_env git -C "${repo}" init -q -b main || return 64
+  mkdir -p "${repo}/docs" "${repo}/scripts"
+  cp "${target}" "${repo}/scripts/check_ledger_null_control.sh"
+  chmod +x "${repo}/scripts/check_ledger_null_control.sh"
+
+  cat > "${repo}/docs/PERF_LEDGER.md" <<'LEDGER'
+# PERF_LEDGER (mergecheck synthetic)
+LEDGER
+  cat > "${repo}/docs/NEGATIVE_EVIDENCE.md" <<'LEDGER'
+# NEGATIVE_EVIDENCE (mergecheck synthetic base)
+
+### 2098-03-01 — REJECT synthetic shared-history base row
+A/A null: 1.001 ratio, measured in the same invocation as the paired run.
+Decision: REJECT — reverted.
+LEDGER
+
+  leakcheck_env git -C "${repo}" -c user.name=mergecheck -c user.email=mergecheck@local \
+    add docs scripts || return 64
+  leakcheck_env git -C "${repo}" -c user.name=mergecheck -c user.email=mergecheck@local \
+    commit -q -m "mergecheck base" || return 64
+
+  # Second parent: committed history carrying a row that HAS no same-invocation
+  # null — exactly the shape the merge-blind gate falsely re-blocked. It was
+  # committed on its own line; the merge must not re-litigate it.
+  leakcheck_env git -C "${repo}" checkout -q -b side || return 64
+  cat >> "${repo}/docs/NEGATIVE_EVIDENCE.md" <<'ROW'
+
+### 2099-03-02 — REJECT synthetic second-parent history row
+Decision: REJECT — reverted; recorded before the evidence contract hardened.
+ROW
+  leakcheck_env git -C "${repo}" -c user.name=mergecheck -c user.email=mergecheck@local \
+    commit -q -am "side: historical ledger row" || return 64
+
+  # Diverge main so the merge is a true two-parent merge, not a fast-forward.
+  leakcheck_env git -C "${repo}" checkout -q main || return 64
+  echo "divergence marker" >> "${repo}/docs/PERF_LEDGER.md"
+  leakcheck_env git -C "${repo}" -c user.name=mergecheck -c user.email=mergecheck@local \
+    commit -q -am "main: diverge" || return 64
+
+  leakcheck_env git -C "${repo}" -c user.name=mergecheck -c user.email=mergecheck@local \
+    merge --no-commit --no-ff -q side >/dev/null 2>&1 || return 64
+
+  if [[ "${variant}" == "control" ]]; then
+    # A genuinely new row (present in neither parent), added mid-merge with no
+    # evidence: the gate must still block the merge commit.
+    cat >> "${repo}/docs/NEGATIVE_EVIDENCE.md" <<'ROW'
+
+### 2099-03-03 — REJECT synthetic mid-merge smuggled row without evidence
+Decision: REJECT — reverted without recorded evidence.
+ROW
+    leakcheck_env git -C "${repo}" add docs/NEGATIVE_EVIDENCE.md || return 64
+  fi
+
+  local rc=0
+  leakcheck_env "${repo}/scripts/check_ledger_null_control.sh" --staged || rc=$?
+  return "${rc}"
+}
+
+run_mergecheck() {
+  local target="${LEDGER_MERGECHECK_TARGET:-${BASH_SOURCE[0]}}"
+  if [[ "${target}" != /* ]]; then
+    target="$(cd "$(dirname "${target}")" && pwd)/$(basename "${target}")"
+  fi
+  if [[ ! -f "${target}" ]]; then
+    echo "ERROR: mergecheck target not found: ${target}" >&2
+    return 64
+  fi
+
+  local failed=0 rc dir
+
+  MERGECHECK_LAST_DIR=""
+  rc=0
+  run_mergecheck_once "${target}" probe > /dev/null 2>&1 || rc=$?
+  dir="${MERGECHECK_LAST_DIR}"
+  if [[ ${rc} -eq 0 ]]; then
+    echo "[ledger-mergecheck] PASS merge probe: second-parent committed history admitted during a merge: exit 0"
+  else
+    echo "[ledger-mergecheck] BLOCKED merge probe: second-parent history was re-gated (exit ${rc}) — merge blindness" >&2
+    failed=1
+  fi
+  retain_mergecheck_dir "${dir}"
+
+  MERGECHECK_LAST_DIR=""
+  rc=0
+  run_mergecheck_once "${target}" control > /dev/null 2>&1 || rc=$?
+  dir="${MERGECHECK_LAST_DIR}"
+  if [[ ${rc} -eq 2 ]]; then
+    echo "[ledger-mergecheck] PASS merge control: neither-parent row is still blocked mid-merge: exit 2"
+  else
+    echo "[ledger-mergecheck] BLOCKED merge control: expected exit 2, got ${rc} — the merge path admits ungated rows" >&2
+    failed=1
+  fi
+  retain_mergecheck_dir "${dir}"
+
+  if [[ ${failed} -ne 0 ]]; then
+    echo "[ledger-mergecheck] BLOCKED: merge-blindness regression detected" >&2
+    return 2
+  fi
+  echo "[ledger-mergecheck] OK: 2/2 merge-awareness cases"
+}
+
+retain_mergecheck_dir() {
+  local dir="$1"
+  if [[ -n "${dir}" && -d "${dir}" && "${dir}" == *ledger-mergecheck* ]]; then
+    echo "[ledger-mergecheck] retained temp repo: ${dir}" >&2
+  fi
+}
+
 case "${MODE}" in
   candidate)
     candidate_preflight
@@ -860,10 +1034,14 @@ case "${MODE}" in
     LEDGER_GATE_STATUS=0
     if ! run_selfcheck; then LEDGER_GATE_STATUS=2; fi
     if ! run_leakcheck; then LEDGER_GATE_STATUS=2; fi
+    if ! run_mergecheck; then LEDGER_GATE_STATUS=2; fi
     exit "${LEDGER_GATE_STATUS}"
     ;;
   leakcheck)
     run_leakcheck
+    ;;
+  mergecheck)
+    run_mergecheck
     ;;
   staged|since|all)
     lint_ledgers
