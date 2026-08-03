@@ -6913,6 +6913,88 @@ mod tests {
         });
     }
 
+    /// E6.3 bounded replay campaign for the qualified position-capable
+    /// single-term quote law. Each deterministic seed selects one scalar term
+    /// and must preserve the full live observation; the paired one-fixture law
+    /// above retains the intentionally invalid multi-term phrase control.
+    #[cfg(feature = "perf-harness")]
+    #[test]
+    fn e63_single_term_quote_seed_matrix_replays_live_observations() {
+        use frankensearch_core::IndexableDocument;
+
+        const SEEDS: [u64; 3] = [
+            0xe63_907e_5eed_0001,
+            0xe63_907e_5eed_0002,
+            0xe63_907e_5eed_0003,
+        ];
+        let documents = vec![
+            IndexableDocument::new("doc-1", "alpha beta beta").with_title("guide"),
+            IndexableDocument::new("doc-2", "alpha gamma").with_title("alpha overview"),
+            IndexableDocument::new("doc-3", "beta gamma gamma gamma").with_title("alpha"),
+            IndexableDocument::new("doc-4", "alpha beta gamma delta").with_title("reference"),
+            IndexableDocument::new("doc-5", "delta epsilon").with_title("quiet"),
+        ];
+
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            for (term, seed) in [("alpha", SEEDS[0]), ("beta", SEEDS[1]), ("gamma", SEEDS[2])] {
+                let quoted = format!("\"{term}\"");
+                assert_eq!(
+                    quoted,
+                    format!("\"{term}\""),
+                    "E6.3 seed {seed:#x} must replay its quote transform byte-identically",
+                );
+                let bare_cases = [("single-term-quote", term)];
+                let quoted_cases = [("single-term-quote", quoted.as_str())];
+                let baseline = e63_observations(
+                    &cx,
+                    &documents,
+                    &bare_cases,
+                    seed,
+                    "e6.3-single-term-quote-v1",
+                )
+                .await;
+                let transformed = e63_observations(
+                    &cx,
+                    &documents,
+                    &quoted_cases,
+                    seed,
+                    "e6.3-single-term-quote-v1",
+                )
+                .await;
+                let baseline_case = baseline.first().expect("E6.3 seed baseline quote fixture");
+                let quoted_case = transformed.first().expect("E6.3 seed quoted quote fixture");
+                assert_eq!(
+                    baseline_case.0, quoted_case.0,
+                    "E6.3 seed {seed:#x} quote case identity drifted"
+                );
+                for (engine, before, after) in [
+                    ("Quill", &baseline_case.1, &quoted_case.1),
+                    ("Tantivy", &baseline_case.2, &quoted_case.2),
+                ] {
+                    let comparison = compare_observations(
+                        before.clone(),
+                        after.clone(),
+                        ComparatorConfig::default(),
+                    )
+                    .unwrap_or_else(|error| {
+                        panic!("E6.3 {engine} seed {seed:#x} quote comparison failed: {error}")
+                    });
+                    assert!(
+                        matches!(
+                            comparison.rank_class,
+                            RankClass::RankExact | RankClass::TieOrder
+                        ) && comparison
+                            .divergences
+                            .iter()
+                            .all(|divergence| divergence.class == DivergenceClass::TieOrder),
+                        "E6.3 {engine} seed {seed:#x} produced a non-tie single-term quote divergence: {:?}",
+                        comparison.divergences,
+                    );
+                }
+            }
+        });
+    }
+
     /// E6.3 capability law: a positionless schema still serves a single-term
     /// quote because it reduces to a term query, while a multi-term phrase
     /// must fail at the typed position-capability boundary. This is not a
