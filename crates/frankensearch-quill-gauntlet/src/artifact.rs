@@ -1215,6 +1215,122 @@ fn is_lower_sha256(value: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
+const ARTIFACTSTORE_V4_SOURCE_SNAPSHOT_SCHEMA_VERSION: u32 = 1;
+const ARTIFACTSTORE_V4_SOURCE_SNAPSHOT_HASH_DOMAIN: &[u8] =
+    b"frankensearch.artifactstore.v4.source\0";
+const MAX_ARTIFACTSTORE_V4_SOURCE_SNAPSHOT_BYTES: u64 = 16 * 1024 * 1024;
+
+/// File-kind witness for one compiler-visible source input.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ArtifactStoreV4SourceEntryKind {
+    File,
+    Symlink,
+}
+
+/// One canonical, content-addressed compiler-visible source input.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ArtifactStoreV4SourceEntry {
+    pub relative_path: String,
+    pub kind: ArtifactStoreV4SourceEntryKind,
+    pub mode: u32,
+    pub byte_len: u64,
+    pub sha256: String,
+    pub symlink_target: Option<String>,
+}
+
+/// Immutable ordered source-input witness for ArtifactStore v4.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ArtifactStoreV4SourceSnapshot {
+    pub schema_version: u32,
+    pub entries: Vec<ArtifactStoreV4SourceEntry>,
+    pub identity_sha256: String,
+}
+
+impl ArtifactStoreV4SourceSnapshot {
+    /// Construct and bind a canonical snapshot from descriptor-stable caller inputs.
+    pub fn new(entries: Vec<ArtifactStoreV4SourceEntry>) -> Result<Self, GauntletError> {
+        let mut snapshot = Self {
+            schema_version: ARTIFACTSTORE_V4_SOURCE_SNAPSHOT_SCHEMA_VERSION,
+            entries,
+            identity_sha256: String::new(),
+        };
+        snapshot.validate_entries()?;
+        snapshot.identity_sha256 = snapshot.computed_identity_sha256()?;
+        Ok(snapshot)
+    }
+
+    /// Revalidate a decoded snapshot and its domain-separated identity.
+    pub fn validate(&self) -> Result<(), GauntletError> {
+        if self.schema_version != ARTIFACTSTORE_V4_SOURCE_SNAPSHOT_SCHEMA_VERSION
+            || !is_lower_sha256(&self.identity_sha256)
+        {
+            return Err(GauntletError::InvalidPreparedArtifact {
+                reason: "ArtifactStore v4 source snapshot has an invalid schema or identity"
+                    .to_owned(),
+            });
+        }
+        self.validate_entries()?;
+        if self.identity_sha256 != self.computed_identity_sha256()? {
+            return Err(GauntletError::InvalidPreparedArtifact {
+                reason:
+                    "ArtifactStore v4 source snapshot identity does not match canonical entries"
+                        .to_owned(),
+            });
+        }
+        Ok(())
+    }
+
+    fn validate_entries(&self) -> Result<(), GauntletError> {
+        let mut previous = None;
+        for entry in &self.entries {
+            if !is_canonical_source_relative_path(&entry.relative_path)
+                || !is_lower_sha256(&entry.sha256)
+                || previous.is_some_and(|path: &str| path >= entry.relative_path.as_str())
+            {
+                return Err(GauntletError::InvalidPreparedArtifact {
+                    reason: "ArtifactStore v4 source snapshot entries are not canonical and strictly ordered".to_owned(),
+                });
+            }
+            match (&entry.kind, &entry.symlink_target) {
+                (ArtifactStoreV4SourceEntryKind::File, None) => {}
+                (ArtifactStoreV4SourceEntryKind::Symlink, Some(target)) if !target.is_empty() => {}
+                _ => {
+                    return Err(GauntletError::InvalidPreparedArtifact {
+                        reason:
+                            "ArtifactStore v4 source snapshot file kind and symlink target disagree"
+                                .to_owned(),
+                    });
+                }
+            }
+            previous = Some(entry.relative_path.as_str());
+        }
+        Ok(())
+    }
+
+    fn computed_identity_sha256(&self) -> Result<String, GauntletError> {
+        let bytes = serialize_json_bounded(
+            &(self.schema_version, &self.entries),
+            MAX_ARTIFACTSTORE_V4_SOURCE_SNAPSHOT_BYTES,
+            "ArtifactStore v4 source snapshot exceeds its byte budget",
+        )?;
+        let mut hasher = Sha256::new();
+        hasher.update(ARTIFACTSTORE_V4_SOURCE_SNAPSHOT_HASH_DOMAIN);
+        hasher.update(bytes);
+        Ok(lower_hex(&hasher.finalize()))
+    }
+}
+
+fn is_canonical_source_relative_path(path: &str) -> bool {
+    !path.is_empty()
+        && !path.contains('\\')
+        && path
+            .split('/')
+            .all(|component| !component.is_empty() && component != "." && component != "..")
+}
+
 /// Mutable run provenance referencing one immutable object hash.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -3071,6 +3187,75 @@ mod tests {
         );
         let revision = run_fixture_git(repository.path(), &["rev-parse", "HEAD"]);
         (repository, revision)
+    }
+
+    #[test]
+    fn artifactstore_v4_source_snapshot_binds_sorted_compiler_visible_inputs() {
+        let file_hash = "a".repeat(64);
+        let link_hash = "b".repeat(64);
+        let snapshot = ArtifactStoreV4SourceSnapshot::new(vec![
+            ArtifactStoreV4SourceEntry {
+                relative_path: "Cargo.lock".to_owned(),
+                kind: ArtifactStoreV4SourceEntryKind::File,
+                mode: 0o100644,
+                byte_len: 42,
+                sha256: file_hash,
+                symlink_target: None,
+            },
+            ArtifactStoreV4SourceEntry {
+                relative_path: "crates/current".to_owned(),
+                kind: ArtifactStoreV4SourceEntryKind::Symlink,
+                mode: 0o120777,
+                byte_len: 18,
+                sha256: link_hash,
+                symlink_target: Some("../shared/current".to_owned()),
+            },
+        ])
+        .expect("construct canonical source snapshot");
+
+        snapshot.validate().expect("validate constructed snapshot");
+        assert!(is_lower_sha256(&snapshot.identity_sha256));
+
+        let mut reordered = snapshot.clone();
+        reordered.entries.reverse();
+        assert!(matches!(
+            reordered.validate(),
+            Err(GauntletError::InvalidPreparedArtifact { .. })
+        ));
+
+        let mut tampered = snapshot;
+        tampered.entries[0].byte_len += 1;
+        assert!(matches!(
+            tampered.validate(),
+            Err(GauntletError::InvalidPreparedArtifact { .. })
+        ));
+    }
+
+    #[test]
+    fn artifactstore_v4_source_snapshot_rejects_ambiguous_paths_and_kinds() {
+        let hash = "c".repeat(64);
+        assert!(matches!(
+            ArtifactStoreV4SourceSnapshot::new(vec![ArtifactStoreV4SourceEntry {
+                relative_path: "../Cargo.toml".to_owned(),
+                kind: ArtifactStoreV4SourceEntryKind::File,
+                mode: 0o100644,
+                byte_len: 1,
+                sha256: hash.clone(),
+                symlink_target: None,
+            }]),
+            Err(GauntletError::InvalidPreparedArtifact { .. })
+        ));
+        assert!(matches!(
+            ArtifactStoreV4SourceSnapshot::new(vec![ArtifactStoreV4SourceEntry {
+                relative_path: "current".to_owned(),
+                kind: ArtifactStoreV4SourceEntryKind::Symlink,
+                mode: 0o120777,
+                byte_len: 0,
+                sha256: hash,
+                symlink_target: None,
+            }]),
+            Err(GauntletError::InvalidPreparedArtifact { .. })
+        ));
     }
 
     #[test]
