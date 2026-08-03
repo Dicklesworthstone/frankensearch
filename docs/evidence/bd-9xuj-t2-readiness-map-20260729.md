@@ -115,3 +115,71 @@ No golden serializes a search payload today (`SearchPayload` `output_schema.rs:4
 **SAFE-NOW:** `core/src/types.rs` (C1; keep the `core/src/lib.rs` export edit to one added name — that file has +4/-4 on semantic branches) · `index/src/in_memory.rs` (C3, C4-half) · `index/src/two_tier.rs` (C4-persistent, C8-index — best index-crate landing zone) · `fusion/src/searcher.rs` (C6, C7 — best landing zone overall) · `daemon_fallback.rs`/`federated.rs` (template/deferred) · test files.
 
 **Non-blocking adjacents:** gxwy (gauntlet-only), fk04a (quill grimoire/index/keeper — no T2 overlap; quill contended by semantic branches independently), IcyMouse receipt-v2 (helps C2; coordinate, don't wait).
+
+## 5. Corrections — 2026-07-31 (T2-C1r2 rebuild)
+
+Recorded by the C1 rebuild lane after integration review; each item corrects
+this map against what the tree and the review actually established.
+
+### 5.1 C1 supersession record (NO-GO history, kept truthful)
+
+The first C1 implementation (`8cb3c3e7`, branch `codex/sandygrove-t2c1-20260731`)
+received a **NO-GO** from integration review (YellowSparrow, messages
+#7388/#7397) for four defects:
+
+1. `BoundQueryEmbedding::new` performed no identity validation — an
+   incoherent bundle could bind and then "prove" itself downstream;
+2. it encoded the obsolete **same-space-is-sufficient** admission law
+   ("a query embedding is admissible exactly when it was produced in that
+   same space"), contradicting the post-review supersession notice at the
+   top of this map (admit a different producer only through the
+   `is_conformance_compatible_with` golden-vector certificate, with typed
+   `ConformanceCompatibleProducer` telemetry);
+3. its FSVI-side evidence was synthetic — no production `create_v2` writer
+   roundtrip;
+4. it introduced a UBS-critical `panic!` path.
+
+The rebuild (T2-C1r2, based on `origin/main` `58726e26`) supersedes
+`8cb3c3e7` entirely. Its shape: bind-time `EmbeddingIdentityBundleV1::
+validate()` in the constructor; `verify_space_identity` retained as the
+space **join** (necessary, never sufficient for a foreign producer);
+`verify_producer_conformance(expected_bundle, tier)` implementing the full
+admission law with typed `SpaceIdentityAdmission` telemetry
+(`SameProducer` / `ConformanceCompatibleProducer`); a real
+`VectorIndex::create_v2` → `open_admitted_v2` roundtrip test in the index
+crate; no new panic paths.
+
+### 5.2 §1.3 correction — the "discarded identity_v2" arm was unreachable
+
+§1.3 states `from_fsvi` "opens a `VectorIndex` then discards
+id/revision/identity_v2". The discard arm cannot execute:
+`VectorIndex::open` is **v1-only by design** (`parse_header` rejects
+version 2), so on the `open()` path `identity_v2` is structurally `None`.
+Identity-complete v2 artifacts are opened exclusively through exact
+admission (`VectorIndex::open_admitted_v2`), and the C3 in-memory
+identity-bearing load is therefore `from_admitted_v2(&ValidatedFsviBytes)`,
+not a repaired `from_fsvi`. (First discovered during the original C3;
+promoted from that commit message into this map so the map is no longer
+wrong on its own.)
+
+### 5.3 §0.1 refinement under the corrected admission law
+
+§0.1's join-key analysis stands: full-bundle fingerprints can never match
+at an index seam, and the space fingerprint is the correct join key. What
+§0.1 did **not** say — and the first C1 wrongly inferred — is that the
+join is also the admission. A bare space fingerprint carries no producer
+attestation, so fingerprint-only seams can only join; seams holding the
+full expected bundle must apply the admission law (producer equality, or
+certificate-verified conformance, else reject).
+
+### 5.4 Re-verified at `58726e26`
+
+`VectorIndex::create_v2` still has **zero production call sites** (its only
+callers are in-crate tests and `native_hnsw.rs` test fixtures;
+`TwoTierIndexBuilder::finish` still routes to the v1 constructors with
+`identity_v2: None`), so §1.9's conclusion holds unchanged: every
+production index today is v1/identity-less and the typed
+`LegacyUnidentified` fallback remains mandatory at every converted seam.
+New since the map: admission snapshots the artifact's containing directory
+(`DirectoryChangedDuringRead` fails closed), so admission-path test
+fixtures need isolated directories.

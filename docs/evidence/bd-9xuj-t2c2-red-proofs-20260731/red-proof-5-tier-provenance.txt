@@ -1,0 +1,10 @@
+RED PROOF 5: semantic_vector_with_tier_for_doc_id quality arm MISLABELED as Fast
+mutation applied to crates/frankensearch-index/src/two_tier.rs at commit e5693265b11c31cb98ba4864a6fa8ff21524a643
+expected RED: semantic_vector_with_tier_reports_serving_tier
+test two_tier::tests::semantic_vector_with_tier_reports_serving_tier ... FAILED
+thread 'two_tier::tests::semantic_vector_with_tier_reports_serving_tier' (2579616) panicked at crates/frankensearch-index/src/two_tier.rs:4529:9:
+assertion `left == right` failed
+  left: Fast
+ right: Quality
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 526 filtered out; finished in 0.04s
+EXIT_STATUS=101

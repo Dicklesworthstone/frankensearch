@@ -1,0 +1,36 @@
+== cargo test -p frankensearch-index -p frankensearch-fusion -p frankensearch-core (r2 tip afcae1dba89d5b7ce183c0d42a569fc1f577c86c) ==
+     Running unittests src/lib.rs (/data/projects/frankensearch/target/debug/deps/frankensearch_core-97a135de7b2db461)
+test result: ok. 1002 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.34s
+     Running tests/schema_conformance.rs (/data/projects/frankensearch/target/debug/deps/schema_conformance-1f9ecd31c4af9b16)
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running unittests src/lib.rs (/data/projects/frankensearch/target/debug/deps/frankensearch_fusion-96d3427253334d6d)
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 940 filtered out; finished in 0.08s
+test result: ok. 937 passed; 0 failed; 4 ignored; 0 measured; 0 filtered out; finished in 2.47s
+     Running tests/composition_harness.rs (/data/projects/frankensearch/target/debug/deps/composition_harness-3e9d18e68f5e074a)
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+     Running tests/interaction_integration.rs (/data/projects/frankensearch/target/debug/deps/interaction_integration-30373ce690ba8c23)
+test result: ok. 29 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.87s
+     Running tests/interaction_unit.rs (/data/projects/frankensearch/target/debug/deps/interaction_unit-616f3f4e5090681c)
+test result: ok. 25 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.49s
+     Running tests/sync_searcher_tests.rs (/data/projects/frankensearch/target/debug/deps/sync_searcher_tests-de1134703a7e570b)
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.09s
+     Running unittests src/lib.rs (/data/projects/frankensearch/target/debug/deps/frankensearch_index-70cb04692e675252)
+test result: ok. 539 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 10.16s
+     Running tests/fsvi_roundtrip.rs (/data/projects/frankensearch/target/debug/deps/fsvi_roundtrip-d8e88d7088a2fe87)
+test result: ok. 25 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.11s
+     Running tests/in_memory_tests.rs (/data/projects/frankensearch/target/debug/deps/in_memory_tests-88ab50dab786dd08)
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+     Running tests/ivf_recall_test.rs (/data/projects/frankensearch/target/debug/deps/ivf_recall_test-d5e456176b27eb0c)
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 18.43s
+     Running tests/space_identity_roundtrip.rs (/data/projects/frankensearch/target/debug/deps/space_identity_roundtrip-b883d944ddb03b55)
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.03s
+     Running tests/zero_signal_lifecycle.rs (/data/projects/frankensearch/target/debug/deps/zero_signal_lifecycle-f9e1c03ba9ad873c)
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.12s
+   Doc-tests frankensearch_core
+test result: ok. 2 passed; 0 failed; 3 ignored; 0 measured; 0 filtered out; finished in 0.00s
+   Doc-tests frankensearch_fusion
+test result: ok. 3 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 0.00s
+   Doc-tests frankensearch_index
+test result: ok. 2 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.12s
+EXIT_STATUS=0

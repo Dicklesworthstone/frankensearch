@@ -323,6 +323,48 @@ impl IndexBuilder {
         if let Some(ref qe) = quality_embedder {
             index_builder.set_quality_embedder_id(qe.id());
         }
+        // bd-9xuj T2-C2: the warning above promises the written vectors carry
+        // this embedder's identity — perform that binding for real. When the
+        // embedder supplies its complete identity bundle, thread it through
+        // the builder so the built index carries the typed producing identity
+        // (validated, dimension-checked at finish) and its header revision,
+        // not just the id string. A legacy embedder without a bundle stays a
+        // typed legacy-unidentified build: absence is routed, never
+        // fabricated from id strings.
+        match fast_embedder.identity() {
+            Ok(identity) => {
+                if let Err(error) = index_builder.set_fast_identity(identity) {
+                    export_error(metrics_exporter.as_ref(), &error);
+                    return Err(error);
+                }
+            }
+            Err(reason) => {
+                tracing::debug!(
+                    fast_embedder = %fast_embedder.id(),
+                    %reason,
+                    "fast embedder supplies no identity bundle; this generation is \
+                     built legacy-unidentified"
+                );
+            }
+        }
+        if let Some(ref qe) = quality_embedder {
+            match qe.identity() {
+                Ok(identity) => {
+                    if let Err(error) = index_builder.set_quality_identity(identity) {
+                        export_error(metrics_exporter.as_ref(), &error);
+                        return Err(error);
+                    }
+                }
+                Err(reason) => {
+                    tracing::debug!(
+                        quality_embedder = %qe.id(),
+                        %reason,
+                        "quality embedder supplies no identity bundle; this generation's \
+                         quality tier is built legacy-unidentified"
+                    );
+                }
+            }
+        }
 
         let total = self.documents.len();
         let mut errors = Vec::new();
@@ -1171,6 +1213,69 @@ mod tests {
         EmbedderStack::from_parts(fast, Some(quality))
     }
 
+    /// Identity-aware stub (bd-9xuj T2-C2): same deterministic vectors as
+    /// [`StubEmbedder`], but it supplies a complete identity bundle the way
+    /// production embedders do, so builds through it must bind the typed
+    /// producing identity — not just the id string.
+    struct IdentityStubEmbedder {
+        id: &'static str,
+        dim: usize,
+        identity: frankensearch_core::generation::EmbeddingIdentityBundleV1,
+    }
+
+    impl IdentityStubEmbedder {
+        fn new(id: &'static str, dim: usize) -> Self {
+            Self {
+                id,
+                dim,
+                identity:
+                    frankensearch_core::generation::EmbeddingIdentityBundleV1::explicit_test_model(
+                        id,
+                        u32::try_from(dim).expect("test dimension fits u32"),
+                    ),
+            }
+        }
+    }
+
+    impl Embedder for IdentityStubEmbedder {
+        fn embed<'a>(&'a self, _cx: &'a Cx, text: &'a str) -> SearchFuture<'a, Vec<f32>> {
+            let dim = self.dim;
+            Box::pin(async move {
+                let mut vec = vec![0.0; dim];
+                if let Some(slot) = vec.get_mut(text.len() % dim) {
+                    *slot = 1.0;
+                }
+                Ok(vec)
+            })
+        }
+
+        fn identity(
+            &self,
+        ) -> SearchResult<&frankensearch_core::generation::EmbeddingIdentityBundleV1> {
+            Ok(&self.identity)
+        }
+
+        fn dimension(&self) -> usize {
+            self.dim
+        }
+
+        fn id(&self) -> &str {
+            self.id
+        }
+
+        fn model_name(&self) -> &str {
+            self.id
+        }
+
+        fn is_semantic(&self) -> bool {
+            true
+        }
+
+        fn category(&self) -> ModelCategory {
+            ModelCategory::StaticEmbedder
+        }
+    }
+
     fn fast_only_stack() -> EmbedderStack {
         let fast = Arc::new(StubEmbedder {
             id: "stub-fast",
@@ -1282,6 +1387,129 @@ mod tests {
             let index = TwoTierIndex::open(dir.path(), TwoTierConfig::default()).unwrap();
             assert_eq!(index.doc_count(), 3);
             assert!(index.has_quality_index());
+        });
+    }
+
+    /// bd-9xuj T2-C2: `build` must thread the embedders' REAL identities into
+    /// the built index, not just their id strings. Observable through the
+    /// persisted v1 headers: the id string AND the space's immutable revision
+    /// survive a reopen — while the space fingerprint does not (v1 persists
+    /// no identity), and that absence must stay typed, never re-fabricated
+    /// from the surviving strings.
+    #[test]
+    fn build_threads_typed_identity_into_persisted_headers() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let dir = tempfile::tempdir().unwrap();
+            let fast = IdentityStubEmbedder::new("identity-fast", 4);
+            let quality = IdentityStubEmbedder::new("identity-quality", 4);
+            let fast_revision = fast.identity.space.immutable_revision.clone();
+            let quality_revision = quality.identity.space.immutable_revision.clone();
+            let stack = EmbedderStack::from_parts(Arc::new(fast), Some(Arc::new(quality)));
+
+            let stats = IndexBuilder::new(dir.path())
+                .with_embedder_stack(stack)
+                .add_document("doc-1", "Hello world")
+                .add_document("doc-2", "Distributed consensus")
+                .build(&cx)
+                .await
+                .unwrap();
+            assert_eq!(stats.doc_count, 2);
+
+            let reopened = TwoTierIndex::open(dir.path(), TwoTierConfig::default()).unwrap();
+            assert_eq!(reopened.fast_embedder_id(), "identity-fast");
+            assert_eq!(
+                reopened.fast_embedder_revision(),
+                fast_revision.as_str(),
+                "the fast header must carry the identity's immutable revision, \
+                 which only exists if build threaded the typed identity through"
+            );
+            assert_eq!(reopened.quality_embedder_id(), Some("identity-quality"));
+            assert_eq!(
+                reopened.quality_embedder_revision(),
+                Some(quality_revision.as_str())
+            );
+            assert_eq!(
+                reopened.fast_space_fingerprint_hex(),
+                None,
+                "v1 artifacts persist no space identity; reopen is typed \
+                 legacy-unidentified, never fabricated from header strings"
+            );
+            assert_eq!(reopened.quality_space_fingerprint_hex(), None);
+        });
+    }
+
+    /// The legacy arm stays legacy: a stack of identity-less embedders keeps
+    /// building exactly as before — empty header revisions, no identity —
+    /// so the typed threading cannot have made identity a requirement.
+    #[test]
+    fn build_without_identity_bundles_stays_legacy_unidentified() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let dir = tempfile::tempdir().unwrap();
+            let stats = IndexBuilder::new(dir.path())
+                .with_embedder_stack(stub_stack())
+                .add_document("doc-1", "Hello world")
+                .build(&cx)
+                .await
+                .unwrap();
+            assert_eq!(stats.doc_count, 1);
+
+            let reopened = TwoTierIndex::open(dir.path(), TwoTierConfig::default()).unwrap();
+            assert_eq!(reopened.fast_embedder_id(), "stub-fast");
+            assert_eq!(reopened.fast_embedder_revision(), "");
+            assert_eq!(reopened.quality_embedder_revision(), Some(""));
+            assert_eq!(reopened.fast_space_fingerprint_hex(), None);
+            assert_eq!(reopened.quality_space_fingerprint_hex(), None);
+        });
+    }
+
+    /// bd-9xuj T2-C2 follow-up (review #8151): threading identities through
+    /// `build` introduced a NEW production failure mode — a build that
+    /// previously succeeded now fails when an embedder's declared identity
+    /// does not describe the vectors it actually emits. Pin the failure:
+    /// declared space dimension 8, emitted vectors dimension 4 →
+    /// `TwoTierIndexBuilder::finish` rejects with typed `InvalidConfig` at
+    /// `fast_identity.space.dimension` — never a panic, and never an index
+    /// carrying an identity that lies about its vectors.
+    #[test]
+    fn build_fails_typed_when_declared_identity_dimension_mismatches_vectors() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let dir = tempfile::tempdir().unwrap();
+            // Emits 4-dim vectors but declares an 8-dim space: exactly the
+            // self-inconsistent embedder the finish()-time check exists for.
+            let lying = IdentityStubEmbedder {
+                id: "identity-lying-fast",
+                dim: 4,
+                identity:
+                    frankensearch_core::generation::EmbeddingIdentityBundleV1::explicit_test_model(
+                        "identity-lying-fast",
+                        8,
+                    ),
+            };
+            let stack = EmbedderStack::from_parts(Arc::new(lying), None);
+            let error = IndexBuilder::new(dir.path())
+                .with_embedder_stack(stack)
+                .add_document("doc-1", "Hello world")
+                .build(&cx)
+                .await
+                .expect_err(
+                    "a declared identity that does not describe the emitted vectors \
+                     must fail the build with a typed error",
+                );
+            assert!(
+                matches!(
+                    &error,
+                    SearchError::InvalidConfig {
+                        field,
+                        value,
+                        reason,
+                    } if field == "fast_identity.space.dimension"
+                        && value == "8"
+                        && reason.contains("does not describe")
+                ),
+                "expected typed InvalidConfig at fast_identity.space.dimension \
+                 (value 8, refusing an identity that does not describe the \
+                 written vectors), got {error:?}"
+            );
         });
     }
 

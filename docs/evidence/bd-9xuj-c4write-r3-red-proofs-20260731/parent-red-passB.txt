@@ -1,0 +1,47 @@
+== PARENT-RED pass B (compile-red) @ 7095b1da: seam test finish_propagates_wal_directory_sync_failure_without_publishing ported verbatim ==
+== cmd: cargo test -p frankensearch-index --lib -- two_tier::tests::finish_propagates_wal_directory_sync_failure ==
+   Compiling frankensearch-index v0.2.1 (/data/tmp/claude-1000/-data-projects-frankensearch/6ba18fed-10c5-4855-b287-a7067faf4133/scratchpad/c4r3-parent-worktree/crates/frankensearch-index)
+warning: use of deprecated method `wide::i16x8::mul_widen`: renamed to `widening_mul`
+    --> crates/frankensearch-index/src/simd.rs:1268:28
+     |
+1268 |         acc0 += w8::<0>(s).mul_widen(w8::<0>(q));
+     |                            ^^^^^^^^^
+     |
+     = note: `#[warn(deprecated)]` on by default
+
+warning: use of deprecated method `wide::i16x8::mul_widen`: renamed to `widening_mul`
+    --> crates/frankensearch-index/src/simd.rs:1269:28
+     |
+1269 |         acc1 += w8::<8>(s).mul_widen(w8::<8>(q));
+     |                            ^^^^^^^^^
+
+warning: use of deprecated method `wide::i16x8::mul_widen`: renamed to `widening_mul`
+    --> crates/frankensearch-index/src/simd.rs:1270:29
+     |
+1270 |         acc2 += w8::<16>(s).mul_widen(w8::<16>(q));
+     |                             ^^^^^^^^^
+
+warning: use of deprecated method `wide::i16x8::mul_widen`: renamed to `widening_mul`
+    --> crates/frankensearch-index/src/simd.rs:1271:29
+     |
+1271 |         acc3 += w8::<24>(s).mul_widen(w8::<24>(q));
+     |                             ^^^^^^^^^
+
+warning: use of deprecated method `wide::i16x8::mul_widen`: renamed to `widening_mul`
+    --> crates/frankensearch-index/src/simd.rs:1279:46
+     |
+1279 |         sum += i16x8::from(s.map(i16::from)).mul_widen(i16x8::from(q.map(i16::from)));
+     |                                              ^^^^^^^^^
+
+error[E0433]: cannot find module or crate `builder_fault_injection` in this scope
+    --> crates/frankensearch-index/src/two_tier.rs:6082:9
+     |
+6082 |         builder_fault_injection::arm_wal_directory_sync_failure();
+     |         ^^^^^^^^^^^^^^^^^^^^^^^ use of unresolved module or unlinked crate `builder_fault_injection`
+     |
+     = help: if you wanted to use a crate named `builder_fault_injection`, use `cargo add builder_fault_injection` to add it to your `Cargo.toml`
+
+For more information about this error, try `rustc --explain E0433`.
+warning: `frankensearch-index` (lib test) generated 5 warnings
+error: could not compile `frankensearch-index` (lib test) due to 1 previous error; 5 warnings emitted
+EXIT_STATUS=101

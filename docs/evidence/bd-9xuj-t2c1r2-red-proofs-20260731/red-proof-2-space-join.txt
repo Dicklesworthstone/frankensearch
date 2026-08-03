@@ -1,0 +1,61 @@
+=== RED-PROOF 2: verify_space_identity BYPASSED (unconditional Ok) — working-tree mutation on top of HEAD 890e64c44a559ece8a7a26995a384614471ff7ef (branch codex/sandygrove-t2c1r2-20260731) ===
+ crates/frankensearch-core/src/types.rs | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+--- core arm: C1 rejection tests ---
+test types::tests::same_dimension_wrong_space_is_rejected_by_space_fingerprint ... FAILED
+test types::tests::distinct_models_at_equal_dimension_always_reject_space_scoped ... FAILED
+
+failures:
+
+---- types::tests::same_dimension_wrong_space_is_rejected_by_space_fingerprint stdout ----
+
+thread 'types::tests::same_dimension_wrong_space_is_rejected_by_space_fingerprint' (2117828) panicked at crates/frankensearch-core/src/types.rs:956:14:
+fast vector must not enter the quality space: ()
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- types::tests::distinct_models_at_equal_dimension_always_reject_space_scoped stdout ----
+
+thread 'types::tests::distinct_models_at_equal_dimension_always_reject_space_scoped' (2117827) panicked at crates/frankensearch-core/src/types.rs:1071:30:
+distinct models must never share a space: ()
+
+
+failures:
+    types::tests::distinct_models_at_equal_dimension_always_reject_space_scoped
+    types::tests::same_dimension_wrong_space_is_rejected_by_space_fingerprint
+
+test result: FAILED. 0 passed; 2 failed; 0 ignored; 0 measured; 999 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p frankensearch-core --lib`
+EXIT_STATUS=101
+--- index arm 1: C3 in-memory consumer (bound_query_joins...) ---
+
+---- in_memory::tests::bound_query_joins_in_memory_space_identity_through_verifier stdout ----
+
+thread 'in_memory::tests::bound_query_joins_in_memory_space_identity_through_verifier' (2118652) panicked at crates/frankensearch-index/src/in_memory.rs:1790:14:
+wrong space at equal dimension must reject: ()
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    in_memory::tests::bound_query_joins_in_memory_space_identity_through_verifier
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 517 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p frankensearch-index --lib`
+EXIT_STATUS=101
+--- index arm 2: C1 real create_v2 roundtrip ---
+
+---- create_v2_roundtrip_joins_and_certifies_through_real_artifact stdout ----
+
+thread 'create_v2_roundtrip_joins_and_certifies_through_real_artifact' (2119038) panicked at crates/frankensearch-index/tests/space_identity_roundtrip.rs:159:10:
+wrong space must reject against the artifact fingerprint: ()
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    create_v2_roundtrip_joins_and_certifies_through_real_artifact
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s
+
+error: test failed, to rerun pass `-p frankensearch-index --test space_identity_roundtrip`
+EXIT_STATUS=101

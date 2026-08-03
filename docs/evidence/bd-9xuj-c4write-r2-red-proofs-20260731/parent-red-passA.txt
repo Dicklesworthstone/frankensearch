@@ -1,0 +1,155 @@
+# Parent-red pass A — behavioral red proofs on the FROZEN NO-GO'd tip 868c0801
+#
+# Method: `git archive 868c0801b52b556c9a6991b6ca1a98b4802d30e9 | tar -x` into a
+# scratch dir (NOT a git worktree; frozen branch untouched). The r2 test block
+# from crates/frankensearch-fusion/src/refresh.rs (commit 02e17c97) was appended
+# verbatim to the parent's refresh.rs test module, EXCLUDING the compile-red
+# test staged_generation_retains_admission_owners (see pass B). No non-test
+# parent code was modified.
+#
+# Command (set -o pipefail; lane wrapper sets RCH_DISABLE=1, the repo's single
+# shared CARGO_TARGET_DIR, scratchpad TMPDIR, and cds into the archive dir):
+#   cargo test -p frankensearch-fusion --lib -- --exact \
+#     refresh::tests::classification_never_deletes_a_stale_wal_v1 \
+#     refresh::tests::classification_never_truncates_a_corrupt_wal_trailer_v1 \
+#     refresh::tests::mixed_v2_fast_v1_quality_classifies_without_mutating_either \
+#     refresh::tests::header_valid_content_corrupt_v2_refuses_admission_not_composite \
+#     refresh::tests::all_tombstoned_v1_fails_closed_as_retaining_content \
+#     refresh::tests::pre_drain_full_admission_leaves_canonical_directory_invariant \
+#     refresh::tests::bootstrap_over_empty_seed_with_stale_wal_does_not_resurrect_foreign_rows \
+#     --test-threads=4
+#
+# EXPECTED on the parent: 5 FAILED (the repair pins), 2 passed
+# (pre_drain_full_admission_leaves_canonical_directory_invariant — v2
+# inspection was already byte-invariant on the parent;
+# bootstrap_over_empty_seed_with_stale_wal_... — green on the parent via the
+# old delete-at-classification path). The WARN lines "discarding
+# stale/mismatched WAL entries and removing file" / "truncating corrupted WAL
+# trailer" emitted DURING CLASSIFICATION are the audited hazard firing live.
+# Final line EXIT_STATUS is from the pipefail-captured cargo exit.
+
+    Updating crates.io index
+    Updating git repository `https://github.com/Dicklesworthstone/hnswlib-rs`
+    Updating git repository `https://github.com/Dicklesworthstone/frankentorch`
+     Locking 631 packages to latest Rust 1.95 compatible versions
+      Adding compact_str v0.9.1 (available: v0.10.0)
+      Adding fastembed v5.17.2 (available: v5.17.4)
+      Adding ftui-backend v0.2.1 (available: v0.5.0)
+      Adding ftui-core v0.2.1 (available: v0.5.0)
+      Adding ftui-extras v0.2.1 (available: v0.5.0)
+      Adding ftui-layout v0.2.1 (available: v0.5.1)
+      Adding ftui-render v0.2.1 (available: v0.5.0)
+      Adding ftui-style v0.2.1 (available: v0.5.0)
+      Adding ftui-text v0.2.1 (available: v0.5.0)
+      Adding ftui-tty v0.2.1 (available: v0.5.0)
+      Adding ftui-widgets v0.2.1 (available: v0.5.0)
+      Adding generic-array v0.14.7 (available: v0.14.9)
+      Adding jsonschema v0.46.10 (available: v0.49.2)
+      Adding ort v2.0.0-rc.12 (available: v2.0.0-rc.13)
+      Adding ort-sys v2.0.0-rc.12 (available: v2.0.0-rc.13)
+      Adding pdf-extract v0.10.0 (available: v0.12.0)
+      Adding safetensors v0.7.0 (available: v0.8.0)
+      Adding sysinfo v0.38.4 (available: v0.39.6)
+   Compiling clap_builder v4.6.5
+   Compiling frankensearch-index v0.2.1 (/data/tmp/claude-1000/-data-projects-frankensearch/6ba18fed-10c5-4855-b287-a7067faf4133/scratchpad/parent-868c0801/crates/frankensearch-index)
+   Compiling frankensearch-embed v0.2.1 (/data/tmp/claude-1000/-data-projects-frankensearch/6ba18fed-10c5-4855-b287-a7067faf4133/scratchpad/parent-868c0801/crates/frankensearch-embed)
+   Compiling frankensearch-core v0.2.1 (/data/tmp/claude-1000/-data-projects-frankensearch/6ba18fed-10c5-4855-b287-a7067faf4133/scratchpad/parent-868c0801/crates/frankensearch-core)
+   Compiling clap v4.6.5
+   Compiling criterion v0.8.2
+warning: use of deprecated method `wide::i16x8::mul_widen`: renamed to `widening_mul`
+    --> crates/frankensearch-index/src/simd.rs:1268:28
+     |
+1268 |         acc0 += w8::<0>(s).mul_widen(w8::<0>(q));
+     |                            ^^^^^^^^^
+     |
+     = note: `#[warn(deprecated)]` on by default
+
+warning: use of deprecated method `wide::i16x8::mul_widen`: renamed to `widening_mul`
+    --> crates/frankensearch-index/src/simd.rs:1269:28
+     |
+1269 |         acc1 += w8::<8>(s).mul_widen(w8::<8>(q));
+     |                            ^^^^^^^^^
+
+warning: use of deprecated method `wide::i16x8::mul_widen`: renamed to `widening_mul`
+    --> crates/frankensearch-index/src/simd.rs:1270:29
+     |
+1270 |         acc2 += w8::<16>(s).mul_widen(w8::<16>(q));
+     |                             ^^^^^^^^^
+
+warning: use of deprecated method `wide::i16x8::mul_widen`: renamed to `widening_mul`
+    --> crates/frankensearch-index/src/simd.rs:1271:29
+     |
+1271 |         acc3 += w8::<24>(s).mul_widen(w8::<24>(q));
+     |                             ^^^^^^^^^
+
+warning: use of deprecated method `wide::i16x8::mul_widen`: renamed to `widening_mul`
+    --> crates/frankensearch-index/src/simd.rs:1279:46
+     |
+1279 |         sum += i16x8::from(s.map(i16::from)).mul_widen(i16x8::from(q.map(i16::from)));
+     |                                              ^^^^^^^^^
+
+warning: `frankensearch-index` (lib) generated 5 warnings
+   Compiling frankensearch-fusion v0.2.1 (/data/tmp/claude-1000/-data-projects-frankensearch/6ba18fed-10c5-4855-b287-a7067faf4133/scratchpad/parent-868c0801/crates/frankensearch-fusion)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 21.48s
+     Running unittests src/lib.rs (/data/projects/frankensearch/target/debug/deps/frankensearch_fusion-96d80a28be546b39)
+
+running 7 tests
+test refresh::tests::all_tombstoned_v1_fails_closed_as_retaining_content ... FAILED
+test refresh::tests::classification_never_truncates_a_corrupt_wal_trailer_v1 ... FAILED
+test refresh::tests::bootstrap_over_empty_seed_with_stale_wal_does_not_resurrect_foreign_rows ... ok
+test refresh::tests::header_valid_content_corrupt_v2_refuses_admission_not_composite ... FAILED
+test refresh::tests::classification_never_deletes_a_stale_wal_v1 ... FAILED
+test refresh::tests::pre_drain_full_admission_leaves_canonical_directory_invariant ... ok
+test refresh::tests::mixed_v2_fast_v1_quality_classifies_without_mutating_either ... FAILED
+
+failures:
+
+---- refresh::tests::all_tombstoned_v1_fails_closed_as_retaining_content stdout ----
+
+thread 'refresh::tests::all_tombstoned_v1_fails_closed_as_retaining_content' (2260969) panicked at crates/frankensearch-fusion/src/refresh.rs:3891:18:
+all-tombstoned v1 fails closed under read-only classification: 1
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- refresh::tests::classification_never_truncates_a_corrupt_wal_trailer_v1 stdout ----
+2026-07-31T22:51:33.507523Z  WARN ThreadId(05) frankensearch_index::wal: crates/frankensearch-index/src/wal.rs:917: WAL batch corrupt or truncated, discarding remainder path=/data/tmp/claude-1000/-data-projects-frankensearch/6ba18fed-10c5-4855-b287-a7067faf4133/scratchpad/tmp/frankensearch-refresh-test-r2-corrupt-trailer-control-2260968-1785538293507180497/control.idx.wal offset=553 entries_recovered=1
+2026-07-31T22:51:33.507577Z  WARN ThreadId(05) frankensearch_index: crates/frankensearch-index/src/lib.rs:1766: truncating corrupted WAL trailer path=/data/tmp/claude-1000/-data-projects-frankensearch/6ba18fed-10c5-4855-b287-a7067faf4133/scratchpad/tmp/frankensearch-refresh-test-r2-corrupt-trailer-control-2260968-1785538293507180497/control.idx.wal actual_len=585 valid_len=553
+2026-07-31T22:51:33.526188Z  WARN ThreadId(05) frankensearch_index::wal: crates/frankensearch-index/src/wal.rs:917: WAL batch corrupt or truncated, discarding remainder path=/data/tmp/claude-1000/-data-projects-frankensearch/6ba18fed-10c5-4855-b287-a7067faf4133/scratchpad/tmp/frankensearch-refresh-test-r2-corrupt-trailer-invariance-2260968-1785538293395249819/vector.fast.idx.wal offset=553 entries_recovered=1
+2026-07-31T22:51:33.526224Z  WARN ThreadId(05) frankensearch_index: crates/frankensearch-index/src/lib.rs:1766: truncating corrupted WAL trailer path=/data/tmp/claude-1000/-data-projects-frankensearch/6ba18fed-10c5-4855-b287-a7067faf4133/scratchpad/tmp/frankensearch-refresh-test-r2-corrupt-trailer-invariance-2260968-1785538293395249819/vector.fast.idx.wal actual_len=585 valid_len=553
+
+thread 'refresh::tests::classification_never_truncates_a_corrupt_wal_trailer_v1' (2260972) panicked at crates/frankensearch-fusion/src/refresh.rs:3664:13:
+assertion `left == right` failed: read-only classification must NEVER truncate a corrupt WAL trailer
+  left: [70, 87, 65, 76, 1, 0, 0, 1, 0, 0, 1, 2, 0, 0, 0, 0, 93, 217, 15, 66, 70, 87, 66, 49, 1, 0, 0, 0, 7, 0, 100, 111, 99, 45, 119, 97, 108, 86, 17, 100, 20, 28, 22, 213, 23, 199, 24, 163, 25, 128, 26, 92, 27, 28, 28, 138, 28, 248, 28, 103, 29, 213, 29, 67, 30, 177, 30, 31, 31, 142, 31, 252, 31, 53, 32, 108, 32, 163, 32, 218, 32, 17, 33, 72, 33, 127, 33, 183, 33, 238, 33, 37, 34, 92, 34, 147, 34, 202, 34, 1, 35, 56, 35, 111, 35, 166, 35, 221, 35, 10, 36, 38, 36, 65, 36, 93, 36, 120, 36, 148, 36, 176, 36, 203, 36, 231, 36, 2, 37, 30, 37, 57, 37, 85, 37, 112, 37, 140, 37, 167, 37, 195, 37, 222, 37, 250, 37, 22, 38, 49, 38, 77, 38, 104, 38, 132, 38, 159, 38, 187, 38, 214, 38, 242, 38, 13, 39, 41, 39, 69, 39, 96, 39, 124, 39, 151, 39, 179, 39, 206, 39, 234, 39, 3, 40, 16, 40, 30, 40, 44, 40, 58, 40, 72, 40, 85, 40, 99, 40, 113, 40, 127, 40, 140, 40, 154, 40, 168, 40, 182, 40, 195, 40, 209, 40, 223, 40, 237, 40, 251, 40, 8, 41, 22, 41, 36, 41, 50, 41, 63, 41, 77, 41, 91, 41, 105, 41, 119, 41, 132, 41, 146, 41, 160, 41, 174, 41, 187, 41, 201, 41, 215, 41, 229, 41, 242, 41, 0, 42, 14, 42, 28, 42, 42, 42, 55, 42, 69, 42, 83, 42, 97, 42, 110, 42, 124, 42, 138, 42, 152, 42, 165, 42, 179, 42, 193, 42, 207, 42, 221, 42, 234, 42, 248, 42, 6, 43, 20, 43, 33, 43, 47, 43, 61, 43, 75, 43, 89, 43, 102, 43, 116, 43, 130, 43, 144, 43, 157, 43, 171, 43, 185, 43, 199, 43, 212, 43, 226, 43, 240, 43, 254, 43, 6, 44, 13, 44, 20, 44, 26, 44, 33, 44, 40, 44, 47, 44, 54, 44, 61, 44, 68, 44, 75, 44, 82, 44, 88, 44, 95, 44, 102, 44, 109, 44, 116, 44, 123, 44, 130, 44, 137, 44, 143, 44, 150, 44, 157, 44, 164, 44, 171, 44, 178, 44, 185, 44, 192, 44, 199, 44, 205, 44, 212, 44, 219, 44, 226, 44, 233, 44, 240, 44, 247, 44, 254, 44, 5, 45, 11, 45, 18, 45, 25, 45, 32, 45, 39, 45, 46, 45, 53, 45, 60, 45, 67, 45, 73, 45, 80, 45, 87, 45, 94, 45, 101, 45, 108, 45, 115, 45, 122, 45, 128, 45, 135, 45, 142, 45, 149, 45, 156, 45, 163, 45, 170, 45, 177, 45, 184, 45, 190, 45, 197, 45, 204, 45, 211, 45, 218, 45, 225, 45, 232, 45, 239, 45, 246, 45, 252, 45, 3, 46, 10, 46, 17, 46, 24, 46, 31, 46, 38, 46, 45, 46, 52, 46, 58, 46, 65, 46, 72, 46, 79, 46, 86, 46, 93, 46, 100, 46, 107, 46, 113, 46, 120, 46, 127, 46, 134, 46, 141, 46, 148, 46, 155, 46, 162, 46, 169, 46, 175, 46, 182, 46, 189, 46, 196, 46, 203, 46, 210, 46, 217, 46, 224, 46, 231, 46, 124, 112, 6, 228]
+ right: [70, 87, 65, 76, 1, 0, 0, 1, 0, 0, 1, 2, 0, 0, 0, 0, 93, 217, 15, 66, 70, 87, 66, 49, 1, 0, 0, 0, 7, 0, 100, 111, 99, 45, 119, 97, 108, 86, 17, 100, 20, 28, 22, 213, 23, 199, 24, 163, 25, 128, 26, 92, 27, 28, 28, 138, 28, 248, 28, 103, 29, 213, 29, 67, 30, 177, 30, 31, 31, 142, 31, 252, 31, 53, 32, 108, 32, 163, 32, 218, 32, 17, 33, 72, 33, 127, 33, 183, 33, 238, 33, 37, 34, 92, 34, 147, 34, 202, 34, 1, 35, 56, 35, 111, 35, 166, 35, 221, 35, 10, 36, 38, 36, 65, 36, 93, 36, 120, 36, 148, 36, 176, 36, 203, 36, 231, 36, 2, 37, 30, 37, 57, 37, 85, 37, 112, 37, 140, 37, 167, 37, 195, 37, 222, 37, 250, 37, 22, 38, 49, 38, 77, 38, 104, 38, 132, 38, 159, 38, 187, 38, 214, 38, 242, 38, 13, 39, 41, 39, 69, 39, 96, 39, 124, 39, 151, 39, 179, 39, 206, 39, 234, 39, 3, 40, 16, 40, 30, 40, 44, 40, 58, 40, 72, 40, 85, 40, 99, 40, 113, 40, 127, 40, 140, 40, 154, 40, 168, 40, 182, 40, 195, 40, 209, 40, 223, 40, 237, 40, 251, 40, 8, 41, 22, 41, 36, 41, 50, 41, 63, 41, 77, 41, 91, 41, 105, 41, 119, 41, 132, 41, 146, 41, 160, 41, 174, 41, 187, 41, 201, 41, 215, 41, 229, 41, 242, 41, 0, 42, 14, 42, 28, 42, 42, 42, 55, 42, 69, 42, 83, 42, 97, 42, 110, 42, 124, 42, 138, 42, 152, 42, 165, 42, 179, 42, 193, 42, 207, 42, 221, 42, 234, 42, 248, 42, 6, 43, 20, 43, 33, 43, 47, 43, 61, 43, 75, 43, 89, 43, 102, 43, 116, 43, 130, 43, 144, 43, 157, 43, 171, 43, 185, 43, 199, 43, 212, 43, 226, 43, 240, 43, 254, 43, 6, 44, 13, 44, 20, 44, 26, 44, 33, 44, 40, 44, 47, 44, 54, 44, 61, 44, 68, 44, 75, 44, 82, 44, 88, 44, 95, 44, 102, 44, 109, 44, 116, 44, 123, 44, 130, 44, 137, 44, 143, 44, 150, 44, 157, 44, 164, 44, 171, 44, 178, 44, 185, 44, 192, 44, 199, 44, 205, 44, 212, 44, 219, 44, 226, 44, 233, 44, 240, 44, 247, 44, 254, 44, 5, 45, 11, 45, 18, 45, 25, 45, 32, 45, 39, 45, 46, 45, 53, 45, 60, 45, 67, 45, 73, 45, 80, 45, 87, 45, 94, 45, 101, 45, 108, 45, 115, 45, 122, 45, 128, 45, 135, 45, 142, 45, 149, 45, 156, 45, 163, 45, 170, 45, 177, 45, 184, 45, 190, 45, 197, 45, 204, 45, 211, 45, 218, 45, 225, 45, 232, 45, 239, 45, 246, 45, 252, 45, 3, 46, 10, 46, 17, 46, 24, 46, 31, 46, 38, 46, 45, 46, 52, 46, 58, 46, 65, 46, 72, 46, 79, 46, 86, 46, 93, 46, 100, 46, 107, 46, 113, 46, 120, 46, 127, 46, 134, 46, 141, 46, 148, 46, 155, 46, 162, 46, 169, 46, 175, 46, 182, 46, 189, 46, 196, 46, 203, 46, 210, 46, 217, 46, 224, 46, 231, 46, 124, 112, 6, 228, 171, 171, 171, 171, 171, 171, 171, 171, 171, 171, 171, 171, 171, 171, 171, 171, 171, 171, 171, 171, 171, 171, 171, 171, 171, 171, 171, 171, 171, 171, 171, 171]
+
+---- refresh::tests::header_valid_content_corrupt_v2_refuses_admission_not_composite stdout ----
+
+thread 'refresh::tests::header_valid_content_corrupt_v2_refuses_admission_not_composite' (2260977) panicked at crates/frankensearch-fusion/src/refresh.rs:3792:13:
+the refusal must be the admission's own typed corruption error, got InvalidConfig { field: "refresh.canonical_publication", value: "composite-generation-authority-unavailable", reason: "the identity-bound v2 replacement for /data/tmp/claude-1000/-data-projects-frankensearch/6ba18fed-10c5-4855-b287-a7067faf4133/scratchpad/tmp/frankensearch-refresh-test-r2-content-corrupt-v2-2260968-1785538293527424824 is admissible (and can be staged and proven via stage_identity_bound_generation), but canonical installation of a split fast/quality generation pair is refused until the composite generation-authority primitive lands (bd-xomn.1/.3); no per-tier rename sequence can make the pair atomic" }
+
+---- refresh::tests::classification_never_deletes_a_stale_wal_v1 stdout ----
+2026-07-31T22:51:33.575354Z  WARN ThreadId(04) frankensearch_index: crates/frankensearch-index/src/lib.rs:1753: discarding stale/mismatched WAL entries and removing file path=/data/tmp/claude-1000/-data-projects-frankensearch/6ba18fed-10c5-4855-b287-a7067faf4133/scratchpad/tmp/frankensearch-refresh-test-r2-stale-wal-donor-2260968-1785538293468829267/donor.idx main_gen=2 wal_gen=2
+2026-07-31T22:51:33.603083Z  WARN ThreadId(04) frankensearch_index: crates/frankensearch-index/src/lib.rs:1753: discarding stale/mismatched WAL entries and removing file path=/data/tmp/claude-1000/-data-projects-frankensearch/6ba18fed-10c5-4855-b287-a7067faf4133/scratchpad/tmp/frankensearch-refresh-test-r2-stale-wal-control-2260968-1785538293602829394/control.idx main_gen=1 wal_gen=3
+2026-07-31T22:51:33.603306Z  WARN ThreadId(04) frankensearch_index: crates/frankensearch-index/src/lib.rs:1753: discarding stale/mismatched WAL entries and removing file path=/data/tmp/claude-1000/-data-projects-frankensearch/6ba18fed-10c5-4855-b287-a7067faf4133/scratchpad/tmp/frankensearch-refresh-test-r2-stale-wal-invariance-2260968-1785538293394475781/vector.fast.idx main_gen=1 wal_gen=3
+
+thread 'refresh::tests::classification_never_deletes_a_stale_wal_v1' (2260971) panicked at crates/frankensearch-fusion/src/refresh.rs:3579:13:
+read-only classification must NEVER delete a stale WAL sidecar
+
+---- refresh::tests::mixed_v2_fast_v1_quality_classifies_without_mutating_either stdout ----
+2026-07-31T22:51:33.716831Z  WARN ThreadId(12) frankensearch_index: crates/frankensearch-index/src/lib.rs:1753: discarding stale/mismatched WAL entries and removing file path=/data/tmp/claude-1000/-data-projects-frankensearch/6ba18fed-10c5-4855-b287-a7067faf4133/scratchpad/tmp/frankensearch-refresh-test-r2-mixed-wal-donor-2260968-1785538293654305859/donor.idx main_gen=2 wal_gen=2
+2026-07-31T22:51:33.726444Z  WARN ThreadId(12) frankensearch_index: crates/frankensearch-index/src/lib.rs:1753: discarding stale/mismatched WAL entries and removing file path=/data/tmp/claude-1000/-data-projects-frankensearch/6ba18fed-10c5-4855-b287-a7067faf4133/scratchpad/tmp/frankensearch-refresh-test-r2-mixed-wal-control-2260968-1785538293726215119/control.idx main_gen=1 wal_gen=3
+2026-07-31T22:51:33.726776Z  WARN ThreadId(12) frankensearch_index: crates/frankensearch-index/src/lib.rs:1753: discarding stale/mismatched WAL entries and removing file path=/data/tmp/claude-1000/-data-projects-frankensearch/6ba18fed-10c5-4855-b287-a7067faf4133/scratchpad/tmp/frankensearch-refresh-test-r2-mixed-generation-2260968-1785538293547759493/vector.quality.idx main_gen=1 wal_gen=3
+
+thread 'refresh::tests::mixed_v2_fast_v1_quality_classifies_without_mutating_either' (2260980) panicked at crates/frankensearch-fusion/src/refresh.rs:3737:13:
+classification must not delete the v1 quality tier's stale WAL
+
+
+failures:
+    refresh::tests::all_tombstoned_v1_fails_closed_as_retaining_content
+    refresh::tests::classification_never_deletes_a_stale_wal_v1
+    refresh::tests::classification_never_truncates_a_corrupt_wal_trailer_v1
+    refresh::tests::header_valid_content_corrupt_v2_refuses_admission_not_composite
+    refresh::tests::mixed_v2_fast_v1_quality_classifies_without_mutating_either
+
+test result: FAILED. 2 passed; 5 failed; 0 ignored; 0 measured; 933 filtered out; finished in 0.33s
+
+error: test failed, to rerun pass `-p frankensearch-fusion --lib`
