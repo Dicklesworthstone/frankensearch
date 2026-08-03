@@ -5515,7 +5515,7 @@ mod tests {
             "fixture must cross a posting-block boundary"
         );
         let checkpoint = Arc::new(CountingCheckpoint::default());
-        let checkpoint_for_cursor: Arc<dyn QueryWorkCheckpoint> = Arc::clone(&checkpoint);
+        let checkpoint_for_cursor: Arc<dyn QueryWorkCheckpoint> = checkpoint.clone();
         let segment_num_docs = u32::try_from(postings.len())?;
         let sealed = SealedPostingCursor::new(&list, segment_num_docs)?;
         let mut cursor = CheckpointPostingCursor::new(sealed, checkpoint_for_cursor)?;
