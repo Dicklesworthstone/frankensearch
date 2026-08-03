@@ -3109,6 +3109,32 @@ mod tests {
         }
     }
 
+    /// Pin the versioned query-normalization seed mapping used in replay
+    /// artifacts. The campaign already proves each transformed query is
+    /// equivalent, but a remapped seed would otherwise reproduce a different
+    /// transform under the same historical identity.
+    #[cfg(feature = "perf-harness")]
+    #[test]
+    fn e63_ascii_query_normalization_seed_schedule_v1_is_exact_and_periodic() {
+        assert_eq!(
+            e63_seeded_ascii_query_normalization("alpha", 0),
+            " \talpha\n"
+        );
+        assert_eq!(e63_seeded_ascii_query_normalization("alpha", 1), "ALPHA");
+        assert_eq!(
+            e63_seeded_ascii_query_normalization("alpha", 2),
+            "\tALPHA  "
+        );
+        assert_eq!(
+            e63_seeded_ascii_query_normalization("alpha", 3),
+            " \talpha\n"
+        );
+        assert_eq!(
+            e63_seeded_ascii_query_normalization("alpha", u64::MAX),
+            " \talpha\n"
+        );
+    }
+
     #[cfg(feature = "perf-harness")]
     fn e63_seeded_flush_batch_size(seed: u64) -> usize {
         match seed % 3 {
