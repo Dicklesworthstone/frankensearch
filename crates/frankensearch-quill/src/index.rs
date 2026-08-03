@@ -14855,6 +14855,49 @@ mod tests {
         });
     }
 
+    #[cfg(feature = "profile-internals")]
+    #[test]
+    fn profiled_exact_term_counter_algebra_tracks_two_sealed_segments() {
+        run_with_cx(|cx| async move {
+            let directory = tempfile::tempdir().expect("two-segment profile directory");
+            let writer = QuillIndex::create(&cx, directory.path(), deterministic_config())
+                .await
+                .expect("create two-segment profile writer");
+            for document in [
+                IndexableDocument::new("first", "profiled alpha first"),
+                IndexableDocument::new("second", "profiled alpha second"),
+            ] {
+                LexicalSearch::index_document(&writer, &cx, &document)
+                    .await
+                    .expect("stage two-segment profile document");
+                LexicalSearch::commit(&writer, &cx)
+                    .await
+                    .expect("publish one sealed profile segment");
+            }
+            let reader = QuillSearchIndex::open(&cx, directory.path(), deterministic_config())
+                .await
+                .expect("open two-segment profile reader");
+            let outcome = reader
+                .search_paginated_with_profile(&cx, "alpha", 10, 0, false)
+                .expect("execute two-segment profiled search");
+            let (result, receipt) = match outcome {
+                QuillProfiledSearchOutcome::Completed { result, receipt } => (result, receipt),
+                QuillProfiledSearchOutcome::Failed { error, .. } => {
+                    panic!("two-segment profiled search unexpectedly failed: {error}")
+                }
+            };
+            assert_eq!(result.hits.len(), 2);
+            assert_eq!(receipt.segment_counts(), (2, 0));
+            assert_eq!(receipt.cache(), QuillProfileCacheDisposition::Miss);
+            assert_eq!(receipt.execution(), Some(QuillProfileExecutionMode::Serial));
+            assert_eq!(receipt.counters().0, 2);
+            assert_eq!(receipt.counters().1, 4);
+            assert_eq!(receipt.counters().2, 6);
+            assert_eq!(receipt.counters().3, 2);
+            assert!(receipt.counters().4 > 0);
+        });
+    }
+
     #[test]
     fn read_only_search_handle_coexists_with_writer_and_pins_publication() {
         run_with_cx(|cx| async move {
