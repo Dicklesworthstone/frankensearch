@@ -544,4 +544,62 @@ mod tests {
             Err(GenerationRootAdmissionErrorV1::UnsafeFileType)
         ));
     }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn descriptor_descent_keeps_normal_children_and_rejects_symlink_ancestors() {
+        use std::fs::{self, File};
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().expect("temporary trusted root");
+        fs::create_dir(directory.path().join("generations")).expect("create child directory");
+        let root = GenerationRootCapabilityV1::from_trusted_directory(
+            File::open(directory.path()).expect("open trusted root descriptor"),
+        )
+        .expect("admit directory descriptor");
+        let normal = GenerationRootRouteV1::parse(Path::new("generations"))
+            .expect("normal descendant route");
+        root.descend(&normal)
+            .expect("descriptor-relative normal descent");
+
+        symlink("generations", directory.path().join("redirect"))
+            .expect("create ancestor symlink fixture");
+        let redirected = GenerationRootRouteV1::parse(Path::new("redirect"))
+            .expect("syntactically normal route");
+        assert!(matches!(
+            root.descend(&redirected),
+            Err(GenerationRootAdmissionErrorV1::NotDirectory)
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn descriptor_open_refuses_hardlinked_final_file() {
+        use std::fs::{self, File};
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+
+        let directory = tempfile::tempdir().expect("temporary trusted root");
+        let source = directory.path().join("source");
+        let authority = directory.path().join("AUTHORITY");
+        fs::write(&source, b"linked authority").expect("write source fixture");
+        fs::set_permissions(&source, fs::Permissions::from_mode(0o600))
+            .expect("restrict source fixture mode");
+        fs::hard_link(&source, &authority).expect("create hardlink fixture");
+        let metadata = fs::metadata(&authority).expect("authority hardlink metadata");
+        let root = GenerationRootCapabilityV1::from_trusted_directory(
+            File::open(directory.path()).expect("open trusted root descriptor"),
+        )
+        .expect("admit directory descriptor");
+        assert!(matches!(
+            root.read_regular_file(
+                OsStr::new("AUTHORITY"),
+                GenerationRootFilePolicyV1 {
+                    expected_uid: metadata.uid(),
+                    expected_mode: 0o600,
+                    max_bytes: 4_096,
+                },
+            ),
+            Err(GenerationRootAdmissionErrorV1::UnsafeFileType)
+        ));
+    }
 }
