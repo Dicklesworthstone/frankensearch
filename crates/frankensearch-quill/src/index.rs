@@ -15173,7 +15173,8 @@ mod tests {
                     panic!("fragmented profiled search unexpectedly failed: {error}")
                 }
             };
-            let expected_segments = SEGMENT_COUNT_FANOUT_THRESHOLD as u64;
+            let expected_segments = u64::try_from(SEGMENT_COUNT_FANOUT_THRESHOLD)
+                .expect("fan-out threshold fits the profile receipt");
             assert_eq!(result.hits.len(), SEGMENT_COUNT_FANOUT_THRESHOLD);
             assert_eq!(receipt.segment_counts(), (expected_segments, 0));
             assert_eq!(receipt.cache(), QuillProfileCacheDisposition::Miss);
