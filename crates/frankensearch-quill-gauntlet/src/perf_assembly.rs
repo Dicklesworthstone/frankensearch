@@ -2517,23 +2517,32 @@ fn derive_assembly(
                 reason: reason.clone(),
             });
         }
-        for reason in [
-            EvidenceReason::new(
-                PERF_ASSEMBLY_ENGINE_LIFECYCLE_NO_CLAIM_CODE,
-                "H2 v5 proves the outer direct child only; engine actual-work, queue, worker-join, feed-drain, and pending-zero observations are unavailable",
-                EvidenceSeverity::NoClaim,
-            ),
-            EvidenceReason::new(
-                PERF_ASSEMBLY_PROCESS_TREE_NO_CLAIM_CODE,
-                "H2 v5 does not prove descendant/process-group quiescence or inherited-handle closure",
-                EvidenceSeverity::NoClaim,
-            ),
-        ] {
+        let reason = EvidenceReason::new(
+            PERF_ASSEMBLY_ENGINE_LIFECYCLE_NO_CLAIM_CODE,
+            "H2 v5 proves the outer direct child only; engine actual-work, queue, worker-join, feed-drain, and pending-zero observations are unavailable",
+            EvidenceSeverity::NoClaim,
+        );
+        non_adjudicable_sources.push(PerfEvidenceAssemblyNoClaimSource {
+            evidence_artifact_sha256: source.bound_evidence_file_sha256.clone(),
+            run_id: source.run_id.clone(),
+            cell_ids: source.cell_ids.clone(),
+            reason,
+        });
+        if !source
+            .process
+            .receipt
+            .process_lifecycle()
+            .descendant_process_tree_quiescence_is_proven()
+        {
             non_adjudicable_sources.push(PerfEvidenceAssemblyNoClaimSource {
                 evidence_artifact_sha256: source.bound_evidence_file_sha256.clone(),
                 run_id: source.run_id.clone(),
                 cell_ids: source.cell_ids.clone(),
-                reason,
+                reason: EvidenceReason::new(
+                    PERF_ASSEMBLY_PROCESS_TREE_NO_CLAIM_CODE,
+                    "H2 v5 proves only a direct child; descendant/process-group quiescence and inherited-handle closure remain unproven",
+                    EvidenceSeverity::NoClaim,
+                ),
             });
         }
         if !run_ids.insert(source.run_id.as_str()) {

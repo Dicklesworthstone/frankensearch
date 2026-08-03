@@ -480,6 +480,12 @@ impl LocalPerfProcessLifecycle {
     pub const fn process_tree_quiescence(self) -> LocalPerfProcessTreeQuiescence {
         LocalPerfProcessTreeQuiescence::DirectChildOnly
     }
+
+    /// Whether this receipt proves every descendant reached a terminal state.
+    #[must_use]
+    pub const fn descendant_process_tree_quiescence_is_proven(self) -> bool {
+        false
+    }
 }
 
 /// Why an engine-internal fact is absent from an outer runner attempt.
