@@ -50,7 +50,7 @@ use crate::{PerfCellApplicability, PerfCellApplicabilityReason};
 const PRODUCER_CONTRACT_SCHEMA_VERSION: &str =
     "frankensearch.quill-local-perf-producer-contract.v1";
 /// Strict wire schema for one local-run process-attempt receipt.
-pub const LOCAL_PERF_ATTEMPT_RECEIPT_SCHEMA_VERSION: &str = "frankensearch.perf-runner-attempt.v6";
+pub const LOCAL_PERF_ATTEMPT_RECEIPT_SCHEMA_VERSION: &str = "frankensearch.perf-runner-attempt.v7";
 /// Strict schema for the diagnostic inventory retained before runner completion.
 pub const PERF_RUN_PRECOMMIT_SCHEMA_VERSION: &str = "frankensearch.perf-run-precommit.v5";
 const MAX_IDENTITY_COMPONENT_BYTES: usize = 96;
@@ -441,16 +441,21 @@ pub enum LocalPerfProcessTreeQuiescence {
 ///
 /// A PID on its own is never authority to signal a later process: Linux can
 /// reuse it after the original child exits. The only verified form therefore
-/// binds that PID to the kernel's `/proc/<pid>/stat` start-time tick captured
-/// immediately after spawn. Other platforms and failed captures are retained
-/// as an explicit absence, which rejects completed receipt publication.
+/// binds that PID to both a dedicated child-led process group and the kernel's
+/// `/proc/<pid>/stat` start-time tick captured immediately after spawn. Other
+/// platforms and failed captures are retained as an explicit absence, which
+/// rejects completed receipt publication.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "kind")]
 pub enum LocalPerfRootProcessIdentity {
     /// `Command::spawn` did not return a child PID.
     NotSpawned,
-    /// Linux PID plus its kernel-reported process birth tick.
-    LinuxProcStartTime { pid: u32, start_time_ticks: u64 },
+    /// Linux PID, dedicated process group, and kernel-reported birth tick.
+    LinuxProcStartTime {
+        pid: u32,
+        process_group_id: u32,
+        start_time_ticks: u64,
+    },
     /// A child was spawned, but no birth identity was safely captured.
     Unverifiable { pid: u32 },
 }
@@ -3374,7 +3379,7 @@ fn verify_benchmark_path(
 }
 
 fn configure_benchmark_child(child: &mut Command, environment: &BTreeMap<OsString, OsString>) {
-    child.env_clear().envs(environment);
+    child.env_clear().envs(environment).process_group(0);
 }
 
 fn capture_platform(config: &LocalPerfRunConfig) -> Result<PlatformCapture, LocalPerfRunError> {
@@ -4731,21 +4736,19 @@ fn validate_root_process_identity(
     lifecycle: LocalPerfProcessLifecycle,
     root_process_identity: LocalPerfRootProcessIdentity,
 ) -> Result<(), LocalPerfRunError> {
-    let identity_matches_spawn = matches!(
-        (lifecycle.spawn_succeeded, root_process_identity),
-        (false, LocalPerfRootProcessIdentity::NotSpawned)
-            | (
-                true,
-                LocalPerfRootProcessIdentity::LinuxProcStartTime {
-                    pid: 1..,
-                    start_time_ticks: 1..
-                }
-            )
-            | (
-                true,
-                LocalPerfRootProcessIdentity::Unverifiable { pid: 1.. }
-            )
-    );
+    let identity_matches_spawn = match (lifecycle.spawn_succeeded, root_process_identity) {
+        (false, LocalPerfRootProcessIdentity::NotSpawned) => true,
+        (
+            true,
+            LocalPerfRootProcessIdentity::LinuxProcStartTime {
+                pid,
+                process_group_id,
+                start_time_ticks,
+            },
+        ) => pid > 0 && process_group_id == pid && start_time_ticks > 0,
+        (true, LocalPerfRootProcessIdentity::Unverifiable { pid }) => pid > 0,
+        _ => false,
+    };
     if !identity_matches_spawn
         || (outcome == LocalPerfAttemptOutcome::Completed
             && !root_process_identity.has_verified_birth_identity())
@@ -4764,13 +4767,14 @@ fn capture_root_process_identity(child: &Child) -> LocalPerfRootProcessIdentity 
     let stat_path = format!("/proc/{pid}/stat");
     let identity = fs::read_to_string(stat_path)
         .ok()
-        .and_then(|stat| parse_linux_proc_start_time(&stat))
-        .map(
-            |start_time_ticks| LocalPerfRootProcessIdentity::LinuxProcStartTime {
+        .and_then(|stat| parse_linux_proc_process_identity(&stat))
+        .and_then(|(process_group_id, start_time_ticks)| {
+            (process_group_id == pid).then_some(LocalPerfRootProcessIdentity::LinuxProcStartTime {
                 pid,
+                process_group_id,
                 start_time_ticks,
-            },
-        );
+            })
+        });
     identity.unwrap_or(LocalPerfRootProcessIdentity::Unverifiable { pid })
 }
 
@@ -4780,16 +4784,24 @@ fn capture_root_process_identity(child: &Child) -> LocalPerfRootProcessIdentity 
 }
 
 #[cfg(target_os = "linux")]
-fn parse_linux_proc_start_time(stat: &str) -> Option<u64> {
+fn parse_linux_proc_process_identity(stat: &str) -> Option<(u32, u64)> {
     // `/proc/<pid>/stat`'s second field is parenthesized and may itself carry
     // spaces or parentheses. Split from its final close-paren so field 22
     // (the start-time tick) stays positional even for adversarial comm values.
     let (_, suffix) = stat.rsplit_once(')')?;
-    suffix
-        .split_ascii_whitespace()
-        .nth(19)
+    let mut fields = suffix.split_ascii_whitespace();
+    let _state = fields.next()?;
+    let _parent_pid = fields.next()?;
+    let process_group_id = fields
+        .next()?
+        .parse::<u32>()
+        .ok()
+        .filter(|process_group_id| *process_group_id > 0)?;
+    let start_time_ticks = fields
+        .nth(16)
         .and_then(|start_time_ticks| start_time_ticks.parse::<u64>().ok())
-        .filter(|start_time_ticks| *start_time_ticks > 0)
+        .filter(|start_time_ticks| *start_time_ticks > 0)?;
+    Some((process_group_id, start_time_ticks))
 }
 
 fn validate_attempt_build(build: &RunnerBuild) -> Result<(), LocalPerfRunError> {
@@ -4963,6 +4975,7 @@ pub fn completed_attempt_receipt_for_test(
         },
         root_process_identity: LocalPerfRootProcessIdentity::LinuxProcStartTime {
             pid: 37,
+            process_group_id: 37,
             start_time_ticks: 81,
         },
         internal_lifecycle_gaps: LocalPerfInternalLifecycleGaps {
@@ -5196,6 +5209,7 @@ mod tests {
         let root_process_identity = if process_lifecycle.spawn_succeeded {
             LocalPerfRootProcessIdentity::LinuxProcStartTime {
                 pid: 37,
+                process_group_id: 37,
                 start_time_ticks: 81,
             }
         } else {
@@ -6642,9 +6656,12 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn linux_root_birth_identity_uses_the_final_proc_comm_delimiter() {
-        let stat = "37 (benchmark) worker)) R 1 1 1 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 81";
-        assert_eq!(parse_linux_proc_start_time(stat), Some(81));
-        assert_eq!(parse_linux_proc_start_time("37 (benchmark) R 1 2"), None);
+        let stat = "37 (benchmark) worker)) R 1 37 1 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 81";
+        assert_eq!(parse_linux_proc_process_identity(stat), Some((37, 81)));
+        assert_eq!(
+            parse_linux_proc_process_identity("37 (benchmark) R 1 2"),
+            None
+        );
     }
 
     #[test]
@@ -6666,12 +6683,49 @@ mod tests {
         assert!(captured < waited);
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn configured_benchmark_child_leads_a_dedicated_process_group() {
+        let mut command = Command::new("/bin/sh");
+        command
+            .args(["-c", "exec sleep 60"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        configure_benchmark_child(&mut command, &BTreeMap::new());
+        let mut child = command
+            .spawn()
+            .expect("spawn dedicated process-group child");
+        assert!(matches!(
+            capture_root_process_identity(&child),
+            LocalPerfRootProcessIdentity::LinuxProcStartTime {
+                pid,
+                process_group_id,
+                ..
+            } if pid == child.id() && process_group_id == pid
+        ));
+        force_kill_and_reap(&mut child).expect("reap dedicated process-group child");
+    }
+
     #[test]
     fn completed_receipt_rejects_an_unverifiable_root_pid() {
         let (receipt, _, _) = attempt_fixture(LocalPerfAttemptOutcome::Completed, Some(b"bound"));
         let mut receipt = receipt;
         receipt.root_process_identity = LocalPerfRootProcessIdentity::Unverifiable { pid: 37 };
         let bytes = seal_attempt_receipt(receipt).expect("reseal root-identity mutation");
+        assert!(LocalPerfAttemptReceipt::from_verified_slice(&bytes).is_err());
+    }
+
+    #[test]
+    fn completed_receipt_rejects_a_non_dedicated_root_process_group() {
+        let (receipt, _, _) = attempt_fixture(LocalPerfAttemptOutcome::Completed, Some(b"bound"));
+        let mut receipt = receipt;
+        receipt.root_process_identity = LocalPerfRootProcessIdentity::LinuxProcStartTime {
+            pid: 37,
+            process_group_id: 36,
+            start_time_ticks: 81,
+        };
+        let bytes = seal_attempt_receipt(receipt).expect("reseal process-group mutation");
         assert!(LocalPerfAttemptReceipt::from_verified_slice(&bytes).is_err());
     }
 
