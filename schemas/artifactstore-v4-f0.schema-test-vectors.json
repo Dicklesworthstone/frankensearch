@@ -1,0 +1,218 @@
+{
+  "schema": "artifactstore-v4-f0.schema.json",
+  "cases": [
+    {
+      "name": "verified_admitted_complete_pass_can_be_qualified",
+      "expect_valid": true,
+      "instance": {
+        "schema_version": 4,
+        "object_kind": "completion",
+        "identity_scheme": "sha256-domain-separated-v1",
+        "object_identity": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        "predecessor_identity": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+        "authentication": "verified_receipt_chain",
+        "admission": "admitted",
+        "decision": "pass",
+        "release": "qualified",
+        "coverage": "complete",
+        "privacy": "public",
+        "redaction_witness": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+        "issued_at_unix_ns": 1,
+        "terminal_outcome": "succeeded",
+        "signature": {
+          "algorithm": "ed25519",
+          "key_id": "supervisor-2026-08",
+          "signature": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        },
+        "artifact_index_digest": "sha256:4444444444444444444444444444444444444444444444444444444444444444",
+        "failure_artifact_index_digest": "sha256:5555555555555555555555555555555555555555555555555555555555555555"
+      }
+    },
+    {
+      "name": "verified_admitted_complete_miss_remains_authentic",
+      "expect_valid": true,
+      "instance": {
+        "schema_version": 4,
+        "object_kind": "completion",
+        "identity_scheme": "sha256-domain-separated-v1",
+        "object_identity": "sha256:6666666666666666666666666666666666666666666666666666666666666666",
+        "predecessor_identity": "sha256:7777777777777777777777777777777777777777777777777777777777777777",
+        "authentication": "verified_receipt_chain",
+        "admission": "admitted",
+        "decision": "miss",
+        "release": "not_qualified",
+        "coverage": "complete",
+        "privacy": "restricted",
+        "redaction_witness": "sha256:8888888888888888888888888888888888888888888888888888888888888888",
+        "issued_at_unix_ns": 2,
+        "terminal_outcome": "failed",
+        "signature": {
+          "algorithm": "ed25519",
+          "key_id": "supervisor-2026-08",
+          "signature": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        },
+        "artifact_index_digest": "sha256:9999999999999999999999999999999999999999999999999999999999999999",
+        "failure_artifact_index_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      }
+    },
+    {
+      "name": "rejects_authentic_but_unadmitted_pass",
+      "expect_valid": false,
+      "instance": {
+        "schema_version": 4,
+        "object_kind": "completion",
+        "identity_scheme": "sha256-domain-separated-v1",
+        "object_identity": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        "predecessor_identity": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+        "authentication": "verified_receipt_chain",
+        "admission": "unadmitted",
+        "decision": "pass",
+        "release": "not_qualified",
+        "coverage": "complete",
+        "privacy": "public",
+        "redaction_witness": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+        "issued_at_unix_ns": 3,
+        "terminal_outcome": "succeeded",
+        "signature": {"algorithm": "ed25519", "key_id": "reviewer-1", "signature": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"},
+        "artifact_index_digest": "sha256:4444444444444444444444444444444444444444444444444444444444444444",
+        "failure_artifact_index_digest": "sha256:5555555555555555555555555555555555555555555555555555555555555555"
+      }
+    },
+    {
+      "name": "rejects_admitted_but_incomplete_coverage",
+      "expect_valid": false,
+      "instance": {
+        "schema_version": 4,
+        "object_kind": "completion",
+        "identity_scheme": "sha256-domain-separated-v1",
+        "object_identity": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        "predecessor_identity": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+        "authentication": "verified_receipt_chain",
+        "admission": "admitted",
+        "decision": "pass",
+        "release": "not_qualified",
+        "coverage": "incomplete",
+        "privacy": "public",
+        "redaction_witness": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+        "issued_at_unix_ns": 4,
+        "terminal_outcome": "succeeded",
+        "signature": {"algorithm": "ed25519", "key_id": "reviewer-1", "signature": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"},
+        "artifact_index_digest": "sha256:4444444444444444444444444444444444444444444444444444444444444444",
+        "failure_artifact_index_digest": "sha256:5555555555555555555555555555555555555555555555555555555555555555"
+      }
+    },
+    {
+      "name": "rejects_hash_only_as_authenticated",
+      "expect_valid": false,
+      "instance": {
+        "schema_version": 4,
+        "object_kind": "completion",
+        "identity_scheme": "sha256-domain-separated-v1",
+        "object_identity": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        "predecessor_identity": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+        "authentication": "verified_receipt_chain",
+        "admission": "admitted",
+        "decision": "pass",
+        "release": "qualified",
+        "coverage": "complete",
+        "privacy": "public",
+        "redaction_witness": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+        "issued_at_unix_ns": 5,
+        "terminal_outcome": "succeeded",
+        "signature": {"algorithm": "sha256", "key_id": "hash-only", "signature": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"},
+        "artifact_index_digest": "sha256:4444444444444444444444444444444444444444444444444444444444444444",
+        "failure_artifact_index_digest": "sha256:5555555555555555555555555555555555555555555555555555555555555555"
+      }
+    },
+    {
+      "name": "rejects_legacy_as_promotable",
+      "expect_valid": false,
+      "instance": {
+        "schema_version": 4,
+        "object_kind": "completion",
+        "identity_scheme": "sha256-domain-separated-v1",
+        "object_identity": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        "predecessor_identity": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+        "authentication": "unauthenticated_legacy",
+        "admission": "admitted",
+        "decision": "pass",
+        "release": "qualified",
+        "coverage": "complete",
+        "privacy": "public",
+        "redaction_witness": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+        "issued_at_unix_ns": 6,
+        "terminal_outcome": "succeeded",
+        "artifact_index_digest": "sha256:4444444444444444444444444444444444444444444444444444444444444444",
+        "failure_artifact_index_digest": "sha256:5555555555555555555555555555555555555555555555555555555555555555"
+      }
+    },
+    {
+      "name": "rejects_success_as_automatic_pass_without_authenticated_chain",
+      "expect_valid": false,
+      "instance": {
+        "schema_version": 4,
+        "object_kind": "completion",
+        "identity_scheme": "sha256-domain-separated-v1",
+        "object_identity": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        "predecessor_identity": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+        "authentication": "integrity_only",
+        "admission": "unadmitted",
+        "decision": "pass",
+        "release": "not_qualified",
+        "coverage": "complete",
+        "privacy": "public",
+        "redaction_witness": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+        "issued_at_unix_ns": 7,
+        "terminal_outcome": "succeeded",
+        "artifact_index_digest": "sha256:4444444444444444444444444444444444444444444444444444444444444444",
+        "failure_artifact_index_digest": "sha256:5555555555555555555555555555555555555555555555555555555555555555"
+      }
+    },
+    {
+      "name": "rejects_miss_as_unauthentic",
+      "expect_valid": false,
+      "instance": {
+        "schema_version": 4,
+        "object_kind": "completion",
+        "identity_scheme": "sha256-domain-separated-v1",
+        "object_identity": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        "predecessor_identity": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+        "authentication": "integrity_only",
+        "admission": "unadmitted",
+        "decision": "miss",
+        "release": "not_qualified",
+        "coverage": "complete",
+        "privacy": "public",
+        "redaction_witness": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+        "issued_at_unix_ns": 8,
+        "terminal_outcome": "failed",
+        "artifact_index_digest": "sha256:4444444444444444444444444444444444444444444444444444444444444444",
+        "failure_artifact_index_digest": "sha256:5555555555555555555555555555555555555555555555555555555555555555"
+      }
+    },
+    {
+      "name": "rejects_unknown_version_enum_algorithm_and_nonce",
+      "expect_valid": false,
+      "instance": {
+        "schema_version": 5,
+        "object_kind": "run",
+        "identity_scheme": "sha256-domain-separated-v1",
+        "object_identity": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        "predecessor_identity": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+        "authentication": "signed",
+        "admission": "admitted",
+        "decision": "pass",
+        "release": "qualified",
+        "coverage": "complete",
+        "privacy": "public",
+        "redaction_witness": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+        "issued_at_unix_ns": 9,
+        "terminal_outcome": "succeeded",
+        "signature": {"algorithm": "rsa", "key_id": "unknown", "signature": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff"},
+        "execution_nonce": "00000000000000000000000000000000",
+        "artifact_index_digest": "sha256:4444444444444444444444444444444444444444444444444444444444444444",
+        "failure_artifact_index_digest": "sha256:5555555555555555555555555555555555555555555555555555555555555555"
+      }
+    }
+  ]
+}

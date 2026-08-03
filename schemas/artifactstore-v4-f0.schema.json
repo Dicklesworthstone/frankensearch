@@ -14,6 +14,7 @@
     "admission",
     "decision",
     "release",
+    "coverage",
     "privacy",
     "redaction_witness",
     "issued_at_unix_ns"
@@ -56,6 +57,10 @@
     "release": {
       "type": "string",
       "enum": ["qualified", "not_qualified"]
+    },
+    "coverage": {
+      "type": "string",
+      "enum": ["complete", "incomplete"]
     },
     "privacy": {
       "type": "string",
@@ -149,9 +154,29 @@
         "properties": {
           "authentication": {"const": "verified_receipt_chain"},
           "admission": {"const": "admitted"},
-          "decision": {"const": "pass"}
+          "decision": {"const": "pass"},
+          "coverage": {"const": "complete"}
         }
       }
+    },
+    {
+      "if": {
+        "properties": {"admission": {"enum": ["unadmitted", "no_decision"]}},
+        "required": ["admission"]
+      },
+      "then": {
+        "properties": {
+          "decision": {"const": "no_decision"},
+          "release": {"const": "not_qualified"}
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {"admission": {"const": "admitted"}},
+        "required": ["admission"]
+      },
+      "then": {"properties": {"coverage": {"const": "complete"}}}
     },
     {
       "if": {
