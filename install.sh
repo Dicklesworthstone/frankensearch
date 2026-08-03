@@ -48,6 +48,10 @@ ARTIFACT_URL="${ARTIFACT_URL:-}"
 LOCK_FILE="/tmp/fsfs-install.lock"
 SYSTEM=0
 NO_GUM=0
+NO_COLOR_MODE=0
+if [ -n "${NO_COLOR:-}" ]; then
+  NO_COLOR_MODE=1
+fi
 
 # Detect gum for fancy output (https://github.com/charmbracelet/gum)
 HAS_GUM=0
@@ -59,7 +63,9 @@ log() { [ "$QUIET" -eq 1 ] && return 0; echo -e "$@"; }
 
 info() {
   [ "$QUIET" -eq 1 ] && return 0
-  if [ "$HAS_GUM" -eq 1 ] && [ "$NO_GUM" -eq 0 ]; then
+  if [ "$NO_COLOR_MODE" -eq 1 ]; then
+    printf '%s\n' "→ $*"
+  elif [ "$HAS_GUM" -eq 1 ] && [ "$NO_GUM" -eq 0 ]; then
     gum style --foreground 39 "→ $*"
   else
     echo -e "\033[0;34m→\033[0m $*"
@@ -67,7 +73,10 @@ info() {
 }
 
 ok() {
-  if [ "$HAS_GUM" -eq 1 ] && [ "$NO_GUM" -eq 0 ]; then
+  [ "$QUIET" -eq 1 ] && return 0
+  if [ "$NO_COLOR_MODE" -eq 1 ]; then
+    printf '%s\n' "✓ $*"
+  elif [ "$HAS_GUM" -eq 1 ] && [ "$NO_GUM" -eq 0 ]; then
     gum style --foreground 42 "✓ $*"
   else
     echo -e "\033[0;32m✓\033[0m $*"
@@ -75,7 +84,10 @@ ok() {
 }
 
 warn() {
-  if [ "$HAS_GUM" -eq 1 ] && [ "$NO_GUM" -eq 0 ]; then
+  [ "$QUIET" -eq 1 ] && return 0
+  if [ "$NO_COLOR_MODE" -eq 1 ]; then
+    printf '%s\n' "⚠ $*"
+  elif [ "$HAS_GUM" -eq 1 ] && [ "$NO_GUM" -eq 0 ]; then
     gum style --foreground 214 "⚠ $*"
   else
     echo -e "\033[1;33m⚠\033[0m $*"
@@ -83,7 +95,9 @@ warn() {
 }
 
 err() {
-  if [ "$HAS_GUM" -eq 1 ] && [ "$NO_GUM" -eq 0 ]; then
+  if [ "$NO_COLOR_MODE" -eq 1 ]; then
+    printf '%s\n' "✗ $*" >&2
+  elif [ "$HAS_GUM" -eq 1 ] && [ "$NO_GUM" -eq 0 ]; then
     gum style --foreground 196 "✗ $*"
   else
     echo -e "\033[0;31m✗\033[0m $*"
@@ -271,6 +285,16 @@ run_installer_contract_test() {
     verify-staged)
       [ "$#" -eq 2 ] || { err "contract verify-staged requires STAGED_BINARY"; return 2; }
       verify_staged_binary "$2"
+      ;;
+    output-mode)
+      [ "$#" -eq 2 ] || { err "contract output-mode requires QUIET"; return 2; }
+      QUIET="$2"
+      HAS_GUM=0
+      NO_GUM=1
+      info "info-output"
+      ok "ok-output"
+      warn "warn-output"
+      err "error-output"
       ;;
     install-built)
       [ "$#" -eq 3 ] || { err "contract install-built requires SOURCE DESTINATION"; return 2; }

@@ -227,6 +227,30 @@ check_installer_behavior() {
   else
     echo "[installer][OK]   staged binary verification fails before destination replacement"
   fi
+
+  local quiet_output no_color_output
+  quiet_output=$(NO_COLOR=1 FSFS_INSTALL_CONTRACT_TEST=1 "$installer_shell" "$installer" output-mode 1 2>&1)
+  if [[ "$quiet_output" == *"error-output" ]] \
+    && [[ "$quiet_output" != *"info-output"* ]] \
+    && [[ "$quiet_output" != *"ok-output"* ]] \
+    && [[ "$quiet_output" != *"warn-output"* ]]; then
+    echo "[installer][OK]   quiet mode suppresses routine output while retaining errors"
+  else
+    echo "[installer][FAIL] quiet mode output contract violated: ${quiet_output:-<empty>}"
+    FAILURES=$((FAILURES + 1))
+  fi
+
+  no_color_output=$(NO_COLOR=1 FSFS_INSTALL_CONTRACT_TEST=1 "$installer_shell" "$installer" output-mode 0 2>&1)
+  if [[ "$no_color_output" == *"info-output"* ]] \
+    && [[ "$no_color_output" == *"ok-output"* ]] \
+    && [[ "$no_color_output" == *"warn-output"* ]] \
+    && [[ "$no_color_output" == *"error-output"* ]] \
+    && [[ "$no_color_output" != *$'\033'* ]]; then
+    echo "[installer][OK]   NO_COLOR output is complete and escape-free"
+  else
+    echo "[installer][FAIL] NO_COLOR output contract violated"
+    FAILURES=$((FAILURES + 1))
+  fi
 }
 
 check_model_features() {
