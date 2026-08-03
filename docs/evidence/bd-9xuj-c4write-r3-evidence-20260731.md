@@ -1,5 +1,22 @@
 # bd-9xuj T2 C4-write r3 — NO-GO repair: durable WAL retirement BEFORE tier publication (evidence card)
 
+## DISPOSITION AT LANDING (2026-08-03)
+
+The retire-before-publish ordering described below was NOT landed. It was
+superseded at merge by main's generation-authority protocol (bd-zhjv8): the
+rename is the atomic authority switch; superseded sidecars are invalidated
+by generation and retired AFTER publication. Pre-publication durable
+retirement reintroduces the crash window in which a failure between
+retirement and rename destroys the surviving generation's acknowledged WAL
+appends — the two-resource-commit finding that closed bd-zhjv8 (authority,
+not ordering). The helper functions and tests named in this card
+(`write_tier_with_durable_wal_retirement`, `retire_wal_sidecar_durably`, the
+`builder_fault_injection` hooks, and the two ordering fault tests) were
+dropped accordingly at merge. The surviving test
+`crash_after_rename_state_is_pinned_and_unconstructable_through_finish` was
+re-documented for the landed protocol. The card body below is retained
+unedited as the historical record of the r3 branch.
+
 Date: 2026-07-31. Branch: `codex/sandygrove-c4write-r3-20260731`.
 Successor chain — NOT a rewrite: the r2 branch
 `codex/sandygrove-c4write-r2-20260731` stays frozen at its NO-GO'd tip
