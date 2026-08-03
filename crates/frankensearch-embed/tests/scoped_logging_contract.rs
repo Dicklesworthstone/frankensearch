@@ -46,6 +46,8 @@ struct ReceiptIdentity {
     cargo_manifest_sha256: String,
     contract_source_sha256: String,
     executable_sha256: String,
+    active_features: String,
+    active_features_sha256: String,
 }
 
 #[derive(Debug)]
@@ -438,6 +440,7 @@ fn workspace_root() -> PathBuf {
 impl ReceiptIdentity {
     fn capture() -> Self {
         let root = workspace_root();
+        let active_features = active_embed_features();
         Self {
             cargo_lock_sha256: sha256_file(&root.join("Cargo.lock")),
             cargo_manifest_sha256: sha256_file(&root.join("Cargo.toml")),
@@ -447,13 +450,42 @@ impl ReceiptIdentity {
             executable_sha256: sha256_file(
                 &std::env::current_exe().expect("fresh-process test binary must exist"),
             ),
+            active_features_sha256: output_sha256(active_features.as_bytes(), &[]),
+            active_features,
         }
     }
 }
 
+fn active_embed_features() -> String {
+    let mut active = Vec::new();
+    for (name, enabled) in [
+        ("api", cfg!(feature = "api")),
+        ("bench-internals", cfg!(feature = "bench-internals")),
+        (
+            "bundled-default-models",
+            cfg!(feature = "bundled-default-models"),
+        ),
+        ("default", cfg!(feature = "default")),
+        ("download", cfg!(feature = "download")),
+        ("fastembed", cfg!(feature = "fastembed")),
+        ("hash", cfg!(feature = "hash")),
+        ("model2vec", cfg!(feature = "model2vec")),
+    ] {
+        if enabled {
+            active.push(name);
+        }
+    }
+    assert!(
+        !active.is_empty(),
+        "receipt must bind the compile-time feature selection"
+    );
+    active.join(",")
+}
+
 fn filter_sha256(rust_log: Option<&std::ffi::OsStr>) -> String {
-    let bytes = match rust_log {
-        Some(filter) => {
+    let bytes = rust_log.map_or_else(
+        || b"<unset>".to_vec(),
+        |filter| {
             #[cfg(unix)]
             use std::os::unix::ffi::OsStrExt;
 
@@ -465,13 +497,12 @@ fn filter_sha256(rust_log: Option<&std::ffi::OsStr>) -> String {
             {
                 filter.to_string_lossy().into_owned().into_bytes()
             }
-        }
-        None => b"<unset>".to_vec(),
-    };
+        },
+    );
     output_sha256(&bytes, &[])
 }
 
-fn termination_signal(status: &ExitStatus) -> Option<i32> {
+fn termination_signal(status: ExitStatus) -> Option<i32> {
     #[cfg(unix)]
     {
         use std::os::unix::process::ExitStatusExt;
@@ -492,7 +523,7 @@ impl SealedChildReceipt {
             case: case.to_owned(),
             terminal_cause: TerminalCause::Exited,
             exit_code: output.status.code(),
-            termination_signal: termination_signal(&output.status),
+            termination_signal: termination_signal(output.status),
             filter_sha256: filter_sha256(rust_log),
             output_sha256: output.output_sha256.clone(),
             output_tail_sha256: output_sha256(tail.as_bytes(), &[]),
@@ -544,7 +575,7 @@ impl SealedChildReceipt {
             case: case.to_owned(),
             terminal_cause,
             exit_code: status.code(),
-            termination_signal: termination_signal(status),
+            termination_signal: termination_signal(*status),
             filter_sha256: filter_sha256(rust_log),
             output_sha256: output_digest.clone(),
             output_tail_sha256: output_sha256(output_tail.as_bytes(), &[]),
@@ -603,9 +634,14 @@ fn assert_sealed_receipt(receipt: &SealedChildReceipt, expected_case: &str) {
         &receipt.identity.cargo_manifest_sha256,
         &receipt.identity.contract_source_sha256,
         &receipt.identity.executable_sha256,
+        &receipt.identity.active_features_sha256,
     ] {
         assert_sha256_digest(digest);
     }
+    assert!(
+        !receipt.identity.active_features.is_empty(),
+        "receipt must retain the exact active feature set"
+    );
 }
 
 fn lock_package_block<'a>(lock: &'a str, name: &str, version: &str) -> &'a str {
