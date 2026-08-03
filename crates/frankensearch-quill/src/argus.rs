@@ -6199,6 +6199,70 @@ mod tests {
         }
     }
 
+    /// Bench-only control retaining the sealed cursor's data path while forcing
+    /// `TermScorer` through its defensive post-move validation branch.
+    #[cfg(feature = "bench-internals")]
+    struct ForcedPostMoveValidationCursor<'a> {
+        inner: SealedPostingCursor<'a>,
+    }
+
+    #[cfg(feature = "bench-internals")]
+    impl PostingCursor for ForcedPostMoveValidationCursor<'_> {
+        fn doc(&self) -> Option<u32> {
+            self.inner.doc()
+        }
+        fn freq(&self) -> Option<u32> {
+            self.inner.freq()
+        }
+        fn positions_handle(&self) -> Option<PositionsHandle<'_>> {
+            self.inner.positions_handle()
+        }
+        fn size_hint(&self) -> u32 {
+            self.inner.size_hint()
+        }
+        fn cost(&self) -> u64 {
+            self.inner.cost()
+        }
+        fn segment_num_docs(&self) -> u32 {
+            self.inner.segment_num_docs()
+        }
+        fn next(&mut self) -> Result<Option<u32>, ArgusError> {
+            self.inner.next()
+        }
+        fn advance(&mut self, target: u32) -> Result<Option<u32>, ArgusError> {
+            self.inner.advance(target)
+        }
+        fn term_score_upper_bound(
+            &self,
+            average: f32,
+            weight: f32,
+            option: TermRecordOption,
+        ) -> Option<f32> {
+            self.inner.term_score_upper_bound(average, weight, option)
+        }
+        fn supports_block_max(&self) -> bool {
+            self.inner.supports_block_max()
+        }
+        fn current_block_score_upper_bound(
+            &self,
+            average: f32,
+            weight: f32,
+            option: TermRecordOption,
+        ) -> Option<f32> {
+            self.inner
+                .current_block_score_upper_bound(average, weight, option)
+        }
+        fn current_block_last_doc(&self) -> Option<u32> {
+            self.inner.current_block_last_doc()
+        }
+        fn current_work_block(&self) -> Option<u64> {
+            self.inner.current_work_block()
+        }
+        fn work_blocks_since(&self, previous: Option<u64>) -> u64 {
+            self.inner.work_blocks_since(previous)
+        }
+    }
+
     #[cfg(feature = "bench-internals")]
     fn timed_encoded_grouped_union(
         encoded_doclens: &EncodedDocLenSection,
@@ -6211,6 +6275,35 @@ mod tests {
         limit: usize,
         group_size: usize,
         rank_pruning: bool,
+    ) -> Result<(u128, Vec<ScoredDoc>, UnionPruningStats), Box<dyn std::error::Error>> {
+        timed_encoded_grouped_union_with_contract(
+            encoded_doclens,
+            encoded_terms,
+            cached_metadata,
+            snapshot,
+            rows_by_term,
+            boosts,
+            segment_num_docs,
+            limit,
+            group_size,
+            rank_pruning,
+            true,
+        )
+    }
+
+    #[cfg(feature = "bench-internals")]
+    fn timed_encoded_grouped_union_with_contract(
+        encoded_doclens: &EncodedDocLenSection,
+        encoded_terms: &[(EncodedPostingList, EncodedBlockMax)],
+        cached_metadata: Option<&[Arc<ValidatedTermPruningMetadata>]>,
+        snapshot: &Bm25FieldSnapshot,
+        rows_by_term: &[Vec<Posting>],
+        boosts: &[f32],
+        segment_num_docs: u32,
+        limit: usize,
+        group_size: usize,
+        rank_pruning: bool,
+        trusted_post_move_contract: bool,
     ) -> Result<(u128, Vec<ScoredDoc>, UnionPruningStats), Box<dyn std::error::Error>> {
         if group_size == 0
             || encoded_terms.len() != rows_by_term.len()
@@ -6276,6 +6369,11 @@ mod tests {
                     size_hint,
                     segment_num_docs,
                 )
+            };
+            let cursor: Box<dyn PostingCursor> = if trusted_post_move_contract {
+                Box::new(cursor)
+            } else {
+                Box::new(ForcedPostMoveValidationCursor { inner: cursor })
             };
             let term = ReferenceScorer::term(TermScorer::new(
                 cursor,
@@ -6923,6 +7021,52 @@ mod tests {
         assert!(PostingCursor::has_validated_post_move_contract(&cursor));
         assert_eq!(PostingCursor::doc(&cursor), Some(3));
         assert!(PostingCursor::positions_handle(&cursor).is_none());
+        Ok(())
+    }
+
+    #[cfg(feature = "bench-internals")]
+    #[test]
+    fn forced_post_move_validation_control_preserves_sealed_cursor_scores()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let postings = [Posting::new(0, 2), Posting::new(1, 1), Posting::new(2, 3)];
+        let encoded_postings = EncodedPostingList::encode(&postings)?;
+        let posting_list = encoded_postings.posting_list()?;
+        let lengths = [Some(8); 3];
+        let encoded_doclens =
+            EncodedDocLenSection::encode(0, 3, &[1], &[DocLenFieldInput::new(1, &lengths)])?;
+        let doclens = encoded_doclens.section(&[1])?;
+        let fieldnorms = doclens.field(1).expect("fixture field exists");
+        let snapshot = snapshot(1, 24, 3)?;
+
+        let scores = |trusted_post_move_contract| -> Result<Vec<(u32, u32)>, ArgusError> {
+            let cursor = SealedPostingCursor::new(&posting_list, 3)?;
+            let cursor: Box<dyn PostingCursor> = if trusted_post_move_contract {
+                Box::new(cursor)
+            } else {
+                Box::new(ForcedPostMoveValidationCursor { inner: cursor })
+            };
+            assert_eq!(
+                cursor.has_validated_post_move_contract(),
+                trusted_post_move_contract,
+                "the control must select the intended post-move contract"
+            );
+            let mut scorer = TermScorer::new(
+                cursor,
+                fieldnorms,
+                snapshot.clone(),
+                3,
+                TermRecordOption::WithFreqs,
+                1.0,
+            )?;
+            let mut observed = Vec::new();
+            while let Some(doc) = scorer.doc() {
+                observed.push((doc, scorer.score()?.to_bits()));
+                scorer.next()?;
+            }
+            Ok(observed)
+        };
+
+        assert_eq!(scores(true)?, scores(false)?);
         Ok(())
     }
 
@@ -10270,6 +10414,20 @@ mod tests {
                     true,
                 )?;
                 assert_hits_bit_exact(&cold_pruned.1, &cold_exhaustive.1);
+                let forced_validation_exhaustive = timed_encoded_grouped_union_with_contract(
+                    &encoded_doclens,
+                    encoded_terms,
+                    None,
+                    &snapshot,
+                    rows_by_term,
+                    boosts,
+                    num_docs,
+                    10,
+                    group_size,
+                    false,
+                    false,
+                )?;
+                assert_hits_bit_exact(&forced_validation_exhaustive.1, &cold_exhaustive.1);
                 let cached_metadata =
                     validate_encoded_pruning_metadata(&encoded_doclens, encoded_terms)?;
                 let cache_payload_bytes = cached_metadata.iter().fold(0_usize, |bytes, term| {
