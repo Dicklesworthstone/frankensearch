@@ -3103,6 +3103,8 @@ struct QueryCheckpoint<'a> {
     budget: u64,
     metering: bool,
     state: QueryFuelState,
+    #[cfg(feature = "profile-internals")]
+    profile: Option<&'a QuillProfileSession>,
     #[cfg(feature = "conformance-internals")]
     conformance_controller: Arc<ConformanceCancellationController>,
 }
@@ -3116,6 +3118,8 @@ impl<'a> QueryCheckpoint<'a> {
             budget,
             metering: upper_bound > budget,
             state: QueryFuelState::default(),
+            #[cfg(feature = "profile-internals")]
+            profile: None,
             #[cfg(feature = "conformance-internals")]
             conformance_controller: Arc::default(),
         })
@@ -3135,6 +3139,46 @@ impl<'a> QueryCheckpoint<'a> {
             budget,
             metering: upper_bound > budget,
             state: QueryFuelState::default(),
+            #[cfg(feature = "profile-internals")]
+            profile: None,
+            conformance_controller,
+        })
+    }
+
+    #[cfg(all(feature = "profile-internals", not(feature = "conformance-internals")))]
+    fn new_with_profile(
+        cx: &'a Cx,
+        phase: &'static str,
+        budget: u64,
+        upper_bound: u64,
+        profile: &'a QuillProfileSession,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            cx,
+            phase,
+            budget,
+            metering: upper_bound > budget,
+            state: QueryFuelState::default(),
+            profile: Some(profile),
+        })
+    }
+
+    #[cfg(all(feature = "profile-internals", feature = "conformance-internals"))]
+    fn new_with_controller_and_profile(
+        cx: &'a Cx,
+        phase: &'static str,
+        budget: u64,
+        upper_bound: u64,
+        conformance_controller: Arc<ConformanceCancellationController>,
+        profile: &'a QuillProfileSession,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            cx,
+            phase,
+            budget,
+            metering: upper_bound > budget,
+            state: QueryFuelState::default(),
+            profile: Some(profile),
             conformance_controller,
         })
     }
@@ -3179,7 +3223,14 @@ impl QueryWorkCheckpoint for QueryCheckpoint<'_> {
         if self.cx.is_cancel_requested() {
             return Err(ArgusError::QueryCancelled { phase: self.phase });
         }
-        if units == 0 || !self.metering {
+        if units == 0 {
+            return Ok(());
+        }
+        if !self.metering {
+            #[cfg(feature = "profile-internals")]
+            if let Some(profile) = self.profile {
+                profile.record_fuel_units(units);
+            }
             return Ok(());
         }
         let admitted =
@@ -3202,6 +3253,10 @@ impl QueryWorkCheckpoint for QueryCheckpoint<'_> {
             QueryWorkKind::PositionDocument => &self.state.position_docs,
         };
         let _ = counter.fetch_add(units, Ordering::Relaxed);
+        #[cfg(feature = "profile-internals")]
+        if let Some(profile) = self.profile {
+            profile.record_fuel_units(units);
+        }
         Ok(())
     }
 }
@@ -6584,6 +6639,39 @@ impl QuillReader {
         )
     }
 
+    #[cfg(all(feature = "profile-internals", not(feature = "conformance-internals")))]
+    #[inline]
+    fn profile_query_checkpoint<'a>(
+        &self,
+        cx: &'a Cx,
+        phase: &'static str,
+        budget: u64,
+        upper_bound: u64,
+        profile: &'a QuillProfileSession,
+    ) -> Arc<QueryCheckpoint<'a>> {
+        QueryCheckpoint::new_with_profile(cx, phase, budget, upper_bound, profile)
+    }
+
+    #[cfg(all(feature = "profile-internals", feature = "conformance-internals"))]
+    #[inline]
+    fn profile_query_checkpoint<'a>(
+        &self,
+        cx: &'a Cx,
+        phase: &'static str,
+        budget: u64,
+        upper_bound: u64,
+        profile: &'a QuillProfileSession,
+    ) -> Arc<QueryCheckpoint<'a>> {
+        QueryCheckpoint::new_with_controller_and_profile(
+            cx,
+            phase,
+            budget,
+            upper_bound,
+            Arc::clone(&self.conformance_controller),
+            profile,
+        )
+    }
+
     fn default_parser(&self) -> Result<&DefaultQueryParser, QuillIndexError> {
         self.parser.as_ref().ok_or_else(|| {
             invalid_state("string query APIs are unavailable for this preparsed-only index")
@@ -6841,6 +6929,8 @@ impl QuillReader {
             parsed.diagnostics,
             #[cfg(feature = "pruning-conformance")]
             pruning_trace,
+            #[cfg(feature = "profile-internals")]
+            profile,
         )?;
         let result_count = u64::try_from(result.hits.len()).unwrap_or(u64::MAX);
         query_span.record("result_count", result_count);
@@ -7187,6 +7277,8 @@ impl QuillReader {
             diagnostics,
             #[cfg(feature = "pruning-conformance")]
             None,
+            #[cfg(feature = "profile-internals")]
+            None,
         )
     }
 
@@ -7202,10 +7294,32 @@ impl QuillReader {
         #[cfg(feature = "pruning-conformance")] pruning_trace: Option<
             &ConformancePruningTraceSession,
         >,
+        #[cfg(feature = "profile-internals")] profile: Option<&QuillProfileSession>,
     ) -> Result<QuillSearchResult, QuillIndexError> {
         validate_query_lowering(query, 1.0, self.schema)?;
         let work_upper_bound =
             query_work_upper_bound(query, snapshot, self.config.glob_expansion_limit)?;
+        #[cfg(feature = "profile-internals")]
+        let concrete_checkpoint = profile.map_or_else(
+            || {
+                self.query_checkpoint(
+                    cx,
+                    "search",
+                    self.config.query_fuel_budget,
+                    work_upper_bound,
+                )
+            },
+            |profile| {
+                self.profile_query_checkpoint(
+                    cx,
+                    "search",
+                    self.config.query_fuel_budget,
+                    work_upper_bound,
+                    profile,
+                )
+            },
+        );
+        #[cfg(not(feature = "profile-internals"))]
         let concrete_checkpoint = self.query_checkpoint(
             cx,
             "search",
@@ -7235,6 +7349,14 @@ impl QuillReader {
         #[cfg(feature = "pruning-conformance")]
         let fan_out = fan_out
             && pruning_trace.is_none_or(|trace| trace.cancellation_arm_generation().is_none());
+        #[cfg(feature = "profile-internals")]
+        if let Some(profile) = profile {
+            profile.bind_execution(if fan_out {
+                QuillProfileExecutionMode::Rayon
+            } else {
+                QuillProfileExecutionMode::Serial
+            })?;
+        }
         self.collect_sealed_segments(
             cx,
             &checkpoint,
@@ -14557,6 +14679,11 @@ mod tests {
             assert_eq!(result.hits.len(), 1);
             assert_eq!(receipt.keeper_generation(), expected_generation);
             assert_eq!(receipt.cache(), QuillProfileCacheDisposition::Miss);
+            assert_eq!(receipt.execution(), Some(QuillProfileExecutionMode::Serial));
+            assert!(
+                receipt.counters().4 > 0,
+                "profiled ordinary query did not record any accepted work checkpoints"
+            );
             assert_eq!(receipt.outcome(), QuillProfileOutcome::Completed);
         });
     }
