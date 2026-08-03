@@ -4299,6 +4299,87 @@ mod tests {
         );
     }
 
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn owner_bound_ann_survives_same_size_in_place_path_rewrite() {
+        use std::os::unix::fs::MetadataExt;
+
+        let directory = tempfile::tempdir().expect("temporary FSVI owner directory");
+        let current_path = directory.path().join("current.fsvi");
+        let replacement_path = directory.path().join("replacement.fsvi");
+        let binding = fsvi_v2_binding(83, 0x83, "ann-in-place-rewrite", 4);
+
+        let mut original =
+            VectorIndex::create_v2(&current_path, binding.clone()).expect("create original FSVI");
+        original
+            .write_record("doc-alpha", &[1.0, 0.0, 0.0, 0.0])
+            .expect("write original alpha");
+        original
+            .write_record("doc-beta", &[0.0, 1.0, 0.0, 0.0])
+            .expect("write original beta");
+        original.finish().expect("finish original FSVI");
+
+        let owner = Arc::new(
+            ValidatedFsviBytes::open_published(&current_path, &binding)
+                .expect("admit original published FSVI"),
+        );
+        let bound = ValidatedNativeHnsw::build(Arc::clone(&owner), params(), 83)
+            .expect("build graph from admitted owner");
+        assert_eq!(
+            bound
+                .search(&[1.0, 0.0, 0.0, 0.0], 1, Some(owner.record_count()))
+                .expect("search original owner through ANN")[0]
+                .doc_id(),
+            "doc-alpha"
+        );
+
+        let mut replacement = VectorIndex::create_v2(&replacement_path, binding.clone())
+            .expect("create replacement FSVI");
+        replacement
+            .write_record("doc-alpha", &[0.0, 1.0, 0.0, 0.0])
+            .expect("write replacement alpha");
+        replacement
+            .write_record("doc-beta", &[1.0, 0.0, 0.0, 0.0])
+            .expect("write replacement beta");
+        replacement.finish().expect("finish replacement FSVI");
+        let replacement_bytes = std::fs::read(&replacement_path).expect("read replacement FSVI");
+        let original_metadata =
+            std::fs::symlink_metadata(&current_path).expect("read original metadata");
+        assert_eq!(
+            usize::try_from(original_metadata.len()).expect("original length fits usize"),
+            replacement_bytes.len(),
+            "fixture must preserve pathname length for the in-place rewrite"
+        );
+        std::fs::write(&current_path, replacement_bytes)
+            .expect("rewrite admitted pathname in place");
+        assert_eq!(
+            std::fs::symlink_metadata(&current_path)
+                .expect("read rewritten metadata")
+                .ino(),
+            original_metadata.ino(),
+            "fixture must retain the original inode rather than rename a replacement"
+        );
+
+        let fresh_owner = ValidatedFsviBytes::open_published(&current_path, &binding)
+            .expect("fresh admission observes rewritten bytes");
+        assert_eq!(
+            fresh_owner
+                .search_top_k(&[1.0, 0.0, 0.0, 0.0], 1, None)
+                .expect("exact search rewritten owner")[0]
+                .doc_id,
+            "doc-beta",
+            "fresh admission must observe the rewritten pathname semantics"
+        );
+        assert_eq!(
+            bound
+                .search(&[1.0, 0.0, 0.0, 0.0], 1, Some(owner.record_count()))
+                .expect("search retained owner-bound ANN")[0]
+                .doc_id(),
+            "doc-alpha",
+            "the owner-built graph must continue to resolve through admitted bytes"
+        );
+    }
+
     #[test]
     fn validated_handle_retains_loaded_owner_after_caller_scope_end() {
         let owner = generation_owner(81, 0x81, "retained-load-owner", 4, 16);
