@@ -7423,12 +7423,14 @@ impl QuillReader {
         let fan_out = fan_out
             && pruning_trace.is_none_or(|trace| trace.cancellation_arm_generation().is_none());
         #[cfg(feature = "profile-internals")]
-        if let Some(profile) = profile {
-            profile.bind_execution(if fan_out {
-                QuillProfileExecutionMode::Rayon
-            } else {
-                QuillProfileExecutionMode::Serial
-            })?;
+        if !keeper.segments().is_empty() {
+            if let Some(profile) = profile {
+                profile.bind_execution(if fan_out {
+                    QuillProfileExecutionMode::Rayon
+                } else {
+                    QuillProfileExecutionMode::Serial
+                })?;
+            }
         }
         self.collect_sealed_segments(
             cx,
@@ -14854,6 +14856,35 @@ mod tests {
             assert_eq!(receipt.work_plan(), None);
             assert_eq!(receipt.counters(), (0, 0, 0, 0, 0));
             assert_eq!(receipt.outcome(), QuillProfileOutcome::Cancelled);
+        });
+    }
+
+    #[cfg(feature = "profile-internals")]
+    #[test]
+    fn profiled_empty_snapshot_has_no_sealed_execution_branch() {
+        run_with_cx(|cx| async move {
+            let directory = tempfile::tempdir().expect("empty profile directory");
+            let _writer = QuillIndex::create(&cx, directory.path(), deterministic_config())
+                .await
+                .expect("create empty profile writer");
+            let reader = QuillSearchIndex::open(&cx, directory.path(), deterministic_config())
+                .await
+                .expect("open empty profile reader");
+            let outcome = reader
+                .search_paginated_with_profile(&cx, "alpha", 10, 0, false)
+                .expect("execute empty profiled search");
+            let (result, receipt) = match outcome {
+                QuillProfiledSearchOutcome::Completed { result, receipt } => (result, receipt),
+                QuillProfiledSearchOutcome::Failed { error, .. } => {
+                    panic!("empty profiled search unexpectedly failed: {error}")
+                }
+            };
+            assert!(result.hits.is_empty());
+            assert_eq!(receipt.cache(), QuillProfileCacheDisposition::Miss);
+            assert_eq!(receipt.execution(), None);
+            assert!(receipt.work_plan().is_some());
+            assert_eq!(receipt.counters(), (0, 0, 0, 0, 0));
+            assert_eq!(receipt.outcome(), QuillProfileOutcome::Completed);
         });
     }
 
