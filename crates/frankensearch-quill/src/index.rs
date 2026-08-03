@@ -7454,10 +7454,6 @@ impl QuillReader {
             work_upper_bound,
         );
         let metering = concrete_checkpoint.metering();
-        #[cfg(feature = "profile-internals")]
-        if let Some(profile) = profile {
-            profile.bind_work_plan(work_upper_bound, metering)?;
-        }
         let checkpoint: QueryCheckpointHandle<'_> = concrete_checkpoint;
         self.collect_sealed_segments(
             cx,
