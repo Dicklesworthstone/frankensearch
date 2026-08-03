@@ -204,13 +204,13 @@ fn phase_label(phase: &SearchPhase) -> &'static str {
     }
 }
 
-fn unavailable_quality_phase_labels(query_vec: &[f32]) -> (Vec<&'static str>, Vec<&'static str>) {
+fn phase_labels(query_vec: &[f32], with_quality: bool) -> (Vec<&'static str>, Vec<&'static str>) {
     let config = TwoTierConfig::default();
-    let sync = SyncTwoTierSearcher::new(sync_index(false), config.clone())
+    let sync = SyncTwoTierSearcher::new(sync_index(with_quality), config.clone())
         .search_iter(query_vec, 4)
         .map(|phase| phase_label(&phase))
         .collect();
-    let index = async_index("quality-index-phase", false);
+    let index = async_index("quality-index-phase", with_quality);
     let fast: Arc<dyn Embedder> = Arc::new(FixedVecEmbedder {
         id: "parity-fast",
         vector: query_vec.to_vec(),
@@ -367,8 +367,16 @@ fn quality_index_unavailable_agrees_and_skips_phase_two_on_both_sides() {
         "sync must report the typed unavailable-index skip"
     );
     assert_eq!(sync_metrics.skip_reason, async_metrics.skip_reason);
-    let (sync_phases, async_phases) = unavailable_quality_phase_labels(&query);
+    let (sync_phases, async_phases) = phase_labels(&query, false);
     assert_eq!(sync_phases, ["initial"]);
+    assert_eq!(sync_phases, async_phases);
+}
+
+#[test]
+fn quality_index_present_emits_matching_initial_then_refined_phases() {
+    let query = normalize(vec![1.0, 0.0, 0.0, 0.0]);
+    let (sync_phases, async_phases) = phase_labels(&query, true);
+    assert_eq!(sync_phases, ["initial", "refined"]);
     assert_eq!(sync_phases, async_phases);
 }
 
