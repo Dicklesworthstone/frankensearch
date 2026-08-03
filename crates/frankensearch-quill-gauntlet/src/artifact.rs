@@ -3824,6 +3824,70 @@ mod tests {
         );
     }
 
+    #[cfg(all(target_family = "unix", not(target_os = "wasi")))]
+    #[test]
+    fn artifactstore_v4_source_snapshot_capture_rejects_incomplete_and_unsafe_inputs() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().expect("temporary source root");
+        std::fs::write(root.path().join("Cargo.lock"), b"locked dependency graph\n")
+            .expect("write source lockfile");
+        std::fs::create_dir(root.path().join("crates")).expect("create source subdirectory");
+        symlink("../Cargo.lock", root.path().join("crates/current"))
+            .expect("create source symlink");
+        symlink("/outside-source-root", root.path().join("crates/escape"))
+            .expect("create escaping source symlink");
+
+        assert!(
+            ArtifactStoreV4SourceSnapshot::capture_selected(
+                root.path(),
+                BTreeMap::from([(
+                    "crates/current".to_owned(),
+                    vec![ArtifactStoreV4SourceInclusionReason::PathDependency],
+                )]),
+                1024,
+            )
+            .is_err(),
+            "a selected symlink must also select its regular-file target"
+        );
+        assert!(
+            ArtifactStoreV4SourceSnapshot::capture_selected(
+                root.path(),
+                BTreeMap::from([(
+                    "crates/escape".to_owned(),
+                    vec![ArtifactStoreV4SourceInclusionReason::PathDependency],
+                )]),
+                1024,
+            )
+            .is_err(),
+            "a source symlink escaping the selected root must fail closed"
+        );
+        assert!(
+            ArtifactStoreV4SourceSnapshot::capture_selected(
+                root.path(),
+                BTreeMap::from([(
+                    "crates".to_owned(),
+                    vec![ArtifactStoreV4SourceInclusionReason::WorkspaceMember],
+                )]),
+                1024,
+            )
+            .is_err(),
+            "a directory is not a compiler-visible file input"
+        );
+        assert!(
+            ArtifactStoreV4SourceSnapshot::capture_selected(
+                root.path(),
+                BTreeMap::from([(
+                    "Cargo.lock".to_owned(),
+                    vec![ArtifactStoreV4SourceInclusionReason::CargoLock],
+                )]),
+                1,
+            )
+            .is_err(),
+            "an oversized selected input must fail closed"
+        );
+    }
+
     #[test]
     fn artifactstore_v4_build_snapshot_binds_exact_build_input_bytes() {
         let mut inputs = vec![
