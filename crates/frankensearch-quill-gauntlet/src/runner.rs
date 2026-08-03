@@ -485,6 +485,8 @@ pub enum MetamorphicLawOutcome {
 pub struct MetamorphicLawDescriptor {
     pub id: String,
     pub generator_id: String,
+    /// Admission state declared by this qualified law before execution.
+    pub applicability: MetamorphicLawApplicability,
     pub preconditions: String,
     pub observable_projection: String,
     pub equivalence_relation: String,
@@ -545,6 +547,7 @@ impl MetamorphicLawRegistry {
                    scopes: Vec<MetamorphicLawScope>| MetamorphicLawDescriptor {
             id: id.to_owned(),
             generator_id: generator_id.to_owned(),
+            applicability: MetamorphicLawApplicability::Applies,
             preconditions: preconditions.to_owned(),
             observable_projection: projection.to_owned(),
             equivalence_relation: equivalence.to_owned(),
@@ -586,6 +589,39 @@ impl MetamorphicLawRegistry {
                     "engine::tests::e63_duplicate_live_id_is_typed_rejection_and_preserves_published_original",
                     vec![MetamorphicLawScope::Quill],
                 ),
+                MetamorphicLawDescriptor {
+                    id: "e6.3-duplicate-then-delete-v1".to_owned(),
+                    generator_id: "e6.3-duplicate-then-delete-v1".to_owned(),
+                    applicability: MetamorphicLawApplicability::SkipWithReason {
+                        reason: MetamorphicSkipReason::LifecycleCapabilityUnavailable,
+                    },
+                    preconditions: "a declared duplicate/upsert lifecycle operation".to_owned(),
+                    observable_projection: "total lexical observation".to_owned(),
+                    equivalence_relation: "declared duplicate-then-delete behavior".to_owned(),
+                    allowed_divergence: "none".to_owned(),
+                    positive_fixture_id: "e63-duplicate-then-delete-positive".to_owned(),
+                    invalid_fixture_id: "e63-duplicate-then-delete-wrong-id".to_owned(),
+                    replay_test: "pending runner lifecycle hook".to_owned(),
+                    shrinker_id: "e6.3-total-lexical-ddmin-v1".to_owned(),
+                    scopes: vec![MetamorphicLawScope::Quill],
+                },
+                MetamorphicLawDescriptor {
+                    id: "e6.3-upsert-versus-delete-add-v1".to_owned(),
+                    generator_id: "e6.3-upsert-versus-delete-add-v1".to_owned(),
+                    applicability: MetamorphicLawApplicability::SkipWithReason {
+                        reason: MetamorphicSkipReason::LifecycleCapabilityUnavailable,
+                    },
+                    preconditions: "a declared upsert and delete/add lifecycle operation"
+                        .to_owned(),
+                    observable_projection: "total lexical observation".to_owned(),
+                    equivalence_relation: "declared replacement semantics".to_owned(),
+                    allowed_divergence: "none".to_owned(),
+                    positive_fixture_id: "e63-upsert-delete-add-positive".to_owned(),
+                    invalid_fixture_id: "e63-upsert-delete-add-content-mutation".to_owned(),
+                    replay_test: "pending runner lifecycle hook".to_owned(),
+                    shrinker_id: "e6.3-total-lexical-ddmin-v1".to_owned(),
+                    scopes: vec![MetamorphicLawScope::Quill],
+                },
                 law(
                     "e6.3-flush-batch-schedule-v1",
                     "e6.3-flush-batch-schedule-v1",
@@ -698,6 +734,57 @@ impl MetamorphicLawRegistry {
                         MetamorphicLawScope::CrossEngine,
                     ],
                 ),
+                MetamorphicLawDescriptor {
+                    id: "e6.3-merge-schedule-v1".to_owned(),
+                    generator_id: "e6.3-merge-schedule-v1".to_owned(),
+                    applicability: MetamorphicLawApplicability::SkipWithReason {
+                        reason: MetamorphicSkipReason::LifecycleCapabilityUnavailable,
+                    },
+                    preconditions: "runner-exposed deterministic merge scheduling".to_owned(),
+                    observable_projection: "total lexical observation".to_owned(),
+                    equivalence_relation: "same committed corpus under a different merge schedule"
+                        .to_owned(),
+                    allowed_divergence: "none".to_owned(),
+                    positive_fixture_id: "e63-merge-schedule-positive".to_owned(),
+                    invalid_fixture_id: "e63-merge-schedule-content-mutation".to_owned(),
+                    replay_test: "pending runner lifecycle hook".to_owned(),
+                    shrinker_id: "e6.3-total-lexical-ddmin-v1".to_owned(),
+                    scopes: vec![MetamorphicLawScope::Quill],
+                },
+                MetamorphicLawDescriptor {
+                    id: "e6.3-reopen-recovery-v1".to_owned(),
+                    generator_id: "e6.3-reopen-recovery-v1".to_owned(),
+                    applicability: MetamorphicLawApplicability::SkipWithReason {
+                        reason: MetamorphicSkipReason::LifecycleCapabilityUnavailable,
+                    },
+                    preconditions: "runner-exposed durable reopen/recovery lifecycle".to_owned(),
+                    observable_projection: "total lexical observation".to_owned(),
+                    equivalence_relation: "same committed corpus before and after reopen"
+                        .to_owned(),
+                    allowed_divergence: "none".to_owned(),
+                    positive_fixture_id: "e63-reopen-recovery-positive".to_owned(),
+                    invalid_fixture_id: "e63-reopen-recovery-corrupt-state".to_owned(),
+                    replay_test: "pending runner lifecycle hook".to_owned(),
+                    shrinker_id: "e6.3-total-lexical-ddmin-v1".to_owned(),
+                    scopes: vec![MetamorphicLawScope::Quill],
+                },
+                MetamorphicLawDescriptor {
+                    id: "e6.3-tombstone-compaction-v1".to_owned(),
+                    generator_id: "e6.3-tombstone-compaction-v1".to_owned(),
+                    applicability: MetamorphicLawApplicability::SkipWithReason {
+                        reason: MetamorphicSkipReason::ScoreSensitiveCorpusStatistics,
+                    },
+                    preconditions: "a score-insensitive projection approved by the runner"
+                        .to_owned(),
+                    observable_projection: "total lexical observation".to_owned(),
+                    equivalence_relation: "same live corpus before and after compaction".to_owned(),
+                    allowed_divergence: "none".to_owned(),
+                    positive_fixture_id: "e63-tombstone-compaction-positive".to_owned(),
+                    invalid_fixture_id: "e63-tombstone-compaction-extra-delete".to_owned(),
+                    replay_test: "pending score-insensitive runner projection".to_owned(),
+                    shrinker_id: "e6.3-total-lexical-ddmin-v1".to_owned(),
+                    scopes: vec![MetamorphicLawScope::Quill],
+                },
                 law(
                     "e6.3-positionless-phrase-capability-v1",
                     "e6.3-positionless-phrase-capability-v1",
@@ -792,7 +879,10 @@ impl MetamorphicLawRegistry {
                     "metamorphic result names an unregistered law",
                 ));
             };
-            if !law.scopes.contains(&result.scope) || !seen.insert((&result.law_id, result.scope)) {
+            if !law.scopes.contains(&result.scope)
+                || law.applicability != result.applicability
+                || !seen.insert((&result.law_id, result.scope))
+            {
                 return Err(campaign_error(
                     "metamorphic result has a duplicate or unsupported scope",
                 ));
@@ -8753,10 +8843,10 @@ mod tests {
                 outcome: Some(MetamorphicLawOutcome::Passed),
             },
             MetamorphicLawResult {
-                law_id: "e6.3-input-order-permutation-v1".to_owned(),
-                scope: MetamorphicLawScope::Tantivy,
+                law_id: "e6.3-tombstone-compaction-v1".to_owned(),
+                scope: MetamorphicLawScope::Quill,
                 applicability: MetamorphicLawApplicability::SkipWithReason {
-                    reason: MetamorphicSkipReason::ProfileOutsideScalarG1a,
+                    reason: MetamorphicSkipReason::ScoreSensitiveCorpusStatistics,
                 },
                 outcome: None,
             },
