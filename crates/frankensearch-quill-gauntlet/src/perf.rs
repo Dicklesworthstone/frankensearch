@@ -17,7 +17,8 @@ use thiserror::Error;
 
 use crate::GauntletError;
 use crate::local_perf_runner::{
-    LOCAL_PERF_ATTEMPT_RECEIPT_SCHEMA_VERSION, PERF_RUN_PRECOMMIT_SCHEMA_VERSION,
+    LOCAL_PERF_ATTEMPT_RECEIPT_SCHEMA_VERSION, LOCAL_PERF_LEASE_RELEASE_RECEIPT_SCHEMA_VERSION,
+    PERF_RUN_PRECOMMIT_SCHEMA_VERSION,
 };
 use crate::machine_class_registry::{
     DefaultFlipDisposition, ExecutionCapacitySemantics, LOCAL_PERF_PRODUCER_CONTRACT_VERSION,
@@ -915,6 +916,10 @@ fn validate_perf_manifest_schema_bindings(
             "runner_attempt_receipt",
             LOCAL_PERF_ATTEMPT_RECEIPT_SCHEMA_VERSION,
         ),
+        (
+            "runner_lease_release_receipt",
+            LOCAL_PERF_LEASE_RELEASE_RECEIPT_SCHEMA_VERSION,
+        ),
         ("precommit_inventory", PERF_RUN_PRECOMMIT_SCHEMA_VERSION),
     ] {
         let found = schemas
@@ -943,6 +948,7 @@ fn validate_perf_manifest_schema_bindings(
             "local_producer_contract",
             "history_pointer",
             "runner_attempt_receipt",
+            "runner_lease_release_receipt",
             "precommit_inventory",
         ]
         .contains(&field.as_str())
@@ -4680,10 +4686,10 @@ mod tests {
 
     #[test]
     fn qg1_profile_plans_have_frozen_exhaustive_applicability_counts() {
-        // GOLDEN-CHANGE (attempt receipt v9): the manifest now binds checked
-        // physical lease device/inode identity alongside its logical family
-        // identity. Matrix cells and applicability counts are unchanged; only
-        // their manifest-bound plan identities advance with the schema.
+        // GOLDEN-CHANGE (lease release receipt v1): the manifest now binds a
+        // post-unlock release receipt to the completed, physical-identity
+        // attempt receipt. Matrix cells and applicability counts are
+        // unchanged; only their manifest-bound plan identities advance.
         let registry = MachineClassRegistry::frozen().expect("frozen machine registry");
         let cases = [
             (
@@ -4693,7 +4699,7 @@ mod tests {
                 16,
                 Some(64),
                 Some(64),
-                "2ecb12fe4c8d687648ea1bc01d94fe9ae14dbbd1833383fe18a657d74c5cb193",
+                "b49415821a8c4b2d0cf5a59ef05a058846825f8fff4ae87ed4f88db2dba9d57b",
             ),
             (
                 ExecutionProfileId::Smt2_128,
@@ -4702,7 +4708,7 @@ mod tests {
                 0,
                 Some(128),
                 Some(128),
-                "f8976ff2ba537782717419cbf077caaac10b067e0b973affdaf76a38928169d3",
+                "2e1169fbe0bb96c1580b5fa75edc5bd46fb52c7533c3be9575b8d99cbd2e46c8",
             ),
             (
                 ExecutionProfileId::Scheduler10,
@@ -4711,7 +4717,7 @@ mod tests {
                 40,
                 Some(10),
                 Some(8),
-                "5137957d18282abbcd254439c8e2787b3ff456e22cd0c662e08b719af2b0d101",
+                "942c940393b959490987413e7ccadda55645c10dac97d025e1007f4544955286",
             ),
         ];
         let mut plan_hashes = BTreeSet::new();
@@ -4952,6 +4958,10 @@ mod tests {
             (
                 "runner_attempt_receipt",
                 LOCAL_PERF_ATTEMPT_RECEIPT_SCHEMA_VERSION,
+            ),
+            (
+                "runner_lease_release_receipt",
+                LOCAL_PERF_LEASE_RELEASE_RECEIPT_SCHEMA_VERSION,
             ),
             ("precommit_inventory", PERF_RUN_PRECOMMIT_SCHEMA_VERSION),
         ] {
@@ -5517,12 +5527,12 @@ mod tests {
     fn manifest_contract_hash_ignores_only_activation_state() {
         let manifest = PERF_MANIFEST;
         assert_eq!(manifest.matches("activated = false").count(), 10);
-        // GOLDEN-CHANGE (attempt receipt v9): the manifest now names the
-        // checked physical lease identity retained in every receipt.
+        // GOLDEN-CHANGE (lease release receipt v1): the manifest now names
+        // the post-unlock receipt that binds the exact completed attempt.
         // Activation is still the sole administrative normalization exception.
         assert_eq!(
             perf_manifest_contract_sha256(manifest),
-            "a358074b4936bcad79d889b81de3406075ab76bf81400cb538b7391d61729b21",
+            "545c6dadcee75c22c0d40238ded74663df70fcc58adc7c5066455dfe845b3bf1",
             "the normalized all-inactive manifest digest must remain frozen"
         );
         assert_eq!(

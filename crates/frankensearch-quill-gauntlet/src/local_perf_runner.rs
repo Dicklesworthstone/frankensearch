@@ -56,6 +56,9 @@ const PRODUCER_CONTRACT_SCHEMA_VERSION: &str =
     "frankensearch.quill-local-perf-producer-contract.v1";
 /// Strict wire schema for one local-run process-attempt receipt.
 pub const LOCAL_PERF_ATTEMPT_RECEIPT_SCHEMA_VERSION: &str = "frankensearch.perf-runner-attempt.v9";
+/// Strict wire schema for the post-unlock lease-release receipt.
+pub const LOCAL_PERF_LEASE_RELEASE_RECEIPT_SCHEMA_VERSION: &str =
+    "frankensearch.perf-runner-lease-release.v1";
 /// Strict schema for the diagnostic inventory retained before runner completion.
 pub const PERF_RUN_PRECOMMIT_SCHEMA_VERSION: &str = "frankensearch.perf-run-precommit.v5";
 const MAX_IDENTITY_COMPONENT_BYTES: usize = 96;
@@ -136,6 +139,9 @@ pub struct LocalPerfRunOutput {
     /// SHA-256 of [`Self::bound_evidence`], while every failed attempt returns
     /// this same schema through [`LocalPerfRunError::AttemptFailed`].
     pub attempt_receipt: PathBuf,
+    /// Exact strict receipt emitted only after the held benchmark lease was
+    /// explicitly unlocked following durable attempt/evidence publication.
+    pub lease_release_receipt: PathBuf,
     /// Exact raw threshold artifact named by the runner artifact manifest.
     pub threshold_artifact: PathBuf,
     /// Exact pre-binding evidence artifact named by the runner manifest.
@@ -194,6 +200,19 @@ pub enum LocalPerfRunError {
         receipt_path: PathBuf,
         /// Typed producer-rejection boundary.
         outcome: LocalPerfAttemptOutcome,
+        /// Bounded non-secret publication diagnostic.
+        detail: String,
+    },
+    /// The final attempt/evidence pair was durable and the host-global lease
+    /// was released, but no durable post-release receipt could be published.
+    /// The caller receives no successful output and must not promote the run.
+    #[error(
+        "local performance runner released its lease but could not durably publish the release receipt at {}: {detail}",
+        receipt_path.display()
+    )]
+    LeaseReleaseReceiptUnavailable {
+        /// Intended release-receipt path; it may be absent or nondurable.
+        receipt_path: PathBuf,
         /// Bounded non-secret publication diagnostic.
         detail: String,
     },
@@ -693,6 +712,101 @@ pub struct LocalPerfAttemptReceipt {
     finished_at_utc: String,
     finished_timestamp_error: Option<String>,
     seal_sha256: String,
+}
+
+/// Strict, canonical proof that a completed attempt's host-global lease was
+/// explicitly unlocked only after the final attempt/evidence pair published.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LocalPerfLeaseReleaseReceipt {
+    schema_version: String,
+    gate: String,
+    profile: MachineProfileKey,
+    run_id: String,
+    run_window: String,
+    lease_file_identity: LeaseFileIdentity,
+    attempt_receipt_sha256: String,
+    released_at_utc: String,
+    seal_sha256: String,
+}
+
+impl LocalPerfLeaseReleaseReceipt {
+    /// Parse exact canonical bytes and verify their self-seal and provenance.
+    ///
+    /// # Errors
+    ///
+    /// Rejects duplicate or unknown fields, noncanonical JSON, malformed
+    /// lease identity, stale schema, or a modified release receipt.
+    pub fn from_verified_slice(contents: &[u8]) -> Result<Self, LocalPerfRunError> {
+        let probe =
+            crate::machine_class_registry::parse_strict_json(contents).map_err(|error| {
+                LocalPerfRunError::Invalid(format!(
+                    "lease release receipt is not strict JSON: {error}"
+                ))
+            })?;
+        let receipt: Self = serde_json::from_value(probe.clone()).map_err(|error| {
+            LocalPerfRunError::Invalid(format!(
+                "lease release receipt does not decode as the current schema: {error}"
+            ))
+        })?;
+        if probe != serde_json::to_value(&receipt)?
+            || contents != receipt.to_json_bytes()?.as_slice()
+        {
+            return Err(LocalPerfRunError::Invalid(
+                "lease release receipt bytes are not the exact canonical encoding".to_owned(),
+            ));
+        }
+        receipt.verify()?;
+        Ok(receipt)
+    }
+
+    /// Load and independently verify one exact lease-release receipt.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed I/O or receipt-verification error.
+    pub fn load_verified(path: &Path) -> Result<Self, LocalPerfRunError> {
+        Self::from_verified_slice(&fs::read(path)?)
+    }
+
+    /// Canonical compact JSON bytes used for persistence and exact hashing.
+    ///
+    /// # Errors
+    ///
+    /// Returns a JSON error only if the typed schema stops being encodable.
+    pub fn to_json_bytes(&self) -> Result<Vec<u8>, LocalPerfRunError> {
+        serde_json::to_vec(self).map_err(LocalPerfRunError::from)
+    }
+
+    fn verify(&self) -> Result<(), LocalPerfRunError> {
+        if self.schema_version != LOCAL_PERF_LEASE_RELEASE_RECEIPT_SCHEMA_VERSION
+            || !is_sha256(&self.attempt_receipt_sha256)
+            || !is_sha256(&self.seal_sha256)
+        {
+            return Err(LocalPerfRunError::Invalid(
+                "lease release receipt has an invalid schema or digest".to_owned(),
+            ));
+        }
+        validate_component(&self.run_id, "lease release run ID")?;
+        validate_component(&self.run_window, "lease release run window")?;
+        validate_lease_file_identity(&self.lease_file_identity)?;
+        validate_utc_timestamp(&self.released_at_utc, "lease release")?;
+        let gate = self.gate.parse::<PerfGate>().map_err(|error| {
+            LocalPerfRunError::Invalid(format!(
+                "lease release receipt names an invalid gate: {error}"
+            ))
+        })?;
+        self.profile.latest_basename(gate.label())?;
+        let mut unsigned = self.clone();
+        let expected_seal = unsigned.seal_sha256.clone();
+        unsigned.seal_sha256.clear();
+        if sha256_hex(&serde_json::to_vec(&unsigned)?) != expected_seal {
+            return Err(LocalPerfRunError::Invalid(
+                "lease release receipt content seal does not verify".to_owned(),
+            ));
+        }
+        Ok(())
+    }
 }
 
 // Same-crate H4 consumption lands separately on the protected train.
@@ -2071,13 +2185,74 @@ fn run_local_perf_command_inner(
         });
     }
 
+    let release_receipt_name = format!("{}.lease-release.json", config.gate.label());
+    let release_receipt_path = config.output_dir.join(&release_receipt_name);
+    if let Err(error) = flock(&lease_file, FlockOperation::Unlock) {
+        return Err(LocalPerfRunError::LeaseReleaseReceiptUnavailable {
+            receipt_path: release_receipt_path,
+            detail: bounded_diagnostic(&std::io::Error::from(error)),
+        });
+    }
     drop(lease_file);
+    let release_receipt_bytes = match utc_now().and_then(|released_at_utc| {
+        completed_lease_release_receipt_bytes(
+            config,
+            &lease_identity,
+            &completed_attempt_bytes,
+            &released_at_utc,
+        )
+    }) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            return Err(LocalPerfRunError::LeaseReleaseReceiptUnavailable {
+                receipt_path: release_receipt_path,
+                detail: bounded_diagnostic(&error),
+            });
+        }
+    };
+    if write_new_sync_at(
+        &run_directories.run.handle,
+        &release_receipt_name,
+        &release_receipt_bytes,
+    )
+    .and_then(|()| {
+        run_directories
+            .run
+            .handle
+            .sync_all()
+            .map_err(LocalPerfRunError::from)
+    })
+    .is_err()
+    {
+        return Err(LocalPerfRunError::LeaseReleaseReceiptUnavailable {
+            receipt_path: release_receipt_path,
+            detail: "release receipt could not be durably published after lease unlock".to_owned(),
+        });
+    }
+    let persisted_release = read_file_at(&run_directories.run.handle, &release_receipt_name)
+        .map_err(|error| LocalPerfRunError::LeaseReleaseReceiptUnavailable {
+            receipt_path: release_receipt_path.clone(),
+            detail: bounded_diagnostic(&error),
+        })?;
+    if persisted_release != release_receipt_bytes {
+        return Err(LocalPerfRunError::LeaseReleaseReceiptUnavailable {
+            receipt_path: release_receipt_path.clone(),
+            detail: "persisted release receipt bytes differ from the sealed publication".to_owned(),
+        });
+    }
+    LocalPerfLeaseReleaseReceipt::load_verified(&release_receipt_path).map_err(|error| {
+        LocalPerfRunError::LeaseReleaseReceiptUnavailable {
+            receipt_path: release_receipt_path.clone(),
+            detail: bounded_diagnostic(&error),
+        }
+    })?;
     Ok(LocalPerfRunOutput {
         run_log: run_log_path,
         artifact_manifest: manifest_path,
         environment_policy: environment_policy_path,
         runner_receipt: receipt_path,
         attempt_receipt: attempt_receipt_path,
+        lease_release_receipt: release_receipt_path,
         threshold_artifact: threshold_path,
         prebinding_evidence: prebinding_evidence_path,
         bound_evidence: bound_evidence_path,
@@ -5251,6 +5426,55 @@ fn bounded_diagnostic<T: std::fmt::Display + ?Sized>(value: &T) -> String {
     message
 }
 
+fn completed_lease_release_receipt_bytes(
+    config: &LocalPerfRunConfig,
+    lease_file_identity: &LeaseFileIdentity,
+    attempt_receipt_bytes: &[u8],
+    released_at_utc: &str,
+) -> Result<Vec<u8>, LocalPerfRunError> {
+    let attempt = LocalPerfAttemptReceipt::from_verified_slice(attempt_receipt_bytes)?;
+    validate_utc_timestamp(released_at_utc, "lease release")?;
+    if attempt.outcome != LocalPerfAttemptOutcome::Completed
+        || attempt.gate != config.gate.label()
+        || attempt.profile != config.profile
+        || attempt.run_id != config.run_id
+        || attempt.run_window != config.run_window
+        || attempt.lease_file_identity != *lease_file_identity
+    {
+        return Err(LocalPerfRunError::Invalid(
+            "lease release receipt differs from its completed attempt identity".to_owned(),
+        ));
+    }
+    if released_at_utc < attempt.finished_at_utc.as_str() {
+        return Err(LocalPerfRunError::Invalid(
+            "lease release timestamp precedes its completed attempt finish".to_owned(),
+        ));
+    }
+    let receipt = LocalPerfLeaseReleaseReceipt {
+        schema_version: LOCAL_PERF_LEASE_RELEASE_RECEIPT_SCHEMA_VERSION.to_owned(),
+        gate: config.gate.label().to_owned(),
+        profile: config.profile,
+        run_id: config.run_id.clone(),
+        run_window: config.run_window.clone(),
+        lease_file_identity: lease_file_identity.clone(),
+        attempt_receipt_sha256: sha256_hex(attempt_receipt_bytes),
+        released_at_utc: released_at_utc.to_owned(),
+        seal_sha256: String::new(),
+    };
+    let receipt_bytes = seal_lease_release_receipt(receipt)?;
+    LocalPerfLeaseReleaseReceipt::from_verified_slice(&receipt_bytes)?;
+    Ok(receipt_bytes)
+}
+
+fn seal_lease_release_receipt(
+    mut receipt: LocalPerfLeaseReleaseReceipt,
+) -> Result<Vec<u8>, LocalPerfRunError> {
+    receipt.seal_sha256.clear();
+    let preimage = serde_json::to_vec(&receipt)?;
+    receipt.seal_sha256 = sha256_hex(&preimage);
+    serde_json::to_vec(&receipt).map_err(LocalPerfRunError::from)
+}
+
 fn seal_attempt_receipt(
     mut receipt: LocalPerfAttemptReceipt,
 ) -> Result<Vec<u8>, LocalPerfRunError> {
@@ -6065,6 +6289,16 @@ mod tests {
     }
 
     #[test]
+    fn lease_release_probe_helper() {
+        let Some(path) = std::env::var_os("QUILL_PERF_TEST_LEASE_RELEASE_PATH") else {
+            return;
+        };
+        let (_lease, _identity) =
+            acquire_family_lease(Path::new(&path)).expect("release probe acquires unlocked lease");
+        println!("lease-release-observed");
+    }
+
+    #[test]
     fn lease_crash_recovery_helper() {
         let Some(path) = std::env::var_os("QUILL_PERF_TEST_CRASH_LEASE_PATH") else {
             return;
@@ -6184,6 +6418,30 @@ mod tests {
         holder_output
             .read_to_string(&mut remainder)
             .expect("drain holder output");
+    }
+
+    #[test]
+    fn explicit_lease_unlock_allows_a_real_contender_before_descriptor_drop() {
+        let directory = tempfile::tempdir().expect("lease release test directory");
+        let lease_path = directory.path().join("release.lock");
+        let (lease, _identity) = acquire_family_lease(&lease_path).expect("acquire held lease");
+
+        flock(&lease, FlockOperation::Unlock).expect("explicitly unlock held lease");
+        let current_test = std::env::current_exe().expect("current test executable");
+        let helper_name = "local_perf_runner::tests::lease_release_probe_helper";
+        let output = Command::new(current_test)
+            .args(["--exact", helper_name, "--nocapture"])
+            .env("QUILL_PERF_TEST_LEASE_RELEASE_PATH", &lease_path)
+            .output()
+            .expect("spawn release contender");
+        assert!(
+            output.status.success(),
+            "release contender failed: {output:?}"
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("lease-release-observed"),
+            "release contender did not prove acquisition after explicit unlock"
+        );
     }
 
     #[test]
@@ -6688,6 +6946,56 @@ mod tests {
     }
 
     #[test]
+    fn lease_release_receipt_binds_only_one_completed_attempt_after_unlock() {
+        let (attempt, attempt_bytes, _) =
+            attempt_fixture(LocalPerfAttemptOutcome::Completed, Some(b"bound"));
+        let mut config = policy_config(PerfGate::Qg1);
+        config.profile = attempt.profile;
+        config.run_id = attempt.run_id.clone();
+        config.run_window = attempt.run_window.clone();
+        let bytes = completed_lease_release_receipt_bytes(
+            &config,
+            &attempt.lease_file_identity,
+            &attempt_bytes,
+            "2026-08-03T15:30:00Z",
+        )
+        .expect("seal completed attempt release receipt");
+        let receipt = LocalPerfLeaseReleaseReceipt::from_verified_slice(&bytes)
+            .expect("verify completed attempt release receipt");
+        assert_eq!(
+            receipt.attempt_receipt_sha256,
+            sha256_hex(&attempt_bytes),
+            "release receipt must bind the exact completed attempt bytes"
+        );
+
+        let mut tampered = receipt.clone();
+        tampered.released_at_utc = "not-a-timestamp".to_owned();
+        let bytes = seal_lease_release_receipt(tampered).expect("reseal timestamp tamper");
+        assert!(LocalPerfLeaseReleaseReceipt::from_verified_slice(&bytes).is_err());
+
+        let (_, failed_attempt_bytes, _) =
+            attempt_fixture(LocalPerfAttemptOutcome::ExitedNonzero { code: 17 }, None);
+        assert!(
+            completed_lease_release_receipt_bytes(
+                &config,
+                &attempt.lease_file_identity,
+                &failed_attempt_bytes,
+                "2026-08-03T15:30:00Z",
+            )
+            .is_err()
+        );
+        assert!(
+            completed_lease_release_receipt_bytes(
+                &config,
+                &attempt.lease_file_identity,
+                &attempt_bytes,
+                "0001-01-01T00:00:00Z",
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
     fn log_sync_and_capture_failures_are_typed_without_false_durability_claims() {
         let (sync_failure, _, run_log) = attempt_fixture(
             LocalPerfAttemptOutcome::PostExitRejected {
@@ -7002,11 +7310,16 @@ mod tests {
             source,
             "let persisted_attempt =\n        read_file_at(&run_directories.run.handle",
         );
+        let lease_unlock =
+            unique_marker_offset(source, "flock(&lease_file, FlockOperation::Unlock)");
+        let release_publish = unique_marker_offset(source, "&release_receipt_bytes,");
         assert!(child_inputs_durable < nested_runner);
         assert!(nested_runner < bound_write);
         assert!(bound_write < bound_reload);
         assert!(bound_reload < final_attempt_publish);
         assert!(final_attempt_publish < final_pair_reload);
+        assert!(final_pair_reload < lease_unlock);
+        assert!(lease_unlock < release_publish);
     }
 
     #[test]
