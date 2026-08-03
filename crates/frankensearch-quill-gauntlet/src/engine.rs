@@ -7666,6 +7666,34 @@ mod tests {
         replacement_case.metadata.generator_seed = Some(SEED);
 
         asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let mut in_batch_subject = qg_position_mode_subject(true);
+            in_batch_subject
+                .claim_fresh_campaign()
+                .expect("E6.3 claim in-batch duplicate-ID Quill campaign");
+            let in_batch_error = in_batch_subject
+                .index_mut()
+                .expect("E6.3 open in-batch duplicate-ID Quill campaign")
+                .index_documents(&cx, &[original.clone(), replacement.clone()])
+                .await
+                .expect_err("E6.3 duplicate IDs in one batch must be rejected atomically");
+            assert!(matches!(
+                in_batch_error,
+                QuillIndexError::InvalidState { ref detail }
+                    if detail.contains("duplicate live document id")
+            ));
+            in_batch_subject
+                .mark_committed()
+                .expect("E6.3 publish empty rejected in-batch duplicate-ID campaign");
+            let in_batch_observation = in_batch_subject
+                .observe(&cx, &original_case)
+                .await
+                .expect("E6.3 observe atomic in-batch rejection");
+            assert_eq!(in_batch_observation.doc_count, 0);
+            assert!(
+                in_batch_observation.hits.is_empty(),
+                "E6.3 in-batch duplicate rejection must not partially admit the original"
+            );
+
             let mut subject = qg_position_mode_subject(true);
             subject
                 .claim_fresh_campaign()
