@@ -162,6 +162,8 @@ impl ArtifactGenerationIdentityV1 {
 
 /// Schema carried by immutable generation-authority references and slot frames.
 pub const GENERATION_AUTHORITY_SCHEMA_V1: u16 = 1;
+/// Schema for the deterministic anti-rollback floor reference provider.
+pub const ANTI_ROLLBACK_FLOOR_SCHEMA_V1: u16 = 1;
 /// Exact byte size of one physical `AUTHORITY` slot frame.
 pub const GENERATION_AUTHORITY_SLOT_BYTES_V1: usize = 4_096;
 /// Maximum canonical activation-manifest size accepted before decoding.
@@ -243,6 +245,23 @@ pub enum GenerationAuthorityErrorV1 {
     /// A mutation was attempted through an inspection-only profile.
     #[error("generation authority read-only profile forbids mutation")]
     ReadOnlyProfile,
+    /// An anti-rollback floor compare-and-advance did not name the current
+    /// exact record.
+    #[error("generation authority anti-rollback floor compare-and-advance conflicted")]
+    FloorCompareAndAdvanceConflict,
+    /// An anti-rollback floor update did not advance its authority sequence.
+    #[error("generation authority anti-rollback floor did not advance")]
+    FloorSequenceRegression,
+    /// An idempotency key was reused for a different floor operation.
+    #[error("generation authority anti-rollback floor idempotency key conflicted")]
+    FloorIdempotencyConflict,
+    /// The deterministic reference provider's CAS version was exhausted.
+    #[error("generation authority anti-rollback floor CAS version is exhausted")]
+    FloorVersionExhausted,
+    /// The deterministic reference provider cannot safely continue after a
+    /// poisoned lock.
+    #[error("generation authority anti-rollback floor store is unavailable")]
+    FloorStoreUnavailable,
     /// The immutable activation manifest did not match its stored self-seal.
     #[error("generation activation manifest self-seal mismatch")]
     ManifestSelfSealMismatch,
@@ -539,6 +558,199 @@ impl GenerationRootSecurityProfileV1 {
         } else {
             Err(GenerationAuthorityErrorV1::ReadOnlyProfile)
         }
+    }
+}
+
+/// Versioned, digest-bound result of one successful anti-rollback floor CAS.
+///
+/// The record is intentionally independent of any generation-root path: its
+/// caller owns storage and replication of this receipt outside the replaceable
+/// root it anchors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct AntiRollbackFloorRecordV1 {
+    /// [`ANTI_ROLLBACK_FLOOR_SCHEMA_V1`].
+    pub schema_version: u16,
+    /// Generation root anchored by this record.
+    pub root_id: [u8; 16],
+    /// Exact externally retained authority floor.
+    pub authority: AuthorityRefV1,
+    /// Monotone successful compare-and-advance version for this root.
+    pub cas_version: u64,
+    /// SHA-256 over the canonical record fields above.
+    pub record_sha256: [u8; 32],
+}
+
+impl AntiRollbackFloorRecordV1 {
+    fn new(floor: AuthorityFloorV1, cas_version: u64) -> Result<Self, GenerationAuthorityErrorV1> {
+        floor.validate()?;
+        if cas_version == 0 {
+            return Err(GenerationAuthorityErrorV1::InvalidField {
+                field: "anti_rollback_floor.cas_version",
+            });
+        }
+        let mut record = Self {
+            schema_version: ANTI_ROLLBACK_FLOOR_SCHEMA_V1,
+            root_id: floor.root_id,
+            authority: floor.authority,
+            cas_version,
+            record_sha256: [0; 32],
+        };
+        record.record_sha256 = record.computed_record_sha256();
+        Ok(record)
+    }
+
+    fn validate(&self) -> Result<(), GenerationAuthorityErrorV1> {
+        if self.schema_version != ANTI_ROLLBACK_FLOOR_SCHEMA_V1 {
+            return Err(GenerationAuthorityErrorV1::InvalidField {
+                field: "anti_rollback_floor.schema_version",
+            });
+        }
+        AuthorityFloorV1::new(self.root_id, self.authority)?;
+        if self.cas_version == 0 {
+            return Err(GenerationAuthorityErrorV1::InvalidField {
+                field: "anti_rollback_floor.cas_version",
+            });
+        }
+        if self.record_sha256 != self.computed_record_sha256() {
+            return Err(GenerationAuthorityErrorV1::ChecksumMismatch);
+        }
+        Ok(())
+    }
+
+    fn computed_record_sha256(&self) -> [u8; 32] {
+        let mut encoder = CanonicalEncoder::new(b"frankensearch.anti-rollback-floor-record.v1");
+        encoder.u16(self.schema_version);
+        encoder.bytes(&self.root_id);
+        encoder.bytes(&self.authority.canonical_bytes());
+        encoder.u64(self.cas_version);
+        Sha256::digest(encoder.finish()).into()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AntiRollbackFloorRequestV1 {
+    root_id: [u8; 16],
+    expected_record_sha256: Option<[u8; 32]>,
+    next_authority: AuthorityRefV1,
+    result: AntiRollbackFloorRecordV1,
+}
+
+#[derive(Default)]
+struct AntiRollbackFloorStoreStateV1 {
+    records: BTreeMap<[u8; 16], AntiRollbackFloorRecordV1>,
+    requests: BTreeMap<[u8; 16], AntiRollbackFloorRequestV1>,
+}
+
+/// Deterministic, linearizable in-memory reference provider for anti-rollback
+/// floor conformance tests and consumer integration tests.
+///
+/// This provider is deliberately not a crash-durable authority. Production
+/// callers must inject a consumer-owned provider outside the generation root;
+/// this implementation makes the exact load/CAS/idempotency contract testable
+/// without selecting a storage backend.
+#[derive(Default)]
+pub struct InMemoryAntiRollbackFloorStoreV1 {
+    state: std::sync::Mutex<AntiRollbackFloorStoreStateV1>,
+}
+
+impl InMemoryAntiRollbackFloorStoreV1 {
+    /// Construct an empty deterministic reference provider.
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Load the exact current floor record for one root.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GenerationAuthorityErrorV1::FloorStoreUnavailable`] when a
+    /// prior panic poisoned the reference-provider lock.
+    pub fn load(
+        &self,
+        root_id: [u8; 16],
+    ) -> Result<Option<AntiRollbackFloorRecordV1>, GenerationAuthorityErrorV1> {
+        if root_id == [0; 16] {
+            return Err(GenerationAuthorityErrorV1::InvalidField {
+                field: "anti_rollback_floor.root_id",
+            });
+        }
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| GenerationAuthorityErrorV1::FloorStoreUnavailable)?;
+        Ok(state.records.get(&root_id).copied())
+    }
+
+    /// Atomically compare and advance one root's anti-rollback floor.
+    ///
+    /// `expected` must be the exact record returned by a prior [`Self::load`]
+    /// call (or `None` for a previously unanchored root). Repeating the same
+    /// operation with the same non-zero `idempotency_key` returns the original
+    /// successful receipt; reusing that key for another operation fails closed.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed conflict, regression, idempotency, exhaustion, or store
+    /// availability error without changing the recorded floor.
+    pub fn compare_and_advance(
+        &self,
+        expected: Option<AntiRollbackFloorRecordV1>,
+        next: AuthorityFloorV1,
+        idempotency_key: [u8; 16],
+    ) -> Result<AntiRollbackFloorRecordV1, GenerationAuthorityErrorV1> {
+        next.validate()?;
+        if idempotency_key == [0; 16] {
+            return Err(GenerationAuthorityErrorV1::InvalidField {
+                field: "anti_rollback_floor.idempotency_key",
+            });
+        }
+        if let Some(expected) = expected {
+            expected.validate()?;
+            if expected.root_id != next.root_id {
+                return Err(GenerationAuthorityErrorV1::RootMismatch);
+            }
+        }
+
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| GenerationAuthorityErrorV1::FloorStoreUnavailable)?;
+        let expected_record_sha256 = expected.map(|record| record.record_sha256);
+        if let Some(previous) = state.requests.get(&idempotency_key) {
+            if previous.root_id == next.root_id
+                && previous.expected_record_sha256 == expected_record_sha256
+                && previous.next_authority == next.authority
+            {
+                return Ok(previous.result);
+            }
+            return Err(GenerationAuthorityErrorV1::FloorIdempotencyConflict);
+        }
+
+        let current = state.records.get(&next.root_id).copied();
+        if current != expected {
+            return Err(GenerationAuthorityErrorV1::FloorCompareAndAdvanceConflict);
+        }
+        if current.is_some_and(|record| next.authority.sequence <= record.authority.sequence) {
+            return Err(GenerationAuthorityErrorV1::FloorSequenceRegression);
+        }
+        let cas_version = current
+            .map(|record| record.cas_version)
+            .unwrap_or(0)
+            .checked_add(1)
+            .ok_or(GenerationAuthorityErrorV1::FloorVersionExhausted)?;
+        let result = AntiRollbackFloorRecordV1::new(next, cas_version)?;
+        state.records.insert(next.root_id, result);
+        state.requests.insert(
+            idempotency_key,
+            AntiRollbackFloorRequestV1 {
+                root_id: next.root_id,
+                expected_record_sha256,
+                next_authority: next.authority,
+                result,
+            },
+        );
+        Ok(result)
     }
 }
 
@@ -4541,6 +4753,70 @@ mod tests {
             Err(GenerationAuthorityErrorV1::ReadOnlyProfile),
             "inspection-only admission cannot be reused for mutation"
         );
+    }
+
+    #[test]
+    fn in_memory_anti_rollback_floor_is_exact_monotone_and_idempotent() {
+        let store = InMemoryAntiRollbackFloorStoreV1::new();
+        let genesis = authority_reference(1, None);
+        let genesis_floor =
+            AuthorityFloorV1::new([0x5a; 16], genesis).expect("valid genesis floor");
+        let first = store
+            .compare_and_advance(None, genesis_floor, [0x41; 16])
+            .expect("first floor advance");
+        assert_eq!(first.cas_version, 1);
+        assert_eq!(store.load([0x5a; 16]), Ok(Some(first)));
+        assert_eq!(
+            store.compare_and_advance(None, genesis_floor, [0x41; 16]),
+            Ok(first),
+            "repeating the exact request returns its original receipt"
+        );
+
+        let successor = authority_reference(2, Some(genesis.fingerprint()));
+        let successor_floor =
+            AuthorityFloorV1::new([0x5a; 16], successor).expect("valid successor floor");
+        let second = store
+            .compare_and_advance(Some(first), successor_floor, [0x42; 16])
+            .expect("monotone successor advance");
+        assert_eq!(second.cas_version, 2);
+        assert_eq!(store.load([0x5a; 16]), Ok(Some(second)));
+
+        assert_eq!(
+            store.compare_and_advance(Some(first), successor_floor, [0x43; 16]),
+            Err(GenerationAuthorityErrorV1::FloorCompareAndAdvanceConflict),
+            "a stale exact CAS receipt cannot overwrite a newer floor"
+        );
+        assert_eq!(
+            store.compare_and_advance(Some(second), genesis_floor, [0x44; 16]),
+            Err(GenerationAuthorityErrorV1::FloorSequenceRegression),
+            "a valid older authority cannot roll the retained floor backward"
+        );
+        assert_eq!(
+            store.compare_and_advance(Some(second), successor_floor, [0x41; 16]),
+            Err(GenerationAuthorityErrorV1::FloorIdempotencyConflict),
+            "a completed idempotency key cannot be rebound to another CAS"
+        );
+        assert_eq!(store.load([0x5a; 16]), Ok(Some(second)));
+    }
+
+    #[test]
+    fn in_memory_anti_rollback_floor_rejects_invalid_root_and_request_identity() {
+        let store = InMemoryAntiRollbackFloorStoreV1::new();
+        let authority = authority_reference(1, None);
+        let floor = AuthorityFloorV1::new([0x5a; 16], authority).expect("valid floor");
+        assert_eq!(
+            store.load([0; 16]),
+            Err(GenerationAuthorityErrorV1::InvalidField {
+                field: "anti_rollback_floor.root_id"
+            })
+        );
+        assert_eq!(
+            store.compare_and_advance(None, floor, [0; 16]),
+            Err(GenerationAuthorityErrorV1::InvalidField {
+                field: "anti_rollback_floor.idempotency_key"
+            })
+        );
+        assert_eq!(store.load([0x5a; 16]), Ok(None));
     }
 
     #[test]

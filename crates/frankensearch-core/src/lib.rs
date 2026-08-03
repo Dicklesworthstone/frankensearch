@@ -115,8 +115,9 @@ pub use fingerprint::{
     DEFAULT_SEMANTIC_CHANGE_THRESHOLD, DocumentFingerprint, SIGNIFICANT_CHAR_COUNT_CHANGE_THRESHOLD,
 };
 pub use generation::{
-    ActivationInvariant, ActivationManifestV1, ArtifactGenerationIdentityV1, AuthorityFloorV1,
-    AuthorityRefV1, AuthoritySlotV1, CommitRange, EMBEDDING_INPUT_CONTRACT_SCHEMA_V1,
+    ANTI_ROLLBACK_FLOOR_SCHEMA_V1, ActivationInvariant, ActivationManifestV1,
+    AntiRollbackFloorRecordV1, ArtifactGenerationIdentityV1, AuthorityFloorV1, AuthorityRefV1,
+    AuthoritySlotV1, CommitRange, EMBEDDING_INPUT_CONTRACT_SCHEMA_V1,
     EMBEDDING_PRODUCER_ATTESTATION_SCHEMA_V1, EMBEDDING_SPACE_IDENTITY_SCHEMA_V1, EmbedderRevision,
     EmbedderTierTag, EmbeddingArtifactIdentityV1, EmbeddingIdentityBundleV1,
     EmbeddingInputContractV1, EmbeddingProducerAttestationV1, EmbeddingProjectionV1,
@@ -127,15 +128,16 @@ pub use generation::{
     GENERATION_LOCK_FRAME_BYTES_V1, GenerationAuthorityActionV1, GenerationAuthorityErrorV1,
     GenerationComponentReceiptV1, GenerationComponentReceiptsV1, GenerationLockFrameKindV1,
     GenerationLockFrameV1, GenerationManifest, GenerationRootSecurityProfileV1,
-    GoldenVectorCertificateV1, HashControlProfileV1, InvariantKind, LexicalArtifact,
-    MANIFEST_SCHEMA_VERSION, ProducerCompatibilityErrorV1, ProducerCompatibilityKindV1,
-    ProducerCompatibilityWitnessV1, QuantizationFormat, RepairDescriptor,
-    TrustedProducerConformanceContextV1, VECTOR_STORAGE_IDENTITY_SCHEMA_V1, ValidationFinding,
-    ValidationResult, VectorArtifact, VectorStorageIdentityV1, VerifiedGoldenConformanceManifestV1,
-    compute_manifest_hash, require_valid, resolve_authority_slot_frames_v1,
-    resolve_authority_slots_at_floor_v1, resolve_authority_slots_v1,
-    resolve_authority_slots_with_locks_v1, resolve_authority_slots_with_profile_v1,
-    validate_manifest, verify_authority_manifest_reference_v1,
+    GoldenVectorCertificateV1, HashControlProfileV1, InMemoryAntiRollbackFloorStoreV1,
+    InvariantKind, LexicalArtifact, MANIFEST_SCHEMA_VERSION, ProducerCompatibilityErrorV1,
+    ProducerCompatibilityKindV1, ProducerCompatibilityWitnessV1, QuantizationFormat,
+    RepairDescriptor, TrustedProducerConformanceContextV1, VECTOR_STORAGE_IDENTITY_SCHEMA_V1,
+    ValidationFinding, ValidationResult, VectorArtifact, VectorStorageIdentityV1,
+    VerifiedGoldenConformanceManifestV1, compute_manifest_hash, require_valid,
+    resolve_authority_slot_frames_v1, resolve_authority_slots_at_floor_v1,
+    resolve_authority_slots_v1, resolve_authority_slots_with_locks_v1,
+    resolve_authority_slots_with_profile_v1, validate_manifest,
+    verify_authority_manifest_reference_v1,
 };
 pub use graph::{DocumentGraph, EdgeType, GraphDocId, GraphEdge};
 pub use host_adapter::{
