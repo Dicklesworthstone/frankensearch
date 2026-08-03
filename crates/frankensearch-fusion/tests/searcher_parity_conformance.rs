@@ -25,12 +25,6 @@ use frankensearch_index::{InMemoryTwoTierIndex, InMemoryVectorIndex, TwoTierInde
 /// Each entry pins WHERE the divergence lives so accidental convergence or a
 /// new divergence both surface as test failures worth reading.
 const KNOWN_DIVERGENCES: &[&str] = &[
-    // sync_searcher.rs:469 counts returned top-k HITS; the async searcher
-    // threads the true scanned-vector count through TwoTierMetrics. Same
-    // field name, different quantity — reconciling it is acceptance item 5
-    // of bd-k3089. Until then the suite compares the fields only for
-    // zero/nonzero agreement.
-    "phase1_vectors_searched: hits-returned (sync) vs vectors-scanned (async)",
     // The sync searcher takes a pre-embedded query vector and has no
     // embedder, so fast/quality embedder ids are absent from its metrics.
     "fast_embedder_id/quality_embedder_id: async-only",
@@ -212,7 +206,11 @@ fn assert_scores_close(case: &str, doc: &str, field: &str, s: Option<f32>, a: Op
                 "[{case}] {doc}: {field} diverges beyond fp tolerance: sync={sv} async={av}"
             );
         }
-        _ => panic!("[{case}] {doc}: {field} present on one side only: sync={s:?} async={a:?}"),
+        _ => assert_eq!(
+            s.is_some(),
+            a.is_some(),
+            "[{case}] {doc}: {field} present on one side only: sync={s:?} async={a:?}"
+        ),
     }
 }
 
@@ -221,12 +219,9 @@ fn assert_metric_parity(case: &str, sync_m: &TwoTierMetrics, async_m: &TwoTierMe
         sync_m.skip_reason, async_m.skip_reason,
         "[{case}] skip_reason diverges"
     );
-    // KNOWN_DIVERGENCES[0]: semantics differ; compare only zero/nonzero until
-    // bd-k3089 acceptance item 5 reconciles the field's meaning.
     assert_eq!(
-        sync_m.phase1_vectors_searched > 0,
-        async_m.phase1_vectors_searched > 0,
-        "[{case}] phase1_vectors_searched zero/nonzero disagreement"
+        sync_m.phase1_vectors_searched, async_m.phase1_vectors_searched,
+        "[{case}] phase1_vectors_searched diverges"
     );
     assert_eq!(
         sync_m.phase2_vectors_searched > 0,
@@ -309,22 +304,21 @@ fn orthogonal_query_agrees() {
 }
 
 #[test]
-fn known_divergence_allowlist_is_still_accurate() {
-    // The allowlist is a contract: entry 0 documents that the sync searcher
-    // reports top-k hit counts. If someone reconciles the semantics (bd-k3089
-    // acceptance item 5), this test MUST be updated together with the
-    // allowlist — that is the point.
-    assert_eq!(KNOWN_DIVERGENCES.len(), 2);
+fn phase1_vectors_searched_reports_the_evaluated_corpus_at_small_k() {
+    assert_eq!(KNOWN_DIVERGENCES.len(), 1);
     let config = TwoTierConfig::default();
-    let k = 2;
+    let k = 1;
     let query = normalize(vec![1.0, 0.0, 0.0, 0.0]);
-    let (_, metrics) = run_sync(&config, &query, k);
-    let candidate_pool = (k * config.candidate_multiplier).min(DOCS.len());
+    let (_, sync_metrics) = run_sync(&config, &query, k);
+    let (_, async_metrics) = run_async("small-k-vector-count", &config, &query, k);
     assert_eq!(
-        metrics.phase1_vectors_searched, candidate_pool,
-        "sync phase1_vectors_searched no longer equals the fetched candidate \
-         pool — if you reconciled the field semantics with the async \
-         vectors-scanned count, update KNOWN_DIVERGENCES and the zero/nonzero \
-         comparison in assert_metric_parity (bd-k3089)"
+        sync_metrics.phase1_vectors_searched,
+        DOCS.len(),
+        "sync phase1_vectors_searched must count evaluated vectors, not the \
+         returned candidate pool"
+    );
+    assert_eq!(
+        sync_metrics.phase1_vectors_searched, async_metrics.phase1_vectors_searched,
+        "small-k phase1_vectors_searched must agree across implementations"
     );
 }
