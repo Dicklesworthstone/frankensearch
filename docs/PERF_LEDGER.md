@@ -8551,3 +8551,35 @@ separate from any speed ranking. See
 and the corresponding negative-evidence entry for full provenance. The public
 CHANGELOG therefore carries no fastest or external-performance claim for this
 primitive.
+
+## 2026-08-03 — CORRECTION: QG-1 TRJ width sweep is structurally invalid / diagnostic only (`bd-qg1-invalid-sweep-quarantine-h4sqj`)
+
+The retained historical sweep committed as `193d2e3f` (with clean-source
+reference `544ffeb19b519d2e6c849f68334a3eabefb3573a` and historical ELF
+digest reference `e0dc6ba3c3c651e25e5693c12e053c1f77e829f38aac603f692266d8e7306ba1`)
+is **STRUCTURALLY INVALID / DIAGNOSTIC ONLY**. The raw commit tree and all
+named historical files remain preserved; this correction neither removes nor
+rewrites them. The abbreviated `e0dc6ba3` Git object is not present in this
+checkout, so it is retained only as a historical digest reference, not
+re-verified provenance.
+
+No throughput magnitude, scaling breakpoint, target-distance, fastest-
+incumbent screen, or gate-activation conclusion may be derived from this
+sweep. Corpus generation occurred between timed calls, letting Tantivy
+background work escape the measured interval while Quill remained
+synchronous. Configured pool width was substituted for observed work. The
+selection also lacks complete manifest coverage, admissible nulls,
+machine-class proof, matched work-unit and byte-count facts, terminal
+quiescence, and complete source/ELF provenance. Historical directional prose
+about a two-worker Tantivy stop and all ratio tables are therefore withdrawn
+as evidence, not reinterpreted as a weaker performance result.
+
+The current authoritative state is
+`.bench-history/QG-1.v7.unmeasured.latest.json`. Historical v3 artifacts are
+read-only diagnostics and cannot masquerade as v5 evidence or a v7 ratchet
+baseline; an unattested or partial selection remains no-claim. A retry must
+use a fresh-process, exact-operation, complete normative matrix with corpus
+generation outside every timed interval; retained matched work-unit,
+byte-count, terminal-quiescence, source, ELF, host, and actual-concurrency
+facts; genuine pinned-incumbent screening; and valid same-invocation A/A
+controls before any new QG-1 decision is considered.
