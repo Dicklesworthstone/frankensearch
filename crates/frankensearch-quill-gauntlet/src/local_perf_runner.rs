@@ -50,7 +50,7 @@ use crate::{PerfCellApplicability, PerfCellApplicabilityReason};
 const PRODUCER_CONTRACT_SCHEMA_VERSION: &str =
     "frankensearch.quill-local-perf-producer-contract.v1";
 /// Strict wire schema for one local-run process-attempt receipt.
-pub const LOCAL_PERF_ATTEMPT_RECEIPT_SCHEMA_VERSION: &str = "frankensearch.perf-runner-attempt.v5";
+pub const LOCAL_PERF_ATTEMPT_RECEIPT_SCHEMA_VERSION: &str = "frankensearch.perf-runner-attempt.v6";
 /// Strict schema for the diagnostic inventory retained before runner completion.
 pub const PERF_RUN_PRECOMMIT_SCHEMA_VERSION: &str = "frankensearch.perf-run-precommit.v5";
 const MAX_IDENTITY_COMPONENT_BYTES: usize = 96;
@@ -369,6 +369,7 @@ pub enum LocalPerfRejectionStage {
     ExitStatusPersistence,
     FinishedTimestamp,
     EndPlatformCapture,
+    RootProcessIdentity,
     PostRunIdentity,
     ArtifactRead,
     ArtifactDurability,
@@ -434,6 +435,32 @@ pub struct LocalPerfProcessLifecycle {
 #[serde(rename_all = "snake_case")]
 pub enum LocalPerfProcessTreeQuiescence {
     DirectChildOnly,
+}
+
+/// Root-process authority retained by a local producer attempt.
+///
+/// A PID on its own is never authority to signal a later process: Linux can
+/// reuse it after the original child exits. The only verified form therefore
+/// binds that PID to the kernel's `/proc/<pid>/stat` start-time tick captured
+/// immediately after spawn. Other platforms and failed captures are retained
+/// as an explicit absence, which rejects completed receipt publication.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum LocalPerfRootProcessIdentity {
+    /// `Command::spawn` did not return a child PID.
+    NotSpawned,
+    /// Linux PID plus its kernel-reported process birth tick.
+    LinuxProcStartTime { pid: u32, start_time_ticks: u64 },
+    /// A child was spawned, but no birth identity was safely captured.
+    Unverifiable { pid: u32 },
+}
+
+impl LocalPerfRootProcessIdentity {
+    /// Whether this value binds a PID to a non-reusable process birth identity.
+    #[must_use]
+    pub const fn has_verified_birth_identity(self) -> bool {
+        matches!(self, Self::LinuxProcStartTime { .. })
+    }
 }
 
 // This public contract is consumed by the dependent H4 assembler slice; keep
@@ -591,6 +618,7 @@ pub struct LocalPerfAttemptReceipt {
     outcome: LocalPerfAttemptOutcome,
     retry: LocalPerfRetryPredicate,
     process_lifecycle: LocalPerfProcessLifecycle,
+    root_process_identity: LocalPerfRootProcessIdentity,
     internal_lifecycle_gaps: LocalPerfInternalLifecycleGaps,
     unsupported_controls: Vec<LocalPerfUnsupportedControl>,
     run_log_sha256: Option<String>,
@@ -862,6 +890,12 @@ impl LocalPerfAttemptReceipt {
         self.process_lifecycle
     }
 
+    /// Root PID/birth identity captured immediately after spawn.
+    #[must_use]
+    pub const fn root_process_identity(&self) -> LocalPerfRootProcessIdentity {
+        self.root_process_identity
+    }
+
     /// Explicit gaps for engine-internal facts the outer runner cannot prove.
     #[must_use]
     pub const fn internal_lifecycle_gaps(&self) -> LocalPerfInternalLifecycleGaps {
@@ -1074,6 +1108,12 @@ impl LocalPerfAttemptReceipt {
                 self.run_log_sha256.is_some(),
             )
             .is_err()
+            || validate_root_process_identity(
+                self.outcome,
+                self.process_lifecycle,
+                self.root_process_identity,
+            )
+            .is_err()
             || self.internal_lifecycle_gaps != expected_gaps
             || self.unsupported_controls
                 != [
@@ -1261,8 +1301,11 @@ fn run_local_perf_command_inner(
         .stdout(Stdio::from(run_log))
         .stderr(Stdio::from(run_log_stderr));
     configure_benchmark_child(&mut child, &captured_build.measurement_environment);
-    let mut child = match child.spawn() {
-        Ok(child) => child,
+    let (mut child, root_process_identity) = match child.spawn() {
+        Ok(child) => {
+            let root_process_identity = capture_root_process_identity(&child);
+            (child, root_process_identity)
+        }
         Err(error) => {
             let run_log_synced = run_log_sync.sync_all().is_ok();
             let run_log_bytes = read_file_at(&run_directories.run.handle, "run.log").ok();
@@ -1294,6 +1337,7 @@ fn run_local_perf_command_inner(
                 &start,
                 outcome,
                 process_lifecycle,
+                LocalPerfRootProcessIdentity::NotSpawned,
                 run_log_bytes.as_deref(),
                 &started_at_utc,
             )?;
@@ -1344,6 +1388,7 @@ fn run_local_perf_command_inner(
             &start,
             outcome,
             process_lifecycle,
+            root_process_identity,
             run_log_result.as_deref().ok(),
             &started_at_utc,
         )?;
@@ -1370,6 +1415,7 @@ fn run_local_perf_command_inner(
                 &start,
                 outcome,
                 process_lifecycle,
+                root_process_identity,
                 None,
                 &started_at_utc,
             )?;
@@ -1402,6 +1448,7 @@ fn run_local_perf_command_inner(
             &start,
             outcome,
             process_lifecycle,
+            root_process_identity,
             Some(&run_log_bytes),
             &started_at_utc,
         )?;
@@ -1424,6 +1471,7 @@ fn run_local_perf_command_inner(
             &start,
             outcome,
             process_lifecycle,
+            root_process_identity,
             Some(&run_log_bytes),
             &started_at_utc,
         )?;
@@ -1457,6 +1505,7 @@ fn run_local_perf_command_inner(
             &start,
             outcome,
             process_lifecycle,
+            root_process_identity,
             Some(&run_log_bytes),
             &started_at_utc,
         )?;
@@ -1480,6 +1529,7 @@ fn run_local_perf_command_inner(
             &start,
             outcome,
             process_lifecycle,
+            root_process_identity,
             Some(&run_log_bytes),
             &started_at_utc,
         )?;
@@ -1496,6 +1546,11 @@ fn run_local_perf_command_inner(
             )?);
         }
     };
+    if !root_process_identity.has_verified_birth_identity() {
+        return Err(post_exit_rejection(
+            LocalPerfRejectionStage::RootProcessIdentity,
+        )?);
+    }
     let finished_at_utc = match utc_now() {
         Ok(timestamp) => timestamp,
         Err(_) => {
@@ -1725,6 +1780,7 @@ fn run_local_perf_command_inner(
         &end,
         &bound_evidence_bytes,
         &run_log_bytes,
+        root_process_identity,
         &started_at_utc,
         &finished_at_utc,
     ) {
@@ -4113,6 +4169,7 @@ fn write_failed_attempt_receipt(
     start: &PlatformCapture,
     outcome: LocalPerfAttemptOutcome,
     process_lifecycle: LocalPerfProcessLifecycle,
+    root_process_identity: LocalPerfRootProcessIdentity,
     run_log_bytes: Option<&[u8]>,
     started_at_utc: &str,
 ) -> Result<PathBuf, LocalPerfRunError> {
@@ -4191,6 +4248,7 @@ fn write_failed_attempt_receipt(
         outcome,
         run_selection,
         process_lifecycle,
+        root_process_identity,
         run_log_bytes,
         None,
         started_at_utc,
@@ -4215,6 +4273,7 @@ fn completed_attempt_receipt_bytes(
     end: &PlatformCapture,
     bound_evidence_bytes: &[u8],
     run_log_bytes: &[u8],
+    root_process_identity: LocalPerfRootProcessIdentity,
     started_at_utc: &str,
     finished_at_utc: &str,
 ) -> Result<Vec<u8>, LocalPerfRunError> {
@@ -4269,6 +4328,7 @@ fn completed_attempt_receipt_bytes(
             run_log_synced: true,
             run_log_captured: true,
         },
+        root_process_identity,
         Some(run_log_bytes),
         Some(bound_evidence_bytes),
         started_at_utc,
@@ -4292,6 +4352,7 @@ fn persist_attempt_receipt(
     outcome: LocalPerfAttemptOutcome,
     run_selection: &ResolvedRunSelection,
     process_lifecycle: LocalPerfProcessLifecycle,
+    root_process_identity: LocalPerfRootProcessIdentity,
     run_log_bytes: Option<&[u8]>,
     completed_bound_evidence: Option<&[u8]>,
     started_at_utc: &str,
@@ -4311,6 +4372,7 @@ fn persist_attempt_receipt(
         outcome,
         run_selection,
         process_lifecycle,
+        root_process_identity,
         run_log_bytes,
         completed_bound_evidence,
         started_at_utc,
@@ -4342,6 +4404,7 @@ fn build_attempt_receipt_bytes(
     outcome: LocalPerfAttemptOutcome,
     run_selection: &ResolvedRunSelection,
     process_lifecycle: LocalPerfProcessLifecycle,
+    root_process_identity: LocalPerfRootProcessIdentity,
     run_log_bytes: Option<&[u8]>,
     completed_bound_evidence: Option<&[u8]>,
     started_at_utc: &str,
@@ -4393,6 +4456,7 @@ fn build_attempt_receipt_bytes(
         outcome,
         retry,
         process_lifecycle,
+        root_process_identity,
         internal_lifecycle_gaps: LocalPerfInternalLifecycleGaps {
             actual_work: unavailable,
             queue: unavailable,
@@ -4662,6 +4726,72 @@ fn validate_process_lifecycle(
     Ok(())
 }
 
+fn validate_root_process_identity(
+    outcome: LocalPerfAttemptOutcome,
+    lifecycle: LocalPerfProcessLifecycle,
+    root_process_identity: LocalPerfRootProcessIdentity,
+) -> Result<(), LocalPerfRunError> {
+    let identity_matches_spawn = matches!(
+        (lifecycle.spawn_succeeded, root_process_identity),
+        (false, LocalPerfRootProcessIdentity::NotSpawned)
+            | (
+                true,
+                LocalPerfRootProcessIdentity::LinuxProcStartTime {
+                    pid: 1..,
+                    start_time_ticks: 1..
+                }
+            )
+            | (
+                true,
+                LocalPerfRootProcessIdentity::Unverifiable { pid: 1.. }
+            )
+    );
+    if !identity_matches_spawn
+        || (outcome == LocalPerfAttemptOutcome::Completed
+            && !root_process_identity.has_verified_birth_identity())
+    {
+        return Err(LocalPerfRunError::Invalid(
+            "attempt root-process identity contradicts spawn state or completed receipt authority"
+                .to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn capture_root_process_identity(child: &Child) -> LocalPerfRootProcessIdentity {
+    let pid = child.id();
+    let stat_path = format!("/proc/{pid}/stat");
+    let identity = fs::read_to_string(stat_path)
+        .ok()
+        .and_then(|stat| parse_linux_proc_start_time(&stat))
+        .map(
+            |start_time_ticks| LocalPerfRootProcessIdentity::LinuxProcStartTime {
+                pid,
+                start_time_ticks,
+            },
+        );
+    identity.unwrap_or(LocalPerfRootProcessIdentity::Unverifiable { pid })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn capture_root_process_identity(child: &Child) -> LocalPerfRootProcessIdentity {
+    LocalPerfRootProcessIdentity::Unverifiable { pid: child.id() }
+}
+
+#[cfg(target_os = "linux")]
+fn parse_linux_proc_start_time(stat: &str) -> Option<u64> {
+    // `/proc/<pid>/stat`'s second field is parenthesized and may itself carry
+    // spaces or parentheses. Split from its final close-paren so field 22
+    // (the start-time tick) stays positional even for adversarial comm values.
+    let (_, suffix) = stat.rsplit_once(')')?;
+    suffix
+        .split_ascii_whitespace()
+        .nth(19)
+        .and_then(|start_time_ticks| start_time_ticks.parse::<u64>().ok())
+        .filter(|start_time_ticks| *start_time_ticks > 0)
+}
+
 fn validate_attempt_build(build: &RunnerBuild) -> Result<(), LocalPerfRunError> {
     let producer = &build.producer;
     if !is_git_revision(&build.git_revision)
@@ -4830,6 +4960,10 @@ pub fn completed_attempt_receipt_for_test(
             child_reaped: true,
             run_log_synced: true,
             run_log_captured: true,
+        },
+        root_process_identity: LocalPerfRootProcessIdentity::LinuxProcStartTime {
+            pid: 37,
+            start_time_ticks: 81,
         },
         internal_lifecycle_gaps: LocalPerfInternalLifecycleGaps {
             actual_work: unavailable,
@@ -5059,6 +5193,14 @@ mod tests {
             },
         };
         let completed = outcome == LocalPerfAttemptOutcome::Completed;
+        let root_process_identity = if process_lifecycle.spawn_succeeded {
+            LocalPerfRootProcessIdentity::LinuxProcStartTime {
+                pid: 37,
+                start_time_ticks: 81,
+            }
+        } else {
+            LocalPerfRootProcessIdentity::NotSpawned
+        };
         let manifest_sha256 = identity
             .artifact_manifest()
             .expect("artifact-bound runner fixture")
@@ -5109,6 +5251,7 @@ mod tests {
             outcome,
             retry,
             process_lifecycle,
+            root_process_identity,
             internal_lifecycle_gaps: LocalPerfInternalLifecycleGaps {
                 actual_work: unavailable,
                 queue: unavailable,
@@ -5920,6 +6063,9 @@ mod tests {
                 stage: LocalPerfRejectionStage::FinishedTimestamp,
             },
             LocalPerfAttemptOutcome::PostExitRejected {
+                stage: LocalPerfRejectionStage::RootProcessIdentity,
+            },
+            LocalPerfAttemptOutcome::PostExitRejected {
                 stage: LocalPerfRejectionStage::PostRunIdentity,
             },
             LocalPerfAttemptOutcome::PostExitRejected {
@@ -6491,6 +6637,42 @@ mod tests {
         unreaped.wait_completed = false;
         unreaped.child_reaped = false;
         assert!(validate_process_lifecycle(recovered, unreaped, true).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_root_birth_identity_uses_the_final_proc_comm_delimiter() {
+        let stat = "37 (benchmark) worker)) R 1 1 1 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 81";
+        assert_eq!(parse_linux_proc_start_time(stat), Some(81));
+        assert_eq!(parse_linux_proc_start_time("37 (benchmark) R 1 2"), None);
+    }
+
+    #[test]
+    fn root_birth_identity_is_captured_before_the_child_can_be_reaped() {
+        let source = production_source();
+        let spawned = unique_marker_offset(
+            source,
+            "let (mut child, root_process_identity) = match child.spawn()",
+        );
+        let captured = unique_marker_offset(
+            source,
+            "let root_process_identity = capture_root_process_identity(&child);",
+        );
+        let waited = unique_marker_offset(
+            source,
+            "let (status, recovered_wait_error) = match child.wait()",
+        );
+        assert!(spawned < captured);
+        assert!(captured < waited);
+    }
+
+    #[test]
+    fn completed_receipt_rejects_an_unverifiable_root_pid() {
+        let (receipt, _, _) = attempt_fixture(LocalPerfAttemptOutcome::Completed, Some(b"bound"));
+        let mut receipt = receipt;
+        receipt.root_process_identity = LocalPerfRootProcessIdentity::Unverifiable { pid: 37 };
+        let bytes = seal_attempt_receipt(receipt).expect("reseal root-identity mutation");
+        assert!(LocalPerfAttemptReceipt::from_verified_slice(&bytes).is_err());
     }
 
     #[test]
