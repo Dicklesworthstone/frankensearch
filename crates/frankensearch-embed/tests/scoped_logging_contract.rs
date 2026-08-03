@@ -188,7 +188,7 @@ fn terminate_and_reap(child: &mut Child) -> ExitStatus {
     child.wait().expect("terminated child must be reaped")
 }
 
-fn read_bounded_child(mut child: Child) -> Result<ChildOutput, ChildFailure> {
+fn read_bounded_child(mut child: Child, timeout: Duration) -> Result<ChildOutput, ChildFailure> {
     let stdout = child.stdout.take().expect("child stdout must be piped");
     let stderr = child.stderr.take().expect("child stderr must be piped");
     let (tx, rx) = mpsc::channel();
@@ -201,7 +201,7 @@ fn read_bounded_child(mut child: Child) -> Result<ChildOutput, ChildFailure> {
     let mut closed_streams = 0;
     let mut terminal_status = None;
     loop {
-        if started.elapsed() > CHILD_TIMEOUT {
+        if started.elapsed() > timeout {
             return Err(ChildFailure::Timeout {
                 status: terminate_and_reap(&mut child),
             });
@@ -243,10 +243,7 @@ fn read_bounded_child(mut child: Child) -> Result<ChildOutput, ChildFailure> {
     })
 }
 
-fn run_child_with_rust_log(
-    case: &str,
-    rust_log: Option<OsString>,
-) -> Result<ChildOutput, ChildFailure> {
+fn spawn_child(case: &str, rust_log: Option<OsString>) -> Child {
     let mut command = Command::new(std::env::current_exe().expect("test binary must exist"));
     command
         .arg(CHILD_TEST)
@@ -261,15 +258,28 @@ fn run_child_with_rust_log(
     if let Some(rust_log) = rust_log {
         command.env("RUST_LOG", rust_log);
     }
-    read_bounded_child(
-        command
-            .spawn()
-            .expect("fresh-process logging child must start"),
-    )
+    command
+        .spawn()
+        .expect("fresh-process logging child must start")
+}
+
+fn run_child_with_rust_log(
+    case: &str,
+    rust_log: Option<OsString>,
+) -> Result<ChildOutput, ChildFailure> {
+    read_bounded_child(spawn_child(case, rust_log), CHILD_TIMEOUT)
 }
 
 fn run_child(case: &str, rust_log: Option<&str>) -> Result<ChildOutput, ChildFailure> {
     run_child_with_rust_log(case, rust_log.map(OsString::from))
+}
+
+fn run_child_with_timeout(
+    case: &str,
+    rust_log: Option<&str>,
+    timeout: Duration,
+) -> Result<ChildOutput, ChildFailure> {
+    read_bounded_child(spawn_child(case, rust_log.map(OsString::from)), timeout)
 }
 
 fn run_passing_child(case: &str, rust_log: Option<&str>) -> ChildOutput {
@@ -410,6 +420,28 @@ fn fresh_process_byte_limit_reaps_noisy_child() {
 }
 
 #[test]
+fn fresh_process_timeout_reaps_stalled_child() {
+    match run_child_with_timeout("timeout-stall", None, Duration::from_millis(50)) {
+        Err(ChildFailure::Timeout { status }) => assert!(
+            !status.success(),
+            "stalled child must be terminated rather than succeed"
+        ),
+        Err(ChildFailure::OutputLimit {
+            bytes,
+            lines,
+            status,
+        }) => panic!(
+            "stalled child unexpectedly hit output cap: {bytes} bytes, {lines} lines, {status:?}"
+        ),
+        Ok(output) => panic!(
+            "stalled child unexpectedly passed after {} bytes and {} lines",
+            output.bytes.len(),
+            output.lines,
+        ),
+    }
+}
+
+#[test]
 fn fresh_process_child() {
     let Ok(case) = std::env::var(CHILD_CASE_ENV) else {
         return;
@@ -457,6 +489,7 @@ fn fresh_process_child() {
                     .expect("byte-overflow child must flush stdout");
             }
         }
+        "timeout-stall" => thread::sleep(Duration::from_secs(1)),
         other => panic!("unknown fresh-process logging child case {other:?}"),
     }
 }
