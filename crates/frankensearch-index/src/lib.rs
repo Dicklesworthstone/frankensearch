@@ -556,23 +556,13 @@ pub struct FsviSnapshotRejected {
     pub detail: String,
 }
 
-/// Why owner-backed ANN is unavailable in this API slice.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum FsviAnnDisabledReason {
-    /// Existing HNSW APIs accept a mutable/path-opened [`VectorIndex`] and
-    /// therefore cannot prove that graph validation consumed this owner's
-    /// exact byte image.
-    OwnerBoundAdapterUnavailable,
-}
-
 /// Typed ANN disposition for one immutable FSVI owner.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case", tag = "status", content = "reason")]
+#[serde(rename_all = "snake_case", tag = "status")]
 pub enum FsviAnnAdmission {
-    /// ANN must not load or rebuild; callers must use the owner's exact-search
-    /// path until an owner-bound graph receipt and adapter are available.
-    Disabled(FsviAnnDisabledReason),
+    /// [`crate::native_hnsw::ValidatedNativeHnsw`] builds and loads only from
+    /// this retained owner and binds the graph receipt to its exact witness.
+    Enabled,
 }
 
 /// Why a recognized artifact must be rebuilt rather than adopted or relabeled.
@@ -1320,11 +1310,10 @@ impl ValidatedFsviBytes {
         ValidatedFsviRowSource { owner: self }
     }
 
-    /// ANN is explicitly disabled until HNSW load/rebuild accepts this sealed
-    /// owner and binds its graph receipt to this exact witness.
+    /// Owner-bound native HNSW can build or load only against this exact owner.
     #[must_use]
     pub const fn ann_admission(&self) -> FsviAnnAdmission {
-        FsviAnnAdmission::Disabled(FsviAnnDisabledReason::OwnerBoundAdapterUnavailable)
+        FsviAnnAdmission::Enabled
     }
 
     /// Exact top-k search over the owned image.
@@ -6293,10 +6282,7 @@ mod tests {
         assert_eq!(index.bytes.as_ref(), before_bytes.as_slice());
         assert_eq!(index.witness(), &before_witness);
 
-        assert_eq!(
-            index.ann_admission(),
-            FsviAnnAdmission::Disabled(FsviAnnDisabledReason::OwnerBoundAdapterUnavailable)
-        );
+        assert_eq!(index.ann_admission(), FsviAnnAdmission::Enabled);
         assert!(!wal::wal_path_for(&path).exists());
     }
 
@@ -6655,10 +6641,7 @@ mod tests {
         expected_docset.update(b"live-result");
         let expected_docset: [u8; SHA256_BYTES] = expected_docset.finalize().into();
         assert_eq!(owner.witness().ordered_live_docset_digest, expected_docset);
-        assert_eq!(
-            owner.ann_admission(),
-            FsviAnnAdmission::Disabled(FsviAnnDisabledReason::OwnerBoundAdapterUnavailable)
-        );
+        assert_eq!(owner.ann_admission(), FsviAnnAdmission::Enabled);
     }
 
     #[test]
