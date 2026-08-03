@@ -76,6 +76,15 @@ frankensearch-quill = { version = "0.2.1", path = "crates/frankensearch-quill" }
 asupersync = { version = ">=0.3.10, <0.4", default-features = false, features = ["proc-macros"] }
 arc-swap = "=1.9.2"
 
+# Descriptor-relative generation-root admission. Keep the syscall surface
+# explicit so unsupported targets compile without pulling platform code in.
+rustix = { version = "=1.1.4", default-features = false, features = [
+    "std",
+    "fs",
+    "process",
+    "thread",
+] }
+
 # Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
