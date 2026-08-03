@@ -250,9 +250,15 @@ fn assert_result_parity(case: &str, sync_r: &[ScoredResult], async_r: &[ScoredRe
         "[{case}] ordered doc_id lists diverge (bd-k3089 class)"
     );
     for (s, a) in sync_r.iter().zip(async_r.iter()) {
+        assert_scores_close(case, &s.doc_id, "score", Some(s.score), Some(a.score));
         assert_eq!(
             s.source, a.source,
             "[{case}] {}: ScoreSource diverges",
+            s.doc_id
+        );
+        assert_eq!(
+            s.index, a.index,
+            "[{case}] {}: vector index diverges",
             s.doc_id
         );
         assert_scores_close(case, &s.doc_id, "fast_score", s.fast_score, a.fast_score);
@@ -262,6 +268,32 @@ fn assert_result_parity(case: &str, sync_r: &[ScoredResult], async_r: &[ScoredRe
             "quality_score",
             s.quality_score,
             a.quality_score,
+        );
+        assert_scores_close(
+            case,
+            &s.doc_id,
+            "lexical_score",
+            s.lexical_score,
+            a.lexical_score,
+        );
+        assert_scores_close(
+            case,
+            &s.doc_id,
+            "rerank_score",
+            s.rerank_score,
+            a.rerank_score,
+        );
+        assert_eq!(
+            s.explanation.is_some(),
+            a.explanation.is_some(),
+            "[{case}] {}: explanation presence diverges",
+            s.doc_id
+        );
+        assert_eq!(
+            s.metadata.as_deref(),
+            a.metadata.as_deref(),
+            "[{case}] {}: metadata diverges",
+            s.doc_id
         );
     }
 }
