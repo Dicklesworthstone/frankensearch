@@ -1431,9 +1431,9 @@ fn run_local_perf_command_inner(
             }
         }
     };
-    let (process_tree_quiescence, descendant_processes_observed) = descendant_scope
-        .reconcile_after_root_exit()
-        .map_err(|error_kind| LocalPerfRunError::UnreapedProcessTree { error_kind })?;
+    let (process_tree_quiescence, descendant_processes_observed) =
+        LocalPerfDescendantScope::reconcile_after_root_exit()
+            .map_err(|error_kind| LocalPerfRunError::UnreapedProcessTree { error_kind })?;
     descendant_scope.restore()?;
     let run_log_synced = run_log_sync.sync_all().is_ok();
     let run_log_result = read_file_at(&run_directories.run.handle, "run.log");
@@ -4702,9 +4702,9 @@ impl LocalPerfDescendantScope {
     fn enter() -> Result<Self, LocalPerfRunError> {
         #[cfg(target_os = "linux")]
         {
-            return Ok(Self {
+            Ok(Self {
                 linux: LinuxSubreaperScope::enter()?,
-            });
+            })
         }
         #[cfg(not(target_os = "linux"))]
         {
@@ -4712,12 +4712,11 @@ impl LocalPerfDescendantScope {
         }
     }
 
-    fn reconcile_after_root_exit(
-        &mut self,
-    ) -> Result<(LocalPerfProcessTreeQuiescence, u32), LocalPerfIoErrorKind> {
+    fn reconcile_after_root_exit()
+    -> Result<(LocalPerfProcessTreeQuiescence, u32), LocalPerfIoErrorKind> {
         #[cfg(target_os = "linux")]
         {
-            return self.linux.reconcile_after_root_exit();
+            LinuxSubreaperScope::reconcile_after_root_exit()
         }
         #[cfg(not(target_os = "linux"))]
         {
@@ -4764,9 +4763,8 @@ impl LinuxSubreaperScope {
         })
     }
 
-    fn reconcile_after_root_exit(
-        &mut self,
-    ) -> Result<(LocalPerfProcessTreeQuiescence, u32), LocalPerfIoErrorKind> {
+    fn reconcile_after_root_exit()
+    -> Result<(LocalPerfProcessTreeQuiescence, u32), LocalPerfIoErrorKind> {
         reap_linux_descendants()?;
         let descendants =
             linux_descendant_pids().map_err(|error| local_perf_io_error_kind(&error))?;
@@ -6981,7 +6979,9 @@ mod tests {
             1
         );
         assert_eq!(
-            wait_slice.matches(".reconcile_after_root_exit()").count(),
+            wait_slice
+                .matches("LocalPerfDescendantScope::reconcile_after_root_exit()")
+                .count(),
             1,
             "root recovery must still reconcile adopted descendants before logs are sealed"
         );
@@ -7125,8 +7125,7 @@ mod tests {
             .spawn()
             .expect("spawn zero-descendant child");
         assert!(child.wait().expect("wait zero-descendant child").success());
-        let (quiescence, observed) = scope
-            .reconcile_after_root_exit()
+        let (quiescence, observed) = LocalPerfDescendantScope::reconcile_after_root_exit()
             .expect("reconcile empty descendant tree");
         scope.restore().expect("restore subreaper state");
         assert_eq!(
@@ -7145,9 +7144,8 @@ mod tests {
             .spawn()
             .expect("spawn background-descendant child");
         assert!(child.wait().expect("wait root child").success());
-        let (quiescence, observed) = scope
-            .reconcile_after_root_exit()
-            .expect("reap adopted descendant");
+        let (quiescence, observed) =
+            LocalPerfDescendantScope::reconcile_after_root_exit().expect("reap adopted descendant");
         scope.restore().expect("restore subreaper state");
         assert_eq!(
             quiescence,
@@ -7177,8 +7175,7 @@ mod tests {
             Some(7),
             "the root must retain its nonzero terminal status"
         );
-        let (quiescence, observed) = scope
-            .reconcile_after_root_exit()
+        let (quiescence, observed) = LocalPerfDescendantScope::reconcile_after_root_exit()
             .expect("reap descendant after failed root");
         scope.restore().expect("restore subreaper state");
         assert_eq!(
