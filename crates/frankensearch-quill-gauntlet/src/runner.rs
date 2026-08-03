@@ -17339,6 +17339,34 @@ mod tests {
                 "the seeded corpus must exercise the finite leaf-boost AST branch"
             );
 
+            let grouped_query =
+                format!("({} OR {}) {}", vocabulary[0], vocabulary[1], vocabulary[2]);
+            let grouped_case = DifferentialCase {
+                fixture_id: "bsjw-nested-boolean-one-level".to_owned(),
+                query: grouped_query.clone(),
+                limit: 20,
+                offset: 0,
+                tie_expansion_limit: 256,
+                count_requested: false,
+                snippet_max_chars: None,
+                metadata: DifferentialCaseMetadata {
+                    generator_id: Some("bsjw-query-tree-v1".to_owned()),
+                    generator_seed: Some(0x6273_6a77_0003),
+                    corpus_hash: Some(corpus_hash.clone()),
+                },
+            };
+            let grouped_run = harness
+                .run(&cx, &subject, &oracle, &grouped_case)
+                .await
+                .unwrap_or_else(|error| panic!("nested Boolean probe failed: {error}"));
+            assert_eq!(
+                grouped_run.comparison.status,
+                ComparisonStatus::Exact,
+                "nested Boolean probe must be exact: query={grouped_query:?} first={:?} divergences={:?}",
+                grouped_run.comparison.first_divergence,
+                grouped_run.comparison.divergences,
+            );
+
             // Typed-error lane: phrase slop is a declared Quill capability gap.
             // The subject must refuse every generated slop AST with its exact
             // typed error while the oracle executes. Crucially, the ordinary
