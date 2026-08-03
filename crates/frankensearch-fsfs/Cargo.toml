@@ -1,6 +1,6 @@
 [package]
 name = "frankensearch-fsfs"
-version = "1.3.0"
+version = "1.4.3"
 description = "Standalone fsfs CLI for two-tier hybrid local search"
 edition.workspace = true
 rust-version.workspace = true
@@ -10,8 +10,13 @@ keywords = ["search", "cli", "semantic", "bm25", "hybrid"]
 categories = ["command-line-utilities", "text-processing", "development-tools"]
 
 [features]
-default = ["embedded-models"]
-embedded-models = ["frankensearch-embed/bundled-default-models", "frankensearch-embed/model2vec", "frankensearch-embed/fastembed"]
+default = ["semantic-loaders"]
+# Loader-capable source/crates.io profile: model bytes stay outside the crate,
+# while explicit `fsfs download-models` installs pinned, verified artifacts.
+semantic-loaders = ["frankensearch-embed/model2vec", "frankensearch-embed/fastembed"]
+# Full release profile: retain the same loaders and additionally embed the two
+# pinned defaults for a zero-download first run.
+embedded-models = ["semantic-loaders", "frankensearch-embed/bundled-default-models"]
 vendored-openssl = ["openssl"]
 # Shared null-control bench harness (frankensearch_core::bench_support). Never a shipping profile.
 bench-internals = ["frankensearch-core/bench-internals"]
@@ -25,11 +30,50 @@ path = "src/lib.rs"
 name = "fsfs"
 path = "src/main.rs"
 
+# These integration targets execute the production fsfs binary. Legacy suites
+# use the embedded fixture lane; `default_build_quickstart` deliberately uses
+# stock loader-capable defaults plus an externally provisioned verified cache.
+[[test]]
+name = "cli_command_tests"
+path = "tests/cli_command_tests.rs"
+required-features = ["embedded-models"]
+
+[[test]]
+name = "default_build_quickstart"
+path = "tests/default_build_quickstart.rs"
+required-features = ["semantic-loaders"]
+
+[[test]]
+name = "cli_e2e_contract"
+path = "tests/cli_e2e_contract.rs"
+required-features = ["embedded-models"]
+
+[[test]]
+name = "e2e_recall"
+path = "tests/e2e_recall.rs"
+required-features = ["embedded-models"]
+
+[[test]]
+name = "filesystem_chaos"
+path = "tests/filesystem_chaos.rs"
+required-features = ["embedded-models"]
+
+[[test]]
+name = "limit_all_large_corpus_benchmark"
+path = "tests/limit_all_large_corpus_benchmark.rs"
+required-features = ["embedded-models"]
+
+[[test]]
+name = "search_quality_harness"
+path = "tests/search_quality_harness.rs"
+required-features = ["embedded-models"]
+
 [dependencies]
 frankensearch-core = { workspace = true }
 frankensearch-embed = { workspace = true, default-features = false, features = ["hash", "download"] }
 frankensearch-index = { workspace = true }
 frankensearch-quill = { workspace = true, features = ["durability"] }
+rustix = { version = "1.1.4", features = ["fs"] }
 frankensearch-durability = { workspace = true }
 frankensearch-lexical = { workspace = true, optional = true }
 frankensearch-storage = { workspace = true }
@@ -63,7 +107,6 @@ serde_json = { workspace = true }
 toon-rust = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
-dirs = { workspace = true }
 toml = { workspace = true }
 signal-hook = "0.4"
 libc = "0.2"

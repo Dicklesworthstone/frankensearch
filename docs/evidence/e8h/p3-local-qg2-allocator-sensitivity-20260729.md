@@ -11,8 +11,9 @@ This survey uses the **memory-mode child seam** (`QUILL_PERF_CHILD_MODE=memory`,
 diagnostic denominator as the P1 profile and the P2 A/B. It is NOT the QG-2
 bulk gate cell: absolute docs/s below are seam-relative, and the
 quill-vs-tantivy columns are **diagnostic only** — they must never be quoted
-as gate numbers (certified QG-2 remains 0.1113 per
-`.bench-history/QG-2.linux-x86_64-zen3.latest.json`). Within-arm allocator
+as gate numbers. Facade-level QG-2 remains inactive; the prior 0.1113 value
+was a superseded, pre-current Ryzen 7 5800X pass-A diagnostic from commit
+`351f5c6d`, and its stale latest pointer is excluded. Within-arm allocator
 ratios (same ELF, same workload, env-only change) are the survey's valid
 product. Machine class **local-5975wx-32c**; Law 6: not transferable.
 
@@ -73,9 +74,13 @@ diagnostically important: the incumbent's remaining allocator appetite means
 allocator-based levers would, if anything, WIDEN the gap when applied
 symmetrically.
 
-**Class-split implication:** the x86-vs-m4 split (certified 0.1113 vs 0.528
-attempt) is further decoupled from "glibc allocator hurts quill on Linux."
-Remaining suspects: per-uarch codegen of the compute families
+**Routing-only class contrast:** the superseded 0.1113 Ryzen diagnostic and
+the retained M4 `invalid_null` attempt
+`m4-macos-qg2-receipt-w5-r30-20260729T021107Z` at
+`0.528360 [0.404084, 0.544504]` never formed a certified class split. The
+available diagnostic contrast is further decoupled from "glibc allocator
+hurts quill on Linux." Remaining suspects: per-uarch codegen of the compute
+families
 (canonicalization/identity, interner probing) and incumbent-side platform
 behavior. The next discriminating probe belongs to the per-class profile
 lanes (FoggyPrairie: trj/m4).

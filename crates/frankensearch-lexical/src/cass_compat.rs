@@ -1134,9 +1134,100 @@ impl CassTantivyIndex {
         limit: usize,
         tie_expansion_limit: usize,
     ) -> SearchResult<crate::OracleQueryObservation> {
+        cass_oracle_preflight(raw_query, filters, limit, tie_expansion_limit)?;
+        let fields = self.fields();
+        let tokens = cass_parse_boolean_query_bounded(raw_query, MAX_CASS_ORACLE_TOKENS).map_err(
+            |actual| cass_oracle_invalid_bound("token_count", actual, MAX_CASS_ORACLE_TOKENS),
+        )?;
+        let has_boolean_operators = cass_tokens_have_boolean_operators(&tokens);
+        let query = cass_fail_closed_tantivy_query(
+            raw_query,
+            cass_try_build_tantivy_query_from_tokens(
+                tokens,
+                has_boolean_operators,
+                filters,
+                &fields,
+                cass_regex_query_cached,
+            ),
+        );
+        self.cass_oracle_observe_built_query(&*query, limit, tie_expansion_limit)
+    }
+
+    /// Observe the real CASS query build and retrieval boundaries without the
+    /// compatibility API's silent match-none fallback.
+    ///
+    /// The returned in-memory witness carries plaintext parser values only so
+    /// the gauntlet can immediately redact them. It is not an artifact DTO.
+    /// Query construction is total here: a regex, lowering, reader, search, or
+    /// document-loading failure is retained as [`CassOracleProfileOutcome::Error`]
+    /// instead of becoming an indistinguishable successful empty result.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError::InvalidConfig`] before token retention, filter
+    /// cloning, or search when any request bound is exceeded.
+    #[cfg(feature = "tantivy-oracle")]
+    pub fn cass_oracle_observe_query_profile(
+        &self,
+        raw_query: &str,
+        filters: &CassQueryFilters,
+        limit: usize,
+        tie_expansion_limit: usize,
+    ) -> SearchResult<CassOracleProfileObservation> {
+        self.cass_oracle_observe_query_profile_with_regex_factory(
+            raw_query,
+            filters,
+            limit,
+            tie_expansion_limit,
+            cass_regex_query_cached,
+        )
+    }
+
+    #[cfg(feature = "tantivy-oracle")]
+    fn cass_oracle_observe_query_profile_with_regex_factory(
+        &self,
+        raw_query: &str,
+        filters: &CassQueryFilters,
+        limit: usize,
+        tie_expansion_limit: usize,
+        regex_query_factory: CassRegexQueryFactory,
+    ) -> SearchResult<CassOracleProfileObservation> {
+        cass_oracle_preflight(raw_query, filters, limit, tie_expansion_limit)?;
+        let tokens = cass_parse_boolean_query_bounded(raw_query, MAX_CASS_ORACLE_TOKENS).map_err(
+            |actual| cass_oracle_invalid_bound("token_count", actual, MAX_CASS_ORACLE_TOKENS),
+        )?;
+        let has_boolean_operators = cass_tokens_have_boolean_operators(&tokens);
+        let fields = self.fields();
+        let outcome = cass_try_build_tantivy_query_from_tokens(
+            tokens.clone(),
+            has_boolean_operators,
+            filters,
+            &fields,
+            regex_query_factory,
+        )
+        .and_then(|query| self.cass_oracle_observe_built_query(&*query, limit, tie_expansion_limit))
+        .map_or_else(
+            CassOracleProfileOutcome::Error,
+            CassOracleProfileOutcome::Success,
+        );
+        Ok(CassOracleProfileObservation {
+            sanitized_query: cass_sanitize_query(raw_query),
+            tokens,
+            has_boolean_operators,
+            filters: filters.clone(),
+            outcome,
+        })
+    }
+
+    #[cfg(feature = "tantivy-oracle")]
+    fn cass_oracle_observe_built_query(
+        &self,
+        query: &dyn Query,
+        limit: usize,
+        tie_expansion_limit: usize,
+    ) -> SearchResult<crate::OracleQueryObservation> {
         let searcher = self.reader()?.searcher();
         let fields = self.fields();
-        let query = cass_build_tantivy_query(raw_query, filters, &fields);
 
         // Fetch past `limit` so the cutoff tie group can be observed whole; a
         // truncated group is reported through `cutoff_tie_complete` instead of
@@ -1144,15 +1235,39 @@ impl CassTantivyIndex {
         let fetch_limit = if limit == 0 {
             0
         } else {
-            limit.saturating_add(tie_expansion_limit)
+            limit.checked_add(tie_expansion_limit).ok_or_else(|| {
+                cass_oracle_invalid_bound(
+                    "expanded_fetch_hits",
+                    usize::MAX,
+                    MAX_CASS_ORACLE_FETCH_HITS,
+                )
+            })?
         };
-        let search_result = crate::execute_query_with_offset(&searcher, &*query, fetch_limit, 0)?;
+        cass_oracle_bound(
+            "expanded_fetch_hits",
+            fetch_limit,
+            MAX_CASS_ORACLE_FETCH_HITS,
+        )?;
+        let search_result = crate::execute_query_with_offset(&searcher, query, fetch_limit, 0)?;
 
         let mut materialized = Vec::with_capacity(search_result.hits.len());
+        let mut retained_identity_bytes = 0_usize;
         for hit in search_result.hits {
             let document = crate::load_doc(&searcher, hit.doc_address)?;
+            let doc_id = cass_document_identity(&document, &fields);
+            cass_oracle_bound(
+                "document_identity_bytes",
+                doc_id.len(),
+                MAX_CASS_ORACLE_DOCUMENT_ID_BYTES,
+            )?;
+            retained_identity_bytes = retained_identity_bytes.saturating_add(doc_id.len());
+            cass_oracle_bound(
+                "aggregate_document_identity_bytes",
+                retained_identity_bytes,
+                MAX_CASS_ORACLE_DOCUMENT_ID_AGGREGATE_BYTES,
+            )?;
             materialized.push(crate::OracleRankedHit {
-                doc_id: cass_document_identity(&document, &fields),
+                doc_id,
                 score_bits: hit.bm25_score.to_bits(),
                 rank: hit.rank,
                 segment_ord: hit.doc_address.segment_ord,
@@ -1166,17 +1281,24 @@ impl CassTantivyIndex {
             .checked_sub(1)
             .and_then(|index| materialized.get(index))
             .map(|hit| hit.score_bits);
-        let cutoff_tie_group = cutoff_bits.map_or_else(Vec::new, |cutoff| {
-            materialized
-                .iter()
-                .filter(|hit| {
-                    f32::from_bits(hit.score_bits)
-                        .total_cmp(&f32::from_bits(cutoff))
-                        .is_eq()
-                })
-                .cloned()
-                .collect()
-        });
+        let mut cutoff_tie_group = Vec::new();
+        if let Some(cutoff) = cutoff_bits {
+            for hit in &materialized {
+                if f32::from_bits(hit.score_bits)
+                    .total_cmp(&f32::from_bits(cutoff))
+                    .is_eq()
+                {
+                    retained_identity_bytes =
+                        retained_identity_bytes.saturating_add(hit.doc_id.len());
+                    cass_oracle_bound(
+                        "aggregate_document_identity_bytes",
+                        retained_identity_bytes,
+                        MAX_CASS_ORACLE_DOCUMENT_ID_AGGREGATE_BYTES,
+                    )?;
+                    cutoff_tie_group.push(hit.clone());
+                }
+            }
+        }
         // The group is complete when either every match was fetched or the last
         // fetched hit scored strictly below the cutoff — otherwise the expansion
         // budget ended inside the tie and the comparator must not assume more.
@@ -1983,7 +2105,7 @@ pub enum CassSourceFilter {
 }
 
 /// Cass-compatible lexical filters applied directly in Tantivy.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct CassQueryFilters {
     pub agents: Vec<String>,
     pub workspaces: Vec<String>,
@@ -2005,6 +2127,149 @@ pub enum CassQueryToken {
     Or,
     /// NOT operator (negates the next term/phrase).
     Not,
+}
+
+/// In-memory evidence from the real fallible Tantivy CASS query boundary.
+///
+/// This type deliberately retains plaintext only between the adapter and the
+/// gauntlet's redaction step. It must never be serialized directly. The
+/// profile-specific `ArtifactStore` v4 DTO owns any durable representation.
+#[cfg(feature = "tantivy-oracle")]
+#[derive(Debug)]
+pub struct CassOracleProfileObservation {
+    /// Shipping CASS sanitization of the raw query.
+    pub sanitized_query: String,
+    /// Ordered tokens passed to the actual Tantivy query builder.
+    pub tokens: Vec<CassQueryToken>,
+    /// Whether the builder selected its explicit Boolean grammar.
+    pub has_boolean_operators: bool,
+    /// Structured filters consumed by the real query builder.
+    pub filters: CassQueryFilters,
+    /// Native rank/tie/count result or the original typed failure.
+    pub outcome: CassOracleProfileOutcome,
+}
+
+/// Total result of one fallible Tantivy CASS profile attempt.
+#[cfg(feature = "tantivy-oracle")]
+#[derive(Debug)]
+pub enum CassOracleProfileOutcome {
+    /// Query construction and retrieval succeeded.
+    Success(crate::OracleQueryObservation),
+    /// Query construction or retrieval failed with its original typed error.
+    Error(SearchError),
+}
+
+/// Maximum raw-query bytes admitted by the dev-only CASS oracle boundary.
+#[cfg(feature = "tantivy-oracle")]
+pub const MAX_CASS_ORACLE_RAW_QUERY_BYTES: usize = 1_048_576;
+
+/// Maximum token count retained by one dev-only CASS oracle observation.
+#[cfg(feature = "tantivy-oracle")]
+pub const MAX_CASS_ORACLE_TOKENS: usize = 20_000;
+
+/// Maximum number of exact filter values admitted by one oracle request.
+#[cfg(feature = "tantivy-oracle")]
+pub const MAX_CASS_ORACLE_FILTER_VALUES: usize = 4_096;
+
+/// Maximum bytes admitted for any individual exact filter value.
+#[cfg(feature = "tantivy-oracle")]
+pub const MAX_CASS_ORACLE_FILTER_VALUE_BYTES: usize = 4_096;
+
+/// Maximum aggregate bytes admitted across all exact filter values.
+#[cfg(feature = "tantivy-oracle")]
+pub const MAX_CASS_ORACLE_FILTER_BYTES: usize = 1_048_576;
+
+/// Maximum requested or expanded fetch cardinality for one oracle call.
+#[cfg(feature = "tantivy-oracle")]
+pub const MAX_CASS_ORACLE_FETCH_HITS: usize = 100_000;
+
+/// Maximum UTF-8 bytes retained for one canonical CASS document identity.
+#[cfg(feature = "tantivy-oracle")]
+pub const MAX_CASS_ORACLE_DOCUMENT_ID_BYTES: usize = 1_024;
+
+/// Maximum aggregate identity bytes retained across fetched and cutoff rows.
+#[cfg(feature = "tantivy-oracle")]
+pub const MAX_CASS_ORACLE_DOCUMENT_ID_AGGREGATE_BYTES: usize = 16 * 1_024 * 1_024;
+
+#[cfg(feature = "tantivy-oracle")]
+fn cass_oracle_preflight(
+    raw_query: &str,
+    filters: &CassQueryFilters,
+    limit: usize,
+    tie_expansion_limit: usize,
+) -> SearchResult<()> {
+    cass_oracle_bound(
+        "raw_query_bytes",
+        raw_query.len(),
+        MAX_CASS_ORACLE_RAW_QUERY_BYTES,
+    )?;
+    cass_oracle_bound("limit", limit, MAX_CASS_ORACLE_FETCH_HITS)?;
+    cass_oracle_bound(
+        "tie_expansion_limit",
+        tie_expansion_limit,
+        MAX_CASS_ORACLE_FETCH_HITS,
+    )?;
+    let expanded_fetch = limit.saturating_add(tie_expansion_limit);
+    cass_oracle_bound(
+        "expanded_fetch_hits",
+        expanded_fetch,
+        MAX_CASS_ORACLE_FETCH_HITS,
+    )?;
+
+    let source_value = match &filters.source_filter {
+        CassSourceFilter::SourceId(value) => Some(value.as_str()),
+        CassSourceFilter::All | CassSourceFilter::Local | CassSourceFilter::Remote => None,
+    };
+    let filter_count = filters
+        .agents
+        .len()
+        .checked_add(filters.workspaces.len())
+        .and_then(|count| count.checked_add(usize::from(source_value.is_some())))
+        .unwrap_or(usize::MAX);
+    cass_oracle_bound(
+        "filter_value_count",
+        filter_count,
+        MAX_CASS_ORACLE_FILTER_VALUES,
+    )?;
+
+    let mut aggregate_bytes = 0_usize;
+    for value in filters
+        .agents
+        .iter()
+        .chain(&filters.workspaces)
+        .map(String::as_str)
+        .chain(source_value)
+    {
+        cass_oracle_bound(
+            "filter_value_bytes",
+            value.len(),
+            MAX_CASS_ORACLE_FILTER_VALUE_BYTES,
+        )?;
+        aggregate_bytes = aggregate_bytes.saturating_add(value.len());
+        cass_oracle_bound(
+            "aggregate_filter_bytes",
+            aggregate_bytes,
+            MAX_CASS_ORACLE_FILTER_BYTES,
+        )?;
+    }
+    Ok(())
+}
+
+#[cfg(feature = "tantivy-oracle")]
+fn cass_oracle_bound(field: &'static str, actual: usize, limit: usize) -> SearchResult<()> {
+    if actual > limit {
+        return Err(cass_oracle_invalid_bound(field, actual, limit));
+    }
+    Ok(())
+}
+
+#[cfg(feature = "tantivy-oracle")]
+fn cass_oracle_invalid_bound(field: &'static str, actual: usize, limit: usize) -> SearchError {
+    SearchError::InvalidConfig {
+        field: format!("cass_oracle.{field}"),
+        value: actual.to_string(),
+        reason: format!("must be no greater than {limit}"),
+    }
 }
 
 /// Sanitize query string to match the `hyphen_normalize` tokenizer for cass indexes.
@@ -2127,6 +2392,32 @@ impl CassWildcardPattern {
 /// - \"quoted phrases\" (phrase match)
 #[must_use]
 pub fn cass_parse_boolean_query(query: &str) -> Vec<CassQueryToken> {
+    match cass_parse_boolean_query_with_sink(query, |tokens, token| {
+        tokens.push(token);
+        Ok::<(), std::convert::Infallible>(())
+    }) {
+        Ok(tokens) => tokens,
+        Err(never) => match never {},
+    }
+}
+
+#[cfg(feature = "tantivy-oracle")]
+fn cass_parse_boolean_query_bounded(
+    query: &str,
+    max_tokens: usize,
+) -> Result<Vec<CassQueryToken>, usize> {
+    cass_parse_boolean_query_with_sink(query, |tokens, token| {
+        cass_push_query_token(tokens, token, max_tokens)
+    })
+}
+
+fn cass_parse_boolean_query_with_sink<Error, PushToken>(
+    query: &str,
+    mut push_token: PushToken,
+) -> Result<Vec<CassQueryToken>, Error>
+where
+    PushToken: FnMut(&mut Vec<CassQueryToken>, CassQueryToken) -> Result<(), Error>,
+{
     let mut tokens = Vec::new();
     let mut chars = query.chars().peekable();
     let mut current_word = String::new();
@@ -2135,7 +2426,10 @@ pub fn cass_parse_boolean_query(query: &str) -> Vec<CassQueryToken> {
         match c {
             '"' => {
                 if !current_word.is_empty() {
-                    tokens.push(CassQueryToken::Term(std::mem::take(&mut current_word)));
+                    push_token(
+                        &mut tokens,
+                        CassQueryToken::Term(std::mem::take(&mut current_word)),
+                    )?;
                 }
                 let mut phrase = String::new();
                 while let Some(&next) = chars.peek() {
@@ -2148,36 +2442,37 @@ pub fn cass_parse_boolean_query(query: &str) -> Vec<CassQueryToken> {
                     }
                 }
                 if !phrase.is_empty() {
-                    tokens.push(CassQueryToken::Phrase(phrase));
+                    push_token(&mut tokens, CassQueryToken::Phrase(phrase))?;
                 }
             }
             '&' if chars.peek() == Some(&'&') => {
                 chars.next();
                 if !current_word.is_empty() {
-                    tokens.push(CassQueryToken::Term(std::mem::take(&mut current_word)));
+                    push_token(
+                        &mut tokens,
+                        CassQueryToken::Term(std::mem::take(&mut current_word)),
+                    )?;
                 }
-                tokens.push(CassQueryToken::And);
+                push_token(&mut tokens, CassQueryToken::And)?;
             }
             '|' if chars.peek() == Some(&'|') => {
                 chars.next();
                 if !current_word.is_empty() {
-                    tokens.push(CassQueryToken::Term(std::mem::take(&mut current_word)));
+                    push_token(
+                        &mut tokens,
+                        CassQueryToken::Term(std::mem::take(&mut current_word)),
+                    )?;
                 }
-                tokens.push(CassQueryToken::Or);
+                push_token(&mut tokens, CassQueryToken::Or)?;
             }
             '-' if current_word.is_empty() => {
-                tokens.push(CassQueryToken::Not);
+                push_token(&mut tokens, CassQueryToken::Not)?;
             }
             ' ' | '\t' | '\n' => {
                 if !current_word.is_empty() {
                     let word = std::mem::take(&mut current_word);
-                    let upper = word.to_ascii_uppercase();
-                    match upper.as_str() {
-                        "AND" => tokens.push(CassQueryToken::And),
-                        "OR" => tokens.push(CassQueryToken::Or),
-                        "NOT" => tokens.push(CassQueryToken::Not),
-                        _ => tokens.push(CassQueryToken::Term(word)),
-                    }
+                    let token = cass_classify_query_word(word);
+                    push_token(&mut tokens, token)?;
                 }
             }
             _ => current_word.push(c),
@@ -2185,16 +2480,36 @@ pub fn cass_parse_boolean_query(query: &str) -> Vec<CassQueryToken> {
     }
 
     if !current_word.is_empty() {
-        let upper = current_word.to_ascii_uppercase();
-        match upper.as_str() {
-            "AND" => tokens.push(CassQueryToken::And),
-            "OR" => tokens.push(CassQueryToken::Or),
-            "NOT" => tokens.push(CassQueryToken::Not),
-            _ => tokens.push(CassQueryToken::Term(current_word)),
-        }
+        let token = cass_classify_query_word(current_word);
+        push_token(&mut tokens, token)?;
     }
 
-    tokens
+    Ok(tokens)
+}
+
+fn cass_classify_query_word(word: String) -> CassQueryToken {
+    if word.eq_ignore_ascii_case("AND") {
+        CassQueryToken::And
+    } else if word.eq_ignore_ascii_case("OR") {
+        CassQueryToken::Or
+    } else if word.eq_ignore_ascii_case("NOT") {
+        CassQueryToken::Not
+    } else {
+        CassQueryToken::Term(word)
+    }
+}
+
+#[cfg(feature = "tantivy-oracle")]
+fn cass_push_query_token(
+    tokens: &mut Vec<CassQueryToken>,
+    token: CassQueryToken,
+    max_tokens: usize,
+) -> Result<(), usize> {
+    if tokens.len() >= max_tokens {
+        return Err(tokens.len().saturating_add(1));
+    }
+    tokens.push(token);
+    Ok(())
 }
 
 #[must_use]
@@ -2938,6 +3253,53 @@ mod cass_query_tests {
             "ranks must be the native fetched order",
         );
 
+        let profiled_filters = CassQueryFilters {
+            agents: vec!["claude".to_owned()],
+            source_filter: CassSourceFilter::Local,
+            ..CassQueryFilters::default()
+        };
+        let profile = index
+            .cass_oracle_observe_query_profile(
+                "c++ \"alpha active\" OR -deprecated",
+                &profiled_filters,
+                10,
+                8,
+            )
+            .expect("bounded profile observation");
+        assert_eq!(
+            profile.sanitized_query,
+            "c   \"alpha active\" OR -deprecated"
+        );
+        assert_eq!(
+            profile.tokens,
+            vec![
+                CassQueryToken::Term("c++".to_owned()),
+                CassQueryToken::Phrase("alpha active".to_owned()),
+                CassQueryToken::Or,
+                CassQueryToken::Not,
+                CassQueryToken::Term("deprecated".to_owned()),
+            ]
+        );
+        assert!(profile.has_boolean_operators);
+        assert_eq!(profile.filters, profiled_filters);
+        let profile_retrieval = match profile.outcome {
+            CassOracleProfileOutcome::Success(retrieval) => retrieval,
+            CassOracleProfileOutcome::Error(error) => {
+                panic!("fallible CASS profile unexpectedly failed: {error:?}")
+            }
+        };
+        assert_eq!(
+            profile_retrieval,
+            index
+                .cass_oracle_observe_query(
+                    "c++ \"alpha active\" OR -deprecated",
+                    &profiled_filters,
+                    10,
+                    8,
+                )
+                .expect("legacy CASS observation for parity")
+        );
+
         // An empty CASS query is a filter-only browse, NOT the default
         // profile's empty short-circuit: it must still match every document.
         let browse = index
@@ -2997,6 +3359,59 @@ mod cass_query_tests {
                 .all(|hit| hit.score_bits == truncated.hits[0].score_bits),
             "the tie group holds exactly the cutoff-score rows",
         );
+    }
+
+    #[cfg(feature = "tantivy-oracle")]
+    #[test]
+    fn cass_oracle_profile_rejects_hostile_bounds_before_clone_or_search() {
+        let (_directory, index) = cass_result_fixture();
+        let oversized_raw = "x".repeat(MAX_CASS_ORACLE_RAW_QUERY_BYTES + 1);
+        assert!(matches!(
+            index.cass_oracle_observe_query_profile(
+                &oversized_raw,
+                &CassQueryFilters::default(),
+                10,
+                8,
+            ),
+            Err(SearchError::InvalidConfig { field, .. })
+                if field == "cass_oracle.raw_query_bytes"
+        ));
+
+        let too_many_tokens = "x ".repeat(MAX_CASS_ORACLE_TOKENS + 1);
+        assert!(matches!(
+            index.cass_oracle_observe_query_profile(
+                &too_many_tokens,
+                &CassQueryFilters::default(),
+                10,
+                8,
+            ),
+            Err(SearchError::InvalidConfig { field, .. })
+                if field == "cass_oracle.token_count"
+        ));
+
+        let aggregate_filters = CassQueryFilters {
+            agents: vec![
+                "x".repeat(MAX_CASS_ORACLE_FILTER_VALUE_BYTES);
+                MAX_CASS_ORACLE_FILTER_BYTES / MAX_CASS_ORACLE_FILTER_VALUE_BYTES + 1
+            ],
+            ..CassQueryFilters::default()
+        };
+        assert!(matches!(
+            index.cass_oracle_observe_query_profile("x", &aggregate_filters, 10, 8),
+            Err(SearchError::InvalidConfig { field, .. })
+                if field == "cass_oracle.aggregate_filter_bytes"
+        ));
+
+        assert!(matches!(
+            index.cass_oracle_observe_query_profile(
+                "x",
+                &CassQueryFilters::default(),
+                MAX_CASS_ORACLE_FETCH_HITS,
+                1,
+            ),
+            Err(SearchError::InvalidConfig { field, .. })
+                if field == "cass_oracle.expanded_fetch_hits"
+        ));
     }
 
     #[test]
@@ -3627,6 +4042,30 @@ mod cass_query_tests {
             hits.is_empty(),
             "a negated regex construction failure must not widen to AllQuery"
         );
+
+        #[cfg(feature = "tantivy-oracle")]
+        {
+            let profile = index
+                .cass_oracle_observe_query_profile_with_regex_factory(
+                    raw_query,
+                    &CassQueryFilters::default(),
+                    10,
+                    8,
+                    force_regex_construction_failure,
+                )
+                .expect("bounded forced-failure profile");
+            assert_eq!(
+                profile.tokens,
+                vec![
+                    CassQueryToken::Not,
+                    CassQueryToken::Term("*legacy".to_owned())
+                ]
+            );
+            assert!(matches!(
+                profile.outcome,
+                CassOracleProfileOutcome::Error(_)
+            ));
+        }
     }
 
     #[test]

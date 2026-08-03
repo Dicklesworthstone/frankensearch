@@ -22,8 +22,6 @@ use asupersync::time::{timeout, wall_now};
 use tracing::instrument;
 use unicode_normalization::UnicodeNormalization;
 
-use time::{OffsetDateTime, format_description::well_known::Rfc3339};
-
 #[cfg(feature = "graph")]
 use frankensearch_core::DocumentGraph;
 use frankensearch_core::ParsedQuery;
@@ -1176,8 +1174,10 @@ impl TwoTierSearcher {
                 }
             } else if self.config.fast_only {
                 metrics.skip_reason = Some("fast_only".to_owned());
-            } else {
+            } else if self.quality_embedder.is_none() {
                 metrics.skip_reason = Some("no_quality_embedder".to_owned());
+            } else {
+                metrics.skip_reason = Some("quality_index_unavailable".to_owned());
             }
         }
 
@@ -2352,7 +2352,7 @@ impl TwoTierSearcher {
 
     /// Whether quality refinement should run.
     fn should_run_quality(&self) -> bool {
-        !self.config.fast_only && self.quality_embedder.is_some()
+        !self.config.fast_only && self.quality_embedder.is_some() && self.index.has_quality_index()
     }
 
     fn phase_gate_should_skip_quality(&self) -> bool {
@@ -2832,10 +2832,11 @@ fn next_telemetry_identifier(prefix: &str) -> String {
     id
 }
 
+#[cfg(test)]
 const TELEMETRY_TIMESTAMP_FALLBACK_RFC3339: &str = "1970-01-01T00:00:00Z";
 
 fn telemetry_timestamp_ms() -> u64 {
-    let nanos = OffsetDateTime::now_utc().unix_timestamp_nanos();
+    let nanos = frankensearch_core::rfc3339::now_unix_nanos();
     if nanos <= 0 {
         return 0;
     }
@@ -2845,9 +2846,7 @@ fn telemetry_timestamp_ms() -> u64 {
 }
 
 fn telemetry_timestamp_now() -> String {
-    OffsetDateTime::now_utc()
-        .format(&Rfc3339)
-        .unwrap_or_else(|_| TELEMETRY_TIMESTAMP_FALLBACK_RFC3339.to_owned())
+    frankensearch_core::rfc3339::format_unix_nanos(frankensearch_core::rfc3339::now_unix_nanos())
 }
 
 fn telemetry_instance_for_adapter(host_adapter: &dyn HostAdapter) -> TelemetryInstance {
@@ -4344,7 +4343,7 @@ mod tests {
     #[test]
     fn search_with_quality_yields_two_phases() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
-            let index = build_test_index(4);
+            let index = build_test_index_with_quality(4);
             let fast = Arc::new(StubEmbedder::new("fast", 4));
             let quality = Arc::new(StubEmbedder::new("quality", 4));
 
@@ -4381,9 +4380,59 @@ mod tests {
     }
 
     #[test]
+    fn configured_quality_embedder_without_quality_index_stays_initial() {
+        let quality_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let quality = Arc::new(CountingEmbedder::new("quality", 4, quality_calls.clone()));
+
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let index = build_test_index(4);
+            let fast = Arc::new(StubEmbedder::new("fast", 4));
+            let searcher = TwoTierSearcher::new(index, fast, TwoTierConfig::default())
+                .with_quality_embedder(quality);
+
+            let mut phase_count = 0;
+            let mut got_initial = false;
+            let mut got_refined = false;
+            let metrics = searcher
+                .search(
+                    &cx,
+                    "test query",
+                    5,
+                    |_| None,
+                    |phase| {
+                        phase_count += 1;
+                        match phase {
+                            SearchPhase::Initial { .. } => got_initial = true,
+                            SearchPhase::Refined { .. } | SearchPhase::Reranked { .. } => {
+                                got_refined = true;
+                            }
+                            SearchPhase::RefinementFailed { .. } => {}
+                        }
+                    },
+                )
+                .await
+                .expect("fast-tier search should succeed");
+
+            assert_eq!(phase_count, 1);
+            assert!(got_initial);
+            assert!(!got_refined);
+            assert_eq!(
+                metrics.skip_reason.as_deref(),
+                Some("quality_index_unavailable")
+            );
+            assert_eq!(metrics.phase2_vectors_searched, 0);
+            assert_eq!(
+                quality_calls.load(std::sync::atomic::Ordering::Relaxed),
+                0,
+                "quality embedding must not start without a quality index"
+            );
+        });
+    }
+
+    #[test]
     fn refined_phase_metrics_report_actual_fused_count() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
-            let index = build_test_index(4); // 10 docs in fixture index
+            let index = build_test_index_with_quality(4); // 10 docs in fixture index
             let fast = Arc::new(StubEmbedder::new("fast", 4));
             let quality = Arc::new(StubEmbedder::new("quality", 4));
             let searcher = TwoTierSearcher::new(index, fast, TwoTierConfig::default())
@@ -4458,7 +4507,7 @@ mod tests {
     #[test]
     fn fast_only_config_skips_quality() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
-            let index = build_test_index(4);
+            let index = build_test_index_with_quality(4);
             let fast = Arc::new(StubEmbedder::new("fast", 4));
             let quality = Arc::new(StubEmbedder::new("quality", 4));
 
@@ -4483,7 +4532,7 @@ mod tests {
     #[test]
     fn phase_gate_can_preempt_quality_phase() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
-            let index = build_test_index(4);
+            let index = build_test_index_with_quality(4);
             let fast = Arc::new(StubEmbedder::new("fast", 4));
             let quality = Arc::new(StubEmbedder::new("quality", 4));
             let mut phase_gate = PhaseGate::new(PhaseGateConfig {
@@ -4518,7 +4567,7 @@ mod tests {
     #[test]
     fn phase_gate_updates_after_refinement_and_can_skip_later_queries() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
-            let index = build_test_index(4);
+            let index = build_test_index_with_quality(4);
             let fast = Arc::new(StubEmbedder::new("fast", 4));
             let quality = Arc::new(StubEmbedder::new("quality", 4));
             let searcher = TwoTierSearcher::new(index, fast, TwoTierConfig::default())
@@ -4933,7 +4982,7 @@ mod tests {
     fn rank(docs: &[String], id: &str) -> usize {
         docs.iter()
             .position(|doc| doc.as_str() == id)
-            .unwrap_or_else(|| panic!("{id} missing from {docs:?}"))
+            .expect("rank helper requires the requested document")
     }
 
     /// PARITY GATE. Both corrections off (the default) ⇒ `correct_phase1_pool` returns the pool
@@ -5170,7 +5219,7 @@ mod tests {
     #[test]
     fn quality_timeout_emits_refinement_failed_with_timeout_error() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
-            let index = build_test_index(4);
+            let index = build_test_index_with_quality(4);
             let fast = Arc::new(StubEmbedder::new("fast", 4));
             let quality = Arc::new(PendingEmbedder::new("quality-pending", 4));
             let config = TwoTierConfig {
@@ -5320,7 +5369,7 @@ mod tests {
     #[test]
     fn fast_embed_failure_with_quality_configured_skips_refinement() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
-            let index = build_test_index(4);
+            let index = build_test_index_with_quality(4);
             let fast: Arc<dyn Embedder> = Arc::new(FailingEmbedder);
             let quality: Arc<dyn Embedder> = Arc::new(StubEmbedder::new("quality", 4));
             let lexical: Arc<dyn LexicalRead> = Arc::new(StubLexical);
@@ -5626,29 +5675,37 @@ mod tests {
     }
 
     #[test]
-    fn exclusion_overhead_is_sub_millisecond_for_typical_query() {
+    fn exclusion_filter_hydrates_each_semantic_candidate_once() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             let index = build_test_index(4);
             let fast = Arc::new(StubEmbedder::new("fast", 4));
             let searcher = TwoTierSearcher::new(index, fast, TwoTierConfig::default());
+            let hydrated_candidates = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let hydrated_candidate_ids = Arc::new(std::sync::atomic::AtomicU16::new(0));
+            let mut initial_results = Vec::new();
 
-            let baseline = searcher
-                .search(
-                    &cx,
-                    "rust systems",
-                    10,
-                    |_| Some("safe rust systems".to_owned()),
-                    |_| {},
-                )
-                .await
-                .expect("baseline search should succeed")
-                .phase1_total_ms;
-            let negated = searcher
+            let metrics = searcher
                 .search(
                     &cx,
                     "rust systems -unsafe",
                     10,
                     |doc_id| {
+                        hydrated_candidates.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let candidate_bit = match doc_id {
+                            "doc-0" => 1 << 0,
+                            "doc-1" => 1 << 1,
+                            "doc-2" => 1 << 2,
+                            "doc-3" => 1 << 3,
+                            "doc-4" => 1 << 4,
+                            "doc-5" => 1 << 5,
+                            "doc-6" => 1 << 6,
+                            "doc-7" => 1 << 7,
+                            "doc-8" => 1 << 8,
+                            "doc-9" => 1 << 9,
+                            _ => 1 << 15,
+                        };
+                        hydrated_candidate_ids
+                            .fetch_or(candidate_bit, std::sync::atomic::Ordering::Relaxed);
                         let text = if doc_id == "doc-0" {
                             "unsafe rust systems"
                         } else {
@@ -5656,16 +5713,35 @@ mod tests {
                         };
                         Some(text.to_owned())
                     },
-                    |_| {},
+                    |phase| {
+                        if let SearchPhase::Initial { results, .. } = phase {
+                            initial_results = results;
+                        }
+                    },
                 )
                 .await
-                .expect("negated search should succeed")
-                .phase1_total_ms;
+                .expect("negated search should succeed");
 
-            let overhead_ms = (negated - baseline).max(0.0);
+            assert_eq!(
+                metrics.phase1_vectors_searched, 10,
+                "the fixture must expose all ten semantic vectors to Phase 1"
+            );
+            assert_eq!(
+                hydrated_candidates.load(std::sync::atomic::Ordering::Relaxed),
+                metrics.phase1_vectors_searched,
+                "exclusion filtering must perform exactly one hydration per fixture candidate"
+            );
+            assert_eq!(
+                hydrated_candidate_ids.load(std::sync::atomic::Ordering::Relaxed),
+                (1_u16 << 10) - 1,
+                "exclusion filtering must hydrate every distinct fixture candidate exactly once"
+            );
+            assert_eq!(metrics.semantic_candidates, 9);
+            assert_eq!(initial_results.len(), 9);
             assert!(
-                overhead_ms < 1.0,
-                "expected exclusion overhead <1ms, observed {overhead_ms:.4}ms (baseline={baseline:.4}ms, negated={negated:.4}ms)"
+                !initial_results
+                    .iter()
+                    .any(|result| matches!(result.doc_id.as_str(), "doc-0"))
             );
         });
     }
@@ -5725,7 +5801,7 @@ mod tests {
     #[test]
     fn refined_phase_uses_zero_fast_score_for_lexical_only_candidates() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
-            let index = build_test_index(4);
+            let index = build_test_index_with_quality(4);
             let fast = Arc::new(StubEmbedder::new("fast", 4));
             let quality = Arc::new(StubEmbedder::new("quality", 4));
             let lexical: Arc<dyn LexicalRead> = Arc::new(StubLexical);
@@ -5845,7 +5921,7 @@ mod tests {
     #[test]
     fn host_adapter_receives_initial_and_refined_search_events() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
-            let index = build_test_index(4);
+            let index = build_test_index_with_quality(4);
             let fast = Arc::new(StubEmbedder::new("fast", 4));
             let quality = Arc::new(StubEmbedder::new("quality", 4));
             let adapter = Arc::new(RecordingHostAdapter::new("coding_agent_session_search"));
@@ -5911,7 +5987,7 @@ mod tests {
     #[test]
     fn host_adapter_receives_refinement_failed_search_event() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
-            let index = build_test_index(4);
+            let index = build_test_index_with_quality(4);
             let fast = Arc::new(StubEmbedder::new("fast", 4));
             let quality = Arc::new(PendingEmbedder::new("quality-pending", 4));
             let adapter = Arc::new(RecordingHostAdapter::new("coding_agent_session_search"));
@@ -5983,7 +6059,7 @@ mod tests {
     #[test]
     fn host_adapter_receives_fast_and_quality_embedding_events() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
-            let index = build_test_index(4);
+            let index = build_test_index_with_quality(4);
             let fast = Arc::new(StubEmbedder::new("fast", 4));
             let quality = Arc::new(StubEmbedder::new("quality", 4));
             let adapter = Arc::new(RecordingHostAdapter::new("coding_agent_session_search"));
@@ -6068,7 +6144,7 @@ mod tests {
     #[test]
     fn host_adapter_receives_lifecycle_and_resource_events_with_runtime_hooks() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
-            let index = build_test_index(4);
+            let index = build_test_index_with_quality(4);
             let fast = Arc::new(StubEmbedder::new("fast", 4));
             let quality = Arc::new(StubEmbedder::new("quality", 4));
             let adapter = Arc::new(RecordingHostAdapter::new("coding_agent_session_search"));
@@ -6262,7 +6338,7 @@ mod tests {
     #[test]
     fn metrics_exporter_receives_search_and_embedding_callbacks() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
-            let index = build_test_index(4);
+            let index = build_test_index_with_quality(4);
             let fast = Arc::new(StubEmbedder::new("fast", 4));
             let quality = Arc::new(StubEmbedder::new("quality", 4));
             let exporter = Arc::new(RecordingExporter::default());
@@ -6419,7 +6495,7 @@ mod tests {
         let fast = Arc::new(CountingEmbedder::new("fast", 4, fast_calls));
         let quality = Arc::new(CountingEmbedder::new("quality", 4, quality_calls.clone()));
 
-        let index = build_test_index(4);
+        let index = build_test_index_with_quality(4);
         // quality set BEFORE cache — both should be wrapped
         let searcher = TwoTierSearcher::new(index, fast, TwoTierConfig::default())
             .with_quality_embedder(quality)
@@ -6451,7 +6527,7 @@ mod tests {
         let fast = Arc::new(CountingEmbedder::new("fast", 4, fast_calls));
         let quality = Arc::new(CountingEmbedder::new("quality", 4, quality_calls.clone()));
 
-        let index = build_test_index(4);
+        let index = build_test_index_with_quality(4);
         // cache set BEFORE quality — quality should still be auto-wrapped
         let searcher = TwoTierSearcher::new(index, fast, TwoTierConfig::default())
             .with_embedding_cache(64)
@@ -6712,7 +6788,7 @@ mod tests {
         let ts = telemetry_timestamp_now();
         assert!(!ts.is_empty());
         assert!(
-            OffsetDateTime::parse(&ts, &Rfc3339).is_ok(),
+            frankensearch_core::rfc3339::parse_rfc3339_to_unix_nanos(&ts).is_ok(),
             "should be RFC3339"
         );
     }
@@ -6720,7 +6796,10 @@ mod tests {
     #[test]
     fn telemetry_timestamp_fallback_constant_is_valid_rfc3339() {
         assert!(
-            OffsetDateTime::parse(TELEMETRY_TIMESTAMP_FALLBACK_RFC3339, &Rfc3339).is_ok(),
+            frankensearch_core::rfc3339::parse_rfc3339_to_unix_nanos(
+                TELEMETRY_TIMESTAMP_FALLBACK_RFC3339
+            )
+            .is_ok(),
             "fallback timestamp must remain RFC3339"
         );
     }
@@ -7262,8 +7341,18 @@ mod tests {
     }
 
     #[test]
-    fn should_run_quality_true_when_quality_embedder_and_not_fast_only() {
+    fn should_run_quality_false_when_quality_index_is_unavailable() {
         let index = build_test_index(4);
+        let fast = Arc::new(StubEmbedder::new("fast", 4));
+        let quality = Arc::new(StubEmbedder::new("quality", 4));
+        let searcher = TwoTierSearcher::new(index, fast, TwoTierConfig::default())
+            .with_quality_embedder(quality);
+        assert!(!searcher.should_run_quality());
+    }
+
+    #[test]
+    fn should_run_quality_true_when_quality_embedder_and_not_fast_only() {
+        let index = build_test_index_with_quality(4);
         let fast = Arc::new(StubEmbedder::new("fast", 4));
         let quality = Arc::new(StubEmbedder::new("quality", 4));
         let searcher = TwoTierSearcher::new(index, fast, TwoTierConfig::default())

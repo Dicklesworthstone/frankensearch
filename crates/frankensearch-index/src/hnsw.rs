@@ -170,7 +170,8 @@ struct ValidatedHnswGeneration {
 
 /// How an HNSW load obtained its in-memory graph.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum HnswLoadDisposition {
+#[non_exhaustive]
+pub enum HnswLoadDisposition {
     /// The current native graph/data pair was deserialized from disk.
     Native,
     /// Metadata was readable, but the graph had to be rebuilt from the source index.
@@ -326,30 +327,51 @@ impl HnswIndex {
         Self::load_with_disposition(path, source_index).map(|(index, _)| index)
     }
 
+    /// Try to load only the exact persisted native graph paired with
+    /// `source_index`, without ever rebuilding it.
+    ///
+    /// `Ok(Some(index))` proves the current native graph/data generation,
+    /// digest receipt, ordered document IDs, vector fingerprint, dimension,
+    /// and topology all match `source_index`. `Ok(None)` means the metadata is
+    /// readable but the selected graph is legacy, stale, incomplete, corrupt,
+    /// or otherwise not admissible as that native artifact. This method never
+    /// scans source rows to construct a replacement graph and never writes,
+    /// replaces, renames, or changes permissions or mtimes.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the metadata file cannot be read or parsed, its
+    /// dimension disagrees with `source_index`, or its dimension exceeds the
+    /// supported distance-kernel budget.
+    pub fn try_load_native(path: &Path, source_index: &VectorIndex) -> SearchResult<Option<Self>> {
+        let meta = Self::validated_load_metadata(path, source_index)?;
+        if meta.format_version != HNSW_META_FORMAT_CURRENT {
+            return Ok(None);
+        }
+        Ok(Self::try_load_native_graph(path, &meta, source_index))
+    }
+
     /// Load an ANN index and report whether its graph came from native sidecars
     /// or was rebuilt from `source_index`.
-    pub(crate) fn load_with_disposition(
+    ///
+    /// This is the fail-closed inspection surface for consumers that must
+    /// distinguish the exact persisted ANN artifact from a compatible
+    /// in-memory fallback. Neither outcome writes, replaces, renames, or
+    /// changes permissions on `path`, its native sidecars, or `source_index`.
+    /// Callers that require the selected on-disk graph must accept only
+    /// [`HnswLoadDisposition::Native`].
+    ///
+    /// # Errors
+    ///
+    /// Returns `SearchError::IndexCorrupted` when metadata is unreadable,
+    /// malformed, dimensionally incompatible, or the source rows cannot be
+    /// decoded. A readable legacy/stale/corrupt native graph is instead
+    /// reported as [`HnswLoadDisposition::Rebuilt`] after an in-memory rebuild.
+    pub fn load_with_disposition(
         path: &Path,
         source_index: &VectorIndex,
     ) -> SearchResult<(Self, HnswLoadDisposition)> {
-        let metadata_bytes = std::fs::read(path).map_err(SearchError::Io)?;
-        let meta: HnswMeta = serde_json::from_slice(&metadata_bytes)
-            .map_err(|e| ann_corrupted(path, format!("failed to parse HNSW metadata: {e}")))?;
-
-        if meta.dimension != source_index.dimension() {
-            return Err(ann_corrupted(
-                path,
-                format!(
-                    "dimension mismatch: hnsw={} source={}",
-                    meta.dimension,
-                    source_index.dimension()
-                ),
-            ));
-        }
-
-        // Validate before the native fast path. Otherwise a forged current-format sidecar
-        // could bypass the dimension bound enforced by graph construction.
-        dist_dot_budget(meta.dimension)?;
+        let meta = Self::validated_load_metadata(path, source_index)?;
 
         // Current format: deserialize the prebuilt native graph directly, skipping the
         // O(n log n) rebuild. Any problem (missing/corrupt sidecars, point-count
@@ -377,10 +399,32 @@ impl HnswIndex {
             .map(|index| (index, HnswLoadDisposition::Rebuilt))
     }
 
+    fn validated_load_metadata(path: &Path, source_index: &VectorIndex) -> SearchResult<HnswMeta> {
+        let metadata_bytes = std::fs::read(path).map_err(SearchError::Io)?;
+        let meta: HnswMeta = serde_json::from_slice(&metadata_bytes)
+            .map_err(|e| ann_corrupted(path, format!("failed to parse HNSW metadata: {e}")))?;
+
+        if meta.dimension != source_index.dimension() {
+            return Err(ann_corrupted(
+                path,
+                format!(
+                    "dimension mismatch: hnsw={} source={}",
+                    meta.dimension,
+                    source_index.dimension()
+                ),
+            ));
+        }
+
+        // Validate before the native fast path. Otherwise a forged current-format sidecar
+        // could bypass the dimension bound enforced by graph construction.
+        dist_dot_budget(meta.dimension)?;
+        Ok(meta)
+    }
+
     /// Attempt to load the prebuilt native `hnsw_rs` graph for a current-format sidecar.
     ///
-    /// Returns `None` (so the caller rebuilds) if any of the following hold —
-    /// a degraded sidecar always degrades to "slow load", never a hard error:
+    /// Returns `None` if any of the following hold. Permissive callers may
+    /// rebuild from the source index; strict callers can reject the artifact:
     /// - the `.hnsw.graph` / `.hnsw.data` sidecars are absent,
     /// - `hnsw_rs` fails to deserialize them,
     /// - the loaded point count disagrees with the metadata `doc_ids`,
@@ -414,7 +458,7 @@ impl HnswIndex {
             Ok(None) => {
                 tracing::warn!(
                     path = %path.display(),
-                    "HNSW native sidecars lack a matching digest receipt; rebuilding"
+                    "HNSW native sidecars lack a matching digest receipt; native load unavailable"
                 );
                 return None;
             }
@@ -422,7 +466,7 @@ impl HnswIndex {
                 tracing::warn!(
                     path = %path.display(),
                     ?error,
-                    "HNSW native sidecar receipt validation failed; rebuilding"
+                    "HNSW native sidecar receipt validation failed; native load unavailable"
                 );
                 return None;
             }
@@ -430,7 +474,8 @@ impl HnswIndex {
         if validated_generation.basename != basename || validated_generation.graph != graph {
             tracing::warn!(
                 path = %path.display(),
-                "HNSW metadata and digest receipt name different native sidecars; rebuilding"
+                "HNSW metadata and digest receipt name different native sidecars; \
+                 native load unavailable"
             );
             return None;
         }
@@ -440,7 +485,7 @@ impl HnswIndex {
         if !meta_matches_live_doc_ids(meta, source_index).ok()? {
             tracing::warn!(
                 path = %path.display(),
-                "HNSW sidecar doc_ids disagree with live VectorIndex; rebuilding"
+                "HNSW sidecar doc_ids disagree with live VectorIndex; native load unavailable"
             );
             return None;
         }
@@ -460,7 +505,7 @@ impl HnswIndex {
                 expected = meta.vector_fingerprint,
                 actual = live_fp,
                 "HNSW sidecar vector fingerprint disagrees with live VectorIndex \
-                 (vectors swapped behind matching doc ids); rebuilding"
+                 (vectors swapped behind matching doc ids); native load unavailable"
             );
             return None;
         }
@@ -490,14 +535,16 @@ impl HnswIndex {
                 tracing::warn!(
                     path = %path.display(),
                     ?error,
-                    "HNSW native sidecar parser rejected the installed generation; rebuilding"
+                    "HNSW native sidecar parser rejected the installed generation; \
+                     native load unavailable"
                 );
                 return None;
             }
             Err(_) => {
                 tracing::warn!(
                     path = %path.display(),
-                    "HNSW native sidecar parser panicked on the installed generation; rebuilding"
+                    "HNSW native sidecar parser panicked on the installed generation; \
+                     native load unavailable"
                 );
                 return None;
             }
@@ -513,7 +560,7 @@ impl HnswIndex {
             tracing::warn!(
                 path = %path.display(),
                 %detail,
-                "HNSW native sidecar failed topology attestation; rebuilding"
+                "HNSW native sidecar failed topology attestation; native load unavailable"
             );
             return None;
         }
@@ -2823,6 +2870,73 @@ mod tests {
         VectorIndex::open(path)
     }
 
+    #[derive(Debug, PartialEq, Eq)]
+    struct ImmutableTreeEntry {
+        relative_path: PathBuf,
+        kind: &'static str,
+        len: u64,
+        modified: Option<SystemTime>,
+        readonly: bool,
+        permission_mode: Option<u32>,
+        bytes: Option<Vec<u8>>,
+    }
+
+    fn snapshot_immutable_tree(root: &Path) -> std::io::Result<Vec<ImmutableTreeEntry>> {
+        fn visit(
+            root: &Path,
+            path: &Path,
+            entries: &mut Vec<ImmutableTreeEntry>,
+        ) -> std::io::Result<()> {
+            let metadata = std::fs::symlink_metadata(path)?;
+            let file_type = metadata.file_type();
+            let kind = if file_type.is_file() {
+                "file"
+            } else if file_type.is_dir() {
+                "directory"
+            } else if file_type.is_symlink() {
+                "symlink"
+            } else {
+                "other"
+            };
+            let relative_path = path.strip_prefix(root).unwrap_or(path).to_path_buf();
+            let bytes = file_type
+                .is_file()
+                .then(|| std::fs::read(path))
+                .transpose()?;
+            #[cfg(unix)]
+            let permission_mode = {
+                use std::os::unix::fs::PermissionsExt;
+                Some(metadata.permissions().mode())
+            };
+            #[cfg(not(unix))]
+            let permission_mode = None;
+            entries.push(ImmutableTreeEntry {
+                relative_path,
+                kind,
+                len: metadata.len(),
+                modified: metadata.modified().ok(),
+                readonly: metadata.permissions().readonly(),
+                permission_mode,
+                bytes,
+            });
+            if file_type.is_dir() {
+                let mut children = std::fs::read_dir(path)?
+                    .map(|entry| entry.map(|entry| entry.path()))
+                    .collect::<std::io::Result<Vec<_>>>()?;
+                children.sort();
+                for child in children {
+                    visit(root, &child, entries)?;
+                }
+            }
+            Ok(())
+        }
+
+        let mut entries = Vec::new();
+        visit(root, root, &mut entries)?;
+        entries.sort_by(|left, right| left.relative_path.cmp(&right.relative_path));
+        Ok(entries)
+    }
+
     fn reject_hnsw_metadata_publish(_: &Path, _: &Path, _: &[u8]) -> SearchResult<()> {
         Err(SearchError::Io(std::io::Error::other(
             "injected metadata publication failure",
@@ -4463,6 +4577,77 @@ mod tests {
             .expect("search");
         assert_eq!(hits[0].doc_id, "doc-0010");
         assert!((hits[0].score - 1.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn public_strict_load_reports_native_without_mutating_selected_artifacts() {
+        let root = temp_path("public-strict-native", "dir");
+        std::fs::create_dir_all(&root).expect("create strict native fixture");
+        let fsvi_path = root.join("selected-source.fsvi");
+        let vectors: Vec<Vec<f32>> = (0..32).map(|i| normalized_vector(i, 16)).collect();
+        let source = write_index(&fsvi_path, &vectors).expect("write source FSVI");
+        let ann =
+            HnswIndex::build_from_vector_index(&source, HnswConfig::default()).expect("build ANN");
+        let metadata_path = root.join("selected-ann.hnsw");
+        ann.save(&metadata_path).expect("save selected native ANN");
+        let before = snapshot_immutable_tree(&root).expect("snapshot selected artifacts");
+
+        let native_only = HnswIndex::try_load_native(&metadata_path, &source)
+            .expect("inspect native graph")
+            .expect("selected graph must be native");
+        let (loaded, disposition) =
+            HnswIndex::load_with_disposition(&metadata_path, &source).expect("strict native load");
+
+        assert_eq!(disposition, HnswLoadDisposition::Native);
+        assert_eq!(native_only.len(), source.live_count());
+        assert_eq!(loaded.len(), source.live_count());
+        assert_eq!(
+            snapshot_immutable_tree(&root).expect("snapshot after strict native load"),
+            before,
+            "native inspection must preserve bytes, mtimes, permissions, and directory inventory"
+        );
+    }
+
+    #[test]
+    fn public_strict_load_reports_rebuilt_for_stale_source_without_mutation() {
+        let root = temp_path("public-strict-stale", "dir");
+        std::fs::create_dir_all(&root).expect("create strict stale fixture");
+        let original_path = root.join("original-source.fsvi");
+        let original_vectors: Vec<Vec<f32>> = (0..24).map(|i| normalized_vector(i, 12)).collect();
+        let original = write_index(&original_path, &original_vectors).expect("original FSVI");
+        let ann = HnswIndex::build_from_vector_index(&original, HnswConfig::default())
+            .expect("build original ANN");
+        let metadata_path = root.join("selected-ann.hnsw");
+        ann.save(&metadata_path).expect("save selected ANN");
+
+        let replacement_path = root.join("replacement-source.fsvi");
+        let replacement_vectors: Vec<Vec<f32>> =
+            (10_000..10_024).map(|i| normalized_vector(i, 12)).collect();
+        let replacement =
+            write_index(&replacement_path, &replacement_vectors).expect("replacement FSVI");
+        let before = snapshot_immutable_tree(&root).expect("snapshot stale fixture");
+
+        assert!(
+            HnswIndex::try_load_native(&metadata_path, &replacement)
+                .expect("inspect stale sidecar")
+                .is_none(),
+            "native-only inspection must reject stale vectors without rebuilding"
+        );
+        let (loaded, disposition) = HnswIndex::load_with_disposition(&metadata_path, &replacement)
+            .expect("stale sidecar should rebuild in memory");
+
+        assert_eq!(disposition, HnswLoadDisposition::Rebuilt);
+        assert_eq!(loaded.len(), replacement.live_count());
+        assert!(
+            loaded
+                .matches_vector_index(&replacement)
+                .expect("rebuilt graph matches replacement")
+        );
+        assert_eq!(
+            snapshot_immutable_tree(&root).expect("snapshot after stale load"),
+            before,
+            "stale detection and in-memory rebuild must preserve every selected artifact"
+        );
     }
 
     #[test]

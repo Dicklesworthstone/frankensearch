@@ -97,7 +97,7 @@ pub struct Passage {
 }
 
 const BOOK: &str = include_str!("../../tests/fixtures/treasure_island/treasure_island.txt");
-/// Consumed only by the Quill-backed lexical lane.
+/// Consumed by the Quill-only smoke lane and the explicit dual-backend lane.
 #[cfg(feature = "quill")]
 const LEXICAL_QUERIES: &str =
     include_str!("../../tests/fixtures/treasure_island/lexical_queries.json");
@@ -209,10 +209,10 @@ pub fn chunk_book(raw: &str) -> Vec<Passage> {
 
 fn corpus() -> Vec<Passage> {
     let passages = chunk_book(BOOK);
-    assert!(
-        passages.len() > 200,
-        "fixture should chunk into a realistic corpus, got {}",
-        passages.len()
+    assert_eq!(
+        passages.len(),
+        339,
+        "the frozen Treasure Island chunk contract must produce exactly 339 passages"
     );
     passages
 }
@@ -231,7 +231,7 @@ fn chapters_of(passages: &[Passage], ids: &[String]) -> BTreeSet<u32> {
 
 // ─── Model resolution ────────────────────────────────────────────────────────
 
-/// Where a real MiniLM sentence-embedder may live.
+/// Where a real `MiniLM` sentence-embedder may live.
 ///
 /// Mirrors the library's own precedence: `FRANKENSEARCH_MODEL_DIR` first (both
 /// as a model root and as a direct model directory), then the default per-user
@@ -416,28 +416,311 @@ fn semantic_queries_do_not_leak_the_answer_vocabulary() {
 #[cfg(feature = "quill")]
 mod lexical {
     use super::{LEXICAL_QUERIES, Passage, chapters_of, corpus};
-    use frankensearch::{IndexableDocument, QuillConfig, QuillIndex};
+    use frankensearch::{IndexableDocument, LexicalSearch, QuillConfig, QuillIndex};
+    #[cfg(feature = "lexical-tantivy")]
+    use frankensearch::{ScoredResult, TantivyIndex};
 
-    async fn build_index(
+    const BOOK_SHA256: &str =
+        "sha256:be2e285d9b0fa633eac35b350490af1693e29c7bf19c54b9260ce6389fab5190";
+    const LEXICAL_QRELS_SHA256: &str =
+        "sha256:da41ba6ed800feeda9318c5053252dd261cebd1b81d45a0a1851af90c87b95f1";
+    const PASSAGE_MANIFEST_SHA256: &str =
+        "sha256:73bc5d2e3f246cc67796b34b49976108cfe81fd91a4badb38af61a66bac40795";
+
+    #[cfg(feature = "lexical-tantivy")]
+    type RankedObservation = Vec<(String, u32)>;
+
+    fn append_len_prefixed(encoded: &mut Vec<u8>, value: &str) {
+        let len = u64::try_from(value.len()).expect("fixture field length must fit u64");
+        encoded.extend_from_slice(&len.to_le_bytes());
+        encoded.extend_from_slice(value.as_bytes());
+    }
+
+    /// Hash the ordered, domain-separated chunk product rather than an
+    /// incidental debug or JSON rendering. Length prefixes make the encoding
+    /// unambiguous, and the domain tag leaves room for a reviewed successor
+    /// without silently changing what this digest means.
+    fn passage_manifest_sha256(passages: &[Passage]) -> String {
+        let mut encoded = b"frankensearch.treasure-island.passage-manifest.v1\0".to_vec();
+        let count = u64::try_from(passages.len()).expect("passage count must fit u64");
+        encoded.extend_from_slice(&count.to_le_bytes());
+        for passage in passages {
+            append_len_prefixed(&mut encoded, &passage.id);
+            encoded.extend_from_slice(&passage.chapter.to_le_bytes());
+            append_len_prefixed(&mut encoded, &passage.title);
+            append_len_prefixed(&mut encoded, &passage.text);
+        }
+        frankensearch::core::sha256_checksum(&encoded)
+    }
+
+    fn indexable_documents(passages: &[Passage]) -> Vec<IndexableDocument> {
+        passages
+            .iter()
+            .map(|passage| {
+                IndexableDocument::new(passage.id.clone(), passage.text.clone())
+                    .with_title(passage.title.clone())
+            })
+            .collect()
+    }
+
+    #[cfg(feature = "lexical-tantivy")]
+    fn lexical_spec() -> serde_json::Value {
+        serde_json::from_str(LEXICAL_QUERIES).expect("lexical_queries.json parses")
+    }
+
+    async fn build_quill_index(
         cx: &frankensearch::Cx,
         dir: &std::path::Path,
-        passages: &[Passage],
+        docs: &[IndexableDocument],
     ) -> QuillIndex {
         let index = QuillIndex::create(cx, dir, QuillConfig::default())
             .await
             .expect("create quill index");
-        let docs: Vec<IndexableDocument> = passages
-            .iter()
-            .map(|p| {
-                IndexableDocument::new(p.id.clone(), p.text.clone()).with_title(p.title.clone())
-            })
-            .collect();
-        index
-            .index_documents(cx, &docs)
+        LexicalSearch::index_documents(&index, cx, docs)
             .await
             .expect("index passages");
-        index.commit(cx).await.expect("commit");
+        LexicalSearch::commit(&index, cx).await.expect("commit");
         index
+    }
+
+    #[cfg(feature = "lexical-tantivy")]
+    async fn build_tantivy_index(
+        cx: &frankensearch::Cx,
+        dir: &std::path::Path,
+        docs: &[IndexableDocument],
+    ) -> TantivyIndex {
+        let index = TantivyIndex::create(dir).expect("create Tantivy index");
+        LexicalSearch::index_documents(&index, cx, docs)
+            .await
+            .expect("index passages");
+        LexicalSearch::commit(&index, cx).await.expect("commit");
+        index
+    }
+
+    #[cfg(feature = "lexical-tantivy")]
+    fn assert_qrels(
+        label: &str,
+        passages: &[Passage],
+        spec: &serde_json::Value,
+        search: impl Fn(&str, usize) -> RankedObservation,
+    ) {
+        let search_limit =
+            usize::try_from(spec["search_limit"].as_u64().expect("search_limit")).expect("usize");
+        let recall_limit =
+            usize::try_from(spec["recall_limit"].as_u64().expect("recall_limit")).expect("usize");
+
+        for query in spec["queries"].as_array().expect("queries") {
+            let name = query["name"].as_str().expect("name");
+            let term = query["term"].as_str().expect("term");
+            let needle = query["must_contain"]
+                .as_str()
+                .expect("must_contain")
+                .to_lowercase();
+
+            let hits = search(term, search_limit);
+            assert!(
+                !hits.is_empty(),
+                "{label} lexical query `{name}` ({term}) returned no hits"
+            );
+            for (doc_id, _) in &hits {
+                let passage = passages
+                    .iter()
+                    .find(|passage| passage.id == *doc_id)
+                    .unwrap_or_else(|| panic!("{label} hit {doc_id} is not a corpus passage"));
+                let haystack = format!("{} {}", passage.title, passage.text).to_lowercase();
+                assert!(
+                    haystack.contains(&needle),
+                    "{label} lexical query `{name}` returned {doc_id}, which does not contain `{needle}`"
+                );
+            }
+
+            let expected: Vec<u32> = query["expect_chapters"]
+                .as_array()
+                .expect("expect_chapters")
+                .iter()
+                .map(|chapter| u32::try_from(chapter.as_u64().expect("chapter")).expect("u32"))
+                .collect();
+            if expected.is_empty() {
+                continue;
+            }
+
+            let ids: Vec<String> = search(term, recall_limit)
+                .into_iter()
+                .map(|(doc_id, _)| doc_id)
+                .collect();
+            let got = chapters_of(passages, &ids);
+            assert!(
+                expected.iter().any(|chapter| got.contains(chapter)),
+                "{label} lexical query `{name}` ({term}) found none of chapters {expected:?} within {recall_limit} hits; got {got:?}"
+            );
+        }
+
+        for query in spec["must_return_nothing"]
+            .as_array()
+            .expect("must_return_nothing")
+        {
+            let term = query["term"].as_str().expect("term");
+            let hits = search(term, 10);
+            assert!(
+                hits.is_empty(),
+                "{label} `{term}` should match nothing in a 19th-century novel, got {} hits",
+                hits.len()
+            );
+        }
+    }
+
+    #[cfg(feature = "lexical-tantivy")]
+    fn quill_sync_observation(
+        index: &QuillIndex,
+        cx: &frankensearch::Cx,
+        query: &str,
+        limit: usize,
+    ) -> RankedObservation {
+        index
+            .search_doc_ids(cx, query, limit)
+            .expect("Quill identifier search")
+            .into_iter()
+            .map(|hit| (hit.document_id, hit.score.to_bits()))
+            .collect()
+    }
+
+    #[cfg(feature = "lexical-tantivy")]
+    fn tantivy_sync_observation(
+        index: &TantivyIndex,
+        cx: &frankensearch::Cx,
+        query: &str,
+        limit: usize,
+    ) -> RankedObservation {
+        index
+            .search_doc_ids(cx, query, limit)
+            .expect("Tantivy identifier search")
+            .into_iter()
+            .map(|hit| (hit.doc_id.to_string(), hit.bm25_score.to_bits()))
+            .collect()
+    }
+
+    #[cfg(feature = "lexical-tantivy")]
+    async fn public_observation<I: LexicalSearch>(
+        index: &I,
+        cx: &frankensearch::Cx,
+        query: &str,
+        limit: usize,
+    ) -> RankedObservation {
+        LexicalSearch::search(index, cx, query, limit)
+            .await
+            .expect("public lexical search")
+            .into_iter()
+            .map(|result: ScoredResult| (result.doc_id.to_string(), result.score.to_bits()))
+            .collect()
+    }
+
+    /// The public and identifier-only paths must return the same score groups
+    /// and documents. Exact-score ties remain a native ordering concern: this
+    /// R0 witness permits only permutations inside one identical-score group
+    /// and therefore does not claim the richer tie-order contract.
+    #[cfg(feature = "lexical-tantivy")]
+    fn assert_same_rank_envelope(
+        label: &str,
+        sync: &RankedObservation,
+        public: &RankedObservation,
+    ) {
+        assert_eq!(
+            sync.len(),
+            public.len(),
+            "{label} adapter result count changed"
+        );
+        for (rank, (sync_hit, public_hit)) in sync.iter().zip(public).enumerate() {
+            assert_eq!(
+                sync_hit.1, public_hit.1,
+                "{label} adapter score bits changed at rank {rank}"
+            );
+        }
+
+        let mut start = 0;
+        while start < sync.len() {
+            let score_bits = sync[start].1;
+            let mut end = start + 1;
+            while end < sync.len() && sync[end].1 == score_bits {
+                end += 1;
+            }
+
+            let mut sync_ids: Vec<&str> = sync[start..end]
+                .iter()
+                .map(|(doc_id, _)| doc_id.as_str())
+                .collect();
+            let mut public_ids: Vec<&str> = public[start..end]
+                .iter()
+                .map(|(doc_id, _)| doc_id.as_str())
+                .collect();
+            sync_ids.sort_unstable();
+            public_ids.sort_unstable();
+            assert_eq!(
+                sync_ids, public_ids,
+                "{label} adapter membership changed inside score group {score_bits:#010x}"
+            );
+            start = end;
+        }
+    }
+
+    #[cfg(feature = "lexical-tantivy")]
+    fn probe_set(spec: &serde_json::Value) -> Vec<(String, usize)> {
+        let search_limit =
+            usize::try_from(spec["search_limit"].as_u64().expect("search_limit")).expect("usize");
+        let recall_limit =
+            usize::try_from(spec["recall_limit"].as_u64().expect("recall_limit")).expect("usize");
+        let mut probes = Vec::new();
+        for query in spec["queries"].as_array().expect("queries") {
+            let term = query["term"].as_str().expect("term").to_owned();
+            probes.push((term.clone(), search_limit));
+            probes.push((term, recall_limit));
+        }
+        for query in spec["must_return_nothing"]
+            .as_array()
+            .expect("must_return_nothing")
+        {
+            probes.push((query["term"].as_str().expect("term").to_owned(), 10));
+        }
+        probes
+    }
+
+    #[cfg(feature = "lexical-tantivy")]
+    async fn assert_adapter_consistency<I: LexicalSearch>(
+        label: &str,
+        index: &I,
+        cx: &frankensearch::Cx,
+        probes: &[(String, usize)],
+        sync_search: impl Fn(&str, usize) -> RankedObservation,
+    ) {
+        for (query, limit) in probes {
+            let sync = sync_search(query, *limit);
+            let public = public_observation(index, cx, query, *limit).await;
+            assert_same_rank_envelope(
+                &format!("{label} query {query:?} limit {limit}"),
+                &sync,
+                &public,
+            );
+        }
+    }
+
+    #[test]
+    fn fixture_source_qrels_and_chunk_manifest_are_frozen() {
+        super::quiet_logging();
+        let passages = corpus();
+        assert_eq!(
+            frankensearch::core::sha256_checksum(super::BOOK.as_bytes()),
+            BOOK_SHA256,
+            "Treasure Island source bytes changed"
+        );
+        assert_eq!(
+            frankensearch::core::sha256_checksum(LEXICAL_QUERIES.as_bytes()),
+            LEXICAL_QRELS_SHA256,
+            "lexical qrels bytes changed"
+        );
+        assert_eq!(
+            passage_manifest_sha256(&passages),
+            PASSAGE_MANIFEST_SHA256,
+            "ordered passage IDs, chapters, titles, or text changed"
+        );
     }
 
     #[test]
@@ -446,7 +729,8 @@ mod lexical {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             let passages = corpus();
             let tmp = tempfile::tempdir().expect("tempdir");
-            let index = build_index(&cx, tmp.path(), &passages).await;
+            let docs = indexable_documents(&passages);
+            let index = build_quill_index(&cx, tmp.path(), &docs).await;
 
             let spec: serde_json::Value =
                 serde_json::from_str(LEXICAL_QUERIES).expect("lexical_queries.json parses");
@@ -530,6 +814,98 @@ mod lexical {
                     hits.len()
                 );
             }
+        });
+    }
+
+    #[cfg(feature = "lexical-tantivy")]
+    #[test]
+    fn quill_and_tantivy_pass_real_prose_qrels_across_reopen() {
+        super::quiet_logging();
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let passages = corpus();
+            let docs = indexable_documents(&passages);
+            let spec = lexical_spec();
+            let probes = probe_set(&spec);
+            let tmp = tempfile::tempdir().expect("tempdir");
+            let quill_dir = tmp.path().join("quill");
+            let tantivy_dir = tmp.path().join("tantivy");
+
+            // Both public index_documents calls receive this exact same slice.
+            // No backend-specific fixture transform can drift between arms.
+            let quill = build_quill_index(&cx, &quill_dir, &docs).await;
+            let tantivy = build_tantivy_index(&cx, &tantivy_dir, &docs).await;
+            assert_eq!(LexicalSearch::doc_count(&quill), docs.len());
+            assert_eq!(LexicalSearch::doc_count(&tantivy), docs.len());
+
+            assert_qrels("Quill before reopen", &passages, &spec, |query, limit| {
+                quill_sync_observation(&quill, &cx, query, limit)
+            });
+            assert_qrels("Tantivy before reopen", &passages, &spec, |query, limit| {
+                tantivy_sync_observation(&tantivy, &cx, query, limit)
+            });
+            assert_adapter_consistency("Quill", &quill, &cx, &probes, |query, limit| {
+                quill_sync_observation(&quill, &cx, query, limit)
+            })
+            .await;
+            assert_adapter_consistency("Tantivy", &tantivy, &cx, &probes, |query, limit| {
+                tantivy_sync_observation(&tantivy, &cx, query, limit)
+            })
+            .await;
+
+            let quill_before: Vec<RankedObservation> = probes
+                .iter()
+                .map(|(query, limit)| quill_sync_observation(&quill, &cx, query, *limit))
+                .collect();
+            let tantivy_before: Vec<RankedObservation> = probes
+                .iter()
+                .map(|(query, limit)| tantivy_sync_observation(&tantivy, &cx, query, *limit))
+                .collect();
+
+            drop(quill);
+            drop(tantivy);
+
+            let quill = QuillIndex::open(&cx, &quill_dir, QuillConfig::default())
+                .await
+                .expect("reopen Quill index");
+            let tantivy = TantivyIndex::open(&tantivy_dir).expect("reopen Tantivy index");
+            assert_eq!(LexicalSearch::doc_count(&quill), docs.len());
+            assert_eq!(LexicalSearch::doc_count(&tantivy), docs.len());
+
+            assert_qrels("Quill after reopen", &passages, &spec, |query, limit| {
+                quill_sync_observation(&quill, &cx, query, limit)
+            });
+            assert_qrels("Tantivy after reopen", &passages, &spec, |query, limit| {
+                tantivy_sync_observation(&tantivy, &cx, query, limit)
+            });
+            assert_adapter_consistency("reopened Quill", &quill, &cx, &probes, |query, limit| {
+                quill_sync_observation(&quill, &cx, query, limit)
+            })
+            .await;
+            assert_adapter_consistency(
+                "reopened Tantivy",
+                &tantivy,
+                &cx,
+                &probes,
+                |query, limit| tantivy_sync_observation(&tantivy, &cx, query, limit),
+            )
+            .await;
+
+            let quill_after: Vec<RankedObservation> = probes
+                .iter()
+                .map(|(query, limit)| quill_sync_observation(&quill, &cx, query, *limit))
+                .collect();
+            let tantivy_after: Vec<RankedObservation> = probes
+                .iter()
+                .map(|(query, limit)| tantivy_sync_observation(&tantivy, &cx, query, *limit))
+                .collect();
+            assert_eq!(
+                quill_after, quill_before,
+                "Quill ranked results changed after close/open"
+            );
+            assert_eq!(
+                tantivy_after, tantivy_before,
+                "Tantivy ranked results changed after close/open"
+            );
         });
     }
 }

@@ -1,0 +1,193 @@
+bench_elf_sha256=a466d5a64a67843a8f2acd4b7add23c25b2015241c64ea35b385ae59431b8c12 (76985272 bytes) /data/tmp/frankensearch-qg1-bb31daa0-a466d5/bin/perf_matrix-a466d5a6
+[quill-perf-oracle] incumbent=tantivy linked_runtime=tantivy v0.26.1, index_format v7 contract_version=0.26.1 lexical=frankensearch-lexical@0.2.1 lexical_git=062a5e5b2d41653b1c8b07888eda1a765e421f49
+[qg-fixture-preflight] manifest=docs/contracts/quill-perf-gates.toml fixture=bulk/xlarge/4/positions_on schema=frankensearch-default-v1 operator=bare_term positions=positions_on threads=4 status=ok hits=2
+[quill-perf-policy] warmup_rounds=1
+[quill-perf-execution-provenance] {"host_identity":"threadripperje","physical_cores":64,"logical_threads":128,"process_available_threads":128,"threads_actually_used":[4],"runtime_detected_isa":["avx2","fma","bmi2","aes","vaes"],"cpu_affinity_allowed_list":"0-127","affinity_or_cpuset_cap":null}
+[qg-commit-parity] gate=QG-1 fixture=bulk/xlarge/4/positions_on arm=tantivy cadence_ms=1000 periodic_commits=12 terminal_commit_calls=1 durability=in_memory
+[qg-commit-parity] gate=QG-1 fixture=bulk/xlarge/4/positions_on arm=tantivy cadence_ms=1000 periodic_commits=12 terminal_commit_calls=1 durability=in_memory
+[qg-commit-parity] gate=QG-1 fixture=bulk/xlarge/4/positions_on arm=tantivy cadence_ms=1000 periodic_commits=12 terminal_commit_calls=1 durability=in_memory
+[qg-commit-parity] gate=QG-1 fixture=bulk/xlarge/4/positions_on arm=tantivy cadence_ms=1000 periodic_commits=12 terminal_commit_calls=1 durability=in_memory
+[qg-commit-parity] gate=QG-1 fixture=bulk/xlarge/4/positions_on arm=tantivy cadence_ms=1000 periodic_commits=12 terminal_commit_calls=1 durability=in_memory
+[qg-commit-parity] gate=QG-1 fixture=bulk/xlarge/4/positions_on arm=tantivy cadence_ms=1000 periodic_commits=12 terminal_commit_calls=1 durability=in_memory
+[qg-commit-parity] gate=QG-1 fixture=bulk/xlarge/4/positions_on arm=tantivy cadence_ms=1000 periodic_commits=12 terminal_commit_calls=1 durability=in_memory
+[qg-commit-parity] gate=QG-1 fixture=bulk/xlarge/4/positions_on arm=tantivy cadence_ms=1000 periodic_commits=12 terminal_commit_calls=1 durability=in_memory
+[qg-commit-parity] gate=QG-1 fixture=bulk/xlarge/4/positions_on arm=tantivy cadence_ms=1000 periodic_commits=12 terminal_commit_calls=1 durability=in_memory
+[qg-commit-parity] gate=QG-1 fixture=bulk/xlarge/4/positions_on arm=tantivy cadence_ms=1000 periodic_commits=12 terminal_commit_calls=1 durability=in_memory
+[qg-commit-parity] gate=QG-1 fixture=bulk/xlarge/4/positions_on arm=tantivy cadence_ms=1000 periodic_commits=12 terminal_commit_calls=1 durability=in_memory
+[qg-commit-parity] gate=QG-1 fixture=bulk/xlarge/4/positions_on arm=tantivy cadence_ms=1000 periodic_commits=12 terminal_commit_calls=1 durability=in_memory
+[qg-commit-parity] gate=QG-1 fixture=bulk/xlarge/4/positions_on arm=tantivy cadence_ms=1000 periodic_commits=12 terminal_commit_calls=1 durability=in_memory
+[qg-commit-parity] gate=QG-1 fixture=bulk/xlarge/4/positions_on arm=tantivy cadence_ms=1000 periodic_commits=12 terminal_commit_calls=1 durability=in_memory
+[qg-commit-parity] gate=QG-1 fixture=bulk/xlarge/4/positions_on arm=tantivy cadence_ms=1000 periodic_commits=12 terminal_commit_calls=1 durability=in_memory
+[qg-commit-parity] gate=QG-1 fixture=bulk/xlarge/4/positions_on arm=tantivy cadence_ms=1000 periodic_commits=12 terminal_commit_calls=1 durability=in_memory
+[qg-commit-parity] gate=QG-1 fixture=bulk/xlarge/4/positions_on arm=tantivy cadence_ms=1000 periodic_commits=12 terminal_commit_calls=1 durability=in_memory
+[qg-commit-parity] gate=QG-1 fixture=bulk/xlarge/4/positions_on arm=tantivy cadence_ms=1000 periodic_commits=12 terminal_commit_calls=1 durability=in_memory
+[qg-commit-parity] gate=QG-1 fixture=bulk/xlarge/4/positions_on arm=tantivy cadence_ms=1000 periodic_commits=12 terminal_commit_calls=1 durability=in_memory
+[qg-commit-parity] gate=QG-1 fixture=bulk/xlarge/4/positions_on arm=tantivy cadence_ms=1000 periodic_commits=12 terminal_commit_calls=1 durability=in_memory
+[qg-commit-parity] gate=QG-1 fixture=bulk/xlarge/4/positions_on arm=tantivy cadence_ms=1000 periodic_commits=11 terminal_commit_calls=1 durability=in_memory
+[qg-commit-parity] gate=QG-1 fixture=bulk/xlarge/4/positions_on arm=tantivy cadence_ms=1000 periodic_commits=11 terminal_commit_calls=1 durability=in_memory
+[qg-commit-parity] gate=QG-1 fixture=bulk/xlarge/4/positions_on arm=quill cadence_ms=1000 periodic_commits=25 terminal_commit_calls=1 durability=in_memory
+[qg-commit-parity] gate=QG-1 fixture=bulk/xlarge/4/positions_on arm=quill cadence_ms=1000 periodic_commits=25 terminal_commit_calls=1 durability=in_memory
+[qg-commit-parity] gate=QG-1 fixture=bulk/xlarge/4/positions_on arm=quill cadence_ms=1000 periodic_commits=25 terminal_commit_calls=1 durability=in_memory
+[qg-commit-parity] gate=QG-1 fixture=bulk/xlarge/4/positions_on arm=quill cadence_ms=1000 periodic_commits=25 terminal_commit_calls=1 durability=in_memory
+[qg-commit-parity] gate=QG-1 fixture=bulk/xlarge/4/positions_on arm=quill cadence_ms=1000 periodic_commits=25 terminal_commit_calls=1 durability=in_memory
+[qg-commit-parity] gate=QG-1 fixture=bulk/xlarge/4/positions_on arm=quill cadence_ms=1000 periodic_commits=25 terminal_commit_calls=1 durability=in_memory
+[qg-commit-parity] gate=QG-1 fixture=bulk/xlarge/4/positions_on arm=quill cadence_ms=1000 periodic_commits=25 terminal_commit_calls=1 durability=in_memory
+[qg-commit-parity] gate=QG-1 fixture=bulk/xlarge/4/positions_on arm=quill cadence_ms=1000 periodic_commits=25 terminal_commit_calls=1 durability=in_memory
+[qg-commit-parity] gate=QG-1 fixture=bulk/xlarge/4/positions_on arm=quill cadence_ms=1000 periodic_commits=25 terminal_commit_calls=1 durability=in_memory
+[qg-commit-parity] gate=QG-1 fixture=bulk/xlarge/4/positions_on arm=quill cadence_ms=1000 periodic_commits=25 terminal_commit_calls=1 durability=in_memory
+[qg-commit-parity] gate=QG-1 fixture=bulk/xlarge/4/positions_on arm=quill cadence_ms=1000 periodic_commits=25 terminal_commit_calls=1 durability=in_memory
+[qg-commit-parity] gate=QG-1 fixture=bulk/xlarge/4/positions_on arm=quill cadence_ms=1000 periodic_commits=25 terminal_commit_calls=1 durability=in_memory
+[qg-commit-parity] gate=QG-1 fixture=bulk/xlarge/4/positions_on arm=quill cadence_ms=1000 periodic_commits=25 terminal_commit_calls=1 durability=in_memory
+[qg-commit-parity] gate=QG-1 fixture=bulk/xlarge/4/positions_on arm=quill cadence_ms=1000 periodic_commits=24 terminal_commit_calls=1 durability=in_memory
+[qg-commit-parity] gate=QG-1 fixture=bulk/xlarge/4/positions_on arm=quill cadence_ms=1000 periodic_commits=25 terminal_commit_calls=1 durability=in_memory
+[qg-commit-parity] gate=QG-1 fixture=bulk/xlarge/4/positions_on arm=quill cadence_ms=1000 periodic_commits=25 terminal_commit_calls=1 durability=in_memory
+[qg-commit-parity] gate=QG-1 fixture=bulk/xlarge/4/positions_on arm=quill cadence_ms=1000 periodic_commits=25 terminal_commit_calls=1 durability=in_memory
+[qg-commit-parity] gate=QG-1 fixture=bulk/xlarge/4/positions_on arm=quill cadence_ms=1000 periodic_commits=25 terminal_commit_calls=1 durability=in_memory
+[qg-commit-parity] gate=QG-1 fixture=bulk/xlarge/4/positions_on arm=quill cadence_ms=1000 periodic_commits=24 terminal_commit_calls=1 durability=in_memory
+[qg-commit-parity] gate=QG-1 fixture=bulk/xlarge/4/positions_on arm=quill cadence_ms=1000 periodic_commits=24 terminal_commit_calls=1 durability=in_memory
+[qg-commit-parity] gate=QG-1 fixture=bulk/xlarge/4/positions_on arm=quill cadence_ms=1000 periodic_commits=25 terminal_commit_calls=1 durability=in_memory
+[qg-commit-parity] gate=QG-1 fixture=bulk/xlarge/4/positions_on arm=quill cadence_ms=1000 periodic_commits=25 terminal_commit_calls=1 durability=in_memory
+[qg-commit-parity] gate=QG-1 fixture=bulk/xlarge/4/positions_on arm=tantivy cadence_ms=1000 periodic_commits=11 terminal_commit_calls=1 durability=in_memory
+[qg-commit-parity] gate=QG-1 fixture=bulk/xlarge/4/positions_on arm=quill cadence_ms=1000 periodic_commits=25 terminal_commit_calls=1 durability=in_memory
+[qg-commit-parity] gate=QG-1 fixture=bulk/xlarge/4/positions_on arm=tantivy cadence_ms=1000 periodic_commits=11 terminal_commit_calls=1 durability=in_memory
+[qg-commit-parity] gate=QG-1 fixture=bulk/xlarge/4/positions_on arm=quill cadence_ms=1000 periodic_commits=25 terminal_commit_calls=1 durability=in_memory
+[qg-commit-parity] gate=QG-1 fixture=bulk/xlarge/4/positions_on arm=tantivy cadence_ms=1000 periodic_commits=11 terminal_commit_calls=1 durability=in_memory
+[qg-commit-parity] gate=QG-1 fixture=bulk/xlarge/4/positions_on arm=quill cadence_ms=1000 periodic_commits=25 terminal_commit_calls=1 durability=in_memory
+[qg-commit-parity] gate=QG-1 fixture=bulk/xlarge/4/positions_on arm=quill cadence_ms=1000 periodic_commits=25 terminal_commit_calls=1 durability=in_memory
+[qg-commit-parity] gate=QG-1 fixture=bulk/xlarge/4/positions_on arm=tantivy cadence_ms=1000 periodic_commits=11 terminal_commit_calls=1 durability=in_memory
+[qg-commit-parity] gate=QG-1 fixture=bulk/xlarge/4/positions_on arm=quill cadence_ms=1000 periodic_commits=25 terminal_commit_calls=1 durability=in_memory
+[qg-commit-parity] gate=QG-1 fixture=bulk/xlarge/4/positions_on arm=tantivy cadence_ms=1000 periodic_commits=11 terminal_commit_calls=1 durability=in_memory
+[qg-commit-parity] gate=QG-1 fixture=bulk/xlarge/4/positions_on arm=tantivy cadence_ms=1000 periodic_commits=11 terminal_commit_calls=1 durability=in_memory
+[qg-commit-parity] gate=QG-1 fixture=bulk/xlarge/4/positions_on arm=quill cadence_ms=1000 periodic_commits=25 terminal_commit_calls=1 durability=in_memory
+[qg-commit-parity] gate=QG-1 fixture=bulk/xlarge/4/positions_on arm=quill cadence_ms=1000 periodic_commits=25 terminal_commit_calls=1 durability=in_memory
+[qg-commit-parity] gate=QG-1 fixture=bulk/xlarge/4/positions_on arm=tantivy cadence_ms=1000 periodic_commits=11 terminal_commit_calls=1 durability=in_memory
+[qg-commit-parity] gate=QG-1 fixture=bulk/xlarge/4/positions_on arm=tantivy cadence_ms=1000 periodic_commits=11 terminal_commit_calls=1 durability=in_memory
+[qg-commit-parity] gate=QG-1 fixture=bulk/xlarge/4/positions_on arm=quill cadence_ms=1000 periodic_commits=25 terminal_commit_calls=1 durability=in_memory
+[qg-commit-parity] gate=QG-1 fixture=bulk/xlarge/4/positions_on arm=tantivy cadence_ms=1000 periodic_commits=11 terminal_commit_calls=1 durability=in_memory
+[qg-commit-parity] gate=QG-1 fixture=bulk/xlarge/4/positions_on arm=quill cadence_ms=1000 periodic_commits=25 terminal_commit_calls=1 durability=in_memory
+[qg-commit-parity] gate=QG-1 fixture=bulk/xlarge/4/positions_on arm=quill cadence_ms=1000 periodic_commits=25 terminal_commit_calls=1 durability=in_memory
+[qg-commit-parity] gate=QG-1 fixture=bulk/xlarge/4/positions_on arm=tantivy cadence_ms=1000 periodic_commits=11 terminal_commit_calls=1 durability=in_memory
+[qg-commit-parity] gate=QG-1 fixture=bulk/xlarge/4/positions_on arm=quill cadence_ms=1000 periodic_commits=25 terminal_commit_calls=1 durability=in_memory
+[qg-commit-parity] gate=QG-1 fixture=bulk/xlarge/4/positions_on arm=tantivy cadence_ms=1000 periodic_commits=11 terminal_commit_calls=1 durability=in_memory
+[quill-perf-paired] fixture=bulk/xlarge/4/positions_on tantivy_null_median=1.029780 tantivy_null_ci95=[0.906013,1.076442] tantivy_null_cv_pct=8.617 quill_null_median=0.994271 quill_null_ci95=[0.988540,1.005279] quill_null_cv_pct=1.045 ab_median=0.205067 ab_ci95=[0.195061,0.210728] ab_cv_pct=5.788 checksum=c63cfd9303c888dd
+[tantivy-lifecycle] receipts=33 sha256=00b4becb456748f087c98122e5eedcaac195246d0290be6f38c6e5c47ad40728 path=/data/tmp/frankensearch-qg1-bb31daa0-a466d5/output/t4/tantivy-lifecycle.jsonl
+[quill-evidence] gate=QG-1 status=invalid_null ratchet_admissible=false json=/data/tmp/frankensearch-qg1-bb31daa0-a466d5/output/t4/QG-1.evidence.json table=/data/tmp/frankensearch-qg1-bb31daa0-a466d5/output/t4/QG-1.evidence.md
+host=threadripperje | physical_cores=64 | logical_threads=128 | process_available_threads=128 | threads_actually_used=[4] | runtime_detected_isa=["avx2", "fma", "bmi2", "aes", "vaes"] | cpu_affinity_allowed_list=0-127 | affinity_or_cpuset_cap=none
+fixture | engine | metric | p50 | median_ci95 | p95 | p99 | cv_pct (provenance) | runs | admission
+--- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---
+bulk/xlarge/4/positions_on | quill | docs_per_second (docs/s) | 35589.080982 | [35388.876256, 35720.412677] | 35969.389234 | 35969.389234 | 0.639 | 10 | sampled
+bulk/xlarge/4/positions_on | tantivy | docs_per_second (docs/s) | 173165.385115 | [168911.542458, 185089.239285] | 190974.287102 | 190974.287102 | 5.731 | 10 | sampled
+bulk/xlarge/4/positions_on | paired_ab | docs_per_second_quill_over_tantivy (ratio) | 0.205067 | [0.195061, 0.210728] | 0.224948 | 0.224948 | 5.788 | 10 | sampled
+bulk/xlarge/4/positions_on | paired_null | docs_per_second_tantivy_over_tantivy (ratio) | 1.029780 | [0.906013, 1.076442] | 1.088303 | 1.088303 | 8.617 | 10 | sampled
+bulk/xlarge/4/positions_on | paired_null_quill | docs_per_second_quill_over_quill (ratio) | 0.994271 | [0.988540, 1.005279] | 1.015810 | 1.015810 | 1.045 | 10 | sampled
+
+[quill-perf-json-begin] gate=QG-1
+{
+  "schema_version": "quill-perf-artifact-v4",
+  "gate": "Qg1",
+  "bench_elf_sha256": "a466d5a64a67843a8f2acd4b7add23c25b2015241c64ea35b385ae59431b8c12",
+  "machine_fingerprint": "linux-x86_64-threadripperje-128thread-AMD_Ryzen_Threadripper_PRO_5995WX_64-Cores",
+  "execution": {
+    "host_identity": "threadripperje",
+    "physical_cores": 64,
+    "logical_threads": 128,
+    "process_available_threads": 128,
+    "threads_actually_used": [
+      4
+    ],
+    "runtime_detected_isa": [
+      "avx2",
+      "fma",
+      "bmi2",
+      "aes",
+      "vaes"
+    ],
+    "cpu_affinity_allowed_list": "0-127",
+    "affinity_or_cpuset_cap": null
+  },
+  "git_rev": "bb31daa04ee58f9c38c9a0d6e42b5a125e6f02ae",
+  "run_window": "qg1-trj-xlarge-fullsweep-bb31daa0-20260729T0824Z",
+  "run_id": "qg1-trj-xlarge-t4-bb31daa0-r10-20260729T0824Z",
+  "corpus_manifest_hash": "0cee09c95deba304c04dd6bb57b98fa07d9e2f379e46f8fb24fac1782cf8b48c",
+  "manifest_sha256": "41e341ee4a2b881b2b3b7a4d09bfcc13748f8fd646e763be81881b93ac8c314d",
+  "cells": [
+    {
+      "fixture": "bulk/xlarge/4/positions_on",
+      "metric": "docs_per_second",
+      "engine": "quill",
+      "unit": "docs/s",
+      "value": 35589.0809816211,
+      "p50": 35589.0809816211,
+      "median_ci95_low": 35388.87625613423,
+      "median_ci95_high": 35720.412677206106,
+      "p95": 35969.38923354487,
+      "p99": 35969.38923354487,
+      "mad": 138.55982511044567,
+      "cv_pct": 0.6391727258342637,
+      "runs": 10
+    },
+    {
+      "fixture": "bulk/xlarge/4/positions_on",
+      "metric": "docs_per_second",
+      "engine": "tantivy",
+      "unit": "docs/s",
+      "value": 173165.38511453912,
+      "p50": 173165.38511453912,
+      "median_ci95_low": 168911.54245829905,
+      "median_ci95_high": 185089.23928455546,
+      "p95": 190974.2871018618,
+      "p99": 190974.2871018618,
+      "mad": 8018.036990791923,
+      "cv_pct": 5.731245748784707,
+      "runs": 10
+    },
+    {
+      "fixture": "bulk/xlarge/4/positions_on",
+      "metric": "docs_per_second_quill_over_tantivy",
+      "engine": "paired_ab",
+      "unit": "ratio",
+      "value": 0.2050670550664086,
+      "p50": 0.2050670550664086,
+      "median_ci95_low": 0.19506142443197247,
+      "median_ci95_high": 0.21072845344608945,
+      "p95": 0.22494836818390992,
+      "p99": 0.22494836818390992,
+      "mad": 0.009108665430746912,
+      "cv_pct": 5.788088946370001,
+      "runs": 10
+    },
+    {
+      "fixture": "bulk/xlarge/4/positions_on",
+      "metric": "docs_per_second_tantivy_over_tantivy",
+      "engine": "paired_null",
+      "unit": "ratio",
+      "value": 1.0297804832977446,
+      "p50": 1.0297804832977446,
+      "median_ci95_low": 0.9060126295376744,
+      "median_ci95_high": 1.0764416608375602,
+      "p95": 1.0883025673781754,
+      "p99": 1.0883025673781754,
+      "mad": 0.05088027632667719,
+      "cv_pct": 8.617033506382063,
+      "runs": 10
+    },
+    {
+      "fixture": "bulk/xlarge/4/positions_on",
+      "metric": "docs_per_second_quill_over_quill",
+      "engine": "paired_null_quill",
+      "unit": "ratio",
+      "value": 0.9942708509905195,
+      "p50": 0.9942708509905195,
+      "median_ci95_low": 0.9885399622237501,
+      "median_ci95_high": 1.0052788763407747,
+      "p95": 1.0158097761713225,
+      "p99": 1.0158097761713225,
+      "mad": 0.007642022500354506,
+      "cv_pct": 1.0451865404428347,
+      "runs": 10
+    }
+  ],
+  "laws_attested": false
+}
+[quill-perf-json-end] gate=QG-1
+[quill-perf] gate=QG-1 json=/data/tmp/frankensearch-qg1-bb31daa0-a466d5/output/t4/QG-1.json table=/data/tmp/frankensearch-qg1-bb31daa0-a466d5/output/t4/QG-1.md

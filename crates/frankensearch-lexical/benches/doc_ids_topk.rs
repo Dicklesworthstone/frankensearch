@@ -10,7 +10,7 @@ use std::hint::black_box;
 use std::sync::Arc;
 
 use criterion::{Criterion, criterion_group, criterion_main};
-use frankensearch_core::{traits::LexicalSearch, types::IndexableDocument};
+use frankensearch_core::{traits::LexicalWrite, types::IndexableDocument};
 use frankensearch_lexical::TantivyIndex;
 
 const N: usize = 100_000;

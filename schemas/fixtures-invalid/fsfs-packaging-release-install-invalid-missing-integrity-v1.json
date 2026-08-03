@@ -10,31 +10,69 @@
   ],
   "artifacts": [
     {
+      "target_triple": "aarch64-apple-darwin",
+      "profile": "embedded",
+      "archive_format": "tar.xz",
+      "archive_path": "fsfs-0.4.0-aarch64-apple-darwin.tar.xz",
+      "metadata_path": "fsfs-0.4.0-aarch64-apple-darwin.metadata.json",
+      "build_tool": "cargo",
+      "semantic_loaders": true,
+      "embedded_models": true
+    },
+    {
+      "target_triple": "x86_64-pc-windows-msvc",
+      "profile": "embedded",
+      "archive_format": "zip",
+      "archive_path": "fsfs-0.4.0-x86_64-pc-windows-msvc.zip",
+      "checksum": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "metadata_path": "fsfs-0.4.0-x86_64-pc-windows-msvc.metadata.json",
+      "build_tool": "cargo",
+      "semantic_loaders": true,
+      "embedded_models": true
+    },
+    {
       "target_triple": "x86_64-unknown-linux-musl",
-      "archive_path": "fsfs-v0.4.0-x86_64-unknown-linux-musl.tar.xz",
-      "metadata_path": "fsfs-v0.4.0-x86_64-unknown-linux-musl.metadata.json",
-      "build_tool": "zigbuild"
+      "profile": "lite",
+      "archive_format": "tar.xz",
+      "archive_path": "fsfs-lite-0.4.0-x86_64-unknown-linux-musl.tar.xz",
+      "checksum": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+      "metadata_path": "fsfs-lite-0.4.0-x86_64-unknown-linux-musl.metadata.json",
+      "build_tool": "zigbuild",
+      "semantic_loaders": false,
+      "embedded_models": false
     },
     {
       "target_triple": "aarch64-unknown-linux-musl",
-      "archive_path": "fsfs-v0.4.0-aarch64-unknown-linux-musl.tar.xz",
+      "profile": "lite",
+      "archive_format": "tar.xz",
+      "archive_path": "fsfs-lite-0.4.0-aarch64-unknown-linux-musl.tar.xz",
       "checksum": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
-      "metadata_path": "fsfs-v0.4.0-aarch64-unknown-linux-musl.metadata.json",
-      "build_tool": "zigbuild"
+      "metadata_path": "fsfs-lite-0.4.0-aarch64-unknown-linux-musl.metadata.json",
+      "build_tool": "zigbuild",
+      "semantic_loaders": false,
+      "embedded_models": false
     },
     {
       "target_triple": "x86_64-apple-darwin",
-      "archive_path": "fsfs-v0.4.0-x86_64-apple-darwin.tar.xz",
+      "profile": "lite",
+      "archive_format": "tar.xz",
+      "archive_path": "fsfs-lite-0.4.0-x86_64-apple-darwin.tar.xz",
       "checksum": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
-      "metadata_path": "fsfs-v0.4.0-x86_64-apple-darwin.metadata.json",
-      "build_tool": "cargo"
+      "metadata_path": "fsfs-lite-0.4.0-x86_64-apple-darwin.metadata.json",
+      "build_tool": "cargo",
+      "semantic_loaders": false,
+      "embedded_models": false
     },
     {
       "target_triple": "aarch64-apple-darwin",
-      "archive_path": "fsfs-v0.4.0-aarch64-apple-darwin.tar.xz",
+      "profile": "lite",
+      "archive_format": "tar.xz",
+      "archive_path": "fsfs-lite-0.4.0-aarch64-apple-darwin.tar.xz",
       "checksum": "sha256:4444444444444444444444444444444444444444444444444444444444444444",
-      "metadata_path": "fsfs-v0.4.0-aarch64-apple-darwin.metadata.json",
-      "build_tool": "cargo"
+      "metadata_path": "fsfs-lite-0.4.0-aarch64-apple-darwin.metadata.json",
+      "build_tool": "cargo",
+      "semantic_loaders": false,
+      "embedded_models": false
     }
   ],
   "verification_summary": {

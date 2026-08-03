@@ -49,6 +49,15 @@ const SAMPLE_DOCS: &[(&str, &str)] = &[
     ("d5", "Zero-knowledge proofs verify without revealing data"),
 ];
 
+#[test]
+fn facade_reexports_split_lexical_reader_contract() {
+    fn accepts_root_reexport(_: Option<&dyn frankensearch::LexicalRead>) {}
+    fn accepts_prelude_reexport(_: Option<&dyn LexicalRead>) {}
+
+    accepts_root_reexport(None);
+    accepts_prelude_reexport(None);
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // 1. Canonicalization
 // ═══════════════════════════════════════════════════════════════════════════

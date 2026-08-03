@@ -173,17 +173,22 @@ fn lifecycle_begin_download_after_consent_succeeds() {
 }
 
 #[test]
-fn lifecycle_success_path_reaches_ready() {
+fn lifecycle_success_path_requires_reindex_after_acquisition() {
     let manifest = test_manifest();
     let consent = DownloadConsent::granted(ConsentSource::Programmatic);
     let mut lifecycle = ModelLifecycle::new(manifest, consent);
     lifecycle.begin_download(1024).unwrap();
     lifecycle.begin_verification().unwrap();
-    lifecycle.mark_ready();
+    lifecycle.mark_staged_verified().unwrap();
     assert!(
-        matches!(lifecycle.state(), ModelState::Ready),
-        "state should be Ready"
+        matches!(lifecycle.state(), ModelState::StagedVerified),
+        "download-only state should be StagedVerified"
     );
+    lifecycle.mark_acquired_needs_reindex().unwrap();
+    assert!(matches!(
+        lifecycle.state(),
+        ModelState::AcquiredNeedsReindex
+    ));
 }
 
 #[test]
@@ -332,6 +337,8 @@ fn model_state_serde_roundtrip() {
             total_bytes: 1024,
         },
         ModelState::Verifying,
+        ModelState::StagedVerified,
+        ModelState::AcquiredNeedsReindex,
         ModelState::Ready,
         ModelState::VerificationFailed {
             reason: "bad hash".to_owned(),

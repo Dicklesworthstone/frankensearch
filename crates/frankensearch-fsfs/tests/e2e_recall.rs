@@ -8,10 +8,10 @@
 //! 5. Verifying that search completes within a performance budget.
 //! 6. Verifying that JSON output is parseable and structurally correct.
 //!
-//! The test deliberately does NOT require model downloads — it works with the
-//! always-available hash embedder fallback for semantic search, relying primarily
-//! on BM25 lexical search for recall.  This means it can run in CI without
-//! network access, GPU, or pre-downloaded models.
+//! The test deliberately does not perform runtime model downloads. It runs only
+//! in the `embedded-models` feature lane, which materializes pinned, verified
+//! semantic model artifacts before indexing. Hash embeddings remain a control
+//! and are never admitted as production semantic results.
 //!
 //! Bead: bd-2w7x.37
 

@@ -4217,6 +4217,8 @@ impl<'a> PositionList<'a> {
             position_bytes: self.bytes,
             position_blocks: &self.blocks,
             position_block_index,
+            current_position_offset: position_reader.position(),
+            current_positions_consumed: false,
             position_reader,
             postings,
         })
@@ -4278,6 +4280,8 @@ pub struct PositionCursor<'a> {
     position_bytes: &'a [u8],
     position_blocks: &'a [PositionBlockMeta],
     position_block_index: Option<usize>,
+    current_position_offset: usize,
+    current_positions_consumed: bool,
     position_reader: PositionByteReader<'a>,
     postings: PostingCursor<'a>,
 }
@@ -4334,12 +4338,83 @@ impl PositionCursor<'_> {
                 field: "current position block",
             });
         }
+        let reader = if self.current_positions_consumed {
+            PositionByteReader::new(
+                self.position_bytes,
+                self.current_position_offset,
+                self.position_reader.end,
+            )?
+        } else {
+            self.position_reader.clone()
+        };
         Ok(Some(PositionIter {
-            reader: self.position_reader.clone(),
+            reader,
             posting_ordinal,
             remaining: freq,
             previous: None,
         }))
+    }
+
+    /// Decode the current run while advancing the cursor-owned POSITIONS
+    /// reader to the next run.
+    ///
+    /// A repeated call for the same posting remains correct by replaying from
+    /// the retained run boundary, but only the first successful call mutates
+    /// the owned reader. On every failure both the owned reader and the
+    /// consumed marker remain unchanged and `output` is empty.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed allocation, corruption, or paired-stream invariant
+    /// failure.
+    pub(crate) fn decode_current_positions_into(
+        &mut self,
+        output: &mut Vec<u32>,
+    ) -> Result<bool, PositionCodecError> {
+        output.clear();
+        let Some(posting_ordinal) = self.postings.posting_ordinal() else {
+            return Ok(false);
+        };
+        let freq = self
+            .postings
+            .freq()
+            .ok_or(PositionCodecError::CursorInvariant {
+                field: "current position frequency",
+            })?;
+        if self.position_block_index.is_none() {
+            return Err(PositionCodecError::CursorInvariant {
+                field: "current position block",
+            });
+        }
+        let expected =
+            usize::try_from(freq).map_err(|_| PositionCodecError::ArithmeticOverflow {
+                field: "current position count",
+            })?;
+        output
+            .try_reserve_exact(expected)
+            .map_err(|_| PositionCodecError::Allocation {
+                resource: "decoded current positions",
+                count: expected,
+            })?;
+
+        let mut next_reader = if self.current_positions_consumed {
+            PositionByteReader::new(
+                self.position_bytes,
+                self.current_position_offset,
+                self.position_reader.end,
+            )?
+        } else {
+            self.position_reader.clone()
+        };
+        if let Err(error) = decode_position_run(&mut next_reader, posting_ordinal, freq, output) {
+            output.clear();
+            return Err(error);
+        }
+        if !self.current_positions_consumed {
+            self.position_reader = next_reader;
+            self.current_positions_consumed = true;
+        }
+        Ok(true)
     }
 
     /// Move strictly forward by one posting. Exhaustion is fused.
@@ -4383,6 +4458,8 @@ impl PositionCursor<'_> {
                 self.position_bytes.len(),
                 self.position_bytes.len(),
             )?;
+            self.current_position_offset = self.position_reader.position();
+            self.current_positions_consumed = false;
             return Ok(None);
         };
 
@@ -4403,6 +4480,8 @@ impl PositionCursor<'_> {
             self.position_block_index = Some(destination);
             self.position_reader =
                 PositionByteReader::from_block(self.position_bytes, destination_block)?;
+            self.current_position_offset = self.position_reader.position();
+            self.current_positions_consumed = false;
         } else if destination < current_block {
             return Err(PositionCodecError::CursorInvariant {
                 field: "position advance moved backward",
@@ -4425,7 +4504,9 @@ impl PositionCursor<'_> {
             .ok_or(PositionCodecError::CursorInvariant {
                 field: "position cursor frequency",
             })?;
-        consume_position_run(&mut self.position_reader, posting_ordinal, freq)?;
+        if !self.current_positions_consumed {
+            consume_position_run(&mut self.position_reader, posting_ordinal, freq)?;
+        }
         let next = self.postings.next()?;
         let Some(next_posting) = next else {
             if !self.position_reader.is_empty() {
@@ -4434,6 +4515,8 @@ impl PositionCursor<'_> {
                 });
             }
             self.position_block_index = None;
+            self.current_position_offset = self.position_reader.position();
+            self.current_positions_consumed = false;
             return Ok(None);
         };
 
@@ -4491,6 +4574,8 @@ impl PositionCursor<'_> {
                 field: "position cursor skipped block seam",
             });
         }
+        self.current_position_offset = self.position_reader.position();
+        self.current_positions_consumed = false;
         Ok(Some(next_posting))
     }
 }
@@ -4751,6 +4836,32 @@ fn position_directory_len(directory: &[RawPositionBlock]) -> Result<usize, Posit
     Ok(length)
 }
 
+#[cfg(test)]
+std::thread_local! {
+    static POSITION_RUN_WORK_FOR_TEST: std::cell::Cell<(usize, usize)> =
+        const { std::cell::Cell::new((0, 0)) };
+}
+
+#[cfg(test)]
+pub(crate) fn reset_position_run_work_for_test() {
+    POSITION_RUN_WORK_FOR_TEST.set((0, 0));
+}
+
+#[cfg(test)]
+pub(crate) fn position_run_work_for_test() -> (usize, usize) {
+    POSITION_RUN_WORK_FOR_TEST.get()
+}
+
+#[cfg(test)]
+fn record_position_run_work_for_test(decoded: bool) {
+    let (owned_decodes, scan_consumes) = POSITION_RUN_WORK_FOR_TEST.get();
+    POSITION_RUN_WORK_FOR_TEST.set(if decoded {
+        (owned_decodes.saturating_add(1), scan_consumes)
+    } else {
+        (owned_decodes, scan_consumes.saturating_add(1))
+    });
+}
+
 fn consume_position_run(
     reader: &mut PositionByteReader<'_>,
     posting_ordinal: u32,
@@ -4775,6 +4886,35 @@ fn consume_position_run(
                 delta: encoded,
             })?;
     }
+    #[cfg(test)]
+    record_position_run_work_for_test(false);
+    Ok(())
+}
+
+fn decode_position_run(
+    reader: &mut PositionByteReader<'_>,
+    posting_ordinal: u32,
+    freq: u32,
+    output: &mut Vec<u32>,
+) -> Result<(), PositionCodecError> {
+    if freq == 0 {
+        return Ok(());
+    }
+    let mut previous = reader.read_u32_vint()?;
+    output.push(previous);
+    for _ in 1..freq {
+        let encoded = reader.read_u32_vint()?;
+        previous = previous
+            .checked_add(encoded)
+            .ok_or(PositionCodecError::PositionOverflow {
+                posting_ordinal,
+                previous,
+                delta: encoded,
+            })?;
+        output.push(previous);
+    }
+    #[cfg(test)]
+    record_position_run_work_for_test(true);
     Ok(())
 }
 
@@ -13110,6 +13250,9 @@ mod tests {
                 .collect::<Result<Vec<_>, _>>()?,
             expected_runs[127]
         );
+        let mut owned_decode = Vec::new();
+        assert!(cursor.decode_current_positions_into(&mut owned_decode)?);
+        assert_eq!(owned_decode, expected_runs[127]);
         assert_eq!(cursor.next()?, Some(postings[128]));
         assert_eq!(cursor.posting_ordinal(), Some(128));
         assert_eq!(
@@ -13128,6 +13271,8 @@ mod tests {
             cursor.advance(postings[before_seam].doc_id)?,
             Some(postings[before_seam])
         );
+        assert!(cursor.decode_current_positions_into(&mut owned_decode)?);
+        assert_eq!(owned_decode, expected_runs[before_seam]);
         assert_eq!(cursor.next()?, Some(postings[position_seam]));
         assert_eq!(
             cursor
@@ -13166,7 +13311,210 @@ mod tests {
                 .collect::<Result<Vec<_>, _>>()?,
             [u32::MAX]
         );
+        assert!(maximum_cursor.decode_current_positions_into(&mut owned_decode)?);
+        assert_eq!(owned_decode, [u32::MAX]);
         assert_eq!(maximum_cursor.next()?, None);
+        Ok(())
+    }
+
+    #[test]
+    fn position_cursor_owned_decode_consumes_each_run_once_and_preserves_replay() -> TestResult {
+        let postings = [
+            Posting::new(10, 2),
+            Posting::new(20, 3),
+            Posting::new(30, 1),
+        ];
+        let runs = [vec![1, 4], vec![7, 7, 130], vec![u32::MAX]];
+        let flat = runs.iter().flatten().copied().collect::<Vec<_>>();
+        let posting_bytes = EncodedPostingList::encode(&postings)?;
+        let posting_list = posting_bytes.posting_list()?;
+        let encoded = EncodedPositionList::encode(&postings, &flat)?;
+        let positions = encoded.position_list(&posting_list)?;
+        assert_eq!(positions.block_count(), 1);
+
+        let mut cursor = positions.cursor()?;
+        let initial_offset = cursor.position_reader.position();
+        let mut decoded = vec![999];
+        assert!(cursor.decode_current_positions_into(&mut decoded)?);
+        assert_eq!(decoded, runs[0]);
+        assert!(cursor.current_positions_consumed);
+        let second_run_offset = cursor.position_reader.position();
+        assert!(second_run_offset > initial_offset);
+
+        assert_eq!(
+            cursor
+                .positions()?
+                .ok_or("replay first consumed run")?
+                .collect::<Result<Vec<_>, _>>()?,
+            runs[0]
+        );
+        assert_eq!(cursor.position_reader.position(), second_run_offset);
+        assert!(cursor.decode_current_positions_into(&mut decoded)?);
+        assert_eq!(decoded, runs[0]);
+        assert_eq!(cursor.position_reader.position(), second_run_offset);
+
+        assert_eq!(cursor.next()?, Some(postings[1]));
+        assert!(!cursor.current_positions_consumed);
+        assert_eq!(cursor.current_position_offset, second_run_offset);
+        assert_eq!(cursor.position_reader.position(), second_run_offset);
+        assert!(cursor.decode_current_positions_into(&mut decoded)?);
+        assert_eq!(decoded, runs[1]);
+        let third_run_offset = cursor.position_reader.position();
+        assert!(third_run_offset > second_run_offset);
+
+        assert_eq!(cursor.advance(postings[2].doc_id)?, Some(postings[2]));
+        assert!(!cursor.current_positions_consumed);
+        assert_eq!(cursor.current_position_offset, third_run_offset);
+        assert_eq!(cursor.position_reader.position(), third_run_offset);
+        assert!(cursor.decode_current_positions_into(&mut decoded)?);
+        assert_eq!(decoded, runs[2]);
+        let exhausted_offset = cursor.position_reader.position();
+        assert_eq!(cursor.next()?, None);
+        assert_eq!(cursor.position_reader.position(), exhausted_offset);
+        assert!(!cursor.current_positions_consumed);
+        assert!(!cursor.decode_current_positions_into(&mut decoded)?);
+        assert!(decoded.is_empty());
+
+        let mut truncated = positions.cursor()?;
+        let original_offset = truncated.position_reader.position();
+        truncated.position_reader.end = original_offset + 1;
+        decoded.push(999);
+        assert!(matches!(
+            truncated.decode_current_positions_into(&mut decoded),
+            Err(PositionCodecError::Truncated { .. })
+        ));
+        assert!(decoded.is_empty());
+        assert!(!truncated.current_positions_consumed);
+        assert_eq!(truncated.position_reader.position(), original_offset);
+
+        let mut retry = positions.cursor()?;
+        let valid_reader = retry.position_reader.clone();
+        let valid_offset = retry.current_position_offset;
+        let noncanonical = [0x81, 0x00];
+        retry.position_reader = PositionByteReader::new(&noncanonical, 0, noncanonical.len())?;
+        decoded.push(999);
+        assert!(matches!(
+            retry.decode_current_positions_into(&mut decoded),
+            Err(PositionCodecError::NonCanonicalVint { domain: "u32", .. })
+        ));
+        assert!(decoded.is_empty());
+        assert!(!retry.current_positions_consumed);
+        assert_eq!(retry.position_reader.position(), 0);
+
+        let overflowing_delta = [0xff, 0xff, 0xff, 0xff, 0x0f, 0x01];
+        retry.position_reader =
+            PositionByteReader::new(&overflowing_delta, 0, overflowing_delta.len())?;
+        assert!(matches!(
+            retry.decode_current_positions_into(&mut decoded),
+            Err(PositionCodecError::PositionOverflow {
+                posting_ordinal: 0,
+                previous: u32::MAX,
+                delta: 1,
+            })
+        ));
+        assert!(decoded.is_empty());
+        assert!(!retry.current_positions_consumed);
+        assert_eq!(retry.position_reader.position(), 0);
+
+        retry.position_reader = valid_reader;
+        retry.current_position_offset = valid_offset;
+        assert!(retry.decode_current_positions_into(&mut decoded)?);
+        assert_eq!(decoded, runs[0], "a failed decode must remain retryable");
+        Ok(())
+    }
+
+    #[test]
+    fn position_cursor_randomized_owned_decode_replay_and_seek_match_rows() -> TestResult {
+        const BASE_SEED: u64 = 0x517c_c1b7_2722_0a95;
+        const CASES: u64 = 8;
+        const POSTING_COUNT: usize = 300;
+
+        for case in 0..CASES {
+            let seed = BASE_SEED ^ case;
+            let mut state = seed;
+            let mut postings = Vec::with_capacity(POSTING_COUNT);
+            let mut expected_runs = Vec::with_capacity(POSTING_COUNT);
+            let mut flat = Vec::new();
+            let mut doc_id = random_u32(&mut state) % 100;
+            for ordinal in 0..POSTING_COUNT {
+                if ordinal != 0 {
+                    doc_id = doc_id
+                        .checked_add(1 + random_u32(&mut state) % 7)
+                        .ok_or("random cursor fixture docid overflow")?;
+                }
+                let frequency = 8 + random_u32(&mut state) % 25;
+                postings.push(Posting::new(doc_id, frequency));
+                let mut position = random_u32(&mut state) % 1_000;
+                let mut run = Vec::with_capacity(usize::try_from(frequency)?);
+                for index in 0..frequency {
+                    if index != 0 {
+                        position = position
+                            .checked_add(random_u32(&mut state) % 6)
+                            .ok_or("random cursor fixture position overflow")?;
+                    }
+                    run.push(position);
+                    flat.push(position);
+                }
+                expected_runs.push(run);
+            }
+
+            let posting_bytes = EncodedPostingList::encode(&postings)?;
+            let posting_list = posting_bytes.posting_list()?;
+            let encoded = EncodedPositionList::encode(&postings, &flat)?;
+            let positions = encoded.position_list(&posting_list)?;
+            assert!(posting_list.block_count() >= 3, "seed={seed:#x}");
+            assert!(positions.block_count() >= 2, "seed={seed:#x}");
+
+            let mut cursor = positions.cursor()?;
+            let mut decoded = Vec::new();
+            while let Some(posting_ordinal) = cursor.posting_ordinal() {
+                let ordinal = usize::try_from(posting_ordinal)?;
+                assert_eq!(cursor.current(), Some(postings[ordinal]), "seed={seed:#x}");
+                assert_eq!(
+                    cursor
+                        .positions()?
+                        .ok_or("random cursor current positions")?
+                        .collect::<Result<Vec<_>, _>>()?,
+                    expected_runs[ordinal],
+                    "immutable replay seed={seed:#x} ordinal={ordinal}",
+                );
+
+                match random_u32(&mut state) % 3 {
+                    0 => {}
+                    1 => {
+                        assert!(cursor.decode_current_positions_into(&mut decoded)?);
+                        assert_eq!(decoded, expected_runs[ordinal]);
+                    }
+                    _ => {
+                        assert!(cursor.decode_current_positions_into(&mut decoded)?);
+                        assert_eq!(decoded, expected_runs[ordinal]);
+                        let reader_offset = cursor.position_reader.position();
+                        assert!(cursor.decode_current_positions_into(&mut decoded)?);
+                        assert_eq!(decoded, expected_runs[ordinal]);
+                        assert_eq!(cursor.position_reader.position(), reader_offset);
+                    }
+                }
+
+                let remaining = POSTING_COUNT - ordinal;
+                if remaining == 1 {
+                    assert_eq!(cursor.next()?, None);
+                } else if random_u32(&mut state) & 1 == 0 {
+                    assert_eq!(cursor.next()?, Some(postings[ordinal + 1]));
+                } else {
+                    let maximum_skip = (remaining - 1).min(17);
+                    let skip = 1 + usize::try_from(random_u32(&mut state))? % maximum_skip;
+                    let target = ordinal + skip;
+                    assert_eq!(
+                        cursor.advance(postings[target].doc_id)?,
+                        Some(postings[target]),
+                        "seek seed={seed:#x} from={ordinal} to={target}",
+                    );
+                }
+            }
+            assert!(cursor.positions()?.is_none(), "seed={seed:#x}");
+            assert!(!cursor.decode_current_positions_into(&mut decoded)?);
+            assert!(decoded.is_empty());
+        }
         Ok(())
     }
 

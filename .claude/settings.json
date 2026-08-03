@@ -1,0 +1,31 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(br show *)",
+      "Bash(br list *)",
+      "Bash(br ready *)",
+      "Bash(br dep list *)",
+      "Bash(br comments list *)",
+      "Bash(bv --robot-triage *)",
+      "Bash(bv --robot-insights *)",
+      "Bash(bv --robot-plan *)",
+      "Bash(bv --robot-next *)",
+      "Bash(bv --robot-alerts *)",
+      "Bash(am robot search *)",
+      "Bash(cass search *)",
+      "Bash(cass health *)",
+      "Bash(rch status *)",
+      "Bash(rch queue *)",
+      "Bash(rch doctor *)",
+      "Bash(ubs *)",
+      "mcp__mcp-agent-mail__fetch_inbox",
+      "mcp__mcp-agent-mail__search_messages",
+      "mcp__mcp-agent-mail__list_agents",
+      "mcp__mcp-agent-mail__summarize_thread",
+      "mcp__mcp-agent-mail__check_file_reservation_conflicts",
+      "mcp__mcp-agent-mail__whois",
+      "mcp__mcp-agent-mail__health_check",
+      "mcp__mcp-agent-mail__list_contacts"
+    ]
+  }
+}

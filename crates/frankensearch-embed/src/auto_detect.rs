@@ -54,8 +54,6 @@ use frankensearch_core::traits::{Embedder, SearchFuture};
 ))]
 use frankensearch_core::traits::{ModelCategory, ModelTier};
 
-#[cfg(feature = "bundled-default-models")]
-use crate::bundled_default_models::ensure_default_semantic_models;
 #[cfg(all(feature = "download", feature = "fastembed"))]
 use crate::fastembed_embedder::DEFAULT_DIMENSION as MINILM_DIMENSION;
 #[cfg(feature = "fastembed")]
@@ -100,10 +98,6 @@ const POTION_MODEL_NAME: &str = "potion-multilingual-128M";
 const POTION_HF_ID: &str = "minishlab/potion-multilingual-128M";
 #[cfg(all(feature = "download", feature = "model2vec"))]
 const POTION_DIMENSION: usize = 256;
-#[cfg(all(
-    feature = "download",
-    any(feature = "model2vec", feature = "fastembed")
-))]
 const OFFLINE_ENV: &str = "FRANKENSEARCH_OFFLINE";
 #[cfg(all(
     feature = "download",
@@ -324,40 +318,43 @@ impl EmbedderStack {
     ///
     /// Callers (fsfs config, library hosts) pass policy EXPLICITLY instead
     /// of relying on process environment: `options.offline = Some(true)`
-    /// forbids model downloads for this detection regardless of
-    /// `FRANKENSEARCH_OFFLINE`, and `Some(false)` ignores the env variable
-    /// entirely — environment cannot silently change library semantics when
-    /// the caller states intent. `None` fields defer to the environment,
-    /// preserving `auto_detect_with` behavior. Detection itself never
-    /// prompts: interactive consent is a product-surface concern.
+    /// forbids model downloads and remote provider construction for this
+    /// detection regardless of `FRANKENSEARCH_OFFLINE`, and `Some(false)`
+    /// ignores the env variable entirely — environment cannot silently change
+    /// library semantics when the caller states intent. `None` fields defer to
+    /// the environment, preserving `auto_detect_with` behavior. Detection
+    /// itself never prompts: interactive consent is a product-surface concern.
     ///
     /// # Errors
     ///
     /// Returns `SearchError::EmbedderUnavailable` when no usable fast
-    /// embedder is available, and `SearchError::UnverifiableRemoteSpace`
-    /// when explicit remote configuration cannot be verified.
+    /// embedder is available or explicit remote intent is prohibited by the
+    /// effective offline policy, and `SearchError::UnverifiableRemoteSpace`
+    /// when explicit remote configuration cannot be verified. Returns
+    /// `SearchError::InvalidConfig` when a deferred
+    /// `FRANKENSEARCH_OFFLINE` value is not a recognized boolean flag.
     pub fn auto_detect_with_options(
         model_root: Option<&Path>,
         options: &DetectOptions,
     ) -> SearchResult<Self> {
+        let remote_env = RemoteIntentEnv::from_environment();
+        let (offline, remote) = resolve_remote_intent(*options, &remote_env)?;
+
         #[cfg(all(
             feature = "download",
             any(feature = "model2vec", feature = "fastembed")
         ))]
         {
-            let mut policy = download_policy_from_environment();
-            if let Some(offline) = options.offline {
-                policy.offline = offline;
-            }
-            Self::auto_detect_with_policy(model_root, policy)
+            let policy = download_policy_from_environment(offline);
+            Self::auto_detect_with_policy(model_root, policy, remote)
         }
         #[cfg(not(all(
             feature = "download",
             any(feature = "model2vec", feature = "fastembed")
         )))]
         {
-            let _ = options;
-            Self::auto_detect_with_policy(model_root)
+            let _ = offline;
+            Self::auto_detect_with_policy(model_root, remote)
         }
     }
 
@@ -368,11 +365,8 @@ impl EmbedderStack {
     fn auto_detect_with_policy(
         model_root: Option<&Path>,
         policy: DownloadPolicy,
+        remote: Option<Arc<dyn Embedder>>,
     ) -> SearchResult<Self> {
-        materialize_bundled_default_models(model_root);
-        // Explicit-but-invalid remote intent is an error, never a silent
-        // downgrade to local/hash detection (bd-p6z6.2).
-        let remote = detect_remote_intent()?;
         let quality = detect_quality_embedder(model_root)
             .or_else(|| maybe_lazy_quality_embedder(model_root, policy))
             .or(remote);
@@ -393,11 +387,10 @@ impl EmbedderStack {
         feature = "download",
         any(feature = "model2vec", feature = "fastembed")
     )))]
-    fn auto_detect_with_policy(model_root: Option<&Path>) -> SearchResult<Self> {
-        materialize_bundled_default_models(model_root);
-        // Explicit-but-invalid remote intent is an error, never a silent
-        // downgrade to local/hash detection (bd-p6z6.2).
-        let remote = detect_remote_intent()?;
+    fn auto_detect_with_policy(
+        model_root: Option<&Path>,
+        remote: Option<Arc<dyn Embedder>>,
+    ) -> SearchResult<Self> {
         let quality = detect_quality_embedder(model_root).or(remote);
         let fast = detect_fast_embedder(model_root)
             .or_else(hash_fallback_embedder)
@@ -845,7 +838,10 @@ impl DownloadPolicy {
 
     fn blocked_reason(self) -> String {
         if self.offline {
-            return format!("{OFFLINE_ENV}=1 disables model auto-download");
+            return format!(
+                "{OFFLINE_ENV}=1 or an explicit offline detection policy disables model \
+                 auto-download"
+            );
         }
         if !self.consent.granted {
             let source = self
@@ -871,12 +867,7 @@ impl DownloadPolicy {
     feature = "download",
     any(feature = "model2vec", feature = "fastembed")
 ))]
-fn download_policy_from_environment() -> DownloadPolicy {
-    let offline = std::env::var(OFFLINE_ENV)
-        .ok()
-        .as_deref()
-        .and_then(parse_bool_flag)
-        .unwrap_or(false);
+fn download_policy_from_environment(offline: bool) -> DownloadPolicy {
     let consent = if offline {
         DownloadConsent::denied(Some(ConsentSource::Environment))
     } else {
@@ -891,10 +882,6 @@ fn download_policy_from_environment() -> DownloadPolicy {
     }
 }
 
-#[cfg(all(
-    feature = "download",
-    any(feature = "model2vec", feature = "fastembed")
-))]
 fn parse_bool_flag(raw: &str) -> Option<bool> {
     let value = raw.trim();
     if value == "1"
@@ -1734,10 +1721,12 @@ fn hash_fallback_embedder() -> Option<Arc<dyn Embedder>> {
 /// environment drift.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct DetectOptions {
-    /// `Some(true)`: never download models during this detection.
-    /// `Some(false)`: permit downloads (still subject to consent policy)
-    /// even if `FRANKENSEARCH_OFFLINE` is set. `None`: follow the
-    /// environment.
+    /// `Some(true)`: never download models or construct a remote provider
+    /// during this detection. Explicit remote intent then returns a typed
+    /// unavailable error, while ambient provider credentials remain ignored.
+    /// `Some(false)`: permit remote selection and downloads (still subject to
+    /// consent policy) even if `FRANKENSEARCH_OFFLINE` is set. `None`: follow
+    /// the environment.
     pub offline: Option<bool>,
 }
 
@@ -1746,6 +1735,7 @@ pub struct DetectOptions {
 /// mutation, which this workspace forbids).
 #[derive(Debug, Clone, Default)]
 struct RemoteIntentEnv {
+    offline: Option<String>,
     provider: Option<String>,
     model: Option<String>,
     dimension: Option<String>,
@@ -1757,6 +1747,7 @@ struct RemoteIntentEnv {
 impl RemoteIntentEnv {
     fn from_environment() -> Self {
         Self {
+            offline: std::env::var(OFFLINE_ENV).ok(),
             provider: std::env::var("FRANKENSEARCH_API_PROVIDER").ok(),
             model: std::env::var("FRANKENSEARCH_API_MODEL").ok(),
             dimension: std::env::var("FRANKENSEARCH_API_DIMENSION").ok(),
@@ -1779,6 +1770,20 @@ impl RemoteIntentEnv {
     }
 }
 
+fn resolve_offline_policy(options: DetectOptions, env: &RemoteIntentEnv) -> SearchResult<bool> {
+    if let Some(offline) = options.offline {
+        return Ok(offline);
+    }
+    let Some(raw) = env.offline.as_deref() else {
+        return Ok(false);
+    };
+    parse_bool_flag(raw).ok_or_else(|| SearchError::InvalidConfig {
+        field: OFFLINE_ENV.to_owned(),
+        value: raw.to_owned(),
+        reason: "expected a boolean flag: 1/0, true/false, yes/no, or on/off".to_owned(),
+    })
+}
+
 fn unverifiable_remote(reason: &str) -> SearchError {
     SearchError::UnverifiableRemoteSpace {
         producer: "environment".to_owned(),
@@ -1789,21 +1794,50 @@ fn unverifiable_remote(reason: &str) -> SearchError {
 /// Resolve explicit remote-embedding intent to a verified embedder, a typed
 /// failure, or nothing (bd-p6z6.2).
 ///
-/// - `Ok(None)`: no explicit frankensearch remote configuration exists.
-///   Ambient provider keys without any `FRANKENSEARCH_API_*` setting are
-///   logged and ignored, exactly as before.
-/// - `Ok(Some(_))`: explicit intent, producer-attested frozen identity,
-///   verified construction.
+/// - `Ok((offline, None))`: no explicit frankensearch remote configuration
+///   exists; `offline` is the single resolved policy snapshot shared with
+///   model-download admission.
+///   Ambient provider keys without any `FRANKENSEARCH_API_*` setting remain
+///   ignored, including while offline.
+/// - `Ok((false, Some(_)))`: explicit intent, producer-attested frozen
+///   identity, verified construction.
+/// - `Err(EmbedderUnavailable)`: explicit remote intent exists while the
+///   effective detection policy is offline. This gate runs before provider
+///   construction.
 /// - `Err(UnverifiableRemoteSpace)`: explicit intent that is missing,
 ///   malformed, unverifiable, or producer-unattested. Detection never
 ///   converts explicit intent into `None` — a silent downgrade to
 ///   local/hash embedders would serve vectors from the wrong space.
-fn detect_remote_intent() -> SearchResult<Option<Arc<dyn Embedder>>> {
-    resolve_remote_intent(&RemoteIntentEnv::from_environment())
+fn resolve_remote_intent(
+    options: DetectOptions,
+    env: &RemoteIntentEnv,
+) -> SearchResult<(bool, Option<Arc<dyn Embedder>>)> {
+    resolve_remote_intent_with(options, env, resolve_remote_intent_online)
+}
+
+fn resolve_remote_intent_with<T>(
+    options: DetectOptions,
+    env: &RemoteIntentEnv,
+    construct_online: impl FnOnce(&RemoteIntentEnv) -> SearchResult<Option<T>>,
+) -> SearchResult<(bool, Option<T>)> {
+    let offline = resolve_offline_policy(options, env)?;
+    if offline {
+        if env.has_explicit_intent() {
+            return Err(SearchError::EmbedderUnavailable {
+                model: "remote-tier".to_owned(),
+                reason: format!(
+                    "{OFFLINE_ENV}=1 or an explicit offline detection policy forbids remote \
+                     provider construction"
+                ),
+            });
+        }
+        return Ok((true, None));
+    }
+    construct_online(env).map(|remote| (false, remote))
 }
 
 #[cfg(feature = "api")]
-fn resolve_remote_intent(env: &RemoteIntentEnv) -> SearchResult<Option<Arc<dyn Embedder>>> {
+fn resolve_remote_intent_online(env: &RemoteIntentEnv) -> SearchResult<Option<Arc<dyn Embedder>>> {
     use crate::api_embedder::ApiEmbedder;
     use crate::api_provider::{GeminiProvider, OpenAiProvider};
 
@@ -1898,38 +1932,20 @@ fn resolve_remote_intent(env: &RemoteIntentEnv) -> SearchResult<Option<Arc<dyn E
 /// Without the `api` feature the build cannot satisfy remote intent, so
 /// explicit configuration is a typed failure rather than a silent ignore.
 #[cfg(not(feature = "api"))]
-fn resolve_remote_intent(env: &RemoteIntentEnv) -> SearchResult<Option<Arc<dyn Embedder>>> {
+fn resolve_remote_intent_online(env: &RemoteIntentEnv) -> SearchResult<Option<Arc<dyn Embedder>>> {
     if env.has_explicit_intent() {
         return Err(unverifiable_remote(
             "explicit remote configuration is present but this build lacks the `api` feature",
         ));
     }
+    if env.openai_key.is_some() || env.gemini_key.is_some() {
+        warn!(
+            "ambient provider key ignored: no frankensearch remote configuration \
+             was supplied and this build lacks the `api` feature"
+        );
+    }
     Ok(None)
 }
-
-#[cfg(feature = "bundled-default-models")]
-fn materialize_bundled_default_models(model_root: Option<&Path>) {
-    match ensure_default_semantic_models(model_root) {
-        Ok(summary) => {
-            if summary.models_written > 0 {
-                info!(
-                    models_written = summary.models_written,
-                    bytes_written = summary.bytes_written,
-                    "materialized bundled default semantic models"
-                );
-            }
-        }
-        Err(_error) => {
-            warn!(
-                reason = "bundled-model-materialization-failed",
-                "failed to materialize bundled default semantic models; continuing with normal detection"
-            );
-        }
-    }
-}
-
-#[cfg(not(feature = "bundled-default-models"))]
-const fn materialize_bundled_default_models(_model_root: Option<&Path>) {}
 
 /// Manifest-required files that are absent from `model_dir`.
 ///
@@ -1971,7 +1987,10 @@ fn candidate_directories(
 
 #[cfg(test)]
 mod tests {
-    #[cfg(all(feature = "model2vec", not(feature = "bundled-default-models")))]
+    #[cfg(any(
+        feature = "bundled-default-models",
+        all(feature = "model2vec", not(feature = "bundled-default-models"))
+    ))]
     use std::fs;
 
     #[cfg(all(feature = "download", feature = "model2vec"))]
@@ -1979,6 +1998,152 @@ mod tests {
 
     use super::*;
     use frankensearch_core::traits::ModelCategory;
+
+    #[cfg(feature = "bundled-default-models")]
+    #[derive(Debug, PartialEq, Eq)]
+    struct ObservedModelEntry {
+        file_kind: u8,
+        len: u64,
+        modified: std::time::SystemTime,
+        created: Option<std::time::SystemTime>,
+        changed: Option<(i64, i64)>,
+        permission_key: u64,
+        bytes: Option<Vec<u8>>,
+    }
+
+    #[cfg(feature = "bundled-default-models")]
+    fn snapshot_model_tree(root: &Path) -> Vec<(PathBuf, ObservedModelEntry)> {
+        fn visit(root: &Path, path: &Path, entries: &mut Vec<(PathBuf, ObservedModelEntry)>) {
+            let mut children = fs::read_dir(path)
+                .expect("read model tree")
+                .map(|entry| entry.expect("read model tree entry").path())
+                .collect::<Vec<_>>();
+            children.sort();
+            for child in children {
+                let relative = child
+                    .strip_prefix(root)
+                    .expect("model tree entry under root")
+                    .to_path_buf();
+                let metadata = fs::symlink_metadata(&child).expect("read model tree metadata");
+                let file_type = metadata.file_type();
+                let file_kind = if file_type.is_dir() {
+                    1
+                } else if file_type.is_file() {
+                    2
+                } else if file_type.is_symlink() {
+                    3
+                } else {
+                    4
+                };
+                #[cfg(unix)]
+                let (permission_key, changed) = {
+                    use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+                    (
+                        u64::from(metadata.permissions().mode()),
+                        Some((metadata.ctime(), metadata.ctime_nsec())),
+                    )
+                };
+                #[cfg(not(unix))]
+                let permission_key = u64::from(metadata.permissions().readonly());
+                #[cfg(not(unix))]
+                let changed = None;
+                entries.push((
+                    relative,
+                    ObservedModelEntry {
+                        file_kind,
+                        len: metadata.len(),
+                        modified: metadata.modified().expect("read model tree mtime"),
+                        created: metadata.created().ok(),
+                        changed,
+                        permission_key,
+                        bytes: file_type
+                            .is_file()
+                            .then(|| fs::read(&child).expect("read model tree file")),
+                    },
+                ));
+                if file_type.is_dir() {
+                    visit(root, &child, entries);
+                }
+            }
+        }
+
+        if !root.exists() {
+            return Vec::new();
+        }
+        let mut entries = Vec::new();
+        visit(root, root, &mut entries);
+        entries
+    }
+
+    #[cfg(feature = "bundled-default-models")]
+    fn detect_observationally(model_root: &Path) -> SearchResult<EmbedderStack> {
+        #[cfg(all(
+            feature = "download",
+            any(feature = "model2vec", feature = "fastembed")
+        ))]
+        {
+            EmbedderStack::auto_detect_with_policy(
+                Some(model_root),
+                DownloadPolicy::for_tests(
+                    DownloadConsent::denied(Some(ConsentSource::Programmatic)),
+                    false,
+                    false,
+                ),
+                None,
+            )
+        }
+        #[cfg(not(all(
+            feature = "download",
+            any(feature = "model2vec", feature = "fastembed")
+        )))]
+        {
+            EmbedderStack::auto_detect_with(Some(model_root))
+        }
+    }
+
+    #[cfg(all(feature = "bundled-default-models", feature = "hash"))]
+    #[test]
+    fn auto_detect_does_not_materialize_an_absent_bundled_cache() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let model_root = temp.path().join("absent-model-root");
+
+        let stack = detect_observationally(&model_root).expect("observational detection");
+
+        assert_eq!(stack.availability(), TwoTierAvailability::HashOnly);
+        assert!(
+            !model_root.exists(),
+            "auto-detection must not create an absent bundled-model cache"
+        );
+    }
+
+    #[cfg(all(feature = "bundled-default-models", feature = "hash"))]
+    #[test]
+    fn auto_detect_leaves_corrupt_bundled_bytes_and_receipts_unchanged() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let model_root = temp.path().join("models");
+        let fast_dir = model_root.join(POTION_MODEL_NAME);
+        let quality_dir = model_root.join(MINILM_MODEL_NAME);
+        fs::create_dir_all(&fast_dir).expect("create corrupt fast model dir");
+        fs::create_dir_all(&quality_dir).expect("create corrupt quality model dir");
+        fs::write(fast_dir.join("tokenizer.json"), b"corrupt-fast-tokenizer")
+            .expect("write corrupt fast bytes");
+        fs::write(fast_dir.join(".verified"), b"stale-fast-receipt")
+            .expect("write stale fast receipt");
+        fs::write(quality_dir.join("model.onnx"), b"corrupt-quality-model")
+            .expect("write corrupt quality bytes");
+        fs::write(quality_dir.join(".verified"), b"stale-quality-receipt")
+            .expect("write stale quality receipt");
+        let before = snapshot_model_tree(&model_root);
+
+        let stack = detect_observationally(&model_root).expect("observational detection");
+
+        assert_eq!(stack.availability(), TwoTierAvailability::HashOnly);
+        assert_eq!(
+            snapshot_model_tree(&model_root),
+            before,
+            "auto-detection must not repair model bytes or mint receipts"
+        );
+    }
 
     struct MrlFixtureEmbedder {
         identity: EmbeddingIdentityBundleV1,
@@ -2052,6 +2217,7 @@ mod tests {
                 false,
                 false,
             ),
+            None,
         )
         .unwrap();
         #[cfg(not(all(
@@ -2070,17 +2236,11 @@ mod tests {
         not(feature = "bundled-default-models")
     ))]
     #[test]
-    fn auto_detect_fast_only_when_model2vec_is_available() {
+    fn auto_detect_rejects_unverified_model2vec_layout() {
         let temp = tempfile::tempdir().unwrap();
         let model_dir = temp.path().join(POTION_MODEL_NAME);
         fs::create_dir_all(&model_dir).unwrap();
         create_test_model2vec_layout(&model_dir, 16, 8);
-        // Plant a verification marker so auto-detect skips SHA-256 checks
-        // against the real manifest (test files have dummy content).
-        crate::model_manifest::write_verification_marker(
-            &crate::model_manifest::ModelManifest::potion_128m(),
-            &model_dir,
-        );
 
         #[cfg(all(
             feature = "download",
@@ -2093,6 +2253,7 @@ mod tests {
                 false,
                 false,
             ),
+            None,
         )
         .unwrap();
         #[cfg(not(all(
@@ -2100,8 +2261,9 @@ mod tests {
             any(feature = "model2vec", feature = "fastembed")
         )))]
         let stack = EmbedderStack::auto_detect_with(Some(temp.path())).unwrap();
-        assert_eq!(stack.availability(), TwoTierAvailability::FastOnly);
-        assert_eq!(stack.fast().id(), POTION_MODEL_NAME);
+        assert_eq!(stack.availability(), TwoTierAvailability::HashOnly);
+        assert_eq!(stack.fast().category(), ModelCategory::HashEmbedder);
+        assert!(stack.quality().is_none());
     }
 
     #[cfg(all(
@@ -2128,6 +2290,7 @@ mod tests {
                 false,
                 false,
             ),
+            None,
         )
         .unwrap();
         #[cfg(not(all(
@@ -2150,6 +2313,7 @@ mod tests {
                 false,
                 false,
             ),
+            None,
         )
         .unwrap();
         assert_eq!(stack.fast().id(), POTION_MODEL_NAME);
@@ -2961,23 +3125,31 @@ mod tests {
 
 #[cfg(test)]
 mod remote_intent_tests {
+    use std::cell::Cell;
+
     use frankensearch_core::SearchError;
 
-    use super::{RemoteIntentEnv, resolve_remote_intent};
+    use super::{
+        DetectOptions, RemoteIntentEnv, resolve_remote_intent, resolve_remote_intent_with,
+    };
 
     fn expect_unverifiable(env: &RemoteIntentEnv, context: &str) {
-        match resolve_remote_intent(env) {
+        match resolve_remote_intent(DetectOptions::default(), env) {
             Err(SearchError::UnverifiableRemoteSpace { .. }) => {}
             Err(other) => panic!("{context}: expected UnverifiableRemoteSpace, got {other:?}"),
-            Ok(Some(_)) => panic!("{context}: expected typed failure, got a verified embedder"),
-            Ok(None) => panic!("{context}: explicit intent silently degraded to None"),
+            Ok((_, Some(_))) => {
+                panic!("{context}: expected typed failure, got a verified embedder")
+            }
+            Ok((_, None)) => panic!("{context}: explicit intent silently degraded to None"),
         }
     }
 
     #[test]
     fn no_intent_and_no_keys_is_none() {
-        let outcome =
-            resolve_remote_intent(&RemoteIntentEnv::default()).expect("no intent is not an error");
+        let (offline, outcome) =
+            resolve_remote_intent(DetectOptions::default(), &RemoteIntentEnv::default())
+                .expect("no intent is not an error");
+        assert!(!offline);
         assert!(outcome.is_none());
     }
 
@@ -2987,8 +3159,213 @@ mod remote_intent_tests {
             openai_key: Some("sk-ambient-unrelated-tool".to_owned()),
             ..RemoteIntentEnv::default()
         };
-        let outcome = resolve_remote_intent(&env).expect("ambient key is not intent");
+        let (offline, outcome) = resolve_remote_intent(DetectOptions::default(), &env)
+            .expect("ambient key is not intent");
+        assert!(!offline);
         assert!(outcome.is_none());
+    }
+
+    #[test]
+    fn explicit_offline_rejects_remote_intent_before_construction() {
+        let env = RemoteIntentEnv {
+            offline: Some("false".to_owned()),
+            provider: Some("openai".to_owned()),
+            identity_json: Some("{malformed identity".to_owned()),
+            openai_key: Some("sk-test".to_owned()),
+            ..RemoteIntentEnv::default()
+        };
+        let construction_calls = Cell::new(0);
+
+        let outcome = resolve_remote_intent_with(
+            DetectOptions {
+                offline: Some(true),
+            },
+            &env,
+            |_| {
+                construction_calls.set(construction_calls.get() + 1);
+                Ok(Some(()))
+            },
+        );
+
+        assert!(matches!(
+            outcome,
+            Err(SearchError::EmbedderUnavailable { .. })
+        ));
+        assert_eq!(construction_calls.get(), 0);
+    }
+
+    #[test]
+    fn explicit_offline_ignores_ambient_credentials_without_construction() {
+        let env = RemoteIntentEnv {
+            openai_key: Some("sk-ambient-unrelated-tool".to_owned()),
+            gemini_key: Some("ambient-gemini-key".to_owned()),
+            ..RemoteIntentEnv::default()
+        };
+        let construction_calls = Cell::new(0);
+
+        let (offline, outcome) = resolve_remote_intent_with(
+            DetectOptions {
+                offline: Some(true),
+            },
+            &env,
+            |_| {
+                construction_calls.set(construction_calls.get() + 1);
+                Ok(Some(()))
+            },
+        )
+        .expect("ambient credentials are not explicit remote intent");
+
+        assert!(offline);
+        assert!(outcome.is_none());
+        assert_eq!(construction_calls.get(), 0);
+    }
+
+    #[test]
+    fn explicit_online_overrides_offline_environment_and_constructs_once() {
+        let env = RemoteIntentEnv {
+            offline: Some("true".to_owned()),
+            provider: Some("openai".to_owned()),
+            ..RemoteIntentEnv::default()
+        };
+        let construction_calls = Cell::new(0);
+
+        let (offline, outcome) = resolve_remote_intent_with(
+            DetectOptions {
+                offline: Some(false),
+            },
+            &env,
+            |_| {
+                construction_calls.set(construction_calls.get() + 1);
+                Ok(Some(41_u8))
+            },
+        )
+        .expect("explicit online policy must override the environment");
+
+        assert!(!offline);
+        assert_eq!(outcome, Some(41));
+        assert_eq!(construction_calls.get(), 1);
+    }
+
+    #[test]
+    fn explicit_offline_does_not_parse_malformed_environment() {
+        let env = RemoteIntentEnv {
+            offline: Some("definitely".to_owned()),
+            ..RemoteIntentEnv::default()
+        };
+        let construction_calls = Cell::new(0);
+
+        let (offline, outcome) = resolve_remote_intent_with(
+            DetectOptions {
+                offline: Some(true),
+            },
+            &env,
+            |_| {
+                construction_calls.set(construction_calls.get() + 1);
+                Ok(Some(()))
+            },
+        )
+        .expect("explicit offline policy must dominate malformed ambient policy");
+
+        assert!(offline);
+        assert!(outcome.is_none());
+        assert_eq!(construction_calls.get(), 0);
+    }
+
+    #[test]
+    fn explicit_online_does_not_parse_malformed_environment() {
+        let env = RemoteIntentEnv {
+            offline: Some("definitely".to_owned()),
+            ..RemoteIntentEnv::default()
+        };
+        let construction_calls = Cell::new(0);
+
+        let (offline, outcome) = resolve_remote_intent_with(
+            DetectOptions {
+                offline: Some(false),
+            },
+            &env,
+            |_| {
+                construction_calls.set(construction_calls.get() + 1);
+                Ok(Some(19_u8))
+            },
+        )
+        .expect("explicit online policy must dominate malformed ambient policy");
+
+        assert!(!offline);
+        assert_eq!(outcome, Some(19));
+        assert_eq!(construction_calls.get(), 1);
+    }
+
+    #[test]
+    fn deferred_malformed_offline_environment_fails_before_construction() {
+        let env = RemoteIntentEnv {
+            offline: Some("definitely".to_owned()),
+            ..RemoteIntentEnv::default()
+        };
+        let construction_calls = Cell::new(0);
+
+        let outcome = resolve_remote_intent_with(DetectOptions::default(), &env, |_| {
+            construction_calls.set(construction_calls.get() + 1);
+            Ok(Some(()))
+        });
+
+        assert!(
+            matches!(&outcome, Err(SearchError::InvalidConfig { .. })),
+            "malformed ambient offline policy must fail as InvalidConfig"
+        );
+        let Err(SearchError::InvalidConfig {
+            field,
+            value,
+            reason,
+        }) = outcome
+        else {
+            return;
+        };
+        assert_eq!(field, super::OFFLINE_ENV);
+        assert_eq!(value, "definitely");
+        assert!(reason.contains("boolean flag"));
+        assert_eq!(construction_calls.get(), 0);
+    }
+
+    #[test]
+    fn deferred_policy_honors_offline_environment_without_construction() {
+        let env = RemoteIntentEnv {
+            offline: Some("yes".to_owned()),
+            provider: Some("gemini".to_owned()),
+            ..RemoteIntentEnv::default()
+        };
+        let construction_calls = Cell::new(0);
+
+        let outcome = resolve_remote_intent_with(DetectOptions::default(), &env, |_| {
+            construction_calls.set(construction_calls.get() + 1);
+            Ok(Some(()))
+        });
+
+        assert!(matches!(
+            outcome,
+            Err(SearchError::EmbedderUnavailable { .. })
+        ));
+        assert_eq!(construction_calls.get(), 0);
+    }
+
+    #[test]
+    fn deferred_policy_honors_online_environment_and_constructs_once() {
+        let env = RemoteIntentEnv {
+            offline: Some("off".to_owned()),
+            provider: Some("gemini".to_owned()),
+            ..RemoteIntentEnv::default()
+        };
+        let construction_calls = Cell::new(0);
+
+        let (offline, outcome) = resolve_remote_intent_with(DetectOptions::default(), &env, |_| {
+            construction_calls.set(construction_calls.get() + 1);
+            Ok(Some(73_u8))
+        })
+        .expect("deferred policy must honor an online environment");
+
+        assert!(!offline);
+        assert_eq!(outcome, Some(73));
+        assert_eq!(construction_calls.get(), 1);
     }
 
     #[test]

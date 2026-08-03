@@ -133,8 +133,12 @@ segment concatenation copies inside `concat_merge_owned`), IDHASH build
 
 ## Allocator-vs-layout split (machine-class-divergence hypothesis input)
 
-Requested classification given the QG-2 class split (certified 0.1113
-x86/Linux vs 0.528 m4-macos attempt):
+Routing-only classification input: the 0.1113 x86/Linux value is a
+superseded pre-current Ryzen 7 5800X diagnostic from commit `351f5c6d`; the
+retained M4 attempt
+`m4-macos-qg2-receipt-w5-r30-20260729T021107Z` is `invalid_null` at
+`0.528360 [0.404084, 0.544504]`. These attempts never formed a certified
+class split, and facade-level QG-2 remains inactive.
 
 - The memmove family is **overwhelmingly data-copy-driven**: rows 1–5+8
   (structural byte movement: column append, section assembly, publication

@@ -1676,6 +1676,11 @@ fn write_durable(path: &Path, data: &[u8]) -> std::io::Result<()> {
         file.write_all(data)?;
         file.sync_all()?;
         fs::rename(&tmp_path, path)?;
+        // The rename lives in the directory entry; without syncing the parent
+        // a power loss can undo the rename even though the data blocks are
+        // durable (bd-xx286, same idiom as the sidecar publication above).
+        #[cfg(unix)]
+        sync_parent_directory(path)?;
         Ok(())
     })();
     if result.is_err() {

@@ -22,7 +22,7 @@ use asupersync::test_utils::run_test_with_cx;
 use frankensearch_core::config::TwoTierConfig;
 use frankensearch_core::error::SearchError;
 use frankensearch_core::traits::{Embedder, LexicalRead, ModelCategory, SearchFuture};
-use frankensearch_core::types::{IndexableDocument, ScoreSource, ScoredResult, SearchPhase};
+use frankensearch_core::types::{ScoreSource, ScoredResult, SearchPhase};
 use frankensearch_index::TwoTierIndex;
 
 use frankensearch_fusion::interaction_lanes::{

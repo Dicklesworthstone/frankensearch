@@ -272,3 +272,184 @@ Standing contract: merge not rebase; per hunk never per file; never a side
 wholesale; union the beads; the three modify/deletes reasoned in the merge
 commit message; zero-deletion diff review against both parents; nothing pushed
 until the owner has checked both lists.
+
+---
+
+# Completion record (2026-08-02, successor session)
+
+All 38 conflicts are resolved and the gate is green. Nothing pushed.
+
+## `scripts/perf-runner.sh` — OWNER RULING APPLIED
+
+Not irreconcilable: a **filename collision between two complementary tools**.
+The decisive evidence is in origin's own tree — `machine_class_registry.rs`
+`include_bytes!`s `docs/evidence/e8h/fingerprints/{trj-zen-128c,m4-macos}-*/`
+`provenance.json`, which are *the local runner's output format*
+(`"schema": "frankensearch.perf-runner.v1"`). Origin consumes what local
+produces; they are not rival designs.
+
+1. `scripts/perf-runner.sh` = **origin's version, byte-identical, unmodified**
+   (verified by `diff` against `:3:`). Typed-producer trust model.
+2. `scripts/perf-diagnostic.sh` = **local's 205-line profiler, kept**, with a
+   header stating it produces **no promotable evidence**. It fills origin's own
+   *"Diagnostic Apple profiling happens outside this promotion producer."* slot.
+   Only two executable lines changed from local's original, both deliberate:
+   the output root is now `$PERF_DIAGNOSTIC_OUT`
+   (default `~/.frankensearch-perf-diagnostics`) so diagnostic directories can
+   never be mistaken for sealed receipts, and `usage()` is now robust to header
+   edits. The emitted `"schema"` string is deliberately **unchanged** —
+   it names the artifact format and the registered fingerprints are hashed as
+   bytes; renaming it would silently fork the format.
+
+### Machine-class taxonomy mapping (no class value vanished)
+
+| `perf-diagnostic.sh --class` | `perf-runner.sh --hardware-class` | `--execution-profile` | promotion status |
+|---|---|---|---|
+| `x86-vps-ovh`  | `x86-vps-ovh`     | `x86-diagnostic` | diagnostic-only (producer refuses) |
+| `trj-zen-128c` | `trj-zen3-5995wx` | `smt2-128`       | available |
+| `trj-zen3-<N>c`| `trj-zen3-5995wx` | `physical-64`    | available |
+| `m4-macos`     | `m4-macos`        | `scheduler-10`   | fails closed pending executing-image attestation |
+| `m5-macos`     | `m5-macos`        | `scheduler-14`   | registered, unavailable (no reachable host) |
+
+`trj-zen-128c` and width-encoded `trj-zen3-<N>c` are **legacy execution
+labels, not hardware classes**; `parse_hardware_class_id()` rejects both with
+`ObsoleteClassId`, and this table is that rejection's migration path. The table
+also lives in `scripts/perf-diagnostic.sh`'s header and is referenced from
+`docs/contracts/quill-hyperopt-campaign.md`.
+
+**macOS probes survive on both sides.** Origin's producer already carries them
+(`local_perf_runner.rs`: `pmset -g therm`, `sysctl hw.pagesize`, plus Linux
+`getconf PAGESIZE` and k10temp/zenpower thermal sensors). No gap to fill. The
+diagnostic script keeps its own copies because it must run on hosts the
+producer will not yet admit.
+
+## The handoff's own claim that was WRONG — read this first
+
+> *"`3bbfe8c8` … net-deleted 10,024 lines of origin's correctness code … **The
+> merge already auto-restored them.**"*
+
+**It had not.** Three-way merge only conflicts where *both* sides touched a
+region. Where local deleted code origin never touched, git applied local's
+deletion **silently and without a conflict**, so those deletions survived into
+the resolved tree. `superset_check.py` cannot see this either: it matches a
+symbol *name anywhere* in the winning text, so a type that is still **used** and
+still **re-exported** but whose **definition** was deleted reads as "present".
+That is exactly how `DaemonTrustLevelV1` passed a "clean superset" check while
+its `enum` had been deleted — 114 compile errors.
+
+Files repaired by restoring origin's version (each traced to `3bbfe8c8`, each
+with **no** later local commit, so nothing local was lost):
+
+`fusion/daemon_fallback.rs` (1914→2619), `fsfs/lifecycle.rs` (3327→3631),
+`gauntlet/runner.rs` (18905→18906), `gauntlet/version_contract.rs`,
+`embed/tests/model_download_tests.rs`, `gauntlet/fixtures/q1-obligations.json`,
+`gauntlet/fixtures/divergence-register-v1.json` (was **deleted outright**),
+`docs/contracts/quill-divergence-register.md`,
+`schemas/fsfs-index-footprint-advisor-v1.schema.json`, and the six
+footprint-advisor fixture/golden files under `schemas/fixtures{,-invalid}/` and
+`fsfs/tests/golden/`.
+
+Also corrected: `crates/frankensearch-index/Cargo.toml`. The handoff kept
+local's `same-file = { workspace = true }` believing `mapped_file.rs` used it.
+It does not — `mapped_file.rs::ensure_same_file` is a **private local fn**, and
+origin deliberately replaced the crate with in-tree
+`frankensearch-index/src/file_identity.rs` ("*Filesystem object identity
+comparison without the `same-file` crate*"). Origin also removed `same-file`
+from `[workspace.dependencies]`, so the inherited dep did not even resolve —
+the workspace would not load. Dependency dropped, matching origin's intent.
+
+## Two real bugs the merge surfaced in local's O(1) `bytes_reserved` (P16 KEEP)
+
+The counter is preserved and is still O(1) on the hot path, but it was wrong in
+two ways once combined with origin's lazy arena. Both are **fixed**, and both
+were caught by origin's tests, not local's:
+
+1. **Lazy first chunk did not update the counter.** Origin's `push` allocates
+   the first chunk on demand; local's counter never saw it, so `bytes_reserved`
+   reported `0` for a non-empty arena. 32 fsfs tests panicked on the
+   `debug_assert`.
+2. **`ByteArena` derived `Clone`.** `Vec::clone` allocates exactly `len`, so a
+   cloned chunk's capacity differs from its source's while the derived clone
+   copied `running_bytes_reserved` verbatim — permanent drift. Replaced with a
+   hand-written `Clone` that recomputes. **Local had no test for this; origin's
+   `collision_bucket_reserved_bytes_match_full_rescan` did**, and it is the test
+   that caught it.
+3. `reset()` also lost its recompute-after-`retain` line in the merge (origin's
+   `reset` had no counter to maintain). Restored, with the invariant now
+   documented on the field: four sites change capacity, and the
+   `debug_assert_eq!` in `bytes_reserved` is the backstop.
+
+## `quill/index.rs` — the mixed-disposition file
+
+Local's P17 within-batch fan-out is **kept** (`index_batch_fanout`,
+`index_batch_serial`, `accumulate_shard_run`, `FANOUT_MIN_SHARD_DOCUMENTS`), and
+origin's `d890f0a7` identity-hash change was **ported into it by hand**: both
+accumulate paths now call `canonical_document_content_hash` (domain-separated,
+field-wise, no preimage buffer) and push `PendingIdentity` directly.
+`retain_identity`, `write_canonical_document_preimage` and the per-shard
+`batch_hasher`/`scratch_preimage` are gone — origin's `derive_segment_id`
+folds `content_hash` at seal, and it already takes `&ScribeShardState`, so it
+works unchanged for both the serial and fan-out paths.
+
+Tests from both sides were **unioned by transplanting whole items** (a naive
+hunk union would have nested the two fixture builders and broken the file):
+local's `fanout_corpus` + 2 fan-out tests alongside origin's
+`parallel_budget_fixture_documents`, `assert_parallel_budget_bound_for_schema`
+and `parallel_worker_panic_is_a_typed_precommit_failure`. A duplicated 150-line
+`conformance_*` helper block introduced by the resolution was removed (origin
+newly **declares** `conformance-internals` in `quill/Cargo.toml`, so that code
+compiles now — the memory note that it "is declared in no Cargo.toml" is stale).
+
+## QG-5 `medium` vs `xlarge` — a contradiction to resolve
+
+The previous session's choice of `compaction/medium` over origin's
+`compaction/xlarge` is **kept** and is self-consistent across `perf.rs`,
+`perf_ratchet.rs`, `quill-perf-gates.toml` and the plan: an xlarge-pinned
+ratchet cell would match no emitted cell and QG-5 would score nothing while
+reading green. But its stated *reason* ("xlarge is still PENDING its e6.1
+generator") is now **contradicted by origin's own `[corpus.xlarge].status`,
+which says the generator LANDED**. The fixture note is rewritten to say so, and
+re-pinning is now unblocked. **Owner decision outstanding:** re-pin QG-5 to
+xlarge as one change across those three files plus a re-baseline. Both gates are
+`activated = false`, so nothing is scored today either way.
+
+## Gate results
+
+- `cargo check --workspace --all-targets` — **green**
+- `cargo clippy --workspace --all-targets` — **no errors.** 3 P17 `unused_mut`
+  cleared (binding-mode only, no assertion touched); 9 pre-existing warnings in
+  local's `fsvi_4bit_vs_incumbent` bench, untouched by this merge
+- `cargo fmt --all --check` — **clean**
+- `cargo test --workspace` — **3731 passed, 3 failed**. The 3 are
+  `fsfs::runtime::tests::{expanded_query_variants_reject_cross_generation_fusion,
+  runtime_download_models_verify_reports_mismatch,
+  search_resources_rebind_on_vector_wal_append_and_tombstone}` and they were
+  **reproduced failing identically at clean `origin/main` (845624d7)** in a
+  throwaway worktree — same panics, same line numbers. Pre-existing, not
+  merge-caused. The whole `frankensearch-fsfs` crate is byte-identical to
+  origin's, so it is running origin's code. Two further `serve_socket_*`
+  failures were a **long `TMPDIR`** artifact (unix socket path limit); they pass
+  under `TMPDIR=/tmp/fsq`.
+- `ubs` on all 107 changed `.rs` files — merged **1673** critical vs
+  origin baseline **1672** on the same file list. The entire delta localizes to
+  `index.rs` and is one more `rust.panic-macro` instance (an `.expect` in
+  local's transplanted tests); the SARIF finding *sets* are identical, no new
+  finding class.
+
+## Zero-loss review against BOTH parents
+
+- **Origin→merged:** scripted line-level audit; every surviving difference is
+  accounted for (README lines superseded by local's richer versions, the
+  deliberate O(1) counter, the documented medium/xlarge choice, and index.rs's
+  64 re-indented serial-body lines whose semantics were each confirmed present
+  inside `index_batch_serial`).
+- **Local→merged:** symbol-level audit over every `.rs` local touched. Exactly
+  20 local-introduced symbols are absent, each individually adjudicated as a
+  rename or strict supersession (full list in the session report), e.g.
+  `detect_remote_intent`→`resolve_remote_intent`,
+  `ALL_REPRESENTATIVE`→`representative_states()`,
+  `ResponseDegradation`→`SemanticResponseContract`,
+  `lifecycle_success_path_reaches_ready`→`..._requires_reindex_after_acquisition`
+  (local's `mark_ready()` no longer exists).
+- **Beads:** union verified **by id**: local 1109 ∪ origin 1140 = **1145**,
+  which is exactly the merged count. Zero dropped in either direction.

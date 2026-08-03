@@ -8,14 +8,24 @@ use crate::GauntletError;
 
 const ORACLE_VERSION_CONTRACT_JSON: &str = include_str!("../oracle-version-contract.json");
 const Q1_FIXTURE_CATALOG_JSON: &str = include_str!("../fixtures/q1-obligations.json");
-const WORKSPACE_MANIFEST: &str = include_str!("../../../Cargo.toml");
-const TANTIVY_VERSION: &str = "0.26.1";
-const TANTIVY_CHECKSUM_SHA256: &str =
+const ORACLE_V2_TANTIVY_VERSION: &str = "0.26.1";
+const ORACLE_V2_TANTIVY_SOURCE: &str = "registry+https://github.com/rust-lang/crates.io-index";
+const ORACLE_V2_TANTIVY_CHECKSUM_SHA256: &str =
     "edde6a10743fff00a4e1a8c9ef020bf5f3cbad301b7d2d39f2b07f123c4eac07";
+const ORACLE_V2_LEXICAL_PACKAGE: &str = "frankensearch-lexical";
+const ORACLE_V2_LEXICAL_PACKAGE_VERSION: &str = "0.2.1";
+const ORACLE_V2_LEXICAL_CONTRACT_AUDIT_REVISION: &str = "062a5e5b2d41653b1c8b07888eda1a765e421f49";
+const LOCKED_TANTIVY_VERSION: &str = env!("QUILL_ORACLE_TANTIVY_VERSION");
+const LOCKED_TANTIVY_SOURCE: &str = env!("QUILL_ORACLE_TANTIVY_SOURCE");
+const LOCKED_TANTIVY_CHECKSUM_SHA256: &str = env!("QUILL_ORACLE_TANTIVY_CHECKSUM_SHA256");
+const ORACLE_DEPENDENCY_CONTRACT_HASH_DOMAIN: &[u8] =
+    b"frankensearch/quill/oracle-dependency-contract/v2\0";
+/// Exact `frankensearch-lexical` crate version resolved by this build.
+pub const FRANKENSEARCH_LEXICAL_CRATE_VERSION: &str = env!("FRANKENSEARCH_LEXICAL_CRATE_VERSION");
 const QUIVER_DIFFERENTIAL_FIXTURE_ID: &str = "quiver-postings-bitpack-scalar-wide-v1";
 const Q1_FIXTURE_CATALOG_SHA256: [u8; 32] = [
-    0x2c, 0x31, 0x3c, 0x1c, 0xf8, 0x96, 0x78, 0x8f, 0x49, 0x2c, 0x6b, 0x79, 0x79, 0x52, 0x65, 0xab,
-    0xd2, 0x5b, 0x1d, 0x00, 0x10, 0x5f, 0xd7, 0x15, 0x9a, 0x98, 0xe1, 0x15, 0x48, 0x2f, 0x95, 0x26,
+    0x16, 0xd4, 0x4d, 0xf2, 0x13, 0x28, 0x25, 0xa5, 0x06, 0x7e, 0x49, 0x5c, 0xb5, 0x3d, 0x03, 0x38,
+    0xe5, 0xca, 0x5a, 0xf1, 0xc8, 0xe7, 0xaa, 0x07, 0x4b, 0x80, 0x94, 0x8c, 0xf3, 0x80, 0x00, 0x9c,
 ];
 
 /// Committed provenance contract for the shipping Tantivy oracle adapter.
@@ -24,43 +34,79 @@ const Q1_FIXTURE_CATALOG_SHA256: [u8; 32] = [
 pub struct OracleVersionContract {
     pub schema_version: u32,
     pub tantivy_version: String,
+    pub tantivy_source: String,
     pub tantivy_checksum_sha256: String,
     pub lexical_package: String,
     pub lexical_package_version: String,
-    pub lexical_git_revision: String,
-    pub source_dirty_allowed: bool,
+    /// Historical revision where the wrapper contract was independently
+    /// audited. This is not the source identity of the executing producer.
+    pub lexical_contract_audit_revision: String,
 }
 
 impl OracleVersionContract {
-    /// Validate the source state supplied by a runner before admitting evidence.
+    /// Validate the self-contained v2 dependency record without consulting the
+    /// current checkout, executable, manifest, or lockfile.
     ///
     /// # Errors
     ///
-    /// Returns an error for a mismatched revision or a dirty source tree. Build
-    /// workers do not infer Git state; the runner must supply it explicitly.
-    pub fn validate_source_state(
-        &self,
-        observed_revision: &str,
-        source_dirty: bool,
-    ) -> Result<(), GauntletError> {
-        if observed_revision != self.lexical_git_revision {
+    /// Returns an error when any v2 package, registry, checksum, or historical
+    /// audit pin is malformed or changed.
+    pub fn validate_stored_structure(&self) -> Result<(), GauntletError> {
+        if self.schema_version != 2
+            || self.tantivy_version != ORACLE_V2_TANTIVY_VERSION
+            || self.tantivy_source != ORACLE_V2_TANTIVY_SOURCE
+            || self.tantivy_checksum_sha256 != ORACLE_V2_TANTIVY_CHECKSUM_SHA256
+            || self.lexical_package != ORACLE_V2_LEXICAL_PACKAGE
+            || self.lexical_package_version != ORACLE_V2_LEXICAL_PACKAGE_VERSION
+            || self.lexical_contract_audit_revision != ORACLE_V2_LEXICAL_CONTRACT_AUDIT_REVISION
+            || !is_lower_hex(&self.tantivy_checksum_sha256, 64)
+            || !is_lower_hex(&self.lexical_contract_audit_revision, 40)
+        {
             return Err(GauntletError::InvalidContract {
-                reason: format!(
-                    "lexical revision {observed_revision} does not match {}",
-                    self.lexical_git_revision
-                ),
-            });
-        }
-        if source_dirty && !self.source_dirty_allowed {
-            return Err(GauntletError::InvalidContract {
-                reason: "dirty lexical source is not admissible evidence".to_owned(),
+                reason: "stored oracle dependency contract is malformed or internally inconsistent"
+                    .to_owned(),
             });
         }
         Ok(())
     }
+
+    /// Validate that this v2 record describes the exact dependency resolved by
+    /// the current producer build.
+    pub(crate) fn validate_current_dependency(&self) -> Result<(), GauntletError> {
+        self.validate_stored_structure()?;
+        if self.tantivy_version != LOCKED_TANTIVY_VERSION
+            || self.tantivy_source != LOCKED_TANTIVY_SOURCE
+            || self.tantivy_checksum_sha256 != LOCKED_TANTIVY_CHECKSUM_SHA256
+            || self.lexical_package_version != FRANKENSEARCH_LEXICAL_CRATE_VERSION
+        {
+            return Err(GauntletError::InvalidContract {
+                reason: "embedded oracle dependency contract does not match the exact Cargo.lock resolution"
+                    .to_owned(),
+            });
+        }
+        #[cfg(feature = "tantivy-oracle")]
+        if self.lexical_package_version
+            != frankensearch_lexical::FRANKENSEARCH_LEXICAL_CRATE_VERSION
+        {
+            return Err(GauntletError::InvalidContract {
+                reason: "embedded oracle wrapper version does not match the linked frankensearch-lexical crate"
+                    .to_owned(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Domain-separated identity of the self-contained dependency record.
+    pub(crate) fn identity_sha256(&self) -> Result<String, GauntletError> {
+        self.validate_stored_structure()?;
+        let mut hasher = Sha256::new();
+        hasher.update(ORACLE_DEPENDENCY_CONTRACT_HASH_DOMAIN);
+        hasher.update(serde_json::to_vec(self)?);
+        Ok(lower_hex(&hasher.finalize()))
+    }
 }
 
-/// One Q1 obligation with an honest executable-or-deferred state.
+/// One Q1 obligation with its executable enforcement surface.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Q1Fixture {
@@ -70,7 +116,7 @@ pub struct Q1Fixture {
     pub assertion: String,
 }
 
-/// Committed catalog of pending Q1 obligations and live internal differentials.
+/// Committed catalog of executable Q1 obligations and live internal differentials.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Q1FixtureCatalog {
@@ -98,22 +144,7 @@ pub struct InternalDifferentialFixture {
 /// Returns an error when a pin is absent, malformed, or no longer exact.
 pub fn oracle_version_contract() -> Result<OracleVersionContract, GauntletError> {
     let contract: OracleVersionContract = serde_json::from_str(ORACLE_VERSION_CONTRACT_JSON)?;
-    if contract.schema_version != 1
-        || contract.tantivy_version != TANTIVY_VERSION
-        || contract.tantivy_checksum_sha256 != TANTIVY_CHECKSUM_SHA256
-        || contract.lexical_package != "frankensearch-lexical"
-        || contract.lexical_package_version != "0.2.1"
-        || contract.source_dirty_allowed
-        || !is_lower_hex(&contract.tantivy_checksum_sha256, 64)
-        || !is_lower_hex(&contract.lexical_git_revision, 40)
-        || !WORKSPACE_MANIFEST
-            .lines()
-            .any(|line| line.trim() == "tantivy = \"=0.26.1\"")
-    {
-        return Err(GauntletError::InvalidContract {
-            reason: "oracle version contract pins are incomplete or malformed".to_owned(),
-        });
-    }
+    contract.validate_current_dependency()?;
     Ok(contract)
 }
 
@@ -122,8 +153,7 @@ pub fn oracle_version_contract() -> Result<OracleVersionContract, GauntletError>
 /// # Errors
 ///
 /// Returns an error when IDs are missing, duplicated, reordered, assigned an
-/// unknown status, or when the executable normative set differs from the
-/// bounded E3.5 acceptance surface.
+/// unknown status, or when any normative Q1 obligation is not executable.
 pub fn q1_fixture_catalog() -> Result<Q1FixtureCatalog, GauntletError> {
     let catalog: Q1FixtureCatalog = serde_json::from_str(Q1_FIXTURE_CATALOG_JSON)?;
     let catalog_hash = Sha256::digest(Q1_FIXTURE_CATALOG_JSON.as_bytes());
@@ -131,14 +161,14 @@ pub fn q1_fixture_catalog() -> Result<Q1FixtureCatalog, GauntletError> {
         "Q1-OB1", "Q1-OB2a", "Q1-OB2b", "Q1-OB2c", "Q1-OB3", "Q1-OB4", "Q1-OB5", "Q1-OB6",
     ];
     const EXPECTED_STATUSES: [&str; 8] = [
-        "deferred",
         "executable",
         "executable",
         "executable",
         "executable",
-        "deferred",
-        "deferred",
-        "deferred",
+        "executable",
+        "executable",
+        "executable",
+        "executable",
     ];
     let ids = catalog
         .fixtures
@@ -173,7 +203,7 @@ pub fn q1_fixture_catalog() -> Result<Q1FixtureCatalog, GauntletError> {
         || internal[0].assertion.is_empty()
     {
         return Err(GauntletError::InvalidContract {
-            reason: "fixture catalog must contain eight ordered Q1 rows with exactly OB2a, OB2b, OB2c, and OB3 executable, plus the executable Quiver differential"
+            reason: "fixture catalog must contain eight ordered executable Q1 rows plus the executable Quiver differential"
                 .to_owned(),
         });
     }
@@ -632,6 +662,16 @@ fn is_lower_hex(value: &str, width: usize) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
+fn lower_hex(bytes: &[u8]) -> String {
+    use std::fmt::Write as _;
+
+    let mut output = String::with_capacity(bytes.len().saturating_mul(2));
+    for byte in bytes {
+        let _ = write!(output, "{byte:02x}");
+    }
+    output
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -677,30 +717,64 @@ mod tests {
     }
 
     #[test]
-    fn embedded_oracle_contract_is_exact_and_rejects_dirty_source() {
+    fn embedded_oracle_contract_matches_exact_lock_resolution() {
         let contract = oracle_version_contract().expect("valid oracle contract");
-        assert_eq!(contract.tantivy_version, TANTIVY_VERSION);
-        assert_eq!(contract.tantivy_checksum_sha256, TANTIVY_CHECKSUM_SHA256);
-        assert_eq!(contract.lexical_git_revision.len(), 40);
-        assert!(
-            contract
-                .validate_source_state(&contract.lexical_git_revision, false)
-                .is_ok()
+        assert_eq!(contract.tantivy_version, LOCKED_TANTIVY_VERSION);
+        assert_eq!(contract.tantivy_source, LOCKED_TANTIVY_SOURCE);
+        assert_eq!(
+            contract.tantivy_checksum_sha256,
+            LOCKED_TANTIVY_CHECKSUM_SHA256
         );
-        assert!(
-            contract
-                .validate_source_state(&contract.lexical_git_revision, true)
-                .is_err()
+        assert_eq!(
+            contract.lexical_package_version,
+            FRANKENSEARCH_LEXICAL_CRATE_VERSION
         );
-        assert!(
-            contract
-                .validate_source_state(&"0".repeat(40), false)
-                .is_err()
-        );
+        assert_eq!(contract.lexical_contract_audit_revision.len(), 40);
+        contract
+            .validate_stored_structure()
+            .expect("stored v2 contract is self-contained");
+        contract
+            .validate_current_dependency()
+            .expect("stored contract matches current lock resolution");
     }
 
     #[test]
-    fn q1_catalog_promotes_e35_obligations_and_runs_live_merge_subfixtures() {
+    fn stored_oracle_contract_rejects_every_mutated_field() {
+        let contract = oracle_version_contract().expect("valid oracle contract");
+        let mut mutations = Vec::new();
+
+        let mut mutated = contract.clone();
+        mutated.schema_version = 1;
+        mutations.push(mutated);
+        let mut mutated = contract.clone();
+        mutated.tantivy_version = "0.26.0".to_owned();
+        mutations.push(mutated);
+        let mut mutated = contract.clone();
+        mutated.tantivy_source = "git+https://example.invalid/tantivy".to_owned();
+        mutations.push(mutated);
+        let mut mutated = contract.clone();
+        mutated.tantivy_checksum_sha256 = "0".repeat(64);
+        mutations.push(mutated);
+        let mut mutated = contract.clone();
+        mutated.lexical_package = "lookalike-lexical".to_owned();
+        mutations.push(mutated);
+        let mut mutated = contract.clone();
+        mutated.lexical_package_version = "0.2.0".to_owned();
+        mutations.push(mutated);
+        let mut mutated = contract;
+        mutated.lexical_contract_audit_revision = "f".repeat(40);
+        mutations.push(mutated);
+
+        for mutation in mutations {
+            assert!(
+                mutation.validate_stored_structure().is_err(),
+                "mutated stored dependency contract was accepted: {mutation:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn q1_catalog_marks_every_obligation_executable_and_runs_live_merge_subfixtures() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             let catalog = q1_fixture_catalog().expect("valid Q1 catalog");
             assert_eq!(
@@ -715,7 +789,10 @@ mod tests {
                     .filter(|fixture| fixture.status == "executable")
                     .map(|fixture| fixture.id.as_str())
                     .collect::<Vec<_>>(),
-                ["Q1-OB2a", "Q1-OB2b", "Q1-OB2c", "Q1-OB3"]
+                [
+                    "Q1-OB1", "Q1-OB2a", "Q1-OB2b", "Q1-OB2c", "Q1-OB3", "Q1-OB4", "Q1-OB5",
+                    "Q1-OB6",
+                ]
             );
             assert_eq!(
                 run_q1_live_fixtures(&cx).await.expect("live Q1 fixtures"),

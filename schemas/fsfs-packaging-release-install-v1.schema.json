@@ -15,7 +15,8 @@
         "x86_64-unknown-linux-musl",
         "aarch64-unknown-linux-musl",
         "x86_64-apple-darwin",
-        "aarch64-apple-darwin"
+        "aarch64-apple-darwin",
+        "x86_64-pc-windows-msvc"
       ]
     },
     "buildTool": {
@@ -27,11 +28,57 @@
     },
     "archiveFormat": {
       "type": "string",
-      "enum": ["tar.xz"]
+      "enum": ["tar.xz", "zip"]
     },
     "osFamily": {
       "type": "string",
-      "enum": ["linux", "macos"]
+      "enum": ["linux", "macos", "windows"]
+    },
+    "releaseProfile": {
+      "type": "string",
+      "enum": ["embedded", "lite"]
+    },
+    "embeddedAppleArmPair": {
+      "properties": {
+        "target_triple": { "const": "aarch64-apple-darwin" },
+        "profile": { "const": "embedded" }
+      },
+      "required": ["target_triple", "profile"]
+    },
+    "embeddedWindowsX64Pair": {
+      "properties": {
+        "target_triple": { "const": "x86_64-pc-windows-msvc" },
+        "profile": { "const": "embedded" }
+      },
+      "required": ["target_triple", "profile"]
+    },
+    "liteLinuxX64Pair": {
+      "properties": {
+        "target_triple": { "const": "x86_64-unknown-linux-musl" },
+        "profile": { "const": "lite" }
+      },
+      "required": ["target_triple", "profile"]
+    },
+    "liteLinuxArm64Pair": {
+      "properties": {
+        "target_triple": { "const": "aarch64-unknown-linux-musl" },
+        "profile": { "const": "lite" }
+      },
+      "required": ["target_triple", "profile"]
+    },
+    "liteAppleX64Pair": {
+      "properties": {
+        "target_triple": { "const": "x86_64-apple-darwin" },
+        "profile": { "const": "lite" }
+      },
+      "required": ["target_triple", "profile"]
+    },
+    "liteAppleArm64Pair": {
+      "properties": {
+        "target_triple": { "const": "aarch64-apple-darwin" },
+        "profile": { "const": "lite" }
+      },
+      "required": ["target_triple", "profile"]
     },
     "channel": {
       "type": "string",
@@ -58,41 +105,94 @@
       "additionalProperties": false,
       "required": [
         "target_triple",
+        "profile",
         "os_family",
         "build_tool",
         "archive_format",
-        "binary_name"
+        "binary_name",
+        "semantic_loaders",
+        "embedded_models"
       ],
       "properties": {
         "target_triple": { "$ref": "#/$defs/targetTriple" },
+        "profile": { "$ref": "#/$defs/releaseProfile" },
         "os_family": { "$ref": "#/$defs/osFamily" },
         "build_tool": { "$ref": "#/$defs/buildTool" },
         "archive_format": { "$ref": "#/$defs/archiveFormat" },
-        "binary_name": { "type": "string", "const": "fsfs" }
-      }
+        "binary_name": { "type": "string", "enum": ["fsfs", "fsfs.exe"] },
+        "semantic_loaders": { "type": "boolean" },
+        "embedded_models": { "type": "boolean" }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "profile": { "const": "embedded" } } },
+          "then": {
+            "properties": {
+              "semantic_loaders": { "const": true },
+              "embedded_models": { "const": true }
+            }
+          }
+        },
+        {
+          "if": { "properties": { "profile": { "const": "lite" } } },
+          "then": {
+            "properties": {
+              "semantic_loaders": { "const": false },
+              "embedded_models": { "const": false }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "target_triple": { "const": "x86_64-pc-windows-msvc" } }
+          },
+          "then": {
+            "properties": {
+              "profile": { "const": "embedded" },
+              "os_family": { "const": "windows" },
+              "archive_format": { "const": "zip" },
+              "binary_name": { "const": "fsfs.exe" }
+            }
+          },
+          "else": {
+            "properties": {
+              "archive_format": { "const": "tar.xz" },
+              "binary_name": { "const": "fsfs" }
+            }
+          }
+        }
+      ]
     },
     "artifactDescriptor": {
       "type": "object",
       "additionalProperties": false,
       "required": [
         "target_triple",
+        "profile",
+        "archive_format",
         "archive_path",
         "checksum",
         "metadata_path",
-        "build_tool"
+        "build_tool",
+        "semantic_loaders",
+        "embedded_models"
       ],
       "properties": {
         "target_triple": { "$ref": "#/$defs/targetTriple" },
+        "profile": { "$ref": "#/$defs/releaseProfile" },
+        "archive_format": { "$ref": "#/$defs/archiveFormat" },
         "archive_path": {
           "type": "string",
-          "pattern": "^fsfs-v[0-9]+\\.[0-9]+\\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?-[A-Za-z0-9_.-]+\\.tar\\.xz$"
+          "pattern": "^fsfs(?:-lite)?-[0-9]+\\.[0-9]+\\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?-[A-Za-z0-9_.-]+\\.(?:tar\\.xz|zip)$"
         },
         "checksum": { "$ref": "#/$defs/sha256Digest" },
         "metadata_path": {
           "type": "string",
-          "pattern": "^fsfs-v[0-9]+\\.[0-9]+\\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?-[A-Za-z0-9_.-]+\\.metadata\\.json$"
+          "pattern": "^fsfs(?:-lite)?-[0-9]+\\.[0-9]+\\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?-[A-Za-z0-9_.-]+\\.metadata\\.json$"
         },
         "build_tool": { "$ref": "#/$defs/buildTool" },
+        "semantic_loaders": { "type": "boolean" },
+        "embedded_models": { "type": "boolean" },
         "signature": {
           "type": "object",
           "additionalProperties": false,
@@ -103,15 +203,57 @@
           "properties": {
             "signature_path": {
               "type": "string",
-              "pattern": "^fsfs-v[0-9]+\\.[0-9]+\\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?-[A-Za-z0-9_.-]+\\.tar\\.xz\\.sig$"
+              "pattern": "^fsfs(?:-lite)?-[0-9]+\\.[0-9]+\\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?-[A-Za-z0-9_.-]+\\.(?:tar\\.xz|zip)\\.sig$"
             },
             "certificate_path": {
               "type": "string",
-              "pattern": "^fsfs-v[0-9]+\\.[0-9]+\\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?-[A-Za-z0-9_.-]+\\.tar\\.xz\\.pem$"
+              "pattern": "^fsfs(?:-lite)?-[0-9]+\\.[0-9]+\\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?-[A-Za-z0-9_.-]+\\.(?:tar\\.xz|zip)\\.pem$"
             }
           }
         }
-      }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "profile": { "const": "embedded" } } },
+          "then": {
+            "properties": {
+              "archive_path": { "pattern": "^fsfs-[0-9]" },
+              "metadata_path": { "pattern": "^fsfs-[0-9]" },
+              "semantic_loaders": { "const": true },
+              "embedded_models": { "const": true }
+            }
+          }
+        },
+        {
+          "if": { "properties": { "profile": { "const": "lite" } } },
+          "then": {
+            "properties": {
+              "archive_path": { "pattern": "^fsfs-lite-[0-9]" },
+              "metadata_path": { "pattern": "^fsfs-lite-[0-9]" },
+              "semantic_loaders": { "const": false },
+              "embedded_models": { "const": false }
+            }
+          }
+        },
+        {
+          "if": {
+            "properties": { "target_triple": { "const": "x86_64-pc-windows-msvc" } }
+          },
+          "then": {
+            "properties": {
+              "profile": { "const": "embedded" },
+              "archive_format": { "const": "zip" },
+              "archive_path": { "pattern": "\\.zip$" }
+            }
+          },
+          "else": {
+            "properties": {
+              "archive_format": { "const": "tar.xz" },
+              "archive_path": { "pattern": "\\.tar\\.xz$" }
+            }
+          }
+        }
+      ]
     },
     "contractDefinition": {
       "type": "object",
@@ -135,24 +277,30 @@
         "schema_version": { "type": "integer", "const": 1 },
         "release_matrix": {
           "type": "array",
-          "minItems": 4,
-          "maxItems": 4,
+          "minItems": 6,
+          "maxItems": 6,
+          "uniqueItems": true,
           "items": { "$ref": "#/$defs/matrixEntry" }
         },
         "artifact_naming": {
           "type": "object",
           "additionalProperties": false,
           "required": [
-            "archive_template",
+            "embedded_archive_template",
+            "lite_archive_template",
             "checksum_suffix",
             "metadata_suffix",
             "signature_suffix",
             "certificate_suffix"
           ],
           "properties": {
-            "archive_template": {
+            "embedded_archive_template": {
               "type": "string",
-              "const": "fsfs-{tag}-{target}.tar.xz"
+              "const": "fsfs-{version}-{target}.{archive_ext}"
+            },
+            "lite_archive_template": {
+              "type": "string",
+              "const": "fsfs-lite-{version}-{target}.{archive_ext}"
             },
             "checksum_suffix": { "type": "string", "const": ".sha256" },
             "metadata_suffix": { "type": "string", "const": ".metadata.json" },
@@ -331,60 +479,54 @@
         {
           "properties": {
             "release_matrix": {
-              "contains": {
-                "type": "object",
-                "properties": {
-                  "target_triple": {
-                    "const": "x86_64-unknown-linux-musl"
-                  }
-                },
-                "required": ["target_triple"]
-              }
+              "contains": { "$ref": "#/$defs/embeddedAppleArmPair" },
+              "minContains": 1,
+              "maxContains": 1
             }
           }
         },
         {
           "properties": {
             "release_matrix": {
-              "contains": {
-                "type": "object",
-                "properties": {
-                  "target_triple": {
-                    "const": "aarch64-unknown-linux-musl"
-                  }
-                },
-                "required": ["target_triple"]
-              }
+              "contains": { "$ref": "#/$defs/embeddedWindowsX64Pair" },
+              "minContains": 1,
+              "maxContains": 1
             }
           }
         },
         {
           "properties": {
             "release_matrix": {
-              "contains": {
-                "type": "object",
-                "properties": {
-                  "target_triple": {
-                    "const": "x86_64-apple-darwin"
-                  }
-                },
-                "required": ["target_triple"]
-              }
+              "contains": { "$ref": "#/$defs/liteLinuxX64Pair" },
+              "minContains": 1,
+              "maxContains": 1
             }
           }
         },
         {
           "properties": {
             "release_matrix": {
-              "contains": {
-                "type": "object",
-                "properties": {
-                  "target_triple": {
-                    "const": "aarch64-apple-darwin"
-                  }
-                },
-                "required": ["target_triple"]
-              }
+              "contains": { "$ref": "#/$defs/liteLinuxArm64Pair" },
+              "minContains": 1,
+              "maxContains": 1
+            }
+          }
+        },
+        {
+          "properties": {
+            "release_matrix": {
+              "contains": { "$ref": "#/$defs/liteAppleX64Pair" },
+              "minContains": 1,
+              "maxContains": 1
+            }
+          }
+        },
+        {
+          "properties": {
+            "release_matrix": {
+              "contains": { "$ref": "#/$defs/liteAppleArm64Pair" },
+              "minContains": 1,
+              "maxContains": 1
             }
           }
         }
@@ -420,7 +562,9 @@
         },
         "artifacts": {
           "type": "array",
-          "minItems": 4,
+          "minItems": 6,
+          "maxItems": 6,
+          "uniqueItems": true,
           "items": { "$ref": "#/$defs/artifactDescriptor" }
         },
         "verification_summary": {
@@ -446,60 +590,54 @@
         {
           "properties": {
             "artifacts": {
-              "contains": {
-                "type": "object",
-                "properties": {
-                  "target_triple": {
-                    "const": "x86_64-unknown-linux-musl"
-                  }
-                },
-                "required": ["target_triple"]
-              }
+              "contains": { "$ref": "#/$defs/embeddedAppleArmPair" },
+              "minContains": 1,
+              "maxContains": 1
             }
           }
         },
         {
           "properties": {
             "artifacts": {
-              "contains": {
-                "type": "object",
-                "properties": {
-                  "target_triple": {
-                    "const": "aarch64-unknown-linux-musl"
-                  }
-                },
-                "required": ["target_triple"]
-              }
+              "contains": { "$ref": "#/$defs/embeddedWindowsX64Pair" },
+              "minContains": 1,
+              "maxContains": 1
             }
           }
         },
         {
           "properties": {
             "artifacts": {
-              "contains": {
-                "type": "object",
-                "properties": {
-                  "target_triple": {
-                    "const": "x86_64-apple-darwin"
-                  }
-                },
-                "required": ["target_triple"]
-              }
+              "contains": { "$ref": "#/$defs/liteLinuxX64Pair" },
+              "minContains": 1,
+              "maxContains": 1
             }
           }
         },
         {
           "properties": {
             "artifacts": {
-              "contains": {
-                "type": "object",
-                "properties": {
-                  "target_triple": {
-                    "const": "aarch64-apple-darwin"
-                  }
-                },
-                "required": ["target_triple"]
-              }
+              "contains": { "$ref": "#/$defs/liteLinuxArm64Pair" },
+              "minContains": 1,
+              "maxContains": 1
+            }
+          }
+        },
+        {
+          "properties": {
+            "artifacts": {
+              "contains": { "$ref": "#/$defs/liteAppleX64Pair" },
+              "minContains": 1,
+              "maxContains": 1
+            }
+          }
+        },
+        {
+          "properties": {
+            "artifacts": {
+              "contains": { "$ref": "#/$defs/liteAppleArm64Pair" },
+              "minContains": 1,
+              "maxContains": 1
             }
           }
         }

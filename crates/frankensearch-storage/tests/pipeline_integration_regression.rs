@@ -8,8 +8,8 @@ use asupersync::Cx;
 use frankensearch_core::traits::{ModelCategory, SearchFuture};
 use frankensearch_core::{Canonicalizer, Embedder, SearchError};
 use frankensearch_storage::{
-    InMemoryVectorSink, IngestAction, IngestRequest, JobQueueConfig, PersistentJobQueue,
-    PipelineConfig, Storage, StorageBackedJobRunner,
+    EmbeddingVectorSink, InMemoryVectorSink, IngestAction, IngestRequest, JobQueueConfig,
+    PersistentJobQueue, PipelineConfig, Storage, StorageBackedJobRunner,
 };
 use fsqlite_types::value::SqliteValue;
 
@@ -120,6 +120,60 @@ impl Embedder for SelectiveFailEmbedder {
     }
 }
 
+#[derive(Debug)]
+struct CancelledEmbedder {
+    id: &'static str,
+    dim: usize,
+}
+
+impl Embedder for CancelledEmbedder {
+    fn embed<'a>(&'a self, _cx: &'a Cx, _text: &'a str) -> SearchFuture<'a, Vec<f32>> {
+        Box::pin(async move {
+            Err(SearchError::Cancelled {
+                phase: "storage-pipeline-embed".to_owned(),
+                reason: "test cancellation".to_owned(),
+            })
+        })
+    }
+
+    fn dimension(&self) -> usize {
+        self.dim
+    }
+
+    fn id(&self) -> &str {
+        self.id
+    }
+
+    fn model_name(&self) -> &str {
+        self.id
+    }
+
+    fn is_semantic(&self) -> bool {
+        true
+    }
+
+    fn category(&self) -> ModelCategory {
+        ModelCategory::StaticEmbedder
+    }
+}
+
+#[derive(Debug)]
+struct CancelledVectorSink;
+
+impl EmbeddingVectorSink for CancelledVectorSink {
+    fn persist(
+        &self,
+        _doc_id: &str,
+        _embedder_id: &str,
+        _embedding: &[f32],
+    ) -> Result<(), SearchError> {
+        Err(SearchError::Cancelled {
+            phase: "storage-pipeline-persist".to_owned(),
+            reason: "test sink cancellation".to_owned(),
+        })
+    }
+}
+
 #[derive(Clone, Debug)]
 struct TestLogWriter {
     buffer: Arc<Mutex<Vec<u8>>>,
@@ -215,12 +269,13 @@ fn ingest_returns_queue_full_when_backpressure_threshold_is_hit() {
 
     let third = runner.ingest(IngestRequest::new("doc-c", "third document"));
     let error = third.expect_err("third ingest should fail with queue backpressure");
-    match error {
-        SearchError::QueueFull { pending, capacity } => {
-            assert_eq!(capacity, 1);
-            assert!(pending >= 1);
-        }
-        other => panic!("expected QueueFull, got {other:?}"),
+    assert!(
+        matches!(error, SearchError::QueueFull { .. }),
+        "expected QueueFull, got {error:?}"
+    );
+    if let SearchError::QueueFull { pending, capacity } = error {
+        assert_eq!(capacity, 1);
+        assert!(pending >= 1);
     }
 }
 
@@ -381,6 +436,98 @@ fn failed_job_does_not_abort_other_jobs_in_same_batch() {
         let depth = queue.queue_depth().expect("queue depth should succeed");
         assert_eq!(depth.completed, 1);
         assert_eq!(depth.failed, 1);
+    });
+}
+
+#[test]
+fn cancelled_embedding_propagates_without_failing_or_retrying_the_claimed_job() {
+    asupersync::test_utils::run_test_with_cx(|cx| async move {
+        let fast = Arc::new(CancelledEmbedder {
+            id: "cancelled-fast-tier",
+            dim: 8,
+        });
+        let (runner, _storage, queue, sink) = make_runner(
+            JobQueueConfig {
+                max_retries: 0,
+                ..JobQueueConfig::default()
+            },
+            PipelineConfig::default(),
+            fast,
+            None,
+        );
+
+        runner
+            .ingest(IngestRequest::new("doc-cancelled", "cancel this embedding"))
+            .expect("cancelled job ingest should succeed");
+
+        let error = runner
+            .process_batch(&cx, "worker-cancelled")
+            .await
+            .expect_err("cancellation must escape process_batch");
+        assert!(matches!(
+            error,
+            SearchError::Cancelled {
+                ref phase,
+                ref reason
+            } if phase == "storage-pipeline-embed" && reason == "test cancellation"
+        ));
+        assert!(
+            sink.entries().is_empty(),
+            "cancelled embedding must not reach the vector sink"
+        );
+
+        let depth = queue.queue_depth().expect("queue depth should succeed");
+        assert_eq!(depth.processing, 1, "the claimed job remains reclaimable");
+        assert_eq!(depth.failed, 0, "cancellation must never queue-fail a job");
+        assert_eq!(depth.pending, 0);
+    });
+}
+
+#[test]
+#[allow(clippy::arc_with_non_send_sync)]
+fn cancelled_vector_persist_propagates_without_failing_the_claimed_job() {
+    asupersync::test_utils::run_test_with_cx(|cx| async move {
+        let storage = Arc::new(Storage::open_in_memory().expect("storage should open"));
+        let queue = Arc::new(PersistentJobQueue::new(
+            Arc::clone(&storage),
+            JobQueueConfig {
+                max_retries: 0,
+                ..JobQueueConfig::default()
+            },
+        ));
+        let runner = StorageBackedJobRunner::new(
+            Arc::clone(&storage),
+            Arc::clone(&queue),
+            Arc::new(frankensearch_core::canonicalize::DefaultCanonicalizer::default()),
+            Arc::new(StubEmbedder::new("persist-cancel-tier", 8, 1.0)),
+            Arc::new(CancelledVectorSink),
+        );
+
+        runner
+            .ingest(IngestRequest::new(
+                "doc-persist-cancelled",
+                "cancel vector persistence",
+            ))
+            .expect("persist-cancelled job ingest should succeed");
+
+        let error = runner
+            .process_batch(&cx, "worker-persist-cancelled")
+            .await
+            .expect_err("sink cancellation must escape process_batch");
+        assert!(matches!(
+            error,
+            SearchError::Cancelled {
+                ref phase,
+                ref reason
+            } if phase == "storage-pipeline-persist" && reason == "test sink cancellation"
+        ));
+
+        let depth = queue.queue_depth().expect("queue depth should succeed");
+        assert_eq!(depth.processing, 1, "the claimed job remains reclaimable");
+        assert_eq!(
+            depth.failed, 0,
+            "sink cancellation must not queue-fail a job"
+        );
     });
 }
 

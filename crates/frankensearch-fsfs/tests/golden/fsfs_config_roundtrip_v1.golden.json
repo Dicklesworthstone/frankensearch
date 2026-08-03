@@ -50,6 +50,7 @@
       "fast_model": "potion-multilingual-128M",
       "quality_model": "all-MiniLM-L6-v2",
       "model_dir": "~/.cache/frankensearch/models",
+      "offline": false,
       "embedding_batch_size": 64,
       "reindex_on_change": true,
       "watch_mode": false
@@ -90,6 +91,7 @@
   "env_var_map": {
     "discovery_roots": "FSFS_DISCOVERY_ROOTS",
     "discovery_exclude_patterns": "FSFS_DISCOVERY_EXCLUDE_PATTERNS",
+    "indexing_offline": "FRANKENSEARCH_OFFLINE",
     "search_default_limit": "FSFS_SEARCH_DEFAULT_LIMIT",
     "search_fast_only": "FSFS_SEARCH_FAST_ONLY",
     "search_explain": "FSFS_SEARCH_EXPLAIN",
@@ -101,6 +103,8 @@
     "roots": "--roots",
     "exclude": "--exclude",
     "limit": "--limit",
+    "offline": "--offline",
+    "online": "--online",
     "fast_only": "--fast-only",
     "explain": "--explain",
     "profile": "--profile",

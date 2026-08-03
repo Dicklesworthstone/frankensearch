@@ -3,29 +3,59 @@
   "schema_version": 1,
   "release_matrix": [
     {
-      "target_triple": "x86_64-unknown-linux-musl",
-      "os_family": "linux",
-      "build_tool": "zigbuild",
-      "archive_format": "tar.xz",
-      "binary_name": "fsfs"
-    },
-    {
-      "target_triple": "aarch64-unknown-linux-musl",
-      "os_family": "linux",
-      "build_tool": "zigbuild",
-      "archive_format": "tar.xz",
-      "binary_name": "fsfs"
-    },
-    {
-      "target_triple": "x86_64-apple-darwin",
+      "target_triple": "aarch64-apple-darwin",
+      "profile": "embedded",
       "os_family": "macos",
       "build_tool": "cargo",
       "archive_format": "tar.xz",
-      "binary_name": "fsfs"
+      "binary_name": "fsfs",
+      "semantic_loaders": true,
+      "embedded_models": true
+    },
+    {
+      "target_triple": "x86_64-pc-windows-msvc",
+      "profile": "embedded",
+      "os_family": "windows",
+      "build_tool": "cargo",
+      "archive_format": "zip",
+      "binary_name": "fsfs.exe",
+      "semantic_loaders": true,
+      "embedded_models": true
+    },
+    {
+      "target_triple": "x86_64-unknown-linux-musl",
+      "profile": "lite",
+      "os_family": "linux",
+      "build_tool": "zigbuild",
+      "archive_format": "tar.xz",
+      "binary_name": "fsfs",
+      "semantic_loaders": false,
+      "embedded_models": false
+    },
+    {
+      "target_triple": "aarch64-unknown-linux-musl",
+      "profile": "lite",
+      "os_family": "linux",
+      "build_tool": "zigbuild",
+      "archive_format": "tar.xz",
+      "binary_name": "fsfs",
+      "semantic_loaders": false,
+      "embedded_models": false
+    },
+    {
+      "target_triple": "x86_64-apple-darwin",
+      "profile": "lite",
+      "os_family": "macos",
+      "build_tool": "cargo",
+      "archive_format": "tar.xz",
+      "binary_name": "fsfs",
+      "semantic_loaders": false,
+      "embedded_models": false
     }
   ],
   "artifact_naming": {
-    "archive_template": "fsfs-{tag}-{target}.tar.xz",
+    "embedded_archive_template": "fsfs-{version}-{target}.{archive_ext}",
+    "lite_archive_template": "fsfs-lite-{version}-{target}.{archive_ext}",
     "checksum_suffix": ".sha256",
     "metadata_suffix": ".metadata.json",
     "signature_suffix": ".sig",

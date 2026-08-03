@@ -457,6 +457,14 @@ where
                 input.overrides.fast_only = Some(false);
                 idx += 1;
             }
+            "--offline" => {
+                input.overrides.offline = Some(true);
+                idx += 1;
+            }
+            "--online" => {
+                input.overrides.offline = Some(false);
+                idx += 1;
+            }
             "--watch-mode" => {
                 input.overrides.allow_background_indexing = Some(true);
                 idx += 1;
@@ -1006,6 +1014,8 @@ fn is_known_cli_flag(token: &str) -> bool {
             | "-f"
             | "--fast-only"
             | "--no-fast-only"
+            | "--offline"
+            | "--online"
             | "--watch-mode"
             | "--no-watch-mode"
             | "--explain"
@@ -1060,6 +1070,7 @@ mod tests {
             "--limit",
             "25",
             "--fast-only",
+            "--offline",
             "--watch-mode",
             "--explain",
             "--profile",
@@ -1073,12 +1084,22 @@ mod tests {
         assert_eq!(input.query.as_deref(), Some("hello world"));
         assert_eq!(input.overrides.limit, Some(25));
         assert_eq!(input.overrides.fast_only, Some(true));
+        assert_eq!(input.overrides.offline, Some(true));
         assert_eq!(input.overrides.allow_background_indexing, Some(true));
         assert_eq!(input.overrides.explain, Some(true));
         assert_eq!(
             input.overrides.roots.expect("roots"),
             vec!["/repo".to_string(), "/notes".to_string()]
         );
+    }
+
+    #[test]
+    fn online_and_offline_flags_are_explicit_last_writer_wins_overrides() {
+        let offline = parse_cli_args(["search", "query", "--offline"]).expect("offline");
+        assert_eq!(offline.overrides.offline, Some(true));
+
+        let online = parse_cli_args(["search", "query", "--offline", "--online"]).expect("online");
+        assert_eq!(online.overrides.offline, Some(false));
     }
 
     #[test]
@@ -1160,10 +1181,10 @@ mod tests {
 
         let reindex = parse_cli_args([
             "index",
+            ".",
             "--full",
             "--index-dir",
             "/tmp/frankensearch-index",
-            ".",
         ])
         .expect("identity-change recovery command");
         assert_eq!(reindex.command, CliCommand::Index);
@@ -1378,6 +1399,14 @@ mod tests {
         assert_eq!(input.command, CliCommand::Index);
         assert!(input.full_reindex);
         assert!(input.watch);
+    }
+
+    #[test]
+    fn parse_plain_index_is_a_one_shot_request() {
+        let input = parse_cli_args(["index", "/tmp/corpus"]).unwrap();
+        assert_eq!(input.command, CliCommand::Index);
+        assert!(!input.watch);
+        assert_eq!(input.overrides.allow_background_indexing, None);
     }
 
     #[test]

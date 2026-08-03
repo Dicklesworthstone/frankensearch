@@ -18,7 +18,6 @@ use frankensearch_core::{
 use fsqlite::{Connection, Row};
 use fsqlite_types::value::SqliteValue;
 use serde::{Deserialize, Serialize};
-use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 /// Current schema version for the ops telemetry database.
 pub const OPS_SCHEMA_VERSION: i64 = 2;
@@ -440,18 +439,25 @@ fn parse_rfc3339_timestamp_ms(timestamp: &str) -> SearchResult<i64> {
     parse_rfc3339_timestamp_ms_reference(timestamp)
 }
 
-/// General-purpose RFC3339 → epoch-milliseconds parser via the `time` crate.
+/// General-purpose RFC3339 → epoch-milliseconds parser via the shared
+/// in-tree implementation ([`frankensearch_core::rfc3339`]).
 ///
 /// Retained as the canonical reference (and as the fallback for any input the
-/// [`fast_parse_rfc3339_utc_ms`] fast path declines).
+/// [`fast_parse_rfc3339_utc_ms`] fast path declines — offsets and
+/// fractional seconds land here).
 fn parse_rfc3339_timestamp_ms_reference(timestamp: &str) -> SearchResult<i64> {
-    let parsed =
-        OffsetDateTime::parse(timestamp, &Rfc3339).map_err(|err| SearchError::InvalidConfig {
-            field: "telemetry_envelope.ts".to_owned(),
-            value: timestamp.to_owned(),
-            reason: format!("must be RFC3339 ({err})"),
+    let nanos =
+        frankensearch_core::rfc3339::parse_rfc3339_to_unix_nanos(timestamp).map_err(|err| {
+            SearchError::InvalidConfig {
+                field: "telemetry_envelope.ts".to_owned(),
+                value: timestamp.to_owned(),
+                reason: format!("must be RFC3339 ({err})"),
+            }
         })?;
-    let millis = parsed.unix_timestamp_nanos() / 1_000_000;
+    // Truncating division toward zero, matching the prior `time`-based
+    // reference (`unix_timestamp_nanos() / 1_000_000`) exactly; `div_euclid`
+    // would floor and diverge by 1 ms for sub-millisecond pre-1970 inputs.
+    let millis = nanos / 1_000_000;
     i64::try_from(millis).map_err(|_| SearchError::InvalidConfig {
         field: "telemetry_envelope.ts".to_owned(),
         value: timestamp.to_owned(),
@@ -1518,8 +1524,15 @@ impl OpsStorage {
             }
 
             let mut db_inserted = 0_usize;
+            let mut ensured_project_keys = BTreeSet::new();
+            let mut ensured_instance_ids = BTreeSet::new();
             for event in &to_insert {
-                db_inserted = db_inserted.saturating_add(insert_search_event_row(conn, event)?);
+                db_inserted = db_inserted.saturating_add(insert_search_event_row(
+                    conn,
+                    event,
+                    &mut ensured_project_keys,
+                    &mut ensured_instance_ids,
+                )?);
             }
 
             let db_deduplicated = to_insert.len().saturating_sub(db_inserted);
@@ -2386,11 +2399,26 @@ impl OpsStorage {
         let result = operation(self.connection());
         match result {
             Ok(value) => {
-                self.connection().execute("COMMIT;").map_err(ops_error)?;
+                self.connection().execute("COMMIT;").map_err(|commit_err| {
+                    if let Err(rollback_err) = self.connection().execute("ROLLBACK;") {
+                        tracing::warn!(
+                            target: "frankensearch.ops.storage",
+                            error = %rollback_err,
+                            "rollback failed after operations storage commit error"
+                        );
+                    }
+                    ops_error(commit_err)
+                })?;
                 Ok(value)
             }
             Err(error) => {
-                let _ignored = self.connection().execute("ROLLBACK;");
+                if let Err(rollback_err) = self.connection().execute("ROLLBACK;") {
+                    tracing::warn!(
+                        target: "frankensearch.ops.storage",
+                        error = %rollback_err,
+                        "rollback failed after operations storage transaction error"
+                    );
+                }
                 Err(error)
             }
         }
@@ -2599,7 +2627,16 @@ fn evidence_link_id(alert_id: &str, evidence_uri: &str) -> String {
     format!("evlnk:{hash:016x}")
 }
 
-fn insert_search_event_row(conn: &Connection, event: &SearchEventRecord) -> SearchResult<usize> {
+#[allow(
+    clippy::set_contains_or_insert,
+    reason = "the cache must be populated only after its database ensure succeeds"
+)]
+fn insert_search_event_row<'a>(
+    conn: &Connection,
+    event: &'a SearchEventRecord,
+    ensured_project_keys: &mut BTreeSet<&'a str>,
+    ensured_instance_ids: &mut BTreeSet<&'a str>,
+) -> SearchResult<usize> {
     // Manual dedup: FrankenSQLite does not support INSERT OR IGNORE reliably.
     let existing = conn
         .query_with_params(
@@ -2611,9 +2648,17 @@ fn insert_search_event_row(conn: &Connection, event: &SearchEventRecord) -> Sear
         return Ok(0);
     }
 
-    // Ensure the referenced project and instance exist (FK constraints).
-    ensure_project_exists(conn, &event.project_key, event.ts_ms)?;
-    ensure_instance_exists(conn, &event.instance_id, &event.project_key, event.ts_ms)?;
+    // Ensure each referenced parent once per transaction. Keep this after the
+    // event-id lookup so a database retry remains a pure no-op, including when
+    // the retry payload names parents that do not exist.
+    if !ensured_project_keys.contains(event.project_key.as_str()) {
+        ensure_project_exists(conn, &event.project_key, event.ts_ms)?;
+        ensured_project_keys.insert(event.project_key.as_str());
+    }
+    if !ensured_instance_ids.contains(event.instance_id.as_str()) {
+        ensure_instance_exists(conn, &event.instance_id, &event.project_key, event.ts_ms)?;
+        ensured_instance_ids.insert(event.instance_id.as_str());
+    }
 
     let params = [
         SqliteValue::Text(event.event_id.clone().into()),
@@ -3666,6 +3711,17 @@ mod tests {
         }
     }
 
+    fn single_integer_value(conn: &Connection, query: &str) -> Option<i64> {
+        let rows = conn
+            .query(query)
+            .map_err(ops_error)
+            .expect("integer query should succeed");
+        match rows.first()?.get(0) {
+            Some(SqliteValue::Integer(value)) => Some(*value),
+            _ => None,
+        }
+    }
+
     fn search_event_order(conn: &Connection) -> Vec<(String, i64)> {
         let rows = conn
             .query(
@@ -4072,6 +4128,145 @@ mod tests {
         assert_eq!(
             ordered_ids,
             vec!["event-order-a", "event-order-b", "event-order-c"]
+        );
+    }
+
+    #[test]
+    fn ingest_search_events_batch_reuses_parents_without_changing_first_event_semantics() {
+        let storage = OpsStorage::open_in_memory().expect("in-memory ops storage should open");
+
+        let late = sample_search_event("event-shared-parent-c", 30);
+        let early = sample_search_event("event-shared-parent-a", 10);
+        let middle = sample_search_event("event-shared-parent-b", 20);
+        let result = storage
+            .ingest_search_events_batch(&[late, middle, early], 64)
+            .expect("shared-parent batch should ingest");
+
+        assert_eq!(result.inserted, 3);
+        assert_eq!(result.deduplicated, 0);
+        assert_eq!(table_row_count(storage.connection(), "projects"), 1);
+        assert_eq!(table_row_count(storage.connection(), "instances"), 1);
+        assert_eq!(
+            single_integer_value(
+                storage.connection(),
+                "SELECT created_at_ms FROM projects WHERE project_key = 'project-a';",
+            ),
+            Some(10),
+            "the earliest canonically ordered event must establish the project"
+        );
+        assert_eq!(
+            single_integer_value(
+                storage.connection(),
+                "SELECT first_seen_ms FROM instances WHERE instance_id = 'instance-a';",
+            ),
+            Some(10),
+            "the earliest canonically ordered event must establish the instance"
+        );
+        assert_eq!(
+            search_event_order(storage.connection()),
+            vec![
+                ("event-shared-parent-a".to_owned(), 10),
+                ("event-shared-parent-b".to_owned(), 20),
+                ("event-shared-parent-c".to_owned(), 30),
+            ]
+        );
+    }
+
+    #[test]
+    fn ingest_search_events_batch_caches_each_distinct_parent_pair_independently() {
+        let storage = OpsStorage::open_in_memory().expect("in-memory ops storage should open");
+
+        let default_first = sample_search_event("event-project-a-early", 20);
+        let default_followup = sample_search_event("event-project-a-late", 40);
+        let mut alternate_seed = sample_search_event("event-project-b-early", 10);
+        alternate_seed.project_key = "project-b".to_owned();
+        alternate_seed.instance_id = "instance-b".to_owned();
+        let mut alternate_later = sample_search_event("event-project-b-late", 30);
+        alternate_later.project_key = "project-b".to_owned();
+        alternate_later.instance_id = "instance-b".to_owned();
+
+        let result = storage
+            .ingest_search_events_batch(
+                &[
+                    default_followup,
+                    alternate_later,
+                    default_first,
+                    alternate_seed,
+                ],
+                64,
+            )
+            .expect("mixed-parent batch should ingest");
+
+        assert_eq!(result.inserted, 4);
+        assert_eq!(result.deduplicated, 0);
+        assert_eq!(table_row_count(storage.connection(), "projects"), 2);
+        assert_eq!(table_row_count(storage.connection(), "instances"), 2);
+        assert_eq!(
+            single_integer_value(
+                storage.connection(),
+                "SELECT created_at_ms FROM projects WHERE project_key = 'project-a';",
+            ),
+            Some(20)
+        );
+        assert_eq!(
+            single_integer_value(
+                storage.connection(),
+                "SELECT created_at_ms FROM projects WHERE project_key = 'project-b';",
+            ),
+            Some(10)
+        );
+        assert_eq!(
+            single_integer_value(
+                storage.connection(),
+                "SELECT first_seen_ms FROM instances WHERE instance_id = 'instance-a';",
+            ),
+            Some(20)
+        );
+        assert_eq!(
+            single_integer_value(
+                storage.connection(),
+                "SELECT first_seen_ms FROM instances WHERE instance_id = 'instance-b';",
+            ),
+            Some(10)
+        );
+    }
+
+    #[test]
+    fn ingest_search_events_batch_database_retry_does_not_create_payload_parents() {
+        let storage = OpsStorage::open_in_memory().expect("in-memory ops storage should open");
+        let original = sample_search_event("event-parent-retry", 10);
+        storage
+            .ingest_search_events_batch(std::slice::from_ref(&original), 64)
+            .expect("initial event should ingest");
+
+        let mut retry = original;
+        retry.project_key = "project-retry-decoy".to_owned();
+        retry.instance_id = "instance-retry-decoy".to_owned();
+        retry.ts_ms = 20;
+        let result = storage
+            .ingest_search_events_batch(&[retry], 64)
+            .expect("database retry should remain a no-op");
+
+        assert_eq!(result.inserted, 0);
+        assert_eq!(result.deduplicated, 1);
+        assert_eq!(search_event_count(storage.connection()), 1);
+        assert_eq!(table_row_count(storage.connection(), "projects"), 1);
+        assert_eq!(table_row_count(storage.connection(), "instances"), 1);
+        assert!(
+            storage
+                .connection()
+                .query("SELECT 1 FROM projects WHERE project_key = 'project-retry-decoy';")
+                .expect("project lookup should succeed")
+                .is_empty(),
+            "a database retry must not create a project from its changed payload"
+        );
+        assert!(
+            storage
+                .connection()
+                .query("SELECT 1 FROM instances WHERE instance_id = 'instance-retry-decoy';")
+                .expect("instance lookup should succeed")
+                .is_empty(),
+            "a database retry must not create an instance from its changed payload"
         );
     }
 

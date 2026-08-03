@@ -524,6 +524,82 @@ pub struct ParsedQuery {
     pub was_truncated: bool,
 }
 
+/// Maximum raw-query bytes admitted by the dev-only CASS observation boundary.
+///
+/// Shipping parsing still admits [`MAX_QUERY_LENGTH`] Unicode scalar values.
+/// This separate byte cap prevents a conformance caller from retaining an
+/// arbitrarily large pre-truncation witness.
+#[cfg(any(test, feature = "conformance-internals"))]
+pub const MAX_CASS_OBSERVATION_RAW_QUERY_BYTES: usize = 1_048_576;
+
+/// Maximum number of exact filter values admitted by one CASS observation.
+#[cfg(any(test, feature = "conformance-internals"))]
+pub const MAX_CASS_OBSERVATION_FILTER_VALUES: usize = 4_096;
+
+/// Maximum bytes admitted for any individual exact filter value.
+#[cfg(any(test, feature = "conformance-internals"))]
+pub const MAX_CASS_OBSERVATION_FILTER_VALUE_BYTES: usize = 4_096;
+
+/// Maximum aggregate bytes admitted across all exact filter values.
+#[cfg(any(test, feature = "conformance-internals"))]
+pub const MAX_CASS_OBSERVATION_FILTER_BYTES: usize = 1_048_576;
+
+/// One token consumed by the native CASS grammar, including its source offset.
+///
+/// This is an evidence boundary rather than a second lexer: values are projected
+/// from the private token stream that [`CassQueryParser`] actually lowers. Text
+/// is intentionally retained here only in memory; durable gauntlet artifacts
+/// must redact it before persistence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg(any(test, feature = "conformance-internals"))]
+pub enum CassQueryToken {
+    /// A term operand and its starting UTF-8 byte offset.
+    Term { text: String, byte_offset: usize },
+    /// A quoted phrase operand and its opening-quote byte offset.
+    Phrase { text: String, byte_offset: usize },
+    /// An explicit conjunction.
+    And { byte_offset: usize },
+    /// An explicit disjunction.
+    Or { byte_offset: usize },
+    /// An explicit or prefix negation.
+    Not { byte_offset: usize },
+}
+
+/// Complete in-memory witness emitted by the real native CASS parser.
+///
+/// `parsed` is exactly the value returned by [`CassQueryParser::parse`]. The
+/// additional fields expose the parser's actual token stream and the named
+/// CASS sanitization transform so a conformance adapter does not reconstruct
+/// either value from the source corpus.
+#[derive(Debug, Clone, PartialEq)]
+#[cfg(any(test, feature = "conformance-internals"))]
+pub struct CassParsedQueryObservation {
+    /// Lowered query tree, classification, diagnostics, and truncation state.
+    pub parsed: ParsedQuery,
+    /// Shipping CASS sanitization applied to the admitted query prefix.
+    pub sanitized_query: String,
+    /// Exact query prefix admitted to the shipping parser.
+    pub admitted_query: String,
+    /// Ordered tokens consumed by the native grammar.
+    pub tokens: Vec<CassQueryToken>,
+}
+
+/// A bounded CASS observation request was rejected before witness allocation.
+#[derive(Debug, Clone, Error, PartialEq, Eq)]
+#[cfg(any(test, feature = "conformance-internals"))]
+pub enum CassQueryObservationError {
+    /// One request dimension exceeded its fixed conformance-only cap.
+    #[error("CASS observation field {field} has size {actual}, exceeding limit {limit}")]
+    BoundExceeded {
+        /// Stable request dimension.
+        field: &'static str,
+        /// Observed size, saturated to `usize::MAX` on arithmetic overflow.
+        actual: usize,
+        /// Maximum admitted size.
+        limit: usize,
+    },
+}
+
 /// Invalid schema configuration for the shipping default parser.
 #[derive(Debug, Clone, Error, PartialEq, Eq)]
 pub enum QueryParserConfigError {
@@ -732,6 +808,7 @@ impl DefaultQueryParser {
         if let Some(node) = parsed.as_mut() {
             rewrite_parser_syntax(node);
             trim_parser_dropped(&mut node.query, &node.dedup_key);
+            flatten_should_of_should(&mut node.query);
         }
         repair_root_all_negative(&mut parsed, &mut grammar);
 
@@ -2110,16 +2187,18 @@ impl Grammar {
     }
 
     fn parse_or(&mut self, depth: usize) -> Option<ParsedNode> {
-        let mut nodes = Vec::new();
-        let mut syntactic_operands = 0;
-        let mut explicit_or = false;
+        let mut top_nodes = Vec::new();
+        let mut top_operands = 0_usize;
+        let mut run_nodes = Vec::new();
+        let mut run_operands = 0_usize;
+        let mut run_explicit = false;
         let mut joined_from_explicit_or = false;
 
         loop {
             if !self.peek().is_some_and(LexToken::can_start_operand) {
                 break;
             }
-            syntactic_operands += 1;
+            run_operands += 1;
             let mut node = self.parse_and(depth);
             let joined_to_explicit_or = matches!(self.peek(), Some(LexToken::Or(_)));
             if let Some(node) = node.as_mut()
@@ -2129,7 +2208,7 @@ impl Grammar {
                 wrap_direct_negative_or_operand(node);
             }
             if let Some(node) = node {
-                nodes.push(node);
+                run_nodes.push(node);
             }
             if let Some(LexToken::Or(offset)) = self.peek() {
                 let offset = *offset;
@@ -2140,16 +2219,72 @@ impl Grammar {
                     self.syntax_diagnostic_at("syntax recovery: OR has no right operand", offset);
                     break;
                 }
-                explicit_or = true;
+                run_explicit = true;
                 joined_from_explicit_or = true;
             } else if !self.peek().is_some_and(LexToken::can_start_operand) {
                 break;
             } else {
                 joined_from_explicit_or = false;
+                Self::flush_or_run(
+                    &mut top_nodes,
+                    &mut top_operands,
+                    &mut run_nodes,
+                    &mut run_operands,
+                    &mut run_explicit,
+                );
             }
         }
 
-        combine_or(nodes, syntactic_operands, explicit_or)
+        if top_operands == 0 {
+            // The whole chain is one run — a pure explicit-OR chain, a pure
+            // implicit chain, or a single operand. Keep the historical flat
+            // combination, including its same-level duplicate-retention rule.
+            return combine_or(run_nodes, run_operands, run_explicit);
+        }
+        Self::flush_or_run(
+            &mut top_nodes,
+            &mut top_operands,
+            &mut run_nodes,
+            &mut run_operands,
+            &mut run_explicit,
+        );
+        combine_or(top_nodes, top_operands, false)
+    }
+
+    /// Close one explicit-`OR` run at an implicit-adjacency boundary.
+    ///
+    /// The pinned grammar nests an explicit `OR` expression as its own node
+    /// beneath the implicit disjunction, so its operands live one level below
+    /// operands joined by plain adjacency — and the duplicate-retention
+    /// rewrite, which only compares children of the SAME boolean level, never
+    /// dedups across that boundary. Flattening the whole mixed chain instead
+    /// made Quill drop a trailing operand that duplicates an OR-run member,
+    /// scoring exactly one clause short of the oracle (bd-htcun, found by the
+    /// bd-bsjw campaign as a clean 2.0x score deficit on
+    /// `slices OR title:Nested AND reused slices`).
+    fn flush_or_run(
+        top_nodes: &mut Vec<ParsedNode>,
+        top_operands: &mut usize,
+        run_nodes: &mut Vec<ParsedNode>,
+        run_operands: &mut usize,
+        run_explicit: &mut bool,
+    ) {
+        if *run_operands == 0 && run_nodes.is_empty() {
+            return;
+        }
+        *top_operands += 1;
+        let nodes = std::mem::take(run_nodes);
+        let operands = std::mem::replace(run_operands, 0);
+        let explicit = std::mem::replace(run_explicit, false);
+        if explicit {
+            if let Some(node) = combine_or(nodes, operands, true) {
+                top_nodes.push(node);
+            }
+        } else {
+            // An adjacency boundary closes a run immediately, so a run
+            // without an explicit OR is a single implicit operand.
+            top_nodes.extend(nodes);
+        }
     }
 
     fn parse_and(&mut self, depth: usize) -> Option<ParsedNode> {
@@ -2232,14 +2367,17 @@ impl Grammar {
             node.dedup_key = negative_boolean_dedup_key(dedup_key);
         }
         if not_count != 0 {
-            if occur.is_some() {
-                wrap_not_for_and(&mut node);
-            } else {
-                node.occur = Some(Occur::MustNot);
-                node.from_not = true;
-            }
-        }
-        if let Some(occur) = occur {
+            // A `NOT` stacked with an explicit `+`/`-` prefix (`NOT -x`) sits
+            // outside the contract grammar's single-prefix fragment rule; the
+            // pinned oracle collapses the stack to ONE exclusion rather than
+            // composing a double negation (bd-251nt, found by the bd-bsjw
+            // structure-aware campaign; oracle behavior pinned by
+            // stacked_negation_prefixes_pin_oracle_semantics in the lexical
+            // crate). `NOT +x` is unprobed on the oracle and takes the same
+            // collapse; revisit with a probe before relying on it.
+            node.occur = Some(Occur::MustNot);
+            node.from_not = true;
+        } else if let Some(occur) = occur {
             node.occur = Some(occur);
         }
         Some(node)
@@ -2876,6 +3014,51 @@ fn negative_boolean_dedup_key(child: SyntaxKey) -> SyntaxKey {
     SyntaxKey::Boolean(vec![(Some(Occur::MustNot), child)])
 }
 
+/// Mirror the pinned grammar's lowering: an optional (`Should`) clause whose
+/// child is an all-optional boolean splices its children into the parent.
+///
+/// Duplicate retention already ran on the NESTED syntax (where the pinned
+/// grammar keeps explicit-`OR` runs and parenthesised groups one level below
+/// the implicit disjunction — bd-htcun), but the oracle then FLATTENS
+/// pure-disjunctive nesting for execution, so score accumulation associates
+/// left-to-right over one flat clause list. Executing the nested shape
+/// instead diverges by ULPs on boosted mixes (campaign finding: 2-ULP
+/// `RankMismatch` on `((small^3.0 OR when AND this reused) OR tracing NOT
+/// generic)`). Flattening after dedup reproduces the oracle's association
+/// exactly. A non-`Should` occurrence or a mixed-occurrence child is a
+/// boundary, as is any non-boolean node (boosts included).
+fn flatten_should_of_should(query: &mut Query) {
+    let Query::Boolean { clauses, .. } = query else {
+        return;
+    };
+    for clause in clauses.iter_mut() {
+        flatten_should_of_should(&mut clause.query);
+    }
+    let mut flattened = Vec::with_capacity(clauses.len());
+    for clause in clauses.drain(..) {
+        let splice = clause.occur == Occur::Should
+            && matches!(
+                &clause.query,
+                Query::Boolean { clauses: children, .. }
+                    if children
+                        .iter()
+                        .all(|child| child.occur == Occur::Should)
+            );
+        if splice {
+            let Query::Boolean {
+                clauses: children, ..
+            } = clause.query
+            else {
+                unreachable!("splice guard matched a boolean");
+            };
+            flattened.extend(children);
+        } else {
+            flattened.push(clause);
+        }
+    }
+    *clauses = flattened;
+}
+
 fn combine_and(nodes: Vec<ParsedNode>, syntactic_operands: usize) -> Option<ParsedNode> {
     combine_boolean(
         nodes,
@@ -3436,7 +3619,50 @@ impl CassQueryParser {
     /// Parse one CASS query and append its structured filters.
     #[must_use]
     pub fn parse(&self, raw_query: &str, filters: &CassQueryFilters) -> ParsedQuery {
-        let (truncated_query, was_truncated) = truncated_prefix(raw_query);
+        let (admitted_query, was_truncated) = truncated_prefix(raw_query);
+        self.parse_admitted(admitted_query, was_truncated, filters, |_| {})
+    }
+
+    /// Parse one CASS query and retain the exact lexer/lowering witness.
+    ///
+    /// This calls the same implementation as [`Self::parse`]. It exists for
+    /// dev-only conformance adapters that must observe the real parser boundary
+    /// without echoing or independently reparsing the input corpus.
+    /// # Errors
+    ///
+    /// Returns a typed bound error before parsing or cloning evidence when the
+    /// raw query, filter count, individual filter value, or aggregate filter
+    /// bytes exceed the diagnostic contract.
+    #[cfg(any(test, feature = "conformance-internals"))]
+    pub fn parse_observed(
+        &self,
+        raw_query: &str,
+        filters: &CassQueryFilters,
+    ) -> Result<CassParsedQueryObservation, CassQueryObservationError> {
+        cass_observation_preflight(raw_query, filters)?;
+        let (admitted_query, was_truncated) = truncated_prefix(raw_query);
+        let mut observed_tokens = Vec::new();
+        let parsed = self.parse_admitted(admitted_query, was_truncated, filters, |tokens| {
+            observed_tokens.extend(tokens.iter().map(CassLexToken::observed));
+        });
+        Ok(CassParsedQueryObservation {
+            parsed,
+            sanitized_query: cass_sanitize_query(admitted_query),
+            admitted_query: admitted_query.to_owned(),
+            tokens: observed_tokens,
+        })
+    }
+
+    fn parse_admitted<Observe>(
+        &self,
+        admitted_query: &str,
+        was_truncated: bool,
+        filters: &CassQueryFilters,
+        mut observe_tokens: Observe,
+    ) -> ParsedQuery
+    where
+        Observe: FnMut(&[CassLexToken]),
+    {
         let mut diagnostics = Vec::new();
         if was_truncated {
             emit_diagnostic(
@@ -3446,12 +3672,13 @@ impl CassQueryParser {
                     message: format!(
                         "CASS query truncated to {MAX_QUERY_LENGTH} Unicode scalar values"
                     ),
-                    byte_offset: Some(truncated_query.len()),
+                    byte_offset: Some(admitted_query.len()),
                     fragment: None,
                 },
             );
         }
-        let tokens = cass_lex(truncated_query, &mut diagnostics);
+        let tokens = cass_lex(admitted_query, &mut diagnostics);
+        observe_tokens(&tokens);
         let mut grammar = CassGrammar {
             parser: *self,
             tokens,
@@ -3468,7 +3695,7 @@ impl CassQueryParser {
         let query = self.apply_filters(root, filters);
         ParsedQuery {
             query,
-            explanation: classify_query(truncated_query),
+            explanation: classify_query(admitted_query),
             diagnostics: grammar.diagnostics,
             was_truncated,
         }
@@ -3683,6 +3910,72 @@ fn cass_complement(query: Query) -> Query {
     }
 }
 
+#[cfg(any(test, feature = "conformance-internals"))]
+fn cass_observation_preflight(
+    raw_query: &str,
+    filters: &CassQueryFilters,
+) -> Result<(), CassQueryObservationError> {
+    cass_observation_bound(
+        "raw_query_bytes",
+        raw_query.len(),
+        MAX_CASS_OBSERVATION_RAW_QUERY_BYTES,
+    )?;
+
+    let source_value = match &filters.source_filter {
+        CassSourceFilter::SourceId(value) => Some(value.as_str()),
+        CassSourceFilter::All | CassSourceFilter::Local | CassSourceFilter::Remote => None,
+    };
+    let filter_count = filters
+        .agents
+        .len()
+        .checked_add(filters.workspaces.len())
+        .and_then(|count| count.checked_add(usize::from(source_value.is_some())))
+        .unwrap_or(usize::MAX);
+    cass_observation_bound(
+        "filter_value_count",
+        filter_count,
+        MAX_CASS_OBSERVATION_FILTER_VALUES,
+    )?;
+
+    let mut aggregate_bytes = 0_usize;
+    for value in filters
+        .agents
+        .iter()
+        .chain(&filters.workspaces)
+        .map(String::as_str)
+        .chain(source_value)
+    {
+        cass_observation_bound(
+            "filter_value_bytes",
+            value.len(),
+            MAX_CASS_OBSERVATION_FILTER_VALUE_BYTES,
+        )?;
+        aggregate_bytes = aggregate_bytes.saturating_add(value.len());
+        cass_observation_bound(
+            "aggregate_filter_bytes",
+            aggregate_bytes,
+            MAX_CASS_OBSERVATION_FILTER_BYTES,
+        )?;
+    }
+    Ok(())
+}
+
+#[cfg(any(test, feature = "conformance-internals"))]
+fn cass_observation_bound(
+    field: &'static str,
+    actual: usize,
+    limit: usize,
+) -> Result<(), CassQueryObservationError> {
+    if actual > limit {
+        return Err(CassQueryObservationError::BoundExceeded {
+            field,
+            actual,
+            limit,
+        });
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum CassLexToken {
     Term { text: String, offset: usize },
@@ -3690,6 +3983,31 @@ enum CassLexToken {
     And { offset: usize },
     Or { offset: usize },
     Not { offset: usize },
+}
+
+impl CassLexToken {
+    #[cfg(any(test, feature = "conformance-internals"))]
+    fn observed(&self) -> CassQueryToken {
+        match self {
+            Self::Term { text, offset } => CassQueryToken::Term {
+                text: text.clone(),
+                byte_offset: *offset,
+            },
+            Self::Phrase { text, offset } => CassQueryToken::Phrase {
+                text: text.clone(),
+                byte_offset: *offset,
+            },
+            Self::And { offset } => CassQueryToken::And {
+                byte_offset: *offset,
+            },
+            Self::Or { offset } => CassQueryToken::Or {
+                byte_offset: *offset,
+            },
+            Self::Not { offset } => CassQueryToken::Not {
+                byte_offset: *offset,
+            },
+        }
+    }
 }
 
 fn cass_lex(query: &str, diagnostics: &mut Vec<QueryDiagnostic>) -> Vec<CassLexToken> {
@@ -3976,7 +4294,7 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     #[cfg(feature = "tantivy-oracle")]
-    use frankensearch_core::traits::LexicalSearch;
+    use frankensearch_core::traits::LexicalWrite;
     #[cfg(feature = "tantivy-oracle")]
     use frankensearch_core::types::IndexableDocument;
     #[cfg(feature = "tantivy-oracle")]
@@ -4614,6 +4932,158 @@ mod tests {
 
     fn cass_parser() -> CassQueryParser {
         CassQueryParser::new(CASS_SEMANTIC_SCHEMA).expect("CASS schema supports its parser")
+    }
+
+    #[test]
+    fn cass_parser_observation_uses_the_real_lexer_and_admitted_prefix() {
+        let parser = cass_parser();
+        let raw = "c++ \"exact phrase\" OR -deprecated";
+        let filters = CassQueryFilters::default();
+        let observed = parser
+            .parse_observed(raw, &filters)
+            .expect("bounded observation");
+
+        assert_eq!(observed.parsed, parser.parse(raw, &filters));
+        assert_eq!(observed.admitted_query, raw);
+        assert_eq!(
+            observed.sanitized_query,
+            "c   \"exact phrase\" OR -deprecated"
+        );
+        assert_eq!(
+            observed.tokens,
+            vec![
+                CassQueryToken::Term {
+                    text: "c++".to_owned(),
+                    byte_offset: 0,
+                },
+                CassQueryToken::Phrase {
+                    text: "exact phrase".to_owned(),
+                    byte_offset: 4,
+                },
+                CassQueryToken::Or { byte_offset: 19 },
+                CassQueryToken::Not { byte_offset: 22 },
+                CassQueryToken::Term {
+                    text: "deprecated".to_owned(),
+                    byte_offset: 23,
+                },
+            ]
+        );
+
+        let mut oversized = "auth".to_owned();
+        oversized.push_str(&" ".repeat(MAX_QUERY_LENGTH - oversized.chars().count()));
+        oversized.push_str("private-tail");
+        let truncated = parser
+            .parse_observed(&oversized, &filters)
+            .expect("bounded truncated observation");
+        assert!(truncated.parsed.was_truncated);
+        assert_eq!(truncated.admitted_query.chars().count(), MAX_QUERY_LENGTH);
+        assert!(!truncated.sanitized_query.contains("private-tail"));
+        assert!(truncated.tokens.iter().all(|token| {
+            !matches!(
+                token,
+                CassQueryToken::Term { text, .. } if text.contains("private-tail")
+            )
+        }));
+    }
+
+    #[test]
+    fn cass_parser_observation_uses_utf8_byte_offsets_within_the_admitted_prefix() {
+        let parser = cass_parser();
+        let filters = CassQueryFilters::default();
+        let raw = "搜索 \"éclair\" OR 尾巴";
+        let observed = parser
+            .parse_observed(raw, &filters)
+            .expect("multibyte observation is bounded");
+
+        assert_eq!(observed.admitted_query, raw);
+        assert_eq!(
+            observed.tokens,
+            vec![
+                CassQueryToken::Term {
+                    text: "搜索".to_owned(),
+                    byte_offset: 0,
+                },
+                CassQueryToken::Phrase {
+                    text: "éclair".to_owned(),
+                    byte_offset: "搜索 ".len(),
+                },
+                CassQueryToken::Or {
+                    byte_offset: "搜索 \"éclair\" ".len(),
+                },
+                CassQueryToken::Term {
+                    text: "尾巴".to_owned(),
+                    byte_offset: "搜索 \"éclair\" OR ".len(),
+                },
+            ]
+        );
+        assert!(observed.tokens.iter().all(|token| {
+            let offset = match token {
+                CassQueryToken::Term { byte_offset, .. }
+                | CassQueryToken::Phrase { byte_offset, .. }
+                | CassQueryToken::And { byte_offset }
+                | CassQueryToken::Or { byte_offset }
+                | CassQueryToken::Not { byte_offset } => *byte_offset,
+            };
+            offset < observed.admitted_query.len()
+                && observed.admitted_query.is_char_boundary(offset)
+        }));
+    }
+
+    #[test]
+    fn cass_parser_observation_rejects_hostile_bounds_before_witness_allocation() {
+        let parser = cass_parser();
+        let oversized_raw = "x".repeat(MAX_CASS_OBSERVATION_RAW_QUERY_BYTES + 1);
+        assert_eq!(
+            parser.parse_observed(&oversized_raw, &CassQueryFilters::default()),
+            Err(CassQueryObservationError::BoundExceeded {
+                field: "raw_query_bytes",
+                actual: MAX_CASS_OBSERVATION_RAW_QUERY_BYTES + 1,
+                limit: MAX_CASS_OBSERVATION_RAW_QUERY_BYTES,
+            })
+        );
+
+        let oversized_filter = "x".repeat(MAX_CASS_OBSERVATION_FILTER_VALUE_BYTES + 1);
+        let filters = CassQueryFilters {
+            agents: vec![oversized_filter],
+            ..CassQueryFilters::default()
+        };
+        assert_eq!(
+            parser.parse_observed("bounded", &filters),
+            Err(CassQueryObservationError::BoundExceeded {
+                field: "filter_value_bytes",
+                actual: MAX_CASS_OBSERVATION_FILTER_VALUE_BYTES + 1,
+                limit: MAX_CASS_OBSERVATION_FILTER_VALUE_BYTES,
+            })
+        );
+
+        let aggregate_filters = CassQueryFilters {
+            agents: vec![
+                "x".repeat(MAX_CASS_OBSERVATION_FILTER_VALUE_BYTES);
+                MAX_CASS_OBSERVATION_FILTER_BYTES / MAX_CASS_OBSERVATION_FILTER_VALUE_BYTES
+                    + 1
+            ],
+            ..CassQueryFilters::default()
+        };
+        assert!(matches!(
+            parser.parse_observed("bounded", &aggregate_filters),
+            Err(CassQueryObservationError::BoundExceeded {
+                field: "aggregate_filter_bytes",
+                ..
+            })
+        ));
+
+        let filters = CassQueryFilters {
+            agents: vec!["x".to_owned(); MAX_CASS_OBSERVATION_FILTER_VALUES + 1],
+            ..CassQueryFilters::default()
+        };
+        assert_eq!(
+            parser.parse_observed("bounded", &filters),
+            Err(CassQueryObservationError::BoundExceeded {
+                field: "filter_value_count",
+                actual: MAX_CASS_OBSERVATION_FILTER_VALUES + 1,
+                limit: MAX_CASS_OBSERVATION_FILTER_VALUES,
+            })
+        );
     }
 
     fn cass_filters_from_fixture(case: &Value) -> CassQueryFilters {
@@ -5483,6 +5953,51 @@ mod tests {
         );
     }
 
+    /// A trailing operand that duplicates an explicit-OR-run member must
+    /// SURVIVE: the pinned grammar nests the OR run one level below the
+    /// implicit disjunction, so duplicate retention never crosses that
+    /// boundary (bd-htcun) — and the nesting then FLATTENS for execution so
+    /// score accumulation associates exactly like the oracle's. A pure
+    /// implicit chain still dedups.
+    #[test]
+    fn mixed_chain_duplicate_survives_or_run_nesting() {
+        let mixed = parser().parse("alpha OR beta AND gamma alpha");
+        let Query::Boolean { clauses, .. } = &mixed.query else {
+            panic!("mixed chain must lower to a boolean: {:?}", mixed.query);
+        };
+        assert_eq!(
+            clauses.len(),
+            3,
+            "flattened execution shape: alpha, the AND group, and the \
+             SURVIVING trailing duplicate: {clauses:?}"
+        );
+        assert!(
+            matches!(&clauses[0].query, Query::Term { text, .. } if text == "alpha"),
+            "leading operand first: {clauses:?}"
+        );
+        assert!(
+            matches!(&clauses[2].query, Query::Term { text, .. } if text == "alpha"),
+            "the trailing duplicate survives after flattening: {clauses:?}"
+        );
+
+        let pure = parser().parse("alpha alpha");
+        let Query::Boolean {
+            clauses: pure_clauses,
+            ..
+        } = &pure.query
+        else {
+            panic!(
+                "two-operand implicit chain lowers to a boolean: {:?}",
+                pure.query
+            );
+        };
+        assert_eq!(
+            pure_clauses.len(),
+            1,
+            "a pure implicit chain still retains only the first duplicate: {pure_clauses:?}"
+        );
+    }
+
     #[test]
     fn field_ids_not_backend_handles_are_stored_in_leaves() {
         let parsed = parser().parse("title:Rust");
@@ -5683,9 +6198,14 @@ mod tests {
             panic!("raw-distinct groups must both survive");
         };
         assert_eq!(clauses.len(), 2);
-        assert!(clauses.iter().all(|clause| {
-            matches!(&clause.query, Query::Boolean { clauses, .. } if clauses.len() == 1)
-        }));
+        // Raw-identity dedup ran on the NESTED syntax (distinct /x/ vs /y/
+        // prevent it), then the post-trim singleton groups splice into the
+        // parent for oracle-associated execution (bd-htcun flatten).
+        assert!(
+            clauses
+                .iter()
+                .all(|clause| { matches!(&clause.query, Query::Term { text, .. } if text == "a") })
+        );
 
         let Query::Boolean { clauses, .. } = parser().parse("(a /x/) (a /x/)").query else {
             panic!("the rewritten duplicate keeps its root Boolean");
@@ -6481,6 +7001,7 @@ mod tests {
         if let Some(node) = parsed.as_mut() {
             rewrite_parser_syntax(node);
             trim_parser_dropped(&mut node.query, &node.dedup_key);
+            flatten_should_of_should(&mut node.query);
         }
         repair_root_all_negative(&mut parsed, &mut grammar);
         ParsedQuery {

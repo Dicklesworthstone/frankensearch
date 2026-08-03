@@ -55,7 +55,23 @@
       "measured_bytes": 398458880,
       "projected_savings_bytes": 67108864,
       "replay_command": "FSFS_INDEX_FOOTPRINT_FIXTURE=oversized FSFS_INDEX_FOOTPRINT_DOMAIN=vector_index cargo test -p frankensearch-fsfs index_footprint_advisor_policy_suite -- --nocapture",
-      "operator_command": "fsfs compact --dry-run --format json",
+      "operator_command": {
+        "schema_version": 1,
+        "command": "fsfs",
+        "arguments": [
+          "status",
+          "--format",
+          "json"
+        ],
+        "preconditions": [
+          "review_diagnostic_output",
+          "select_supported_mutation_workflow"
+        ],
+        "mutation_class": "read_only_diagnostic",
+        "dry_run_support": "unavailable",
+        "confirmation_required": false,
+        "guidance": "Compaction preview is not supported; inspect vector_index status, then select a documented mutation workflow and independently confirm its targets."
+      },
       "rationale": "oversized: compact reclaimable fragments for vector_index"
     },
     {
@@ -66,7 +82,23 @@
       "measured_bytes": 251658240,
       "projected_savings_bytes": 25165824,
       "replay_command": "FSFS_INDEX_FOOTPRINT_FIXTURE=oversized FSFS_INDEX_FOOTPRINT_DOMAIN=lexical_index cargo test -p frankensearch-fsfs index_footprint_advisor_policy_suite -- --nocapture",
-      "operator_command": "fsfs index --rebuild lexical_index --dry-run --format json",
+      "operator_command": {
+        "schema_version": 1,
+        "command": "fsfs",
+        "arguments": [
+          "status",
+          "--format",
+          "json"
+        ],
+        "preconditions": [
+          "review_diagnostic_output",
+          "select_supported_mutation_workflow"
+        ],
+        "mutation_class": "read_only_diagnostic",
+        "dry_run_support": "unavailable",
+        "confirmation_required": false,
+        "guidance": "Rebuild preview is not supported; inspect lexical_index status, then select a documented mutation workflow and independently confirm its targets."
+      },
       "rationale": "oversized: rebuild the domain to remove stale segments for lexical_index"
     },
     {
@@ -77,7 +109,23 @@
       "measured_bytes": 94371840,
       "projected_savings_bytes": 8388608,
       "replay_command": "FSFS_INDEX_FOOTPRINT_FIXTURE=oversized FSFS_INDEX_FOOTPRINT_DOMAIN=metadata cargo test -p frankensearch-fsfs index_footprint_advisor_policy_suite -- --nocapture",
-      "operator_command": "fsfs index --rebuild metadata --dry-run --format json",
+      "operator_command": {
+        "schema_version": 1,
+        "command": "fsfs",
+        "arguments": [
+          "status",
+          "--format",
+          "json"
+        ],
+        "preconditions": [
+          "review_diagnostic_output",
+          "select_supported_mutation_workflow"
+        ],
+        "mutation_class": "read_only_diagnostic",
+        "dry_run_support": "unavailable",
+        "confirmation_required": false,
+        "guidance": "Rebuild preview is not supported; inspect metadata status, then select a documented mutation workflow and independently confirm its targets."
+      },
       "rationale": "oversized: rebuild the domain to remove stale segments for metadata"
     },
     {
@@ -88,7 +136,24 @@
       "measured_bytes": 1132462080,
       "projected_savings_bytes": 671088640,
       "replay_command": "FSFS_INDEX_FOOTPRINT_FIXTURE=oversized FSFS_INDEX_FOOTPRINT_DOMAIN=model_cache cargo test -p frankensearch-fsfs index_footprint_advisor_policy_suite -- --nocapture",
-      "operator_command": "fsfs config set search.fast_only true --dry-run --format json",
+      "operator_command": {
+        "schema_version": 1,
+        "command": "fsfs",
+        "arguments": [
+          "config",
+          "validate",
+          "--format",
+          "json"
+        ],
+        "preconditions": [
+          "review_diagnostic_output",
+          "select_supported_mutation_workflow"
+        ],
+        "mutation_class": "read_only_diagnostic",
+        "dry_run_support": "unavailable",
+        "confirmation_required": false,
+        "guidance": "Configuration mutation preview is not supported; validate the current configuration for model_cache, then edit it through a documented confirmed workflow."
+      },
       "rationale": "oversized: adjust feature settings before rebuilding or retaining large caches for model_cache"
     },
     {
@@ -99,7 +164,23 @@
       "measured_bytes": 272629760,
       "projected_savings_bytes": 125829120,
       "replay_command": "FSFS_INDEX_FOOTPRINT_FIXTURE=oversized FSFS_INDEX_FOOTPRINT_DOMAIN=artifact cargo test -p frankensearch-fsfs index_footprint_advisor_policy_suite -- --nocapture",
-      "operator_command": "fsfs doctor --retention-audit --dry-run --format json",
+      "operator_command": {
+        "schema_version": 1,
+        "command": "fsfs",
+        "arguments": [
+          "status",
+          "--format",
+          "json"
+        ],
+        "preconditions": [
+          "review_diagnostic_output",
+          "select_supported_mutation_workflow"
+        ],
+        "mutation_class": "read_only_diagnostic",
+        "dry_run_support": "unavailable",
+        "confirmation_required": false,
+        "guidance": "Retention preview is not supported; run read-only diagnostics for artifact and review policy guidance before selecting any mutation workflow."
+      },
       "rationale": "oversized: retain current files and only audit policy for artifact"
     }
   ],

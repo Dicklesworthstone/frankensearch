@@ -126,13 +126,13 @@ fn resolve_cache_root_with(env: &dyn EnvLookup) -> PathBuf {
     // 4. macOS Application Support (when XDG unset)
     #[cfg(target_os = "macos")]
     {
-        if let Some(path) = dirs::data_local_dir() {
+        if let Some(path) = frankensearch_core::platform_dirs::data_local_dir() {
             return path.join(FRANKENSEARCH_SUBDIR).join(MODELS_SUBDIR);
         }
     }
 
     // 5. ~/.local/share/frankensearch/models/
-    if let Some(home) = dirs::home_dir() {
+    if let Some(home) = frankensearch_core::platform_dirs::home_dir() {
         return home
             .join(".local")
             .join("share")
@@ -141,7 +141,7 @@ fn resolve_cache_root_with(env: &dyn EnvLookup) -> PathBuf {
     }
 
     // Ultimate fallback: data_local_dir or ./models
-    dirs::data_local_dir().map_or_else(
+    frankensearch_core::platform_dirs::data_local_dir().map_or_else(
         || PathBuf::from(MODELS_SUBDIR),
         |p| p.join(FRANKENSEARCH_SUBDIR).join(MODELS_SUBDIR),
     )

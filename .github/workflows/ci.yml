@@ -7,18 +7,130 @@ on:
       - main
     tags:
       - "v*"
+      - "crates-v*"
   schedule:
     - cron: "23 3 * * *"
   workflow_dispatch:
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name != 'schedule' && !startsWith(github.ref, 'refs/tags/v') }}
+  cancel-in-progress: ${{ github.event_name != 'schedule' && !startsWith(github.ref, 'refs/tags/') }}
 
 permissions:
   contents: read
 
 jobs:
+  installer-platform:
+    name: Installer platform proof (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            cargo_args: ""
+            expected_profile: semantic-loaders
+          - os: macos-15
+            target: aarch64-apple-darwin
+            cargo_args: ""
+            expected_profile: semantic-loaders
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+            cargo_args: "--no-default-features"
+            expected_profile: explicit-lite
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install nightly toolchain
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
+        with:
+          toolchain: nightly-2026-07-20
+
+      - name: Prepare path dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          deps_dir="$(cd "$GITHUB_WORKSPACE/.." && pwd)"
+          asupersync_ref="15e6b6920fa0ad3e6d843ea55186eed754389ad2"
+          frankensqlite_ref="5c99eeb93d789c1309d5c46a540289369ff39535"
+          fast_cmaes_ref="17f633e2c24bdd0c358310949066e5922b9e17b5"
+
+          clone_or_update() {
+            local repo_url="$1"
+            local dest_path="$2"
+            local ref="$3"
+            if [[ -d "${dest_path}/.git" ]]; then
+              git -C "${dest_path}" fetch --depth 1 origin "${ref}"
+            else
+              git clone --no-checkout "${repo_url}" "${dest_path}"
+              git -C "${dest_path}" fetch --depth 1 origin "${ref}"
+            fi
+            git -C "${dest_path}" checkout --detach FETCH_HEAD
+          }
+
+          clone_or_update "https://github.com/Dicklesworthstone/asupersync.git" "${deps_dir}/asupersync" "${asupersync_ref}"
+          clone_or_update "https://github.com/Dicklesworthstone/frankensqlite.git" "${deps_dir}/frankensqlite" "${frankensqlite_ref}"
+          clone_or_update "https://github.com/Dicklesworthstone/fast_cmaes.git" "${deps_dir}/fast_cmaes" "${fast_cmaes_ref}"
+
+          while IFS= read -r -d '' manifest; do
+            if [[ "$RUNNER_OS" == "macOS" ]]; then
+              sed -i '' -e "s|/data/projects/|${deps_dir}/|g" "$manifest"
+            else
+              sed -i -e "s|/data/projects/|${deps_dir}/|g" "$manifest"
+            fi
+          done < <(find "$GITHUB_WORKSPACE" -name Cargo.toml -print0)
+
+      - name: Install jsonschema validator module
+        # The standalone `jsonschema` CLI was removed in python-jsonschema 4.x;
+        # the contract scripts fall back to the python3 module, which must exist.
+        run: python3 -m pip install --user --upgrade jsonschema
+
+      - name: Exercise installer with the platform system Bash
+        env:
+          FSFS_INSTALL_TEST_BASH: /bin/bash
+        run: |
+          /bin/bash --version | head -n 1
+          /bin/bash -n install.sh
+          /bin/bash -n scripts/check_fsfs_packaging_release_install_contract.sh
+          /bin/bash scripts/check_fsfs_packaging_release_install_contract.sh --mode installer
+
+      - name: Build declared installer profile
+        run: cargo build --locked --release -p frankensearch-fsfs ${{ matrix.cargo_args }}
+
+      - name: Install built binary through installer production primitive
+        env:
+          FSFS_INSTALL_CONTRACT_TEST: "1"
+        run: |
+          set -euo pipefail
+          proof_dir="${RUNNER_TEMP}/fsfs-installer-platform"
+          bin_dir="${proof_dir}/bin"
+          mkdir -p "${bin_dir}"
+          /bin/bash install.sh install-built target/release/fsfs "${bin_dir}/fsfs"
+          "${bin_dir}/fsfs" version >"${proof_dir}/version.log" 2>&1
+          {
+            printf 'target=%s\n' '${{ matrix.target }}'
+            printf 'profile=%s\n' '${{ matrix.expected_profile }}'
+            printf 'system_bash=%s\n' "$(/bin/bash --version | head -n 1)"
+            printf 'revision=%s\n' "${GITHUB_SHA}"
+          } >"${proof_dir}/receipt.txt"
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "${bin_dir}/fsfs" >"${proof_dir}/binary.sha256"
+          else
+            shasum -a 256 "${bin_dir}/fsfs" >"${proof_dir}/binary.sha256"
+          fi
+
+      - name: Upload installer platform proof
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: fsfs-installer-${{ matrix.target }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/fsfs-installer-platform/**
+          if-no-files-found: error
+          retention-days: 14
+
   quality:
     name: Quality (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
@@ -69,15 +181,107 @@ jobs:
 
           # Cargo.toml files reference /data/projects/<dep> (local dev path).
           # Rewrite those absolute paths to point at the sibling clones for CI.
-          find "$GITHUB_WORKSPACE" -name Cargo.toml -exec \
-            sed -i.bak -e "s|/data/projects/|${deps_dir}/|g" {} +
-          find "$GITHUB_WORKSPACE" -name '*.bak' -delete
+          while IFS= read -r -d '' manifest; do
+            if [[ "$RUNNER_OS" == "macOS" ]]; then
+              sed -i '' -e "s|/data/projects/|${deps_dir}/|g" "$manifest"
+            else
+              sed -i -e "s|/data/projects/|${deps_dir}/|g" "$manifest"
+            fi
+          done < <(find "$GITHUB_WORKSPACE" -name Cargo.toml -print0)
 
       - name: Cache cargo registry + target
         uses: Swatinem/rust-cache@v2
         with:
           shared-key: workspace-${{ matrix.os }}-nightly
           cache-targets: true
+
+      - name: Resolve validation profile
+        id: validation_profile
+        shell: bash
+        run: |
+          set -euo pipefail
+          profile="premerge"
+          if [[ "${GITHUB_EVENT_NAME}" == "schedule" ]]; then
+            profile="nightly"
+          fi
+          echo "profile=${profile}" >> "${GITHUB_OUTPUT}"
+          echo "validation_profile=${profile}" >> "${GITHUB_ENV}"
+
+      - name: Validate crates.io publication planner
+        if: matrix.os == 'ubuntu-latest'
+        shell: bash
+        run: |
+          set -euo pipefail
+          scripts/check_crates_publish_contract.sh --mode self-test
+          scripts/check_crates_publish_contract.sh \
+            --mode audit \
+            --scope workspace \
+            --output "${RUNNER_TEMP}/frankensearch-crates-publish-plan.json"
+          jq -e '
+            .schema == "frankensearch-crates-publish-plan-v1"
+            and .scope == "workspace"
+            and ([.packages[].name] | index("frankensearch-quill")) != null
+            and ([.packages[].name] | index("frankensearch-fusion")) != null
+            and ([.packages[].name] | index("frankensearch")) != null
+            and (
+              ([.packages[].name] | index("frankensearch-quill"))
+              < ([.packages[].name] | index("frankensearch-fusion"))
+            )
+            and (
+              ([.packages[].name] | index("frankensearch-quill"))
+              < ([.packages[].name] | index("frankensearch"))
+            )
+          ' "${RUNNER_TEMP}/frankensearch-crates-publish-plan.json"
+
+      - name: Upload crates.io publication-plan receipt
+        if: matrix.os == 'ubuntu-latest' && always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: crates-publish-audit-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/frankensearch-crates-publish-plan.json
+          if-no-files-found: error
+
+      - name: Validate fsfs model feature and release contract
+        if: matrix.os == 'ubuntu-latest'
+        shell: bash
+        run: scripts/check_fsfs_packaging_release_install_contract.sh --mode model-features
+
+      - name: cargo check (workspace model-free defaults)
+        run: cargo check --workspace --all-targets
+
+      - name: cargo check (fsfs explicit model-free lane)
+        run: cargo check -p frankensearch-fsfs --no-default-features
+
+      - name: Downstream path-dep consumer smoke (fresh resolution, bd-efe5y)
+        if: matrix.os == 'ubuntu-latest'
+        shell: bash
+        run: |
+          set -euo pipefail
+          # A green in-repo build can ride a warm Cargo.lock; a downstream path-dep
+          # consumer (e.g. hfdt) always re-resolves from the DECLARED ranges. bd-efe5y:
+          # the wide floor said 1.1.1 while the code needed 1.6.0's `widening_mul` —
+          # invisible in-repo, fatal for every consumer. This synthesizes the smallest
+          # such consumer and checks it against a lockfile built from scratch, so a
+          # declared-range/API drift fails HERE instead of in the consumer's tree.
+          consumer_dir="${RUNNER_TEMP}/frankensearch-consumer-smoke"
+          rm -rf "${consumer_dir}"
+          mkdir -p "${consumer_dir}/src"
+          cat > "${consumer_dir}/Cargo.toml" <<EOF
+          [package]
+          name = "frankensearch-consumer-smoke"
+          version = "0.0.0"
+          edition = "2021"
+          publish = false
+
+          [dependencies]
+          frankensearch = { path = "${GITHUB_WORKSPACE}/frankensearch" }
+          frankensearch-index = { path = "${GITHUB_WORKSPACE}/crates/frankensearch-index" }
+          frankensearch-quill = { path = "${GITHUB_WORKSPACE}/crates/frankensearch-quill" }
+          EOF
+          printf 'fn main() {}\n' > "${consumer_dir}/src/main.rs"
+          cd "${consumer_dir}"
+          cargo generate-lockfile
+          cargo check --locked
 
       - name: Cache verified bundled model inputs
         uses: actions/cache@v4
@@ -92,23 +296,62 @@ jobs:
           scripts/rch-ensure-deps.sh --models-only
           scripts/rch-ensure-deps.sh --models-only --check
 
-      - name: Resolve validation profile
-        id: validation_profile
+      - name: Stock-default fsfs semantic quickstart proof
+        if: matrix.os == 'ubuntu-latest'
+        timeout-minutes: 30
         shell: bash
+        env:
+          FRANKENSEARCH_REQUIRE_SEMANTIC_E2E: "1"
         run: |
           set -euo pipefail
-          profile="premerge"
-          if [[ "${GITHUB_EVENT_NAME}" == "schedule" ]]; then
-            profile="nightly"
-          fi
-          echo "profile=${profile}" >> "${GITHUB_OUTPUT}"
-          echo "validation_profile=${profile}" >> "${GITHUB_ENV}"
+          artifact_dir="${RUNNER_TEMP}/fsfs-default-semantic-e2e"
+          mkdir -p "${artifact_dir}"
+          export FRANKENSEARCH_MODEL_DIR="${HOME}/.local/share/frankensearch/models"
 
-      - name: cargo check
-        run: cargo check --workspace --all-targets
+          cargo test --locked -p frankensearch-fsfs --test default_build_quickstart \
+            loader_only::default_build_without_models_fails_closed_with_actionable_guidance \
+            -- --exact --nocapture 2>&1 | tee "${artifact_dir}/missing-corrupt.log"
+          cargo test --locked -p frankensearch-fsfs --test default_build_quickstart \
+            loader_only::default_build_indexes_and_returns_a_real_hybrid_result \
+            -- --ignored --exact --nocapture 2>&1 | tee "${artifact_dir}/real-model.log"
 
-      - name: cargo check (fsfs lite -- no embedded models)
-        run: cargo check -p frankensearch-fsfs --no-default-features
+          sha256sum "${artifact_dir}/missing-corrupt.log" "${artifact_dir}/real-model.log" \
+            >"${artifact_dir}/SHA256SUMS"
+          python3 - "${artifact_dir}/receipt.json" <<'PY'
+          import json
+          import os
+          import pathlib
+          import sys
+
+          receipt = {
+              "schema": "fsfs-default-semantic-e2e-v1",
+              "revision": os.environ["GITHUB_SHA"],
+              "profile": "stock-default-semantic-loaders",
+              "model_root": os.environ["FRANKENSEARCH_MODEL_DIR"],
+              "lanes": [
+                  "missing-corrupt",
+                  "real-model-semantic-only",
+                  "real-model-hybrid",
+              ],
+              "status": "pass",
+          }
+          pathlib.Path(sys.argv[1]).write_text(
+              json.dumps(receipt, indent=2, sort_keys=True) + "\n",
+              encoding="utf-8",
+          )
+          PY
+
+      - name: Upload stock-default fsfs semantic quickstart proof
+        if: always() && matrix.os == 'ubuntu-latest'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: fsfs-default-semantic-e2e-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/fsfs-default-semantic-e2e/**
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: cargo check (fsfs explicit embedded-models lane)
+        run: cargo check -p frankensearch-fsfs --no-default-features --features embedded-models
 
       - name: Pre-flip lexical feature graph guard (bd-quill-e7.4)
         if: matrix.os == 'ubuntu-latest'
@@ -148,10 +391,159 @@ jobs:
         env:
           GAUNTLET_SUBJECT_REVISION: ${{ github.sha }}
           GAUNTLET_SUBJECT_DIRTY: "false"
-          GAUNTLET_ORACLE_REVISION: 062a5e5b2d41653b1c8b07888eda1a765e421f49
-          GAUNTLET_ORACLE_DIRTY: "false"
           GAUNTLET_ARTIFACT_ROOT: target/coverage/quill-gauntlet-pr
         run: cargo test -p frankensearch-quill-gauntlet --features tantivy-oracle runner::tests::live_ -- --nocapture
+
+      - name: Bind job-scoped Salej artifact lane
+        id: salej_lane
+        if: always() && matrix.os == 'ubuntu-latest'
+        shell: bash
+        env:
+          EXPECTED_SALEJ_LANE_KEY: ${{ github.job }}-${{ runner.arch }}-${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          if [[ ! "${EXPECTED_SALEJ_LANE_KEY}" =~ ^[A-Za-z0-9._-]+$ ]]; then
+            echo "Unsafe Salej artifact lane key: ${EXPECTED_SALEJ_LANE_KEY}" >&2
+            exit 1
+          fi
+          printf 'key=%s\n' "${EXPECTED_SALEJ_LANE_KEY}" >> "${GITHUB_OUTPUT}"
+
+      - name: Assert Salej artifact lane identity contract
+        if: matrix.os == 'ubuntu-latest'
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import pathlib
+          import re
+
+          source = pathlib.Path(".github/workflows/ci.yml").read_text(encoding="utf-8")
+          dollar = "$"
+          lane_expression = (
+              dollar + "{{ github.job }}-"
+              + dollar + "{{ runner.arch }}-"
+              + dollar + "{{ github.run_id }}-"
+              + dollar + "{{ github.run_attempt }}"
+          )
+          lane_output = "steps" + ".salej_lane.outputs.key"
+          lane_reference = dollar + "{{ " + lane_output + " }}"
+
+          def job_block(job: str) -> str:
+              match = re.search(
+                  rf"(?ms)^  {re.escape(job)}:\n(?P<body>.*?)(?=^  [A-Za-z0-9_-]+:\n|\Z)",
+                  source,
+              )
+              if match is None:
+                  raise SystemExit(f"salej.identity.missing_job: {job}")
+              return match.group(0)
+
+          for job in ("quality", "salej-conformance"):
+              block = job_block(job)
+              declaration = f"EXPECTED_SALEJ_LANE_KEY: {lane_expression}"
+              if block.count(declaration) != 1:
+                  raise SystemExit(
+                      f"salej.identity.lane_declaration: {job} expected exactly one {declaration!r}"
+                  )
+              binding_id = "id" + ": salej_lane"
+              if block.count(binding_id) != 1:
+                  raise SystemExit(
+                      f"salej.identity.lane_binding_step: {job} expected exactly one salej_lane id"
+                  )
+              binding_match = re.search(
+                  r"(?m)^\s+- name: Bind job-scoped Salej artifact lane\n"
+                  + rf"\s+{re.escape(binding_id)}\n"
+                  r"\s+if: always\(\) && matrix\.os == 'ubuntu-latest'$",
+                  block,
+              )
+              if binding_match is None:
+                  raise SystemExit(
+                      f"salej.identity.lane_binding_guard: {job} must bind under always() "
+                      "on the Ubuntu publication lane"
+                  )
+              failure_upload_guard = (
+                  "if" + ": always() && failure() && matrix.os == 'ubuntu-latest' "
+                  f"&& {lane_output} != ''"
+              )
+              if block.count(failure_upload_guard) != 1:
+                  raise SystemExit(
+                      f"salej.identity.failure_upload_guard: {job} expected exactly one "
+                      f"{failure_upload_guard!r}"
+                  )
+              required = (
+                  f"GAUNTLET_UNION_HORIZON_ARTIFACT_ROOT: target/coverage/quill-gauntlet-salej/{lane_reference}",
+                  f"GAUNTLET_UNION_HORIZON_RUN_ID: {lane_reference}",
+                  f"name: quill-gauntlet-salej-diagnostic-{lane_reference}",
+                  f"path: target/coverage/quill-gauntlet-salej/{lane_reference}/*.json",
+                  f"name: quill-gauntlet-salej-attempt-{lane_reference}",
+                  f"path: target/coverage/quill-gauntlet-salej/{lane_reference}/**",
+              )
+              for fragment in required:
+                  if block.count(fragment) != 1:
+                      raise SystemExit(
+                          f"salej.identity.contract_fragment: {job} expected exactly one {fragment!r}"
+                      )
+              if block.count(lane_reference) != len(required):
+                  raise SystemExit(
+                      f"salej.identity.unreviewed_lane_reference: {job} found "
+                      f"{block.count(lane_reference)}, expected {len(required)}"
+                  )
+              expected_output_references = len(required) + 1
+              if block.count(lane_output) != expected_output_references:
+                  raise SystemExit(
+                      f"salej.identity.unreviewed_output_reference: {job} found "
+                      f"{block.count(lane_output)}, expected {expected_output_references}"
+                  )
+              first_reference = block.find(lane_reference)
+              if first_reference <= binding_match.start():
+                  raise SystemExit(
+                      f"salej.identity.reference_before_binding: {job} consumes the lane key "
+                      "before its always()-guarded producer"
+                  )
+
+          quality_key = f"quality-X64-{dollar}{{{{ github.run_id }}}}-{dollar}{{{{ github.run_attempt }}}}"
+          conformance_key = f"salej-conformance-X64-{dollar}{{{{ github.run_id }}}}-{dollar}{{{{ github.run_attempt }}}}"
+          if quality_key == conformance_key:
+              raise SystemExit("salej.identity.collision: distinct github.job values collapsed")
+          print("salej.identity.job_scoped_artifacts: PASS")
+          PY
+
+      - name: Salej partial pruning-receipt cancellation PR gate
+        if: matrix.os == 'ubuntu-latest'
+        timeout-minutes: 15
+        run: cargo test -p frankensearch-quill --features pruning-conformance --test cancellation_contract pruning_conformance_traced_public_search_discards_partial_receipt_and_replays_exactly -- --exact --nocapture
+
+      - name: Salej pruning-trace lifecycle unit PR gate
+        if: matrix.os == 'ubuntu-latest'
+        timeout-minutes: 15
+        run: cargo test -p frankensearch-quill --lib --features pruning-conformance pruning_conformance_ -- --nocapture --test-threads=1
+
+      - name: Salej direct-term MaxScore UNION_HORIZON diagnostic PR gate
+        if: matrix.os == 'ubuntu-latest'
+        timeout-minutes: 30
+        env:
+          GAUNTLET_SUBJECT_REVISION: ${{ github.sha }}
+          GAUNTLET_SUBJECT_DIRTY: "false"
+          GAUNTLET_UNION_HORIZON_ARTIFACT_ROOT: target/coverage/quill-gauntlet-salej/${{ steps.salej_lane.outputs.key }}
+          GAUNTLET_UNION_HORIZON_RUN_ID: ${{ steps.salej_lane.outputs.key }}
+        run: cargo test -p frankensearch-quill-gauntlet --features tantivy-oracle,pruning-conformance runner::tests::salej_complete_union_horizon_diagnostic_bundle -- --ignored --exact --nocapture --test-threads=1
+
+      - name: Upload Salej UNION_HORIZON diagnostic bundle
+        if: success() && matrix.os == 'ubuntu-latest'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: quill-gauntlet-salej-diagnostic-${{ steps.salej_lane.outputs.key }}
+          path: target/coverage/quill-gauntlet-salej/${{ steps.salej_lane.outputs.key }}/*.json
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload non-admissible Salej failure attempt
+        if: always() && failure() && matrix.os == 'ubuntu-latest' && steps.salej_lane.outputs.key != ''
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: quill-gauntlet-salej-attempt-${{ steps.salej_lane.outputs.key }}
+          path: target/coverage/quill-gauntlet-salej/${{ steps.salej_lane.outputs.key }}/**
+          if-no-files-found: warn
+          retention-days: 14
 
       - name: Upload Quill oracle PR campaign artifacts
         if: always() && matrix.os == 'ubuntu-latest'
@@ -176,7 +568,7 @@ jobs:
 
       - name: E2E contract smoke (fsfs)
         if: matrix.os == 'ubuntu-latest'
-        run: cargo test -p frankensearch-fsfs --test cli_e2e_contract -- --nocapture
+        run: cargo test -p frankensearch-fsfs --features embedded-models --test cli_e2e_contract -- --nocapture
 
       - name: Telemetry adapter dry-run lane smoke
         if: matrix.os == 'ubuntu-latest'
@@ -482,6 +874,234 @@ jobs:
             echo "- Perf gate artifacts: \`perf_regression_gate_policy.json\`, \`perf_regression_gate_result.json\`."
           } >> "${GITHUB_STEP_SUMMARY}"
 
+  salej-conformance:
+    name: Salej conformance (${{ matrix.os }}, ${{ matrix.architecture }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            architecture: x86_64
+          - os: macos-15
+            architecture: arm64
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Bind job-scoped Salej artifact lane
+        id: salej_lane
+        if: always() && matrix.os == 'ubuntu-latest'
+        shell: bash
+        env:
+          EXPECTED_SALEJ_LANE_KEY: ${{ github.job }}-${{ runner.arch }}-${{ github.run_id }}-${{ github.run_attempt }}
+        run: |
+          set -euo pipefail
+          if [[ ! "${EXPECTED_SALEJ_LANE_KEY}" =~ ^[A-Za-z0-9._-]+$ ]]; then
+            echo "Unsafe Salej artifact lane key: ${EXPECTED_SALEJ_LANE_KEY}" >&2
+            exit 1
+          fi
+          printf 'key=%s\n' "${EXPECTED_SALEJ_LANE_KEY}" >> "${GITHUB_OUTPUT}"
+
+      - name: Assert exact runner architecture
+        shell: bash
+        run: |
+          set -euo pipefail
+          observed="$(uname -m)"
+          if [[ "${observed}" != "${{ matrix.architecture }}" ]]; then
+            echo "Expected ${{ matrix.architecture }} but GitHub assigned ${observed}" >&2
+            exit 1
+          fi
+          {
+            echo "### Salej runner identity"
+            echo "- image: ${{ matrix.os }}"
+            echo "- architecture: ${observed}"
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Install nightly toolchain
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
+        with:
+          toolchain: nightly-2026-07-20
+          components: rustfmt, clippy
+
+      - name: Prepare path dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          deps_dir="$(cd "$GITHUB_WORKSPACE/.." && pwd)"
+          asupersync_ref="15e6b6920fa0ad3e6d843ea55186eed754389ad2"
+          frankensqlite_ref="5c99eeb93d789c1309d5c46a540289369ff39535"
+          fast_cmaes_ref="17f633e2c24bdd0c358310949066e5922b9e17b5"
+
+          clone_or_update() {
+            local repo_url="$1"
+            local dest_path="$2"
+            local ref="$3"
+            if [[ -d "${dest_path}/.git" ]]; then
+              git -C "${dest_path}" fetch --depth 1 origin "${ref}"
+            else
+              git clone --no-checkout "${repo_url}" "${dest_path}"
+              git -C "${dest_path}" fetch --depth 1 origin "${ref}"
+            fi
+            git -C "${dest_path}" checkout --detach FETCH_HEAD
+          }
+
+          clone_or_update "https://github.com/Dicklesworthstone/asupersync.git" "${deps_dir}/asupersync" "${asupersync_ref}"
+          clone_or_update "https://github.com/Dicklesworthstone/frankensqlite.git" "${deps_dir}/frankensqlite" "${frankensqlite_ref}"
+          clone_or_update "https://github.com/Dicklesworthstone/fast_cmaes.git" "${deps_dir}/fast_cmaes" "${fast_cmaes_ref}"
+
+          while IFS= read -r -d '' manifest; do
+            if [[ "$RUNNER_OS" == "macOS" ]]; then
+              sed -i '' -e "s|/data/projects/|${deps_dir}/|g" "$manifest"
+            else
+              sed -i -e "s|/data/projects/|${deps_dir}/|g" "$manifest"
+            fi
+          done < <(find "$GITHUB_WORKSPACE" -name Cargo.toml -print0)
+
+      - name: Cache Salej Cargo registry and target
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: salej-${{ matrix.os }}-nightly
+          cache-targets: true
+
+      - name: Clippy Quill pruning-conformance surface
+        run: cargo clippy -p frankensearch-quill --all-targets --features pruning-conformance -- -D warnings
+
+      - name: Clippy Salej gauntlet feature surface
+        run: cargo clippy -p frankensearch-quill-gauntlet --all-targets --features tantivy-oracle,pruning-conformance -- -D warnings
+
+      - name: Salej partial pruning-receipt cancellation contract
+        timeout-minutes: 15
+        run: cargo test -p frankensearch-quill --features pruning-conformance --test cancellation_contract pruning_conformance_traced_public_search_discards_partial_receipt_and_replays_exactly -- --exact --nocapture
+
+      - name: Salej pruning-trace lifecycle units
+        timeout-minutes: 15
+        run: cargo test -p frankensearch-quill --lib --features pruning-conformance pruning_conformance_ -- --nocapture --test-threads=1
+
+      - name: Salej full nonignored Apple-Silicon matrix
+        if: matrix.os == 'macos-15'
+        timeout-minutes: 75
+        env:
+          GAUNTLET_SUBJECT_REVISION: ${{ github.sha }}
+          GAUNTLET_SUBJECT_DIRTY: "false"
+        run: cargo test -p frankensearch-quill-gauntlet --features tantivy-oracle,pruning-conformance runner::tests::salej_ -- --nocapture --test-threads=1
+
+      - name: Salej Ubuntu provenance and interruption gaps
+        if: matrix.os == 'ubuntu-latest'
+        timeout-minutes: 30
+        env:
+          GAUNTLET_SUBJECT_REVISION: ${{ github.sha }}
+          GAUNTLET_SUBJECT_DIRTY: "false"
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p frankensearch-quill-gauntlet --features tantivy-oracle,pruning-conformance runner::tests::salej_runtime_identity_rejects_revision_or_dirty_state_rewrites -- --exact --nocapture --test-threads=1
+          cargo test -p frankensearch-quill-gauntlet --features tantivy-oracle,pruning-conformance runner::tests::salej_diagnostic_source_identity_accepts_degraded_provenance_without_upgrading_it -- --exact --nocapture --test-threads=1
+          cargo test -p frankensearch-quill-gauntlet --features tantivy-oracle,pruning-conformance runner::tests::salej_union_horizon_offset_page_matches_control_with_real_tombstones -- --exact --nocapture --test-threads=1
+          cargo test -p frankensearch-quill-gauntlet --features tantivy-oracle,pruning-conformance runner::tests::salej_union_horizon_cancellation_at_final_collection_checkpoint_is_atomic -- --exact --nocapture --test-threads=1
+          cargo test -p frankensearch-quill-gauntlet --features tantivy-oracle,pruning-conformance runner::tests::salej_union_horizon_minimum_fuel_boundary_is_atomic_and_deterministic -- --exact --nocapture --test-threads=1
+
+      - name: Salej sealed UNION_HORIZON diagnostic bundle
+        if: matrix.os == 'ubuntu-latest'
+        timeout-minutes: 60
+        env:
+          GAUNTLET_SUBJECT_REVISION: ${{ github.sha }}
+          GAUNTLET_SUBJECT_DIRTY: "false"
+          GAUNTLET_UNION_HORIZON_ARTIFACT_ROOT: target/coverage/quill-gauntlet-salej/${{ steps.salej_lane.outputs.key }}
+          GAUNTLET_UNION_HORIZON_RUN_ID: ${{ steps.salej_lane.outputs.key }}
+        run: cargo test -p frankensearch-quill-gauntlet --features tantivy-oracle,pruning-conformance runner::tests::salej_complete_union_horizon_diagnostic_bundle -- --ignored --exact --nocapture --test-threads=1
+
+      - name: Upload Salej UNION_HORIZON diagnostic bundle
+        if: success() && matrix.os == 'ubuntu-latest'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: quill-gauntlet-salej-diagnostic-${{ steps.salej_lane.outputs.key }}
+          path: target/coverage/quill-gauntlet-salej/${{ steps.salej_lane.outputs.key }}/*.json
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload non-admissible Salej failure attempt
+        if: always() && failure() && matrix.os == 'ubuntu-latest' && steps.salej_lane.outputs.key != ''
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: quill-gauntlet-salej-attempt-${{ steps.salej_lane.outputs.key }}
+          path: target/coverage/quill-gauntlet-salej/${{ steps.salej_lane.outputs.key }}/**
+          if-no-files-found: warn
+          retention-days: 14
+
+  fsfs-executable-quickstart:
+    # bd-fsfs-executable-quickstart-ci-ve3ul: run the README's documented
+    # source-install quick start against the REAL binary and a deterministic
+    # corpus. Fails closed on index nontermination (bd-fsfs-index-command-
+    # quiescence-v53qo), model-unavailable inert builds (bd-fsfs-default-build-
+    # usable-6mtid), missing durability artifacts, empty or wrongly ranked
+    # search results, hash-only degradation, and leaked processes.
+    name: fsfs executable quick start
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install nightly toolchain
+        uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c
+        with:
+          toolchain: nightly-2026-07-20
+
+      - name: Prepare path dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          deps_dir="$(cd "$GITHUB_WORKSPACE/.." && pwd)"
+          asupersync_ref="15e6b6920fa0ad3e6d843ea55186eed754389ad2"
+          frankensqlite_ref="5c99eeb93d789c1309d5c46a540289369ff39535"
+          fast_cmaes_ref="17f633e2c24bdd0c358310949066e5922b9e17b5"
+
+          clone_or_update() {
+            local repo_url="$1"
+            local dest_path="$2"
+            local ref="$3"
+            if [[ -d "${dest_path}/.git" ]]; then
+              git -C "${dest_path}" fetch --depth 1 origin "${ref}"
+            else
+              git clone --no-checkout "${repo_url}" "${dest_path}"
+              git -C "${dest_path}" fetch --depth 1 origin "${ref}"
+            fi
+            git -C "${dest_path}" checkout --detach FETCH_HEAD
+          }
+
+          clone_or_update "https://github.com/Dicklesworthstone/asupersync.git" "${deps_dir}/asupersync" "${asupersync_ref}"
+          clone_or_update "https://github.com/Dicklesworthstone/frankensqlite.git" "${deps_dir}/frankensqlite" "${frankensqlite_ref}"
+          clone_or_update "https://github.com/Dicklesworthstone/fast_cmaes.git" "${deps_dir}/fast_cmaes" "${fast_cmaes_ref}"
+
+          while IFS= read -r -d '' manifest; do
+            sed -i -e "s|/data/projects/|${deps_dir}/|g" "$manifest"
+          done < <(find "$GITHUB_WORKSPACE" -name Cargo.toml -print0)
+
+      - name: Cache cargo registry + target
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: workspace-ubuntu-latest-nightly
+          cache-targets: true
+
+      - name: Cache verified bundled model inputs
+        uses: actions/cache@v4
+        with:
+          path: ~/.local/share/frankensearch/models
+          key: bundled-model-inputs-${{ runner.os }}-v1-a28f4eeb-c9745ed1
+
+      - name: Provision verified bundled model inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+          scripts/rch-ensure-deps.sh --models-only
+          scripts/rch-ensure-deps.sh --models-only --check
+
+      - name: Run executable quick-start gate
+        shell: bash
+        run: scripts/check_fsfs_executable_quickstart.sh --keep-artifacts
+
   ann-path-identity:
     name: ANN path identity (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
@@ -523,9 +1143,13 @@ jobs:
           clone_at_ref "https://github.com/Dicklesworthstone/frankensqlite.git" "${deps_dir}/frankensqlite" "${frankensqlite_ref}"
           clone_at_ref "https://github.com/Dicklesworthstone/fast_cmaes.git" "${deps_dir}/fast_cmaes" "${fast_cmaes_ref}"
 
-          find "$GITHUB_WORKSPACE" -name Cargo.toml -exec \
-            sed -i.bak -e "s|/data/projects/|${deps_dir}/|g" {} +
-          find "$GITHUB_WORKSPACE" -name '*.bak' -delete
+          while IFS= read -r -d '' manifest; do
+            if [[ "$RUNNER_OS" == "macOS" ]]; then
+              sed -i '' -e "s|/data/projects/|${deps_dir}/|g" "$manifest"
+            else
+              sed -i -e "s|/data/projects/|${deps_dir}/|g" "$manifest"
+            fi
+          done < <(find "$GITHUB_WORKSPACE" -name Cargo.toml -print0)
 
       - name: Cache cargo registry + target
         uses: Swatinem/rust-cache@v2
@@ -569,8 +1193,6 @@ jobs:
           RCH_TEST_TIMEOUT_SEC: "4200"
           GAUNTLET_SUBJECT_REVISION: ${{ github.sha }}
           GAUNTLET_SUBJECT_DIRTY: "false"
-          GAUNTLET_ORACLE_REVISION: 062a5e5b2d41653b1c8b07888eda1a765e421f49
-          GAUNTLET_ORACLE_DIRTY: "false"
           GAUNTLET_ARTIFACT_ROOT: target/coverage/quill-gauntlet-nightly
         run: RCH_REQUIRE_REMOTE=1 RCH_NO_SELF_HEALING=1 rch --no-self-healing exec -- cargo test --profile release -p frankensearch-quill-gauntlet --features tantivy-oracle runner::tests::live_both_profiles_campaign_nightly_full_lane -- --ignored --exact --nocapture
 
@@ -781,11 +1403,11 @@ jobs:
           run_test_suite \
             fsfs-cli-formats \
             "json,jsonl,toon,csv,stream" \
-            cargo test -p frankensearch-fsfs --test cli_command_tests -- --nocapture
+            cargo test -p frankensearch-fsfs --features embedded-models --test cli_command_tests -- --nocapture
           run_test_suite \
             fsfs-cli-e2e \
             "dual-mode,index-search-status" \
-            cargo test -p frankensearch-fsfs --test cli_e2e_contract -- --nocapture
+            cargo test -p frankensearch-fsfs --features embedded-models --test cli_e2e_contract -- --nocapture
           run_test_suite \
             fsfs-baseline-matrix \
             "quill-e7-lexical,drift-dashboard" \
@@ -844,7 +1466,8 @@ jobs:
     permissions:
       contents: read
       id-token: write
-    # NOTE: Full builds (with embedded-models / fastembed) require ort/ONNX Runtime,
+    # NOTE: Full builds explicitly enable embedded-models / fastembed and require
+    # verified model inputs plus ort/ONNX Runtime,
     # which only provides prebuilt binaries for aarch64-apple-darwin, x86_64-pc-windows-msvc,
     # and x86_64-unknown-linux-gnu. Linux musl and x86_64-apple-darwin are only available
     # as lite builds (--no-default-features) — see release-build-lite job below.
@@ -902,14 +1525,27 @@ jobs:
           shared-key: release-${{ matrix.target }}-nightly
           cache-targets: true
 
-      - name: Add Rust target
-        run: rustup target add ${{ matrix.target }}
+      - name: Cache verified bundled model inputs
+        uses: actions/cache@v4
+        with:
+          path: ~/.local/share/frankensearch/models
+          key: bundled-model-inputs-${{ runner.os }}-v1-a28f4eeb-c9745ed1
 
-      - name: Build fsfs release binary
+      - name: Provision verified bundled model inputs
         shell: bash
         run: |
           set -euo pipefail
-          cargo build -p frankensearch-fsfs --release --target "${{ matrix.target }}"
+          scripts/rch-ensure-deps.sh --models-only
+          scripts/rch-ensure-deps.sh --models-only --check
+
+      - name: Add Rust target
+        run: rustup target add ${{ matrix.target }}
+
+      - name: Build fsfs release binary (embedded models)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build -p frankensearch-fsfs --release --target "${{ matrix.target }}" --no-default-features --features embedded-models
 
       - name: Package archive + checksum
         shell: bash
@@ -976,7 +1612,10 @@ jobs:
             "target": "${TARGET_TRIPLE}",
             "binary": "${binary_name}",
             "build_timestamp_utc": "${build_timestamp}",
-            "rustc": "${rustc_version}"
+            "rustc": "${rustc_version}",
+            "profile": "embedded",
+            "semantic_loaders": true,
+            "embedded_models": true
           }
           EOF
           rm -f "dist/${binary_name}"
@@ -1134,6 +1773,21 @@ jobs:
           else
             shasum -a 256 "${archive_path}" > "${archive_path}.sha256"
           fi
+
+          build_timestamp="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          rustc_version="$(rustc -V)"
+          cat > "dist/${archive_base}.metadata.json" <<EOF
+          {
+            "tag": "${TAG_NAME}",
+            "target": "${TARGET_TRIPLE}",
+            "binary": "${binary_name}",
+            "build_timestamp_utc": "${build_timestamp}",
+            "rustc": "${rustc_version}",
+            "profile": "lite",
+            "semantic_loaders": false,
+            "embedded_models": false
+          }
+          EOF
           rm -f "dist/${binary_name}"
 
       - name: Upload lite release artifacts
@@ -1146,8 +1800,10 @@ jobs:
     name: Publish GitHub Release
     if: >-
       startsWith(github.ref, 'refs/tags/v') && !cancelled()
-      && (needs.release-build.result == 'success' || needs.release-build-lite.result == 'success')
-    needs: [release-build, release-build-lite]
+      && needs.release-build.result == 'success'
+      && needs.release-build-lite.result == 'success'
+      && needs.fsfs-executable-quickstart.result == 'success'
+    needs: [release-build, release-build-lite, fsfs-executable-quickstart]
     runs-on: ubuntu-latest
     timeout-minutes: 20
     permissions:
@@ -1158,6 +1814,98 @@ jobs:
         with:
           path: dist
 
+      - name: Validate exact six-profile release inventory
+        shell: bash
+        env:
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          python3 - "${TAG_NAME}" <<'PY'
+          import hashlib
+          import json
+          import pathlib
+          import re
+          import sys
+
+          tag = sys.argv[1]
+          version = tag.removeprefix("v")
+          root = pathlib.Path("dist")
+          expected = {
+              ("embedded", "aarch64-apple-darwin"): ("tar.xz", "fsfs", True, True),
+              ("embedded", "x86_64-pc-windows-msvc"): ("zip", "fsfs.exe", True, True),
+              ("lite", "x86_64-unknown-linux-musl"): ("tar.xz", "fsfs", False, False),
+              ("lite", "aarch64-unknown-linux-musl"): ("tar.xz", "fsfs", False, False),
+              ("lite", "x86_64-apple-darwin"): ("tar.xz", "fsfs", False, False),
+              ("lite", "aarch64-apple-darwin"): ("tar.xz", "fsfs", False, False),
+          }
+          metadata_files = sorted(root.rglob("fsfs*.metadata.json"))
+          if len(metadata_files) != len(expected):
+              raise SystemExit(
+                  f"release.inventory.metadata_count: expected 6, found {len(metadata_files)}: {metadata_files}"
+              )
+
+          seen = set()
+          expected_archives = set()
+          for metadata_path in metadata_files:
+              metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+              key = (metadata.get("profile"), metadata.get("target"))
+              if key not in expected or key in seen:
+                  raise SystemExit(f"release.inventory.unexpected_or_duplicate_pair: {key}")
+              seen.add(key)
+              extension, binary, semantic_loaders, embedded_models = expected[key]
+              prefix = "fsfs" if key[0] == "embedded" else "fsfs-lite"
+              base = f"{prefix}-{version}-{key[1]}"
+              expected_metadata_name = f"{base}.metadata.json"
+              if metadata_path.name != expected_metadata_name:
+                  raise SystemExit(
+                      f"release.inventory.metadata_name: expected {expected_metadata_name}, found {metadata_path.name}"
+                  )
+              expected_fields = {
+                  "tag": tag,
+                  "target": key[1],
+                  "binary": binary,
+                  "profile": key[0],
+                  "semantic_loaders": semantic_loaders,
+                  "embedded_models": embedded_models,
+              }
+              for field, value in expected_fields.items():
+                  if metadata.get(field) != value:
+                      raise SystemExit(
+                          f"release.inventory.metadata_field: {metadata_path} {field}={metadata.get(field)!r}, expected {value!r}"
+                      )
+
+              archive_path = metadata_path.with_name(f"{base}.{extension}")
+              checksum_path = archive_path.with_name(f"{archive_path.name}.sha256")
+              if not archive_path.is_file() or not checksum_path.is_file():
+                  raise SystemExit(
+                      f"release.inventory.missing_archive_pair: archive={archive_path} checksum={checksum_path}"
+                  )
+              checksum_text = checksum_path.read_text(encoding="utf-8").strip()
+              checksum_match = re.match(r"^([0-9a-fA-F]{64})(?:\s|$)", checksum_text)
+              if checksum_match is None:
+                  raise SystemExit(f"release.inventory.malformed_checksum: {checksum_path}")
+              actual_digest = hashlib.sha256(archive_path.read_bytes()).hexdigest()
+              if checksum_match.group(1).lower() != actual_digest:
+                  raise SystemExit(f"release.inventory.checksum_mismatch: {archive_path}")
+              expected_archives.add(archive_path.resolve())
+
+          if seen != set(expected):
+              raise SystemExit(f"release.inventory.missing_pairs: {sorted(set(expected) - seen)}")
+          versioned_archives = {
+              path.resolve()
+              for path in root.rglob("fsfs*")
+              if path.is_file()
+              and re.match(r"^fsfs(?:-lite)?-[0-9].*\.(?:tar\.xz|zip)$", path.name)
+          }
+          if versioned_archives != expected_archives:
+              raise SystemExit(
+                  "release.inventory.archive_set_mismatch: "
+                  f"missing={sorted(expected_archives - versioned_archives)} "
+                  f"unexpected={sorted(versioned_archives - expected_archives)}"
+              )
+          print("release.inventory.exact_six: PASS")
+          PY
+
       - name: Publish release
         uses: softprops/action-gh-release@v2
         with:
@@ -1165,8 +1913,8 @@ jobs:
 
   publish-crates:
     name: Publish crates.io packages
-    if: startsWith(github.ref, 'refs/tags/v') && !contains(github.ref_name, '-') && vars.ENABLE_CRATES_PUBLISH == 'true' && github.repository_owner == 'Dicklesworthstone'
-    needs: release-publish
+    if: startsWith(github.ref, 'refs/tags/crates-v') && vars.ENABLE_CRATES_PUBLISH == 'true' && github.repository_owner == 'Dicklesworthstone'
+    needs: quality
     runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
@@ -1211,76 +1959,63 @@ jobs:
             sed -i.bak -e "s|/data/projects/|${deps_dir}/|g" {} +
           find "$GITHUB_WORKSPACE" -name '*.bak' -delete
 
-      - name: Resolve publish sequence + validate tag/version alignment
+      - name: Resolve and authenticate publication plan
         id: publish_plan
         shell: bash
         env:
           TAG_NAME: ${{ github.ref_name }}
         run: |
           set -euo pipefail
+          plan_path="${RUNNER_TEMP}/frankensearch-crates-publish-plan.json"
+          scripts/check_crates_publish_contract.sh \
+            --mode gate \
+            --scope workspace \
+            --registry-census live \
+            --release-tag "${TAG_NAME}" \
+            --output "${plan_path}"
 
-          crates=(
-            frankensearch-core
-            frankensearch-embed
-            frankensearch-index
-            frankensearch-lexical
-            frankensearch-fusion
-            frankensearch-storage
-            frankensearch
-          )
+          sequence="$(jq -r '[.packages[] | select(.action == "publish") | .name] | join(" ")' "${plan_path}")"
+          exact_existing="$(jq -r '[.packages[] | select(.action == "skip_exact_archive") | .name] | join(" ")' "${plan_path}")"
+          echo "Publication sequence: ${sequence:-<nothing-new>}"
+          echo "Exact-source versions already present: ${exact_existing:-<none>}"
+          echo "sequence=${sequence}" >> "${GITHUB_OUTPUT}"
+          echo "plan_path=${plan_path}" >> "${GITHUB_OUTPUT}"
 
-          version="${TAG_NAME#v}"
-          if [[ "${version}" == "${TAG_NAME}" ]]; then
-            echo "Tag '${TAG_NAME}' must use the v<semver> format." >&2
-            exit 1
-          fi
-
-          cargo metadata --no-deps --format-version 1 > /tmp/cargo-metadata.json
-          release_crate_version="$(jq -r '.packages[] | select(.name == "frankensearch") | .version' /tmp/cargo-metadata.json)"
-          if [[ -z "${release_crate_version}" || "${release_crate_version}" == "null" ]]; then
-            echo "Release crate 'frankensearch' not found in workspace metadata." >&2
-            exit 1
-          fi
-          if [[ "${release_crate_version}" != "${version}" ]]; then
-            echo "Version mismatch for release crate 'frankensearch': crate=${release_crate_version}, tag=${version}" >&2
-            exit 1
-          fi
-
-          for crate in "${crates[@]}"; do
-            crate_version="$(jq -r --arg crate "${crate}" '.packages[] | select(.name == $crate) | .version' /tmp/cargo-metadata.json)"
-            if [[ -z "${crate_version}" || "${crate_version}" == "null" ]]; then
-              echo "Crate '${crate}' not found in workspace metadata." >&2
-              exit 1
-            fi
-            echo "Publish plan includes ${crate} ${crate_version}"
-          done
-
-          echo "sequence=${crates[*]}" >> "${GITHUB_OUTPUT}"
-          echo "version=${version}" >> "${GITHUB_OUTPUT}"
+      - name: Upload authenticated publication-plan receipt
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: crates-publish-plan-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/frankensearch-crates-publish-plan.json
+          if-no-files-found: error
 
       - name: Publish crates in dependency order
+        if: steps.publish_plan.outputs.sequence != ''
         shell: bash
         env:
           CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-          RELEASE_VERSION: ${{ steps.publish_plan.outputs.version }}
+          PLAN_PATH: ${{ steps.publish_plan.outputs.plan_path }}
+          PUBLISH_SEQUENCE: ${{ steps.publish_plan.outputs.sequence }}
         run: |
           set -euo pipefail
           if [[ -z "${CARGO_REGISTRY_TOKEN:-}" ]]; then
             echo "CARGO_REGISTRY_TOKEN is required when ENABLE_CRATES_PUBLISH=true" >&2
             exit 1
           fi
-          already_published() {
-            grep -qiE 'already (uploaded|exists)|is already uploaded'
-          }
 
-          for crate in ${{ steps.publish_plan.outputs.sequence }}; do
+          for crate in ${PUBLISH_SEQUENCE}; do
+            crate_version="$(
+              jq -r --arg crate "${crate}" \
+                '.packages[] | select(.name == $crate) | .version' \
+                "${PLAN_PATH}"
+            )"
             for attempt in 1 2 3 4 5; do
               set +e
               dry_run_output="$(cargo publish -p "${crate}" --locked --dry-run 2>&1)"
               dry_run_status=$?
               set -e
               echo "${dry_run_output}"
-              if [[ "${dry_run_status}" -eq 0 ]] || already_published <<< "${dry_run_output}"; then
+              if [[ "${dry_run_status}" -eq 0 ]]; then
                 break
               fi
               if [[ "${attempt}" -eq 5 ]]; then
@@ -1289,18 +2024,10 @@ jobs:
               fi
               sleep 20
             done
-            echo "Publishing ${crate} (${RELEASE_VERSION})"
-            set +e
-            publish_output="$(cargo publish -p "${crate}" --locked --token "${CARGO_REGISTRY_TOKEN}" 2>&1)"
-            publish_status=$?
-            set -e
-            echo "${publish_output}"
-            if [[ "${publish_status}" -ne 0 ]]; then
-              if already_published <<< "${publish_output}"; then
-                echo "${crate} is already published; continuing."
-              else
-                exit "${publish_status}"
-              fi
-            fi
+            echo "Publishing ${crate} ${crate_version}"
+            cargo publish \
+              -p "${crate}" \
+              --locked \
+              --token "${CARGO_REGISTRY_TOKEN}"
             sleep 30
           done

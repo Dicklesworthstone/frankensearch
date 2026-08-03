@@ -54,6 +54,66 @@
       "type": "string",
       "pattern": "^FSFS_INDEX_FOOTPRINT_FIXTURE=(small|fragmented|oversized) FSFS_INDEX_FOOTPRINT_DOMAIN=(vector_index|lexical_index|metadata|model_cache|artifact) cargo test -p frankensearch-fsfs index_footprint_advisor_policy_suite -- --nocapture$"
     },
+    "operatorCommand": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "command",
+        "arguments",
+        "preconditions",
+        "mutation_class",
+        "dry_run_support",
+        "confirmation_required",
+        "guidance"
+      ],
+      "properties": {
+        "schema_version": {
+          "type": "integer",
+          "const": 1
+        },
+        "command": {
+          "type": "string",
+          "const": "fsfs"
+        },
+        "arguments": {
+          "type": "array",
+          "minItems": 3,
+          "items": {
+            "type": "string",
+            "minLength": 1
+          }
+        },
+        "preconditions": {
+          "type": "array",
+          "minItems": 2,
+          "uniqueItems": true,
+          "items": {
+            "type": "string",
+            "enum": [
+              "review_diagnostic_output",
+              "select_supported_mutation_workflow"
+            ]
+          }
+        },
+        "mutation_class": {
+          "type": "string",
+          "const": "read_only_diagnostic"
+        },
+        "dry_run_support": {
+          "type": "string",
+          "const": "unavailable"
+        },
+        "confirmation_required": {
+          "type": "boolean",
+          "const": false
+        },
+        "guidance": {
+          "type": "string",
+          "minLength": 1
+        }
+      }
+    },
     "contractDefinition": {
       "type": "object",
       "additionalProperties": false,
@@ -302,8 +362,7 @@
           "$ref": "#/$defs/replayCommand"
         },
         "operator_command": {
-          "type": "string",
-          "minLength": 1
+          "$ref": "#/$defs/operatorCommand"
         },
         "rationale": {
           "type": "string",

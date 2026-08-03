@@ -115,7 +115,7 @@ Required manifest body fields:
 |---|---|---|
 | `suite` | Yes | Which test suite produced this pack |
 | `determinism_tier` | Yes | Reproducibility guarantee level |
-| `seed` | Yes | Master randomness seed |
+| `seed` | Yes | Root randomness seed |
 | `config_hash` | Yes | SHA-256 of the effective test configuration |
 | `model_versions` | Yes | List of model name/revision/digest tuples |
 | `platform` | Yes | OS, architecture, and compiler version |
@@ -360,7 +360,7 @@ All suites must map producer-specific fields to the following canonical envelope
 |---|---|
 | `suite` | Producer lane identifier normalized to `core` / `fsfs` / `ops` / `interaction` |
 | `run_id` | Shared ULID across every file in one artifact pack |
-| `seed` | Suite master seed (single deterministic replay root) |
+| `seed` | Suite root seed (single deterministic replay root) |
 | `config_hash` | SHA-256 of effective run config, not raw config text |
 | `reason_code` | Stable machine code (`e2e.*` namespace), never free-form text |
 | `artifacts[].file` | Canonical file names defined in this contract |
@@ -473,7 +473,7 @@ bash replay_command.txt
 - Core contract lane (example):
   - `cargo test -p frankensearch-core -- --nocapture`
 - fsfs CLI contract lane (example):
-  - `cargo test -p frankensearch-fsfs --test cli_e2e_contract -- --nocapture`
+  - `cargo test -p frankensearch-fsfs --features embedded-models --test cli_e2e_contract -- --nocapture`
 - ops/control-plane lane:
   - Use the exact command from `replay_command.txt`; ops replay must preserve transcript evidence when failing.
 
@@ -483,7 +483,7 @@ The `quality` job in `.github/workflows/ci.yml` enforces the unified artifact co
 
 ### Hard-Fail CI Gates
 
-- `cargo test -p frankensearch-fsfs --test cli_e2e_contract -- --nocapture`
+- `cargo test -p frankensearch-fsfs --features embedded-models --test cli_e2e_contract -- --nocapture`
   - validates fsfs bundle shape and replay/diagnostic artifacts through shared validators.
 - JSON Schema fixture enforcement:
   - every `schemas/fixtures/e2e-*.json` must validate against `schemas/e2e-artifact-v1.schema.json`

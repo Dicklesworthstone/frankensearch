@@ -1,0 +1,540 @@
+{
+  "schema": "frankensearch-qg10-source-contract-v1",
+  "generator": "scripts/check_feature_matrix_overlay.sh",
+  "review_status": "unreviewed_template",
+  "claim_scope": {
+    "kind": "source-workspace-only",
+    "performance_claim": false,
+    "registry_or_package_claim": false,
+    "registry_or_package_owner": "bd-8nqz.6",
+    "flip_authorized": false,
+    "flip_authorization_owner": "bd-3beo",
+    "semantic_foundation_f_in_scope": false,
+    "semantic_foundation_f_disposition": "excluded-post-batch4"
+  },
+  "namespace_contract": {
+    "production_feature": "lexical",
+    "production_backend": "quill",
+    "production_module": "frankensearch::lexical",
+    "native_alias_feature": "quill",
+    "native_alias_module": "frankensearch::quill",
+    "compatibility_feature": "lexical-tantivy",
+    "compatibility_backend": "tantivy",
+    "compatibility_module": "frankensearch::lexical_tantivy",
+    "compatibility_type": "frankensearch::TantivyIndex",
+    "cass_feature": "cass-compat",
+    "both_backends_selected_backend": "quill"
+  },
+  "required_facade_features": [
+    "ann",
+    "api",
+    "bench-internals",
+    "cass-compat",
+    "default",
+    "download",
+    "durability",
+    "durable",
+    "fastembed",
+    "fastembed-reranker",
+    "fts5",
+    "full",
+    "full-fts5",
+    "graph",
+    "hash",
+    "hybrid",
+    "lexical",
+    "lexical-tantivy",
+    "model2vec",
+    "native",
+    "persistent",
+    "quill",
+    "rerank",
+    "semantic",
+    "storage"
+  ],
+  "required_facade_targets": [
+    {
+      "name": "basic_search",
+      "kind": [
+        "example"
+      ],
+      "crate_types": [
+        "bin"
+      ],
+      "required_features": []
+    },
+    {
+      "name": "bench_quick",
+      "kind": [
+        "example"
+      ],
+      "crate_types": [
+        "bin"
+      ],
+      "required_features": []
+    },
+    {
+      "name": "config_override",
+      "kind": [
+        "example"
+      ],
+      "crate_types": [
+        "bin"
+      ],
+      "required_features": []
+    },
+    {
+      "name": "cross_component",
+      "kind": [
+        "test"
+      ],
+      "crate_types": [
+        "bin"
+      ],
+      "required_features": []
+    },
+    {
+      "name": "custom_embedder",
+      "kind": [
+        "example"
+      ],
+      "crate_types": [
+        "bin"
+      ],
+      "required_features": []
+    },
+    {
+      "name": "frankensearch",
+      "kind": [
+        "lib"
+      ],
+      "crate_types": [
+        "lib"
+      ],
+      "required_features": []
+    },
+    {
+      "name": "index_builder_lexical_staging",
+      "kind": [
+        "bench"
+      ],
+      "crate_types": [
+        "bin"
+      ],
+      "required_features": [
+        "bench-internals",
+        "lexical"
+      ]
+    },
+    {
+      "name": "integration",
+      "kind": [
+        "test"
+      ],
+      "crate_types": [
+        "bin"
+      ],
+      "required_features": []
+    },
+    {
+      "name": "reconciliation",
+      "kind": [
+        "test"
+      ],
+      "crate_types": [
+        "bin"
+      ],
+      "required_features": []
+    },
+    {
+      "name": "search_bench",
+      "kind": [
+        "bench"
+      ],
+      "crate_types": [
+        "bin"
+      ],
+      "required_features": [
+        "lexical-tantivy"
+      ]
+    },
+    {
+      "name": "streaming_search",
+      "kind": [
+        "example"
+      ],
+      "crate_types": [
+        "bin"
+      ],
+      "required_features": []
+    },
+    {
+      "name": "treasure_island_e2e",
+      "kind": [
+        "test"
+      ],
+      "crate_types": [
+        "bin"
+      ],
+      "required_features": []
+    },
+    {
+      "name": "validate_full_pipeline",
+      "kind": [
+        "example"
+      ],
+      "crate_types": [
+        "bin"
+      ],
+      "required_features": []
+    },
+    {
+      "name": "validate_fusion",
+      "kind": [
+        "example"
+      ],
+      "crate_types": [
+        "bin"
+      ],
+      "required_features": []
+    },
+    {
+      "name": "validate_index_io",
+      "kind": [
+        "example"
+      ],
+      "crate_types": [
+        "bin"
+      ],
+      "required_features": []
+    }
+  ],
+  "required_lanes": [
+    {
+      "name": "no-default",
+      "feature_mode": "no-default",
+      "requested_features": [],
+      "expected_lexical_backend": "none",
+      "expected_selected_backend": "none",
+      "required_packages": [],
+      "forbidden_package_prefixes": [
+        "frankensearch-lexical",
+        "frankensearch-quill",
+        "tantivy"
+      ],
+      "behavior_test": "feature_matrix_smoke::no_default_lane_behavior"
+    },
+    {
+      "name": "default",
+      "feature_mode": "default",
+      "requested_features": [],
+      "expected_lexical_backend": "none",
+      "expected_selected_backend": "none",
+      "required_packages": [],
+      "forbidden_package_prefixes": [
+        "frankensearch-lexical",
+        "frankensearch-quill",
+        "tantivy"
+      ],
+      "behavior_test": "feature_matrix_smoke::default_lane_behavior"
+    },
+    {
+      "name": "hash",
+      "feature_mode": "no-default",
+      "requested_features": [
+        "hash"
+      ],
+      "expected_lexical_backend": "none",
+      "expected_selected_backend": "none",
+      "required_packages": [],
+      "forbidden_package_prefixes": [
+        "frankensearch-lexical",
+        "frankensearch-quill",
+        "tantivy"
+      ],
+      "behavior_test": "feature_matrix_smoke::hash_lane_behavior"
+    },
+    {
+      "name": "quill",
+      "feature_mode": "no-default",
+      "requested_features": [
+        "quill"
+      ],
+      "expected_lexical_backend": "quill",
+      "expected_selected_backend": "quill",
+      "required_packages": [
+        "frankensearch-quill"
+      ],
+      "forbidden_package_prefixes": [
+        "frankensearch-lexical",
+        "tantivy"
+      ],
+      "behavior_test": "feature_matrix_smoke::quill_lane_behavior"
+    },
+    {
+      "name": "lexical",
+      "feature_mode": "no-default",
+      "requested_features": [
+        "lexical"
+      ],
+      "expected_lexical_backend": "quill",
+      "expected_selected_backend": "quill",
+      "required_packages": [
+        "frankensearch-quill"
+      ],
+      "forbidden_package_prefixes": [
+        "frankensearch-lexical",
+        "tantivy"
+      ],
+      "behavior_test": "feature_matrix_smoke::lexical_lane_behavior"
+    },
+    {
+      "name": "lexical-bench",
+      "feature_mode": "no-default",
+      "requested_features": [
+        "bench-internals",
+        "lexical"
+      ],
+      "expected_lexical_backend": "quill",
+      "expected_selected_backend": "quill",
+      "required_packages": [
+        "frankensearch-quill"
+      ],
+      "forbidden_package_prefixes": [
+        "frankensearch-lexical",
+        "tantivy"
+      ],
+      "behavior_test": "feature_matrix_smoke::lexical_bench_lane_behavior"
+    },
+    {
+      "name": "lexical-tantivy",
+      "feature_mode": "no-default",
+      "requested_features": [
+        "lexical-tantivy"
+      ],
+      "expected_lexical_backend": "tantivy",
+      "expected_selected_backend": "tantivy",
+      "required_packages": [
+        "frankensearch-lexical",
+        "tantivy"
+      ],
+      "forbidden_package_prefixes": [
+        "frankensearch-quill"
+      ],
+      "behavior_test": "feature_matrix_smoke::lexical_tantivy_lane_behavior"
+    },
+    {
+      "name": "cass-compat",
+      "feature_mode": "no-default",
+      "requested_features": [
+        "cass-compat"
+      ],
+      "expected_lexical_backend": "tantivy",
+      "expected_selected_backend": "tantivy",
+      "required_packages": [
+        "frankensearch-lexical",
+        "tantivy"
+      ],
+      "forbidden_package_prefixes": [
+        "frankensearch-quill"
+      ],
+      "behavior_test": "feature_matrix_smoke::cass_compat_lane_behavior"
+    },
+    {
+      "name": "both-backends",
+      "feature_mode": "no-default",
+      "requested_features": [
+        "lexical",
+        "lexical-tantivy"
+      ],
+      "expected_lexical_backend": "quill+tantivy",
+      "expected_selected_backend": "quill",
+      "required_packages": [
+        "frankensearch-lexical",
+        "frankensearch-quill",
+        "tantivy"
+      ],
+      "forbidden_package_prefixes": [],
+      "behavior_test": "feature_matrix_smoke::both_backends_lane_behavior"
+    },
+    {
+      "name": "semantic",
+      "feature_mode": "no-default",
+      "requested_features": [
+        "semantic"
+      ],
+      "expected_lexical_backend": "none",
+      "expected_selected_backend": "none",
+      "required_packages": [],
+      "forbidden_package_prefixes": [
+        "frankensearch-lexical",
+        "frankensearch-quill",
+        "tantivy"
+      ],
+      "behavior_test": "feature_matrix_smoke::semantic_lane_behavior"
+    },
+    {
+      "name": "hybrid",
+      "feature_mode": "no-default",
+      "requested_features": [
+        "hybrid"
+      ],
+      "expected_lexical_backend": "quill",
+      "expected_selected_backend": "quill",
+      "required_packages": [
+        "frankensearch-quill"
+      ],
+      "forbidden_package_prefixes": [
+        "frankensearch-lexical",
+        "tantivy"
+      ],
+      "behavior_test": "feature_matrix_smoke::hybrid_lane_behavior"
+    },
+    {
+      "name": "persistent",
+      "feature_mode": "no-default",
+      "requested_features": [
+        "persistent"
+      ],
+      "expected_lexical_backend": "quill",
+      "expected_selected_backend": "quill",
+      "required_packages": [
+        "frankensearch-quill"
+      ],
+      "forbidden_package_prefixes": [
+        "frankensearch-lexical",
+        "tantivy"
+      ],
+      "behavior_test": "feature_matrix_smoke::persistent_lane_behavior"
+    },
+    {
+      "name": "durable",
+      "feature_mode": "no-default",
+      "requested_features": [
+        "durable"
+      ],
+      "expected_lexical_backend": "quill",
+      "expected_selected_backend": "quill",
+      "required_packages": [
+        "frankensearch-quill"
+      ],
+      "forbidden_package_prefixes": [
+        "frankensearch-lexical",
+        "tantivy"
+      ],
+      "behavior_test": "feature_matrix_smoke::durable_lane_behavior"
+    },
+    {
+      "name": "full",
+      "feature_mode": "no-default",
+      "requested_features": [
+        "full"
+      ],
+      "expected_lexical_backend": "quill",
+      "expected_selected_backend": "quill",
+      "required_packages": [
+        "frankensearch-quill"
+      ],
+      "forbidden_package_prefixes": [
+        "frankensearch-lexical",
+        "tantivy"
+      ],
+      "behavior_test": "feature_matrix_smoke::full_lane_behavior"
+    },
+    {
+      "name": "full-fts5",
+      "feature_mode": "no-default",
+      "requested_features": [
+        "full-fts5"
+      ],
+      "expected_lexical_backend": "quill",
+      "expected_selected_backend": "quill",
+      "required_packages": [
+        "frankensearch-quill"
+      ],
+      "forbidden_package_prefixes": [
+        "frankensearch-lexical",
+        "tantivy"
+      ],
+      "behavior_test": "feature_matrix_smoke::full_fts5_lane_behavior"
+    },
+    {
+      "name": "all-features",
+      "feature_mode": "all-features",
+      "requested_features": [],
+      "expected_lexical_backend": "quill+tantivy",
+      "expected_selected_backend": "quill",
+      "required_packages": [
+        "frankensearch-lexical",
+        "frankensearch-quill",
+        "tantivy"
+      ],
+      "forbidden_package_prefixes": [],
+      "behavior_test": "feature_matrix_smoke::all_features_lane_behavior"
+    }
+  ],
+  "reviewed_inventory": {
+    "cargo_lock_sha256": null,
+    "workspace_manifest_sha256": null,
+    "facade_manifest_sha256": null,
+    "toolchain_sha256": null,
+    "facade_features_sha256": null,
+    "target_inventory_sha256": null,
+    "schema_inventory_sha256": null,
+    "source_publish_order_sha256": null,
+    "resolved_features_by_lane": {
+      "all-features": null,
+      "both-backends": null,
+      "cass-compat": null,
+      "default": null,
+      "durable": null,
+      "full": null,
+      "full-fts5": null,
+      "hash": null,
+      "hybrid": null,
+      "lexical": null,
+      "lexical-bench": null,
+      "lexical-tantivy": null,
+      "no-default": null,
+      "persistent": null,
+      "quill": null,
+      "semantic": null
+    },
+    "dependency_packages_by_lane": {
+      "all-features": null,
+      "both-backends": null,
+      "cass-compat": null,
+      "default": null,
+      "durable": null,
+      "full": null,
+      "full-fts5": null,
+      "hash": null,
+      "hybrid": null,
+      "lexical": null,
+      "lexical-bench": null,
+      "lexical-tantivy": null,
+      "no-default": null,
+      "persistent": null,
+      "quill": null,
+      "semantic": null
+    },
+    "public_api_by_lane": {
+      "all-features": null,
+      "both-backends": null,
+      "cass-compat": null,
+      "default": null,
+      "durable": null,
+      "full": null,
+      "full-fts5": null,
+      "hash": null,
+      "hybrid": null,
+      "lexical": null,
+      "lexical-bench": null,
+      "lexical-tantivy": null,
+      "no-default": null,
+      "persistent": null,
+      "quill": null,
+      "semantic": null
+    }
+  }
+}

@@ -309,7 +309,9 @@ fn main() {
     println!("=== CLAIM CONVERSION: FSVI 4-bit two-pass vs third-party incumbent ===");
     println!("claim_under_test      = \"the fastest lossless vector-search primitive\"");
     println!("claim_sources         = CHANGELOG.md:66 ; docs/PERF_LEDGER.md:825,827");
-    println!("incumbent             = ndarray 0.17 / matrixmultiply 0.3 sgemm+sgemv (faiss IndexFlatIP shape)");
+    println!(
+        "incumbent             = ndarray 0.17 / matrixmultiply 0.3 sgemm+sgemv (faiss IndexFlatIP shape)"
+    );
     println!("host                  = {}", hostname());
     println!("cpu_model             = {}", cpu_model());
     println!("elf_sha256            = {}", elf_sha256());
@@ -401,9 +403,15 @@ fn main() {
         }
     }
     println!("\n--- LOSSLESSNESS (top-{K} doc-id set equality, {QUERIES} queries) ---");
-    println!("candidate == ours_exact_f16     : {agree_cand_vs_ours_exact}/{QUERIES}   <- the claim's own definition");
-    println!("candidate == incumbent_f32      : {agree_cand_vs_incumbent}/{QUERIES}   <- the world's definition");
-    println!("ours_exact_f16 == incumbent_f32 : {agree_ours_exact_vs_incumbent}/{QUERIES}   <- our f16 storage vs f32 truth");
+    println!(
+        "candidate == ours_exact_f16     : {agree_cand_vs_ours_exact}/{QUERIES}   <- the claim's own definition"
+    );
+    println!(
+        "candidate == incumbent_f32      : {agree_cand_vs_incumbent}/{QUERIES}   <- the world's definition"
+    );
+    println!(
+        "ours_exact_f16 == incumbent_f32 : {agree_ours_exact_vs_incumbent}/{QUERIES}   <- our f16 storage vs f32 truth"
+    );
 
     // ── Timed rounds, BRACKETED. ────────────────────────────────────────────
     // Runs 1 and 2 used a whole-round A/A (inc_a first, inc_b last) and the null

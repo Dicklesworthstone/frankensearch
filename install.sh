@@ -15,15 +15,16 @@
 #   --easy-mode        Auto-update PATH in shell rc files
 #   --verify           Run self-test after install
 #   --from-source      Build from source instead of downloading binary
-#   --lite             Build lite variant (no embedded models, ~15MB binary)
+#   --lite             Force the model-free source profile (~15MB binary)
 #   --quiet            Suppress non-error output
 #   --no-gum           Disable gum formatting even if available
 #
-# Lite build:
-#   The default build embeds ML models (~570MB) for zero-config semantic search.
-#   Use --lite (with --from-source) for a much smaller binary (~15MB) that loads
-#   models from ~/.local/share/frankensearch/models/ at runtime.
-#   Download models after install with: fsfs download-models
+# Build profiles:
+#   Full release artifacts embed ML models for zero-config semantic search.
+#   Cargo and source-build defaults compile Model2Vec + FastEmbed loaders but
+#   acquire the pinned model bytes separately with `fsfs download-models`.
+#   Use --lite to force the explicit model-free --no-default-features lane;
+#   downloaded files alone cannot add loaders to that stripped binary.
 #   Equivalent to: cargo build --release -p frankensearch-fsfs --no-default-features
 #
 set -euo pipefail
@@ -88,6 +89,166 @@ err() {
     echo -e "\033[0;31m✗\033[0m $*"
   fi
 }
+
+validate_sha256() {
+  local checksum="${1:-}"
+  [ "${#checksum}" -eq 64 ] || return 1
+  case "$checksum" in
+    *[![:xdigit:]]*) return 1 ;;
+  esac
+}
+
+checksum_from_manifest() {
+  local manifest="$1" artifact="$2"
+  [ -f "$manifest" ] || return 1
+  awk -v artifact="$artifact" '
+    length($1) == 64 && $1 ~ /^[[:xdigit:]]+$/ {
+      filename = $2
+      sub(/^\*/, "", filename)
+      if (filename == artifact) {
+        print tolower($1)
+        exit
+      }
+    }
+  ' "$manifest"
+}
+
+checksum_from_sidecar() {
+  local sidecar="$1"
+  [ -f "$sidecar" ] || return 1
+  awk '
+    length($1) == 64 && $1 ~ /^[[:xdigit:]]+$/ {
+      print tolower($1)
+      exit
+    }
+  ' "$sidecar"
+}
+
+verify_archive_checksum() {
+  local archive="$1" expected="$2" tool_mode="${3:-auto}" actual=""
+  local actual_normalized="" expected_normalized=""
+  if ! validate_sha256 "$expected"; then
+    err "Release checksum must be exactly 64 hexadecimal characters"
+    return 1
+  fi
+
+  case "$tool_mode" in
+    auto)
+      if command -v sha256sum >/dev/null 2>&1; then
+        actual=$(sha256sum -- "$archive" | awk '{print $1}')
+      elif command -v shasum >/dev/null 2>&1; then
+        actual=$(shasum -a 256 -- "$archive" | awk '{print $1}')
+      else
+        err "No SHA-256 verifier found (need sha256sum or shasum); refusing to install an unverified artifact"
+        return 1
+      fi
+      ;;
+    none)
+      # Used only by the non-networked contract test entrypoint below.
+      err "No SHA-256 verifier found (need sha256sum or shasum); refusing to install an unverified artifact"
+      return 1
+      ;;
+    *)
+      err "Unknown checksum tool mode: $tool_mode"
+      return 1
+      ;;
+  esac
+
+  actual_normalized=$(printf '%s' "$actual" | tr '[:upper:]' '[:lower:]')
+  expected_normalized=$(printf '%s' "$expected" | tr '[:upper:]' '[:lower:]')
+  if ! validate_sha256 "$actual" || [ "$actual_normalized" != "$expected_normalized" ]; then
+    err "Checksum mismatch for $(basename "$archive")"
+    return 1
+  fi
+}
+
+install_route() {
+  local explicit_lite="$1" full_artifact_available="$2" target="${3:-}"
+  if [ "$explicit_lite" -eq 1 ]; then
+    printf '%s\n' "source-lite"
+  elif [ "$target" = "x86_64-apple-darwin" ]; then
+    printf '%s\n' "unsupported-semantic"
+  elif [ "$full_artifact_available" -eq 1 ]; then
+    printf '%s\n' "artifact-full"
+  else
+    printf '%s\n' "source-default"
+  fi
+}
+
+fail_unsupported_semantic_platform() {
+  local target="$1"
+  err "unsupported_platform: the ordinary semantic fsfs profile is not available for ${target}"
+  err "The pinned ONNX Runtime distribution has no Intel macOS binary, so a default source fallback would fail."
+  err "Use install.sh --lite for an explicit model-free build, or install the semantic profile on Apple Silicon or Linux."
+  return 78
+}
+
+install_binary() {
+  local source_binary="$1" destination_binary="$2"
+  if [ "$SYSTEM" -eq 1 ]; then
+    sudo install -m 0755 "$source_binary" "$destination_binary"
+  else
+    install -m 0755 "$source_binary" "$destination_binary"
+  fi
+}
+
+run_installer_contract_test() {
+  local action="${1:-}"
+  case "$action" in
+    checksum)
+      [ "$#" -ge 3 ] || { err "contract checksum requires ARCHIVE EXPECTED [TOOL_MODE]"; return 2; }
+      verify_archive_checksum "$2" "$3" "${4:-auto}"
+      ;;
+    manifest)
+      [ "$#" -eq 3 ] || { err "contract manifest requires MANIFEST ARTIFACT"; return 2; }
+      local resolved
+      resolved=$(checksum_from_manifest "$2" "$3")
+      validate_sha256 "$resolved" || {
+        err "Checksum for $3 is absent from the release manifest"
+        return 1
+      }
+      printf '%s\n' "$resolved"
+      ;;
+    sidecar)
+      [ "$#" -eq 2 ] || { err "contract sidecar requires SIDECAR"; return 2; }
+      local resolved
+      resolved=$(checksum_from_sidecar "$2")
+      validate_sha256 "$resolved" || {
+        err "Checksum sidecar is absent or malformed: $2"
+        return 1
+      }
+      printf '%s\n' "$resolved"
+      ;;
+    route)
+      [ "$#" -eq 3 ] || [ "$#" -eq 4 ] || {
+        err "contract route requires EXPLICIT_LITE FULL_ARTIFACT_AVAILABLE [TARGET]"
+        return 2
+      }
+      install_route "$2" "$3" "${4:-}"
+      ;;
+    unsupported)
+      [ "$#" -eq 2 ] || { err "contract unsupported requires TARGET"; return 2; }
+      fail_unsupported_semantic_platform "$2"
+      ;;
+    install-built)
+      [ "$#" -eq 3 ] || { err "contract install-built requires SOURCE DESTINATION"; return 2; }
+      SYSTEM=0
+      install_binary "$2" "$3"
+      ;;
+    *)
+      err "Unknown installer contract test: $action"
+      return 2
+      ;;
+  esac
+}
+
+# This non-networked test seam exercises the same routing and checksum
+# functions as production without acquiring the installer lock or writing to
+# the destination. It is intentionally unavailable unless the checker opts in.
+if [ "${FSFS_INSTALL_CONTRACT_TEST:-0}" = "1" ]; then
+  run_installer_contract_test "$@"
+  exit $?
+fi
 
 run_with_spinner() {
   local title="$1"
@@ -177,7 +338,8 @@ ensure_rust() {
 usage() {
   cat <<EOFU
 Usage: install.sh [--version vX.Y.Z] [--dest DIR] [--system] [--easy-mode] [--verify] \\
-                  [--artifact-url URL] [--checksum HEX] [--checksum-url URL] [--quiet] [--no-gum]
+                  [--artifact-url URL] [--checksum HEX] [--checksum-url URL] \\
+                  [--from-source] [--lite] [--quiet] [--no-gum]
 
 Options:
   --version vX.Y.Z   Install specific version (default: latest)
@@ -186,8 +348,8 @@ Options:
   --easy-mode        Auto-update PATH in shell rc files
   --verify           Run self-test after install
   --from-source      Build from source instead of downloading binary
-  --lite             Build lite variant without embedded models (~15MB vs ~570MB)
-                     Implies --from-source. Run 'fsfs download-models' after install.
+  --lite             Force the model-free source profile (~15MB).
+                     Implies --from-source; the Cargo default is loader-capable.
   --quiet            Suppress non-error output
   --no-gum           Disable gum formatting even if available
 EOFU
@@ -232,9 +394,6 @@ if [ "$QUIET" -eq 0 ]; then
   fi
 fi
 
-resolve_version
-
-mkdir -p "$DEST"
 OS=$(uname -s | tr '[:upper:]' '[:lower:]')
 ARCH=$(uname -m)
 case "$ARCH" in
@@ -253,9 +412,19 @@ case "${OS}-${ARCH}" in
   *) :;;
 esac
 
+if [ "$LITE" -eq 0 ] && [ "$TARGET" = "x86_64-apple-darwin" ]; then
+  fail_unsupported_semantic_platform "$TARGET"
+  exit $?
+fi
+
+# Version lookup may use the network. Unsupported ordinary profiles are
+# rejected above before any release lookup, artifact probe, or filesystem
+# installation mutation. Intel macOS remains available only through --lite.
+resolve_version
+mkdir -p "$DEST"
+
 # Build artifact filename and download URL.
 # dsr artifact naming: fsfs-${version_bare}-${target_triple}.${ext}
-# Also try versionless: fsfs-${target_triple}.${ext}
 VERSION_BARE="${VERSION#v}"  # strip leading v for artifact naming
 TAR=""
 URL=""
@@ -356,30 +525,21 @@ download_with_progress() {
 
 if [ "$FROM_SOURCE" -eq 0 ]; then
   if ! download_with_progress "$URL" "$TMP/$TAR" "Downloading ${BINARY_NAME} ${VERSION}"; then
-    # Try versionless artifact name as fallback
-    FALLBACK_TAR="${BINARY_NAME}-${TARGET}.${EXT}"
-    FALLBACK_URL="https://github.com/${OWNER}/${REPO}/releases/download/${VERSION}/${FALLBACK_TAR}"
-    warn "Primary download failed; trying fallback artifact..."
-    if ! download_with_progress "$FALLBACK_URL" "$TMP/$FALLBACK_TAR" "Downloading fallback artifact"; then
-      # Full Linux artifacts are large and may not be published for every
-      # release. Prefer a published lite binary before falling back to a slow
-      # source build that has to download and embed hundreds of MB of models.
-      LITE_TAR="fsfs-lite-${VERSION_BARE}-${TARGET}.${EXT}"
-      LITE_URL="https://github.com/${OWNER}/${REPO}/releases/download/${VERSION}/${LITE_TAR}"
-      warn "Fallback artifact failed; trying lite release artifact..."
-      if [ -n "$TARGET" ] && download_with_progress "$LITE_URL" "$TMP/$LITE_TAR" "Downloading lite artifact"; then
-        TAR="$LITE_TAR"
-        URL="$LITE_URL"
-        LITE=1
-        warn "Installed lite artifact; run 'fsfs download-models' later for semantic models"
-      else
-        warn "Artifact download failed; falling back to build-from-source"
+    ROUTE=$(install_route "$LITE" 0 "$TARGET")
+    case "$ROUTE" in
+      source-default)
+        warn "Full artifact download failed; building the loader-capable default from source"
         FROM_SOURCE=1
-      fi
-    else
-      TAR="$FALLBACK_TAR"
-      URL="$FALLBACK_URL"
-    fi
+        ;;
+      unsupported-semantic)
+        fail_unsupported_semantic_platform "$TARGET"
+        exit $?
+        ;;
+      *)
+        err "Internal installer routing error: expected source-default or unsupported-semantic, got $ROUTE"
+        exit 1
+        ;;
+    esac
   fi
 fi
 
@@ -403,9 +563,10 @@ if [ "$FROM_SOURCE" -eq 1 ]; then
   # successful compile followed by a spurious "Build failed" because the
   # binary lands in an unexpected location.
   if [ "$LITE" -eq 1 ]; then
-    info "Building lite variant (no embedded models)"
+    info "Building lite variant (semantic model loaders disabled)"
     (cd "$TMP/src" && unset CARGO_TARGET_DIR CARGO_BUILD_TARGET_DIR CARGO_BUILD_TARGET && cargo build --release -p frankensearch-fsfs --no-default-features)
   else
+    info "Building default semantic-loader variant (model bytes acquired separately)"
     (cd "$TMP/src" && unset CARGO_TARGET_DIR CARGO_BUILD_TARGET_DIR CARGO_BUILD_TARGET && cargo build --release -p frankensearch-fsfs)
   fi
   BIN="$TMP/src/target/release/${BINARY_NAME}"
@@ -422,11 +583,7 @@ if [ "$FROM_SOURCE" -eq 1 ]; then
       exit 1
     fi
   fi
-  if [ "$SYSTEM" -eq 1 ]; then
-    sudo install -m 0755 "$BIN" "$DEST/${BINARY_NAME}"
-  else
-    install -m 0755 "$BIN" "$DEST/${BINARY_NAME}"
-  fi
+  install_binary "$BIN" "$DEST/${BINARY_NAME}"
   ok "Installed to $DEST/${BINARY_NAME} (source build)"
   maybe_add_path
   if [ "$VERIFY" -eq 1 ]; then
@@ -437,8 +594,16 @@ if [ "$FROM_SOURCE" -eq 1 ]; then
     ok "Self-test complete: $SELF_TEST_OUTPUT"
   fi
   if [ "$LITE" -eq 1 ]; then
-    info "Lite build: no ML models embedded. Download them with:"
-    info "  ${BINARY_NAME} download-models"
+    info "Model-free build: Model2Vec and FastEmbed execution are not compiled."
+    info "Install the standard build for semantic retrieval; downloaded files alone cannot activate this lite binary."
+  else
+    info "Semantic loaders installed. Provision and verify the registered models with:"
+    info "  ${BINARY_NAME} download-models potion-multilingual-128m"
+    info "  ${BINARY_NAME} download-models all-minilm-l6-v2"
+    info "  ${BINARY_NAME} download-models potion-multilingual-128m --verify"
+    info "  ${BINARY_NAME} download-models all-minilm-l6-v2 --verify"
+    info "  ${BINARY_NAME} index /path/to/files"
+    info "  ${BINARY_NAME} search \"your query\""
   fi
   ok "Done. Binary at: $DEST/${BINARY_NAME}"
   exit 0
@@ -454,35 +619,23 @@ if [ -z "$CHECKSUM" ]; then
   info "Fetching checksum from ${CHECKSUM_URL}"
   CHECKSUM_FILE="$TMP/SHA256SUMS"
   if curl -fsSL --connect-timeout 30 --max-time 60 "$CHECKSUM_URL" -o "$CHECKSUM_FILE"; then
-    CHECKSUM=$(grep "  ${TAR}\$" "$CHECKSUM_FILE" 2>/dev/null | awk '{print $1}')
-    if [ -z "$CHECKSUM" ]; then
-      CHECKSUM=$(grep " ${TAR}\$" "$CHECKSUM_FILE" 2>/dev/null | awk '{print $1}')
-    fi
+    CHECKSUM=$(checksum_from_manifest "$CHECKSUM_FILE" "$TAR" || true)
   fi
   if [ -z "$CHECKSUM" ] && [ "$CHECKSUM_URL_DEFAULTED" -eq 1 ]; then
     SIDECAR_CHECKSUM_URL="${URL}.sha256"
     info "Fetching checksum sidecar from ${SIDECAR_CHECKSUM_URL}"
     if curl -fsSL --connect-timeout 30 --max-time 60 "$SIDECAR_CHECKSUM_URL" -o "$CHECKSUM_FILE"; then
-      CHECKSUM=$(awk 'NF >= 1 && $1 ~ /^[0-9a-fA-F]{64}$/ { print $1; exit }' "$CHECKSUM_FILE")
+      CHECKSUM=$(checksum_from_sidecar "$CHECKSUM_FILE" || true)
     fi
   fi
   if [ -z "$CHECKSUM" ]; then
-    warn "Checksum for ${TAR} not found; skipping verification"
-    CHECKSUM="SKIP"
+    err "Checksum for ${TAR} is unavailable; refusing to install an unverified artifact"
+    exit 1
   fi
 fi
 
-if [ "$CHECKSUM" != "SKIP" ]; then
-  if command -v sha256sum >/dev/null 2>&1; then
-    echo "$CHECKSUM  $TMP/$TAR" | sha256sum -c - || { err "Checksum mismatch"; exit 1; }
-    ok "Checksum verified"
-  elif command -v shasum >/dev/null 2>&1; then
-    echo "$CHECKSUM  $TMP/$TAR" | shasum -a 256 -c - || { err "Checksum mismatch"; exit 1; }
-    ok "Checksum verified"
-  else
-    warn "No sha256sum or shasum found; skipping checksum verification"
-  fi
-fi
+verify_archive_checksum "$TMP/$TAR" "$CHECKSUM" || exit 1
+ok "Checksum verified"
 
 # Extract
 info "Extracting"
@@ -500,11 +653,7 @@ if [ ! -x "$BIN" ]; then
 fi
 [ -x "$BIN" ] || { err "Binary not found in archive"; exit 1; }
 
-if [ "$SYSTEM" -eq 1 ]; then
-  sudo install -m 0755 "$BIN" "$DEST/${BINARY_NAME}"
-else
-  install -m 0755 "$BIN" "$DEST/${BINARY_NAME}"
-fi
+install_binary "$BIN" "$DEST/${BINARY_NAME}"
 ok "Installed to $DEST/${BINARY_NAME}"
 maybe_add_path
 
@@ -529,6 +678,10 @@ if [ "$HAS_GUM" -eq 1 ] && [ "$NO_GUM" -eq 0 ]; then
     "$(gum style --foreground 245 "Version: $(gum style --bold "${VERSION}")")" \
     "" \
     "$(gum style --foreground 39 --bold 'Quick start:')" \
+    "$(gum style --foreground 245 '  fsfs download-models potion-multilingual-128m')" \
+    "$(gum style --foreground 245 '  fsfs download-models all-minilm-l6-v2')" \
+    "$(gum style --foreground 245 '  fsfs download-models potion-multilingual-128m --verify')" \
+    "$(gum style --foreground 245 '  fsfs download-models all-minilm-l6-v2 --verify')" \
     "$(gum style --foreground 245 '  fsfs index /path/to/files   Index a directory')" \
     "$(gum style --foreground 245 '  fsfs search "your query"    Search your index')" \
     "$(gum style --foreground 245 '  fsfs                        Interactive TUI')"
@@ -549,6 +702,10 @@ else
   echo -e "  \033[1;32m│\033[0m  Version: \033[1m${VERSION}\033[0m$(printf '%*s' "$VPAD" '')\033[1;32m│\033[0m"
   echo -e "  \033[1;32m│\033[0m                                         \033[1;32m│\033[0m"
   echo -e "  \033[1;32m│\033[0m  \033[1;36mQuick start:\033[0m                          \033[1;32m│\033[0m"
+  echo -e "  \033[1;32m│\033[0m  \033[0;90m$ fsfs download-models potion-multilingual-128m\033[0m"
+  echo -e "  \033[1;32m│\033[0m  \033[0;90m$ fsfs download-models all-minilm-l6-v2\033[0m"
+  echo -e "  \033[1;32m│\033[0m  \033[0;90m$ fsfs download-models potion-multilingual-128m --verify\033[0m"
+  echo -e "  \033[1;32m│\033[0m  \033[0;90m$ fsfs download-models all-minilm-l6-v2 --verify\033[0m"
   echo -e "  \033[1;32m│\033[0m  \033[0;90m$ fsfs index /path/to/files\033[0m           \033[1;32m│\033[0m"
   echo -e "  \033[1;32m│\033[0m  \033[0;90m$ fsfs search \"your query\"\033[0m            \033[1;32m│\033[0m"
   echo -e "  \033[1;32m│\033[0m  \033[0;90m$ fsfs\033[0m  \033[2m(interactive TUI)\033[0m          \033[1;32m│\033[0m"

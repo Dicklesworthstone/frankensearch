@@ -1,0 +1,53 @@
+{
+  "schema_version": "quill-perf-ratchet-v3",
+  "gate": "Qg2",
+  "mode": "promotion",
+  "gate_activated": false,
+  "decision": "quarantine",
+  "reasons": [
+    {
+      "code": "perf.ratchet.current_evidence_not_admissible",
+      "message": "candidate current evidence has gate status invalid_null and cannot update history"
+    },
+    {
+      "code": "perf.ratchet.bootstrap_promotion",
+      "message": "an otherwise-Allow promotion will establish the first measured baseline"
+    },
+    {
+      "code": "perf.ratchet.missing_rerun",
+      "message": "promotion requires a second measurement from the same revision and machine"
+    },
+    {
+      "code": "perf.ratchet.bootstrap_target_missed",
+      "message": "QG-2 single-thread median-ratio CI [0.328160, 0.359203] does not clear 1.5"
+    },
+    {
+      "code": "perf.ratchet.gate_inactive",
+      "message": "QG-2 remains provisional because the normative manifest has activated=false"
+    }
+  ],
+  "comparisons": [],
+  "evidence": [
+    {
+      "role": "manifest",
+      "path": "docs/contracts/quill-perf-gates.toml",
+      "sha256": "68be56bd481ae44433b42b2310fa97352b08483a1f619366be549c20b07ae851"
+    },
+    {
+      "role": "baseline",
+      "path": ".bench-history/QG-2.unmeasured.latest.json",
+      "sha256": "dea65ca784bff9ef47bf2aa2f3bcd511458516a0160a91ab5558081a80c9a85b"
+    },
+    {
+      "role": "candidate",
+      "path": ".bench-history/attempts/2026-07-28/QG-2/qg2-candidate-trj-b083-quiet-20260728T1927Z/QG-2.json",
+      "sha256": "ab98a9a2063e150c563bf7fa97f74e3a5bab0ef6266e7854d23e6981d60f80fd"
+    },
+    {
+      "role": "candidate_current",
+      "path": ".bench-history/attempts/2026-07-28/QG-2/qg2-candidate-trj-b083-quiet-20260728T1927Z/QG-2.evidence.json",
+      "sha256": "b754d0bfc79a1a60ad4ef966aeacf35e23d595b201c4721a2a1c9e710d09dbc5"
+    }
+  ],
+  "history_updates": []
+}

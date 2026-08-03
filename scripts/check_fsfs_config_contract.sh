@@ -45,15 +45,41 @@ if [[ ! -f "$SCHEMA" ]]; then
   exit 2
 fi
 
-if ! command -v jsonschema >/dev/null 2>&1; then
-  echo "ERROR: jsonschema CLI not found in PATH" >&2
+# jsonschema tool resolution: the standalone `jsonschema` CLI was removed in
+# python-jsonschema 4.x, so modern runners ship only the module. Accept either.
+if command -v jsonschema >/dev/null 2>&1; then
+  JSONSCHEMA_MODE="cli"
+elif python3 -c 'import jsonschema' >/dev/null 2>&1; then
+  JSONSCHEMA_MODE="module"
+else
+  echo "ERROR: no jsonschema validator found: install the python3 jsonschema module (python3 -m pip install jsonschema)" >&2
   exit 2
 fi
+
+jsonschema_validate() {
+  local file="$1"
+  if [[ "${JSONSCHEMA_MODE}" == "cli" ]]; then
+    jsonschema -i "$file" "$SCHEMA" >/dev/null 2>&1
+  else
+    python3 - "$file" "$SCHEMA" >/dev/null 2>&1 <<'PY'
+import json
+import sys
+
+import jsonschema
+
+with open(sys.argv[1], encoding="utf-8") as handle:
+    instance = json.load(handle)
+with open(sys.argv[2], encoding="utf-8") as handle:
+    schema = json.load(handle)
+jsonschema.validate(instance, schema)
+PY
+  fi
+}
 
 check_valid() {
   local scope="$1"
   local file="$2"
-  if jsonschema -i "$file" "$SCHEMA" >/dev/null 2>&1; then
+  if jsonschema_validate "$file"; then
     echo "[$scope][OK]   valid fixture accepted: $file"
   else
     echo "[$scope][FAIL] valid fixture rejected: $file"
@@ -64,7 +90,7 @@ check_valid() {
 check_invalid() {
   local scope="$1"
   local file="$2"
-  if jsonschema -i "$file" "$SCHEMA" >/dev/null 2>&1; then
+  if jsonschema_validate "$file"; then
     echo "[$scope][FAIL] invalid fixture unexpectedly accepted: $file"
     FAILURES=$((FAILURES + 1))
   else

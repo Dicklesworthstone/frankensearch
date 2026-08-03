@@ -61,8 +61,14 @@ pub use conformal::{
     AdaptiveConformalState, AdaptiveConformalUpdate, ConformalSearchCalibration,
     MondrianConformalCalibration,
 };
-pub use daemon_fallback::{DaemonFallbackEmbedder, DaemonFallbackReranker, NoopDaemonClient};
-pub use federated::{FederatedConfig, FederatedFusion, FederatedHit, FederatedSearcher};
+pub use daemon_fallback::{
+    AssumedDaemonClient, AssumedDaemonEmbeddingBatchV1, DaemonFallbackEmbedder,
+    DaemonFallbackReranker, DaemonTrustLevelV1, NoopDaemonClient, PinnedDaemonVerifierV1,
+};
+pub use federated::{
+    FederatedConfig, FederatedCoverage, FederatedFusion, FederatedHit, FederatedResponse,
+    FederatedSearcher, FederatedShardError,
+};
 pub use feedback::{FeedbackCollector, FeedbackConfig, FeedbackSignal, SignalWeights};
 #[cfg(feature = "graph")]
 pub use graph_rank::GraphRanker;

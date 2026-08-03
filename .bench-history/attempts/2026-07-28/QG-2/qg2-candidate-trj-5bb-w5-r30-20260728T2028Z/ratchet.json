@@ -1,0 +1,76 @@
+{
+  "schema_version": "quill-perf-ratchet-v3",
+  "gate": "Qg2",
+  "mode": "promotion",
+  "gate_activated": true,
+  "decision": "allow",
+  "reasons": [
+    {
+      "code": "perf.ratchet.bootstrap_promotion",
+      "message": "an otherwise-Allow promotion will establish the first measured baseline"
+    },
+    {
+      "code": "perf.ratchet.bootstrap_target_missed",
+      "message": "QG-2 single-thread median-ratio CI [0.341425, 0.351114] does not clear 1.5"
+    },
+    {
+      "code": "perf.ratchet.bootstrap_target_missed",
+      "message": "QG-2 single-thread median-ratio CI [0.344699, 0.356242] does not clear 1.5"
+    }
+  ],
+  "comparisons": [],
+  "evidence": [
+    {
+      "role": "manifest",
+      "path": "docs/contracts/quill-perf-gates.toml",
+      "sha256": "0a0ea67ee8a613bf91a8966219eedc6248c9d8544e9379b6c71199fbe62f6d04"
+    },
+    {
+      "role": "baseline",
+      "path": ".bench-history/QG-2.unmeasured.latest.json",
+      "sha256": "dea65ca784bff9ef47bf2aa2f3bcd511458516a0160a91ab5558081a80c9a85b"
+    },
+    {
+      "role": "candidate",
+      "path": ".bench-history/attempts/2026-07-28/QG-2/qg2-candidate-trj-5bb-w5-r30-20260728T2028Z/QG-2.json",
+      "sha256": "256c4a113ec472303811ae0691b4d2aca9cf30f3a956a97456db62c20f586158"
+    },
+    {
+      "role": "rerun",
+      "path": ".bench-history/attempts/2026-07-28/QG-2/qg2-rerun-trj-5bb-w5-r30-20260728T2032Z/QG-2.json",
+      "sha256": "b5c26b8fb77620fb60b50ad28f3b1012aff04f84c6a4b7675cd56fb384b9d505"
+    },
+    {
+      "role": "candidate_current",
+      "path": ".bench-history/attempts/2026-07-28/QG-2/qg2-candidate-trj-5bb-w5-r30-20260728T2028Z/QG-2.evidence.json",
+      "sha256": "6936ae195a7b939083a9f5fc9b81db1ee306619182ba8820a0c99a7fb32ae0d1"
+    },
+    {
+      "role": "rerun_current",
+      "path": ".bench-history/attempts/2026-07-28/QG-2/qg2-rerun-trj-5bb-w5-r30-20260728T2032Z/QG-2.evidence.json",
+      "sha256": "876f20b8be76eaec69b34d9fb97bfd5da85e84462c5d8f0a1080f1173ad09ffb"
+    }
+  ],
+  "history_updates": [
+    {
+      "role": "history_window",
+      "path": ".bench-history/QG-2.trj-zen3-16c.2026-07-28.json",
+      "sha256": "256c4a113ec472303811ae0691b4d2aca9cf30f3a956a97456db62c20f586158"
+    },
+    {
+      "role": "history_evidence_window",
+      "path": ".bench-history/QG-2.trj-zen3-16c.2026-07-28.evidence.json",
+      "sha256": "6936ae195a7b939083a9f5fc9b81db1ee306619182ba8820a0c99a7fb32ae0d1"
+    },
+    {
+      "role": "history_evidence_latest",
+      "path": ".bench-history/QG-2.trj-zen3-16c.latest.evidence.json",
+      "sha256": "6936ae195a7b939083a9f5fc9b81db1ee306619182ba8820a0c99a7fb32ae0d1"
+    },
+    {
+      "role": "history_latest",
+      "path": ".bench-history/QG-2.trj-zen3-16c.latest.json",
+      "sha256": "256c4a113ec472303811ae0691b4d2aca9cf30f3a956a97456db62c20f586158"
+    }
+  ]
+}

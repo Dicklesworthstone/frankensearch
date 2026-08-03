@@ -55,7 +55,23 @@
       "measured_bytes": 8388608,
       "projected_savings_bytes": 0,
       "replay_command": "FSFS_INDEX_FOOTPRINT_FIXTURE=small FSFS_INDEX_FOOTPRINT_DOMAIN=vector_index cargo test -p frankensearch-fsfs index_footprint_advisor_policy_suite -- --nocapture",
-      "operator_command": "fsfs doctor --retention-audit --dry-run --format json",
+      "operator_command": {
+        "schema_version": 1,
+        "command": "fsfs",
+        "arguments": [
+          "status",
+          "--format",
+          "json"
+        ],
+        "preconditions": [
+          "review_diagnostic_output",
+          "select_supported_mutation_workflow"
+        ],
+        "mutation_class": "read_only_diagnostic",
+        "dry_run_support": "unavailable",
+        "confirmation_required": false,
+        "guidance": "Retention preview is not supported; run read-only diagnostics for vector_index and review policy guidance before selecting any mutation workflow."
+      },
       "rationale": "small: retain current files and only audit policy for vector_index"
     },
     {
@@ -66,7 +82,23 @@
       "measured_bytes": 6291456,
       "projected_savings_bytes": 0,
       "replay_command": "FSFS_INDEX_FOOTPRINT_FIXTURE=small FSFS_INDEX_FOOTPRINT_DOMAIN=lexical_index cargo test -p frankensearch-fsfs index_footprint_advisor_policy_suite -- --nocapture",
-      "operator_command": "fsfs doctor --retention-audit --dry-run --format json",
+      "operator_command": {
+        "schema_version": 1,
+        "command": "fsfs",
+        "arguments": [
+          "status",
+          "--format",
+          "json"
+        ],
+        "preconditions": [
+          "review_diagnostic_output",
+          "select_supported_mutation_workflow"
+        ],
+        "mutation_class": "read_only_diagnostic",
+        "dry_run_support": "unavailable",
+        "confirmation_required": false,
+        "guidance": "Retention preview is not supported; run read-only diagnostics for lexical_index and review policy guidance before selecting any mutation workflow."
+      },
       "rationale": "small: retain current files and only audit policy for lexical_index"
     },
     {
@@ -77,7 +109,23 @@
       "measured_bytes": 2097152,
       "projected_savings_bytes": 0,
       "replay_command": "FSFS_INDEX_FOOTPRINT_FIXTURE=small FSFS_INDEX_FOOTPRINT_DOMAIN=metadata cargo test -p frankensearch-fsfs index_footprint_advisor_policy_suite -- --nocapture",
-      "operator_command": "fsfs doctor --retention-audit --dry-run --format json",
+      "operator_command": {
+        "schema_version": 1,
+        "command": "fsfs",
+        "arguments": [
+          "status",
+          "--format",
+          "json"
+        ],
+        "preconditions": [
+          "review_diagnostic_output",
+          "select_supported_mutation_workflow"
+        ],
+        "mutation_class": "read_only_diagnostic",
+        "dry_run_support": "unavailable",
+        "confirmation_required": false,
+        "guidance": "Retention preview is not supported; run read-only diagnostics for metadata and review policy guidance before selecting any mutation workflow."
+      },
       "rationale": "small: retain current files and only audit policy for metadata"
     },
     {
@@ -88,7 +136,23 @@
       "measured_bytes": 18874368,
       "projected_savings_bytes": 0,
       "replay_command": "FSFS_INDEX_FOOTPRINT_FIXTURE=small FSFS_INDEX_FOOTPRINT_DOMAIN=model_cache cargo test -p frankensearch-fsfs index_footprint_advisor_policy_suite -- --nocapture",
-      "operator_command": "fsfs doctor --retention-audit --dry-run --format json",
+      "operator_command": {
+        "schema_version": 1,
+        "command": "fsfs",
+        "arguments": [
+          "status",
+          "--format",
+          "json"
+        ],
+        "preconditions": [
+          "review_diagnostic_output",
+          "select_supported_mutation_workflow"
+        ],
+        "mutation_class": "read_only_diagnostic",
+        "dry_run_support": "unavailable",
+        "confirmation_required": false,
+        "guidance": "Retention preview is not supported; run read-only diagnostics for model_cache and review policy guidance before selecting any mutation workflow."
+      },
       "rationale": "small: retain current files and only audit policy for model_cache"
     },
     {
@@ -99,7 +163,23 @@
       "measured_bytes": 1048576,
       "projected_savings_bytes": 0,
       "replay_command": "FSFS_INDEX_FOOTPRINT_FIXTURE=small FSFS_INDEX_FOOTPRINT_DOMAIN=artifact cargo test -p frankensearch-fsfs index_footprint_advisor_policy_suite -- --nocapture",
-      "operator_command": "fsfs doctor --retention-audit --dry-run --format json",
+      "operator_command": {
+        "schema_version": 1,
+        "command": "fsfs",
+        "arguments": [
+          "status",
+          "--format",
+          "json"
+        ],
+        "preconditions": [
+          "review_diagnostic_output",
+          "select_supported_mutation_workflow"
+        ],
+        "mutation_class": "read_only_diagnostic",
+        "dry_run_support": "unavailable",
+        "confirmation_required": false,
+        "guidance": "Retention preview is not supported; run read-only diagnostics for artifact and review policy guidance before selecting any mutation workflow."
+      },
       "rationale": "small: retain current files and only audit policy for artifact"
     }
   ],

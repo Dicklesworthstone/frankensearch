@@ -17,7 +17,7 @@
   "manifest": {
     "v": 1,
     "schema": "e2e-manifest-v1",
-    "run_id": "01JABCDEF00000000000000000",
+    "run_id": "01JABCD3EFGHJKMNPQRSTVWXYZ",
     "ts": "2026-02-14T00:00:00Z",
     "body": {
       "suite": "fsfs",
@@ -45,7 +45,7 @@
       "artifacts": [
         {
           "file": "artifacts_index.json",
-          "checksum": "sha256:9c9562cc84c2bc809efe9ae9c5529498ab0f7340ad2ad24995040c20c08f0dc2"
+          "checksum": "sha256:c1c4a2539f26506733e66002d3d62cfac3a4283a74ac173b41d8a26c220465df"
         },
         {
           "file": "env.json",
@@ -53,11 +53,11 @@
         },
         {
           "file": "replay_command.txt",
-          "checksum": "sha256:a82c2406418711bbb0a61d9b0837e67c1fdd31e8edea08c599ec3d19a9e86931"
+          "checksum": "sha256:cef728639237f3ee3206868fd9affb4ebb583c1d422c7c5f506543cf08a259b5"
         },
         {
           "file": "repro.lock",
-          "checksum": "sha256:cfe1afcd8d0fac7a3abeea38c5422b5606718ad84ffe0cb9853432dd51443891"
+          "checksum": "sha256:1f385100021f9c8fd22d4c691c2d829ab44f684f8836adb6d2362c9173986ee2"
         },
         {
           "file": "structured_events.jsonl",
@@ -188,5 +188,5 @@
       }
     }
   ],
-  "replay_command": "frankensearch --seed 42 search rust async cancellation --stream --format jsonl"
+  "replay_command": "cargo test -p frankensearch-fsfs --features embedded-models --test cli_e2e_contract -- --nocapture --exact scenario_cli_search_stream"
 }

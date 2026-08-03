@@ -4,8 +4,8 @@
   "fixtures": [
     {
       "id": "Q1-OB1",
-      "status": "deferred",
-      "enforcement": "G1a runs the manifest-overlap sub-fixture and E3.5 runs the live merge-bound-consecutive sub-fixture; the full crash matrix remains owned by e3.9",
+      "status": "executable",
+      "enforcement": "Gauntlet run_q1_live_fixtures executes manifest-overlap and live merge-bound-consecutive rejection; Quill scribe r1_batch_crossing_lease_boundary_cuts_into_fresh_lease and index delta_seal_transaction_has_no_gap_and_never_crosses_a_lease enforce single-lease seals; Keeper deterministic_publish_crash_states_recover_read_only_and_gc_exactly covers crash recovery",
       "assertion": "covering intervals do not overlap, merge inputs are bound-consecutive, and every seal stays within one lease"
     },
     {
@@ -34,20 +34,20 @@
     },
     {
       "id": "Q1-OB4",
-      "status": "deferred",
-      "enforcement": "owned by e3.6 compaction fixture",
+      "status": "executable",
+      "enforcement": "Quill index compaction_preserves_q1_docids_and_live_query_identity and durable_compaction_crash_boundary_keeps_old_manifest_authoritative cover live identity and publication safety; compaction_ab executes byte-identical sparse-docid rebuild parity at exactly 5, 20, and 50 percent tombstones",
       "assertion": "compaction preserves surviving document IDs and query behavior at 5, 20, and 50 percent tombstones"
     },
     {
       "id": "Q1-OB5",
-      "status": "deferred",
-      "enforcement": "G1a runs the allocator-boundary sub-fixture; real scalar-flush and delta-seal segment cuts remain owned by e5.4",
+      "status": "executable",
+      "enforcement": "Gauntlet run_q1_live_fixtures executes allocator-boundary checks; Quill scribe lease_disjointness_under_concurrent_sessions_property, r1_batch_crossing_lease_boundary_cuts_into_fresh_lease, and burn_on_end_accounting_and_burned_tail_never_reused cover allocation; index delta_seal_transaction_has_no_gap_and_never_crosses_a_lease covers the live delta-seal path",
       "assertion": "concurrent leases remain disjoint, unused IDs burn on end, and lease exhaustion cuts a segment"
     },
     {
       "id": "Q1-OB6",
-      "status": "deferred",
-      "enforcement": "owned by e3.7 multi-shard property test",
+      "status": "executable",
+      "enforcement": "Quill keeper interleaved_multi_shard_random_merge_schedule_preserves_q1_intervals exercises randomized policy merges; index production_writer_routes_batches_across_resolved_shards_with_disjoint_leases and commit_applies_tier_policy_to_cross_shard_bound_consecutive_run cover the production multi-shard writer",
       "assertion": "interleaved multi-shard ingest and random policy merges preserve pairwise-disjoint intervals"
     }
   ],
