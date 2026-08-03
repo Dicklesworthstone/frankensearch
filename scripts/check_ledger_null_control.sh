@@ -266,7 +266,13 @@ blob_stream() {
         fi
       fi
       ;;
-    since|all)
+    since)
+      # --since describes the committed range merge-base(ref, HEAD)..HEAD.
+      # Its hunk line numbers must be read against the matching HEAD blob, not
+      # a mutable worktree that may have inserted lines before those hunks.
+      git -C "${ROOT_DIR}" show "HEAD:${rel}"
+      ;;
+    all)
       command cat "${abs}"
       ;;
     selfcheck)
