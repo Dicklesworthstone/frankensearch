@@ -6510,6 +6510,63 @@ mod tests {
     }
 
     #[test]
+    fn f32_owner_search_and_row_metadata_match_normal_reader_with_tombstones() {
+        let path = temp_index_path("v2-f32-owner-reader-parity");
+        let binding = fsvi_v2_binding("v2-f32-owner-reader-parity", 4, Quantization::F32, 24, 0x84);
+        let mut writer = VectorIndex::create_v2(&path, binding.clone()).expect("F32 parity writer");
+        writer
+            .write_tombstone_record("tombstone-best", &[1.0, 0.0, 0.0, 0.0])
+            .expect("tombstone row");
+        writer
+            .write_record("alpha", &[0.99, 0.1, 0.0, 0.0])
+            .expect("alpha row");
+        writer
+            .write_record("beta", &[0.8, 0.6, 0.0, 0.0])
+            .expect("beta row");
+        writer
+            .write_record("gamma", &[0.0, 1.0, 0.0, 0.0])
+            .expect("gamma row");
+        writer.finish().expect("finish F32 parity fixture");
+
+        let owner = admit_owned_v2_fixture(&path, &binding).expect("admit F32 sealed owner");
+        let normal = VectorIndex::open(&path).expect("open ordinary F32 reader");
+
+        assert_eq!(owner.metadata(), normal.metadata());
+        assert_eq!(owner.record_count(), normal.record_count());
+        assert_eq!(owner.live_count(), normal.live_count());
+        assert_eq!(owner.tombstone_count(), normal.tombstone_count());
+
+        for index in 0..owner.record_count() {
+            let owner_row = owner.row(index).expect("sealed owner row");
+            let normal_entry = normal.record_at(index).expect("ordinary reader row");
+            assert_eq!(
+                owner_row.doc_id(),
+                normal.doc_id_at(index).expect("ordinary document id")
+            );
+            assert_eq!(
+                owner_row.vector_bytes(),
+                normal.vector_bytes(index).expect("ordinary vector bytes")
+            );
+            assert_eq!(owner_row.flags(), FsviRecordFlags(normal_entry.flags));
+        }
+
+        let query = [1.0, 0.0, 0.0, 0.0];
+        let owner_hits = owner
+            .search_top_k(&query, 10, None)
+            .expect("sealed owner exact search");
+        let normal_hits = normal
+            .search_top_k(&query, 10, None)
+            .expect("ordinary reader exact search");
+        assert_eq!(owner_hits.len(), normal_hits.len());
+        assert!(owner_hits.iter().all(|hit| hit.doc_id != "tombstone-best"));
+        for (owner_hit, normal_hit) in owner_hits.iter().zip(&normal_hits) {
+            assert_eq!(owner_hit.index, normal_hit.index);
+            assert_eq!(owner_hit.doc_id, normal_hit.doc_id);
+            assert_eq!(owner_hit.score.to_bits(), normal_hit.score.to_bits());
+        }
+    }
+
+    #[test]
     fn all_live_docset_digest_remains_byte_compatible_with_xomn_formula() {
         let binding = fsvi_v2_binding("v2-all-live-compatible", 4, Quantization::F16, 24, 0x84);
         let (path, expected) = write_v2_fixture("v2-all-live-compatible", binding);
