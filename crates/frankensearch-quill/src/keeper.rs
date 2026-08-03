@@ -6621,8 +6621,8 @@ fn writer_lock_record_names_live_owner(record: WriterLockRecord) -> bool {
         let Some(start_time) = linux_process_start_time(record.pid) else {
             return true;
         };
-        return writer_pid_start_nonce_from_linux_start_time(record.pid, start_time)
-            == record.pid_start_nonce;
+        writer_pid_start_nonce_from_linux_start_time(record.pid, start_time)
+            == record.pid_start_nonce
     }
 
     #[cfg(not(target_os = "linux"))]
@@ -12898,7 +12898,7 @@ fn detect_live_writer(directory: &Path) -> bool {
     let Ok(Some(record)) = read_writer_lock_record(&lock_path, &mut file) else {
         return false;
     };
-    !writer_pid_is_dead(record.pid)
+    writer_lock_record_names_live_owner(record)
 }
 
 impl SegmentStatsProvider for KeeperSnapshot {
@@ -17408,6 +17408,22 @@ mod tests {
         assert_ne!(replacement.record.pid_start_nonce, stale.pid_start_nonce);
         drop(replacement);
         assert_eq!(std::fs::metadata(lock_path)?.len(), 0);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stale_writer_start_nonce_is_not_reported_as_live() -> TestResult {
+        let directory = tempdir()?;
+        let lock_path = directory.path().join("LOCK");
+        let current = WriterLockRecord::current(&lock_path)?;
+        let stale = WriterLockRecord {
+            pid_start_nonce: current.pid_start_nonce ^ 1,
+            ..current
+        };
+        std::fs::write(&lock_path, stale.to_bytes())?;
+
+        assert!(!detect_live_writer(directory.path()));
         Ok(())
     }
 
