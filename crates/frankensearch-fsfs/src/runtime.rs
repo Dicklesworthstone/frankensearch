@@ -18705,7 +18705,8 @@ mod tests {
 
     use std::process::{Command, Output, Stdio};
 
-    const PUBLICATION_LEASE_RUNTIME_HELPER_ROOT_ENV: &str = "FSFS_RUNTIME_PUBLICATION_LEASE_TEST_ROOT";
+    const PUBLICATION_LEASE_RUNTIME_HELPER_ROOT_ENV: &str =
+        "FSFS_RUNTIME_PUBLICATION_LEASE_TEST_ROOT";
     const PUBLICATION_LEASE_RUNTIME_HELPER_OPERATION_ENV: &str =
         "FSFS_RUNTIME_PUBLICATION_LEASE_TEST_OPERATION";
 
@@ -18790,7 +18791,10 @@ mod tests {
         }
     }
 
-    fn publication_lease_test_sentinel(index_root: &Path, generation: &str) -> super::IndexSentinel {
+    fn publication_lease_test_sentinel(
+        index_root: &Path,
+        generation: &str,
+    ) -> super::IndexSentinel {
         super::IndexSentinel {
             schema_version: 1,
             generation_complete: true,
@@ -22097,27 +22101,27 @@ mod tests {
                     .expect("retire incomplete checkpoint after sentinel B");
                 println!("FSFS_RUNTIME_PUBLISH_B_OK");
             }
-            "probe-second-publisher" => match crate::lifecycle::PublicationLease::acquire(
-                &index_root,
-            ) {
-                Err(SearchError::SubsystemError { subsystem, source })
-                    if subsystem == "publication-lease"
-                        && source
-                            .downcast_ref::<crate::lifecycle::PublicationLeaseBusy>()
-                            .is_some() =>
-                {
-                    println!("FSFS_RUNTIME_SECOND_PUBLISHER_BUSY");
+            "probe-second-publisher" => {
+                match crate::lifecycle::PublicationLease::acquire(&index_root) {
+                    Err(SearchError::SubsystemError { subsystem, source })
+                        if subsystem == "publication-lease"
+                            && source
+                                .downcast_ref::<crate::lifecycle::PublicationLeaseBusy>()
+                                .is_some() =>
+                    {
+                        println!("FSFS_RUNTIME_SECOND_PUBLISHER_BUSY");
+                    }
+                    Err(error) => panic!("unexpected second-publisher admission error: {error}"),
+                    Ok(lease) => {
+                        lease
+                            .fence("unexpected second publisher")
+                            .expect("fence unexpected publisher");
+                        fs::write(index_root.join("second-publisher-mutated"), b"mutated")
+                            .expect("record unexpected second-publisher mutation");
+                        println!("FSFS_RUNTIME_SECOND_PUBLISHER_MUTATED");
+                    }
                 }
-                Err(error) => panic!("unexpected second-publisher admission error: {error}"),
-                Ok(lease) => {
-                    lease
-                        .fence("unexpected second publisher")
-                        .expect("fence unexpected publisher");
-                    fs::write(index_root.join("second-publisher-mutated"), b"mutated")
-                        .expect("record unexpected second-publisher mutation");
-                    println!("FSFS_RUNTIME_SECOND_PUBLISHER_MUTATED");
-                }
-            },
+            }
             other => panic!("unknown runtime publication-lease helper operation {other}"),
         }
     }
