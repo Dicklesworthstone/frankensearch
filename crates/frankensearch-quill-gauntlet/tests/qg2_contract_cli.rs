@@ -98,7 +98,7 @@ fn complete_contract_fixture() -> TempDir {
 
     let manifest_sha256 = perf_manifest_contract_sha256(&manifest);
     let template = serde_json::from_slice::<PerfGateArtifact>(include_bytes!(
-        "../../../.bench-history/QG-1.unmeasured.latest.json"
+        "../../../.bench-history/QG-1.v7.unmeasured.latest.json"
     ))
     .expect("sentinel template");
     for gate in PerfGate::ALL {
