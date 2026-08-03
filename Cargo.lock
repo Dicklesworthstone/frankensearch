@@ -1731,9 +1731,12 @@ dependencies = [
  "fsqlite-core",
  "fsqlite-error",
  "fsqlite-types",
+ "libc",
  "memmap2",
+ "rustix",
  "serde",
  "serde_json",
+ "tempfile",
  "tracing",
  "xxhash-rust",
 ]
@@ -4968,9 +4971,9 @@ checksum = "e3a9fe34e3e7a50316060351f37187a3f546bce95496156754b601a5fa71b76e"
 
 [[package]]
 name = "sketches-ddsketch"
-version = "0.4.0"
+version = "0.4.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "05e40b6cf54d988dc1a2223531b969c9a9e30906ad90ef64890c27b4bfbb46ea"
+checksum = "513c3f5f732bfd6fbb187619c2dfe9d2f25f1a2976f01d575f0fd329d565df56"
 dependencies = [
  "serde",
 ]
