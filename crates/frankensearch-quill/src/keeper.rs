@@ -6365,15 +6365,20 @@ impl WriterLockRecord {
 fn writer_pid_start_nonce(pid: u32, acquired_unix_s: i64) -> u64 {
     #[cfg(target_os = "linux")]
     if let Some(start_time) = linux_process_start_time(pid) {
-        let mut identity = [0_u8; 12];
-        identity[..4].copy_from_slice(&pid.to_le_bytes());
-        identity[4..].copy_from_slice(&start_time.to_le_bytes());
-        return xxhash_rust::xxh3::xxh3_64(&identity);
+        return writer_pid_start_nonce_from_linux_start_time(pid, start_time);
     }
 
     let mut identity = [0_u8; 12];
     identity[..4].copy_from_slice(&pid.to_le_bytes());
     identity[4..].copy_from_slice(&acquired_unix_s.to_le_bytes());
+    xxhash_rust::xxh3::xxh3_64(&identity)
+}
+
+#[cfg(target_os = "linux")]
+fn writer_pid_start_nonce_from_linux_start_time(pid: u32, start_time: u64) -> u64 {
+    let mut identity = [0_u8; 12];
+    identity[..4].copy_from_slice(&pid.to_le_bytes());
+    identity[4..].copy_from_slice(&start_time.to_le_bytes());
     xxhash_rust::xxh3::xxh3_64(&identity)
 }
 
@@ -6486,7 +6491,7 @@ fn acquire_writer_admission(directory: &Path) -> Result<Arc<WriterAdmissionInner
     }
 
     if let Some(previous) = read_writer_lock_record(&lock_path, &mut lock_file)?
-        && !writer_pid_is_dead(previous.pid)
+        && writer_lock_record_names_live_owner(previous)
     {
         return Err(KeeperError::WriterBusy {
             path: lock_path,
@@ -6599,6 +6604,24 @@ fn write_writer_lock_record(
             path: path.to_path_buf(),
             source,
         })
+}
+
+fn writer_lock_record_names_live_owner(record: WriterLockRecord) -> bool {
+    if writer_pid_is_dead(record.pid) {
+        return false;
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let Some(start_time) = linux_process_start_time(record.pid) else {
+            return true;
+        };
+        return writer_pid_start_nonce_from_linux_start_time(record.pid, start_time)
+            == record.pid_start_nonce;
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    true
 }
 
 #[cfg(unix)]
@@ -17357,6 +17380,28 @@ mod tests {
             Err(KeeperError::WriterLockCorrupted { .. })
         ));
         assert_eq!(std::fs::read(lock_path)?, before);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn writer_admission_replaces_a_live_pid_record_with_a_stale_start_nonce() -> TestResult {
+        let directory = tempdir()?;
+        let admission = acquire_writer_admission(directory.path())?;
+        let lock_path = directory.path().join("LOCK");
+        drop(admission);
+
+        let current = WriterLockRecord::current(&lock_path)?;
+        let stale = WriterLockRecord {
+            pid_start_nonce: current.pid_start_nonce ^ 1,
+            ..current
+        };
+        std::fs::write(&lock_path, stale.to_bytes())?;
+
+        let replacement = acquire_writer_admission(directory.path())?;
+        assert_ne!(replacement.record.pid_start_nonce, stale.pid_start_nonce);
+        drop(replacement);
+        assert_eq!(std::fs::metadata(lock_path)?.len(), 0);
         Ok(())
     }
 
