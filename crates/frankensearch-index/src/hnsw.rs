@@ -643,8 +643,18 @@ impl HnswIndex {
         // behaviors. Metadata remains the sole commit point.
         let generation_prefix =
             hnsw_generation_prefix(&requested_basename, self.vector_fingerprint);
-        let generation = tempfile::Builder::new()
-            .prefix(&generation_prefix)
+        let mut generation_builder = tempfile::Builder::new();
+        generation_builder.prefix(&generation_prefix);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            // Tempfile defaults to a private 0700 directory. Published ANN
+            // generations must instead inherit the caller's umask, just like
+            // the FSVI artifact in the same parent directory.
+            generation_builder.permissions(std::fs::Permissions::from_mode(0o777));
+        }
+        let generation = generation_builder
             .tempdir_in(parent)
             .map_err(SearchError::Io)?;
         let dumped_basename = self
@@ -2397,7 +2407,19 @@ fn gc_superseded_hnsw_generations(
 }
 
 fn install_hnsw_metadata(path: &Path, parent: &Path, bytes: &[u8]) -> SearchResult<()> {
-    let mut temporary = tempfile::NamedTempFile::new_in(parent).map_err(SearchError::Io)?;
+    let mut temporary_builder = tempfile::Builder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        // Keep the atomically persisted metadata consistent with ordinary
+        // index files: 0666 constrained by the deployment's umask, rather
+        // than tempfile's private 0600 default.
+        temporary_builder.permissions(std::fs::Permissions::from_mode(0o666));
+    }
+    let mut temporary = temporary_builder
+        .tempfile_in(parent)
+        .map_err(SearchError::Io)?;
     temporary.write_all(bytes).map_err(SearchError::Io)?;
     temporary.as_file().sync_all().map_err(SearchError::Io)?;
     temporary.persist(path).map_err(|error| {
@@ -5302,6 +5324,75 @@ mod tests {
             external_sentinel.is_file(),
             "GC must not traverse into the target of a generation-named symlink"
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_publication_honors_umask_for_metadata_and_generation_artifacts() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().expect("temporary ANN root");
+        let source_path = root.path().join("source.fsvi");
+        let source = write_index(&source_path, &[vec![1.0_f32, 0.0], vec![0.0_f32, 1.0]])
+            .expect("write source index");
+        let ann = HnswIndex::build_from_vector_index(&source, HnswConfig::default())
+            .expect("build native ANN");
+        let metadata_path = root.path().join("vector.fast.hnsw");
+        ann.save(&metadata_path).expect("save native ANN");
+
+        let source_mode = std::fs::metadata(&source_path)
+            .expect("inspect source index")
+            .permissions()
+            .mode()
+            & 0o666;
+        let metadata_mode = std::fs::metadata(&metadata_path)
+            .expect("inspect HNSW metadata")
+            .permissions()
+            .mode()
+            & 0o666;
+        assert_eq!(
+            metadata_mode, source_mode,
+            "persisted HNSW metadata must retain the parent deployment's umask policy"
+        );
+
+        let metadata: HnswMeta =
+            serde_json::from_slice(&std::fs::read(&metadata_path).expect("read HNSW metadata"))
+                .expect("parse HNSW metadata");
+        let generation = root.path().join(
+            metadata
+                .sidecar_generation
+                .as_deref()
+                .expect("metadata must name its generation"),
+        );
+        let generation_mode = std::fs::metadata(&generation)
+            .expect("inspect HNSW generation")
+            .permissions()
+            .mode()
+            & 0o666;
+        assert_eq!(
+            generation_mode, source_mode,
+            "published generation data permissions must retain the parent deployment's umask policy"
+        );
+        let basename = metadata
+            .sidecar_basename
+            .as_deref()
+            .expect("metadata must name its native sidecars");
+        for path in [
+            generation.join(format!("{basename}.hnsw.graph")),
+            generation.join(format!("{basename}.hnsw.data")),
+            generation.join(HNSW_GENERATION_RECEIPT_FILENAME),
+        ] {
+            assert_eq!(
+                std::fs::metadata(&path)
+                    .expect("inspect generation artifact")
+                    .permissions()
+                    .mode()
+                    & 0o666,
+                source_mode,
+                "generation artifact '{}' must retain the parent deployment's umask policy",
+                path.display()
+            );
+        }
     }
 
     #[test]
