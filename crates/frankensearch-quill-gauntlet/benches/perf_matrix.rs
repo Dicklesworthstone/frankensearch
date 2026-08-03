@@ -5269,6 +5269,7 @@ fn main() {
         tests::assert_non_qg1_corpus_identity_preserves_legacy_hash();
         tests::assert_qg9_cache_evidence_contract();
         tests::assert_qg9_cache_eviction_file_discovery();
+        tests::assert_qg9_cache_eviction_request();
         eprintln!(
             "[quill-perf-self-check] H1 immutable producer and continuous-timing contracts passed"
         );
@@ -5345,6 +5346,27 @@ mod tests {
     #[test]
     fn qg9_cache_eviction_discovers_nested_regular_files_without_treating_dirs_as_files() {
         assert_qg9_cache_eviction_file_discovery();
+    }
+
+    #[cfg(target_os = "linux")]
+    pub fn assert_qg9_cache_eviction_request() {
+        let fixture = tempfile::tempdir().expect("QG-9 cache-eviction fixture directory");
+        std::fs::write(fixture.path().join("segment.fslx"), b"segment")
+            .expect("write QG-9 cache-eviction fixture");
+        assert_eq!(
+            super::evict_index_file_cache(fixture.path())
+                .expect("QG-9 Linux cache eviction request must succeed"),
+            1,
+            "QG-9 must request eviction for every regular index file"
+        );
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub fn assert_qg9_cache_eviction_request() {}
+
+    #[test]
+    fn qg9_linux_cache_eviction_request_is_real() {
+        assert_qg9_cache_eviction_request();
     }
 
     fn hostile_tantivy_continuous_receipt() -> super::Qg1ContinuousTimingReceipt {

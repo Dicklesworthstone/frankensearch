@@ -231,6 +231,9 @@ pub enum GenerationAuthorityErrorV1 {
     /// A valid publication attempt remains unresolved and must be reconciled.
     #[error("generation authority publication attempt remains unresolved")]
     UnresolvedAttempt,
+    /// The immutable authority counter cannot advance beyond `u64::MAX`.
+    #[error("generation authority sequence is exhausted")]
+    SequenceExhausted,
     /// The immutable activation manifest did not match its stored self-seal.
     #[error("generation activation manifest self-seal mismatch")]
     ManifestSelfSealMismatch,
@@ -335,6 +338,19 @@ impl AuthorityRefV1 {
             });
         }
         Ok(())
+    }
+
+    /// Return the next authority sequence without allowing counter rollover.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed exhaustion error for the terminal `u64::MAX` authority
+    /// rather than permitting an ABA-like wrap to an earlier sequence.
+    pub fn next_sequence(&self) -> Result<u64, GenerationAuthorityErrorV1> {
+        self.validate()?;
+        self.sequence
+            .checked_add(1)
+            .ok_or(GenerationAuthorityErrorV1::SequenceExhausted)
     }
 
     /// Canonical bytes used to link consecutive authority references.
@@ -4137,6 +4153,19 @@ mod tests {
         assert!(
             AuthorityRefV1::from_canonical_bytes(&successor.canonical_bytes()[..99]).is_err(),
             "truncated authority references never decode"
+        );
+    }
+
+    #[test]
+    fn authority_reference_never_rolls_over_its_sequence() {
+        assert_eq!(authority_reference(1, None).next_sequence(), Ok(2));
+        let terminal =
+            AuthorityRefV1::new(u64::MAX, [0x81; 16], 4_096, [0x82; 32], Some([0x83; 32]))
+                .expect("terminal authority reference remains decodable");
+        assert_eq!(
+            terminal.next_sequence(),
+            Err(GenerationAuthorityErrorV1::SequenceExhausted),
+            "terminal authority state must not wrap into an earlier generation"
         );
     }
 
