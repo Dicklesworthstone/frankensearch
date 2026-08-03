@@ -6034,16 +6034,22 @@ mod tests {
 
     #[test]
     fn gate_decisions_only_apply_to_eligible_evidence() {
-        let mut artifact = provisional_artifact();
-        artifact
-            .apply_gate_decision(EvidenceDecisionStatus::Allow)
-            .expect("eligible promotion");
-        assert_eq!(artifact.gate_decision, Some(EvidenceDecisionStatus::Allow));
+        for decision in [
+            EvidenceDecisionStatus::Allow,
+            EvidenceDecisionStatus::Quarantine,
+            EvidenceDecisionStatus::Block,
+        ] {
+            let mut artifact = provisional_artifact();
+            artifact
+                .apply_gate_decision(decision)
+                .expect("eligible terminal decision");
+            assert_eq!(artifact.gate_decision, Some(decision));
 
-        let dir = tempfile::tempdir().expect("tempdir");
-        let paths = artifact.write_atomic(dir.path()).expect("write");
-        let reloaded = PerfEvidenceArtifact::load_verified(&paths.json).expect("reload");
-        assert_eq!(reloaded.gate_decision, Some(EvidenceDecisionStatus::Allow));
+            let dir = tempfile::tempdir().expect("tempdir");
+            let paths = artifact.write_atomic(dir.path()).expect("write");
+            let reloaded = PerfEvidenceArtifact::load_verified(&paths.json).expect("reload");
+            assert_eq!(reloaded.gate_decision, Some(decision));
+        }
 
         let mut artifact = provisional_artifact();
         assert!(matches!(
