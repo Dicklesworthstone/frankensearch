@@ -48,7 +48,7 @@ fn real_tokenizer() -> Tokenizer {
     tokenizer
 }
 
-fn exercise_real_tokenizer() {
+fn exercise_real_tokenizer_body() {
     let mut normalized = NormalizedString::from("Crème brûlée");
     normalizer()
         .normalize(&mut normalized)
@@ -56,14 +56,91 @@ fn exercise_real_tokenizer() {
     assert_eq!(normalized.get(), "Creme brulee");
 
     let tokenizer = real_tokenizer();
+    let error = tokenizer
+        .encode("Crème brûlée", false)
+        .expect_err("the empty in-memory WordLevel must reject its missing UNK token");
+    assert!(error.to_string().contains("Missing [UNK] token"));
+}
+
+fn exercise_real_tokenizer() {
     run_test_with_cx(|_cx| async move {
         // WordLevel has no vocabulary on purpose. `encode` reaches the configured
         // real normalizer before reporting the model's expected missing-UNK error.
-        let error = tokenizer
-            .encode("Crème brûlée", false)
-            .expect_err("the empty in-memory WordLevel must reject its missing UNK token");
-        assert!(error.to_string().contains("Missing [UNK] token"));
+        exercise_real_tokenizer_body();
     });
+}
+
+fn witness_worker_dispatch_contract() {
+    run_test_with_cx(|_cx| async move {
+        let explicit_dispatch = tracing::dispatcher::get_default(|dispatch| dispatch.clone());
+
+        let unpropagated = thread::spawn(|| {
+            tracing::dispatcher::get_default(|dispatch| {
+                dispatch.is::<tracing::subscriber::NoSubscriber>()
+            })
+        });
+        assert!(
+            unpropagated
+                .join()
+                .expect("unpropagated worker must complete"),
+            "worker unexpectedly inherited its caller dispatcher"
+        );
+
+        let propagated = thread::spawn(move || {
+            tracing::dispatcher::with_default(&explicit_dispatch, || {
+                tracing::dispatcher::get_default(|dispatch| {
+                    !dispatch.is::<tracing::subscriber::NoSubscriber>()
+                })
+            })
+        });
+        assert!(
+            propagated
+                .join()
+                .expect("explicitly propagated worker must complete"),
+            "worker did not observe its explicit dispatcher"
+        );
+    });
+}
+
+fn witness_overlapping_runtimes() {
+    let (ready_tx, ready_rx) = mpsc::channel();
+    let (go_a_tx, go_a_rx) = mpsc::channel();
+    let (go_b_tx, go_b_rx) = mpsc::channel();
+
+    let ready_a = ready_tx.clone();
+    let worker_a = thread::spawn(move || {
+        run_test_with_cx(|_cx| async move {
+            ready_a.send(()).expect("runtime A must report readiness");
+            go_a_rx
+                .recv_timeout(CHILD_TIMEOUT)
+                .expect("runtime A must be released");
+            exercise_real_tokenizer_body();
+        });
+    });
+    let worker_b = thread::spawn(move || {
+        run_test_with_cx(|_cx| async move {
+            ready_tx.send(()).expect("runtime B must report readiness");
+            go_b_rx
+                .recv_timeout(CHILD_TIMEOUT)
+                .expect("runtime B must be released");
+            exercise_real_tokenizer_body();
+        });
+    });
+
+    ready_rx
+        .recv_timeout(CHILD_TIMEOUT)
+        .expect("runtime A must reach the overlap gate");
+    ready_rx
+        .recv_timeout(CHILD_TIMEOUT)
+        .expect("runtime B must reach the overlap gate");
+    go_a_tx
+        .send(())
+        .expect("runtime A release must be delivered");
+    go_b_tx
+        .send(())
+        .expect("runtime B release must be delivered");
+    worker_a.join().expect("runtime A must complete");
+    worker_b.join().expect("runtime B must complete");
 }
 
 fn spawn_drain<R>(mut reader: R, stream_is_stderr: bool, tx: mpsc::Sender<(bool, Vec<u8>)>)
@@ -236,6 +313,12 @@ fn real_tokenizers_log_output_requires_explicit_bridge_and_trace() {
     let panic_restoration_child = run_child("panic-restoration", Some("trace"));
     assert_marker_is_suppressed("panic-restoration", &panic_restoration_child);
 
+    let worker_dispatch_child = run_child("worker-dispatch", Some("trace"));
+    assert_marker_is_suppressed("worker-dispatch", &worker_dispatch_child);
+
+    let overlapping_runtimes_child = run_child("overlapping-runtimes", Some("trace"));
+    assert_marker_is_suppressed("overlapping-runtimes", &overlapping_runtimes_child);
+
     let explicit_child = run_child("explicit-bridge", Some("trace"));
     let explicit = assert_child_passed("explicit-bridge", &explicit_child);
     assert!(
@@ -275,6 +358,8 @@ fn fresh_process_child() {
             );
             exercise_real_tokenizer();
         }
+        "worker-dispatch" => witness_worker_dispatch_contract(),
+        "overlapping-runtimes" => witness_overlapping_runtimes(),
         other => panic!("unknown fresh-process logging child case {other:?}"),
     }
 }
