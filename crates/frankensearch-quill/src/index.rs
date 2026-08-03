@@ -3220,6 +3220,27 @@ impl<'a> QueryCheckpoint<'a> {
         self.metering
     }
 
+    #[cfg(feature = "profile-internals")]
+    fn record_snapshot_doc_freq(&self) {
+        if let Some(profile) = self.profile {
+            profile.record_snapshot_doc_freq(1);
+        }
+    }
+
+    #[cfg(feature = "profile-internals")]
+    fn record_global_doc_freq(&self) {
+        if let Some(profile) = self.profile {
+            profile.record_global_doc_freq(1);
+        }
+    }
+
+    #[cfg(feature = "profile-internals")]
+    fn record_term_dictionary_view(&self) {
+        if let Some(profile) = self.profile {
+            profile.record_term_dictionary_view(1);
+        }
+    }
+
     fn exhausted(&self, consumed: u64) -> ArgusError {
         let segments_touched = self.state.segments_touched.load(Ordering::Acquire);
         let dictionary_blocks = self.state.dictionary_blocks.load(Ordering::Acquire);
@@ -3294,7 +3315,16 @@ impl QueryWorkCheckpoint for QueryCheckpoint<'_> {
     }
 }
 
+#[cfg(feature = "profile-internals")]
+type QueryCheckpointHandle<'a> = Arc<QueryCheckpoint<'a>>;
+#[cfg(not(feature = "profile-internals"))]
 type QueryCheckpointHandle<'a> = Arc<dyn QueryWorkCheckpoint + 'a>;
+
+fn clone_query_checkpoint_for_argus<'a>(
+    checkpoint: &QueryCheckpointHandle<'a>,
+) -> Arc<dyn QueryWorkCheckpoint + 'a> {
+    checkpoint.clone()
+}
 
 #[derive(Default)]
 struct QueryWorkShape {
@@ -10525,7 +10555,10 @@ fn lower_query_with_mode<'a>(
                             PhraseTerm::new(
                                 field.field_id,
                                 term.position,
-                                CheckpointPostingCursor::new(cursor, Arc::clone(checkpoint))?,
+                                CheckpointPostingCursor::new(
+                                    cursor,
+                                    clone_query_checkpoint_for_argus(checkpoint),
+                                )?,
                                 snapshot_doc_freq,
                             )
                         }
@@ -10538,7 +10571,10 @@ fn lower_query_with_mode<'a>(
                             PhraseTerm::new(
                                 field.field_id,
                                 term.position,
-                                CheckpointPostingCursor::new(cursor, Arc::clone(checkpoint))?,
+                                CheckpointPostingCursor::new(
+                                    cursor,
+                                    clone_query_checkpoint_for_argus(checkpoint),
+                                )?,
                                 snapshot_doc_freq,
                             )
                         }
@@ -10552,14 +10588,14 @@ fn lower_query_with_mode<'a>(
                         owned_fieldnorms(segment, schema, field.field_id)?,
                         bm25,
                         boost,
-                        Some(Arc::clone(checkpoint)),
+                        Some(clone_query_checkpoint_for_argus(checkpoint)),
                     )?,
                     QueryLeaf::Delta(delta) => PhraseScorer::new_with_checkpoint(
                         phrase_terms,
                         DeltaFieldNorms::new(delta, field.field_id),
                         bm25,
                         boost,
-                        Some(Arc::clone(checkpoint)),
+                        Some(clone_query_checkpoint_for_argus(checkpoint)),
                     )?,
                 };
                 clauses.push(ScorerClause::should(ReferenceScorer::phrase(scorer)));
@@ -11478,12 +11514,16 @@ fn lower_leaf_term<'a>(
             checkpoint.admit(QueryWorkKind::DictionaryBlock, 1)?;
             let (cursor, fieldnorms) =
                 open_sealed_term_cursor(segment, schema, field_ord, term, rank_pruning)?;
-            let cursor = CheckpointPostingCursor::new(cursor, Arc::clone(checkpoint))?;
+            #[cfg(feature = "profile-internals")]
+            checkpoint.record_term_dictionary_view();
+            let cursor =
+                CheckpointPostingCursor::new(cursor, clone_query_checkpoint_for_argus(checkpoint))?;
             build_term_scorer(cursor, fieldnorms, stats, doc_freq, record_option, boost)
         }
         QueryLeaf::Delta(delta) => {
             let cursor = DeltaPostingCursor::new(delta, field_ord, term)?;
-            let cursor = CheckpointPostingCursor::new(cursor, Arc::clone(checkpoint))?;
+            let cursor =
+                CheckpointPostingCursor::new(cursor, clone_query_checkpoint_for_argus(checkpoint))?;
             build_term_scorer(
                 cursor,
                 DeltaFieldNorms::new(delta, field_ord),
@@ -11502,6 +11542,8 @@ fn checkpointed_snapshot_doc_freq(
     field_ord: u16,
     term: &[u8],
 ) -> Result<u64, QuillIndexError> {
+    #[cfg(feature = "profile-internals")]
+    checkpoint.record_snapshot_doc_freq();
     if snapshot.bm25_field_stats(field_ord).is_none() {
         return Err(invalid_state(format!(
             "snapshot has no BM25 statistics for field {field_ord}"
@@ -11510,6 +11552,11 @@ fn checkpointed_snapshot_doc_freq(
     let mut total = 0_u64;
     for segment in snapshot.keeper_snapshot().segments() {
         let dictionary = open_dictionary(segment, snapshot.keeper_snapshot().schema())?;
+        #[cfg(feature = "profile-internals")]
+        {
+            checkpoint.record_global_doc_freq();
+            checkpoint.record_term_dictionary_view();
+        }
         checkpoint.admit(QueryWorkKind::DictionaryBlock, 1)?;
         if let Some(found) = dictionary.lookup(field_ord, term)? {
             total = total
@@ -14744,6 +14791,9 @@ mod tests {
                 panic!("profiled ordinary query did not bind its work plan");
             };
             assert!(work_upper_bound > 0);
+            assert_eq!(receipt.counters().0, 1);
+            assert_eq!(receipt.counters().1, 1);
+            assert_eq!(receipt.counters().2, 2);
             assert!(
                 receipt.counters().4 > 0,
                 "profiled ordinary query did not record any accepted work checkpoints"
