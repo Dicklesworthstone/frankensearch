@@ -394,6 +394,11 @@ jobs:
           GAUNTLET_ARTIFACT_ROOT: target/coverage/quill-gauntlet-pr
         run: cargo test -p frankensearch-quill-gauntlet --features tantivy-oracle runner::tests::live_ -- --nocapture
 
+      - name: Quill E6.3 metamorphic PR lane (bd-quill-e6.3)
+        if: matrix.os == 'ubuntu-latest'
+        timeout-minutes: 10
+        run: cargo test -p frankensearch-quill-gauntlet --features perf-harness e63_ -- --test-threads=4
+
       - name: Bind job-scoped Salej artifact lane
         id: salej_lane
         if: always() && matrix.os == 'ubuntu-latest'
