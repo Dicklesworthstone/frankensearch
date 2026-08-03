@@ -9,11 +9,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ops::{Bound, Deref};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-#[cfg(any(feature = "conformance-internals", feature = "profile-internals"))]
-use std::sync::{Mutex as StdMutex, atomic::AtomicBool};
 #[cfg(feature = "conformance-internals")]
 use std::sync::atomic::AtomicU8;
 use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(any(feature = "conformance-internals", feature = "profile-internals"))]
+use std::sync::{Mutex as StdMutex, atomic::AtomicBool};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use arc_swap::{ArcSwap, ArcSwapOption};
@@ -1969,6 +1969,27 @@ pub struct QuillProfileReceipt {
     fuel_units: u64,
     overflowed: bool,
     outcome: QuillProfileOutcome,
+}
+
+/// Ordinary search outcome paired with its invocation-bound profile receipt.
+#[cfg(feature = "profile-internals")]
+#[doc(hidden)]
+#[derive(Debug)]
+pub enum QuillProfiledSearchOutcome {
+    /// The ordinary search completed normally.
+    Completed {
+        /// Ordinary result from the profiled invocation.
+        result: QuillSearchResult,
+        /// Immutable receipt from that same invocation.
+        receipt: QuillProfileReceipt,
+    },
+    /// The ordinary search returned a typed failure after profile admission.
+    Failed {
+        /// Original ordinary-search error.
+        error: QuillIndexError,
+        /// Immutable receipt from that same invocation.
+        receipt: QuillProfileReceipt,
+    },
 }
 
 #[cfg(feature = "profile-internals")]
@@ -6590,6 +6611,52 @@ impl QuillReader {
         self.search_paginated_on(cx, query, limit, offset, exact_count, published.as_ref())
     }
 
+    #[cfg(feature = "profile-internals")]
+    fn search_paginated_with_profile(
+        &self,
+        cx: &Cx,
+        query: &str,
+        limit: usize,
+        offset: usize,
+        exact_count: bool,
+    ) -> Result<QuillProfiledSearchOutcome, QuillIndexError> {
+        let published = self.published_snapshot.load();
+        let keeper = published.keeper_snapshot();
+        let sealed_segments = u64::try_from(keeper.segments().len()).map_err(|_| {
+            invalid_state("profile-internals sealed segment count does not fit u64")
+        })?;
+        let delta_segments = u64::try_from(published.delta_count())
+            .map_err(|_| invalid_state("profile-internals Delta segment count does not fit u64"))?;
+        let session = QuillProfileSession::new(
+            published.snapshot_epoch(),
+            published.keeper_generation(),
+            sealed_segments,
+            delta_segments,
+        );
+        let result = self.search_paginated_on_inner(
+            cx,
+            query,
+            limit,
+            offset,
+            exact_count,
+            #[cfg(feature = "pruning-conformance")]
+            None,
+            Some(&session),
+            published.as_ref(),
+        );
+        let outcome = match &result {
+            Ok(_) => QuillProfileOutcome::Completed,
+            Err(QuillIndexError::Cancelled { .. }) => QuillProfileOutcome::Cancelled,
+            Err(QuillIndexError::QueryFuelExhausted { .. }) => QuillProfileOutcome::FuelExhausted,
+            Err(_) => QuillProfileOutcome::OtherError,
+        };
+        let receipt = session.complete(outcome)?;
+        Ok(match result {
+            Ok(result) => QuillProfiledSearchOutcome::Completed { result, receipt },
+            Err(error) => QuillProfiledSearchOutcome::Failed { error, receipt },
+        })
+    }
+
     #[cfg(feature = "pruning-conformance")]
     fn search_paginated_with_conformance_pruning_trace(
         &self,
@@ -6612,6 +6679,8 @@ impl QuillReader {
             offset,
             exact_count,
             Some(guard.session()),
+            #[cfg(feature = "profile-internals")]
+            None,
             published.as_ref(),
         )?;
         let receipt = guard.complete()?;
@@ -6635,6 +6704,8 @@ impl QuillReader {
             exact_count,
             #[cfg(feature = "pruning-conformance")]
             None,
+            #[cfg(feature = "profile-internals")]
+            None,
             snapshot,
         )
     }
@@ -6649,6 +6720,7 @@ impl QuillReader {
         #[cfg(feature = "pruning-conformance")] pruning_trace: Option<
             &ConformancePruningTraceSession,
         >,
+        #[cfg(feature = "profile-internals")] profile: Option<&QuillProfileSession>,
         snapshot: &QuillSearchSnapshot,
     ) -> Result<QuillSearchResult, QuillIndexError> {
         let keeper = snapshot.keeper_snapshot();
@@ -6676,6 +6748,10 @@ impl QuillReader {
         let _query_entered = query_span.enter();
         if let Err(error) = check_cancel(cx, "search") {
             query_span.record("cache_lookup", "not_checked");
+            #[cfg(feature = "profile-internals")]
+            if let Some(profile) = profile {
+                profile.bind_cache(QuillProfileCacheDisposition::NotChecked)?;
+            }
             return Err(error);
         }
         let cache_enabled = self.ranked_query_cache_enabled();
@@ -6690,6 +6766,10 @@ impl QuillReader {
                 exact_count,
             ) {
                 query_span.record("cache_lookup", "hit");
+                #[cfg(feature = "profile-internals")]
+                if let Some(profile) = profile {
+                    profile.bind_cache(QuillProfileCacheDisposition::Hit)?;
+                }
                 query_span.record(
                     "result_count",
                     u64::try_from(result.hits.len()).unwrap_or(u64::MAX),
@@ -6700,8 +6780,16 @@ impl QuillReader {
                 return Ok(result);
             }
             query_span.record("cache_lookup", "miss");
+            #[cfg(feature = "profile-internals")]
+            if let Some(profile) = profile {
+                profile.bind_cache(QuillProfileCacheDisposition::Miss)?;
+            }
         } else {
             query_span.record("cache_lookup", "disabled");
+            #[cfg(feature = "profile-internals")]
+            if let Some(profile) = profile {
+                profile.bind_cache(QuillProfileCacheDisposition::Disabled)?;
+            }
         }
         let parsed = {
             let parse_span = tracing::info_span!(
@@ -7831,6 +7919,31 @@ impl QuillSearchIndex {
     ) -> Result<QuillSearchResult, QuillIndexError> {
         self.reader
             .search_paginated(cx, query, limit, offset, exact_count)
+    }
+
+    /// Execute one ordinary ranked search and retain a diagnostic sidecar receipt.
+    ///
+    /// The profile feature is intentionally separate from timing and
+    /// conformance features. The returned error variant preserves the ordinary
+    /// typed failure and its same-invocation receipt instead of fabricating a
+    /// successful result.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed error only when profile admission or finalization itself
+    /// fails; ordinary search failures are represented in the returned outcome.
+    #[cfg(feature = "profile-internals")]
+    #[doc(hidden)]
+    pub fn search_paginated_with_profile(
+        &self,
+        cx: &Cx,
+        query: &str,
+        limit: usize,
+        offset: usize,
+        exact_count: bool,
+    ) -> Result<QuillProfiledSearchOutcome, QuillIndexError> {
+        self.reader
+            .search_paginated_with_profile(cx, query, limit, offset, exact_count)
     }
 
     /// Search for full lexical results with canonical stored metadata.
@@ -14401,6 +14514,50 @@ mod tests {
                 .await
                 .expect("publish both disjoint batches");
             assert_eq!(index.doc_count(), 4);
+        });
+    }
+
+    #[cfg(feature = "profile-internals")]
+    #[test]
+    fn profiled_search_binds_the_ordinary_snapshot_and_cache_disposition() {
+        run_with_cx(|cx| async move {
+            let directory = tempfile::tempdir().expect("profiled index directory");
+            let writer = QuillIndex::create(&cx, directory.path(), deterministic_config())
+                .await
+                .expect("create profiled writer");
+            LexicalSearch::index_document(
+                &writer,
+                &cx,
+                &IndexableDocument::new("first", "profiled alpha"),
+            )
+            .await
+            .expect("stage profiled document");
+            LexicalSearch::commit(&writer, &cx)
+                .await
+                .expect("publish profiled document");
+            let reader = QuillSearchIndex::open(&cx, directory.path(), deterministic_config())
+                .await
+                .expect("open profiled reader");
+            let expected_generation = reader.keeper_generation();
+            let outcome = reader
+                .search_paginated_with_profile(&cx, "alpha", 10, 0, false)
+                .expect("profiled ordinary search");
+            assert!(
+                matches!(outcome, QuillProfiledSearchOutcome::Completed { .. }),
+                "profiled ordinary search unexpectedly failed"
+            );
+            let Some((result, receipt)) = (match outcome {
+                QuillProfiledSearchOutcome::Completed { result, receipt } => {
+                    Some((result, receipt))
+                }
+                QuillProfiledSearchOutcome::Failed { .. } => None,
+            }) else {
+                return;
+            };
+            assert_eq!(result.hits.len(), 1);
+            assert_eq!(receipt.keeper_generation(), expected_generation);
+            assert_eq!(receipt.cache(), QuillProfileCacheDisposition::Miss);
+            assert_eq!(receipt.outcome(), QuillProfileOutcome::Completed);
         });
     }
 
