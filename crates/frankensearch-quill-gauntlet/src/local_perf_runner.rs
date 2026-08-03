@@ -1072,6 +1072,42 @@ impl LocalPerfAttemptReceipt {
         Ok(())
     }
 
+    /// Prove that exact pre-build booking-receipt bytes describe the same
+    /// worker, resource scope, and typed invocation as this attempt.
+    ///
+    /// # Errors
+    ///
+    /// Rejects substituted, noncanonical, or identity-mismatched booking
+    /// evidence, including a booking from another otherwise valid run.
+    pub fn verify_booking_receipt(
+        &self,
+        booking_receipt_bytes: &[u8],
+    ) -> Result<(), LocalPerfRunError> {
+        if sha256_hex(booking_receipt_bytes) != self.booking_receipt_sha256 {
+            return Err(LocalPerfRunError::Invalid(
+                "booking receipt bytes differ from the sealed process receipt".to_owned(),
+            ));
+        }
+        let booking = LocalPerfBookingReceipt::from_verified_slice(booking_receipt_bytes)?;
+        if booking.gate != self.gate
+            || booking.profile != self.profile
+            || booking.run_id != self.run_id
+            || booking.run_window != self.run_window
+            || booking.fixture_selector != self.fixture_selector
+            || booking.selected_cell_ids != self.selected_cell_ids
+            || booking.lease_file_identity != self.lease_file_identity
+            || booking.worker_fingerprint_sha256 != self.hardware.fingerprint_sha256
+            || booking.effective_cpuset_sha256 != self.execution_start.effective_cpuset_sha256
+            || booking.source_git_revision != self.build.git_revision
+            || booking.cargo_lock_sha256 != self.build.cargo_lock_sha256
+        {
+            return Err(LocalPerfRunError::Invalid(
+                "booking receipt identity differs from the sealed process receipt".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
     fn verify_completed_runner_identity(
         &self,
         identity: &VerifiedRunnerIdentity,
@@ -7280,7 +7316,8 @@ mod tests {
 
     #[test]
     fn booking_receipt_binds_exclusive_worker_cpuset_storage_and_fixture_scope() {
-        let (attempt, _, _) = attempt_fixture(LocalPerfAttemptOutcome::Completed, Some(b"bound"));
+        let (mut attempt, _, _) =
+            attempt_fixture(LocalPerfAttemptOutcome::Completed, Some(b"bound"));
         let receipt = LocalPerfBookingReceipt {
             schema_version: LOCAL_PERF_BOOKING_RECEIPT_SCHEMA_VERSION.to_owned(),
             gate: attempt.gate.clone(),
@@ -7318,16 +7355,26 @@ mod tests {
         let bytes = seal_booking_receipt(receipt).expect("seal booking receipt");
         let verified =
             LocalPerfBookingReceipt::from_verified_slice(&bytes).expect("verify booking receipt");
+        attempt.booking_receipt_sha256 = sha256_hex(&bytes);
+        attempt
+            .verify_booking_receipt(&bytes)
+            .expect("booking receipt matches attempt");
         assert_eq!(verified.profile, attempt.profile);
         assert_eq!(
             verified.effective_cpuset_sha256,
             attempt.execution_start.effective_cpuset_sha256
         );
 
-        let mut tampered = verified;
+        let mut tampered = verified.clone();
         tampered.storage_slots.run_directory.inode = "not-a-decimal-inode".to_owned();
         let bytes = seal_booking_receipt(tampered).expect("reseal storage tamper");
         assert!(LocalPerfBookingReceipt::from_verified_slice(&bytes).is_err());
+
+        let mut mismatched = verified;
+        mismatched.run_window = "other-window".to_owned();
+        let bytes = seal_booking_receipt(mismatched).expect("reseal run mismatch");
+        attempt.booking_receipt_sha256 = sha256_hex(&bytes);
+        assert!(attempt.verify_booking_receipt(&bytes).is_err());
     }
 
     #[test]
