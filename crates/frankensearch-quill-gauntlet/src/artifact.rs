@@ -1240,7 +1240,7 @@ pub struct ArtifactStoreV4SourceEntry {
     pub symlink_target: Option<String>,
 }
 
-/// Immutable ordered source-input witness for ArtifactStore v4.
+/// Immutable ordered source-input witness for `ArtifactStore` v4.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ArtifactStoreV4SourceSnapshot {
@@ -1563,6 +1563,22 @@ impl ArtifactStore {
             #[cfg(test)]
             enforce_live_source_checkout: true,
         }
+    }
+
+    /// Bind canonical source inputs into an `ArtifactStore` v4 snapshot.
+    ///
+    /// This only establishes the immutable Source object. It deliberately
+    /// grants no execution or release authority until the v4 Build and
+    /// supervisor-authentication layers have verified their own bindings.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when an entry is malformed, ambiguously named, or
+    /// cannot be bound to the canonical source identity.
+    pub fn bind_v4_source_snapshot(
+        entries: Vec<ArtifactStoreV4SourceEntry>,
+    ) -> Result<ArtifactStoreV4SourceSnapshot, GauntletError> {
+        ArtifactStoreV4SourceSnapshot::new(entries)
     }
 
     #[cfg(test)]
@@ -3193,7 +3209,7 @@ mod tests {
     fn artifactstore_v4_source_snapshot_binds_sorted_compiler_visible_inputs() {
         let file_hash = "a".repeat(64);
         let link_hash = "b".repeat(64);
-        let snapshot = ArtifactStoreV4SourceSnapshot::new(vec![
+        let snapshot = ArtifactStore::bind_v4_source_snapshot(vec![
             ArtifactStoreV4SourceEntry {
                 relative_path: "Cargo.lock".to_owned(),
                 kind: ArtifactStoreV4SourceEntryKind::File,
