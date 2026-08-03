@@ -3675,14 +3675,24 @@ mod tests {
     fn artifactstore_v4_source_snapshot_binds_sorted_compiler_visible_inputs() {
         let file_hash = "a".repeat(64);
         let link_hash = "b".repeat(64);
+        let source_reasons = vec![
+            ArtifactStoreV4SourceInclusionReason::Tracked,
+            ArtifactStoreV4SourceInclusionReason::Untracked,
+            ArtifactStoreV4SourceInclusionReason::IgnoredGenerated,
+            ArtifactStoreV4SourceInclusionReason::WorkspaceMember,
+            ArtifactStoreV4SourceInclusionReason::PathDependency,
+            ArtifactStoreV4SourceInclusionReason::CargoLock,
+            ArtifactStoreV4SourceInclusionReason::CargoConfig,
+            ArtifactStoreV4SourceInclusionReason::ToolchainConfig,
+            ArtifactStoreV4SourceInclusionReason::TargetConfig,
+            ArtifactStoreV4SourceInclusionReason::BuildScriptInput,
+            ArtifactStoreV4SourceInclusionReason::BuildScriptOutput,
+        ];
         let snapshot = ArtifactStore::bind_v4_source_snapshot(vec![
             ArtifactStoreV4SourceEntry {
                 relative_path: "Cargo.lock".to_owned(),
                 kind: ArtifactStoreV4SourceEntryKind::File,
-                inclusion_reasons: vec![
-                    ArtifactStoreV4SourceInclusionReason::Tracked,
-                    ArtifactStoreV4SourceInclusionReason::CargoLock,
-                ],
+                inclusion_reasons: source_reasons.clone(),
                 mode: 0o100644,
                 byte_len: 42,
                 sha256: file_hash,
@@ -3704,6 +3714,15 @@ mod tests {
 
         snapshot.validate().expect("validate constructed snapshot");
         assert!(is_lower_sha256(&snapshot.identity_sha256));
+
+        for index in 0..source_reasons.len() {
+            let mut tampered_reasons = snapshot.clone();
+            tampered_reasons.entries[0].inclusion_reasons.remove(index);
+            assert!(matches!(
+                tampered_reasons.validate(),
+                Err(GauntletError::InvalidPreparedArtifact { .. })
+            ));
+        }
 
         let mut reordered = snapshot.clone();
         reordered.entries.reverse();
