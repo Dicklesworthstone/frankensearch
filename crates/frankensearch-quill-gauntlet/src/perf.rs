@@ -27,6 +27,7 @@ use crate::machine_class_registry::{
 };
 use crate::perf_assembly::PERF_EVIDENCE_ASSEMBLY_SCHEMA_VERSION;
 use crate::perf_evidence::PERF_EVIDENCE_SCHEMA_VERSION;
+use crate::perf_ratchet::PERF_HISTORY_POINTER_SCHEMA_VERSION;
 
 /// Version of the JSON emitted by the QG matrix harness.
 pub const PERF_ARTIFACT_SCHEMA_VERSION: &str = "quill-perf-artifact-v7";
@@ -898,6 +899,7 @@ fn validate_perf_manifest_schema_bindings(
         ("threshold_artifact", PERF_ARTIFACT_SCHEMA_VERSION),
         ("evidence_artifact", PERF_EVIDENCE_SCHEMA_VERSION),
         ("evidence_assembly", PERF_EVIDENCE_ASSEMBLY_SCHEMA_VERSION),
+        ("history_pointer", PERF_HISTORY_POINTER_SCHEMA_VERSION),
         ("machine_registry", MACHINE_CLASS_REGISTRY_SCHEMA_VERSION),
         ("applicability_plan", PERF_APPLICABILITY_PLAN_SCHEMA_VERSION),
         ("runner_completion_receipt", RUNNER_RECEIPT_SCHEMA_VERSION),
@@ -4910,6 +4912,7 @@ mod tests {
             ("threshold_artifact", PERF_ARTIFACT_SCHEMA_VERSION),
             ("evidence_artifact", PERF_EVIDENCE_SCHEMA_VERSION),
             ("evidence_assembly", PERF_EVIDENCE_ASSEMBLY_SCHEMA_VERSION),
+            ("history_pointer", PERF_HISTORY_POINTER_SCHEMA_VERSION),
             ("machine_registry", MACHINE_CLASS_REGISTRY_SCHEMA_VERSION),
             ("runner_completion_receipt", RUNNER_RECEIPT_SCHEMA_VERSION),
             (

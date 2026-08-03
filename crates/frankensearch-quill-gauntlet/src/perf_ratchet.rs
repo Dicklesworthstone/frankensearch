@@ -24,6 +24,8 @@ use crate::{
 
 /// Version of the machine-readable ratchet decision artifact.
 pub const PERF_RATCHET_SCHEMA_VERSION: &str = "quill-perf-ratchet-v4";
+/// Strict schema for the immutable pointer to an admitted history artifact pair.
+pub const PERF_HISTORY_POINTER_SCHEMA_VERSION: &str = "frankensearch.perf-history-pointer.v2";
 /// Maximum directional pass-over-pass regression admitted for a cell.
 pub const PERF_MAX_REGRESSION_PCT: f64 = 5.0;
 /// Maximum disagreement admitted between same-revision candidate reruns.

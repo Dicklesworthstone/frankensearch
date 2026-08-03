@@ -12,10 +12,11 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use frankensearch_quill_gauntlet::{
     ExecutionProfileId, HardwareClassId, MachineClassAdmissionContext, MachineClassRegistry,
-    MachineProfileKey, PERF_ARTIFACT_SCHEMA_VERSION, PerfEvidenceArtifact, PerfEvidenceFile,
-    PerfGate, PerfGateArtifact, PerfGateDecision, PerfRatchetMode, PerfRatchetRequest,
+    MachineProfileKey, PERF_ARTIFACT_SCHEMA_VERSION, PERF_EVIDENCE_SCHEMA_VERSION,
+    PERF_HISTORY_POINTER_SCHEMA_VERSION, PerfEvidenceArtifact, PerfEvidenceFile, PerfGate,
+    PerfGateArtifact, PerfGateDecision, PerfRatchetMode, PerfRatchetRequest,
     VerifiedRunnerIdentity, evaluate_perf_ratchet, is_explicit_bootstrap,
-    is_explicit_bootstrap_for, perf_manifest_contract_sha256, PERF_EVIDENCE_SCHEMA_VERSION,
+    is_explicit_bootstrap_for, perf_manifest_contract_sha256,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -49,8 +50,6 @@ Exit status: 0=Allow, 1=Block, 2=Quarantine, 64=invalid invocation.";
 
 type LoadedEvidence = (PerfEvidenceArtifact, Vec<u8>);
 type AdmittedRunnerReceipt = (VerifiedRunnerIdentity, Vec<u8>, Vec<u8>, Vec<u8>);
-
-const HISTORY_POINTER_SCHEMA_VERSION: &str = "frankensearch.perf-history-pointer.v2";
 
 fn current_bootstrap_basename(gate: PerfGate) -> String {
     let Some(version) = PERF_ARTIFACT_SCHEMA_VERSION.strip_prefix("quill-perf-artifact-") else {
@@ -828,15 +827,15 @@ fn read_baseline(
         );
     }
 
-    if schema_version != HISTORY_POINTER_SCHEMA_VERSION {
+    if schema_version != PERF_HISTORY_POINTER_SCHEMA_VERSION {
         return Err(format!(
-            "baseline {} has unsupported schema {schema_version:?}; expected current threshold {PERF_ARTIFACT_SCHEMA_VERSION:?} or history pointer {HISTORY_POINTER_SCHEMA_VERSION:?}",
+            "baseline {} has unsupported schema {schema_version:?}; expected current threshold {PERF_ARTIFACT_SCHEMA_VERSION:?} or history pointer {PERF_HISTORY_POINTER_SCHEMA_VERSION:?}",
             path.display()
         )
         .into());
     }
     let pointer = serde_json::from_value::<HistoryPointer>(probe)?;
-    if pointer.schema_version != HISTORY_POINTER_SCHEMA_VERSION
+    if pointer.schema_version != PERF_HISTORY_POINTER_SCHEMA_VERSION
         || serde_json::to_vec_pretty(&pointer)? != bytes
     {
         return Err(format!(
@@ -1105,6 +1104,7 @@ fn validate_manifest_schema_bindings(manifest: &toml::Value) -> Result<(), Box<d
     for (field, expected) in [
         ("threshold_artifact", PERF_ARTIFACT_SCHEMA_VERSION),
         ("evidence_artifact", PERF_EVIDENCE_SCHEMA_VERSION),
+        ("history_pointer", PERF_HISTORY_POINTER_SCHEMA_VERSION),
     ] {
         let found = schemas
             .get(field)
@@ -1181,7 +1181,7 @@ fn plan_history_if_requested(
     let rolling_evidence = history_dir.join(&evidence_file);
     let latest_pointer = history_dir.join(format!("{stem}.latest.json"));
     let pointer = HistoryPointer {
-        schema_version: HISTORY_POINTER_SCHEMA_VERSION.to_owned(),
+        schema_version: PERF_HISTORY_POINTER_SCHEMA_VERSION.to_owned(),
         gate,
         profile,
         run_id: candidate_run_id.to_owned(),
@@ -1480,6 +1480,24 @@ mod tests {
             stale_error.contains("schemas.evidence_artifact")
                 && stale_error.contains("quill-perf-evidence-v5"),
             "unexpected stale-schema error: {stale_error}"
+        );
+
+        let mut stale_history_pointer = manifest.clone();
+        stale_history_pointer
+            .get_mut("schemas")
+            .and_then(toml::Value::as_table_mut)
+            .expect("schema table")
+            .insert(
+                "history_pointer".to_owned(),
+                toml::Value::String("frankensearch.perf-history-pointer.v1".to_owned()),
+            );
+        let stale_history_pointer_error = validate_manifest_schema_bindings(&stale_history_pointer)
+            .expect_err("stale history-pointer schema must fail closed")
+            .to_string();
+        assert!(
+            stale_history_pointer_error.contains("schemas.history_pointer")
+                && stale_history_pointer_error.contains(PERF_HISTORY_POINTER_SCHEMA_VERSION),
+            "unexpected stale history-pointer schema error: {stale_history_pointer_error}"
         );
 
         let mut missing_threshold = manifest;
