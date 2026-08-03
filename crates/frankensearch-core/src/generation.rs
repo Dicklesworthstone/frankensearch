@@ -3999,6 +3999,42 @@ mod tests {
     }
 
     #[test]
+    fn lock_aware_resolver_rejects_wrong_roles_and_cross_root_evidence() {
+        let genesis = authority_reference(1, None);
+        let successor = authority_reference(2, Some(genesis.fingerprint()));
+        let first = authority_slot(1, genesis);
+        let second = authority_slot(0, successor);
+        let owner = authority_lock(GenerationLockFrameKindV1::Owner, successor);
+        assert_eq!(
+            resolve_authority_slots_with_locks_v1(Some(first), Some(second), None, Some(owner)),
+            Err(GenerationAuthorityErrorV1::InvalidField {
+                field: "generation_lock.attempt.kind"
+            }),
+            "owner frames cannot be reinterpreted as unresolved attempts"
+        );
+
+        let foreign_attempt = GenerationLockFrameV1::new(
+            GenerationLockFrameKindV1::Attempt,
+            [0x6b; 16],
+            [0x72; 16],
+            [0x73; 16],
+            1,
+            successor.fingerprint(),
+        )
+        .expect("well-formed foreign-root attempt");
+        assert_eq!(
+            resolve_authority_slots_with_locks_v1(
+                Some(first),
+                Some(second),
+                None,
+                Some(foreign_attempt),
+            ),
+            Err(GenerationAuthorityErrorV1::LockRootMismatch),
+            "attempt evidence from another root cannot block or select this authority"
+        );
+    }
+
+    #[test]
     fn authority_resolver_requires_an_exact_consecutive_predecessor() {
         let first = authority_reference(1, None);
         let second = authority_reference(2, Some(first.fingerprint()));
