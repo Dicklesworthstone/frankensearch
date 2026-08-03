@@ -16,6 +16,7 @@ use std::{
 };
 
 use asupersync::test_utils::{install_global_test_log_bridge, run_test_with_cx};
+use sha2::{Digest, Sha256};
 use tokenizers::{
     Tokenizer,
     models::wordlevel::WordLevel,
@@ -35,6 +36,7 @@ struct ChildOutput {
     status: ExitStatus,
     bytes: Vec<u8>,
     lines: usize,
+    output_sha256: String,
 }
 
 #[derive(Debug)]
@@ -43,10 +45,34 @@ enum ChildFailure {
         bytes: usize,
         lines: usize,
         status: ExitStatus,
+        output_sha256: String,
     },
     Timeout {
         status: ExitStatus,
+        output_sha256: String,
     },
+}
+
+fn output_sha256(bytes: &[u8], trailing: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    hasher.update(trailing);
+    let digest = hasher.finalize();
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut encoded = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+        encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
+    }
+    encoded
+}
+
+fn assert_sha256_digest(digest: &str) {
+    assert_eq!(digest.len(), 64, "output digest must be SHA-256");
+    assert!(
+        digest.bytes().all(|byte| byte.is_ascii_hexdigit()),
+        "output digest must be hexadecimal"
+    );
 }
 
 fn normalizer() -> Sequence {
@@ -205,6 +231,7 @@ fn read_bounded_child(mut child: Child, timeout: Duration) -> Result<ChildOutput
         if started.elapsed() > timeout {
             return Err(ChildFailure::Timeout {
                 status: terminate_and_reap(&mut child),
+                output_sha256: output_sha256(&bytes, &[]),
             });
         }
 
@@ -221,6 +248,7 @@ fn read_bounded_child(mut child: Child, timeout: Duration) -> Result<ChildOutput
                         bytes: bytes.len() + chunk.len(),
                         lines,
                         status: terminate_and_reap(&mut child),
+                        output_sha256: output_sha256(&bytes, &chunk),
                     });
                 }
                 bytes.extend_from_slice(&chunk);
@@ -237,10 +265,12 @@ fn read_bounded_child(mut child: Child, timeout: Duration) -> Result<ChildOutput
         }
     }
 
+    let output_sha256 = output_sha256(&bytes, &[]);
     Ok(ChildOutput {
         status: terminal_status.expect("exited child must have a status"),
         bytes,
         lines,
+        output_sha256,
     })
 }
 
@@ -305,6 +335,7 @@ fn run_passing_child_with_non_unicode_rust_log(case: &str) -> ChildOutput {
 
 fn assert_child_passed(case: &str, output: &ChildOutput) -> String {
     let text = String::from_utf8_lossy(&output.bytes).into_owned();
+    assert_sha256_digest(&output.output_sha256);
     assert!(
         output.status.success(),
         "fresh-process case {case:?} failed after {} lines:\n{text}",
@@ -424,7 +455,9 @@ fn fresh_process_output_limit_reaps_noisy_child() {
             bytes,
             lines,
             status,
+            output_sha256,
         }) => {
+            assert_sha256_digest(&output_sha256);
             assert!(bytes > 0, "bounded receipt must record observed output");
             assert!(lines > MAX_OUTPUT_LINES, "line limit did not trigger");
             assert!(
@@ -432,7 +465,11 @@ fn fresh_process_output_limit_reaps_noisy_child() {
                 "overflowing child must be terminated rather than succeed"
             );
         }
-        Err(ChildFailure::Timeout { status }) => {
+        Err(ChildFailure::Timeout {
+            status,
+            output_sha256,
+        }) => {
+            assert_sha256_digest(&output_sha256);
             panic!("noisy child hit wall-time bound instead of line cap: {status:?}");
         }
         Ok(output) => panic!(
@@ -450,7 +487,9 @@ fn fresh_process_byte_limit_reaps_noisy_child() {
             bytes,
             lines,
             status,
+            output_sha256,
         }) => {
+            assert_sha256_digest(&output_sha256);
             assert!(bytes > MAX_OUTPUT_BYTES, "byte limit did not trigger");
             assert!(
                 lines <= MAX_OUTPUT_LINES,
@@ -461,7 +500,11 @@ fn fresh_process_byte_limit_reaps_noisy_child() {
                 "overflowing child must be terminated rather than succeed"
             );
         }
-        Err(ChildFailure::Timeout { status }) => {
+        Err(ChildFailure::Timeout {
+            status,
+            output_sha256,
+        }) => {
+            assert_sha256_digest(&output_sha256);
             panic!("byte-only child hit wall-time bound instead of byte cap: {status:?}");
         }
         Ok(output) => panic!(
@@ -475,16 +518,23 @@ fn fresh_process_byte_limit_reaps_noisy_child() {
 #[test]
 fn fresh_process_timeout_reaps_stalled_child() {
     match run_child_with_timeout("timeout-stall", None, Duration::from_millis(50)) {
-        Err(ChildFailure::Timeout { status }) => assert!(
-            !status.success(),
-            "stalled child must be terminated rather than succeed"
-        ),
+        Err(ChildFailure::Timeout {
+            status,
+            output_sha256,
+        }) => {
+            assert_sha256_digest(&output_sha256);
+            assert!(
+                !status.success(),
+                "stalled child must be terminated rather than succeed"
+            );
+        }
         Err(ChildFailure::OutputLimit {
             bytes,
             lines,
             status,
+            output_sha256,
         }) => panic!(
-            "stalled child unexpectedly hit output cap: {bytes} bytes, {lines} lines, {status:?}"
+            "stalled child unexpectedly hit output cap: {bytes} bytes, {lines} lines, {status:?}, {output_sha256}"
         ),
         Ok(output) => panic!(
             "stalled child unexpectedly passed after {} bytes and {} lines",
