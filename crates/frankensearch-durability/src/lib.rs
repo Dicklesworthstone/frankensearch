@@ -40,7 +40,11 @@ pub use file_protector::{
     FileVerifyResult, HealthCheckResult, NoopDurability, RepairPipelineConfig,
 };
 pub use fsvi_protector::{FsviProtectionResult, FsviProtector, FsviRepairResult, FsviVerifyResult};
-pub use generation_root::{GenerationRootRouteErrorV1, GenerationRootRouteV1};
+pub use generation_root::{
+    GenerationRootAdmissionErrorV1, GenerationRootCapabilityV1, GenerationRootFilePolicyV1,
+    GenerationRootFileWitnessV1, GenerationRootRouteErrorV1, GenerationRootRouteV1,
+    RetainedGenerationRootFileV1,
+};
 pub use metrics::{DecodeOutcomeClass, DurabilityMetrics, DurabilityMetricsSnapshot};
 pub use repair_trailer::{
     REPAIR_TRAILER_MAGIC, REPAIR_TRAILER_VERSION, RepairSymbol, RepairTrailerHeader,
