@@ -470,6 +470,10 @@ fn real_tokenizers_log_output_requires_explicit_bridge_and_trace() {
     let panic_restoration_child = run_passing_child("panic-restoration", Some("trace"));
     assert_marker_is_suppressed("panic-restoration", &panic_restoration_child);
 
+    let cancellation_restoration_child =
+        run_passing_child("cancellation-restoration", Some("trace"));
+    assert_marker_is_suppressed("cancellation-restoration", &cancellation_restoration_child);
+
     let worker_dispatch_child = run_passing_child("worker-dispatch", Some("trace"));
     assert_marker_is_suppressed("worker-dispatch", &worker_dispatch_child);
 
@@ -661,6 +665,23 @@ fn fresh_process_child() {
             assert!(
                 restored,
                 "run_test_with_cx leaked its dispatcher after panic"
+            );
+            exercise_real_tokenizer();
+        }
+        "cancellation-restoration" => {
+            run_test_with_cx(|cx| async move {
+                cx.cancel_fast(asupersync::CancelKind::User);
+                assert!(
+                    cx.checkpoint().is_err(),
+                    "cancelled Cx checkpoint must fail"
+                );
+            });
+            let restored = tracing::dispatcher::get_default(|dispatch| {
+                dispatch.is::<tracing::subscriber::NoSubscriber>()
+            });
+            assert!(
+                restored,
+                "run_test_with_cx leaked its dispatcher after cancellation"
             );
             exercise_real_tokenizer();
         }
