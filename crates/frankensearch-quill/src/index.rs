@@ -14772,6 +14772,39 @@ mod tests {
         });
     }
 
+    #[cfg(feature = "profile-internals")]
+    #[test]
+    fn profiled_search_preserves_precheck_cancellation_without_work() {
+        run_with_cx(|cx| async move {
+            let directory = tempfile::tempdir().expect("cancelled profile directory");
+            let _writer = QuillIndex::create(&cx, directory.path(), deterministic_config())
+                .await
+                .expect("create cancelled profile writer");
+            let reader = QuillSearchIndex::open(&cx, directory.path(), deterministic_config())
+                .await
+                .expect("open cancelled profile reader");
+            let cancelled = cx.clone();
+            cancelled.set_cancel_requested(true);
+            let outcome = reader
+                .search_paginated_with_profile(&cancelled, "alpha", 10, 0, false)
+                .expect("profile admission must preserve ordinary cancellation");
+            let (error, receipt) = match outcome {
+                QuillProfiledSearchOutcome::Completed { .. } => {
+                    panic!("pre-cancelled profiled search unexpectedly completed")
+                }
+                QuillProfiledSearchOutcome::Failed { error, receipt } => (error, receipt),
+            };
+            assert!(
+                matches!(error, QuillIndexError::Cancelled { ref phase } if *phase == "search")
+            );
+            assert_eq!(receipt.cache(), QuillProfileCacheDisposition::NotChecked);
+            assert_eq!(receipt.execution(), None);
+            assert_eq!(receipt.work_plan(), None);
+            assert_eq!(receipt.counters(), (0, 0, 0, 0, 0));
+            assert_eq!(receipt.outcome(), QuillProfileOutcome::Cancelled);
+        });
+    }
+
     #[test]
     fn read_only_search_handle_coexists_with_writer_and_pins_publication() {
         run_with_cx(|cx| async move {
