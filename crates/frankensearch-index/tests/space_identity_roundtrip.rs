@@ -8,9 +8,12 @@
 //! join against the space fingerprint decoded from that artifact's own header
 //! bytes.
 //!
-//! Note on the `LegacyUnidentified` boundary: `create_v2` has zero production
-//! call sites today (`TwoTierIndexBuilder::finish` still routes through the
-//! legacy v1 constructors with `identity_v2: None`), so every production
+//! Note on the `LegacyUnidentified` boundary: the only production call sites
+//! of `create_v2` today are the two staging writes in the fusion crate's
+//! `RefreshWorker::stage_identity_bound_generation` (one per tier), whose
+//! output is staged and non-canonical until publication;
+//! `TwoTierIndexBuilder::finish` still routes through the legacy v1
+//! constructors with `identity_v2: None`, so every canonical production
 //! index is v1 and identity-less. Such artifacts never reach the verifiers
 //! exercised below — the seams route them as typed `LegacyUnidentified`
 //! reindex instead. This test proves the identity-bearing path those legacy

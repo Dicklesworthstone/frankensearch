@@ -298,9 +298,12 @@ impl BoundQueryEmbedding {
     ///
     /// `expected_space_fingerprint` must come from an identity-bearing
     /// source: an FSVI v2 header written by `VectorIndex::create_v2`, or an
-    /// explicitly supplied space identity. Today **zero production writers
-    /// call `create_v2`** — `TwoTierIndexBuilder::finish` routes through
-    /// the legacy v1 constructors with `identity_v2: None` — so every
+    /// explicitly supplied space identity. The only production writers that
+    /// call `create_v2` today are the two staging call sites in the fusion
+    /// crate's `RefreshWorker::stage_identity_bound_generation` (one per
+    /// tier), whose output is staged and non-canonical until publication —
+    /// `TwoTierIndexBuilder::finish` still routes through the legacy v1
+    /// constructors with `identity_v2: None` — so every *canonical*
     /// production index on disk is v1 and has *no* space fingerprint to
     /// pass here. Those artifacts must never reach this verifier: the seam
     /// routes them as typed `LegacyUnidentified`
@@ -349,6 +352,21 @@ impl BoundQueryEmbedding {
     ///   telemetry the caller is expected to record;
     /// - otherwise the pairing is rejected. A matching space fingerprint
     ///   alone never admits a foreign producer.
+    ///
+    /// # `ConformanceCompatibleProducer` is comparison-grade, NOT trust
+    ///
+    /// This is a *pairwise* check: it establishes only that the two bundles
+    /// AGREE with each other. Mutual agreement does not bind either producer
+    /// to any trusted fixture — two bundles carrying the same wrong (or
+    /// fabricated) certificate bytes still "agree". Verification against a
+    /// pinned trusted corpus is the trunk's certificate flow
+    /// ([`crate::generation::GoldenVectorCertificateV1::verify_exact_f32`]
+    /// and the witness flow in `generation.rs`), which this method deliberately
+    /// does not perform. Callers must therefore treat
+    /// `ConformanceCompatibleProducer` as comparison-grade telemetry and
+    /// never as an admission basis — the one production caller
+    /// (`require_same_producer` in the fusion crate's refresh path) logs the
+    /// outcome and refuses it.
     ///
     /// # Errors
     ///
