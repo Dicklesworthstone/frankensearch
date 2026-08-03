@@ -16842,6 +16842,38 @@ mod tests {
     }
 
     #[test]
+    fn gc_refuses_to_delete_a_newly_unreachable_segment_without_provenance() -> TestResult {
+        let directory = tempdir()?;
+        let live = write_test_segment(directory.path(), 0xa, 1, 0, 2)?;
+        let newly_unreachable = write_test_segment(directory.path(), 0xb, 2, 2, 4)?;
+        let previous = durable_test_manifest(2, vec![live.clone()]);
+        let mut current = durable_test_manifest(3, vec![live]);
+        current.docid_high_watermark = previous.docid_high_watermark;
+        write_manifest(&directory.path().join("MANIFEST.prev"), &previous)?;
+        write_manifest(&directory.path().join("MANIFEST"), &current)?;
+
+        let now = SystemTime::now()
+            .checked_add(DEFAULT_GARBAGE_GRACE + Duration::from_secs(1))
+            .expect("test clock remains representable");
+        let report = collect_writer_garbage_at(
+            directory.path(),
+            DEFAULT_SCHEMA,
+            GarbageCollectionOptions::default(),
+            now,
+        )?;
+
+        assert!(report.is_empty());
+        assert!(
+            directory
+                .path()
+                .join(canonical_segment_name(newly_unreachable.segment_id))
+                .exists(),
+            "a missing first-unreachable receipt must fail closed rather than infer age from mtime"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn future_claim_blocks_gc_before_any_deletion() -> TestResult {
         let directory = tempdir()?;
         write_manifest(
