@@ -3023,6 +3023,13 @@ fn release_checksum_url(tag: &str) -> String {
 }
 
 /// Construct the asset filename for a given version and target triple.
+///
+/// The release pipeline ships two archive families: full builds (embedded
+/// models; aarch64 macOS and Windows) named `fsfs-VERSION-TRIPLE`, and lite
+/// builds (loader-capable, no embedded models; both musl Linux targets and
+/// Intel macOS) named `fsfs-lite-VERSION-TRIPLE`. This constructor previously
+/// always produced the full-build name, so Linux self-update requested an
+/// asset that no release has ever contained and 404ed unconditionally.
 fn release_asset_filename(tag: &str, triple: &str) -> String {
     let version = tag.strip_prefix('v').unwrap_or(tag);
     let ext = if triple.contains("windows") {
@@ -3030,7 +3037,15 @@ fn release_asset_filename(tag: &str, triple: &str) -> String {
     } else {
         "tar.xz"
     };
-    format!("fsfs-{version}-{triple}.{ext}")
+    let family = if matches!(
+        triple,
+        "x86_64-unknown-linux-musl" | "aarch64-unknown-linux-musl" | "x86_64-apple-darwin"
+    ) {
+        "fsfs-lite"
+    } else {
+        "fsfs"
+    };
+    format!("{family}-{version}-{triple}.{ext}")
 }
 
 /// Extract the expected SHA-256 hash for a given asset filename from a
@@ -3059,6 +3074,20 @@ fn extract_hash_from_sums(sums_content: &str, asset_filename: &str) -> Option<St
         }
     }
     None
+}
+
+/// Extract the SHA-256 hash from a per-asset `.sha256` sidecar file.
+///
+/// The release pipeline writes these with `sha256sum archive > archive.sha256`,
+/// so the hash is the first whitespace-delimited token; anything that is not
+/// exactly 64 hex digits is rejected rather than trusted.
+fn extract_hash_from_sidecar(sidecar_content: &str) -> Option<String> {
+    let token = sidecar_content.split_whitespace().next()?;
+    if token.len() == 64 && token.chars().all(|c| c.is_ascii_hexdigit()) {
+        Some(token.to_owned())
+    } else {
+        None
+    }
 }
 
 // ─── Version Check Cache ───────────────────────────────────────────────────
@@ -4248,26 +4277,49 @@ impl FsfsRuntime {
         notes.push(format!("downloading {asset_url}"));
         download_release_asset(&asset_url, &archive_path)?;
 
-        // Download and verify checksum.
-        let expected_hash = if download_release_asset(&checksum_url, &checksum_path).is_ok() {
+        // Download and verify checksum: prefer the release-level SHA256SUMS,
+        // fall back to the per-asset `.sha256` sidecar the release pipeline
+        // ships for every archive, and refuse to install unverified bytes if
+        // neither source yields a hash (previously this path silently skipped
+        // verification whenever SHA256SUMS was absent — which it was for every
+        // release before v1.4.3).
+        let mut expected_hash = if download_release_asset(&checksum_url, &checksum_path).is_ok() {
             let content = fs::read_to_string(&checksum_path).unwrap_or_default();
             extract_hash_from_sums(&content, &asset_filename)
         } else {
-            notes.push("SHA256SUMS not available; skipping verification".into());
             None
         };
-
-        if let Some(ref expected) = expected_hash {
-            let actual = compute_sha256_of_file(&archive_path)?;
-            if !actual.eq_ignore_ascii_case(expected) {
-                return Err(SearchError::InvalidConfig {
-                    field: "update.checksum".into(),
-                    value: actual,
-                    reason: format!("SHA-256 mismatch: expected {expected}"),
-                });
+        if expected_hash.is_none() {
+            let sidecar_url = format!("{asset_url}.sha256");
+            let sidecar_path = temp_dir.join("asset.sha256");
+            if download_release_asset(&sidecar_url, &sidecar_path).is_ok() {
+                let content = fs::read_to_string(&sidecar_path).unwrap_or_default();
+                expected_hash = extract_hash_from_sidecar(&content);
+                if expected_hash.is_some() {
+                    notes.push("checksum sourced from per-asset .sha256 sidecar".into());
+                }
             }
-            notes.push("SHA-256 checksum verified".into());
         }
+        let Some(expected) = expected_hash else {
+            return Err(SearchError::InvalidConfig {
+                field: "update.checksum".into(),
+                value: asset_filename.clone(),
+                reason: format!(
+                    "no usable checksum: {checksum_url} lacks this asset and \
+                     {asset_url}.sha256 is unavailable; refusing to install an \
+                     unverified artifact"
+                ),
+            });
+        };
+        let actual = compute_sha256_of_file(&archive_path)?;
+        if !actual.eq_ignore_ascii_case(&expected) {
+            return Err(SearchError::InvalidConfig {
+                field: "update.checksum".into(),
+                value: actual,
+                reason: format!("SHA-256 mismatch: expected {expected}"),
+            });
+        }
+        notes.push("SHA-256 checksum verified".into());
 
         // Extract binary from the archive.
         let extract_dir = temp_dir.join("extract");
@@ -19914,8 +19966,29 @@ mod tests {
                 .await
                 .expect("publish first expansion witness");
 
+            // Full-mode execution requires a complete generation: the vector
+            // arm must exist alongside the lexical arm (fail-closed semantic
+            // generation contract). The cross-generation rejection under test
+            // is still driven by the lexical successor commit below.
+            let vector_path = temp.path().join(super::FSFS_VECTOR_INDEX_FILE);
+            fs::create_dir_all(vector_path.parent().expect("vector parent"))
+                .expect("create vector parent");
+            // cfg(test) resolves the fast embedder to HashEmbedder::default_256
+            // (id fnv1a-256), so the stored generation must carry that identity.
+            let vector = vec![0.125_f32; 256];
+            let mut vector_writer = VectorIndex::create(&vector_path, "fnv1a-256", vector.len())
+                .expect("create expansion vector index");
+            vector_writer
+                .write_record("alpha.md", &vector)
+                .expect("write expansion vector");
+            vector_writer.finish().expect("finish expansion vector arm");
+
             let mut config = FsfsConfig::default();
             config.storage.index_dir = temp.path().display().to_string();
+            // Hermetic embedder resolution: an empty model_dir forces the hash
+            // fallback so the active identity matches the hash-384 generation
+            // regardless of models cached on the host.
+            config.indexing.model_dir = temp.path().join("models").display().to_string();
             let runtime = FsfsRuntime::new(config).with_cli_input(CliInput {
                 index_dir: Some(temp.path().to_path_buf()),
                 ..CliInput::default()
@@ -25174,7 +25247,19 @@ mod tests {
             let model_root = temp.path().join("models");
             let potion_dir = model_root.join("potion-multilingual-128M");
             fs::create_dir_all(&potion_dir).expect("create model dir");
+            // The verifier requires the complete file set before checksumming;
+            // an absent member reports ModelNotFound instead of the checksum
+            // error this test pins. Corrupt every required file.
             fs::write(potion_dir.join("tokenizer.json"), b"broken").expect("write model file");
+            // The registered potion manifest lists tokenizer.json THEN
+            // model.safetensors. The fixture must be complete: with the
+            // weights file absent, per-file resolution fell through to the
+            // HOST cache on provisioned machines (mismatch reported, test
+            // green) but yielded ModelNotFound on bare CI runners. Writing
+            // both files pins the typed HashMismatch on tokenizer.json in
+            // every environment.
+            fs::write(potion_dir.join("model.safetensors"), b"also-broken")
+                .expect("write weights file");
 
             let mut config = FsfsConfig::default();
             config.indexing.model_dir = model_root.display().to_string();
@@ -26082,9 +26167,12 @@ mod tests {
 
     #[test]
     fn release_asset_url_format() {
+        // Linux ships lite archives only; the URL must use the fsfs-lite
+        // family or self-update 404s against every real release (the previous
+        // pin of the full-build name froze exactly that defect).
         let url = super::release_asset_url("v0.2.0", "x86_64-unknown-linux-musl");
         assert!(url.contains("v0.2.0"));
-        assert!(url.contains("fsfs-0.2.0-x86_64-unknown-linux-musl.tar.xz"));
+        assert!(url.contains("fsfs-lite-0.2.0-x86_64-unknown-linux-musl.tar.xz"));
         assert!(url.starts_with("https://github.com/"));
     }
 
@@ -26092,6 +26180,28 @@ mod tests {
     fn release_asset_url_windows_uses_zip() {
         let url = super::release_asset_url("v1.1.2", "x86_64-pc-windows-msvc");
         assert!(url.contains("fsfs-1.1.2-x86_64-pc-windows-msvc.zip"));
+    }
+
+    #[test]
+    fn release_asset_url_families_match_release_matrix() {
+        // Lite family: both musl targets and Intel macOS.
+        for triple in [
+            "x86_64-unknown-linux-musl",
+            "aarch64-unknown-linux-musl",
+            "x86_64-apple-darwin",
+        ] {
+            let name = super::release_asset_filename("v1.4.2", triple);
+            assert_eq!(name, format!("fsfs-lite-1.4.2-{triple}.tar.xz"));
+        }
+        // Full family: aarch64 macOS tarball and the Windows zip.
+        assert_eq!(
+            super::release_asset_filename("v1.4.2", "aarch64-apple-darwin"),
+            "fsfs-1.4.2-aarch64-apple-darwin.tar.xz"
+        );
+        assert_eq!(
+            super::release_asset_filename("v1.4.2", "x86_64-pc-windows-msvc"),
+            "fsfs-1.4.2-x86_64-pc-windows-msvc.zip"
+        );
     }
 
     #[test]
@@ -26134,7 +26244,7 @@ mod tests {
     fn release_asset_filename_includes_version_and_triple() {
         assert_eq!(
             super::release_asset_filename("v1.1.2", "x86_64-unknown-linux-musl"),
-            "fsfs-1.1.2-x86_64-unknown-linux-musl.tar.xz"
+            "fsfs-lite-1.1.2-x86_64-unknown-linux-musl.tar.xz"
         );
         assert_eq!(
             super::release_asset_filename("v1.1.2", "x86_64-pc-windows-msvc"),
@@ -28023,35 +28133,33 @@ mod tests {
     }
 
     #[test]
-    fn missing_checksum_file_not_reported_as_verified() {
-        // Simulate the update path where SHA256SUMS download fails:
-        // expected_hash should be None, and "SHA-256 checksum verified"
-        // should NOT appear in notes.
-        let mut notes: Vec<String> = Vec::new();
-        let checksum_download_ok = false; // simulate download failure
+    fn sidecar_hash_extraction_accepts_sha256sum_output() {
+        // `sha256sum archive > archive.sha256` format: hash, spaces, filename.
+        let content = "b4fd38c6488aaff5e73af315c1d5f923277e1d1f7b987f96cd028515f5e564a6  fsfs-lite-1.4.3-x86_64-unknown-linux-musl.tar.xz\n";
+        assert_eq!(
+            super::extract_hash_from_sidecar(content).as_deref(),
+            Some("b4fd38c6488aaff5e73af315c1d5f923277e1d1f7b987f96cd028515f5e564a6")
+        );
+        // Bare hash with no filename is also acceptable sidecar content.
+        let bare = "b4fd38c6488aaff5e73af315c1d5f923277e1d1f7b987f96cd028515f5e564a6";
+        assert!(super::extract_hash_from_sidecar(bare).is_some());
+    }
 
-        let expected_hash: Option<String> = if checksum_download_ok {
-            Some("abc".into())
-        } else {
-            notes.push("SHA256SUMS not available; skipping verification".into());
-            None
-        };
-
-        // When expected_hash is None, the checksum block is skipped entirely.
-        if let Some(ref expected) = expected_hash {
-            notes.push(format!("SHA-256 checksum verified against {expected}"));
+    #[test]
+    fn sidecar_hash_extraction_rejects_non_hash_content() {
+        // A 404 HTML page, truncated hash, or non-hex token must never be
+        // trusted as a checksum (the fallback would otherwise turn an error
+        // page into a guaranteed mismatch at best, or worse with a crafted
+        // token).
+        for bad in [
+            "<html>Not Found</html>",
+            "abc123",
+            "zz".repeat(32).as_str(),
+            "",
+            "   \n",
+        ] {
+            assert_eq!(super::extract_hash_from_sidecar(bad), None, "{bad:?}");
         }
-
-        assert!(expected_hash.is_none());
-        assert!(
-            !notes.iter().any(|n| n.contains("checksum verified")),
-            "missing checksum file must NOT produce 'verified' note: {:?}",
-            notes
-        );
-        assert!(
-            notes.iter().any(|n| n.contains("skipping verification")),
-            "missing checksum file should note that verification was skipped"
-        );
     }
 
     // --- 3. Platform detection ---

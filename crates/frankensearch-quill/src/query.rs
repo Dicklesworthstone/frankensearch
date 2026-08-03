@@ -808,6 +808,7 @@ impl DefaultQueryParser {
         if let Some(node) = parsed.as_mut() {
             rewrite_parser_syntax(node);
             trim_parser_dropped(&mut node.query, &node.dedup_key);
+            flatten_should_of_should(&mut node.query);
         }
         repair_root_all_negative(&mut parsed, &mut grammar);
 
@@ -2186,16 +2187,18 @@ impl Grammar {
     }
 
     fn parse_or(&mut self, depth: usize) -> Option<ParsedNode> {
-        let mut nodes = Vec::new();
-        let mut syntactic_operands = 0;
-        let mut explicit_or = false;
+        let mut top_nodes = Vec::new();
+        let mut top_operands = 0_usize;
+        let mut run_nodes = Vec::new();
+        let mut run_operands = 0_usize;
+        let mut run_explicit = false;
         let mut joined_from_explicit_or = false;
 
         loop {
             if !self.peek().is_some_and(LexToken::can_start_operand) {
                 break;
             }
-            syntactic_operands += 1;
+            run_operands += 1;
             let mut node = self.parse_and(depth);
             let joined_to_explicit_or = matches!(self.peek(), Some(LexToken::Or(_)));
             if let Some(node) = node.as_mut()
@@ -2205,7 +2208,7 @@ impl Grammar {
                 wrap_direct_negative_or_operand(node);
             }
             if let Some(node) = node {
-                nodes.push(node);
+                run_nodes.push(node);
             }
             if let Some(LexToken::Or(offset)) = self.peek() {
                 let offset = *offset;
@@ -2216,16 +2219,72 @@ impl Grammar {
                     self.syntax_diagnostic_at("syntax recovery: OR has no right operand", offset);
                     break;
                 }
-                explicit_or = true;
+                run_explicit = true;
                 joined_from_explicit_or = true;
             } else if !self.peek().is_some_and(LexToken::can_start_operand) {
                 break;
             } else {
                 joined_from_explicit_or = false;
+                Self::flush_or_run(
+                    &mut top_nodes,
+                    &mut top_operands,
+                    &mut run_nodes,
+                    &mut run_operands,
+                    &mut run_explicit,
+                );
             }
         }
 
-        combine_or(nodes, syntactic_operands, explicit_or)
+        if top_operands == 0 {
+            // The whole chain is one run — a pure explicit-OR chain, a pure
+            // implicit chain, or a single operand. Keep the historical flat
+            // combination, including its same-level duplicate-retention rule.
+            return combine_or(run_nodes, run_operands, run_explicit);
+        }
+        Self::flush_or_run(
+            &mut top_nodes,
+            &mut top_operands,
+            &mut run_nodes,
+            &mut run_operands,
+            &mut run_explicit,
+        );
+        combine_or(top_nodes, top_operands, false)
+    }
+
+    /// Close one explicit-`OR` run at an implicit-adjacency boundary.
+    ///
+    /// The pinned grammar nests an explicit `OR` expression as its own node
+    /// beneath the implicit disjunction, so its operands live one level below
+    /// operands joined by plain adjacency — and the duplicate-retention
+    /// rewrite, which only compares children of the SAME boolean level, never
+    /// dedups across that boundary. Flattening the whole mixed chain instead
+    /// made Quill drop a trailing operand that duplicates an OR-run member,
+    /// scoring exactly one clause short of the oracle (bd-htcun, found by the
+    /// bd-bsjw campaign as a clean 2.0x score deficit on
+    /// `slices OR title:Nested AND reused slices`).
+    fn flush_or_run(
+        top_nodes: &mut Vec<ParsedNode>,
+        top_operands: &mut usize,
+        run_nodes: &mut Vec<ParsedNode>,
+        run_operands: &mut usize,
+        run_explicit: &mut bool,
+    ) {
+        if *run_operands == 0 && run_nodes.is_empty() {
+            return;
+        }
+        *top_operands += 1;
+        let nodes = std::mem::take(run_nodes);
+        let operands = std::mem::replace(run_operands, 0);
+        let explicit = std::mem::replace(run_explicit, false);
+        if explicit {
+            if let Some(node) = combine_or(nodes, operands, true) {
+                top_nodes.push(node);
+            }
+        } else {
+            // An adjacency boundary closes a run immediately, so a run
+            // without an explicit OR is a single implicit operand.
+            top_nodes.extend(nodes);
+        }
     }
 
     fn parse_and(&mut self, depth: usize) -> Option<ParsedNode> {
@@ -2308,14 +2367,17 @@ impl Grammar {
             node.dedup_key = negative_boolean_dedup_key(dedup_key);
         }
         if not_count != 0 {
-            if occur.is_some() {
-                wrap_not_for_and(&mut node);
-            } else {
-                node.occur = Some(Occur::MustNot);
-                node.from_not = true;
-            }
-        }
-        if let Some(occur) = occur {
+            // A `NOT` stacked with an explicit `+`/`-` prefix (`NOT -x`) sits
+            // outside the contract grammar's single-prefix fragment rule; the
+            // pinned oracle collapses the stack to ONE exclusion rather than
+            // composing a double negation (bd-251nt, found by the bd-bsjw
+            // structure-aware campaign; oracle behavior pinned by
+            // stacked_negation_prefixes_pin_oracle_semantics in the lexical
+            // crate). `NOT +x` is unprobed on the oracle and takes the same
+            // collapse; revisit with a probe before relying on it.
+            node.occur = Some(Occur::MustNot);
+            node.from_not = true;
+        } else if let Some(occur) = occur {
             node.occur = Some(occur);
         }
         Some(node)
@@ -2950,6 +3012,51 @@ fn wrap_not_for_and(node: &mut ParsedNode) {
 
 fn negative_boolean_dedup_key(child: SyntaxKey) -> SyntaxKey {
     SyntaxKey::Boolean(vec![(Some(Occur::MustNot), child)])
+}
+
+/// Mirror the pinned grammar's lowering: an optional (`Should`) clause whose
+/// child is an all-optional boolean splices its children into the parent.
+///
+/// Duplicate retention already ran on the NESTED syntax (where the pinned
+/// grammar keeps explicit-`OR` runs and parenthesised groups one level below
+/// the implicit disjunction — bd-htcun), but the oracle then FLATTENS
+/// pure-disjunctive nesting for execution, so score accumulation associates
+/// left-to-right over one flat clause list. Executing the nested shape
+/// instead diverges by ULPs on boosted mixes (campaign finding: 2-ULP
+/// `RankMismatch` on `((small^3.0 OR when AND this reused) OR tracing NOT
+/// generic)`). Flattening after dedup reproduces the oracle's association
+/// exactly. A non-`Should` occurrence or a mixed-occurrence child is a
+/// boundary, as is any non-boolean node (boosts included).
+fn flatten_should_of_should(query: &mut Query) {
+    let Query::Boolean { clauses, .. } = query else {
+        return;
+    };
+    for clause in clauses.iter_mut() {
+        flatten_should_of_should(&mut clause.query);
+    }
+    let mut flattened = Vec::with_capacity(clauses.len());
+    for clause in clauses.drain(..) {
+        let splice = clause.occur == Occur::Should
+            && matches!(
+                &clause.query,
+                Query::Boolean { clauses: children, .. }
+                    if children
+                        .iter()
+                        .all(|child| child.occur == Occur::Should)
+            );
+        if splice {
+            let Query::Boolean {
+                clauses: children, ..
+            } = clause.query
+            else {
+                unreachable!("splice guard matched a boolean");
+            };
+            flattened.extend(children);
+        } else {
+            flattened.push(clause);
+        }
+    }
+    *clauses = flattened;
 }
 
 fn combine_and(nodes: Vec<ParsedNode>, syntactic_operands: usize) -> Option<ParsedNode> {
@@ -5846,6 +5953,51 @@ mod tests {
         );
     }
 
+    /// A trailing operand that duplicates an explicit-OR-run member must
+    /// SURVIVE: the pinned grammar nests the OR run one level below the
+    /// implicit disjunction, so duplicate retention never crosses that
+    /// boundary (bd-htcun) — and the nesting then FLATTENS for execution so
+    /// score accumulation associates exactly like the oracle's. A pure
+    /// implicit chain still dedups.
+    #[test]
+    fn mixed_chain_duplicate_survives_or_run_nesting() {
+        let mixed = parser().parse("alpha OR beta AND gamma alpha");
+        let Query::Boolean { clauses, .. } = &mixed.query else {
+            panic!("mixed chain must lower to a boolean: {:?}", mixed.query);
+        };
+        assert_eq!(
+            clauses.len(),
+            3,
+            "flattened execution shape: alpha, the AND group, and the \
+             SURVIVING trailing duplicate: {clauses:?}"
+        );
+        assert!(
+            matches!(&clauses[0].query, Query::Term { text, .. } if text == "alpha"),
+            "leading operand first: {clauses:?}"
+        );
+        assert!(
+            matches!(&clauses[2].query, Query::Term { text, .. } if text == "alpha"),
+            "the trailing duplicate survives after flattening: {clauses:?}"
+        );
+
+        let pure = parser().parse("alpha alpha");
+        let Query::Boolean {
+            clauses: pure_clauses,
+            ..
+        } = &pure.query
+        else {
+            panic!(
+                "two-operand implicit chain lowers to a boolean: {:?}",
+                pure.query
+            );
+        };
+        assert_eq!(
+            pure_clauses.len(),
+            1,
+            "a pure implicit chain still retains only the first duplicate: {pure_clauses:?}"
+        );
+    }
+
     #[test]
     fn field_ids_not_backend_handles_are_stored_in_leaves() {
         let parsed = parser().parse("title:Rust");
@@ -6046,9 +6198,14 @@ mod tests {
             panic!("raw-distinct groups must both survive");
         };
         assert_eq!(clauses.len(), 2);
-        assert!(clauses.iter().all(|clause| {
-            matches!(&clause.query, Query::Boolean { clauses, .. } if clauses.len() == 1)
-        }));
+        // Raw-identity dedup ran on the NESTED syntax (distinct /x/ vs /y/
+        // prevent it), then the post-trim singleton groups splice into the
+        // parent for oracle-associated execution (bd-htcun flatten).
+        assert!(
+            clauses
+                .iter()
+                .all(|clause| { matches!(&clause.query, Query::Term { text, .. } if text == "a") })
+        );
 
         let Query::Boolean { clauses, .. } = parser().parse("(a /x/) (a /x/)").query else {
             panic!("the rewritten duplicate keeps its root Boolean");
@@ -6844,6 +7001,7 @@ mod tests {
         if let Some(node) = parsed.as_mut() {
             rewrite_parser_syntax(node);
             trim_parser_dropped(&mut node.query, &node.dedup_key);
+            flatten_should_of_should(&mut node.query);
         }
         repair_root_all_negative(&mut parsed, &mut grammar);
         ParsedQuery {

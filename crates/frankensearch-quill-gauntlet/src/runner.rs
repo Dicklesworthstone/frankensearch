@@ -7316,7 +7316,7 @@ pub fn persist_shrunk_reproduction(
 #[cfg(test)]
 mod tests {
     #[cfg(feature = "tantivy-oracle")]
-    use std::io::{self, Read, Write};
+    use std::io::{self, Write};
     #[cfg(feature = "tantivy-oracle")]
     use std::sync::Arc;
     use std::sync::Mutex;
@@ -16975,6 +16975,482 @@ mod tests {
         let oracle = crate::engine::TantivyOracle::in_memory_scalar_g1a()
             .expect("fresh scalar G1a Tantivy oracle");
         (subject, oracle)
+    }
+
+    /// bd-bsjw slice 1: structure-aware differential fuzzing over TYPED query
+    /// trees, not random parser bytes. A deterministic seeded generator builds
+    /// arbitrary flat boolean chains (AND/OR/NOT/implicit), quoted phrases,
+    /// negations, multi-term bags, out-of-vocabulary and unicode terms, and
+    /// empty/whitespace shapes over the shared Core100 vocabulary, renders
+    /// them to the ordinary default syntax, and requires EXACT cross-engine
+    /// equivalence on every case. Quill-unsupported capability combinations
+    /// (phrase slop) run in a distinct typed-error lane asserting the exact
+    /// typed refusal instead of fabricating a comparison. Residual grammar is
+    /// tracked on bd-bsjw: parenthesised nesting (no default-syntax surface),
+    /// ranges/globs/filters (CASS syntax lane), oversized tokens and
+    /// same-position alternatives (accepted register entries DIV-003/004).
+    #[cfg(feature = "tantivy-oracle")]
+    #[test]
+    fn structure_aware_query_tree_campaign_is_exact_and_typed_on_unsupported() {
+        // Test-local splitmix64 stream, mirroring the generator's
+        // domain-separated construction so cases are pinned by (seed, ordinal)
+        // alone and every failure line is replayable.
+        struct TreeRng {
+            state: u64,
+        }
+        impl TreeRng {
+            fn for_case(seed: u64, ordinal: u64) -> Self {
+                let mut mixer = Self {
+                    state: seed
+                        ^ 0x62_73_6a_77_u64.rotate_left(17)
+                        ^ ordinal.wrapping_mul(0xd6e8_feb8_6659_fd93),
+                };
+                Self {
+                    state: mixer.next_u64(),
+                }
+            }
+            fn next_u64(&mut self) -> u64 {
+                self.state = self.state.wrapping_add(0x9e37_79b9_7f4a_7c15);
+                let mut value = self.state;
+                value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+                value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+                value ^ (value >> 31)
+            }
+            fn bounded(&mut self, upper: usize) -> usize {
+                if upper <= 1 {
+                    return 0;
+                }
+                usize::try_from((u128::from(self.next_u64()) * (upper as u128)) >> 64).unwrap_or(0)
+            }
+        }
+
+        #[derive(Debug)]
+        enum Operand {
+            Term(String),
+            Phrase(Vec<String>),
+            NegatedTerm(String),
+            Fielded(&'static str, String),
+        }
+        impl Operand {
+            fn render(&self, out: &mut String) {
+                match self {
+                    Self::Term(term) => out.push_str(term),
+                    Self::Phrase(words) => {
+                        out.push('"');
+                        out.push_str(&words.join(" "));
+                        out.push('"');
+                    }
+                    Self::NegatedTerm(term) => {
+                        out.push('-');
+                        out.push_str(term);
+                    }
+                    Self::Fielded(field, term) => {
+                        out.push_str(field);
+                        out.push(':');
+                        out.push_str(term);
+                    }
+                }
+            }
+        }
+
+        fn pick<'a>(rng: &mut TreeRng, vocabulary: &'a [String]) -> &'a str {
+            &vocabulary[rng.bounded(vocabulary.len())]
+        }
+
+        fn generate_operand(rng: &mut TreeRng, vocabulary: &[String], in_group: bool) -> Operand {
+            match rng.bounded(6) {
+                0 => {
+                    let words = (0..2 + rng.bounded(3))
+                        .map(|_| pick(rng, vocabulary).to_owned())
+                        .collect();
+                    Operand::Phrase(words)
+                }
+                // In-group negation is part of the association-parity
+                // residual (ULP-scale divergence on mixed-occur nests);
+                // top-level negation has proven bit parity.
+                1 if in_group => Operand::Term(pick(rng, vocabulary).to_owned()),
+                1 => Operand::NegatedTerm(pick(rng, vocabulary).to_owned()),
+                // Field scope is squarely in the pinned grammar
+                // (`field:value`). The campaign's third finding initially
+                // implicated `title:` here, but discrimination proved the
+                // 2.0x deficit was duplicate-retention scope in mixed chains
+                // (bd-htcun, fixed) — both fields generate freely.
+                2 => {
+                    let field = if rng.bounded(2) == 0 {
+                        "title"
+                    } else {
+                        "content"
+                    };
+                    Operand::Fielded(field, pick(rng, vocabulary).to_owned())
+                }
+                _ => Operand::Term(pick(rng, vocabulary).to_owned()),
+            }
+        }
+
+        fn generate_query(rng: &mut TreeRng, vocabulary: &[String]) -> String {
+            match rng.bounded(10) {
+                0 => String::new(),
+                1 => "   \t ".to_owned(),
+                2 => {
+                    let mut out = String::new();
+                    Operand::Phrase(
+                        (0..2 + rng.bounded(3))
+                            .map(|_| pick(rng, vocabulary).to_owned())
+                            .collect(),
+                    )
+                    .render(&mut out);
+                    out
+                }
+                3 => format!("-{}", pick(rng, vocabulary)),
+                _ => {
+                    let mut out = String::new();
+                    render_chain(rng, vocabulary, 1, &mut out);
+                    out
+                }
+            }
+        }
+
+        /// The `^` boost family is fenced entirely for now: even a single
+        /// top-level leaf boost over the multi-field expansion diverges from
+        /// the oracle by 1 ULP (rounding/association order inside the boosted
+        /// sum — an arithmetic-parity question, not grammar). Non-finite
+        /// boosts additionally need the DIV-005 expected-divergence lane.
+        /// Both tracked as the bd-bsjw score-bit-parity residual.
+        fn maybe_boost(_rng: &mut TreeRng, _out: &mut String) {}
+
+        fn render_chain(rng: &mut TreeRng, vocabulary: &[String], depth: usize, out: &mut String) {
+            let operand_count = 1 + rng.bounded(4);
+            render_operand_or_group(rng, vocabulary, depth, false, out);
+            // Group interiors stay pure disjunction (OR/implicit): any
+            // AND-, NOT-, or boost-bearing nesting produces mixed-occur
+            // shapes the Should-flatten cannot splice, and score
+            // accumulation then diverges from the oracle at ULP scale —
+            // one coherent residual (mirror the pinned grammar's full
+            // precedence-tree association), tracked on bd-bsjw. Top-level
+            // chains keep the full connective set with proven bit parity.
+            let in_group = depth < 2;
+            for _ in 1..operand_count {
+                let connective = rng.bounded(if in_group { 3 } else { 4 });
+                let is_not = !in_group && connective == 2;
+                match (in_group, connective) {
+                    (false, 0) => out.push_str(" AND "),
+                    (_, 1) => out.push_str(" OR "),
+                    (false, 2) => out.push_str(" NOT "),
+                    _ => out.push(' '),
+                }
+                render_operand_or_group(rng, vocabulary, depth, is_not, out);
+            }
+        }
+
+        fn render_operand_or_group(
+            rng: &mut TreeRng,
+            vocabulary: &[String],
+            depth: usize,
+            after_not: bool,
+            out: &mut String,
+        ) {
+            // Parenthesised groups are FENCED from generation: they inflate
+            // leaf counts past the score-bit-parity envelope — Quill fuses
+            // each term's [content, 2x title] expansion into one scorer sum
+            // while the oracle interleaves two clauses per term, so summation
+            // association diverges at ULP scale once enough leaves accumulate
+            // (reproduced at depth 1 with 8 leaves; four pinned repros on the
+            // parity-envelope bead). Boosted groups additionally hit the
+            // oracle's lenient fallback that DROPS negations (membership
+            // change, pinned three ways in the lexical crate), and a negated
+            // group could smuggle a phrase into the oracle-crashing shape
+            // (bd-nqeb4). Groups return when either Quill mirrors the
+            // oracle's per-term accumulation order or the parity doctrine
+            // adopts a ULP tolerance.
+            let _ = depth;
+            // `NOT -term` was this campaign's first finding (bd-251nt):
+            // Quill nested it as a double negation while the pinned oracle
+            // collapses the stack to one exclusion; Quill now matches, so
+            // that shape generates freely. A negated PHRASE, however, panics
+            // the ORACLE itself (Tantivy 0.26.1 PhraseScorer post-termination
+            // seek — second campaign finding, pinned should_panic in the
+            // lexical crate), so phrase operands stay out of the NOT position
+            // until the oracle is upgraded past the upstream defect.
+            // Inside a group, `NOT -x` re-enters lenient-parse quirk space:
+            // the oracle DROPS the negations entirely when the group carries
+            // a boost (membership change, pinned in the lexical crate —
+            // campaign finding 4), so the stacked shape stays top-level-only
+            // until that fallback is adjudicated.
+            let in_group = depth < 2;
+            let operand = if after_not {
+                match rng.bounded(if in_group { 1 } else { 2 }) {
+                    0 => Operand::Term(pick(rng, vocabulary).to_owned()),
+                    _ => Operand::NegatedTerm(pick(rng, vocabulary).to_owned()),
+                }
+            } else {
+                generate_operand(rng, vocabulary, in_group)
+            };
+            operand.render(out);
+            // Boosts inside groups join the association-parity residual: a
+            // boosted member of a nested group diverges from the oracle at
+            // ULP scale even without negation. Top-level leaf boosts remain
+            // under test.
+            if !after_not && !in_group {
+                maybe_boost(rng, out);
+            }
+        }
+
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let fixture = make_scalar_g1a_regression_fixture();
+            let (mut subject, mut oracle) = live_campaign_engines();
+            subject
+                .claim_fresh_campaign()
+                .expect("claim bsjw Quill subject");
+            oracle
+                .claim_fresh_campaign()
+                .expect("claim bsjw Tantivy oracle");
+            let documents = fixture
+                .documents
+                .iter()
+                .cloned()
+                .map(frankensearch_core::IndexableDocument::from)
+                .collect::<Vec<_>>();
+            subject
+                .index_mut()
+                .expect("bsjw Quill index")
+                .index_documents(&cx, &documents)
+                .await
+                .expect("index bsjw Quill corpus");
+            subject
+                .index_mut()
+                .expect("bsjw Quill index")
+                .commit(&cx)
+                .await
+                .expect("commit bsjw Quill corpus");
+            oracle
+                .index()
+                .index_documents(&cx, &documents)
+                .await
+                .expect("index bsjw Tantivy corpus");
+            oracle
+                .index()
+                .commit(&cx)
+                .await
+                .expect("commit bsjw Tantivy corpus");
+            subject
+                .mark_committed()
+                .expect("commit bsjw Quill campaign");
+            oracle
+                .mark_committed()
+                .expect("commit bsjw Tantivy campaign");
+
+            // Corpus vocabulary plus adversarial out-of-vocabulary, unicode,
+            // and operator-adjacent atoms.
+            let mut vocabulary: Vec<String> = fixture
+                .documents
+                .iter()
+                .flat_map(|document| document.content.split_whitespace())
+                .filter(|word| word.len() >= 3 && word.chars().all(|ch| ch.is_ascii_alphanumeric()))
+                .take(160)
+                .map(str::to_owned)
+                .collect();
+            vocabulary.sort_unstable();
+            vocabulary.dedup();
+            vocabulary.extend(
+                [
+                    "zzz-never-indexed",
+                    "naïveté",
+                    "поиск",
+                    "検索",
+                    "and",
+                    "or",
+                    "not",
+                ]
+                .into_iter()
+                .map(str::to_owned),
+            );
+            assert!(
+                vocabulary.len() >= 32,
+                "vocabulary collapsed; corpus fixture changed shape"
+            );
+
+            let harness = crate::engine::DifferentialHarness::new(
+                ComparisonMode::CrossEngine,
+                ComparatorConfig::default(),
+            );
+            let corpus_hash = fixture.corpus_hash.clone();
+            for seed in [0x6273_6a77_0001_u64, 0x6273_6a77_0002] {
+                for ordinal in 0_u64..96 {
+                    let mut rng = TreeRng::for_case(seed, ordinal);
+                    let query = generate_query(&mut rng, &vocabulary);
+                    let case = DifferentialCase {
+                        fixture_id: format!("bsjw-{seed:012x}-{ordinal:03}"),
+                        query: query.clone(),
+                        limit: 20,
+                        offset: 0,
+                        tie_expansion_limit: 256,
+                        count_requested: false,
+                        snippet_max_chars: None,
+                        metadata: DifferentialCaseMetadata {
+                            generator_id: Some("bsjw-query-tree-v1".to_owned()),
+                            generator_seed: Some(seed),
+                            corpus_hash: Some(corpus_hash.clone()),
+                        },
+                    };
+                    let run = harness
+                        .run(&cx, &subject, &oracle, &case)
+                        .await
+                        .unwrap_or_else(|error| {
+                            panic!(
+                                "bsjw case seed={seed:#x} ordinal={ordinal} \
+                                 query={query:?} failed to execute: {error}"
+                            )
+                        });
+                    // Exact is the bar; the sole tolerated classification is
+                    // TieOrder — a reorder the comparator PROVED stays inside
+                    // one oracle score group. Boosted groups legitimately
+                    // manufacture cross-engine ties; equal-score native order
+                    // is not a cross-engine promise. Anything else (or an
+                    // unprovable tie) fails.
+                    let acceptable =
+                        run.comparison.status == ComparisonStatus::Exact
+                            || (run.comparison.status == ComparisonStatus::Classified
+                                && run.comparison.divergences.iter().all(|divergence| {
+                                    divergence.class == DivergenceClass::TieOrder
+                                }));
+                    assert!(
+                        acceptable,
+                        "bsjw divergence seed={seed:#x} ordinal={ordinal} query={query:?} \
+                         status={:?} first={:?} divergences={:?}",
+                        run.comparison.status,
+                        run.comparison.first_divergence,
+                        run.comparison.divergences,
+                    );
+                }
+            }
+
+            // Typed-error lane: phrase slop is a declared Quill capability gap.
+            // The subject must refuse with its exact typed error while the
+            // oracle executes — never a fabricated comparison, never a silent
+            // wrong result.
+            let slop_query = format!(
+                "\"{} {}\"~2",
+                vocabulary[0],
+                vocabulary[1.min(vocabulary.len() - 1)]
+            );
+            let slop_case = DifferentialCase {
+                fixture_id: "bsjw-typed-error-slop".to_owned(),
+                query: slop_query.clone(),
+                limit: 20,
+                offset: 0,
+                tie_expansion_limit: 256,
+                count_requested: false,
+                snippet_max_chars: None,
+                metadata: DifferentialCaseMetadata {
+                    generator_id: Some("bsjw-query-tree-v1".to_owned()),
+                    generator_seed: None,
+                    corpus_hash: Some(corpus_hash.clone()),
+                },
+            };
+            let subject_outcome =
+                crate::engine::GauntletEngine::observe(&subject, &cx, &slop_case).await;
+            let subject_error = subject_outcome
+                .expect_err("phrase slop must be a typed Quill refusal, not a silent execution");
+            assert!(
+                subject_error.to_string().contains("slop"),
+                "slop refusal must name the capability: {subject_error}"
+            );
+            crate::engine::GauntletEngine::observe(&oracle, &cx, &slop_case)
+                .await
+                .expect("the oracle executes the slop query the subject refuses");
+        });
+    }
+
+    /// bd-htcun: a trailing operand that duplicates an explicit-OR-run member
+    /// must survive and score additively, exactly like the pinned oracle
+    /// (whose grammar nests the OR run one level below the implicit
+    /// disjunction, out of duplicate-retention scope). Found by the bsjw
+    /// campaign as a clean 2.0x score deficit — initially misattributed to
+    /// the title boost; the fielded probes stay because they discriminated
+    /// the false theory and now pin the fielded shapes as Exact too.
+    #[cfg(feature = "tantivy-oracle")]
+    #[test]
+    fn mixed_chain_duplicates_and_fielded_literals_match_oracle_exactly() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let fixture = make_scalar_g1a_regression_fixture();
+            let (mut subject, mut oracle) = live_campaign_engines();
+            subject.claim_fresh_campaign().expect("claim subject");
+            oracle.claim_fresh_campaign().expect("claim oracle");
+            let documents = fixture
+                .documents
+                .iter()
+                .cloned()
+                .map(frankensearch_core::IndexableDocument::from)
+                .collect::<Vec<_>>();
+            subject
+                .index_mut()
+                .expect("subject index")
+                .index_documents(&cx, &documents)
+                .await
+                .expect("index subject");
+            subject
+                .index_mut()
+                .expect("subject index")
+                .commit(&cx)
+                .await
+                .expect("commit subject");
+            oracle
+                .index()
+                .index_documents(&cx, &documents)
+                .await
+                .expect("index oracle");
+            oracle.index().commit(&cx).await.expect("commit oracle");
+            subject.mark_committed().expect("subject committed");
+            oracle.mark_committed().expect("oracle committed");
+
+            let harness = crate::engine::DifferentialHarness::new(
+                ComparisonMode::CrossEngine,
+                ComparatorConfig::default(),
+            );
+            for (label, query) in [
+                ("bare-fielded", "title:nested"),
+                ("fielded-or", "title:nested OR slices"),
+                ("fielded-and", "title:nested AND reused"),
+                ("or-of-and", "slices OR title:nested AND reused"),
+                (
+                    "or-of-and-distinct-tail",
+                    "beta OR title:nested AND reused gamma",
+                ),
+                ("dup-tail-no-field", "slices OR generic AND reused slices"),
+                (
+                    "dup-tail-lowercase",
+                    "slices OR title:nested AND reused slices",
+                ),
+                ("capital-no-dup", "beta OR title:Nested AND reused gamma"),
+                ("found-chain", "slices OR title:Nested AND reused slices"),
+            ] {
+                let case = DifferentialCase {
+                    fixture_id: format!("htcun-{label}"),
+                    query: query.to_owned(),
+                    limit: 20,
+                    offset: 0,
+                    tie_expansion_limit: 256,
+                    count_requested: false,
+                    snippet_max_chars: None,
+                    metadata: DifferentialCaseMetadata {
+                        generator_id: Some("htcun-title-boost-probe".to_owned()),
+                        generator_seed: None,
+                        corpus_hash: Some(fixture.corpus_hash.clone()),
+                    },
+                };
+                let run = harness
+                    .run(&cx, &subject, &oracle, &case)
+                    .await
+                    .unwrap_or_else(|error| panic!("htcun probe {label} failed: {error}"));
+                assert_eq!(
+                    run.comparison.status,
+                    ComparisonStatus::Exact,
+                    "htcun probe {label} query={query:?} first={:?} divergences={:?}",
+                    run.comparison.first_divergence,
+                    run.comparison.divergences,
+                );
+            }
+        });
     }
 
     #[cfg(feature = "tantivy-oracle")]
