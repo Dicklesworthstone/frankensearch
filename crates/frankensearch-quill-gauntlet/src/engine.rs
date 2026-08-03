@@ -6712,6 +6712,96 @@ mod tests {
         });
     }
 
+    /// E6.3 bounded replay campaign for the qualified two-distinct-term,
+    /// unboosted positive `AND` commutativity law. The paired one-fixture law
+    /// keeps the intentionally invalid `OR` operator mutation.
+    #[cfg(feature = "perf-harness")]
+    #[test]
+    fn e63_two_term_and_seed_matrix_replays_live_observations() {
+        use frankensearch_core::IndexableDocument;
+
+        const SEEDS: [u64; 3] = [
+            0xe63_a11d_c0aa_5eed,
+            0xe63_a11d_c0aa_5eee,
+            0xe63_a11d_c0aa_5eef,
+        ];
+        let documents = vec![
+            IndexableDocument::new("doc-1", "alpha beta beta").with_title("guide"),
+            IndexableDocument::new("doc-2", "alpha gamma").with_title("alpha overview"),
+            IndexableDocument::new("doc-3", "beta gamma gamma gamma").with_title("alpha"),
+            IndexableDocument::new("doc-4", "alpha beta gamma delta").with_title("reference"),
+            IndexableDocument::new("doc-5", "delta epsilon").with_title("quiet"),
+        ];
+
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            for ((left, right), seed) in [
+                (("alpha", "beta"), SEEDS[0]),
+                (("alpha", "gamma"), SEEDS[1]),
+                (("beta", "gamma"), SEEDS[2]),
+            ] {
+                let canonical = format!("{left} AND {right}");
+                let commuted = format!("{right} AND {left}");
+                assert_ne!(
+                    canonical, commuted,
+                    "E6.3 seed {seed:#x} must exercise a real operand-order transform"
+                );
+                assert_eq!(
+                    commuted,
+                    format!("{right} AND {left}"),
+                    "E6.3 seed {seed:#x} must replay its operand-order transform byte-identically",
+                );
+                let canonical_cases = [("two-term-and", canonical.as_str())];
+                let commuted_cases = [("two-term-and", commuted.as_str())];
+                let baseline = e63_observations(
+                    &cx,
+                    &documents,
+                    &canonical_cases,
+                    seed,
+                    "e6.3-two-term-and-commutativity-v1",
+                )
+                .await;
+                let transformed = e63_observations(
+                    &cx,
+                    &documents,
+                    &commuted_cases,
+                    seed,
+                    "e6.3-two-term-and-commutativity-v1",
+                )
+                .await;
+                let baseline_case = baseline.first().expect("E6.3 seed baseline AND fixture");
+                let commuted_case = transformed.first().expect("E6.3 seed commuted AND fixture");
+                assert_eq!(
+                    baseline_case.0, commuted_case.0,
+                    "E6.3 seed {seed:#x} AND case identity drifted"
+                );
+                for (engine, before, after) in [
+                    ("Quill", &baseline_case.1, &commuted_case.1),
+                    ("Tantivy", &baseline_case.2, &commuted_case.2),
+                ] {
+                    let comparison = compare_observations(
+                        before.clone(),
+                        after.clone(),
+                        ComparatorConfig::default(),
+                    )
+                    .unwrap_or_else(|error| {
+                        panic!("E6.3 {engine} seed {seed:#x} AND comparison failed: {error}")
+                    });
+                    assert!(
+                        matches!(
+                            comparison.rank_class,
+                            RankClass::RankExact | RankClass::TieOrder
+                        ) && comparison
+                            .divergences
+                            .iter()
+                            .all(|divergence| divergence.class == DivergenceClass::TieOrder),
+                        "E6.3 {engine} seed {seed:#x} produced a non-tie AND commutation divergence: {:?}",
+                        comparison.divergences,
+                    );
+                }
+            }
+        });
+    }
+
     /// E6.3 law: the two distinct, unboosted optional operands of one scalar
     /// `OR` are commutative. As with the `AND` law, this excludes association,
     /// boosts, and mixed occurrences because those shapes can expose parser or
