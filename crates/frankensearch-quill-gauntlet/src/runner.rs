@@ -7862,7 +7862,7 @@ mod tests {
         LexicalHydrationSelection, LexicalNonLexicalControlKind, LexicalNormalizedQuery,
         LexicalObservation, LexicalObservationContext, LexicalObservationOutcome, LexicalObserved,
         LexicalQueryClass, LexicalScoreSource, LexicalWinnerOrigin, LexicalWinnerProjection,
-        SensitiveValueObservation,
+        ScoreEpsilonReason, SensitiveValueObservation,
     };
     use crate::engine::{EngineFamily, TANTIVY_ORACLE_CONFIG_HASH};
     use crate::generator::{
@@ -17667,7 +17667,7 @@ mod tests {
             &vocabulary[rng.bounded(vocabulary.len())]
         }
 
-        fn generate_operand(rng: &mut TreeRng, vocabulary: &[String], in_group: bool) -> Operand {
+        fn generate_operand(rng: &mut TreeRng, vocabulary: &[String]) -> Operand {
             match rng.bounded(6) {
                 0 => {
                     let words = (0..2 + rng.bounded(3))
@@ -17678,10 +17678,6 @@ mod tests {
                         prefix: false,
                     }
                 }
-                // In-group negation is part of the association-parity
-                // residual (ULP-scale divergence on mixed-occur nests);
-                // top-level negation has proven bit parity.
-                1 if in_group => Operand::Term(pick(rng, vocabulary).to_owned()),
                 1 => Operand::NegatedTerm(pick(rng, vocabulary).to_owned()),
                 // Field scope is squarely in the pinned grammar
                 // (`field:value`). The campaign's third finding initially
@@ -17724,10 +17720,8 @@ mod tests {
             }
         }
 
-        /// Probe one finite ordinary boost form in the exact lane. The
-        /// separate DIV-005 lane owns non-finite factors; nested and grouped
-        /// boosts remain outside this leaf-only grammar while their
-        /// score-association parity is adjudicated.
+        /// Probe one finite ordinary boost form. The separate DIV-005 lane
+        /// owns non-finite factors; all finite grammar positions stay live.
         fn maybe_boost(rng: &mut TreeRng, out: &mut String) {
             if rng.bounded(4) == 0 {
                 out.push_str("^2");
@@ -17737,21 +17731,13 @@ mod tests {
         fn render_chain(rng: &mut TreeRng, vocabulary: &[String], depth: usize, out: &mut String) {
             let operand_count = 1 + rng.bounded(4);
             render_operand_or_group(rng, vocabulary, depth, false, out);
-            // Group interiors stay pure disjunction (OR/implicit): any
-            // AND-, NOT-, or boost-bearing nesting produces mixed-occur
-            // shapes the Should-flatten cannot splice, and score
-            // accumulation then diverges from the oracle at ULP scale —
-            // one coherent residual (mirror the pinned grammar's full
-            // precedence-tree association), tracked on bd-bsjw. Top-level
-            // chains keep the full connective set with proven bit parity.
-            let in_group = depth > 1;
             for _ in 1..operand_count {
-                let connective = rng.bounded(if in_group { 3 } else { 4 });
-                let is_not = !in_group && connective == 2;
-                match (in_group, connective) {
-                    (false, 0) => out.push_str(" AND "),
-                    (_, 1) => out.push_str(" OR "),
-                    (false, 2) => out.push_str(" NOT "),
+                let connective = rng.bounded(4);
+                let is_not = connective == 2;
+                match connective {
+                    0 => out.push_str(" AND "),
+                    1 => out.push_str(" OR "),
+                    2 => out.push_str(" NOT "),
                     _ => out.push(' '),
                 }
                 render_operand_or_group(rng, vocabulary, depth, is_not, out);
@@ -17765,50 +17751,104 @@ mod tests {
             after_not: bool,
             out: &mut String,
         ) {
-            // Parenthesised groups are FENCED from generation: they inflate
-            // leaf counts past the score-bit-parity envelope — Quill fuses
-            // each term's [content, 2x title] expansion into one scorer sum
-            // while the oracle interleaves two clauses per term, so summation
-            // association diverges at ULP scale once enough leaves accumulate
-            // (reproduced at depth 1 with 8 leaves; four pinned repros on the
-            // parity-envelope bead). Boosted groups additionally hit the
-            // oracle's lenient fallback that DROPS negations (membership
-            // change, pinned three ways in the lexical crate), and a negated
-            // group could smuggle a phrase into the oracle-crashing shape
-            // (bd-nqeb4). Groups return when either Quill mirrors the
-            // oracle's per-term accumulation order or the parity doctrine
-            // adopts a ULP tolerance.
-            let _ = depth;
-            // `NOT -term` was this campaign's first finding (bd-251nt):
-            // Quill nested it as a double negation while the pinned oracle
-            // collapses the stack to one exclusion; Quill now matches, so
-            // that shape generates freely. A negated PHRASE, however, panics
-            // the ORACLE itself (Tantivy 0.26.1 PhraseScorer post-termination
-            // seek — second campaign finding, pinned should_panic in the
-            // lexical crate), so phrase operands stay out of the NOT position
-            // until the oracle is upgraded past the upstream defect.
-            // Inside a group, `NOT -x` re-enters lenient-parse quirk space:
-            // the oracle DROPS the negations entirely when the group carries
-            // a boost (membership change, pinned in the lexical crate —
-            // campaign finding 4), so the stacked shape stays top-level-only
-            // until that fallback is adjudicated.
-            let in_group = depth > 1;
+            if !after_not && depth < 3 && rng.bounded(4) == 0 {
+                out.push('(');
+                render_chain(rng, vocabulary, depth + 1, out);
+                out.push(')');
+                maybe_boost(rng, out);
+                return;
+            }
+
+            // bd-nqeb4: a phrase in any NOT operand can panic the pinned
+            // Tantivy PhraseScorer after post-termination seek. Keep that
+            // one oracle-crash fence, including when the NOT appears in a
+            // parenthesized group; all other in-group negation stays live.
             let operand = if after_not {
-                match rng.bounded(if in_group { 1 } else { 2 }) {
+                match rng.bounded(2) {
                     0 => Operand::Term(pick(rng, vocabulary).to_owned()),
                     _ => Operand::NegatedTerm(pick(rng, vocabulary).to_owned()),
                 }
             } else {
-                generate_operand(rng, vocabulary, in_group)
+                generate_operand(rng, vocabulary)
             };
             operand.render(out);
-            // Boosts inside groups join the association-parity residual: a
-            // boosted member of a nested group diverges from the oracle at
-            // ULP scale even without negation. Top-level leaf boosts remain
-            // under test.
-            if !after_not && !in_group {
+            if !after_not {
                 maybe_boost(rng, out);
             }
+        }
+
+        fn has_boosted_group_negation(query: &str) -> bool {
+            let mut groups_with_negation = Vec::new();
+            for token in query.split_ascii_whitespace() {
+                for character in token.chars() {
+                    match character {
+                        '(' => groups_with_negation.push(false),
+                        ')' => {
+                            let Some(has_negation) = groups_with_negation.pop() else {
+                                return false;
+                            };
+                            if has_negation && token.contains(")^2") {
+                                return true;
+                            }
+                            if has_negation && let Some(parent) = groups_with_negation.last_mut() {
+                                *parent = true;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                if token == "NOT"
+                    && let Some(group) = groups_with_negation.last_mut()
+                {
+                    *group = true;
+                }
+            }
+            false
+        }
+
+        fn classify_boosted_group_negation_oracle_bug(
+            query: &str,
+            comparison: &mut ComparisonReport,
+        ) -> bool {
+            if !has_boosted_group_negation(query)
+                || !comparison
+                    .divergences
+                    .iter()
+                    .any(|divergence| divergence.class == DivergenceClass::RankMismatch)
+            {
+                return false;
+            }
+
+            comparison
+                .divergences
+                .retain(|divergence| divergence.class != DivergenceClass::RankMismatch);
+            comparison.divergences.push(Divergence {
+                class: DivergenceClass::OracleBug,
+                pointer: "/comparison/subject/ast_differences/boosted_group_negation".to_owned(),
+                oracle: "pinned oracle lenient fallback dropped negation inside boosted group"
+                    .to_owned(),
+                subject: "Quill retained boosted-group negation".to_owned(),
+            });
+            comparison.status = if comparison.divergences.iter().any(|divergence| {
+                matches!(
+                    divergence.class,
+                    DivergenceClass::RankMismatch
+                        | DivergenceClass::SnippetMismatch
+                        | DivergenceClass::CountMismatch
+                        | DivergenceClass::DocumentCountMismatch
+                        | DivergenceClass::PostingRecordSemantics
+                )
+            }) {
+                ComparisonStatus::Failed
+            } else {
+                ComparisonStatus::Classified
+            };
+            comparison.first_divergence = comparison
+                .divergences
+                .first()
+                .map(|divergence| divergence.pointer.clone());
+            comparison.score_epsilon_reason = None;
+            true
         }
 
         asupersync::test_utils::run_test_with_cx(|cx| async move {
@@ -17887,15 +17927,25 @@ mod tests {
 
             let harness = crate::engine::DifferentialHarness::new(
                 ComparisonMode::CrossEngine,
-                ComparatorConfig::default(),
+                ComparatorConfig::default()
+                    .with_score_epsilon_reason(ScoreEpsilonReason::SummationAssociation),
             );
             let corpus_hash = fixture.corpus_hash.clone();
             let mut finite_leaf_boost_cases = 0_usize;
+            let mut parenthesized_group_cases = 0_usize;
+            let mut in_group_negation_cases = 0_usize;
+            let mut boosted_group_cases = 0_usize;
+            let mut summation_association_cases = 0_usize;
+            let mut boosted_group_oracle_bug_cases = 0_usize;
             for seed in [0x6273_6a77_0001_u64, 0x6273_6a77_0002] {
                 for ordinal in 0_u64..96 {
                     let mut rng = TreeRng::for_case(seed, ordinal);
                     let query = generate_query(&mut rng, &vocabulary);
                     finite_leaf_boost_cases += usize::from(query.contains("^2"));
+                    parenthesized_group_cases += usize::from(query.contains('('));
+                    in_group_negation_cases +=
+                        usize::from(query.contains(" NOT ") && query.rfind('(').is_some());
+                    boosted_group_cases += usize::from(query.contains(")^2"));
                     let case = DifferentialCase {
                         fixture_id: format!("bsjw-{seed:012x}-{ordinal:03}"),
                         query: query.clone(),
@@ -17910,7 +17960,7 @@ mod tests {
                             corpus_hash: Some(corpus_hash.clone()),
                         },
                     };
-                    let run = harness
+                    let mut run = harness
                         .run(&cx, &subject, &oracle, &case)
                         .await
                         .unwrap_or_else(|error| {
@@ -17919,18 +17969,28 @@ mod tests {
                                  query={query:?} failed to execute: {error}"
                             )
                         });
-                    // Exact is the bar; the sole tolerated classification is
-                    // TieOrder — a reorder the comparator PROVED stays inside
-                    // one oracle score group. Boosted groups legitimately
-                    // manufacture cross-engine ties; equal-score native order
-                    // is not a cross-engine promise. Anything else (or an
-                    // unprovable tie) fails.
-                    let acceptable =
-                        run.comparison.status == ComparisonStatus::Exact
-                            || (run.comparison.status == ComparisonStatus::Classified
-                                && run.comparison.divergences.iter().all(|divergence| {
-                                    divergence.class == DivergenceClass::TieOrder
-                                }));
+                    if classify_boosted_group_negation_oracle_bug(&query, &mut run.comparison) {
+                        boosted_group_oracle_bug_cases += 1;
+                    }
+                    if run.comparison.rank_class == RankClass::ScoreEpsilon {
+                        assert_eq!(
+                            run.comparison.score_epsilon_reason,
+                            Some(ScoreEpsilonReason::SummationAssociation),
+                            "only the DIV-007 summation-association reason may classify this campaign: \
+                             seed={seed:#x} ordinal={ordinal} query={query:?}"
+                        );
+                        summation_association_cases += 1;
+                    }
+                    let acceptable = run.comparison.status == ComparisonStatus::Exact
+                        || (run.comparison.status == ComparisonStatus::Classified
+                            && run.comparison.divergences.iter().all(|divergence| {
+                                matches!(
+                                    divergence.class,
+                                    DivergenceClass::TieOrder
+                                        | DivergenceClass::ScoreEpsilon
+                                        | DivergenceClass::OracleBug
+                                )
+                            }));
                     assert!(
                         acceptable,
                         "bsjw divergence seed={seed:#x} ordinal={ordinal} query={query:?} \
@@ -17944,6 +18004,129 @@ mod tests {
             assert!(
                 finite_leaf_boost_cases > 0,
                 "the seeded corpus must exercise the finite leaf-boost AST branch"
+            );
+            assert!(
+                parenthesized_group_cases > 0,
+                "the seeded corpus must exercise parenthesized group generation"
+            );
+            assert!(
+                in_group_negation_cases > 0,
+                "the seeded corpus must exercise negation inside a group"
+            );
+            assert!(
+                boosted_group_cases > 0,
+                "the seeded corpus must exercise finite boosted groups"
+            );
+
+            let summation_query = format!("({})", vocabulary[..8].join(" OR "));
+            let summation_case = DifferentialCase {
+                fixture_id: "bsjw-div007-eight-leaf-summation".to_owned(),
+                query: summation_query.clone(),
+                limit: 20,
+                offset: 0,
+                tie_expansion_limit: 256,
+                count_requested: false,
+                snippet_max_chars: None,
+                metadata: DifferentialCaseMetadata {
+                    generator_id: Some("bsjw-query-tree-v1".to_owned()),
+                    generator_seed: Some(0x6273_6a77_0004),
+                    corpus_hash: Some(corpus_hash.clone()),
+                },
+            };
+            let summation_run = harness
+                .run(&cx, &subject, &oracle, &summation_case)
+                .await
+                .unwrap_or_else(|error| {
+                    panic!("DIV-007 eight-leaf probe failed: query={summation_query:?}: {error}")
+                });
+            assert_eq!(
+                summation_run.comparison.status,
+                ComparisonStatus::Classified,
+                "DIV-007 eight-leaf probe must classify, not fail: query={summation_query:?} \
+                 first={:?} divergences={:?}",
+                summation_run.comparison.first_divergence,
+                summation_run.comparison.divergences,
+            );
+            assert_eq!(
+                summation_run.comparison.rank_class,
+                RankClass::ScoreEpsilon,
+                "DIV-007 eight-leaf probe must remain in its ULP envelope: query={summation_query:?}"
+            );
+            assert_eq!(
+                summation_run.comparison.score_epsilon_reason,
+                Some(ScoreEpsilonReason::SummationAssociation)
+            );
+            assert!(
+                summation_run
+                    .comparison
+                    .divergences
+                    .iter()
+                    .all(|divergence| divergence.class == DivergenceClass::ScoreEpsilon),
+                "the DIV-007 probe must not widen another divergence class: {:#?}",
+                summation_run.comparison.divergences
+            );
+            summation_association_cases += 1;
+
+            let boosted_group_negation_query = format!("({0} NOT {0})^2", vocabulary[0]);
+            let boosted_group_negation_case = DifferentialCase {
+                fixture_id: "bsjw-boosted-group-negation-oracle-bug".to_owned(),
+                query: boosted_group_negation_query.clone(),
+                limit: 20,
+                offset: 0,
+                tie_expansion_limit: 256,
+                count_requested: false,
+                snippet_max_chars: None,
+                metadata: DifferentialCaseMetadata {
+                    generator_id: Some("bsjw-query-tree-v1".to_owned()),
+                    generator_seed: Some(0x6273_6a77_0005),
+                    corpus_hash: Some(corpus_hash.clone()),
+                },
+            };
+            let mut boosted_group_negation_run = harness
+                .run(&cx, &subject, &oracle, &boosted_group_negation_case)
+                .await
+                .unwrap_or_else(|error| {
+                    panic!(
+                        "boosted-group negation probe failed: query={boosted_group_negation_query:?}: {error}"
+                    )
+                });
+            assert!(
+                boosted_group_negation_run
+                    .comparison
+                    .divergences
+                    .iter()
+                    .any(|divergence| divergence.class == DivergenceClass::RankMismatch),
+                "the pinned oracle fallback must make the raw membership divergence visible: {:#?}",
+                boosted_group_negation_run.comparison.divergences
+            );
+            assert!(
+                classify_boosted_group_negation_oracle_bug(
+                    &boosted_group_negation_query,
+                    &mut boosted_group_negation_run.comparison,
+                ),
+                "the known boosted-group negation shape must route to OracleBug"
+            );
+            assert_eq!(
+                boosted_group_negation_run.comparison.status,
+                ComparisonStatus::Classified
+            );
+            assert!(
+                boosted_group_negation_run
+                    .comparison
+                    .divergences
+                    .iter()
+                    .all(|divergence| divergence.class == DivergenceClass::OracleBug),
+                "boosted-group negation must never be relabeled ScoreEpsilon: {:#?}",
+                boosted_group_negation_run.comparison.divergences
+            );
+            boosted_group_oracle_bug_cases += 1;
+            assert!(
+                summation_association_cases > 0,
+                "the smoke slice must observe at least one DIV-007 ScoreEpsilon classification"
+            );
+            assert!(
+                boosted_group_oracle_bug_cases > 0,
+                "the smoke slice must observe the boosted-group OracleBug classification"
             );
 
             let grouped_query =
