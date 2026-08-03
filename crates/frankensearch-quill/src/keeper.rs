@@ -6490,7 +6490,12 @@ fn acquire_writer_admission(directory: &Path) -> Result<Arc<WriterAdmissionInner
         });
     }
 
-    if let Some(previous) = read_writer_lock_record(&lock_path, &mut lock_file)?
+    let previous = match read_writer_lock_record(&lock_path, &mut lock_file) {
+        Ok(record) => record,
+        Err(KeeperError::WriterLockCorrupted { .. }) => None,
+        Err(error) => return Err(error),
+    };
+    if let Some(previous) = previous
         && writer_lock_record_names_live_owner(previous)
     {
         return Err(KeeperError::WriterBusy {
@@ -17354,7 +17359,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn writer_admission_is_exclusive_reusable_and_corruption_fails_closed() -> TestResult {
+    fn writer_admission_is_exclusive_reusable_and_repairs_torn_records() -> TestResult {
         let directory = tempdir()?;
         let first = acquire_writer_admission(directory.path())?;
         let lock_path = directory.path().join("LOCK");
@@ -17374,12 +17379,13 @@ mod tests {
         let second = acquire_writer_admission(directory.path())?;
         drop(second);
         std::fs::write(&lock_path, b"truncated")?;
-        let before = std::fs::read(&lock_path)?;
-        assert!(matches!(
-            acquire_writer_admission(directory.path()),
-            Err(KeeperError::WriterLockCorrupted { .. })
-        ));
-        assert_eq!(std::fs::read(lock_path)?, before);
+        let repaired = acquire_writer_admission(directory.path())?;
+        assert_eq!(
+            std::fs::metadata(&lock_path)?.len(),
+            usize_to_u64(WRITER_LOCK_RECORD_BYTES)
+        );
+        drop(repaired);
+        assert_eq!(std::fs::metadata(lock_path)?.len(), 0);
         Ok(())
     }
 
