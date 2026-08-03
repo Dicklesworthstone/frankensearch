@@ -14,6 +14,9 @@ use ahash::{AHashMap, AHashSet};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use frankensearch_core::explanation::{
+    ExplainedSource, ExplanationPhase, HitExplanation, ScoreComponent,
+};
 use frankensearch_core::filter::SearchFilter;
 use frankensearch_core::{
     FusedHit, PhaseMetrics, ScoreSource, ScoredResult, SearchError, SearchPhase, SearchResult,
@@ -515,7 +518,16 @@ impl SyncTwoTierSearcher {
                 self.effective_semantic_weight(lexical)
             });
         let initial_results = lexical_hits.as_ref().map_or_else(
-            || vector_hits_to_scored_results(&fast_hits, k, ScoreSource::SemanticFast, None, None),
+            || {
+                vector_hits_to_scored_results(
+                    &fast_hits,
+                    k,
+                    ScoreSource::SemanticFast,
+                    None,
+                    None,
+                    &self.config,
+                )
+            },
             |lexical| {
                 fused_hits_to_scored_results(
                     fuse_by_strategy(
@@ -871,6 +883,7 @@ fn vector_hits_to_scored_results(
     source: ScoreSource,
     fast_scores: Option<&AHashMap<&str, f32>>,
     quality_scores: Option<&AHashMap<&str, f32>>,
+    config: &TwoTierConfig,
 ) -> Vec<ScoredResult> {
     let mut seen = AHashSet::with_capacity(hits.len());
     hits.iter()
@@ -884,6 +897,23 @@ fn vector_hits_to_scored_results(
             let quality_score = quality_scores
                 .and_then(|scores| scores.get(hit.doc_id.as_str()))
                 .copied();
+            let explanation = config.explain.then(|| {
+                Box::new(HitExplanation {
+                    final_score: f64::from(hit.score),
+                    components: vec![ScoreComponent {
+                        source: ExplainedSource::SemanticFast {
+                            embedder: "sync-fast-query".to_owned(),
+                            cosine_sim: f64::from(hit.score),
+                        },
+                        raw_score: f64::from(hit.score),
+                        normalized_score: f64::from(hit.score),
+                        rrf_contribution: 0.0,
+                        weight: 1.0,
+                    }],
+                    phase: ExplanationPhase::Initial,
+                    rank_movement: None,
+                })
+            });
             ScoredResult {
                 doc_id: hit.doc_id.clone(),
                 score: hit.score,
@@ -893,7 +923,7 @@ fn vector_hits_to_scored_results(
                 quality_score,
                 lexical_score: None,
                 rerank_score: None,
-                explanation: None,
+                explanation,
                 metadata: None,
             }
         })

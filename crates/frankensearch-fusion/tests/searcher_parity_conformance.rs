@@ -490,9 +490,10 @@ fn assert_metric_parity(case: &str, sync_m: &TwoTierMetrics, async_m: &TwoTierMe
         async_m.fast_embedder_id.is_some(),
         "[{case}] async fast id missing"
     );
-    assert!(
+    assert_eq!(
         async_m.quality_embedder_id.is_some(),
-        "[{case}] async quality id missing"
+        async_m.phase2_vectors_searched > 0,
+        "[{case}] async quality id must reflect whether Phase 2 ran"
     );
 
     assert!(is_known_divergence(KnownDivergence::QueryClass));
@@ -510,9 +511,10 @@ fn assert_metric_parity(case: &str, sync_m: &TwoTierMetrics, async_m: &TwoTierMe
         sync_m.kendall_tau, None,
         "[{case}] sync kendall tau changed"
     );
-    assert!(
+    assert_eq!(
         async_m.kendall_tau.is_some(),
-        "[{case}] async kendall tau missing"
+        async_m.phase2_vectors_searched > 0,
+        "[{case}] async kendall tau must reflect whether Phase 2 ran"
     );
 }
 
@@ -599,6 +601,30 @@ fn fast_only_agrees_and_skips_phase_two_on_both_sides() {
     assert_eq!(
         sync_metrics.skip_reason, async_metrics.skip_reason,
         "fast_only skip_reason diverges"
+    );
+}
+
+#[test]
+fn fast_only_explanations_are_present_on_both_sides() {
+    let config = TwoTierConfig {
+        fast_only: true,
+        explain: true,
+        ..TwoTierConfig::default()
+    };
+    let query = normalize(vec![1.0, 0.0, 0.0, 0.0]);
+    let (sync_results, sync_metrics) = run_sync(&config, &query, 4);
+    let (async_results, async_metrics) = run_async("fast-only-explain", &config, &query, 4);
+    assert_result_parity("fast-only-explain", &sync_results, &async_results);
+    assert_metric_parity("fast-only-explain", &sync_metrics, &async_metrics);
+    assert!(
+        sync_results
+            .iter()
+            .all(|result| result.explanation.is_some())
+    );
+    assert!(
+        async_results
+            .iter()
+            .all(|result| result.explanation.is_some())
     );
 }
 
