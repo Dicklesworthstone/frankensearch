@@ -38,10 +38,16 @@ pub use artifact::{
     classify_campaign_report_schema,
 };
 pub use campaign_contract::{
-    REPLACEMENT_COMPLETENESS_EXPECTED_CELL_COUNT, REPLACEMENT_COMPLETENESS_POLICY_SCHEMA_VERSION,
-    frozen_replacement_cell_keys, frozen_replacement_completeness_policy,
-    frozen_replacement_seed_bundle, frozen_replacement_seed_schedule,
-    replacement_completeness_policy_sha256, validate_replacement_completeness,
+    BuiltInEvidenceBindingV1, CampaignCellEvidenceV1, CampaignCellKeyV1, CampaignContractModeV1,
+    CampaignContractValueError, CampaignCorpusV1, CampaignEvidenceRole, CampaignExecutionProfileV1,
+    CampaignHardwareClassV1, CampaignMachineProfileV1, CampaignNightV1, CampaignProfileV1,
+    CampaignReplayV1, CampaignSeedBundleV1, CampaignSeedScheduleV1, CampaignSeedSlotV1,
+    CampaignSha256V1, CampaignTopologyV1, REPLACEMENT_COMPLETENESS_EXPECTED_CELL_COUNT,
+    REPLACEMENT_COMPLETENESS_POLICY_SCHEMA_VERSION, ReplacementCompletenessError,
+    ReplacementCompletenessPolicyV1, UnexpectedCampaignCellReasonV1, frozen_replacement_cell_keys,
+    frozen_replacement_completeness_policy, frozen_replacement_seed_bundle,
+    frozen_replacement_seed_schedule, replacement_completeness_policy_sha256,
+    validate_replacement_completeness,
 };
 #[cfg(feature = "tantivy-oracle")]
 pub use comparator::observe_tantivy_cass_profile;
