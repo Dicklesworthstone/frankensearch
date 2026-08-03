@@ -3130,6 +3130,10 @@ impl PinnedDirectory {
                     || before.st_ino != after.st_ino
                     || before.st_mode != after.st_mode
                     || before.st_size != after.st_size
+                    || before.st_mtime != after.st_mtime
+                    || before.st_mtime_nsec != after.st_mtime_nsec
+                    || before.st_ctime != after.st_ctime
+                    || before.st_ctime_nsec != after.st_ctime_nsec
                 {
                     return Err(GauntletError::InvalidPreparedArtifact {
                         reason:
@@ -3169,6 +3173,10 @@ impl PinnedDirectory {
                     || before.st_ino != after.st_ino
                     || before.st_mode != after.st_mode
                     || before.st_size != after.st_size
+                    || before.st_mtime != after.st_mtime
+                    || before.st_mtime_nsec != after.st_mtime_nsec
+                    || before.st_ctime != after.st_ctime
+                    || before.st_ctime_nsec != after.st_ctime_nsec
                 {
                     return Err(GauntletError::InvalidPreparedArtifact {
                         reason: "ArtifactStore v4 source symlink changed during descriptor-stable capture"
@@ -3243,6 +3251,10 @@ impl PinnedDirectory {
             || before.st_ino != after.st_ino
             || before.st_mode != after.st_mode
             || before.st_size != after.st_size
+            || before.st_mtime != after.st_mtime
+            || before.st_mtime_nsec != after.st_mtime_nsec
+            || before.st_ctime != after.st_ctime
+            || before.st_ctime_nsec != after.st_ctime_nsec
             || u64::try_from(bytes.len()).unwrap_or(u64::MAX) != byte_len
         {
             return Err(GauntletError::InvalidPreparedArtifact {
@@ -3750,6 +3762,7 @@ mod tests {
     #[cfg(all(target_family = "unix", not(target_os = "wasi")))]
     #[test]
     fn artifactstore_v4_source_snapshot_capture_binds_file_and_symlink_bytes() {
+        use std::os::unix::fs::PermissionsExt as _;
         use std::os::unix::fs::symlink;
 
         let root = tempfile::tempdir().expect("temporary source root");
@@ -3759,24 +3772,22 @@ mod tests {
         symlink("../Cargo.lock", root.path().join("crates/current"))
             .expect("create source symlink");
 
-        let snapshot = ArtifactStoreV4SourceSnapshot::capture_selected(
-            root.path(),
-            BTreeMap::from([
-                (
-                    "Cargo.lock".to_owned(),
-                    vec![
-                        ArtifactStoreV4SourceInclusionReason::Tracked,
-                        ArtifactStoreV4SourceInclusionReason::CargoLock,
-                    ],
-                ),
-                (
-                    "crates/current".to_owned(),
-                    vec![ArtifactStoreV4SourceInclusionReason::PathDependency],
-                ),
-            ]),
-            1024,
-        )
-        .expect("capture descriptor-stable source snapshot");
+        let selected = BTreeMap::from([
+            (
+                "Cargo.lock".to_owned(),
+                vec![
+                    ArtifactStoreV4SourceInclusionReason::Tracked,
+                    ArtifactStoreV4SourceInclusionReason::CargoLock,
+                ],
+            ),
+            (
+                "crates/current".to_owned(),
+                vec![ArtifactStoreV4SourceInclusionReason::PathDependency],
+            ),
+        ]);
+        let snapshot =
+            ArtifactStoreV4SourceSnapshot::capture_selected(root.path(), selected.clone(), 1024)
+                .expect("capture descriptor-stable source snapshot");
 
         snapshot.validate().expect("validate captured snapshot");
         assert_eq!(snapshot.entries[0].byte_len, 24);
@@ -3787,6 +3798,29 @@ mod tests {
         assert_eq!(
             snapshot.entries[1].resolved_target_path.as_deref(),
             Some("Cargo.lock")
+        );
+
+        std::fs::write(root.path().join("Cargo.lock"), b"sealed dependency graph\n")
+            .expect("rewrite source lockfile at the same length");
+        let content_mutated =
+            ArtifactStoreV4SourceSnapshot::capture_selected(root.path(), selected.clone(), 1024)
+                .expect("recapture same-length content mutation");
+        assert_ne!(
+            snapshot.identity_sha256, content_mutated.identity_sha256,
+            "same-length in-place content mutation must change the Source identity"
+        );
+
+        std::fs::set_permissions(
+            root.path().join("Cargo.lock"),
+            std::fs::Permissions::from_mode(0o100600),
+        )
+        .expect("change source-file mode");
+        let mode_mutated =
+            ArtifactStoreV4SourceSnapshot::capture_selected(root.path(), selected, 1024)
+                .expect("recapture mode mutation");
+        assert_ne!(
+            content_mutated.identity_sha256, mode_mutated.identity_sha256,
+            "mode mutation must change the Source identity"
         );
     }
 
