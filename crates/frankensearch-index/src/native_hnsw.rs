@@ -4381,6 +4381,65 @@ mod tests {
     }
 
     #[test]
+    fn owner_bound_ann_full_beam_matches_exact_owner_ranking() {
+        let directory = tempfile::tempdir().expect("temporary FSVI owner directory");
+        let binding = fsvi_v2_binding(84, 0x84, "ann-exact-owner-parity", 4);
+        let rows = [
+            (
+                "dead-best".to_owned(),
+                vec![1.0, 0.0, 0.0, 0.0],
+                FsviRecordFlags::TOMBSTONE,
+            ),
+            (
+                "live-alpha".to_owned(),
+                vec![0.9, 0.1, 0.0, 0.0],
+                FsviRecordFlags::LIVE,
+            ),
+            (
+                "live-beta".to_owned(),
+                vec![0.6, 0.4, 0.0, 0.0],
+                FsviRecordFlags::LIVE,
+            ),
+            (
+                "live-gamma".to_owned(),
+                vec![0.1, 0.9, 0.0, 0.0],
+                FsviRecordFlags::LIVE,
+            ),
+        ];
+        let owner =
+            admitted_fsvi_owner_with_flags(directory.path(), "owner-parity.fsvi", &binding, &rows);
+        let query = [1.0, 0.0, 0.0, 0.0];
+        let exact = owner
+            .search_top_k(&query, owner.live_count(), None)
+            .expect("exact same-owner search");
+        let bound = ValidatedNativeHnsw::build(Arc::clone(&owner), params(), 84)
+            .expect("build graph from exact-search owner");
+        let ann = bound
+            .search(&query, owner.live_count(), Some(owner.record_count()))
+            .expect("full-beam owner-bound ANN search");
+
+        assert_eq!(
+            ann.iter()
+                .map(ValidatedNativeHnswHit::doc_id)
+                .collect::<Vec<_>>(),
+            exact
+                .iter()
+                .map(|hit| hit.doc_id.as_str())
+                .collect::<Vec<_>>(),
+            "full-beam ANN must preserve the exact ranking from its retained owner"
+        );
+        assert_eq!(
+            ann.iter()
+                .map(ValidatedNativeHnswHit::physical_row)
+                .collect::<Vec<_>>(),
+            exact.iter().map(|hit| hit.index).collect::<Vec<_>>(),
+            "ANN hits must resolve the exact physical rows owned by the same image"
+        );
+        assert!(ann.iter().all(|hit| hit.flags().is_live()));
+        assert!(ann.iter().all(|hit| hit.doc_id() != "dead-best"));
+    }
+
+    #[test]
     fn validated_handle_retains_loaded_owner_after_caller_scope_end() {
         let owner = generation_owner(81, 0x81, "retained-load-owner", 4, 16);
         let weak_owner = Arc::downgrade(&owner);
