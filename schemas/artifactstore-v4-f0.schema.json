@@ -8,6 +8,7 @@
   "required": [
     "schema_version",
     "object_kind",
+    "principal_role",
     "identity_scheme",
     "object_identity",
     "authentication",
@@ -27,6 +28,15 @@
     "object_kind": {
       "type": "string",
       "enum": ["source", "build", "execution", "completion"]
+    },
+    "principal_role": {
+      "type": "string",
+      "enum": [
+        "source_publisher",
+        "build_service",
+        "execution_supervisor",
+        "completion_issuer"
+      ]
     },
     "identity_scheme": {
       "type": "string",
@@ -205,6 +215,7 @@
       },
       "then": {
         "required": ["source_digest"],
+        "properties": {"principal_role": {"const": "source_publisher"}},
         "not": {"required": ["predecessor_identity"]}
       }
     },
@@ -214,7 +225,8 @@
         "required": ["object_kind"]
       },
       "then": {
-        "required": ["predecessor_identity", "source_digest", "cargo_lock_digest", "executable_digest"]
+        "required": ["predecessor_identity", "source_digest", "cargo_lock_digest", "executable_digest"],
+        "properties": {"principal_role": {"const": "build_service"}}
       }
     },
     {
@@ -223,7 +235,8 @@
         "required": ["object_kind"]
       },
       "then": {
-        "required": ["predecessor_identity", "execution_nonce", "nonce_expires_at_unix_ns", "command_digest"]
+        "required": ["predecessor_identity", "execution_nonce", "nonce_expires_at_unix_ns", "command_digest"],
+        "properties": {"principal_role": {"const": "execution_supervisor"}}
       }
     },
     {
@@ -232,7 +245,8 @@
         "required": ["object_kind"]
       },
       "then": {
-        "required": ["predecessor_identity", "artifact_index_digest", "failure_artifact_index_digest", "terminal_outcome"]
+        "required": ["predecessor_identity", "artifact_index_digest", "failure_artifact_index_digest", "terminal_outcome"],
+        "properties": {"principal_role": {"const": "completion_issuer"}}
       }
     }
   ],

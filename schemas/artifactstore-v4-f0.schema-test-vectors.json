@@ -7,6 +7,7 @@
       "instance": {
         "schema_version": 4,
         "object_kind": "completion",
+        "principal_role": "completion_issuer",
         "identity_scheme": "sha256-domain-separated-v1",
         "object_identity": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
         "predecessor_identity": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
@@ -34,6 +35,7 @@
       "instance": {
         "schema_version": 4,
         "object_kind": "completion",
+        "principal_role": "completion_issuer",
         "identity_scheme": "sha256-domain-separated-v1",
         "object_identity": "sha256:6666666666666666666666666666666666666666666666666666666666666666",
         "predecessor_identity": "sha256:7777777777777777777777777777777777777777777777777777777777777777",
@@ -61,6 +63,7 @@
       "instance": {
         "schema_version": 4,
         "object_kind": "completion",
+        "principal_role": "completion_issuer",
         "identity_scheme": "sha256-domain-separated-v1",
         "object_identity": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
         "predecessor_identity": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
@@ -79,11 +82,36 @@
       }
     },
     {
+      "name": "rejects_completion_with_non_completion_principal_role",
+      "expect_valid": false,
+      "instance": {
+        "schema_version": 4,
+        "object_kind": "completion",
+        "principal_role": "build_service",
+        "identity_scheme": "sha256-domain-separated-v1",
+        "object_identity": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "predecessor_identity": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "authentication": "verified_receipt_chain",
+        "admission": "admitted",
+        "decision": "pass",
+        "release": "qualified",
+        "coverage": "complete",
+        "privacy": "public",
+        "redaction_witness": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "issued_at_unix_ns": 31,
+        "terminal_outcome": "succeeded",
+        "signature": {"algorithm": "ed25519", "key_id": "completion-issuer-1", "signature": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"},
+        "artifact_index_digest": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+        "failure_artifact_index_digest": "sha256:eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+      }
+    },
+    {
       "name": "rejects_admitted_but_incomplete_coverage",
       "expect_valid": false,
       "instance": {
         "schema_version": 4,
         "object_kind": "completion",
+        "principal_role": "completion_issuer",
         "identity_scheme": "sha256-domain-separated-v1",
         "object_identity": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
         "predecessor_identity": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
@@ -107,6 +135,7 @@
       "instance": {
         "schema_version": 4,
         "object_kind": "completion",
+        "principal_role": "completion_issuer",
         "identity_scheme": "sha256-domain-separated-v1",
         "object_identity": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
         "predecessor_identity": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
@@ -130,6 +159,7 @@
       "instance": {
         "schema_version": 4,
         "object_kind": "completion",
+        "principal_role": "completion_issuer",
         "identity_scheme": "sha256-domain-separated-v1",
         "object_identity": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
         "predecessor_identity": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
@@ -152,6 +182,7 @@
       "instance": {
         "schema_version": 4,
         "object_kind": "completion",
+        "principal_role": "completion_issuer",
         "identity_scheme": "sha256-domain-separated-v1",
         "object_identity": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
         "predecessor_identity": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
@@ -174,6 +205,7 @@
       "instance": {
         "schema_version": 4,
         "object_kind": "completion",
+        "principal_role": "completion_issuer",
         "identity_scheme": "sha256-domain-separated-v1",
         "object_identity": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
         "predecessor_identity": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
@@ -196,6 +228,7 @@
       "instance": {
         "schema_version": 5,
         "object_kind": "run",
+        "principal_role": "unknown",
         "identity_scheme": "sha256-domain-separated-v1",
         "object_identity": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
         "predecessor_identity": "sha256:2222222222222222222222222222222222222222222222222222222222222222",

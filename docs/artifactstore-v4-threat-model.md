@@ -47,9 +47,12 @@ chain produced from independently verified source bytes.
 
 The principals are: the source publisher, build service, execution supervisor,
 completion issuer, evidence-policy evaluator, release policy, verifier, and
-reader. A single deployment may host more than one role, but a receipt always
-records the principal role and signing key identity so roles cannot be silently
-collapsed.
+reader. A single deployment may host more than one role, but each object
+records the canonical producer role and signing key identity so roles cannot be
+silently collapsed. The F0 schema binds `source` to `source_publisher`, `build`
+to `build_service`, `execution` to `execution_supervisor`, and `completion` to
+`completion_issuer`; a deployment may share infrastructure, never a receipt
+role label.
 
 The immutable object chain is strictly ordered:
 
