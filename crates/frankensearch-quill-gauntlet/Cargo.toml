@@ -15,6 +15,7 @@ tantivy-oracle = [
     "frankensearch-lexical/tantivy-oracle",
     "frankensearch-quill/bench-internals",
 ]
+fuzz-harness = ["tantivy-oracle"]
 pruning-conformance = ["frankensearch-quill/pruning-conformance"]
 perf-harness = [
     "tantivy-oracle",

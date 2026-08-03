@@ -2254,6 +2254,40 @@ impl TantivyOracle {
     }
 }
 
+/// Build one committed scalar Quill/Tantivy pair for an external fuzzing run.
+///
+/// This constructor is feature-gated because the pair is deliberately
+/// one-shot: each corpus receives fresh engines, both are committed before a
+/// query may execute, and the normal production API does not expose campaign
+/// lifecycle controls.
+///
+/// # Errors
+///
+/// Returns the first engine construction, indexing, or commit failure.
+#[cfg(feature = "fuzz-harness")]
+pub async fn scalar_g1a_fuzz_pair(
+    cx: &Cx,
+    documents: &[frankensearch_core::IndexableDocument],
+) -> Result<(QuillSubject, TantivyOracle), GauntletError> {
+    use frankensearch_core::LexicalSearch;
+
+    let config = QuillConfig {
+        deterministic_ingest: true,
+        ..QuillConfig::default()
+    };
+    let mut subject = QuillSubject::in_memory(config)?;
+    let mut oracle = TantivyOracle::in_memory_scalar_g1a()?;
+    subject.claim_fresh_campaign()?;
+    oracle.claim_fresh_campaign()?;
+    subject.index_mut()?.index_documents(cx, documents).await?;
+    subject.index_mut()?.commit(cx).await?;
+    oracle.index().index_documents(cx, documents).await?;
+    oracle.index().commit(cx).await?;
+    subject.mark_committed()?;
+    oracle.mark_committed()?;
+    Ok((subject, oracle))
+}
+
 #[cfg(feature = "tantivy-oracle")]
 impl GauntletEngine for TantivyOracle {
     fn descriptor(&self) -> EngineDescriptor {

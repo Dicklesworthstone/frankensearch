@@ -71,6 +71,8 @@ pub use comparator::{
     compare_lexical_observations, compare_observations, observe_lexical_outcome,
     observe_live_quill_cancellation_receipt, observe_quill_cass_profile,
 };
+#[cfg(feature = "fuzz-harness")]
+pub use engine::scalar_g1a_fuzz_pair;
 pub use engine::{
     CASS_TANTIVY_ORACLE_CONFIG_HASH, ComparisonMode, DifferentialCase, DifferentialCaseMetadata,
     DifferentialHarness, EngineDescriptor, EngineFamily, EnginePairIdentity, GauntletEngine,
