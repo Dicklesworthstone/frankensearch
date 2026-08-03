@@ -6009,6 +6009,23 @@ mod tests {
     }
 
     #[test]
+    fn lease_collision_helper() {
+        let Some(path) = std::env::var_os("QUILL_PERF_TEST_LEASE_COLLISION_PATH") else {
+            return;
+        };
+        let error = acquire_family_lease(Path::new(&path))
+            .expect_err("lease contender must not acquire a held family lease");
+        assert!(
+            matches!(
+                &error,
+                LocalPerfRunError::Io(error) if matches!(error.kind(), std::io::ErrorKind::WouldBlock)
+            ),
+            "lease contender failed with an unexpected error: {error}"
+        );
+        println!("lease-collision-observed");
+    }
+
+    #[test]
     fn lease_crash_recovery_helper() {
         let Some(path) = std::env::var_os("QUILL_PERF_TEST_CRASH_LEASE_PATH") else {
             return;
@@ -6108,15 +6125,19 @@ mod tests {
             }
         }
 
+        let collision_helper_name = "local_perf_runner::tests::lease_collision_helper";
         let contender = Command::new(&current_test)
-            .args(["--exact", helper_name, "--nocapture"])
-            .env("QUILL_PERF_TEST_LEASE_PATH", &lease_path)
+            .args(["--exact", collision_helper_name, "--nocapture"])
+            .env("QUILL_PERF_TEST_LEASE_COLLISION_PATH", &lease_path)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status()
             .expect("run lease contender");
-        assert!(!contender.success(), "second process acquired held lease");
+        assert!(
+            contender.success(),
+            "second process did not report the expected held-lease collision"
+        );
 
         drop(holder.stdin.take());
         assert!(holder.wait().expect("wait for lease holder").success());
