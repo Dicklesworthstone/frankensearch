@@ -196,12 +196,15 @@ pub enum LocalPerfRunError {
     Invalid(String),
     /// A measured child attempt reached a durable typed terminal receipt.
     #[error(
-        "local performance runner attempt ended as {outcome:?}; sealed receipt preserved at {}",
-        receipt_path.display()
+        "local performance runner attempt ended as {outcome:?}; sealed receipt preserved at {} and post-unlock release receipt at {}",
+        receipt_path.display(),
+        lease_release_receipt.display()
     )]
     AttemptFailed {
         /// Exact canonical attempt-receipt path.
         receipt_path: PathBuf,
+        /// Exact post-unlock lease-release receipt path.
+        lease_release_receipt: PathBuf,
         /// Typed terminal outcome preserved in the receipt.
         outcome: LocalPerfAttemptOutcome,
     },
@@ -742,8 +745,8 @@ pub struct LocalPerfAttemptReceipt {
     seal_sha256: String,
 }
 
-/// Strict, canonical proof that a completed attempt's host-global lease was
-/// explicitly unlocked only after the final attempt/evidence pair published.
+/// Strict, canonical proof that a terminal attempt's host-global lease was
+/// explicitly unlocked only after its sealed attempt receipt published.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct LocalPerfLeaseReleaseReceipt {
@@ -786,15 +789,6 @@ impl LocalPerfLeaseReleaseReceipt {
         }
         receipt.verify()?;
         Ok(receipt)
-    }
-
-    /// Load and independently verify one exact lease-release receipt.
-    ///
-    /// # Errors
-    ///
-    /// Returns a typed I/O or receipt-verification error.
-    pub fn load_verified(path: &Path) -> Result<Self, LocalPerfRunError> {
-        Self::from_verified_slice(&fs::read(path)?)
     }
 
     /// Canonical compact JSON bytes used for persistence and exact hashing.
@@ -1109,21 +1103,16 @@ impl LocalPerfAttemptReceipt {
     }
 
     /// Prove that exact post-unlock lease-release receipt bytes name this
-    /// completed process attempt and were issued no earlier than its finish.
+    /// terminal process attempt and were issued no earlier than its finish.
     ///
     /// # Errors
     ///
-    /// Rejects a failed attempt, substituted or noncanonical release receipt,
-    /// or a receipt from another invocation.
+    /// Rejects a substituted or noncanonical release receipt, or a receipt
+    /// from another invocation.
     pub fn verify_lease_release_receipt(
         &self,
         lease_release_receipt_bytes: &[u8],
     ) -> Result<(), LocalPerfRunError> {
-        if self.outcome != LocalPerfAttemptOutcome::Completed {
-            return Err(LocalPerfRunError::Invalid(
-                "failed attempt cannot have an admissible lease-release receipt".to_owned(),
-            ));
-        }
         let release =
             LocalPerfLeaseReleaseReceipt::from_verified_slice(lease_release_receipt_bytes)?;
         if release.attempt_receipt_sha256 != self.exact_sha256()?
@@ -1792,10 +1781,14 @@ fn run_local_perf_command_inner(
                 run_log_bytes.as_deref(),
                 &started_at_utc,
             )?;
-            return Err(LocalPerfRunError::AttemptFailed {
-                receipt_path: attempt_path,
+            return Err(failed_attempt_error_after_release(
+                config,
+                &lease_file,
+                &lease_identity,
+                &run_directories,
+                attempt_path,
                 outcome,
-            });
+            )?);
         }
     };
     let (status, recovered_wait_error, process_group_recovery) = match child.wait() {
@@ -1853,10 +1846,14 @@ fn run_local_perf_command_inner(
             run_log_result.as_deref().ok(),
             &started_at_utc,
         )?;
-        return Err(LocalPerfRunError::AttemptFailed {
-            receipt_path: attempt_path,
+        return Err(failed_attempt_error_after_release(
+            config,
+            &lease_file,
+            &lease_identity,
+            &run_directories,
+            attempt_path,
             outcome,
-        });
+        )?);
     }
     let run_log_bytes = match run_log_result {
         Ok(bytes) => bytes,
@@ -1881,10 +1878,14 @@ fn run_local_perf_command_inner(
                 None,
                 &started_at_utc,
             )?;
-            return Err(LocalPerfRunError::AttemptFailed {
-                receipt_path: attempt_path,
+            return Err(failed_attempt_error_after_release(
+                config,
+                &lease_file,
+                &lease_identity,
+                &run_directories,
+                attempt_path,
                 outcome,
-            });
+            )?);
         }
     };
     let exit_code = status.code().map_or(-1, i64::from);
@@ -1915,10 +1916,14 @@ fn run_local_perf_command_inner(
             Some(&run_log_bytes),
             &started_at_utc,
         )?;
-        return Err(LocalPerfRunError::AttemptFailed {
-            receipt_path: attempt_path,
+        return Err(failed_attempt_error_after_release(
+            config,
+            &lease_file,
+            &lease_identity,
+            &run_directories,
+            attempt_path,
             outcome,
-        });
+        )?);
     }
     if let Some(error_kind) = recovered_wait_error {
         let outcome = LocalPerfAttemptOutcome::WaitRecoveredByKill { error_kind };
@@ -1939,10 +1944,14 @@ fn run_local_perf_command_inner(
             Some(&run_log_bytes),
             &started_at_utc,
         )?;
-        return Err(LocalPerfRunError::AttemptFailed {
-            receipt_path: attempt_path,
+        return Err(failed_attempt_error_after_release(
+            config,
+            &lease_file,
+            &lease_identity,
+            &run_directories,
+            attempt_path,
             outcome,
-        });
+        )?);
     }
     if !status.success() {
         let outcome = status.code().map_or_else(
@@ -1974,10 +1983,14 @@ fn run_local_perf_command_inner(
             Some(&run_log_bytes),
             &started_at_utc,
         )?;
-        return Err(LocalPerfRunError::AttemptFailed {
-            receipt_path: attempt_path,
+        return Err(failed_attempt_error_after_release(
+            config,
+            &lease_file,
+            &lease_identity,
+            &run_directories,
+            attempt_path,
             outcome,
-        });
+        )?);
     }
 
     let post_exit_rejection = |stage| -> Result<LocalPerfRunError, LocalPerfRunError> {
@@ -1999,10 +2012,14 @@ fn run_local_perf_command_inner(
             Some(&run_log_bytes),
             &started_at_utc,
         )?;
-        Ok(LocalPerfRunError::AttemptFailed {
+        failed_attempt_error_after_release(
+            config,
+            &lease_file,
+            &lease_identity,
+            &run_directories,
             receipt_path,
             outcome,
-        })
+        )
     };
     if !process_lifecycle.descendant_process_tree_quiescence_is_proven() {
         return Err(post_exit_rejection(
@@ -2451,67 +2468,14 @@ fn run_local_perf_command_inner(
         });
     }
 
-    let release_receipt_name = format!("{}.lease-release.json", config.gate.label());
-    let release_receipt_path = config.output_dir.join(&release_receipt_name);
-    if let Err(error) = flock(&lease_file, FlockOperation::Unlock) {
-        return Err(LocalPerfRunError::LeaseReleaseReceiptUnavailable {
-            receipt_path: release_receipt_path,
-            detail: bounded_diagnostic(&std::io::Error::from(error)),
-        });
-    }
+    let release_receipt_path = publish_terminal_lease_release_receipt(
+        config,
+        &lease_file,
+        &lease_identity,
+        &run_directories,
+        &completed_attempt_bytes,
+    )?;
     drop(lease_file);
-    let release_receipt_bytes = match utc_now().and_then(|released_at_utc| {
-        completed_lease_release_receipt_bytes(
-            config,
-            &lease_identity,
-            &completed_attempt_bytes,
-            &released_at_utc,
-        )
-    }) {
-        Ok(bytes) => bytes,
-        Err(error) => {
-            return Err(LocalPerfRunError::LeaseReleaseReceiptUnavailable {
-                receipt_path: release_receipt_path,
-                detail: bounded_diagnostic(&error),
-            });
-        }
-    };
-    if write_new_sync_at(
-        &run_directories.run.handle,
-        &release_receipt_name,
-        &release_receipt_bytes,
-    )
-    .and_then(|()| {
-        run_directories
-            .run
-            .handle
-            .sync_all()
-            .map_err(LocalPerfRunError::from)
-    })
-    .is_err()
-    {
-        return Err(LocalPerfRunError::LeaseReleaseReceiptUnavailable {
-            receipt_path: release_receipt_path,
-            detail: "release receipt could not be durably published after lease unlock".to_owned(),
-        });
-    }
-    let persisted_release = read_file_at(&run_directories.run.handle, &release_receipt_name)
-        .map_err(|error| LocalPerfRunError::LeaseReleaseReceiptUnavailable {
-            receipt_path: release_receipt_path.clone(),
-            detail: bounded_diagnostic(&error),
-        })?;
-    if persisted_release != release_receipt_bytes {
-        return Err(LocalPerfRunError::LeaseReleaseReceiptUnavailable {
-            receipt_path: release_receipt_path.clone(),
-            detail: "persisted release receipt bytes differ from the sealed publication".to_owned(),
-        });
-    }
-    LocalPerfLeaseReleaseReceipt::load_verified(&release_receipt_path).map_err(|error| {
-        LocalPerfRunError::LeaseReleaseReceiptUnavailable {
-            receipt_path: release_receipt_path.clone(),
-            detail: bounded_diagnostic(&error),
-        }
-    })?;
     Ok(LocalPerfRunOutput {
         booking_receipt: booking_receipt_path,
         run_log: run_log_path,
@@ -4846,6 +4810,38 @@ fn write_failed_attempt_receipt(
     })
 }
 
+fn failed_attempt_error_after_release(
+    config: &LocalPerfRunConfig,
+    lease_file: &OwnedFd,
+    lease_file_identity: &LeaseFileIdentity,
+    directories: &RunDirectories,
+    receipt_path: PathBuf,
+    outcome: LocalPerfAttemptOutcome,
+) -> Result<LocalPerfRunError, LocalPerfRunError> {
+    let receipt_name = format!("{}.attempt.json", config.gate.label());
+    let attempt_receipt_bytes =
+        read_file_at(&directories.run.handle, &receipt_name).map_err(|error| {
+            LocalPerfRunError::LeaseReleaseReceiptUnavailable {
+                receipt_path: config
+                    .output_dir
+                    .join(format!("{}.lease-release.json", config.gate.label())),
+                detail: bounded_diagnostic(&error),
+            }
+        })?;
+    let lease_release_receipt = publish_terminal_lease_release_receipt(
+        config,
+        lease_file,
+        lease_file_identity,
+        directories,
+        &attempt_receipt_bytes,
+    )?;
+    Ok(LocalPerfRunError::AttemptFailed {
+        receipt_path,
+        lease_release_receipt,
+        outcome,
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn completed_attempt_receipt_bytes(
     config: &LocalPerfRunConfig,
@@ -5771,7 +5767,7 @@ fn seal_booking_receipt(
     serde_json::to_vec(&receipt).map_err(LocalPerfRunError::from)
 }
 
-fn completed_lease_release_receipt_bytes(
+fn terminal_lease_release_receipt_bytes(
     config: &LocalPerfRunConfig,
     lease_file_identity: &LeaseFileIdentity,
     attempt_receipt_bytes: &[u8],
@@ -5779,15 +5775,14 @@ fn completed_lease_release_receipt_bytes(
 ) -> Result<Vec<u8>, LocalPerfRunError> {
     let attempt = LocalPerfAttemptReceipt::from_verified_slice(attempt_receipt_bytes)?;
     validate_utc_timestamp(released_at_utc, "lease release")?;
-    if attempt.outcome != LocalPerfAttemptOutcome::Completed
-        || attempt.gate != config.gate.label()
+    if attempt.gate != config.gate.label()
         || attempt.profile != config.profile
         || attempt.run_id != config.run_id
         || attempt.run_window != config.run_window
         || attempt.lease_file_identity != *lease_file_identity
     {
         return Err(LocalPerfRunError::Invalid(
-            "lease release receipt differs from its completed attempt identity".to_owned(),
+            "lease release receipt differs from its terminal attempt identity".to_owned(),
         ));
     }
     if released_at_utc < attempt.finished_at_utc.as_str() {
@@ -5809,6 +5804,70 @@ fn completed_lease_release_receipt_bytes(
     let receipt_bytes = seal_lease_release_receipt(receipt)?;
     LocalPerfLeaseReleaseReceipt::from_verified_slice(&receipt_bytes)?;
     Ok(receipt_bytes)
+}
+
+fn publish_terminal_lease_release_receipt(
+    config: &LocalPerfRunConfig,
+    lease_file: &OwnedFd,
+    lease_file_identity: &LeaseFileIdentity,
+    run_directories: &RunDirectories,
+    attempt_receipt_bytes: &[u8],
+) -> Result<PathBuf, LocalPerfRunError> {
+    let release_receipt_name = format!("{}.lease-release.json", config.gate.label());
+    let release_receipt_path = config.output_dir.join(&release_receipt_name);
+    flock(lease_file, FlockOperation::Unlock).map_err(|error| {
+        LocalPerfRunError::LeaseReleaseReceiptUnavailable {
+            receipt_path: release_receipt_path.clone(),
+            detail: bounded_diagnostic(&std::io::Error::from(error)),
+        }
+    })?;
+    let release_receipt_bytes = utc_now()
+        .and_then(|released_at_utc| {
+            terminal_lease_release_receipt_bytes(
+                config,
+                lease_file_identity,
+                attempt_receipt_bytes,
+                &released_at_utc,
+            )
+        })
+        .map_err(|error| LocalPerfRunError::LeaseReleaseReceiptUnavailable {
+            receipt_path: release_receipt_path.clone(),
+            detail: bounded_diagnostic(&error),
+        })?;
+    write_new_sync_at(
+        &run_directories.run.handle,
+        &release_receipt_name,
+        &release_receipt_bytes,
+    )
+    .and_then(|()| {
+        run_directories
+            .run
+            .handle
+            .sync_all()
+            .map_err(LocalPerfRunError::from)
+    })
+    .map_err(|error| LocalPerfRunError::LeaseReleaseReceiptUnavailable {
+        receipt_path: release_receipt_path.clone(),
+        detail: bounded_diagnostic(&error),
+    })?;
+    let persisted_release = read_file_at(&run_directories.run.handle, &release_receipt_name)
+        .map_err(|error| LocalPerfRunError::LeaseReleaseReceiptUnavailable {
+            receipt_path: release_receipt_path.clone(),
+            detail: bounded_diagnostic(&error),
+        })?;
+    if persisted_release != release_receipt_bytes {
+        return Err(LocalPerfRunError::LeaseReleaseReceiptUnavailable {
+            receipt_path: release_receipt_path.clone(),
+            detail: "persisted release receipt bytes differ from the sealed publication".to_owned(),
+        });
+    }
+    LocalPerfLeaseReleaseReceipt::from_verified_slice(&persisted_release).map_err(|error| {
+        LocalPerfRunError::LeaseReleaseReceiptUnavailable {
+            receipt_path: release_receipt_path.clone(),
+            detail: bounded_diagnostic(&error),
+        }
+    })?;
+    Ok(release_receipt_path)
 }
 
 fn seal_lease_release_receipt(
@@ -7115,7 +7174,7 @@ mod tests {
     }
 
     #[test]
-    fn process_receipts_cover_completed_and_every_supported_failure_outcome() {
+    fn process_receipts_and_terminal_release_cover_completed_and_every_supported_failure_outcome() {
         let bound = b"exact completed bound evidence";
         let outcomes = [
             LocalPerfAttemptOutcome::Completed,
@@ -7164,6 +7223,20 @@ mod tests {
                 sha256_hex(&bytes)
             );
             receipt.verify_run_log(&run_log).expect("exact run log");
+            let mut config = policy_config(PerfGate::Qg1);
+            config.profile = receipt.profile;
+            config.run_id = receipt.run_id.clone();
+            config.run_window = receipt.run_window.clone();
+            let release = terminal_lease_release_receipt_bytes(
+                &config,
+                &receipt.lease_file_identity,
+                &bytes,
+                "2026-08-03T15:30:00Z",
+            )
+            .expect("seal terminal attempt release receipt");
+            receipt
+                .verify_lease_release_receipt(&release)
+                .expect("release receipt binds every sealed terminal outcome");
             let lifecycle = receipt.process_lifecycle();
             assert!(lifecycle.spawn_attempted());
             assert_eq!(
@@ -7305,7 +7378,7 @@ mod tests {
         config.profile = attempt.profile;
         config.run_id = attempt.run_id.clone();
         config.run_window = attempt.run_window.clone();
-        let bytes = completed_lease_release_receipt_bytes(
+        let bytes = terminal_lease_release_receipt_bytes(
             &config,
             &attempt.lease_file_identity,
             &attempt_bytes,
@@ -7338,19 +7411,20 @@ mod tests {
         let bytes = seal_lease_release_receipt(tampered).expect("reseal timestamp tamper");
         assert!(LocalPerfLeaseReleaseReceipt::from_verified_slice(&bytes).is_err());
 
-        let (_, failed_attempt_bytes, _) =
+        let (failed_attempt, failed_attempt_bytes, _) =
             attempt_fixture(LocalPerfAttemptOutcome::ExitedNonzero { code: 17 }, None);
+        let failure_release = terminal_lease_release_receipt_bytes(
+            &config,
+            &attempt.lease_file_identity,
+            &failed_attempt_bytes,
+            "2026-08-03T15:30:00Z",
+        )
+        .expect("seal terminal failed-attempt release receipt");
+        failed_attempt
+            .verify_lease_release_receipt(&failure_release)
+            .expect("release receipt matches failed terminal attempt");
         assert!(
-            completed_lease_release_receipt_bytes(
-                &config,
-                &attempt.lease_file_identity,
-                &failed_attempt_bytes,
-                "2026-08-03T15:30:00Z",
-            )
-            .is_err()
-        );
-        assert!(
-            completed_lease_release_receipt_bytes(
+            terminal_lease_release_receipt_bytes(
                 &config,
                 &attempt.lease_file_identity,
                 &attempt_bytes,
@@ -7740,7 +7814,7 @@ mod tests {
             "let persisted_attempt =\n        read_file_at(&run_directories.run.handle",
         );
         let lease_unlock =
-            unique_marker_offset(source, "flock(&lease_file, FlockOperation::Unlock)");
+            unique_marker_offset(source, "flock(lease_file, FlockOperation::Unlock)");
         let release_publish = unique_marker_offset(source, "&release_receipt_bytes,");
         assert!(booking_publish < child_inputs_durable);
         assert!(child_inputs_durable < nested_runner);

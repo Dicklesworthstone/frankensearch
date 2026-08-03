@@ -4691,8 +4691,8 @@ mod tests {
 
     #[test]
     fn qg1_profile_plans_have_frozen_exhaustive_applicability_counts() {
-        // GOLDEN-CHANGE (attempt receipt v10): the attempt now seals the
-        // exact pre-build booking receipt digest. Matrix cells and
+        // GOLDEN-CHANGE (terminal release receipt): every sealed terminal
+        // attempt now requires a post-unlock receipt. Matrix cells and
         // applicability counts are unchanged; only their manifest-bound plan
         // identities advance.
         let registry = MachineClassRegistry::frozen().expect("frozen machine registry");
@@ -4704,7 +4704,7 @@ mod tests {
                 16,
                 Some(64),
                 Some(64),
-                "7f98bfeea056ddad49d457fbca8dec3b7d2b0316f88cf37350a03bf47f3362ac",
+                "893449ea6995017d8496a62ac3bdfa34fcc18add6f2df4c268ac425024bb74f7",
             ),
             (
                 ExecutionProfileId::Smt2_128,
@@ -4713,7 +4713,7 @@ mod tests {
                 0,
                 Some(128),
                 Some(128),
-                "8ec4602fe8bf28d567b940d58343c72a5d67c94a965c49dbfd3582ac0d48c9f2",
+                "9124b71e748ef29ed6048eea79319e2891b44670b205b9a4e9e6ba8005a3f103",
             ),
             (
                 ExecutionProfileId::Scheduler10,
@@ -4722,7 +4722,7 @@ mod tests {
                 40,
                 Some(10),
                 Some(8),
-                "f3b80ee4d1aadcce95fd6b9e985985663d562e775ed7e425bec30e1febe39b97",
+                "56f659889230d0f22dbb3118e4815ee6e3c823aab4ec37d38f69eae3a86d6392",
             ),
         ];
         let mut plan_hashes = BTreeSet::new();
@@ -5536,12 +5536,12 @@ mod tests {
     fn manifest_contract_hash_ignores_only_activation_state() {
         let manifest = PERF_MANIFEST;
         assert_eq!(manifest.matches("activated = false").count(), 10);
-        // GOLDEN-CHANGE (attempt receipt v10): the manifest now requires the
-        // exact booking digest carried by every post-booking attempt.
+        // GOLDEN-CHANGE (terminal release receipt): every sealed terminal
+        // attempt now requires a post-unlock receipt bound to its exact bytes.
         // Activation is still the sole administrative normalization exception.
         assert_eq!(
             perf_manifest_contract_sha256(manifest),
-            "1495b7c439ef7da4e01e2a262e439af20a6916f465160780b2eec27d76c649c9",
+            "593d2c447946607a6f3a29dfe17b4affe1f9ca4ffdb38f72585ad7c18ddf3ae7",
             "the normalized all-inactive manifest digest must remain frozen"
         );
         assert_eq!(

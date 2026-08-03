@@ -113,9 +113,11 @@ fn run() -> Result<FinalizeOutcome, Box<dyn Error>> {
         Ok(output) => output,
         Err(LocalPerfRunError::AttemptFailed {
             receipt_path,
+            lease_release_receipt,
             outcome,
         }) => {
             println!("attempt_receipt={}", receipt_path.display());
+            println!("lease_release_receipt={}", lease_release_receipt.display());
             println!("attempt_outcome={outcome:?}");
             return Ok(FinalizeOutcome::DurableNoClaim);
         }
@@ -126,6 +128,10 @@ fn run() -> Result<FinalizeOutcome, Box<dyn Error>> {
     println!("environment_policy={}", output.environment_policy.display());
     println!("runner_receipt={}", output.runner_receipt.display());
     println!("attempt_receipt={}", output.attempt_receipt.display());
+    println!(
+        "lease_release_receipt={}",
+        output.lease_release_receipt.display()
+    );
     println!("threshold_artifact={}", output.threshold_artifact.display());
     println!(
         "prebinding_evidence={}",
