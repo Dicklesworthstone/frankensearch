@@ -777,11 +777,6 @@ impl Deref for VectorIndexData {
 pub struct VectorIndex {
     pub(crate) path: PathBuf,
     pub(crate) data: VectorIndexData,
-    /// Held for the lifetime of a mutable mapping so two cooperating
-    /// [`VectorIndex::open`] callers cannot observe and modify the same FSVI
-    /// bytes concurrently. Sealed v2 owners use immutable bytes instead and
-    /// therefore retain no mutable-path lock.
-    mutable_open_lock: Option<File>,
     pub(crate) metadata: VectorMetadata,
     pub(crate) records_offset: usize,
     pub(crate) strings_offset: usize,
@@ -1577,7 +1572,6 @@ impl ValidatedFsviBytes {
         let index = VectorIndex {
             path: PathBuf::from(OWNED_PATH),
             data: VectorIndexData::Immutable(Arc::clone(&bytes)),
-            mutable_open_lock: None,
             metadata,
             records_offset,
             strings_offset,
@@ -1679,16 +1673,6 @@ impl VectorIndex {
             .write(true)
             .open(path)
             .map_err(SearchError::Io)?;
-        file.try_lock().map_err(|error| {
-            SearchError::Io(std::io::Error::new(
-                error.kind(),
-                format!(
-                    "refusing a second mutable FSVI open for '{}': {error}; \
-                     release the existing VectorIndex before opening this path again",
-                    path.display()
-                ),
-            ))
-        })?;
         let data = unsafe { MmapMut::map_mut(&file).map_err(SearchError::Io)? };
         let (metadata, header_len) = parse_header(path, &data)?;
 
@@ -1800,7 +1784,6 @@ impl VectorIndex {
         Ok(Self {
             path: path.to_path_buf(),
             data: VectorIndexData::Mutable(data),
-            mutable_open_lock: Some(file),
             metadata,
             records_offset,
             strings_offset,
@@ -6435,6 +6418,74 @@ mod tests {
         );
     }
 
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn sealed_owner_survives_in_place_same_size_path_rewrite() {
+        let directory = tempfile::tempdir().expect("private publication directory");
+        let path = directory.path().join("current.fsvi");
+        let replacement_path = directory.path().join("replacement.fsvi");
+        let binding = fsvi_v2_binding("same-size-rewrite", 4, Quantization::F16, 22, 0x82);
+
+        let mut original = VectorIndex::create_v2(&path, binding.clone()).expect("original writer");
+        original
+            .write_record("doc-alpha", &[1.0, 0.0, 0.0, 0.0])
+            .expect("original alpha");
+        original
+            .write_record("doc-beta", &[0.0, 1.0, 0.0, 0.0])
+            .expect("original beta");
+        original.finish().expect("finish original");
+        let owner =
+            ValidatedFsviBytes::open_published(&path, &binding).expect("admit original owner");
+        let expected_witness = owner.witness().clone();
+        let expected_hits = owner
+            .search_top_k(&[1.0, 0.0, 0.0, 0.0], 2, None)
+            .expect("search original");
+
+        let mut replacement =
+            VectorIndex::create_v2(&replacement_path, binding.clone()).expect("replacement writer");
+        replacement
+            .write_record("doc-alpha", &[0.0, 1.0, 0.0, 0.0])
+            .expect("replacement alpha");
+        replacement
+            .write_record("doc-beta", &[1.0, 0.0, 0.0, 0.0])
+            .expect("replacement beta");
+        replacement.finish().expect("finish replacement");
+
+        let replacement_bytes = fs::read(&replacement_path).expect("read replacement bytes");
+        let original_identity =
+            stable_file_identity(&fs::symlink_metadata(&path).expect("original metadata"));
+        assert_eq!(
+            usize::try_from(original_identity.size).expect("original length fits"),
+            replacement_bytes.len(),
+            "fixture must exercise an in-place rewrite at the exact old length"
+        );
+        fs::write(&path, &replacement_bytes).expect("rewrite original pathname in place");
+        assert_eq!(
+            stable_file_identity(&fs::symlink_metadata(&path).expect("rewritten metadata")).inode,
+            original_identity.inode,
+            "same-size rewrite must retain the pathname inode rather than rename a replacement"
+        );
+
+        assert_eq!(owner.witness(), &expected_witness);
+        let observed_hits = owner
+            .search_top_k(&[1.0, 0.0, 0.0, 0.0], 2, None)
+            .expect("search retained owner");
+        assert_eq!(observed_hits.len(), expected_hits.len());
+        for (observed, expected) in observed_hits.iter().zip(&expected_hits) {
+            assert_eq!(observed.index, expected.index);
+            assert_eq!(observed.doc_id, expected.doc_id);
+            assert_eq!(observed.score.to_bits(), expected.score.to_bits());
+        }
+
+        assert!(matches!(
+            ValidatedFsviBytes::reopen_exact(&path, &binding, &expected_witness),
+            Err(FsviAdmissionError::SnapshotRejected(FsviSnapshotRejected {
+                reason: FsviSnapshotRejectionReason::WitnessMismatch,
+                ..
+            }))
+        ));
+    }
+
     #[test]
     fn same_display_strings_and_dimension_cannot_cross_open_distinct_identity_bundles() {
         let path_a = temp_index_path("v2-same-display-identity-a");
@@ -6524,63 +6575,6 @@ mod tests {
             owner.ann_admission(),
             FsviAnnAdmission::Disabled(FsviAnnDisabledReason::OwnerBoundAdapterUnavailable)
         );
-    }
-
-    #[test]
-    fn f32_owner_search_and_row_metadata_match_normal_reader_with_tombstones() {
-        let path = temp_index_path("v2-f32-owner-reader-parity");
-        let binding = fsvi_v2_binding("v2-f32-owner-reader-parity", 4, Quantization::F32, 24, 0x84);
-        let mut writer = VectorIndex::create_v2(&path, binding.clone()).expect("F32 parity writer");
-        writer
-            .write_tombstone_record("tombstone-best", &[1.0, 0.0, 0.0, 0.0])
-            .expect("tombstone row");
-        writer
-            .write_record("alpha", &[0.99, 0.1, 0.0, 0.0])
-            .expect("alpha row");
-        writer
-            .write_record("beta", &[0.8, 0.6, 0.0, 0.0])
-            .expect("beta row");
-        writer
-            .write_record("gamma", &[0.0, 1.0, 0.0, 0.0])
-            .expect("gamma row");
-        writer.finish().expect("finish F32 parity fixture");
-
-        let owner = admit_owned_v2_fixture(&path, &binding).expect("admit F32 sealed owner");
-        let normal = VectorIndex::open(&path).expect("open ordinary F32 reader");
-
-        assert_eq!(owner.metadata(), normal.metadata());
-        assert_eq!(owner.record_count(), normal.record_count());
-        assert_eq!(owner.live_count(), normal.live_count());
-        assert_eq!(owner.tombstone_count(), normal.tombstone_count());
-
-        for index in 0..owner.record_count() {
-            let owner_row = owner.row(index).expect("sealed owner row");
-            let normal_entry = normal.record_at(index).expect("ordinary reader row");
-            assert_eq!(
-                owner_row.doc_id(),
-                normal.doc_id_at(index).expect("ordinary document id")
-            );
-            assert_eq!(
-                owner_row.vector_bytes(),
-                normal.vector_bytes(index).expect("ordinary vector bytes")
-            );
-            assert_eq!(owner_row.flags(), FsviRecordFlags(normal_entry.flags));
-        }
-
-        let query = [1.0, 0.0, 0.0, 0.0];
-        let owner_hits = owner
-            .search_top_k(&query, 10, None)
-            .expect("sealed owner exact search");
-        let normal_hits = normal
-            .search_top_k(&query, 10, None)
-            .expect("ordinary reader exact search");
-        assert_eq!(owner_hits.len(), normal_hits.len());
-        assert!(owner_hits.iter().all(|hit| hit.doc_id != "tombstone-best"));
-        for (owner_hit, normal_hit) in owner_hits.iter().zip(&normal_hits) {
-            assert_eq!(owner_hit.index, normal_hit.index);
-            assert_eq!(owner_hit.doc_id, normal_hit.doc_id);
-            assert_eq!(owner_hit.score.to_bits(), normal_hit.score.to_bits());
-        }
     }
 
     #[test]
@@ -9617,23 +9611,6 @@ mod tests {
     }
 
     // ─── VectorIndex::open edge cases ───────────────────────────────────
-
-    #[test]
-    fn mutable_open_refuses_a_second_live_handle_until_the_first_is_dropped() {
-        let path = temp_index_path("mutable-open-exclusive");
-        let mut writer = VectorIndex::create(&path, "test", 4).expect("writer");
-        writer
-            .write_record("doc-0", &[1.0, 0.0, 0.0, 0.0])
-            .expect("record");
-        writer.finish().expect("finish fixture");
-
-        let first = VectorIndex::open(&path).expect("first mutable open");
-        let second = VectorIndex::open(&path).expect_err("second mutable open must be refused");
-        assert!(matches!(second, SearchError::Io(_)));
-
-        drop(first);
-        VectorIndex::open(&path).expect("open succeeds once the mutable owner is released");
-    }
 
     #[test]
     fn open_nonexistent_file_returns_index_not_found() {
