@@ -1997,6 +1997,7 @@ pub struct QuillProfileReceipt {
     sealed_segments: u64,
     delta_segments: u64,
     cache: QuillProfileCacheDisposition,
+    fanout_eligible: Option<bool>,
     execution: Option<QuillProfileExecutionMode>,
     work_plan: Option<(u64, bool)>,
     snapshot_doc_freq_calls: u64,
@@ -2055,6 +2056,16 @@ impl QuillProfileReceipt {
     #[must_use]
     pub const fn cache(&self) -> QuillProfileCacheDisposition {
         self.cache
+    }
+
+    /// Whether the sealed snapshot met the shipping Rayon fan-out shape gate.
+    ///
+    /// Cache-served and pre-planning failures have no fan-out observation.
+    /// This records eligibility independently from the selected execution
+    /// branch, which can still be serial when shipping fuel metering is active.
+    #[must_use]
+    pub const fn fanout_eligible(&self) -> Option<bool> {
+        self.fanout_eligible
     }
 
     /// Actual sealed-segment execution branch, when sealed work was reached.
@@ -2140,6 +2151,7 @@ pub struct QuillProfileSession {
 #[derive(Debug)]
 struct QuillProfileSessionState {
     cache: Option<QuillProfileCacheDisposition>,
+    fanout_eligible: Option<bool>,
     execution: Option<QuillProfileExecutionMode>,
     work_plan: Option<(u64, bool)>,
     completed: bool,
@@ -2172,6 +2184,7 @@ impl QuillProfileSession {
             overflowed: AtomicBool::new(false),
             state: StdMutex::new(QuillProfileSessionState {
                 cache: None,
+                fanout_eligible: None,
                 execution: None,
                 work_plan: None,
                 completed: false,
@@ -2220,6 +2233,27 @@ impl QuillProfileSession {
             ));
         }
         state.execution = Some(execution);
+        drop(state);
+        Ok(())
+    }
+
+    /// Bind whether the ordinary sealed snapshot met the Rayon shape gate.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed invalid-state error if the session was finalized, the
+    /// eligibility fact was already bound, or the session lock is poisoned.
+    pub fn bind_fanout_eligibility(&self, eligible: bool) -> Result<(), QuillIndexError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| invalid_state("profile-internals session lock is poisoned"))?;
+        if state.completed || state.fanout_eligible.is_some() {
+            return Err(invalid_state(
+                "profile-internals fan-out eligibility was already bound",
+            ));
+        }
+        state.fanout_eligible = Some(eligible);
         drop(state);
         Ok(())
     }
@@ -2349,6 +2383,7 @@ impl QuillProfileSession {
             sealed_segments: self.sealed_segments,
             delta_segments: self.delta_segments,
             cache,
+            fanout_eligible: state.fanout_eligible,
             execution: state.execution,
             work_plan: state.work_plan,
             snapshot_doc_freq_calls: self.snapshot_doc_freq_calls.load(Ordering::Acquire),
@@ -7535,7 +7570,12 @@ impl QuillReader {
             .iter()
             .map(|segment| u64::from(segment.doc_count()))
             .sum();
-        let fan_out = sealed_segment_fanout(keeper.segments().len(), sealed_docs) && !metering;
+        let fanout_eligible = sealed_segment_fanout(keeper.segments().len(), sealed_docs);
+        #[cfg(feature = "profile-internals")]
+        if let Some(profile) = profile {
+            profile.bind_fanout_eligibility(fanout_eligible)?;
+        }
+        let fan_out = fanout_eligible && !metering;
         #[cfg(feature = "pruning-conformance")]
         let fan_out = fan_out
             && pruning_trace.is_none_or(|trace| trace.cancellation_arm_generation().is_none());
@@ -12150,6 +12190,9 @@ mod tests {
             .bind_cache(QuillProfileCacheDisposition::Miss)
             .expect("bind cache disposition once");
         session
+            .bind_fanout_eligibility(true)
+            .expect("bind shipping fan-out eligibility once");
+        session
             .bind_execution(QuillProfileExecutionMode::Rayon)
             .expect("bind actual shipping branch once");
         session.record_snapshot_doc_freq(5);
@@ -12165,6 +12208,7 @@ mod tests {
         assert_eq!(receipt.keeper_generation(), 23);
         assert_eq!(receipt.segment_counts(), (5, 2));
         assert_eq!(receipt.cache(), QuillProfileCacheDisposition::Miss);
+        assert_eq!(receipt.fanout_eligible(), Some(true));
         assert_eq!(receipt.execution(), Some(QuillProfileExecutionMode::Rayon));
         assert_eq!(receipt.counters(), (5, 25, 30, 7, 41));
         assert!(!receipt.overflowed());
@@ -12179,6 +12223,14 @@ mod tests {
         conflicting_cache
             .bind_cache(QuillProfileCacheDisposition::Disabled)
             .expect("bind first cache fact");
+        conflicting_cache
+            .bind_fanout_eligibility(false)
+            .expect("bind first fan-out fact");
+        assert!(matches!(
+            conflicting_cache.bind_fanout_eligibility(true),
+            Err(QuillIndexError::InvalidState { detail })
+                if detail.contains("already bound")
+        ));
         assert!(matches!(
             conflicting_cache.bind_cache(QuillProfileCacheDisposition::Hit),
             Err(QuillIndexError::InvalidState { detail })
@@ -12188,6 +12240,7 @@ mod tests {
             .complete(QuillProfileOutcome::Cancelled)
             .expect("conflicting bind cannot overwrite the original fact");
         assert_eq!(retained.cache(), QuillProfileCacheDisposition::Disabled);
+        assert_eq!(retained.fanout_eligible(), Some(false));
         assert_eq!(retained.outcome(), QuillProfileOutcome::Cancelled);
 
         let incomplete = QuillProfileSession::new(1, 1, 0, 0);
@@ -14935,6 +14988,7 @@ mod tests {
             assert_eq!(result.hits.len(), 1);
             assert_eq!(receipt.keeper_generation(), expected_generation);
             assert_eq!(receipt.cache(), QuillProfileCacheDisposition::Miss);
+            assert_eq!(receipt.fanout_eligible(), Some(false));
             assert_eq!(receipt.execution(), Some(QuillProfileExecutionMode::Serial));
             let Some((work_upper_bound, _metering)) = receipt.work_plan() else {
                 panic!("profiled ordinary query did not bind its work plan");
@@ -14964,6 +15018,7 @@ mod tests {
                 }
             };
             assert_eq!(repeat_receipt.cache(), QuillProfileCacheDisposition::Hit);
+            assert_eq!(repeat_receipt.fanout_eligible(), None);
             assert_eq!(repeat_receipt.execution(), None);
             assert_eq!(repeat_receipt.work_plan(), None);
             assert_eq!(repeat_receipt.counters(), (0, 0, 0, 0, 0));
@@ -15001,6 +15056,7 @@ mod tests {
                 matches!(error, QuillIndexError::Cancelled { ref phase } if *phase == "search")
             );
             assert_eq!(receipt.cache(), QuillProfileCacheDisposition::NotChecked);
+            assert_eq!(receipt.fanout_eligible(), None);
             assert_eq!(receipt.execution(), None);
             assert_eq!(receipt.work_plan(), None);
             assert_eq!(receipt.counters(), (0, 0, 0, 0, 0));
@@ -15032,6 +15088,7 @@ mod tests {
             };
             assert!(result.hits.is_empty());
             assert_eq!(receipt.cache(), QuillProfileCacheDisposition::Miss);
+            assert_eq!(receipt.fanout_eligible(), Some(false));
             assert_eq!(receipt.execution(), None);
             assert!(receipt.work_plan().is_some());
             assert_eq!(receipt.counters(), (0, 0, 0, 0, 0));
@@ -15074,12 +15131,61 @@ mod tests {
             assert_eq!(result.hits.len(), 2);
             assert_eq!(receipt.segment_counts(), (2, 0));
             assert_eq!(receipt.cache(), QuillProfileCacheDisposition::Miss);
+            assert_eq!(receipt.fanout_eligible(), Some(false));
             assert_eq!(receipt.execution(), Some(QuillProfileExecutionMode::Serial));
             assert_eq!(receipt.counters().0, 2);
             assert_eq!(receipt.counters().1, 4);
             assert_eq!(receipt.counters().2, 6);
             assert_eq!(receipt.counters().3, 2);
             assert!(receipt.counters().4 > 0);
+        });
+    }
+
+    #[cfg(feature = "profile-internals")]
+    #[test]
+    fn profiled_fragmented_snapshot_records_fanout_eligibility_and_rayon() {
+        run_with_cx(|cx| async move {
+            let directory = tempfile::tempdir().expect("fragmented profile directory");
+            let writer = QuillIndex::create(&cx, directory.path(), deterministic_config())
+                .await
+                .expect("create fragmented profile writer");
+            for ordinal in 0..SEGMENT_COUNT_FANOUT_THRESHOLD {
+                let document = IndexableDocument::new(
+                    format!("fragmented-{ordinal}"),
+                    format!("profiled alpha fragmented {ordinal}"),
+                );
+                LexicalSearch::index_document(&writer, &cx, &document)
+                    .await
+                    .expect("stage fragmented profile document");
+                LexicalSearch::commit(&writer, &cx)
+                    .await
+                    .expect("publish fragmented profile segment");
+            }
+            let reader = QuillSearchIndex::open(&cx, directory.path(), deterministic_config())
+                .await
+                .expect("open fragmented profile reader");
+            let outcome = reader
+                .search_paginated_with_profile(&cx, "alpha", 16, 0, false)
+                .expect("execute fragmented profiled search");
+            let (result, receipt) = match outcome {
+                QuillProfiledSearchOutcome::Completed { result, receipt } => (result, receipt),
+                QuillProfiledSearchOutcome::Failed { error, .. } => {
+                    panic!("fragmented profiled search unexpectedly failed: {error}")
+                }
+            };
+            let expected_segments = SEGMENT_COUNT_FANOUT_THRESHOLD as u64;
+            assert_eq!(result.hits.len(), SEGMENT_COUNT_FANOUT_THRESHOLD);
+            assert_eq!(receipt.segment_counts(), (expected_segments, 0));
+            assert_eq!(receipt.cache(), QuillProfileCacheDisposition::Miss);
+            assert_eq!(receipt.fanout_eligible(), Some(true));
+            assert_eq!(receipt.execution(), Some(QuillProfileExecutionMode::Rayon));
+            assert_eq!(receipt.counters().0, expected_segments);
+            assert_eq!(receipt.counters().1, expected_segments * expected_segments);
+            assert_eq!(
+                receipt.counters().2,
+                expected_segments * expected_segments + expected_segments
+            );
+            assert_eq!(receipt.counters().3, expected_segments);
         });
     }
 
