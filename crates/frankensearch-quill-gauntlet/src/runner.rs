@@ -17110,13 +17110,15 @@ mod tests {
             }
         }
 
-        /// The `^` boost family is fenced entirely for now: even a single
-        /// top-level leaf boost over the multi-field expansion diverges from
-        /// the oracle by 1 ULP (rounding/association order inside the boosted
-        /// sum — an arithmetic-parity question, not grammar). Non-finite
-        /// boosts additionally need the DIV-005 expected-divergence lane.
-        /// Both tracked as the bd-bsjw score-bit-parity residual.
-        fn maybe_boost(_rng: &mut TreeRng, _out: &mut String) {}
+        /// Probe one finite ordinary boost form in the exact lane. The
+        /// separate DIV-005 lane owns non-finite factors; nested and grouped
+        /// boosts remain outside this leaf-only grammar while their
+        /// score-association parity is adjudicated.
+        fn maybe_boost(rng: &mut TreeRng, out: &mut String) {
+            if rng.bounded(4) == 0 {
+                out.push_str("^2");
+            }
+        }
 
         fn render_chain(rng: &mut TreeRng, vocabulary: &[String], depth: usize, out: &mut String) {
             let operand_count = 1 + rng.bounded(4);
@@ -17128,7 +17130,7 @@ mod tests {
             // one coherent residual (mirror the pinned grammar's full
             // precedence-tree association), tracked on bd-bsjw. Top-level
             // chains keep the full connective set with proven bit parity.
-            let in_group = depth < 2;
+            let in_group = depth > 1;
             for _ in 1..operand_count {
                 let connective = rng.bounded(if in_group { 3 } else { 4 });
                 let is_not = !in_group && connective == 2;
@@ -17176,7 +17178,7 @@ mod tests {
             // a boost (membership change, pinned in the lexical crate —
             // campaign finding 4), so the stacked shape stays top-level-only
             // until that fallback is adjudicated.
-            let in_group = depth < 2;
+            let in_group = depth > 1;
             let operand = if after_not {
                 match rng.bounded(if in_group { 1 } else { 2 }) {
                     0 => Operand::Term(pick(rng, vocabulary).to_owned()),
@@ -17274,10 +17276,12 @@ mod tests {
                 ComparatorConfig::default(),
             );
             let corpus_hash = fixture.corpus_hash.clone();
+            let mut finite_leaf_boost_cases = 0_usize;
             for seed in [0x6273_6a77_0001_u64, 0x6273_6a77_0002] {
                 for ordinal in 0_u64..96 {
                     let mut rng = TreeRng::for_case(seed, ordinal);
                     let query = generate_query(&mut rng, &vocabulary);
+                    finite_leaf_boost_cases += usize::from(query.contains("^2"));
                     let case = DifferentialCase {
                         fixture_id: format!("bsjw-{seed:012x}-{ordinal:03}"),
                         query: query.clone(),
@@ -17323,6 +17327,10 @@ mod tests {
                     );
                 }
             }
+            assert!(
+                finite_leaf_boost_cases > 0,
+                "the seeded corpus must exercise the finite leaf-boost AST branch"
+            );
 
             // Typed-error lane: phrase slop is a declared Quill capability gap.
             // The subject must refuse every generated slop AST with its exact
