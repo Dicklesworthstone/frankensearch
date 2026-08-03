@@ -4259,6 +4259,36 @@ mod tests {
     }
 
     #[test]
+    fn raw_authority_frame_resolver_rejects_length_and_order_tears() {
+        let genesis = authority_reference(1, None);
+        let successor = authority_reference(2, Some(genesis.fingerprint()));
+        let first = authority_slot(1, genesis)
+            .encode()
+            .expect("encode genesis frame");
+        let second = authority_slot(0, successor)
+            .encode()
+            .expect("encode successor frame");
+
+        assert_eq!(
+            resolve_authority_slot_frames_v1(Some(&first[..first.len() - 1]), None, [0x5a; 16]),
+            Err(GenerationAuthorityErrorV1::InvalidSlotLength),
+            "a truncated present frame is not one-slot survival"
+        );
+        let mut extended = first.to_vec();
+        extended.push(0);
+        assert_eq!(
+            resolve_authority_slot_frames_v1(Some(&extended), None, [0x5a; 16]),
+            Err(GenerationAuthorityErrorV1::InvalidSlotLength),
+            "an extended present frame is not one-slot survival"
+        );
+        assert_eq!(
+            resolve_authority_slot_frames_v1(Some(&second), Some(&first), [0x5a; 16]),
+            Err(GenerationAuthorityErrorV1::SlotIndexMismatch),
+            "reordered physical frames cannot swap old and new authorities"
+        );
+    }
+
+    #[test]
     fn authority_floor_resolver_rejects_stale_forked_and_gapped_heads() {
         let genesis = authority_reference(1, None);
         let floor = AuthorityFloorV1::new([0x5a; 16], genesis).expect("valid authority floor");
