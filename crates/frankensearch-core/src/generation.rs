@@ -473,6 +473,20 @@ impl AuthorityRefV1 {
     }
 }
 
+fn predecessor_matches_authority(predecessor: Option<[u8; 32]>, authority: AuthorityRefV1) -> bool {
+    predecessor.is_some_and(|predecessor| {
+        constant_time_fingerprint_eq(&predecessor, &authority.fingerprint())
+    })
+}
+
+fn constant_time_fingerprint_eq(left: &[u8; 32], right: &[u8; 32]) -> bool {
+    let mut difference = 0_u8;
+    for index in 0..left.len() {
+        difference |= left[index] ^ right[index];
+    }
+    difference == 0
+}
+
 /// A decoded, authenticated physical authority slot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AuthoritySlotV1 {
@@ -731,8 +745,22 @@ impl InMemoryAntiRollbackFloorStoreV1 {
         if current != expected {
             return Err(GenerationAuthorityErrorV1::FloorCompareAndAdvanceConflict);
         }
-        if current.is_some_and(|record| next.authority.sequence <= record.authority.sequence) {
-            return Err(GenerationAuthorityErrorV1::FloorSequenceRegression);
+        match current {
+            Some(record) => {
+                let expected_sequence = record.authority.next_sequence()?;
+                if next.authority.sequence <= record.authority.sequence {
+                    return Err(GenerationAuthorityErrorV1::FloorSequenceRegression);
+                }
+                if next.authority.sequence != expected_sequence
+                    || !predecessor_matches_authority(next.authority.predecessor, record.authority)
+                {
+                    return Err(GenerationAuthorityErrorV1::BrokenPredecessorLink);
+                }
+            }
+            None if next.authority.sequence != 1 || next.authority.predecessor.is_some() => {
+                return Err(GenerationAuthorityErrorV1::BrokenPredecessorLink);
+            }
+            None => {}
         }
         let cas_version = current
             .map(|record| record.cas_version)
@@ -4798,6 +4826,85 @@ mod tests {
             "a completed idempotency key cannot be rebound to another CAS"
         );
         assert_eq!(store.load([0x5a; 16]), Ok(Some(second)));
+    }
+
+    #[test]
+    fn in_memory_anti_rollback_floor_requires_genesis_and_exact_successor_linkage() {
+        let store = InMemoryAntiRollbackFloorStoreV1::new();
+        let root_id = [0x5a; 16];
+        let fabricated_prior = authority_reference(1, None);
+        let unanchored_successor = AuthorityFloorV1::new(
+            root_id,
+            authority_reference(2, Some(fabricated_prior.fingerprint())),
+        )
+        .expect("self-consistent non-genesis authority is structurally valid");
+        assert_eq!(
+            store.compare_and_advance(None, unanchored_successor, [0x45; 16]),
+            Err(GenerationAuthorityErrorV1::BrokenPredecessorLink),
+            "an unanchored root cannot claim an unobserved predecessor"
+        );
+
+        let genesis = authority_reference(1, None);
+        let first = store
+            .compare_and_advance(
+                None,
+                AuthorityFloorV1::new(root_id, genesis).expect("valid genesis floor"),
+                [0x46; 16],
+            )
+            .expect("genesis advance must succeed");
+
+        let skipped =
+            AuthorityFloorV1::new(root_id, authority_reference(3, Some(genesis.fingerprint())))
+                .expect("self-consistent skipped authority is structurally valid");
+        assert_eq!(
+            store.compare_and_advance(Some(first), skipped, [0x47; 16]),
+            Err(GenerationAuthorityErrorV1::BrokenPredecessorLink),
+            "a floor CAS cannot skip an unobserved authority sequence"
+        );
+
+        let wrong_predecessor = AuthorityFloorV1::new(
+            root_id,
+            AuthorityRefV1::new(2, [0x91; 16], 4_098, [0x92; 32], Some([0x93; 32]))
+                .expect("wrongly linked successor remains structurally valid"),
+        )
+        .expect("floor validation defers predecessor identity to CAS state");
+        assert_eq!(
+            store.compare_and_advance(Some(first), wrong_predecessor, [0x48; 16]),
+            Err(GenerationAuthorityErrorV1::BrokenPredecessorLink),
+            "a successor must bind the exact retained authority fingerprint"
+        );
+        assert_eq!(store.load(root_id), Ok(Some(first)));
+    }
+
+    #[test]
+    fn in_memory_anti_rollback_floor_reports_terminal_authority_exhaustion() {
+        let store = InMemoryAntiRollbackFloorStoreV1::new();
+        let root_id = [0x5a; 16];
+        let terminal =
+            AuthorityRefV1::new(u64::MAX, [0x81; 16], 4_096, [0x82; 32], Some([0x83; 32]))
+                .expect("terminal authority remains structurally valid");
+        let current = AntiRollbackFloorRecordV1::new(
+            AuthorityFloorV1::new(root_id, terminal).expect("valid terminal floor"),
+            7,
+        )
+        .expect("valid terminal record");
+        store
+            .state
+            .lock()
+            .expect("test reference store mutex must be available")
+            .records
+            .insert(root_id, current);
+
+        assert_eq!(
+            store.compare_and_advance(
+                Some(current),
+                AuthorityFloorV1::new(root_id, terminal).expect("valid terminal floor"),
+                [0x49; 16],
+            ),
+            Err(GenerationAuthorityErrorV1::SequenceExhausted),
+            "terminal authority cannot be reinterpreted as a stale or wrapped advance"
+        );
+        assert_eq!(store.load(root_id), Ok(Some(current)));
     }
 
     #[test]
