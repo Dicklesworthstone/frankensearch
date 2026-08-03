@@ -4037,6 +4037,36 @@ mod tests {
     }
 
     #[test]
+    fn fixed_authority_frames_reject_resealed_future_schemas() {
+        let slot = authority_slot(0, authority_reference(1, None));
+        let mut future_slot = slot.encode().expect("encode authority slot");
+        future_slot[8..10].copy_from_slice(&(GENERATION_AUTHORITY_SCHEMA_V1 + 1).to_be_bytes());
+        let slot_digest = Sha256::digest(&future_slot[..AUTHORITY_SLOT_BODY_BYTES]);
+        future_slot[AUTHORITY_SLOT_BODY_BYTES..].copy_from_slice(&slot_digest);
+        assert_eq!(
+            AuthoritySlotV1::from_authenticated_bytes(&future_slot, 0, [0x5a; 16]),
+            Err(GenerationAuthorityErrorV1::InvalidField {
+                field: "authority_slot.header"
+            }),
+            "a future AUTHORITY frame is rejected even with a valid checksum"
+        );
+
+        let mut future_lock = lock_frame(GenerationLockFrameKindV1::Owner)
+            .encode()
+            .expect("encode owner lock frame");
+        future_lock[8..10].copy_from_slice(&(GENERATION_AUTHORITY_SCHEMA_V1 + 1).to_be_bytes());
+        let lock_digest = Sha256::digest(&future_lock[..LOCK_FRAME_BODY_BYTES]);
+        future_lock[LOCK_FRAME_BODY_BYTES..].copy_from_slice(&lock_digest);
+        assert_eq!(
+            GenerationLockFrameV1::from_authenticated_bytes(&future_lock, [0x71; 16]),
+            Err(GenerationAuthorityErrorV1::InvalidField {
+                field: "generation_lock.header"
+            }),
+            "a future LOCK frame is rejected even with a valid checksum"
+        );
+    }
+
+    #[test]
     fn lock_owner_and_attempt_frames_are_distinct_authenticated_contracts() {
         let owner = lock_frame(GenerationLockFrameKindV1::Owner);
         let owner_bytes = owner.encode().expect("encode owner lock frame");
