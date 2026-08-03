@@ -1101,6 +1101,19 @@ fn validate_manifest_schema_bindings(manifest: &toml::Value) -> Result<(), Box<d
         .get("schemas")
         .and_then(toml::Value::as_table)
         .ok_or("manifest does not define a [schemas] table")?;
+    const KNOWN_FIELDS: &[&str] = &[
+        "threshold_artifact",
+        "evidence_artifact",
+        "evidence_assembly",
+        "machine_registry",
+        "applicability_plan",
+        "runner_completion_receipt",
+        "runner_artifact_manifest",
+        "local_producer_contract",
+        "history_pointer",
+        "runner_attempt_receipt",
+        "precommit_inventory",
+    ];
     for (field, expected) in [
         ("threshold_artifact", PERF_ARTIFACT_SCHEMA_VERSION),
         ("evidence_artifact", PERF_EVIDENCE_SCHEMA_VERSION),
@@ -1114,6 +1127,11 @@ fn validate_manifest_schema_bindings(manifest: &toml::Value) -> Result<(), Box<d
             return Err(
                 format!("manifest schemas.{field} is {found:?}, expected {expected:?}").into(),
             );
+        }
+    }
+    for field in schemas.keys() {
+        if !KNOWN_FIELDS.contains(&field.as_str()) {
+            return Err(format!("manifest schemas.{field} is unreviewed").into());
         }
     }
     Ok(())
@@ -1498,6 +1516,23 @@ mod tests {
             stale_history_pointer_error.contains("schemas.history_pointer")
                 && stale_history_pointer_error.contains(PERF_HISTORY_POINTER_SCHEMA_VERSION),
             "unexpected stale history-pointer schema error: {stale_history_pointer_error}"
+        );
+
+        let mut unreviewed_schema = manifest.clone();
+        unreviewed_schema
+            .get_mut("schemas")
+            .and_then(toml::Value::as_table_mut)
+            .expect("schema table")
+            .insert(
+                "unreviewed_schema".to_owned(),
+                toml::Value::String("unreviewed.v1".to_owned()),
+            );
+        let unreviewed_schema_error = validate_manifest_schema_bindings(&unreviewed_schema)
+            .expect_err("unreviewed schema key must fail closed")
+            .to_string();
+        assert!(
+            unreviewed_schema_error.contains("schemas.unreviewed_schema is unreviewed"),
+            "unexpected unreviewed-schema error: {unreviewed_schema_error}"
         );
 
         let mut missing_threshold = manifest;

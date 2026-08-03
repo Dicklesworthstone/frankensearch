@@ -931,6 +931,28 @@ fn validate_perf_manifest_schema_bindings(
             });
         }
     }
+    for field in schemas.keys() {
+        if ![
+            "threshold_artifact",
+            "evidence_artifact",
+            "evidence_assembly",
+            "machine_registry",
+            "applicability_plan",
+            "runner_completion_receipt",
+            "runner_artifact_manifest",
+            "local_producer_contract",
+            "history_pointer",
+            "runner_attempt_receipt",
+            "precommit_inventory",
+        ]
+        .contains(&field.as_str())
+        {
+            return Err(PerfApplicabilityPlanError::ManifestContract {
+                gate: requested_gate,
+                detail: format!("manifest schemas.{field} is unreviewed"),
+            });
+        }
+    }
     Ok(())
 }
 
@@ -4943,6 +4965,20 @@ mod tests {
                 "unexpected stale {field} schema error: {stale_schema}"
             );
         }
+
+        let unreviewed_schema = PERF_MANIFEST.replacen(
+            "precommit_inventory = \"frankensearch.perf-run-precommit.v5\"",
+            "precommit_inventory = \"frankensearch.perf-run-precommit.v5\"\nunreviewed_schema = \"unreviewed.v1\"",
+            1,
+        );
+        let unreviewed_schema = perf_gate_manifest_identity(&unreviewed_schema, PerfGate::Qg1)
+            .expect_err("every manifest schema key must be reviewed");
+        assert!(
+            unreviewed_schema
+                .to_string()
+                .contains("manifest schemas.unreviewed_schema is unreviewed"),
+            "unexpected unreviewed schema error: {unreviewed_schema}"
+        );
 
         let missing = PERF_MANIFEST.replacen("primary_target_cell_width = 8\n", "", 1);
         assert!(matches!(
