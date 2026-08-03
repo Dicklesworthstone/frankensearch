@@ -834,6 +834,33 @@ fn validate_perf_manifest_gate_set(
                 });
             }
         }
+        let allowed_fields: &[&str] = match gate {
+            PerfGate::Qg1 => [
+                "name",
+                "fixture",
+                "target",
+                "primary_target_cell_width",
+                "activated",
+            ]
+            .as_slice(),
+            PerfGate::Qg6 => [
+                "name",
+                "fixture",
+                "queries_per_class",
+                "target",
+                "activated",
+            ]
+            .as_slice(),
+            _ => ["name", "fixture", "target", "activated"].as_slice(),
+        };
+        for field in policy.keys() {
+            if !allowed_fields.contains(&field.as_str()) {
+                return Err(PerfApplicabilityPlanError::ManifestContract {
+                    gate: requested_gate,
+                    detail: format!("manifest gate.{label} defines unexpected field {field}"),
+                });
+            }
+        }
     }
 
     let expected_labels = PerfGate::ALL
@@ -4922,6 +4949,19 @@ mod tests {
         let missing_qg6_query_groups = PERF_MANIFEST.replacen("queries_per_class = 16\n", "", 1);
         assert!(matches!(
             perf_gate_manifest_identity(&missing_qg6_query_groups, PerfGate::Qg1),
+            Err(PerfApplicabilityPlanError::ManifestContract {
+                gate: PerfGate::Qg1,
+                ..
+            })
+        ));
+
+        let unexpected_qg6_field = PERF_MANIFEST.replacen(
+            "queries_per_class = 16",
+            "queries_per_class = 16\nunreviewed_query_groups = 32",
+            1,
+        );
+        assert!(matches!(
+            perf_gate_manifest_identity(&unexpected_qg6_field, PerfGate::Qg1),
             Err(PerfApplicabilityPlanError::ManifestContract {
                 gate: PerfGate::Qg1,
                 ..
