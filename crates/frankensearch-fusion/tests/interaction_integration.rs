@@ -45,6 +45,7 @@ use frankensearch_fusion::interaction_oracles::{
     InvariantGroup, LaneOracleTemplate, LaneTestReport, OracleOutcome, OracleVerdict,
     lane_oracle_templates, oracle_template_for_lane, oracles_for_lane,
 };
+use frankensearch_fusion::rrf::RrfTiebreak;
 use frankensearch_fusion::searcher::TwoTierSearcher;
 use serde_json::Number;
 
@@ -181,7 +182,10 @@ fn build_test_index() -> Arc<TwoTierIndex> {
     Arc::new(builder.finish().expect("finish test index"))
 }
 
-fn build_searcher_for_lane(lane: &InteractionLane) -> (TwoTierSearcher, Arc<TwoTierIndex>) {
+fn build_searcher_for_lane(
+    lane: &InteractionLane,
+    tiebreak: Option<RrfTiebreak>,
+) -> (TwoTierSearcher, Arc<TwoTierIndex>) {
     let index = build_test_index();
     let fast = Arc::new(StubEmbedder::new("fast", DIM));
     let quality = Arc::new(StubEmbedder::new("quality", DIM));
@@ -197,6 +201,11 @@ fn build_searcher_for_lane(lane: &InteractionLane) -> (TwoTierSearcher, Arc<TwoT
     let searcher = TwoTierSearcher::new(Arc::clone(&index), fast, config)
         .with_quality_embedder(quality)
         .with_lexical(lexical);
+    let searcher = if let Some(tiebreak) = tiebreak {
+        searcher.with_rrf_tiebreak(tiebreak)
+    } else {
+        searcher
+    };
 
     (searcher, index)
 }
@@ -402,10 +411,14 @@ fn execute_lane_oracles(
 // ─── Template-Driven Test Execution ────────────────────────────────────────
 
 /// Run the full template-driven oracle suite for a lane.
-async fn run_template_driven_test(cx: &Cx, lane_id: &str) -> (LaneTestReport, LaneOracleTemplate) {
+async fn run_template_driven_test_with_tiebreak(
+    cx: &Cx,
+    lane_id: &str,
+    tiebreak: Option<RrfTiebreak>,
+) -> (LaneTestReport, LaneOracleTemplate) {
     let lane = lane_by_id(lane_id).expect("lane not found");
     let template = oracle_template_for_lane(&lane);
-    let (searcher, _index) = build_searcher_for_lane(&lane);
+    let (searcher, _index) = build_searcher_for_lane(&lane, tiebreak);
     let queries = queries_for_lane(&lane);
     let k = 5;
 
@@ -445,6 +458,11 @@ async fn run_template_driven_test(cx: &Cx, lane_id: &str) -> (LaneTestReport, La
     }
 
     (aggregate_report, template)
+}
+
+/// Run a lane using its shipping default tie-break.
+async fn run_template_driven_test(cx: &Cx, lane_id: &str) -> (LaneTestReport, LaneOracleTemplate) {
+    run_template_driven_test_with_tiebreak(cx, lane_id, None).await
 }
 
 const INTERACTION_OWNER_LANE: &str = "composition-lane";
@@ -1276,6 +1294,40 @@ fn all_lanes_run_without_panic() {
     });
 }
 
+/// The Hash tiebreak is an opt-in ranking policy. It may reorder exact-score
+/// ties, but must not invalidate a declared interaction property or make a
+/// lane's oracle coverage depend on the legacy lexical preference.
+///
+/// This is deliberately not a golden refresh or default flip: a quality gate
+/// still has to decide whether Hash should become the shipping policy.
+#[test]
+fn hash_tiebreak_preserves_declared_interaction_properties() {
+    run_test_with_cx(|cx| async move {
+        for lane in lane_catalog() {
+            let (legacy_report, legacy_template) = run_template_driven_test(&cx, lane.id).await;
+            assert_no_failures(&legacy_report, lane.id);
+            assert_oracle_coverage(&legacy_report, &legacy_template, lane.id);
+
+            let (hash_report, hash_template) =
+                run_template_driven_test_with_tiebreak(&cx, lane.id, Some(RrfTiebreak::Hash)).await;
+            assert_no_failures(&hash_report, lane.id);
+            assert_oracle_coverage(&hash_report, &hash_template, lane.id);
+            assert_eq!(
+                hash_report.pass_count(),
+                legacy_report.pass_count(),
+                "Hash must preserve the declared passing oracle count for lane {}",
+                lane.id,
+            );
+            assert_eq!(
+                hash_report.skip_count(),
+                legacy_report.skip_count(),
+                "Hash must preserve the declared skipped oracle count for lane {}",
+                lane.id,
+            );
+        }
+    });
+}
+
 #[test]
 fn interaction_high_risk_lanes_emit_replay_ready_artifacts() {
     run_test_with_cx(|cx| async move {
@@ -1481,7 +1533,7 @@ fn initial_then_refined_lanes_always_produce_phase2() {
         );
 
         for lane in refined_lanes {
-            let (searcher, _) = build_searcher_for_lane(lane);
+            let (searcher, _) = build_searcher_for_lane(lane, None);
             let queries = queries_for_lane(lane);
             if let Some(fq) = queries.first() {
                 let query = fq.query_for_lane(lane.query_slice.include_negated);
@@ -1526,7 +1578,7 @@ fn maybe_refined_lanes_tolerate_both_outcomes() {
         );
 
         for lane in maybe_lanes {
-            let (searcher, _) = build_searcher_for_lane(lane);
+            let (searcher, _) = build_searcher_for_lane(lane, None);
             let queries = queries_for_lane(lane);
             if let Some(fq) = queries.first() {
                 let query = fq.query_for_lane(lane.query_slice.include_negated);

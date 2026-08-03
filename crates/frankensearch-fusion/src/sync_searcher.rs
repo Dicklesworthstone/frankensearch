@@ -466,7 +466,12 @@ impl SyncTwoTierSearcher {
 
         let phase1_started = Instant::now();
         let fast_hits = self.search_fast_hits(query_vec, fetch, filter)?;
-        metrics.phase1_vectors_searched = fast_hits.len();
+        // `phase1_vectors_searched` is diagnostic work accounting, not the
+        // bounded candidate-pool size. The fast-tier search evaluates the
+        // complete index before returning its top-k pool, matching the async
+        // searcher's metric contract and `TwoTierMetrics` documentation.
+        let phase1_vectors_searched = self.index.doc_count();
+        metrics.phase1_vectors_searched = phase1_vectors_searched;
         metrics.semantic_candidates = fast_hits.len();
         // Typed zero-signal classification (bd-tqhc): an empty semantic lane
         // must carry why. Lazy — the non-empty path pays nothing.
@@ -528,7 +533,7 @@ impl SyncTwoTierSearcher {
                 latency: phase1_latency,
                 metrics: PhaseMetrics {
                     embedder_id: "sync-fast-query".to_owned(),
-                    vectors_searched: fast_hits.len(),
+                    vectors_searched: phase1_vectors_searched,
                     lexical_candidates: metrics.lexical_candidates,
                     fused_count: initial_results.len(),
                 },

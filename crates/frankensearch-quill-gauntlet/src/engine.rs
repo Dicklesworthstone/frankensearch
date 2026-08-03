@@ -2718,7 +2718,7 @@ mod tests {
     };
 
     use super::*;
-    use crate::comparator::{ComparisonStatus, RankClass};
+    use crate::comparator::{ComparisonStatus, DivergenceClass, RankClass};
 
     const E55_ID_FIELD: u16 = 0;
     const E55_CONTENT_FIELD: u16 = 1;
@@ -2962,6 +2962,98 @@ mod tests {
             crate::runner::SemanticContract::scalar_g1a(),
         )
         .expect("QG position-mode Tantivy oracle")
+    }
+
+    /// E6.3 law runner. Each caller supplies its generator identity, while
+    /// every returned observable is projected through the normal differential
+    /// harness so this does not compare an invented side channel.
+    #[cfg(feature = "perf-harness")]
+    async fn e63_observations(
+        cx: &Cx,
+        documents: &[frankensearch_core::IndexableDocument],
+        cases: &[(&str, &str)],
+        seed: u64,
+        generator_id: &str,
+    ) -> Vec<(String, EngineObservation, EngineObservation)> {
+        let mut subject = qg_position_mode_subject(true);
+        let mut oracle = qg_position_mode_oracle(true);
+        subject
+            .claim_fresh_campaign()
+            .expect("E6.3 claim Quill input-order campaign");
+        subject
+            .index_mut()
+            .expect("E6.3 open Quill input-order campaign")
+            .index_documents(cx, documents)
+            .await
+            .expect("E6.3 index Quill input-order fixture");
+        subject
+            .index_mut()
+            .expect("E6.3 open Quill input-order campaign")
+            .commit(cx)
+            .await
+            .expect("E6.3 commit Quill input-order fixture");
+        subject
+            .mark_committed()
+            .expect("E6.3 publish Quill input-order campaign");
+
+        oracle
+            .claim_fresh_campaign()
+            .expect("E6.3 claim Tantivy input-order campaign");
+        oracle
+            .index_documents(cx, documents)
+            .await
+            .expect("E6.3 index Tantivy input-order fixture");
+        oracle
+            .mark_committed()
+            .expect("E6.3 publish Tantivy input-order campaign");
+
+        let harness = DifferentialHarness::default();
+        let mut observations = Vec::with_capacity(cases.len());
+        for &(case_id, query) in cases {
+            let mut case = DifferentialCase::new(format!("e63-{case_id}"), query, 16);
+            case.snippet_max_chars = None;
+            case.tie_expansion_limit = 64;
+            case.metadata.generator_id = Some(generator_id.to_owned());
+            case.metadata.generator_seed = Some(seed);
+            let run = harness
+                .run(cx, &subject, &oracle, &case)
+                .await
+                .unwrap_or_else(|error| panic!("E6.3 case {case_id} failed: {error}"));
+            assert_eq!(
+                run.comparison.status,
+                ComparisonStatus::Exact,
+                "E6.3 cross-engine case {case_id}: {:?}",
+                run.comparison.divergences,
+            );
+            assert_eq!(
+                run.comparison.rank_class,
+                RankClass::RankExact,
+                "E6.3 cross-engine case {case_id}: {:?}",
+                run.comparison.divergences,
+            );
+            observations.push((
+                case_id.to_owned(),
+                run.comparison.subject,
+                run.comparison.oracle,
+            ));
+        }
+        observations
+    }
+
+    #[cfg(feature = "perf-harness")]
+    fn e63_seeded_input_permutation(len: usize, seed: u64) -> Vec<usize> {
+        let mut permutation = (0..len).collect::<Vec<_>>();
+        let mut state = seed;
+        for position in (1..len).rev() {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            let width = u64::try_from(position + 1).expect("E6.3 permutation width fits u64");
+            let selected =
+                usize::try_from(state % width).expect("E6.3 permutation index fits usize");
+            permutation.swap(position, selected);
+        }
+        permutation
     }
 
     struct CountingEngine {
@@ -5930,6 +6022,253 @@ mod tests {
                 repeated_term_scores(&tantivy_mode_evidence[1]),
                 "Tantivy positioned fields retain frequencies while Basic fields clamp tf to one",
             );
+        });
+    }
+
+    /// E6.3 law: with stable external document IDs, ingest order is not an
+    /// observable part of scalar lexical semantics. Equal-score ties may use
+    /// engine-local document addresses, so the law explicitly permits only a
+    /// tie-order classification. The negative fixture keeps the IDs and order
+    /// transform but changes one document's content, proving that the law does
+    /// not accept an arbitrary corpus rewrite.
+    #[cfg(feature = "perf-harness")]
+    #[test]
+    fn e63_seeded_input_order_permutation_is_exact_and_content_mutation_is_not() {
+        use frankensearch_core::IndexableDocument;
+
+        const SEED: u64 = 0xe63_1a00_5eed_0001;
+        let canonical = vec![
+            IndexableDocument::new("doc-1", "alpha beta beta").with_title("guide"),
+            IndexableDocument::new("doc-2", "alpha gamma").with_title("alpha overview"),
+            IndexableDocument::new("doc-3", "beta gamma gamma gamma").with_title("alpha"),
+            IndexableDocument::new("doc-4", "alpha beta gamma delta").with_title("reference"),
+            IndexableDocument::new("doc-5", "delta epsilon").with_title("quiet"),
+        ];
+        let queries = [
+            ("bare-term", "alpha"),
+            ("repeated-term", "beta"),
+            ("boolean-and", "alpha AND beta"),
+            ("fielded-term", "title:alpha"),
+            ("negative-sentinel", "saffron"),
+        ];
+        let permutation = e63_seeded_input_permutation(canonical.len(), SEED);
+        assert_ne!(
+            permutation,
+            (0..canonical.len()).collect::<Vec<_>>(),
+            "E6.3 seed must exercise a real ingest-order transform",
+        );
+        assert_eq!(
+            permutation,
+            e63_seeded_input_permutation(canonical.len(), SEED),
+            "E6.3 seed must replay byte-identically",
+        );
+        let permuted = permutation
+            .iter()
+            .map(|&index| canonical[index].clone())
+            .collect::<Vec<_>>();
+        let mut content_mutated = permuted.clone();
+        content_mutated[permutation
+            .iter()
+            .position(|&index| index == 3)
+            .expect("E6.3 permutation retains doc-4")] =
+            IndexableDocument::new("doc-4", "alpha beta saffron").with_title("reference");
+
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let baseline = e63_observations(
+                &cx,
+                &canonical,
+                &queries,
+                SEED,
+                "e6.3-input-order-permutation-v1",
+            )
+            .await;
+            let transformed = e63_observations(
+                &cx,
+                &permuted,
+                &queries,
+                SEED,
+                "e6.3-input-order-permutation-v1",
+            )
+            .await;
+            let invalid = e63_observations(
+                &cx,
+                &content_mutated,
+                &queries,
+                SEED,
+                "e6.3-input-order-permutation-v1",
+            )
+            .await;
+
+            for (
+                (baseline_id, baseline_quill, baseline_tantivy),
+                (transformed_id, transformed_quill, transformed_tantivy),
+            ) in baseline.iter().zip(&transformed)
+            {
+                assert_eq!(
+                    baseline_id, transformed_id,
+                    "E6.3 replay case identity drifted"
+                );
+                for (engine, before, after) in [
+                    ("Quill", baseline_quill, transformed_quill),
+                    ("Tantivy", baseline_tantivy, transformed_tantivy),
+                ] {
+                    let comparison = compare_observations(
+                        before.clone(),
+                        after.clone(),
+                        ComparatorConfig::default(),
+                    )
+                    .unwrap_or_else(|error| {
+                        panic!("E6.3 {engine} {baseline_id} permutation comparison failed: {error}")
+                    });
+                    assert!(
+                        matches!(
+                            comparison.rank_class,
+                            RankClass::RankExact | RankClass::TieOrder
+                        ) && comparison
+                            .divergences
+                            .iter()
+                            .all(|divergence| divergence.class == DivergenceClass::TieOrder),
+                        "E6.3 {engine} {baseline_id} produced a non-tie divergence under an input-order-only transform: {:?}",
+                        comparison.divergences,
+                    );
+                }
+            }
+
+            let baseline_sentinel = baseline
+                .iter()
+                .find(|(case_id, _, _)| case_id == "negative-sentinel")
+                .expect("E6.3 baseline negative fixture");
+            let invalid_sentinel = invalid
+                .iter()
+                .find(|(case_id, _, _)| case_id == "negative-sentinel")
+                .expect("E6.3 invalid negative fixture");
+            for (engine, before, after) in [
+                ("Quill", &baseline_sentinel.1, &invalid_sentinel.1),
+                ("Tantivy", &baseline_sentinel.2, &invalid_sentinel.2),
+            ] {
+                let comparison = compare_observations(
+                    before.clone(),
+                    after.clone(),
+                    ComparatorConfig::default(),
+                )
+                .unwrap_or_else(|error| {
+                    panic!("E6.3 {engine} invalid-transform comparison failed: {error}")
+                });
+                assert_eq!(
+                    comparison.status,
+                    ComparisonStatus::Failed,
+                    "E6.3 {engine} incorrectly accepted a content mutation as an input-order permutation",
+                );
+            }
+        });
+    }
+
+    /// E6.3 law: the declared scalar G1A analyzer makes free-text case and
+    /// surrounding ASCII whitespace non-observable. The projection is the
+    /// normal cross-engine differential observation, and this intentionally
+    /// excludes fielded and syntax-bearing queries whose parser spelling is
+    /// semantically significant. Replacing the analyzed term itself is the
+    /// invalid fixture and must not be accepted as normalization.
+    #[cfg(feature = "perf-harness")]
+    #[test]
+    fn e63_query_case_and_whitespace_normalization_is_exact_and_term_mutation_is_not() {
+        use frankensearch_core::IndexableDocument;
+
+        const SEED: u64 = 0xe63_c453_0001_5eed;
+        let documents = vec![
+            IndexableDocument::new("doc-1", "alpha beta beta").with_title("guide"),
+            IndexableDocument::new("doc-2", "alpha gamma").with_title("alpha overview"),
+            IndexableDocument::new("doc-3", "beta gamma gamma gamma").with_title("alpha"),
+            IndexableDocument::new("doc-4", "alpha beta gamma delta").with_title("reference"),
+            IndexableDocument::new("doc-5", "delta epsilon").with_title("quiet"),
+        ];
+        let canonical = [("free-text-alpha", "alpha")];
+        let normalized = [("free-text-alpha", " \tAlPhA\n")];
+        let term_mutated = [("free-text-alpha", "saffron")];
+
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let baseline = e63_observations(
+                &cx,
+                &documents,
+                &canonical,
+                SEED,
+                "e6.3-query-normalization-v1",
+            )
+            .await;
+            let transformed = e63_observations(
+                &cx,
+                &documents,
+                &normalized,
+                SEED,
+                "e6.3-query-normalization-v1",
+            )
+            .await;
+            let invalid = e63_observations(
+                &cx,
+                &documents,
+                &term_mutated,
+                SEED,
+                "e6.3-query-normalization-v1",
+            )
+            .await;
+
+            for (
+                (baseline_id, baseline_quill, baseline_tantivy),
+                (normalized_id, normalized_quill, normalized_tantivy),
+            ) in baseline.iter().zip(&transformed)
+            {
+                assert_eq!(
+                    baseline_id, normalized_id,
+                    "E6.3 query-normalization case identity drifted"
+                );
+                for (engine, before, after) in [
+                    ("Quill", baseline_quill, normalized_quill),
+                    ("Tantivy", baseline_tantivy, normalized_tantivy),
+                ] {
+                    let comparison = compare_observations(
+                        before.clone(),
+                        after.clone(),
+                        ComparatorConfig::default(),
+                    )
+                    .unwrap_or_else(|error| {
+                        panic!("E6.3 {engine} {baseline_id} query-normalization comparison failed: {error}")
+                    });
+                    assert!(
+                        matches!(
+                            comparison.rank_class,
+                            RankClass::RankExact | RankClass::TieOrder
+                        ) && comparison
+                            .divergences
+                            .iter()
+                            .all(|divergence| divergence.class == DivergenceClass::TieOrder),
+                        "E6.3 {engine} {baseline_id} produced a non-tie divergence under analyzer-declared query normalization: {:?}",
+                        comparison.divergences,
+                    );
+                }
+            }
+
+            let baseline_case = baseline
+                .first()
+                .expect("E6.3 baseline normalization fixture");
+            let invalid_case = invalid.first().expect("E6.3 invalid normalization fixture");
+            for (engine, before, after) in [
+                ("Quill", &baseline_case.1, &invalid_case.1),
+                ("Tantivy", &baseline_case.2, &invalid_case.2),
+            ] {
+                let comparison = compare_observations(
+                    before.clone(),
+                    after.clone(),
+                    ComparatorConfig::default(),
+                )
+                .unwrap_or_else(|error| {
+                    panic!("E6.3 {engine} invalid query-normalization comparison failed: {error}")
+                });
+                assert_eq!(
+                    comparison.status,
+                    ComparisonStatus::Failed,
+                    "E6.3 {engine} incorrectly accepted a changed analyzed term as normalization",
+                );
+            }
         });
     }
 

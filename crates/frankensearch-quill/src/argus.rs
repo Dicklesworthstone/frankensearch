@@ -604,7 +604,10 @@ impl<'a> CheckpointPostingCursor<'a> {
 
     fn checkpoint_move(&self, previous: Option<u64>) -> Result<(), ArgusError> {
         let units = self.inner.work_blocks_since(previous);
-        self.checkpoint.admit(QueryWorkKind::PostingBlock, units)
+        if units != 0 {
+            self.checkpoint.admit(QueryWorkKind::PostingBlock, units)?;
+        }
+        Ok(())
     }
 }
 
@@ -5665,6 +5668,61 @@ mod tests {
             self.index += tail.partition_point(|posting| posting.doc_id < target);
             Ok(self.doc())
         }
+    }
+
+    #[derive(Default)]
+    struct CountingCheckpoint {
+        admissions: std::sync::atomic::AtomicUsize,
+        admitted_units: std::sync::atomic::AtomicU64,
+    }
+
+    impl QueryWorkCheckpoint for CountingCheckpoint {
+        fn admit(&self, kind: QueryWorkKind, units: u64) -> Result<(), ArgusError> {
+            assert_eq!(kind, QueryWorkKind::PostingBlock);
+            self.admissions
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.admitted_units
+                .fetch_add(units, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn checkpoint_cursor_admits_only_entered_posting_blocks()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let postings = (0..257)
+            .map(|docid| Posting::new(docid, 1))
+            .collect::<Vec<_>>();
+        let encoded = EncodedPostingList::encode(&postings)?;
+        let list = encoded.posting_list()?;
+        let block_count = list.block_count();
+        assert!(
+            block_count > 1,
+            "fixture must cross a posting-block boundary"
+        );
+        let checkpoint = Arc::new(CountingCheckpoint::default());
+        let checkpoint_for_cursor: Arc<dyn QueryWorkCheckpoint> = Arc::clone(&checkpoint);
+        let segment_num_docs = u32::try_from(postings.len())?;
+        let sealed = SealedPostingCursor::new(&list, segment_num_docs)?;
+        let mut cursor = CheckpointPostingCursor::new(sealed, checkpoint_for_cursor)?;
+
+        while cursor.next()?.is_some() {}
+
+        assert_eq!(
+            checkpoint
+                .admissions
+                .load(std::sync::atomic::Ordering::SeqCst),
+            block_count,
+            "the checkpoint runs once for each entered block, never for an in-block posting"
+        );
+        assert_eq!(
+            checkpoint
+                .admitted_units
+                .load(std::sync::atomic::Ordering::SeqCst),
+            u64::try_from(block_count)?,
+            "the charged work is unchanged"
+        );
+        Ok(())
     }
 
     #[derive(Clone, Debug)]

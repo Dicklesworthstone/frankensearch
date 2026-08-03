@@ -156,6 +156,1019 @@ impl ArtifactGenerationIdentityV1 {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Immutable generation authority
+// ---------------------------------------------------------------------------
+
+/// Schema carried by immutable generation-authority references and slot frames.
+pub const GENERATION_AUTHORITY_SCHEMA_V1: u16 = 1;
+/// Exact byte size of one physical `AUTHORITY` slot frame.
+pub const GENERATION_AUTHORITY_SLOT_BYTES_V1: usize = 4_096;
+/// Maximum canonical activation-manifest size accepted before decoding.
+pub const GENERATION_ACTIVATION_MANIFEST_MAX_BYTES_V1: usize = 4_096;
+/// Exact byte size of one physical `LOCK` owner or attempt frame.
+pub const GENERATION_LOCK_FRAME_BYTES_V1: usize = 4_096;
+
+const AUTHORITY_SLOT_DIGEST_BYTES: usize = 32;
+const AUTHORITY_SLOT_BODY_BYTES: usize =
+    GENERATION_AUTHORITY_SLOT_BYTES_V1 - AUTHORITY_SLOT_DIGEST_BYTES;
+const AUTHORITY_SLOT_MAGIC_V1: [u8; 8] = *b"FSAUTH01";
+const AUTHORITY_SLOT_HEADER_BYTES: usize = 131;
+const LOCK_FRAME_DIGEST_BYTES: usize = 32;
+const LOCK_FRAME_BODY_BYTES: usize = GENERATION_LOCK_FRAME_BYTES_V1 - LOCK_FRAME_DIGEST_BYTES;
+const LOCK_FRAME_MAGIC_V1: [u8; 8] = *b"FSLOCK01";
+const LOCK_FRAME_HEADER_BYTES: usize = 104;
+
+/// A bounded reason why an authority reference, physical slot, or slot pair was
+/// rejected. The error deliberately contains no paths, opaque object contents,
+/// or unbounded caller data.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum GenerationAuthorityErrorV1 {
+    /// A required fixed-format field had an unsupported or reserved value.
+    #[error("generation authority has an invalid {field}")]
+    InvalidField {
+        /// Stable field identifier.
+        field: &'static str,
+    },
+    /// A fixed-size frame was truncated or extended.
+    #[error("generation authority slot has an invalid length")]
+    InvalidSlotLength,
+    /// The frame checksum did not authenticate its exact body bytes.
+    #[error("generation authority slot checksum mismatch")]
+    ChecksumMismatch,
+    /// A frame was copied into the wrong physical slot.
+    #[error("generation authority slot index mismatch")]
+    SlotIndexMismatch,
+    /// A frame was copied between authority roots.
+    #[error("generation authority root mismatch")]
+    RootMismatch,
+    /// Canonical zero padding contained data.
+    #[error("generation authority slot contains non-canonical padding")]
+    NonCanonicalPadding,
+    /// Both slots represented an equal-sequence fork.
+    #[error("generation authority slots contain an equal-sequence fork")]
+    EqualSequenceFork,
+    /// A duplicate authority was not the permitted sequence-one genesis form.
+    #[error("generation authority slots contain a non-genesis duplicate")]
+    NonGenesisDuplicate,
+    /// A non-genesis authority was stored in the wrong physical slot.
+    #[error("generation authority slot does not match its sequence parity")]
+    SlotSequenceParity,
+    /// The newer slot skipped a sequence or lacked an exact predecessor link.
+    #[error("generation authority slots lack a consecutive predecessor link")]
+    BrokenPredecessorLink,
+    /// The immutable activation manifest did not match its stored self-seal.
+    #[error("generation activation manifest self-seal mismatch")]
+    ManifestSelfSealMismatch,
+    /// An externally addressed manifest did not match its authority reference.
+    #[error("generation activation manifest does not match its authority reference")]
+    ManifestReferenceMismatch,
+}
+
+/// Immutable pointer to one activation-manifest object.
+///
+/// This is intentionally distinct from [`ArtifactGenerationIdentityV1`]: the
+/// latter identifies one artifact build, while this counter is the monotone
+/// activation authority for a root. Object IDs are random opaque bytes, never a
+/// filename or display name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct AuthorityRefV1 {
+    /// [`GENERATION_AUTHORITY_SCHEMA_V1`].
+    pub schema_version: u16,
+    /// Monotone activation sequence, beginning at one.
+    pub sequence: u64,
+    /// Opaque immutable activation-manifest object identifier.
+    pub object_id: [u8; 16],
+    /// Exact activation-manifest byte length.
+    pub manifest_len: u64,
+    /// SHA-256 of the exact activation-manifest bytes.
+    pub manifest_sha256: [u8; 32],
+    /// SHA-256 fingerprint of the immediately preceding authority reference.
+    /// Genesis has no predecessor.
+    pub predecessor: Option<[u8; 32]>,
+}
+
+impl AuthorityRefV1 {
+    /// Construct and validate one immutable activation authority.
+    ///
+    /// # Errors
+    ///
+    /// Returns a bounded typed error when a reserved identity value is used or
+    /// the sequence/predecessor relation is not canonical.
+    pub fn new(
+        sequence: u64,
+        object_id: [u8; 16],
+        manifest_len: u64,
+        manifest_sha256: [u8; 32],
+        predecessor: Option<[u8; 32]>,
+    ) -> Result<Self, GenerationAuthorityErrorV1> {
+        let reference = Self {
+            schema_version: GENERATION_AUTHORITY_SCHEMA_V1,
+            sequence,
+            object_id,
+            manifest_len,
+            manifest_sha256,
+            predecessor,
+        };
+        reference.validate()?;
+        Ok(reference)
+    }
+
+    /// Validate the fixed, forward-safe authority-reference contract.
+    ///
+    /// # Errors
+    ///
+    /// Returns a bounded typed error for every invalid field.
+    pub fn validate(&self) -> Result<(), GenerationAuthorityErrorV1> {
+        if self.schema_version != GENERATION_AUTHORITY_SCHEMA_V1 {
+            return Err(GenerationAuthorityErrorV1::InvalidField {
+                field: "authority_ref.schema_version",
+            });
+        }
+        if self.sequence == 0 {
+            return Err(GenerationAuthorityErrorV1::InvalidField {
+                field: "authority_ref.sequence",
+            });
+        }
+        if self.object_id == [0; 16] {
+            return Err(GenerationAuthorityErrorV1::InvalidField {
+                field: "authority_ref.object_id",
+            });
+        }
+        if self.manifest_len == 0 {
+            return Err(GenerationAuthorityErrorV1::InvalidField {
+                field: "authority_ref.manifest_len",
+            });
+        }
+        if self.manifest_sha256 == [0; 32] {
+            return Err(GenerationAuthorityErrorV1::InvalidField {
+                field: "authority_ref.manifest_sha256",
+            });
+        }
+        if self.sequence == 1 && self.predecessor.is_some() {
+            return Err(GenerationAuthorityErrorV1::InvalidField {
+                field: "authority_ref.predecessor",
+            });
+        }
+        if self.sequence > 1 && self.predecessor.is_none() {
+            return Err(GenerationAuthorityErrorV1::InvalidField {
+                field: "authority_ref.predecessor",
+            });
+        }
+        if self.predecessor == Some([0; 32]) {
+            return Err(GenerationAuthorityErrorV1::InvalidField {
+                field: "authority_ref.predecessor",
+            });
+        }
+        Ok(())
+    }
+
+    /// Canonical bytes used to link consecutive authority references.
+    #[must_use]
+    pub fn canonical_bytes(&self) -> [u8; 99] {
+        let mut bytes = [0_u8; 99];
+        bytes[..8].copy_from_slice(b"FSAUTHREF");
+        bytes[8..10].copy_from_slice(&self.schema_version.to_be_bytes());
+        bytes[10..18].copy_from_slice(&self.sequence.to_be_bytes());
+        bytes[18..34].copy_from_slice(&self.object_id);
+        bytes[34..42].copy_from_slice(&self.manifest_len.to_be_bytes());
+        bytes[42..74].copy_from_slice(&self.manifest_sha256);
+        bytes[74] = u8::from(self.predecessor.is_some());
+        if let Some(predecessor) = self.predecessor {
+            bytes[75..].copy_from_slice(&predecessor);
+        }
+        bytes
+    }
+
+    /// SHA-256 fingerprint of this exact canonical reference.
+    #[must_use]
+    pub fn fingerprint(&self) -> [u8; 32] {
+        Sha256::digest(self.canonical_bytes()).into()
+    }
+}
+
+/// A decoded, authenticated physical authority slot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AuthoritySlotV1 {
+    /// Physical slot selected by the publisher (`0` or `1`).
+    pub slot_index: u8,
+    /// Root identity bound into the frame.
+    pub root_id: [u8; 16],
+    /// Immutable authority reference carried by the frame.
+    pub authority: AuthorityRefV1,
+}
+
+/// Kind of fixed `LOCK` frame. Owner and attempt remain distinct on disk so an
+/// interrupted attempt cannot be silently mistaken for authority ownership.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum GenerationLockFrameKindV1 {
+    /// Current writer ownership record.
+    Owner,
+    /// In-progress publication attempt record.
+    Attempt,
+}
+
+impl GenerationLockFrameKindV1 {
+    const fn tag(self) -> u8 {
+        match self {
+            Self::Owner => 1,
+            Self::Attempt => 2,
+        }
+    }
+
+    fn from_tag(tag: u8) -> Result<Self, GenerationAuthorityErrorV1> {
+        match tag {
+            1 => Ok(Self::Owner),
+            2 => Ok(Self::Attempt),
+            _ => Err(GenerationAuthorityErrorV1::InvalidField {
+                field: "generation_lock.kind",
+            }),
+        }
+    }
+}
+
+/// Bounded owner/attempt evidence for the fixed generation-root `LOCK` path.
+///
+/// It is an immutable byte contract only: taking a filesystem lock or deciding
+/// whether an attempt may publish belongs to the publisher lane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct GenerationLockFrameV1 {
+    /// Owner or attempt frame classification.
+    pub kind: GenerationLockFrameKindV1,
+    /// Root ID that prevents cross-root frame replay.
+    pub root_id: [u8; 16],
+    /// Opaque writer identity.
+    pub writer_id: [u8; 16],
+    /// Opaque immutable publication attempt identity.
+    pub attempt_id: [u8; 16],
+    /// Monotone writer fence, beginning at one.
+    pub fence: u64,
+    /// Fingerprint of the authority reference the lock state observed.
+    pub authority_fingerprint: [u8; 32],
+}
+
+impl GenerationLockFrameV1 {
+    /// Construct and validate a bounded lock owner/attempt frame.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed error when any identity or fence is reserved.
+    pub fn new(
+        kind: GenerationLockFrameKindV1,
+        root_id: [u8; 16],
+        writer_id: [u8; 16],
+        attempt_id: [u8; 16],
+        fence: u64,
+        authority_fingerprint: [u8; 32],
+    ) -> Result<Self, GenerationAuthorityErrorV1> {
+        let frame = Self {
+            kind,
+            root_id,
+            writer_id,
+            attempt_id,
+            fence,
+            authority_fingerprint,
+        };
+        frame.validate()?;
+        Ok(frame)
+    }
+
+    /// Validate the fixed lock-frame facts.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed error when any fact is reserved or cannot identify a
+    /// specific publication attempt.
+    pub fn validate(&self) -> Result<(), GenerationAuthorityErrorV1> {
+        if self.root_id == [0; 16]
+            || self.writer_id == [0; 16]
+            || self.attempt_id == [0; 16]
+            || self.fence == 0
+            || self.authority_fingerprint == [0; 32]
+        {
+            return Err(GenerationAuthorityErrorV1::InvalidField {
+                field: "generation_lock.frame",
+            });
+        }
+        Ok(())
+    }
+
+    /// Encode this owner/attempt frame into its fixed canonical form.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed error instead of serializing a reserved frame.
+    pub fn encode(
+        self,
+    ) -> Result<[u8; GENERATION_LOCK_FRAME_BYTES_V1], GenerationAuthorityErrorV1> {
+        self.validate()?;
+        let mut bytes = [0_u8; GENERATION_LOCK_FRAME_BYTES_V1];
+        bytes[..8].copy_from_slice(&LOCK_FRAME_MAGIC_V1);
+        bytes[8..10].copy_from_slice(&GENERATION_AUTHORITY_SCHEMA_V1.to_be_bytes());
+        bytes[10] = self.kind.tag();
+        bytes[16..32].copy_from_slice(&self.root_id);
+        bytes[32..48].copy_from_slice(&self.writer_id);
+        bytes[48..64].copy_from_slice(&self.attempt_id);
+        bytes[64..72].copy_from_slice(&self.fence.to_be_bytes());
+        bytes[72..104].copy_from_slice(&self.authority_fingerprint);
+        let digest = Sha256::digest(&bytes[..LOCK_FRAME_BODY_BYTES]);
+        bytes[LOCK_FRAME_BODY_BYTES..].copy_from_slice(&digest);
+        Ok(bytes)
+    }
+
+    /// Parse and authenticate a fixed `LOCK` frame for the expected root.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed error for malformed, copied, tampered, or noncanonical
+    /// owner/attempt frames.
+    pub fn from_authenticated_bytes(
+        bytes: &[u8],
+        expected_root_id: [u8; 16],
+    ) -> Result<Self, GenerationAuthorityErrorV1> {
+        if bytes.len() != GENERATION_LOCK_FRAME_BYTES_V1 {
+            return Err(GenerationAuthorityErrorV1::InvalidSlotLength);
+        }
+        if !bytes[..8].eq(LOCK_FRAME_MAGIC_V1.as_slice())
+            || !bytes[8..10].eq(GENERATION_AUTHORITY_SCHEMA_V1.to_be_bytes().as_slice())
+            || !bytes[11..16].iter().all(|byte| byte.eq(&0))
+        {
+            return Err(GenerationAuthorityErrorV1::InvalidField {
+                field: "generation_lock.header",
+            });
+        }
+        if !bytes[16..32].eq(expected_root_id.as_slice()) {
+            return Err(GenerationAuthorityErrorV1::RootMismatch);
+        }
+        let expected_digest = Sha256::digest(&bytes[..LOCK_FRAME_BODY_BYTES]);
+        if !bytes[LOCK_FRAME_BODY_BYTES..].eq(&expected_digest[..]) {
+            return Err(GenerationAuthorityErrorV1::ChecksumMismatch);
+        }
+        if bytes[LOCK_FRAME_HEADER_BYTES..LOCK_FRAME_BODY_BYTES]
+            .iter()
+            .any(|byte| !byte.eq(&0))
+        {
+            return Err(GenerationAuthorityErrorV1::NonCanonicalPadding);
+        }
+        let mut writer_id = [0_u8; 16];
+        writer_id.copy_from_slice(&bytes[32..48]);
+        let mut attempt_id = [0_u8; 16];
+        attempt_id.copy_from_slice(&bytes[48..64]);
+        let mut authority_fingerprint = [0_u8; 32];
+        authority_fingerprint.copy_from_slice(&bytes[72..104]);
+        Self::new(
+            GenerationLockFrameKindV1::from_tag(bytes[10])?,
+            expected_root_id,
+            writer_id,
+            attempt_id,
+            u64::from_be_bytes(bytes[64..72].try_into().map_err(|_| {
+                GenerationAuthorityErrorV1::InvalidField {
+                    field: "generation_lock.fence",
+                }
+            })?),
+            authority_fingerprint,
+        )
+    }
+}
+
+impl AuthoritySlotV1 {
+    /// Construct one physical authority-slot frame.
+    ///
+    /// # Errors
+    ///
+    /// Returns a bounded typed error when the physical slot/root or its
+    /// authority reference is invalid.
+    pub fn new(
+        slot_index: u8,
+        root_id: [u8; 16],
+        authority: AuthorityRefV1,
+    ) -> Result<Self, GenerationAuthorityErrorV1> {
+        let slot = Self {
+            slot_index,
+            root_id,
+            authority,
+        };
+        slot.validate()?;
+        Ok(slot)
+    }
+
+    /// Validate this in-memory physical slot before encoding or resolving it.
+    ///
+    /// # Errors
+    ///
+    /// Returns a bounded typed error for invalid physical binding data.
+    pub fn validate(&self) -> Result<(), GenerationAuthorityErrorV1> {
+        if self.slot_index > 1 {
+            return Err(GenerationAuthorityErrorV1::InvalidField {
+                field: "authority_slot.slot_index",
+            });
+        }
+        if self.root_id == [0; 16] {
+            return Err(GenerationAuthorityErrorV1::InvalidField {
+                field: "authority_slot.root_id",
+            });
+        }
+        self.authority.validate()
+    }
+
+    /// Encode this slot into its fixed 4096-byte canonical representation.
+    ///
+    /// # Errors
+    ///
+    /// Returns a bounded typed error instead of serializing an invalid slot.
+    pub fn encode(
+        self,
+    ) -> Result<[u8; GENERATION_AUTHORITY_SLOT_BYTES_V1], GenerationAuthorityErrorV1> {
+        self.validate()?;
+        let mut bytes = [0_u8; GENERATION_AUTHORITY_SLOT_BYTES_V1];
+        bytes[..8].copy_from_slice(&AUTHORITY_SLOT_MAGIC_V1);
+        bytes[8..10].copy_from_slice(&GENERATION_AUTHORITY_SCHEMA_V1.to_be_bytes());
+        bytes[10] = self.slot_index;
+        bytes[16..32].copy_from_slice(&self.root_id);
+        bytes[32..34].copy_from_slice(&self.authority.schema_version.to_be_bytes());
+        bytes[34..42].copy_from_slice(&self.authority.sequence.to_be_bytes());
+        bytes[42..58].copy_from_slice(&self.authority.object_id);
+        bytes[58..66].copy_from_slice(&self.authority.manifest_len.to_be_bytes());
+        bytes[66..98].copy_from_slice(&self.authority.manifest_sha256);
+        bytes[98] = u8::from(self.authority.predecessor.is_some());
+        if let Some(predecessor) = self.authority.predecessor {
+            bytes[99..131].copy_from_slice(&predecessor);
+        }
+        let digest = Sha256::digest(&bytes[..AUTHORITY_SLOT_BODY_BYTES]);
+        bytes[AUTHORITY_SLOT_BODY_BYTES..].copy_from_slice(&digest);
+        Ok(bytes)
+    }
+
+    /// Decode and authenticate one physical slot for the expected root and
+    /// physical index.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed error for checksum, root, index, canonical-padding, or
+    /// authority-reference violations.
+    pub fn from_authenticated_bytes(
+        bytes: &[u8],
+        expected_slot_index: u8,
+        expected_root_id: [u8; 16],
+    ) -> Result<Self, GenerationAuthorityErrorV1> {
+        if bytes.len() != GENERATION_AUTHORITY_SLOT_BYTES_V1 {
+            return Err(GenerationAuthorityErrorV1::InvalidSlotLength);
+        }
+        if expected_slot_index > 1 {
+            return Err(GenerationAuthorityErrorV1::InvalidField {
+                field: "authority_slot.expected_slot_index",
+            });
+        }
+        if !bytes[..8].eq(AUTHORITY_SLOT_MAGIC_V1.as_slice())
+            || !bytes[8..10].eq(GENERATION_AUTHORITY_SCHEMA_V1.to_be_bytes().as_slice())
+            || !bytes[11..16].iter().all(|byte| byte.eq(&0))
+        {
+            return Err(GenerationAuthorityErrorV1::InvalidField {
+                field: "authority_slot.header",
+            });
+        }
+        if !bytes[10].eq(&expected_slot_index) {
+            return Err(GenerationAuthorityErrorV1::SlotIndexMismatch);
+        }
+        if !bytes[16..32].eq(expected_root_id.as_slice()) {
+            return Err(GenerationAuthorityErrorV1::RootMismatch);
+        }
+        let expected_digest = Sha256::digest(&bytes[..AUTHORITY_SLOT_BODY_BYTES]);
+        if !bytes[AUTHORITY_SLOT_BODY_BYTES..].eq(&expected_digest[..]) {
+            return Err(GenerationAuthorityErrorV1::ChecksumMismatch);
+        }
+        if bytes[AUTHORITY_SLOT_HEADER_BYTES..AUTHORITY_SLOT_BODY_BYTES]
+            .iter()
+            .any(|byte| !byte.eq(&0))
+        {
+            return Err(GenerationAuthorityErrorV1::NonCanonicalPadding);
+        }
+
+        let mut object_id = [0_u8; 16];
+        object_id.copy_from_slice(&bytes[42..58]);
+        let mut manifest_sha256 = [0_u8; 32];
+        manifest_sha256.copy_from_slice(&bytes[66..98]);
+        let predecessor = match bytes[98] {
+            0 => {
+                if !bytes[99..131].iter().all(|byte| byte.eq(&0)) {
+                    return Err(GenerationAuthorityErrorV1::NonCanonicalPadding);
+                }
+                None
+            }
+            1 => {
+                let mut predecessor = [0_u8; 32];
+                predecessor.copy_from_slice(&bytes[99..131]);
+                Some(predecessor)
+            }
+            _ => {
+                return Err(GenerationAuthorityErrorV1::InvalidField {
+                    field: "authority_slot.predecessor_present",
+                });
+            }
+        };
+        let authority = AuthorityRefV1 {
+            schema_version: u16::from_be_bytes([bytes[32], bytes[33]]),
+            sequence: u64::from_be_bytes(bytes[34..42].try_into().map_err(|_| {
+                GenerationAuthorityErrorV1::InvalidField {
+                    field: "authority_slot.sequence",
+                }
+            })?),
+            object_id,
+            manifest_len: u64::from_be_bytes(bytes[58..66].try_into().map_err(|_| {
+                GenerationAuthorityErrorV1::InvalidField {
+                    field: "authority_slot.manifest_len",
+                }
+            })?),
+            manifest_sha256,
+            predecessor,
+        };
+        authority.validate()?;
+        Self::new(expected_slot_index, expected_root_id, authority)
+    }
+}
+
+/// Resolve the two physical authority slots without performing I/O.
+///
+/// A single surviving valid slot remains usable. Two different slots must be
+/// exactly consecutive and predecessor-linked; an equal reference is legal
+/// only for the duplicated sequence-one genesis record.
+///
+/// # Errors
+///
+/// Returns a typed error instead of selecting a structurally credible fork or
+/// skipping a missing authority history edge.
+pub fn resolve_authority_slots_v1(
+    first: Option<AuthoritySlotV1>,
+    second: Option<AuthoritySlotV1>,
+) -> Result<Option<AuthoritySlotV1>, GenerationAuthorityErrorV1> {
+    if let Some(slot) = first {
+        slot.validate()?;
+    }
+    if let Some(slot) = second {
+        slot.validate()?;
+    }
+    match (first, second) {
+        (None, None) => Ok(None),
+        (Some(slot), None) | (None, Some(slot)) => Ok(Some(slot)),
+        (Some(first), Some(second)) => {
+            // ubs:ignore — slot indices and root IDs are public structural identities.
+            if first.root_id != second.root_id {
+                return Err(GenerationAuthorityErrorV1::InvalidField {
+                    field: "authority_slot.pair",
+                });
+            }
+            // ubs:ignore — authority sequences are public monotone counters.
+            if first.authority.sequence == second.authority.sequence {
+                // ubs:ignore — authority references carry only public immutable identities.
+                if first.authority != second.authority {
+                    return Err(GenerationAuthorityErrorV1::EqualSequenceFork);
+                }
+                if first.authority.sequence != 1 {
+                    return Err(GenerationAuthorityErrorV1::NonGenesisDuplicate);
+                }
+                return Ok(Some(first));
+            }
+
+            let (older, newer) = if first.authority.sequence < second.authority.sequence {
+                (first, second)
+            } else {
+                (second, first)
+            };
+            if !slot_matches_authority_sequence(older) || !slot_matches_authority_sequence(newer) {
+                return Err(GenerationAuthorityErrorV1::SlotSequenceParity);
+            }
+            if older.slot_index == newer.slot_index {
+                return Err(GenerationAuthorityErrorV1::InvalidField {
+                    field: "authority_slot.pair",
+                });
+            }
+            // ubs:ignore — sequence/predecessor fingerprints are public history identities.
+            if newer.authority.sequence != older.authority.sequence.saturating_add(1)
+                // ubs:ignore — predecessor fingerprints are public immutable history identities.
+                || newer.authority.predecessor != Some(older.authority.fingerprint())
+            {
+                return Err(GenerationAuthorityErrorV1::BrokenPredecessorLink);
+            }
+            Ok(Some(newer))
+        }
+    }
+}
+
+fn slot_matches_authority_sequence(slot: AuthoritySlotV1) -> bool {
+    if slot.authority.sequence == 1 {
+        return true;
+    }
+    let expected_slot = u8::try_from(slot.authority.sequence & 1).unwrap_or(u8::MAX);
+    slot.slot_index == expected_slot
+}
+
+/// The transition that created an immutable activation manifest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum GenerationAuthorityActionV1 {
+    /// Select a newly built generation.
+    Activate,
+    /// Select a previously published generation under a newer authority.
+    Rollback,
+    /// Publish a repaired replacement for a damaged generation.
+    Repair,
+    /// Publish a schema-preserving migrated generation.
+    Migrate,
+}
+
+impl GenerationAuthorityActionV1 {
+    const fn tag(self) -> u8 {
+        match self {
+            Self::Activate => 1,
+            Self::Rollback => 2,
+            Self::Repair => 3,
+            Self::Migrate => 4,
+        }
+    }
+}
+
+/// Immutable receipt for one exact generation component.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct GenerationComponentReceiptV1 {
+    /// Exact component byte length.
+    pub byte_len: u64,
+    /// SHA-256 of the exact component bytes.
+    pub sha256: [u8; 32],
+}
+
+impl GenerationComponentReceiptV1 {
+    /// Validate the bounded immutable component receipt.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed error when the receipt cannot identify real bytes.
+    pub fn validate(&self) -> Result<(), GenerationAuthorityErrorV1> {
+        if self.byte_len == 0 {
+            return Err(GenerationAuthorityErrorV1::InvalidField {
+                field: "activation_manifest.component.byte_len",
+            });
+        }
+        if self.sha256 == [0; 32] {
+            return Err(GenerationAuthorityErrorV1::InvalidField {
+                field: "activation_manifest.component.sha256",
+            });
+        }
+        Ok(())
+    }
+
+    fn encode(self, encoder: &mut CanonicalEncoder) {
+        encoder.u64(self.byte_len);
+        encoder.bytes(&self.sha256);
+    }
+}
+
+/// The four component receipts that make one generation selectable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct GenerationComponentReceiptsV1 {
+    /// Vector-index component receipt.
+    pub vector: GenerationComponentReceiptV1,
+    /// Lexical-index component receipt.
+    pub lexical: GenerationComponentReceiptV1,
+    /// ANN component receipt.
+    pub ann: GenerationComponentReceiptV1,
+    /// Metadata component receipt.
+    pub metadata: GenerationComponentReceiptV1,
+}
+
+impl GenerationComponentReceiptsV1 {
+    fn validate(self) -> Result<(), GenerationAuthorityErrorV1> {
+        self.vector.validate()?;
+        self.lexical.validate()?;
+        self.ann.validate()?;
+        self.metadata.validate()
+    }
+
+    fn encode(self, encoder: &mut CanonicalEncoder) {
+        self.vector.encode(encoder);
+        self.lexical.encode(encoder);
+        self.ann.encode(encoder);
+        self.metadata.encode(encoder);
+    }
+}
+
+/// Immutable payload addressed by [`AuthorityRefV1`].
+///
+/// It is pure data: publishing the payload, selecting its object ID, and any
+/// filesystem action belong to the generation-root publisher lane. The
+/// self-seal detects an in-memory or decoded field substitution before a
+/// caller uses the externally addressed manifest digest.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActivationManifestV1 {
+    /// [`GENERATION_AUTHORITY_SCHEMA_V1`].
+    pub schema_version: u16,
+    /// Authority sequence this manifest is eligible to serve.
+    pub authority_sequence: u64,
+    /// Exact preceding authority reference. Genesis has none.
+    pub predecessor: Option<AuthorityRefV1>,
+    /// Transition that produced this generation selection.
+    pub action: GenerationAuthorityActionV1,
+    /// Artifact-generation identity selected by this authority transition.
+    pub generation: ArtifactGenerationIdentityV1,
+    /// Immutable writer-fence witness.
+    pub writer_fence_sha256: [u8; 32],
+    /// Immutable source-checkpoint witness.
+    pub source_checkpoint_sha256: [u8; 32],
+    /// Canonical document-set witness.
+    pub document_set_sha256: [u8; 32],
+    /// Exact vector, lexical, ANN, and metadata component receipts.
+    pub components: GenerationComponentReceiptsV1,
+    /// SHA-256 self-seal over every preceding field.
+    pub self_seal_sha256: [u8; 32],
+}
+
+impl ActivationManifestV1 {
+    /// Construct and self-seal a canonical immutable activation manifest.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed error when a field or predecessor relation is invalid.
+    pub fn new(
+        authority_sequence: u64,
+        predecessor: Option<AuthorityRefV1>,
+        action: GenerationAuthorityActionV1,
+        generation: ArtifactGenerationIdentityV1,
+        writer_fence_sha256: [u8; 32],
+        source_checkpoint_sha256: [u8; 32],
+        document_set_sha256: [u8; 32],
+        components: GenerationComponentReceiptsV1,
+    ) -> Result<Self, GenerationAuthorityErrorV1> {
+        let mut manifest = Self {
+            schema_version: GENERATION_AUTHORITY_SCHEMA_V1,
+            authority_sequence,
+            predecessor,
+            action,
+            generation,
+            writer_fence_sha256,
+            source_checkpoint_sha256,
+            document_set_sha256,
+            components,
+            self_seal_sha256: [0; 32],
+        };
+        manifest.validate_unsealed()?;
+        manifest.self_seal_sha256 = manifest.computed_self_seal();
+        Ok(manifest)
+    }
+
+    /// Validate every field and the self-seal without performing I/O.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed error for an invalid field, broken predecessor relation,
+    /// or mismatched self-seal.
+    pub fn validate(&self) -> Result<(), GenerationAuthorityErrorV1> {
+        self.validate_unsealed()?;
+        // ubs:ignore — the self-seal is public immutable-integrity evidence, not a secret.
+        if self.self_seal_sha256 != self.computed_self_seal() {
+            return Err(GenerationAuthorityErrorV1::ManifestSelfSealMismatch);
+        }
+        Ok(())
+    }
+
+    /// Canonical bytes excluding the self-seal field.
+    #[must_use]
+    pub fn canonical_unsealed_bytes(&self) -> Vec<u8> {
+        let mut encoder = CanonicalEncoder::new(b"frankensearch.activation-manifest.v1");
+        encoder.u16(self.schema_version);
+        encoder.u64(self.authority_sequence);
+        encoder.u8(self.action.tag());
+        encoder.option(self.predecessor.as_ref(), |predecessor, encoder| {
+            encoder.u16(predecessor.schema_version);
+            encoder.u64(predecessor.sequence);
+            encoder.bytes(&predecessor.object_id);
+            encoder.u64(predecessor.manifest_len);
+            encoder.bytes(&predecessor.manifest_sha256);
+            encoder.option(predecessor.predecessor.as_ref(), |ancestor, encoder| {
+                encoder.bytes(ancestor);
+            });
+        });
+        encoder.u16(self.generation.schema_version);
+        encoder.u64(self.generation.sequence);
+        encoder.bytes(&self.generation.nonce);
+        encoder.bytes(&self.writer_fence_sha256);
+        encoder.bytes(&self.source_checkpoint_sha256);
+        encoder.bytes(&self.document_set_sha256);
+        self.components.encode(&mut encoder);
+        encoder.finish()
+    }
+
+    /// Canonical bytes including the validated self-seal.
+    #[must_use]
+    pub fn canonical_bytes(&self) -> Vec<u8> {
+        let mut bytes = self.canonical_unsealed_bytes();
+        bytes.extend_from_slice(&self.self_seal_sha256);
+        bytes
+    }
+
+    /// Parse, validate, and re-encode one bounded canonical activation
+    /// manifest. The input must match [`Self::canonical_bytes`] byte-for-byte.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed error for truncated, extended, future, malformed, or
+    /// non-canonical manifest bytes without allocating based on input lengths.
+    pub fn from_canonical_bytes(bytes: &[u8]) -> Result<Self, GenerationAuthorityErrorV1> {
+        if bytes.len() < 32 || bytes.len() > GENERATION_ACTIVATION_MANIFEST_MAX_BYTES_V1 {
+            return Err(GenerationAuthorityErrorV1::InvalidField {
+                field: "activation_manifest.canonical_bytes",
+            });
+        }
+        let unsealed_len = bytes.len() - 32;
+        let (unsealed, seal) = bytes.split_at(unsealed_len);
+        let mut decoder = CanonicalDecoder::new(unsealed);
+        if decoder.bytes("activation_manifest.domain", 64)?
+            != b"frankensearch.activation-manifest.v1"
+        {
+            return Err(GenerationAuthorityErrorV1::InvalidField {
+                field: "activation_manifest.domain",
+            });
+        }
+        let schema_version = decoder.u16("activation_manifest.schema_version")?;
+        let authority_sequence = decoder.u64("activation_manifest.authority_sequence")?;
+        let action = match decoder.u8("activation_manifest.action")? {
+            1 => GenerationAuthorityActionV1::Activate,
+            2 => GenerationAuthorityActionV1::Rollback,
+            3 => GenerationAuthorityActionV1::Repair,
+            4 => GenerationAuthorityActionV1::Migrate,
+            _ => {
+                return Err(GenerationAuthorityErrorV1::InvalidField {
+                    field: "activation_manifest.action",
+                });
+            }
+        };
+        let predecessor = match decoder.u8("activation_manifest.predecessor.present")? {
+            0 => None,
+            1 => Some(AuthorityRefV1 {
+                schema_version: decoder.u16("activation_manifest.predecessor.schema_version")?,
+                sequence: decoder.u64("activation_manifest.predecessor.sequence")?,
+                object_id: decoder.fixed_bytes("activation_manifest.predecessor.object_id")?,
+                manifest_len: decoder.u64("activation_manifest.predecessor.manifest_len")?,
+                manifest_sha256: decoder
+                    .fixed_bytes("activation_manifest.predecessor.manifest_sha256")?,
+                predecessor: match decoder.u8("activation_manifest.predecessor.ancestor.present")? {
+                    0 => None,
+                    1 => Some(decoder.fixed_bytes("activation_manifest.predecessor.ancestor")?),
+                    _ => {
+                        return Err(GenerationAuthorityErrorV1::InvalidField {
+                            field: "activation_manifest.predecessor.ancestor.present",
+                        });
+                    }
+                },
+            }),
+            _ => {
+                return Err(GenerationAuthorityErrorV1::InvalidField {
+                    field: "activation_manifest.predecessor.present",
+                });
+            }
+        };
+        let generation = ArtifactGenerationIdentityV1 {
+            schema_version: decoder.u16("activation_manifest.generation.schema_version")?,
+            sequence: decoder.u64("activation_manifest.generation.sequence")?,
+            nonce: decoder.fixed_bytes("activation_manifest.generation.nonce")?,
+        };
+        let writer_fence_sha256 = decoder.fixed_bytes("activation_manifest.writer_fence_sha256")?;
+        let source_checkpoint_sha256 =
+            decoder.fixed_bytes("activation_manifest.source_checkpoint_sha256")?;
+        let document_set_sha256 = decoder.fixed_bytes("activation_manifest.document_set_sha256")?;
+        let components = GenerationComponentReceiptsV1 {
+            vector: decoder.component("activation_manifest.components.vector")?,
+            lexical: decoder.component("activation_manifest.components.lexical")?,
+            ann: decoder.component("activation_manifest.components.ann")?,
+            metadata: decoder.component("activation_manifest.components.metadata")?,
+        };
+        decoder.finish()?;
+        let mut self_seal_sha256 = [0_u8; 32];
+        self_seal_sha256.copy_from_slice(seal);
+        let manifest = Self {
+            schema_version,
+            authority_sequence,
+            predecessor,
+            action,
+            generation,
+            writer_fence_sha256,
+            source_checkpoint_sha256,
+            document_set_sha256,
+            components,
+            self_seal_sha256,
+        };
+        manifest.validate()?;
+        if !manifest.canonical_bytes().eq(bytes) {
+            return Err(GenerationAuthorityErrorV1::InvalidField {
+                field: "activation_manifest.canonical_bytes",
+            });
+        }
+        Ok(manifest)
+    }
+
+    /// Exact length and SHA-256 used by the external [`AuthorityRefV1`].
+    #[must_use]
+    pub fn object_receipt(&self) -> (u64, [u8; 32]) {
+        let bytes = self.canonical_bytes();
+        (
+            u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+            Sha256::digest(bytes).into(),
+        )
+    }
+
+    fn validate_unsealed(&self) -> Result<(), GenerationAuthorityErrorV1> {
+        if self.schema_version != GENERATION_AUTHORITY_SCHEMA_V1 {
+            return Err(GenerationAuthorityErrorV1::InvalidField {
+                field: "activation_manifest.schema_version",
+            });
+        }
+        if self.authority_sequence == 0 {
+            return Err(GenerationAuthorityErrorV1::InvalidField {
+                field: "activation_manifest.authority_sequence",
+            });
+        }
+        match (self.authority_sequence, self.predecessor) {
+            (1, None) => {}
+            (1, Some(_)) => {
+                return Err(GenerationAuthorityErrorV1::InvalidField {
+                    field: "activation_manifest.predecessor",
+                });
+            }
+            (_, None) => {
+                return Err(GenerationAuthorityErrorV1::InvalidField {
+                    field: "activation_manifest.predecessor",
+                });
+            }
+            (sequence, Some(predecessor)) => {
+                predecessor.validate()?;
+                if predecessor.sequence.checked_add(1) != Some(sequence) {
+                    return Err(GenerationAuthorityErrorV1::BrokenPredecessorLink);
+                }
+            }
+        }
+        self.generation
+            .validate()
+            .map_err(|_| GenerationAuthorityErrorV1::InvalidField {
+                field: "activation_manifest.generation",
+            })?;
+        for (field, digest) in [
+            (
+                "activation_manifest.writer_fence_sha256",
+                self.writer_fence_sha256,
+            ),
+            (
+                "activation_manifest.source_checkpoint_sha256",
+                self.source_checkpoint_sha256,
+            ),
+            (
+                "activation_manifest.document_set_sha256",
+                self.document_set_sha256,
+            ),
+        ] {
+            // ubs:ignore — component digests are public immutable-integrity identities.
+            if digest == [0; 32] {
+                return Err(GenerationAuthorityErrorV1::InvalidField { field });
+            }
+        }
+        self.components.validate()
+    }
+
+    fn computed_self_seal(&self) -> [u8; 32] {
+        Sha256::digest(self.canonical_unsealed_bytes()).into()
+    }
+}
+
+/// Verify that an immutable activation manifest is the exact object named by
+/// one authority reference.
+///
+/// The caller supplies bytes/object storage outside this pure helper. This
+/// check binds the authority sequence, predecessor fingerprint, exact object
+/// length, and exact object digest before a consumer can select the manifest.
+///
+/// # Errors
+///
+/// Returns a typed error for malformed inputs or any reference/manifest
+/// mismatch. It never falls back to a different manifest.
+pub fn verify_authority_manifest_reference_v1(
+    authority: &AuthorityRefV1,
+    manifest: &ActivationManifestV1,
+) -> Result<(), GenerationAuthorityErrorV1> {
+    authority.validate()?;
+    manifest.validate()?;
+    // ubs:ignore — authority sequence/predecessor fingerprints are public integrity identities.
+    if authority.sequence != manifest.authority_sequence
+        || authority.predecessor
+            != manifest
+                .predecessor
+                .map(|predecessor| predecessor.fingerprint())
+    {
+        return Err(GenerationAuthorityErrorV1::ManifestReferenceMismatch);
+    }
+    let (manifest_len, manifest_sha256) = manifest.object_receipt();
+    // ubs:ignore — manifest lengths and digests are public immutable object identities.
+    if authority.manifest_len != manifest_len || authority.manifest_sha256 != manifest_sha256 {
+        return Err(GenerationAuthorityErrorV1::ManifestReferenceMismatch);
+    }
+    Ok(())
+}
+
 /// One immutable, role-tagged artifact participating in a vector space.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1830,6 +2843,102 @@ impl CanonicalEncoder {
     }
 }
 
+/// Bounds-first reader for the fixed subset of canonical fields used by the
+/// activation-manifest codec. It never allocates from a decoded length.
+struct CanonicalDecoder<'a> {
+    bytes: &'a [u8],
+    offset: usize,
+}
+
+impl<'a> CanonicalDecoder<'a> {
+    const fn new(bytes: &'a [u8]) -> Self {
+        Self { bytes, offset: 0 }
+    }
+
+    fn u8(&mut self, field: &'static str) -> Result<u8, GenerationAuthorityErrorV1> {
+        Ok(self.take(1, field)?[0])
+    }
+
+    fn u16(&mut self, field: &'static str) -> Result<u16, GenerationAuthorityErrorV1> {
+        Ok(u16::from_be_bytes(self.array(field)?))
+    }
+
+    fn u64(&mut self, field: &'static str) -> Result<u64, GenerationAuthorityErrorV1> {
+        Ok(u64::from_be_bytes(self.array(field)?))
+    }
+
+    fn array<const N: usize>(
+        &mut self,
+        field: &'static str,
+    ) -> Result<[u8; N], GenerationAuthorityErrorV1> {
+        let mut result = [0_u8; N];
+        result.copy_from_slice(self.take(N, field)?);
+        Ok(result)
+    }
+
+    fn fixed_bytes<const N: usize>(
+        &mut self,
+        field: &'static str,
+    ) -> Result<[u8; N], GenerationAuthorityErrorV1> {
+        let bytes = self.bytes(field, N)?;
+        if bytes.len() != N {
+            return Err(GenerationAuthorityErrorV1::InvalidField { field });
+        }
+        let mut result = [0_u8; N];
+        result.copy_from_slice(bytes);
+        Ok(result)
+    }
+
+    fn bytes(
+        &mut self,
+        field: &'static str,
+        maximum_len: usize,
+    ) -> Result<&'a [u8], GenerationAuthorityErrorV1> {
+        let length = usize::try_from(self.u64(field)?)
+            .map_err(|_| GenerationAuthorityErrorV1::InvalidField { field })?;
+        if length > maximum_len {
+            return Err(GenerationAuthorityErrorV1::InvalidField { field });
+        }
+        self.take(length, field)
+    }
+
+    fn component(
+        &mut self,
+        field: &'static str,
+    ) -> Result<GenerationComponentReceiptV1, GenerationAuthorityErrorV1> {
+        let byte_len = self.u64(field)?;
+        let sha256 = self.fixed_bytes(field)?;
+        Ok(GenerationComponentReceiptV1 { byte_len, sha256 })
+    }
+
+    fn finish(self) -> Result<(), GenerationAuthorityErrorV1> {
+        if self.offset == self.bytes.len() {
+            Ok(())
+        } else {
+            Err(GenerationAuthorityErrorV1::InvalidField {
+                field: "activation_manifest.canonical_bytes",
+            })
+        }
+    }
+
+    fn take(
+        &mut self,
+        len: usize,
+        field: &'static str,
+    ) -> Result<&'a [u8], GenerationAuthorityErrorV1> {
+        let end = self
+            .offset
+            .checked_add(len)
+            .ok_or(GenerationAuthorityErrorV1::InvalidField { field })?;
+        let value = self
+            .bytes
+            .get(self.offset..end)
+            .ok_or(GenerationAuthorityErrorV1::InvalidField { field })?;
+        self.offset = end;
+        Ok(value)
+    }
+}
+
 fn sha256_hex(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
     let mut hex = String::with_capacity(digest.len() * 2);
@@ -2512,6 +3621,336 @@ fn check_document_count_consistency(m: &GenerationManifest, f: &mut Vec<Validati
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn authority_reference(sequence: u64, predecessor: Option<[u8; 32]>) -> AuthorityRefV1 {
+        AuthorityRefV1::new(
+            sequence,
+            [u8::try_from(sequence).expect("small test sequence"); 16],
+            4_096 + sequence,
+            [u8::try_from(sequence + 16).expect("small test digest"); 32],
+            predecessor,
+        )
+        .expect("valid test authority reference")
+    }
+
+    fn authority_slot(slot_index: u8, authority: AuthorityRefV1) -> AuthoritySlotV1 {
+        AuthoritySlotV1 {
+            slot_index,
+            root_id: [0x5a; 16],
+            authority,
+        }
+    }
+
+    fn lock_frame(kind: GenerationLockFrameKindV1) -> GenerationLockFrameV1 {
+        GenerationLockFrameV1::new(kind, [0x71; 16], [0x72; 16], [0x73; 16], 1, [0x74; 32])
+            .expect("valid test lock frame")
+    }
+
+    fn component_receipts() -> GenerationComponentReceiptsV1 {
+        GenerationComponentReceiptsV1 {
+            vector: GenerationComponentReceiptV1 {
+                byte_len: 101,
+                sha256: [0x11; 32],
+            },
+            lexical: GenerationComponentReceiptV1 {
+                byte_len: 102,
+                sha256: [0x12; 32],
+            },
+            ann: GenerationComponentReceiptV1 {
+                byte_len: 103,
+                sha256: [0x13; 32],
+            },
+            metadata: GenerationComponentReceiptV1 {
+                byte_len: 104,
+                sha256: [0x14; 32],
+            },
+        }
+    }
+
+    fn activation_manifest(
+        authority_sequence: u64,
+        predecessor: Option<AuthorityRefV1>,
+    ) -> ActivationManifestV1 {
+        ActivationManifestV1::new(
+            authority_sequence,
+            predecessor,
+            GenerationAuthorityActionV1::Activate,
+            ArtifactGenerationIdentityV1::new(7, [0x21; 16]).expect("test generation"),
+            [0x31; 32],
+            [0x32; 32],
+            [0x33; 32],
+            component_receipts(),
+        )
+        .expect("valid activation manifest")
+    }
+
+    #[test]
+    fn authority_slot_round_trips_and_authenticates_every_byte() {
+        let authority = authority_reference(1, None);
+        let slot = authority_slot(0, authority);
+        let bytes = slot.encode().expect("encode slot");
+        let decoded =
+            AuthoritySlotV1::from_authenticated_bytes(&bytes, 0, [0x5a; 16]).expect("decode slot");
+        assert_eq!(decoded, slot);
+
+        let mut tampered = bytes;
+        tampered[200] ^= 1;
+        assert_eq!(
+            AuthoritySlotV1::from_authenticated_bytes(&tampered, 0, [0x5a; 16]),
+            Err(GenerationAuthorityErrorV1::ChecksumMismatch),
+            "a byte outside the structured header must still be authenticated"
+        );
+    }
+
+    #[test]
+    fn authority_slot_rejects_recomputed_noncanonical_padding_and_copied_slot() {
+        let slot = authority_slot(0, authority_reference(1, None));
+        let mut noncanonical = slot.encode().expect("encode slot");
+        noncanonical[200] = 1;
+        let digest = Sha256::digest(&noncanonical[..AUTHORITY_SLOT_BODY_BYTES]);
+        noncanonical[AUTHORITY_SLOT_BODY_BYTES..].copy_from_slice(&digest);
+        assert_eq!(
+            AuthoritySlotV1::from_authenticated_bytes(&noncanonical, 0, [0x5a; 16]),
+            Err(GenerationAuthorityErrorV1::NonCanonicalPadding),
+            "a valid checksum does not permit noncanonical bytes"
+        );
+        assert_eq!(
+            AuthoritySlotV1::from_authenticated_bytes(
+                &slot.encode().expect("encode slot"),
+                1,
+                [0x5a; 16],
+            ),
+            Err(GenerationAuthorityErrorV1::SlotIndexMismatch),
+            "a frame copied between physical slots must fail closed"
+        );
+    }
+
+    #[test]
+    fn lock_owner_and_attempt_frames_are_distinct_authenticated_contracts() {
+        let owner = lock_frame(GenerationLockFrameKindV1::Owner);
+        let owner_bytes = owner.encode().expect("encode owner lock frame");
+        assert_eq!(
+            GenerationLockFrameV1::from_authenticated_bytes(&owner_bytes, [0x71; 16])
+                .expect("decode owner lock frame"),
+            owner
+        );
+
+        let attempt = lock_frame(GenerationLockFrameKindV1::Attempt);
+        assert_ne!(
+            attempt.encode().expect("encode attempt lock frame"),
+            owner_bytes,
+            "an attempt must never serialize as an owner record"
+        );
+
+        let mut tampered = owner_bytes;
+        tampered[300] ^= 1;
+        assert_eq!(
+            GenerationLockFrameV1::from_authenticated_bytes(&tampered, [0x71; 16]),
+            Err(GenerationAuthorityErrorV1::ChecksumMismatch),
+            "padding bytes remain authenticated"
+        );
+        assert_eq!(
+            GenerationLockFrameV1::from_authenticated_bytes(&owner_bytes, [0x75; 16]),
+            Err(GenerationAuthorityErrorV1::RootMismatch),
+            "a lock frame copied across roots must fail closed"
+        );
+    }
+
+    #[test]
+    fn authority_resolver_requires_an_exact_consecutive_predecessor() {
+        let first = authority_reference(1, None);
+        let second = authority_reference(2, Some(first.fingerprint()));
+        let resolved = resolve_authority_slots_v1(
+            Some(authority_slot(1, first)),
+            Some(authority_slot(0, second)),
+        )
+        .expect("linked authority slots resolve")
+        .expect("at least one authority");
+        assert_eq!(resolved.authority, second);
+
+        let unlinked = authority_reference(2, Some([0x11; 32]));
+        assert_eq!(
+            resolve_authority_slots_v1(
+                Some(authority_slot(1, first)),
+                Some(authority_slot(0, unlinked)),
+            ),
+            Err(GenerationAuthorityErrorV1::BrokenPredecessorLink),
+            "a newer authority without the exact predecessor fingerprint is not selectable"
+        );
+    }
+
+    #[test]
+    fn authority_resolver_rejects_non_genesis_slot_parity_violation() {
+        let genesis = authority_reference(1, None);
+        let successor = authority_reference(2, Some(genesis.fingerprint()));
+        assert_eq!(
+            resolve_authority_slots_v1(
+                Some(authority_slot(0, genesis)),
+                Some(authority_slot(1, successor)),
+            ),
+            Err(GenerationAuthorityErrorV1::SlotSequenceParity),
+            "a non-genesis authority copied into the opposite physical slot must fail"
+        );
+    }
+
+    #[test]
+    fn authority_resolver_accepts_only_duplicate_genesis() {
+        let genesis = authority_reference(1, None);
+        assert_eq!(
+            resolve_authority_slots_v1(
+                Some(authority_slot(0, genesis)),
+                Some(authority_slot(1, genesis)),
+            ),
+            Ok(Some(authority_slot(0, genesis)))
+        );
+
+        let second = authority_reference(2, Some(genesis.fingerprint()));
+        assert_eq!(
+            resolve_authority_slots_v1(
+                Some(authority_slot(0, second)),
+                Some(authority_slot(1, second)),
+            ),
+            Err(GenerationAuthorityErrorV1::NonGenesisDuplicate)
+        );
+    }
+
+    #[test]
+    fn authority_resolver_rejects_forks_gaps_and_mixed_roots_but_keeps_one_slot_survival() {
+        let genesis = authority_reference(1, None);
+        assert_eq!(
+            resolve_authority_slots_v1(Some(authority_slot(0, genesis)), None),
+            Ok(Some(authority_slot(0, genesis))),
+            "one authenticated surviving slot remains selectable"
+        );
+
+        let fork = AuthorityRefV1::new(1, [0x61; 16], 4_097, [0x62; 32], None)
+            .expect("valid conflicting genesis-shaped reference");
+        assert_eq!(
+            resolve_authority_slots_v1(
+                Some(authority_slot(0, genesis)),
+                Some(authority_slot(1, fork)),
+            ),
+            Err(GenerationAuthorityErrorV1::EqualSequenceFork),
+            "equal sequence with distinct identities is a fork, never a tie-break"
+        );
+
+        let skipped = AuthorityRefV1::new(3, [0x63; 16], 4_099, [0x64; 32], Some([0x65; 32]))
+            .expect("well-formed but nonconsecutive authority reference");
+        assert_eq!(
+            resolve_authority_slots_v1(
+                Some(authority_slot(0, genesis)),
+                Some(authority_slot(1, skipped)),
+            ),
+            Err(GenerationAuthorityErrorV1::BrokenPredecessorLink),
+            "a structurally credible gap must not silently select the newest slot"
+        );
+
+        let mut other_root = authority_slot(1, genesis);
+        other_root.root_id = [0x66; 16];
+        assert_eq!(
+            resolve_authority_slots_v1(Some(authority_slot(0, genesis)), Some(other_root)),
+            Err(GenerationAuthorityErrorV1::InvalidField {
+                field: "authority_slot.pair"
+            }),
+            "two slots from different roots cannot be combined"
+        );
+    }
+
+    #[test]
+    fn activation_manifest_self_seals_all_component_and_transition_witnesses() {
+        let manifest = activation_manifest(1, None);
+        manifest.validate().expect("self-sealed manifest validates");
+        let receipt = manifest.object_receipt();
+        assert!(receipt.0 > 0);
+        assert_ne!(receipt.1, [0; 32]);
+
+        let mut substituted = manifest.clone();
+        substituted.components.metadata.sha256[0] ^= 1;
+        assert_eq!(
+            substituted.validate(),
+            Err(GenerationAuthorityErrorV1::ManifestSelfSealMismatch),
+            "a component substitution must invalidate the activation-manifest self-seal"
+        );
+    }
+
+    #[test]
+    fn activation_manifest_codec_round_trips_and_rejects_noncanonical_boundaries() {
+        let manifest = activation_manifest(1, None);
+        let bytes = manifest.canonical_bytes();
+        assert_eq!(
+            ActivationManifestV1::from_canonical_bytes(&bytes).expect("canonical decode"),
+            manifest,
+            "canonical decode must reproduce the exact structured manifest"
+        );
+
+        let mut extended = bytes.clone();
+        extended.push(0);
+        assert!(
+            ActivationManifestV1::from_canonical_bytes(&extended).is_err(),
+            "trailing bytes must not become a second representation"
+        );
+        assert!(
+            ActivationManifestV1::from_canonical_bytes(&bytes[..bytes.len() - 1]).is_err(),
+            "a truncated self-seal must fail before selecting the manifest"
+        );
+
+        let mut future = manifest;
+        future.schema_version = GENERATION_AUTHORITY_SCHEMA_V1 + 1;
+        future.self_seal_sha256 = future.computed_self_seal();
+        assert_eq!(
+            ActivationManifestV1::from_canonical_bytes(&future.canonical_bytes()),
+            Err(GenerationAuthorityErrorV1::InvalidField {
+                field: "activation_manifest.schema_version"
+            }),
+            "a self-consistent future schema still fails closed"
+        );
+    }
+
+    #[test]
+    fn activation_manifest_requires_the_exact_preceding_authority_sequence() {
+        let genesis = activation_manifest(1, None);
+        let (manifest_len, manifest_sha256) = genesis.object_receipt();
+        let predecessor = AuthorityRefV1::new(1, [0x41; 16], manifest_len, manifest_sha256, None)
+            .expect("genesis authority reference");
+        let successor = activation_manifest(2, Some(predecessor));
+        successor
+            .validate()
+            .expect("consecutive predecessor validates");
+
+        assert_eq!(
+            ActivationManifestV1::new(
+                3,
+                Some(predecessor),
+                GenerationAuthorityActionV1::Activate,
+                ArtifactGenerationIdentityV1::new(7, [0x21; 16]).expect("test generation"),
+                [0x31; 32],
+                [0x32; 32],
+                [0x33; 32],
+                component_receipts(),
+            ),
+            Err(GenerationAuthorityErrorV1::BrokenPredecessorLink),
+            "an activation manifest may not skip an authority sequence"
+        );
+    }
+
+    #[test]
+    fn authority_reference_requires_the_exact_self_sealed_manifest_object() {
+        let manifest = activation_manifest(1, None);
+        let (manifest_len, manifest_sha256) = manifest.object_receipt();
+        let authority = AuthorityRefV1::new(1, [0x51; 16], manifest_len, manifest_sha256, None)
+            .expect("authority names test manifest");
+        verify_authority_manifest_reference_v1(&authority, &manifest)
+            .expect("exact authority manifest binding");
+
+        let wrong_length =
+            AuthorityRefV1::new(1, [0x51; 16], manifest_len + 1, manifest_sha256, None)
+                .expect("otherwise valid authority reference");
+        assert_eq!(
+            verify_authority_manifest_reference_v1(&wrong_length, &manifest),
+            Err(GenerationAuthorityErrorV1::ManifestReferenceMismatch),
+            "a length-mismatched external object must not be selected"
+        );
+    }
 
     fn sample_embedder() -> EmbedderRevision {
         let mut identity = EmbeddingIdentityBundleV1::explicit_test_model("potion-128M", 256);

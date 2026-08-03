@@ -16,6 +16,7 @@
 
 use std::borrow::Borrow;
 use std::collections::{BTreeMap, BTreeSet};
+use std::fs;
 use std::hint::black_box;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -147,12 +148,85 @@ static QG1_CONTINUOUS_TIMING_RECEIPTS: OnceLock<Mutex<Vec<Qg1ContinuousTimingRec
 static CONCURRENCY_OBSERVATIONS: OnceLock<
     Mutex<BTreeMap<(String, String), ConcurrencyAccumulator>>,
 > = OnceLock::new();
+static COLD_CACHE_OBSERVATIONS: OnceLock<Mutex<BTreeMap<String, ColdCacheAccumulator>>> =
+    OnceLock::new();
 
 #[derive(Debug, Clone, Copy)]
 struct ConcurrencyAccumulator {
     count: usize,
     min: usize,
     max: usize,
+}
+
+/// Aggregate the per-arm cache-eviction witnesses before admitting a QG-9 cell.
+#[derive(Debug, Clone, Copy, Default)]
+struct ColdCacheAccumulator {
+    quill_successes: usize,
+    quill_failures: usize,
+    tantivy_successes: usize,
+    tantivy_failures: usize,
+}
+
+fn record_cold_cache_eviction(
+    spec: &PerfCellSpec,
+    arm: EngineArm,
+    eviction: Result<usize, String>,
+) {
+    let cell_id = format!("{}/{}/{}", spec.gate, spec.fixture, spec.metric);
+    let mut observations = COLD_CACHE_OBSERVATIONS
+        .get_or_init(|| Mutex::new(BTreeMap::new()))
+        .lock()
+        .expect("lock cold-cache observations");
+    let entry = observations.entry(cell_id).or_default();
+    let (successes, failures) = match arm {
+        EngineArm::Quill => (&mut entry.quill_successes, &mut entry.quill_failures),
+        EngineArm::Tantivy => (&mut entry.tantivy_successes, &mut entry.tantivy_failures),
+    };
+    match eviction {
+        Ok(file_count) => {
+            assert!(
+                file_count > 0,
+                "QG-9 cache eviction accepted an empty index"
+            );
+            *successes = successes.saturating_add(1);
+        }
+        Err(error) => {
+            eprintln!(
+                "[quill-qg9-cold-cache] arm={} eviction_unverified={error}",
+                arm.label()
+            );
+            *failures = failures.saturating_add(1);
+        }
+    }
+}
+
+fn cold_cache_evidence(accumulator: ColdCacheAccumulator) -> ColdCacheEvidence {
+    let verified = accumulator.quill_successes > 0
+        && accumulator.tantivy_successes > 0
+        && accumulator.quill_failures == 0
+        && accumulator.tantivy_failures == 0;
+    let procedure = if verified {
+        "fresh child process; successful posix_fadvise(POSIX_FADV_DONTNEED) on every regular index file before each open"
+    } else {
+        "fresh child process used, but at least one arm lacked a successful posix_fadvise(POSIX_FADV_DONTNEED) eviction witness"
+    };
+    ColdCacheEvidence {
+        procedure: procedure.to_owned(),
+        verified,
+    }
+}
+
+fn take_cold_cache_evidence(spec: &PerfCellSpec) -> Option<ColdCacheEvidence> {
+    (spec.gate == PerfGate::Qg9).then(|| {
+        let cell_id = format!("{}/{}/{}", spec.gate, spec.fixture, spec.metric);
+        let accumulator = COLD_CACHE_OBSERVATIONS
+            .get_or_init(|| Mutex::new(BTreeMap::new()))
+            .lock()
+            .expect("lock cold-cache observations")
+            .remove(&cell_id)
+            .expect("missing QG-9 cold-cache eviction witness");
+        cold_cache_evidence(accumulator)
+    })
 }
 
 fn record_concurrency(spec: &PerfCellSpec, arm: EngineArm, observed_threads: usize) {
@@ -2301,6 +2375,108 @@ fn fresh_process_search(
     timer.elapsed()
 }
 
+fn collect_regular_files(path: &Path, files: &mut Vec<PathBuf>) -> Result<(), String> {
+    let entries = fs::read_dir(path)
+        .map_err(|error| format!("read QG-9 index directory {}: {error}", path.display()))?;
+    for entry in entries {
+        let entry = entry.map_err(|error| {
+            format!(
+                "read QG-9 index directory entry under {}: {error}",
+                path.display()
+            )
+        })?;
+        let file_type = entry.file_type().map_err(|error| {
+            format!(
+                "inspect QG-9 index entry {}: {error}",
+                entry.path().display()
+            )
+        })?;
+        if file_type.is_dir() {
+            collect_regular_files(&entry.path(), files)?;
+        } else if file_type.is_file() {
+            files.push(entry.path());
+        }
+    }
+    Ok(())
+}
+
+/// Request a per-index-file cold page cache without evicting unrelated workloads.
+///
+/// QG-9 never treats this advisory as proved unless both engine arms succeed on
+/// every sampled fixture. The timed open itself is then performed by a fresh
+/// executable, so no reader state from the producer process survives.
+fn evict_index_file_cache(path: &Path) -> Result<usize, String> {
+    #[cfg(target_os = "linux")]
+    {
+        let mut files = Vec::new();
+        collect_regular_files(path, &mut files)?;
+        files.sort();
+        if files.is_empty() {
+            return Err(format!(
+                "QG-9 index {} has no regular files",
+                path.display()
+            ));
+        }
+        for file_path in &files {
+            let file = fs::File::open(file_path).map_err(|error| {
+                format!(
+                    "open QG-9 index file {} for cache eviction: {error}",
+                    file_path.display()
+                )
+            })?;
+            rustix::fs::fadvise(&file, 0, None, rustix::fs::Advice::DontNeed).map_err(|error| {
+                format!(
+                    "posix_fadvise(POSIX_FADV_DONTNEED) for QG-9 index file {}: {error}",
+                    file_path.display()
+                )
+            })?;
+        }
+        Ok(files.len())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = path;
+        Err("QG-9 has no registered per-file cold-cache eviction method for this OS".to_owned())
+    }
+}
+
+fn fresh_process_open(path: &Path, spec: &PerfCellSpec, arm: EngineArm) -> Duration {
+    let output = Command::new(std::env::current_exe().expect("QG benchmark executable"))
+        .env("QUILL_PERF_CHILD_MODE", "open")
+        .env("QUILL_PERF_CHILD_ENGINE", arm.label())
+        .env("QUILL_PERF_CHILD_PATH", path)
+        .env(
+            "QUILL_PERF_CHILD_HEAP",
+            spec.writer_heap_bytes.unwrap_or(50_000_000).to_string(),
+        )
+        .env(
+            "QUILL_PERF_CHILD_THREADS",
+            spec.threads.unwrap_or(1).to_string(),
+        )
+        .env(
+            "QUILL_PERF_CHILD_POSITIONS",
+            spec.positions
+                .unwrap_or(PositionMode::On)
+                .enabled()
+                .to_string(),
+        )
+        .output()
+        .expect("spawn fresh-process QG-9 reader");
+    assert!(
+        output.status.success(),
+        "fresh-process QG-9 reader failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8(output.stdout).expect("QG-9 child output UTF-8");
+    let nanos = stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("quill-perf-child\\t"))
+        .expect("QG-9 child open measurement")
+        .parse::<u64>()
+        .expect("QG-9 child open measurement nanoseconds");
+    Duration::from_nanos(nanos)
+}
+
 fn commit_metric(context: &BenchContext, spec: &PerfCellSpec, arm: EngineArm) -> f64 {
     let warm_count = context
         .scale
@@ -2669,14 +2845,9 @@ fn cold_open_metric(context: &BenchContext, spec: &PerfCellSpec, arm: EngineArm)
             let _ = index_batches(context, &index, &corpus, count, None);
             let _ = commit(context, &index);
             drop(index);
-            let timer = Instant::now();
-            black_box(
-                context
-                    .runtime
-                    .block_on(QuillIndex::open(&context.cx, &path, quill_config(spec)))
-                    .expect("cold-open Quill"),
-            );
-            timer.elapsed()
+            let eviction = evict_index_file_cache(&path);
+            record_cold_cache_eviction(spec, arm, eviction);
+            fresh_process_open(&path, spec, arm)
         }
         EngineArm::Tantivy => {
             let path = scratch_path("qg9-tantivy");
@@ -2684,17 +2855,9 @@ fn cold_open_metric(context: &BenchContext, spec: &PerfCellSpec, arm: EngineArm)
             let _ = index_batches(context, &index, &corpus, count, None);
             let _ = commit(context, &index);
             drop(index);
-            let timer = Instant::now();
-            black_box(
-                TantivyIndex::open_with_benchmark_config(
-                    &path,
-                    spec.writer_heap_bytes.unwrap_or(50_000_000),
-                    spec.threads.unwrap_or(1),
-                    spec.positions.unwrap_or(PositionMode::On).enabled(),
-                )
-                .expect("cold-open pinned Tantivy"),
-            );
-            timer.elapsed()
+            let eviction = evict_index_file_cache(&path);
+            record_cold_cache_eviction(spec, arm, eviction);
+            fresh_process_open(&path, spec, arm)
         }
     };
     elapsed.as_secs_f64() * 1_000.0
@@ -3964,11 +4127,7 @@ fn collect_cell(
             .expect("treatment-arm null estimator rejected harness-produced streams")
     });
     let is_tokenizer_null = spec.metric == "tokenize_docs_per_second";
-    let cold_cache = (spec.gate == PerfGate::Qg9).then(|| ColdCacheEvidence {
-        procedure: "same-process index drop and reopen; the OS page cache is not dropped"
-            .to_owned(),
-        verified: false,
-    });
+    let cold_cache = take_cold_cache_evidence(spec);
     let mut cell = EvidenceCell::evaluate(
         EvidenceCellSpec {
             gate: spec.gate,
@@ -4957,6 +5116,39 @@ fn run_search_child() {
     println!("quill-perf-child\t{}", doc_ids.len());
 }
 
+fn run_open_child() {
+    let arm = child_engine();
+    let path = PathBuf::from(
+        std::env::var_os("QUILL_PERF_CHILD_PATH").expect("missing QUILL_PERF_CHILD_PATH"),
+    );
+    let heap = child_env::<usize>("QUILL_PERF_CHILD_HEAP");
+    let threads = child_env::<usize>("QUILL_PERF_CHILD_THREADS");
+    let positions = child_env::<bool>("QUILL_PERF_CHILD_POSITIONS");
+    let context = BenchContext::new(MatrixScale::from_env());
+    let timer = Instant::now();
+    match arm {
+        EngineArm::Quill => {
+            black_box(
+                context
+                    .runtime
+                    .block_on(QuillIndex::open(
+                        &context.cx,
+                        &path,
+                        pinned_quill_config(heap, threads),
+                    ))
+                    .expect("fresh-process QG-9 Quill open"),
+            );
+        }
+        EngineArm::Tantivy => {
+            black_box(
+                TantivyIndex::open_with_benchmark_config(&path, heap, threads, positions)
+                    .expect("fresh-process QG-9 pinned Tantivy open"),
+            );
+        }
+    };
+    println!("quill-perf-child\t{}", timer.elapsed().as_nanos());
+}
+
 fn run_memory_child() {
     let arm = child_engine();
     let count = child_env::<u64>("QUILL_PERF_CHILD_COUNT");
@@ -5018,6 +5210,7 @@ fn run_memory_child() {
 fn run_child_mode() -> bool {
     match std::env::var("QUILL_PERF_CHILD_MODE").as_deref() {
         Ok("search") => run_search_child(),
+        Ok("open") => run_open_child(),
         Ok("memory") => run_memory_child(),
         Ok(mode) => panic!("unknown QUILL_PERF_CHILD_MODE {mode:?}"),
         Err(_) => return false,
@@ -5074,6 +5267,8 @@ fn main() {
         tests::assert_qg1_disjoint_partial_shard_contract();
         tests::assert_corpus_identity_fixture_framing();
         tests::assert_non_qg1_corpus_identity_preserves_legacy_hash();
+        tests::assert_qg9_cache_evidence_contract();
+        tests::assert_qg9_cache_eviction_file_discovery();
         eprintln!(
             "[quill-perf-self-check] H1 immutable producer and continuous-timing contracts passed"
         );
@@ -5092,6 +5287,66 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
+    pub fn assert_qg9_cache_evidence_contract() {
+        let quill_only = super::ColdCacheAccumulator {
+            quill_successes: 1,
+            ..super::ColdCacheAccumulator::default()
+        };
+        assert!(
+            !super::cold_cache_evidence(quill_only).verified,
+            "one arm cannot prove a comparative cold-open row"
+        );
+
+        let failed_tantivy = super::ColdCacheAccumulator {
+            quill_successes: 1,
+            tantivy_successes: 1,
+            tantivy_failures: 1,
+            ..super::ColdCacheAccumulator::default()
+        };
+        assert!(
+            !super::cold_cache_evidence(failed_tantivy).verified,
+            "an eviction failure must keep QG-9 at NoDecision"
+        );
+
+        let verified = super::cold_cache_evidence(super::ColdCacheAccumulator {
+            quill_successes: 1,
+            tantivy_successes: 1,
+            ..super::ColdCacheAccumulator::default()
+        });
+        assert!(verified.verified);
+        assert!(verified.procedure.contains("fresh child process"));
+        assert!(verified.procedure.contains("POSIX_FADV_DONTNEED"));
+    }
+
+    #[test]
+    fn qg9_cache_evidence_requires_a_clean_eviction_witness_from_both_arms() {
+        assert_qg9_cache_evidence_contract();
+    }
+
+    pub fn assert_qg9_cache_eviction_file_discovery() {
+        let fixture = tempfile::tempdir().expect("QG-9 fixture directory");
+        let nested = fixture.path().join("segments");
+        std::fs::create_dir(&nested).expect("nested QG-9 fixture directory");
+        std::fs::write(fixture.path().join("meta.json"), b"metadata")
+            .expect("write QG-9 metadata fixture");
+        std::fs::write(nested.join("segment.fslx"), b"segment")
+            .expect("write QG-9 segment fixture");
+
+        let mut files = Vec::new();
+        super::collect_regular_files(fixture.path(), &mut files)
+            .expect("discover QG-9 regular index files");
+        files.sort();
+        assert_eq!(files.len(), 2);
+        assert!(files.iter().all(|path| path.is_file()));
+        assert!(files.iter().any(|path| path.ends_with("meta.json")));
+        assert!(files.iter().any(|path| path.ends_with("segment.fslx")));
+    }
+
+    #[test]
+    fn qg9_cache_eviction_discovers_nested_regular_files_without_treating_dirs_as_files() {
+        assert_qg9_cache_eviction_file_discovery();
+    }
+
     fn hostile_tantivy_continuous_receipt() -> super::Qg1ContinuousTimingReceipt {
         super::Qg1ContinuousTimingReceipt {
             producer_coverage: super::Qg1ProducerCoverage::EngineIndexingLifecycle,
