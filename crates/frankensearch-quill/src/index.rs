@@ -1962,6 +1962,7 @@ pub struct QuillProfileReceipt {
     delta_segments: u64,
     cache: QuillProfileCacheDisposition,
     execution: Option<QuillProfileExecutionMode>,
+    work_plan: Option<(u64, bool)>,
     snapshot_doc_freq_calls: u64,
     global_doc_freq_probes: u64,
     term_dictionary_views: u64,
@@ -2024,6 +2025,14 @@ impl QuillProfileReceipt {
         self.execution
     }
 
+    /// Computed work upper bound and whether the shipping fuel meter was active.
+    ///
+    /// Cache-served and pre-planning failures have no work-plan observation.
+    #[must_use]
+    pub const fn work_plan(&self) -> Option<(u64, bool)> {
+        self.work_plan
+    }
+
     /// Counter tuple in the order: snapshot DF, global DF, TERMDICT views,
     /// lowered segments, and admitted fuel units.
     #[must_use]
@@ -2078,6 +2087,7 @@ pub struct QuillProfileSession {
 struct QuillProfileSessionState {
     cache: Option<QuillProfileCacheDisposition>,
     execution: Option<QuillProfileExecutionMode>,
+    work_plan: Option<(u64, bool)>,
     completed: bool,
 }
 
@@ -2105,6 +2115,7 @@ impl QuillProfileSession {
             state: StdMutex::new(QuillProfileSessionState {
                 cache: None,
                 execution: None,
+                work_plan: None,
                 completed: false,
             }),
         }
@@ -2151,6 +2162,27 @@ impl QuillProfileSession {
             ));
         }
         state.execution = Some(execution);
+        drop(state);
+        Ok(())
+    }
+
+    /// Bind the exact work-plan facts computed by the ordinary query path.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed invalid-state error if planning was already bound, the
+    /// session was finalized, or the session lock is poisoned.
+    pub fn bind_work_plan(&self, upper_bound: u64, metering: bool) -> Result<(), QuillIndexError> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| invalid_state("profile-internals session lock is poisoned"))?;
+        if state.completed || state.work_plan.is_some() {
+            return Err(invalid_state(
+                "profile-internals work plan was already bound",
+            ));
+        }
+        state.work_plan = Some((upper_bound, metering));
         drop(state);
         Ok(())
     }
@@ -2233,6 +2265,7 @@ impl QuillProfileSession {
             delta_segments: self.delta_segments,
             cache,
             execution: state.execution,
+            work_plan: state.work_plan,
             snapshot_doc_freq_calls: self.snapshot_doc_freq_calls.load(Ordering::Acquire),
             global_doc_freq_probes: self.global_doc_freq_probes.load(Ordering::Acquire),
             term_dictionary_views: self.term_dictionary_views.load(Ordering::Acquire),
@@ -7239,6 +7272,10 @@ impl QuillReader {
             work_upper_bound,
         );
         let metering = concrete_checkpoint.metering();
+        #[cfg(feature = "profile-internals")]
+        if let Some(profile) = profile {
+            profile.bind_work_plan(work_upper_bound, metering)?;
+        }
         let checkpoint: QueryCheckpointHandle<'_> = concrete_checkpoint;
         self.collect_sealed_segments(
             cx,
@@ -14703,6 +14740,10 @@ mod tests {
             assert_eq!(receipt.keeper_generation(), expected_generation);
             assert_eq!(receipt.cache(), QuillProfileCacheDisposition::Miss);
             assert_eq!(receipt.execution(), Some(QuillProfileExecutionMode::Serial));
+            let Some((work_upper_bound, _metering)) = receipt.work_plan() else {
+                panic!("profiled ordinary query did not bind its work plan");
+            };
+            assert!(work_upper_bound > 0);
             assert!(
                 receipt.counters().4 > 0,
                 "profiled ordinary query did not record any accepted work checkpoints"
@@ -14725,6 +14766,7 @@ mod tests {
             };
             assert_eq!(repeat_receipt.cache(), QuillProfileCacheDisposition::Hit);
             assert_eq!(repeat_receipt.execution(), None);
+            assert_eq!(repeat_receipt.work_plan(), None);
             assert_eq!(repeat_receipt.counters(), (0, 0, 0, 0, 0));
             assert_eq!(repeat_receipt.outcome(), QuillProfileOutcome::Completed);
         });
