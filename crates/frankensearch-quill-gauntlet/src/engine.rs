@@ -3118,6 +3118,20 @@ mod tests {
         }
     }
 
+    /// The v1 flush-batch generator is a three-state replay contract, not
+    /// merely a non-zero batch-size source. Pinning every residue and the
+    /// period wrap prevents a changed schedule from silently relabelling a
+    /// historical E6.3 seed.
+    #[cfg(feature = "perf-harness")]
+    #[test]
+    fn e63_flush_batch_seed_schedule_v1_is_exact_and_periodic() {
+        assert_eq!(e63_seeded_flush_batch_size(0), 1);
+        assert_eq!(e63_seeded_flush_batch_size(1), 2);
+        assert_eq!(e63_seeded_flush_batch_size(2), 3);
+        assert_eq!(e63_seeded_flush_batch_size(3), 1);
+        assert_eq!(e63_seeded_flush_batch_size(u64::MAX), 1);
+    }
+
     struct CountingEngine {
         descriptor: EngineDescriptor,
         observe_calls: Arc<AtomicUsize>,
