@@ -16,7 +16,7 @@ use std::sync::Arc;
 
 use frankensearch_core::traits::SearchFuture;
 use frankensearch_core::{
-    Cx, Embedder, ModelCategory, ScoredResult, TwoTierConfig, TwoTierMetrics,
+    Cx, Embedder, ModelCategory, ScoredResult, SearchPhase, TwoTierConfig, TwoTierMetrics,
 };
 use frankensearch_fusion::{SyncTwoTierSearcher, TwoTierSearcher};
 use frankensearch_index::{InMemoryTwoTierIndex, InMemoryVectorIndex, TwoTierIndex};
@@ -195,6 +195,50 @@ fn run_sync_with_quality_index(
         .expect("sync search_collect")
 }
 
+fn phase_label(phase: &SearchPhase) -> &'static str {
+    match phase {
+        SearchPhase::Initial { .. } => "initial",
+        SearchPhase::Refined { .. } => "refined",
+        SearchPhase::Reranked { .. } => "reranked",
+        SearchPhase::RefinementFailed { .. } => "refinement_failed",
+    }
+}
+
+fn unavailable_quality_phase_labels(query_vec: &[f32]) -> (Vec<&'static str>, Vec<&'static str>) {
+    let config = TwoTierConfig::default();
+    let sync = SyncTwoTierSearcher::new(sync_index(false), config.clone())
+        .search_iter(query_vec, 4)
+        .map(|phase| phase_label(&phase))
+        .collect();
+    let index = async_index("quality-index-phase", false);
+    let fast: Arc<dyn Embedder> = Arc::new(FixedVecEmbedder {
+        id: "parity-fast",
+        vector: query_vec.to_vec(),
+    });
+    let quality: Arc<dyn Embedder> = Arc::new(FixedVecEmbedder {
+        id: "parity-quality",
+        vector: query_vec.to_vec(),
+    });
+    let mut async_phases = Vec::new();
+    asupersync::test_utils::run_test_with_cx(|cx| {
+        let slot = &mut async_phases;
+        async move {
+            TwoTierSearcher::new(index, fast, config)
+                .with_quality_embedder(quality)
+                .search(
+                    &cx,
+                    "parity conformance query",
+                    4,
+                    |_| None,
+                    |phase| slot.push(phase_label(&phase)),
+                )
+                .await
+                .expect("async phase search");
+        }
+    });
+    (sync, async_phases)
+}
+
 fn assert_result_parity(case: &str, sync_r: &[ScoredResult], async_r: &[ScoredResult]) {
     let sync_ids = sync_r.iter().map(|r| r.doc_id.as_str()).collect::<Vec<_>>();
     let async_ids = async_r
@@ -323,6 +367,9 @@ fn quality_index_unavailable_agrees_and_skips_phase_two_on_both_sides() {
         "sync must report the typed unavailable-index skip"
     );
     assert_eq!(sync_metrics.skip_reason, async_metrics.skip_reason);
+    let (sync_phases, async_phases) = unavailable_quality_phase_labels(&query);
+    assert_eq!(sync_phases, ["initial"]);
+    assert_eq!(sync_phases, async_phases);
 }
 
 #[test]
