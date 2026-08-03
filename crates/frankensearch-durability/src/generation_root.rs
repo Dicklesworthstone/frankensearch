@@ -151,6 +151,15 @@ pub struct GenerationRootFilePolicyV1 {
     pub max_bytes: u64,
 }
 
+/// Explicit ownership and permission policy for the trusted root descriptor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GenerationRootDirectoryPolicyV1 {
+    /// Required Unix owner identity.
+    pub expected_uid: u32,
+    /// Required permission bits, excluding the directory type bits.
+    pub expected_mode: u32,
+}
+
 /// Stable descriptor witness captured before and after a bounded file read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GenerationRootFileWitnessV1 {
@@ -223,10 +232,19 @@ impl GenerationRootCapabilityV1 {
     /// return a typed zero-I/O unsupported result until their platform
     /// qualification is implemented.
     #[cfg(target_os = "linux")]
-    pub fn from_trusted_directory(directory: File) -> Result<Self, GenerationRootAdmissionErrorV1> {
+    pub fn from_trusted_directory(
+        directory: File,
+        policy: GenerationRootDirectoryPolicyV1,
+    ) -> Result<Self, GenerationRootAdmissionErrorV1> {
         let stat = rustix::fs::fstat(&directory).map_err(|_| GenerationRootAdmissionErrorV1::Io)?;
         if rustix::fs::FileType::from_raw_mode(stat.st_mode) != rustix::fs::FileType::Directory {
             return Err(GenerationRootAdmissionErrorV1::NotDirectory);
+        }
+        if stat.st_uid != policy.expected_uid {
+            return Err(GenerationRootAdmissionErrorV1::OwnerMismatch);
+        }
+        if stat.st_mode & 0o7777 != policy.expected_mode {
+            return Err(GenerationRootAdmissionErrorV1::ModeMismatch);
         }
         Ok(Self {
             directory,
@@ -236,8 +254,12 @@ impl GenerationRootCapabilityV1 {
 
     /// Typed zero-I/O stub for non-Linux qualification targets.
     #[cfg(not(target_os = "linux"))]
-    pub fn from_trusted_directory(directory: File) -> Result<Self, GenerationRootAdmissionErrorV1> {
+    pub fn from_trusted_directory(
+        directory: File,
+        policy: GenerationRootDirectoryPolicyV1,
+    ) -> Result<Self, GenerationRootAdmissionErrorV1> {
         drop(directory);
+        let _ = policy;
         Err(GenerationRootAdmissionErrorV1::UnsupportedPlatform)
     }
 
@@ -421,11 +443,28 @@ fn validate_unix_route_bytes(route: &OsStr) -> Result<(), GenerationRootRouteErr
 #[cfg(test)]
 mod tests {
     use super::{
-        GenerationRootAdmissionErrorV1, GenerationRootCapabilityV1, GenerationRootFilePolicyV1,
-        GenerationRootRouteErrorV1, GenerationRootRouteV1,
+        GenerationRootAdmissionErrorV1, GenerationRootCapabilityV1,
+        GenerationRootDirectoryPolicyV1, GenerationRootFilePolicyV1, GenerationRootRouteErrorV1,
+        GenerationRootRouteV1,
     };
     use std::ffi::OsStr;
     use std::path::Path;
+
+    #[cfg(target_os = "linux")]
+    fn admit_test_root(directory: &tempfile::TempDir) -> GenerationRootCapabilityV1 {
+        use std::fs::{self, File};
+        use std::os::unix::fs::MetadataExt as _;
+
+        let metadata = fs::metadata(directory.path()).expect("trusted root metadata");
+        GenerationRootCapabilityV1::from_trusted_directory(
+            File::open(directory.path()).expect("open trusted root descriptor"),
+            GenerationRootDirectoryPolicyV1 {
+                expected_uid: metadata.uid(),
+                expected_mode: metadata.mode() & 0o7777,
+            },
+        )
+        .expect("admit private test root")
+    }
 
     #[test]
     fn route_preserves_normal_component_order_without_filesystem_access() {
@@ -491,10 +530,18 @@ mod tests {
             expected_mode: 0o600,
             max_bytes: 4_096,
         };
-        let root = GenerationRootCapabilityV1::from_trusted_directory(
-            File::open(directory.path()).expect("open trusted root descriptor"),
-        )
-        .expect("admit directory descriptor");
+        let root = admit_test_root(&directory);
+        let root_metadata = fs::metadata(directory.path()).expect("trusted root metadata");
+        assert!(matches!(
+            GenerationRootCapabilityV1::from_trusted_directory(
+                File::open(directory.path()).expect("reopen trusted root descriptor"),
+                GenerationRootDirectoryPolicyV1 {
+                    expected_uid: root_metadata.uid(),
+                    expected_mode: (root_metadata.mode() & 0o7777) ^ 0o100,
+                },
+            ),
+            Err(GenerationRootAdmissionErrorV1::ModeMismatch)
+        ));
 
         let retained = root
             .read_regular_file(OsStr::new("AUTHORITY"), policy)
@@ -544,16 +591,12 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn descriptor_open_refuses_a_final_symlink() {
-        use std::fs::File;
         use std::os::unix::fs::symlink;
 
         let directory = tempfile::tempdir().expect("temporary trusted root");
         symlink("elsewhere", directory.path().join("AUTHORITY"))
             .expect("create final symlink fixture");
-        let root = GenerationRootCapabilityV1::from_trusted_directory(
-            File::open(directory.path()).expect("open trusted root descriptor"),
-        )
-        .expect("admit directory descriptor");
+        let root = admit_test_root(&directory);
         assert!(matches!(
             root.read_regular_file(
                 OsStr::new("AUTHORITY"),
@@ -570,15 +613,12 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn descriptor_descent_keeps_normal_children_and_rejects_symlink_ancestors() {
-        use std::fs::{self, File};
+        use std::fs;
         use std::os::unix::fs::symlink;
 
         let directory = tempfile::tempdir().expect("temporary trusted root");
         fs::create_dir(directory.path().join("generations")).expect("create child directory");
-        let root = GenerationRootCapabilityV1::from_trusted_directory(
-            File::open(directory.path()).expect("open trusted root descriptor"),
-        )
-        .expect("admit directory descriptor");
+        let root = admit_test_root(&directory);
         let normal = GenerationRootRouteV1::parse(Path::new("generations"))
             .expect("normal descendant route");
         root.descend(&normal)
@@ -597,7 +637,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn descriptor_open_refuses_hardlinked_final_file() {
-        use std::fs::{self, File};
+        use std::fs;
         use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 
         let directory = tempfile::tempdir().expect("temporary trusted root");
@@ -608,10 +648,7 @@ mod tests {
             .expect("restrict source fixture mode");
         fs::hard_link(&source, &authority).expect("create hardlink fixture");
         let metadata = fs::metadata(&authority).expect("authority hardlink metadata");
-        let root = GenerationRootCapabilityV1::from_trusted_directory(
-            File::open(directory.path()).expect("open trusted root descriptor"),
-        )
-        .expect("admit directory descriptor");
+        let root = admit_test_root(&directory);
         assert!(matches!(
             root.read_regular_file(
                 OsStr::new("AUTHORITY"),

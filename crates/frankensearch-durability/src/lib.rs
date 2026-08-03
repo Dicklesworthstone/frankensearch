@@ -41,9 +41,9 @@ pub use file_protector::{
 };
 pub use fsvi_protector::{FsviProtectionResult, FsviProtector, FsviRepairResult, FsviVerifyResult};
 pub use generation_root::{
-    GenerationRootAdmissionErrorV1, GenerationRootCapabilityV1, GenerationRootFilePolicyV1,
-    GenerationRootFileWitnessV1, GenerationRootRouteErrorV1, GenerationRootRouteV1,
-    RetainedGenerationRootFileV1,
+    GenerationRootAdmissionErrorV1, GenerationRootCapabilityV1, GenerationRootDirectoryPolicyV1,
+    GenerationRootFilePolicyV1, GenerationRootFileWitnessV1, GenerationRootRouteErrorV1,
+    GenerationRootRouteV1, RetainedGenerationRootFileV1,
 };
 pub use metrics::{DecodeOutcomeClass, DurabilityMetrics, DurabilityMetricsSnapshot};
 pub use repair_trailer::{
