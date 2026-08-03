@@ -1,0 +1,234 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://frankensearch.dev/schemas/artifactstore-v4-f0.schema.json",
+  "title": "ArtifactStore v4 F0 frozen receipt-chain contract",
+  "description": "Structural contract only. Cryptographic verification, canonical reserialization, predecessor lookup, nonce single-use, and independent admission policy remain mandatory runtime checks.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "object_kind",
+    "identity_scheme",
+    "object_identity",
+    "authentication",
+    "admission",
+    "decision",
+    "release",
+    "privacy",
+    "redaction_witness",
+    "issued_at_unix_ns"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "const": 4
+    },
+    "object_kind": {
+      "type": "string",
+      "enum": ["source", "build", "execution", "completion"]
+    },
+    "identity_scheme": {
+      "type": "string",
+      "const": "sha256-domain-separated-v1"
+    },
+    "object_identity": {
+      "$ref": "#/$defs/sha256"
+    },
+    "predecessor_identity": {
+      "$ref": "#/$defs/sha256"
+    },
+    "authentication": {
+      "type": "string",
+      "enum": [
+        "verified_receipt_chain",
+        "integrity_only",
+        "unauthenticated_legacy"
+      ]
+    },
+    "admission": {
+      "type": "string",
+      "enum": ["admitted", "unadmitted", "no_decision"]
+    },
+    "decision": {
+      "type": "string",
+      "enum": ["pass", "miss", "no_decision", "quarantine"]
+    },
+    "release": {
+      "type": "string",
+      "enum": ["qualified", "not_qualified"]
+    },
+    "privacy": {
+      "type": "string",
+      "enum": ["public", "restricted", "secret"]
+    },
+    "redaction_witness": {
+      "$ref": "#/$defs/sha256"
+    },
+    "issued_at_unix_ns": {
+      "type": "integer"
+    },
+    "terminal_outcome": {
+      "type": "string",
+      "enum": [
+        "succeeded",
+        "failed",
+        "cancelled",
+        "timed_out",
+        "interrupted",
+        "unknown"
+      ]
+    },
+    "signature": {
+      "$ref": "#/$defs/signature"
+    },
+    "source_digest": {
+      "$ref": "#/$defs/sha256"
+    },
+    "cargo_lock_digest": {
+      "$ref": "#/$defs/sha256"
+    },
+    "executable_digest": {
+      "$ref": "#/$defs/sha256"
+    },
+    "execution_nonce": {
+      "$ref": "#/$defs/nonzeroNonce"
+    },
+    "nonce_expires_at_unix_ns": {
+      "type": "integer"
+    },
+    "command_digest": {
+      "$ref": "#/$defs/sha256"
+    },
+    "artifact_index_digest": {
+      "$ref": "#/$defs/sha256"
+    },
+    "failure_artifact_index_digest": {
+      "$ref": "#/$defs/sha256"
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {"authentication": {"const": "verified_receipt_chain"}},
+        "required": ["authentication"]
+      },
+      "then": {"required": ["signature"]},
+      "else": {"not": {"required": ["signature"]}}
+    },
+    {
+      "if": {
+        "properties": {"authentication": {"const": "unauthenticated_legacy"}},
+        "required": ["authentication"]
+      },
+      "then": {
+        "properties": {
+          "admission": {"const": "unadmitted"},
+          "decision": {"const": "no_decision"},
+          "release": {"const": "not_qualified"}
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {"authentication": {"const": "integrity_only"}},
+        "required": ["authentication"]
+      },
+      "then": {
+        "properties": {
+          "admission": {"enum": ["unadmitted", "no_decision"]},
+          "release": {"const": "not_qualified"}
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {"release": {"const": "qualified"}},
+        "required": ["release"]
+      },
+      "then": {
+        "properties": {
+          "authentication": {"const": "verified_receipt_chain"},
+          "admission": {"const": "admitted"},
+          "decision": {"const": "pass"}
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {"decision": {"const": "miss"}},
+        "required": ["decision"]
+      },
+      "then": {
+        "properties": {
+          "authentication": {"const": "verified_receipt_chain"},
+          "admission": {"const": "admitted"},
+          "release": {"const": "not_qualified"}
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {"decision": {"const": "quarantine"}},
+        "required": ["decision"]
+      },
+      "then": {"properties": {"release": {"const": "not_qualified"}}}
+    },
+    {
+      "if": {
+        "properties": {"object_kind": {"const": "source"}},
+        "required": ["object_kind"]
+      },
+      "then": {
+        "required": ["source_digest"],
+        "not": {"required": ["predecessor_identity"]}
+      }
+    },
+    {
+      "if": {
+        "properties": {"object_kind": {"const": "build"}},
+        "required": ["object_kind"]
+      },
+      "then": {
+        "required": ["predecessor_identity", "source_digest", "cargo_lock_digest", "executable_digest"]
+      }
+    },
+    {
+      "if": {
+        "properties": {"object_kind": {"const": "execution"}},
+        "required": ["object_kind"]
+      },
+      "then": {
+        "required": ["predecessor_identity", "execution_nonce", "nonce_expires_at_unix_ns", "command_digest"]
+      }
+    },
+    {
+      "if": {
+        "properties": {"object_kind": {"const": "completion"}},
+        "required": ["object_kind"]
+      },
+      "then": {
+        "required": ["predecessor_identity", "artifact_index_digest", "failure_artifact_index_digest", "terminal_outcome"]
+      }
+    }
+  ],
+  "$defs": {
+    "sha256": {
+      "type": "string",
+      "pattern": "^sha256:[a-f0-9]{64}$"
+    },
+    "nonzeroNonce": {
+      "type": "string",
+      "pattern": "^(?!0{32}$)[a-f0-9]{32}$"
+    },
+    "signature": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["algorithm", "key_id", "signature"],
+      "properties": {
+        "algorithm": {"type": "string", "const": "ed25519"},
+        "key_id": {"type": "string", "pattern": "^[a-z0-9][a-z0-9._-]{0,127}$"},
+        "signature": {"type": "string", "pattern": "^[a-f0-9]{128}$"}
+      }
+    }
+  }
+}

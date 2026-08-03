@@ -5,6 +5,12 @@ implementation, a migration approval, a release qualification, or a performance
 claim. Implementations in F1-F4 must conform to this document or introduce a
 new schema version.
 
+The machine-readable structural contract is
+[`artifactstore-v4-f0.schema.json`](../../schemas/artifactstore-v4-f0.schema.json).
+It rejects unknown state values and the illegal trust/admission/decision/release
+combinations that can be expressed structurally; implementations must still
+validate signatures, predecessor bytes, nonce state, and policy coverage.
+
 ## Scope and non-goals
 
 ArtifactStore v4 persists the evidence chain for one source snapshot, build,
