@@ -3710,6 +3710,21 @@ mod tests {
     }
 
     #[test]
+    fn authority_slot_rejects_every_single_byte_mutation() {
+        let encoded = authority_slot(0, authority_reference(1, None))
+            .encode()
+            .expect("encode slot");
+        for byte_index in 0..GENERATION_AUTHORITY_SLOT_BYTES_V1 {
+            let mut mutated = encoded;
+            mutated[byte_index] ^= 0x80;
+            assert!(
+                AuthoritySlotV1::from_authenticated_bytes(&mutated, 0, [0x5a; 16]).is_err(),
+                "single-byte mutation at offset {byte_index} must never decode"
+            );
+        }
+    }
+
+    #[test]
     fn authority_slot_rejects_recomputed_noncanonical_padding_and_copied_slot() {
         let slot = authority_slot(0, authority_reference(1, None));
         let mut noncanonical = slot.encode().expect("encode slot");
@@ -3761,6 +3776,21 @@ mod tests {
             Err(GenerationAuthorityErrorV1::RootMismatch),
             "a lock frame copied across roots must fail closed"
         );
+    }
+
+    #[test]
+    fn lock_frame_rejects_every_single_byte_mutation() {
+        let encoded = lock_frame(GenerationLockFrameKindV1::Owner)
+            .encode()
+            .expect("encode owner lock frame");
+        for byte_index in 0..GENERATION_LOCK_FRAME_BYTES_V1 {
+            let mut mutated = encoded;
+            mutated[byte_index] ^= 0x80;
+            assert!(
+                GenerationLockFrameV1::from_authenticated_bytes(&mutated, [0x71; 16]).is_err(),
+                "single-byte mutation at offset {byte_index} must never decode"
+            );
+        }
     }
 
     #[test]
