@@ -55,7 +55,7 @@ use crate::{PerfCellApplicability, PerfCellApplicabilityReason};
 const PRODUCER_CONTRACT_SCHEMA_VERSION: &str =
     "frankensearch.quill-local-perf-producer-contract.v1";
 /// Strict wire schema for one local-run process-attempt receipt.
-pub const LOCAL_PERF_ATTEMPT_RECEIPT_SCHEMA_VERSION: &str = "frankensearch.perf-runner-attempt.v9";
+pub const LOCAL_PERF_ATTEMPT_RECEIPT_SCHEMA_VERSION: &str = "frankensearch.perf-runner-attempt.v10";
 /// Strict wire schema for the post-unlock lease-release receipt.
 pub const LOCAL_PERF_LEASE_RELEASE_RECEIPT_SCHEMA_VERSION: &str =
     "frankensearch.perf-runner-lease-release.v1";
@@ -261,6 +261,7 @@ pub enum LocalPerfRunError {
 #[derive(Debug)]
 struct CapturedBuild {
     receipt: RunnerBuild,
+    booking_receipt_sha256: String,
     revision: String,
     command: Vec<OsString>,
     measurement_environment: BTreeMap<OsString, OsString>,
@@ -715,6 +716,7 @@ pub struct LocalPerfAttemptReceipt {
     run_window: String,
     registry_sha256: String,
     lease_file_identity: LeaseFileIdentity,
+    booking_receipt_sha256: String,
     hardware: RunnerHardware,
     execution_request: RunnerExecutionRequest,
     execution_start: RunnerExecutionSnapshot,
@@ -1265,6 +1267,7 @@ impl LocalPerfAttemptReceipt {
         if self.schema_version != LOCAL_PERF_ATTEMPT_RECEIPT_SCHEMA_VERSION
             || self.mode != "measurement"
             || self.registry_sha256 != MACHINE_CLASS_REGISTRY_SHA256
+            || !is_sha256(&self.booking_receipt_sha256)
             || self
                 .run_log_sha256
                 .as_deref()
@@ -1625,6 +1628,7 @@ fn run_local_perf_command_inner(
         &source_before,
         &producer_before,
         &external_paths.target,
+        sha256_hex(&booking_receipt_bytes),
         environments,
     )?;
 
@@ -3607,6 +3611,7 @@ fn prepare_benchmark(
     source_before: &CleanSourceSnapshot,
     producer_before: &ExecutingProducer,
     target: &PinnedDirectory,
+    booking_receipt_sha256: String,
     environments: ControlledEnvironments,
 ) -> Result<CapturedBuild, LocalPerfRunError> {
     verify_pinned_directory(target)?;
@@ -3729,6 +3734,7 @@ fn prepare_benchmark(
             environment_sha256: environments.policy_sha256,
             producer: producer_after,
         },
+        booking_receipt_sha256,
         revision: source_after.revision,
         command,
         measurement_environment: environments.measurement,
@@ -4953,6 +4959,7 @@ fn build_attempt_receipt_bytes(
         run_window: config.run_window.clone(),
         registry_sha256: MACHINE_CLASS_REGISTRY_SHA256.to_owned(),
         lease_file_identity: lease_file_identity.clone(),
+        booking_receipt_sha256: build.booking_receipt_sha256.clone(),
         hardware: start.hardware.clone(),
         execution_request: start.request.clone(),
         execution_start: start.snapshot.clone(),
@@ -5816,6 +5823,7 @@ pub fn completed_attempt_receipt_for_test(
             device: "1".to_owned(),
             inode: "2".to_owned(),
         },
+        booking_receipt_sha256: "b".repeat(64),
         hardware: runner.hardware,
         execution_request: runner.execution.request,
         execution_start: runner.execution.start,
@@ -6141,6 +6149,7 @@ mod tests {
                 device: "1".to_owned(),
                 inode: "2".to_owned(),
             },
+            booking_receipt_sha256: "b".repeat(64),
             hardware: runner.hardware,
             execution_request: runner.execution.request,
             execution_start: runner.execution.start,
@@ -7161,6 +7170,11 @@ mod tests {
         let mut binding_tamper = receipt.clone();
         binding_tamper.bound_evidence_sha256 = None;
         let bytes = seal_attempt_receipt(binding_tamper).expect("reseal binding tamper");
+        assert!(LocalPerfAttemptReceipt::from_verified_slice(&bytes).is_err());
+
+        let mut booking_tamper = receipt.clone();
+        booking_tamper.booking_receipt_sha256 = "not-a-sha256".to_owned();
+        let bytes = seal_attempt_receipt(booking_tamper).expect("reseal booking tamper");
         assert!(LocalPerfAttemptReceipt::from_verified_slice(&bytes).is_err());
 
         let mut missing_end = receipt.clone();

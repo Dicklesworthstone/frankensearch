@@ -4691,8 +4691,8 @@ mod tests {
 
     #[test]
     fn qg1_profile_plans_have_frozen_exhaustive_applicability_counts() {
-        // GOLDEN-CHANGE (booking receipt v1): the manifest now binds the
-        // pre-build exclusive resource booking receipt. Matrix cells and
+        // GOLDEN-CHANGE (attempt receipt v10): the attempt now seals the
+        // exact pre-build booking receipt digest. Matrix cells and
         // applicability counts are unchanged; only their manifest-bound plan
         // identities advance.
         let registry = MachineClassRegistry::frozen().expect("frozen machine registry");
@@ -4704,7 +4704,7 @@ mod tests {
                 16,
                 Some(64),
                 Some(64),
-                "f377f667aba2a909cfe92c58755cdcd6800c3e68b37e5f71a395b4bee544ef41",
+                "7f98bfeea056ddad49d457fbca8dec3b7d2b0316f88cf37350a03bf47f3362ac",
             ),
             (
                 ExecutionProfileId::Smt2_128,
@@ -4713,7 +4713,7 @@ mod tests {
                 0,
                 Some(128),
                 Some(128),
-                "fc805c6261b5cc9c31388ccddf81707ee8bf53432bdfcd30647d35d97b2245d6",
+                "8ec4602fe8bf28d567b940d58343c72a5d67c94a965c49dbfd3582ac0d48c9f2",
             ),
             (
                 ExecutionProfileId::Scheduler10,
@@ -4722,7 +4722,7 @@ mod tests {
                 40,
                 Some(10),
                 Some(8),
-                "adc95829b5aa907a15bfb085c3eca36a5f53486dcb5978482c8e2d4494bf405e",
+                "f3b80ee4d1aadcce95fd6b9e985985663d562e775ed7e425bec30e1febe39b97",
             ),
         ];
         let mut plan_hashes = BTreeSet::new();
@@ -5536,12 +5536,12 @@ mod tests {
     fn manifest_contract_hash_ignores_only_activation_state() {
         let manifest = PERF_MANIFEST;
         assert_eq!(manifest.matches("activated = false").count(), 10);
-        // GOLDEN-CHANGE (booking receipt v1): the manifest now names the
-        // pre-build receipt that binds the exclusive resource scope.
+        // GOLDEN-CHANGE (attempt receipt v10): the manifest now requires the
+        // exact booking digest carried by every post-booking attempt.
         // Activation is still the sole administrative normalization exception.
         assert_eq!(
             perf_manifest_contract_sha256(manifest),
-            "abde88dcaa525112a5373f6d5f98ab79c36d0b24ebaf4df74034b2cc09f04902",
+            "1495b7c439ef7da4e01e2a262e439af20a6916f465160780b2eec27d76c649c9",
             "the normalized all-inactive manifest digest must remain frozen"
         );
         assert_eq!(
