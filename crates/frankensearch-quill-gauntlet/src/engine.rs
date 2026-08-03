@@ -6517,6 +6517,107 @@ mod tests {
         });
     }
 
+    /// E6.3 law: the two distinct, unboosted optional operands of one scalar
+    /// `OR` are commutative. As with the `AND` law, this excludes association,
+    /// boosts, and mixed occurrences because those shapes can expose parser or
+    /// score-accumulation behavior. Changing the operator to `AND` is the
+    /// intentionally invalid counterexample.
+    #[cfg(feature = "perf-harness")]
+    #[test]
+    fn e63_two_term_or_commutes_but_and_is_not_equivalent() {
+        use frankensearch_core::IndexableDocument;
+
+        const SEED: u64 = 0xe63_0f00_c0aa_5eed;
+        let documents = vec![
+            IndexableDocument::new("doc-1", "alpha beta beta").with_title("guide"),
+            IndexableDocument::new("doc-2", "alpha gamma").with_title("alpha overview"),
+            IndexableDocument::new("doc-3", "beta gamma gamma gamma").with_title("alpha"),
+            IndexableDocument::new("doc-4", "alpha beta gamma delta").with_title("reference"),
+            IndexableDocument::new("doc-5", "delta epsilon").with_title("quiet"),
+        ];
+        let canonical = [("two-term-or", "alpha OR beta")];
+        let commuted = [("two-term-or", "beta OR alpha")];
+        let operator_mutated = [("two-term-or", "alpha AND beta")];
+
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let baseline = e63_observations(
+                &cx,
+                &documents,
+                &canonical,
+                SEED,
+                "e6.3-two-term-or-commutativity-v1",
+            )
+            .await;
+            let transformed = e63_observations(
+                &cx,
+                &documents,
+                &commuted,
+                SEED,
+                "e6.3-two-term-or-commutativity-v1",
+            )
+            .await;
+            let invalid = e63_observations(
+                &cx,
+                &documents,
+                &operator_mutated,
+                SEED,
+                "e6.3-two-term-or-commutativity-v1",
+            )
+            .await;
+
+            let baseline_case = baseline.first().expect("E6.3 baseline OR fixture");
+            let commuted_case = transformed.first().expect("E6.3 commuted OR fixture");
+            assert_eq!(
+                baseline_case.0, commuted_case.0,
+                "E6.3 two-term OR case identity drifted"
+            );
+            for (engine, before, after) in [
+                ("Quill", &baseline_case.1, &commuted_case.1),
+                ("Tantivy", &baseline_case.2, &commuted_case.2),
+            ] {
+                let comparison = compare_observations(
+                    before.clone(),
+                    after.clone(),
+                    ComparatorConfig::default(),
+                )
+                .unwrap_or_else(|error| {
+                    panic!("E6.3 {engine} two-term OR comparison failed: {error}")
+                });
+                assert!(
+                    matches!(
+                        comparison.rank_class,
+                        RankClass::RankExact | RankClass::TieOrder
+                    ) && comparison
+                        .divergences
+                        .iter()
+                        .all(|divergence| divergence.class == DivergenceClass::TieOrder),
+                    "E6.3 {engine} produced a non-tie divergence under two-term OR commutation: {:?}",
+                    comparison.divergences,
+                );
+            }
+
+            let invalid_case = invalid.first().expect("E6.3 invalid AND fixture");
+            for (engine, before, after) in [
+                ("Quill", &baseline_case.1, &invalid_case.1),
+                ("Tantivy", &baseline_case.2, &invalid_case.2),
+            ] {
+                let comparison = compare_observations(
+                    before.clone(),
+                    after.clone(),
+                    ComparatorConfig::default(),
+                )
+                .unwrap_or_else(|error| {
+                    panic!("E6.3 {engine} invalid OR-to-AND comparison failed: {error}")
+                });
+                assert_eq!(
+                    comparison.status,
+                    ComparisonStatus::Failed,
+                    "E6.3 {engine} incorrectly accepted an OR-to-AND mutation as commutation",
+                );
+            }
+        });
+    }
+
     /// E6.3 law: on the position-capable scalar fixture, a quoted single term
     /// reduces to the same term query. This does not assert phrase equivalence
     /// generally: the multi-term phrase is the intentionally invalid control,
