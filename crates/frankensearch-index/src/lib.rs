@@ -7156,6 +7156,93 @@ mod tests {
         }
     }
 
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn published_open_rejects_aliased_wal_entries_without_mutating_targets() {
+        use std::os::unix::fs::symlink;
+
+        for (alias_kind, symbolic_alias) in [("symlink", true), ("hardlink", false)] {
+            let directory = tempfile::tempdir().expect("private aliased WAL publication directory");
+            let path = directory.path().join(format!("{alias_kind}.fsvi"));
+            let backing_path = directory.path().join(format!("{alias_kind}-wal-backing"));
+            let binding = fsvi_v2_binding(
+                &format!("v2-published-{alias_kind}-wal"),
+                4,
+                Quantization::F16,
+                54,
+                0xae,
+            );
+            VectorIndex::create_v2(&path, binding.clone())
+                .expect("aliased WAL publication writer")
+                .finish()
+                .expect("finish aliased WAL publication fixture");
+            fs::write(&backing_path, b"aliased-wal-bytes").expect("write alias backing bytes");
+            let wal_path = wal::wal_path_for(&path);
+            if symbolic_alias {
+                symlink(&backing_path, &wal_path).expect("create WAL symlink");
+            } else {
+                fs::hard_link(&backing_path, &wal_path).expect("create WAL hardlink");
+            }
+
+            let index_before = stable_file_identity(
+                &fs::symlink_metadata(&path).expect("index metadata before rejection"),
+            );
+            let wal_bytes_before = fs::read(&wal_path).expect("read aliased WAL before rejection");
+            let backing_bytes_before =
+                fs::read(&backing_path).expect("read alias backing before rejection");
+            let wal_before = stable_file_identity(
+                &fs::symlink_metadata(&wal_path).expect("WAL metadata before rejection"),
+            );
+            let backing_before = stable_file_identity(
+                &fs::symlink_metadata(&backing_path).expect("backing metadata before rejection"),
+            );
+            let entries_before = directory_entry_names(directory.path());
+            let parent_before = stable_file_identity(
+                &fs::symlink_metadata(directory.path()).expect("parent metadata before rejection"),
+            );
+
+            assert_snapshot_rejection(
+                ValidatedFsviBytes::open_published(&path, &binding),
+                FsviSnapshotRejectionReason::PublishedWalPresent,
+            );
+
+            assert_eq!(
+                stable_file_identity(
+                    &fs::symlink_metadata(&path).expect("index metadata after rejection"),
+                ),
+                index_before
+            );
+            assert_eq!(
+                stable_file_identity(
+                    &fs::symlink_metadata(&wal_path).expect("WAL metadata after rejection"),
+                ),
+                wal_before
+            );
+            assert_eq!(
+                stable_file_identity(
+                    &fs::symlink_metadata(&backing_path).expect("backing metadata after rejection"),
+                ),
+                backing_before
+            );
+            assert_eq!(directory_entry_names(directory.path()), entries_before);
+            assert_eq!(
+                stable_file_identity(
+                    &fs::symlink_metadata(directory.path())
+                        .expect("parent metadata after rejection"),
+                ),
+                parent_before
+            );
+            assert_eq!(
+                fs::read(&wal_path).expect("read aliased WAL after rejection"),
+                wal_bytes_before
+            );
+            assert_eq!(
+                fs::read(&backing_path).expect("read alias backing after rejection"),
+                backing_bytes_before
+            );
+        }
+    }
+
     #[test]
     fn fsvi_v2_inspection_distinguishes_reindex_upgrade_and_corruption() {
         let legacy_path = temp_index_path("v2-inspect-legacy");
