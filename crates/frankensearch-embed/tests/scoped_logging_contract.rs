@@ -28,6 +28,7 @@ const CHILD_CASE_ENV: &str = "FRANKENSEARCH_SCOPED_LOGGING_CHILD_CASE";
 const CHILD_TEST: &str = "fresh_process_child";
 const MAX_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
 const MAX_OUTPUT_LINES: usize = 10_000;
+const MAX_RECEIPT_TAIL_BYTES: usize = 4 * 1024;
 const CHILD_TIMEOUT: Duration = Duration::from_secs(20);
 const TOKENIZERS_TRACE_MARKER: &str = "transform_range call";
 
@@ -46,10 +47,12 @@ enum ChildFailure {
         lines: usize,
         status: ExitStatus,
         output_sha256: String,
+        output_tail: String,
     },
     Timeout {
         status: ExitStatus,
         output_sha256: String,
+        output_tail: String,
     },
 }
 
@@ -73,6 +76,21 @@ fn assert_sha256_digest(digest: &str) {
         digest.bytes().all(|byte| byte.is_ascii_hexdigit()),
         "output digest must be hexadecimal"
     );
+}
+
+fn output_tail(bytes: &[u8], trailing: &[u8]) -> String {
+    let start = bytes
+        .len()
+        .saturating_add(trailing.len())
+        .saturating_sub(MAX_RECEIPT_TAIL_BYTES);
+    let mut bounded = Vec::with_capacity(MAX_RECEIPT_TAIL_BYTES);
+    if start < bytes.len() {
+        bounded.extend_from_slice(&bytes[start..]);
+        bounded.extend_from_slice(trailing);
+    } else {
+        bounded.extend_from_slice(&trailing[start - bytes.len()..]);
+    }
+    String::from_utf8_lossy(&bounded).into_owned()
 }
 
 fn normalizer() -> Sequence {
@@ -242,6 +260,7 @@ fn read_bounded_child(mut child: Child, timeout: Duration) -> Result<ChildOutput
             return Err(ChildFailure::Timeout {
                 status: terminate_and_reap(&mut child),
                 output_sha256: output_sha256(&bytes, &[]),
+                output_tail: output_tail(&bytes, &[]),
             });
         }
 
@@ -259,6 +278,7 @@ fn read_bounded_child(mut child: Child, timeout: Duration) -> Result<ChildOutput
                         lines,
                         status: terminate_and_reap(&mut child),
                         output_sha256: output_sha256(&bytes, &chunk),
+                        output_tail: output_tail(&bytes, &chunk),
                     });
                 }
                 bytes.extend_from_slice(&chunk);
@@ -472,8 +492,13 @@ fn fresh_process_output_limit_reaps_noisy_child() {
             lines,
             status,
             output_sha256,
+            output_tail,
         }) => {
             assert_sha256_digest(&output_sha256);
+            assert!(
+                output_tail.len() <= MAX_RECEIPT_TAIL_BYTES,
+                "output-limit receipt tail exceeded its bound"
+            );
             assert!(bytes > 0, "bounded receipt must record observed output");
             assert!(lines > MAX_OUTPUT_LINES, "line limit did not trigger");
             assert!(
@@ -484,6 +509,7 @@ fn fresh_process_output_limit_reaps_noisy_child() {
         Err(ChildFailure::Timeout {
             status,
             output_sha256,
+            ..
         }) => {
             assert_sha256_digest(&output_sha256);
             panic!("noisy child hit wall-time bound instead of line cap: {status:?}");
@@ -504,6 +530,7 @@ fn fresh_process_byte_limit_reaps_noisy_child() {
             lines,
             status,
             output_sha256,
+            ..
         }) => {
             assert_sha256_digest(&output_sha256);
             assert!(bytes > MAX_OUTPUT_BYTES, "byte limit did not trigger");
@@ -519,6 +546,7 @@ fn fresh_process_byte_limit_reaps_noisy_child() {
         Err(ChildFailure::Timeout {
             status,
             output_sha256,
+            ..
         }) => {
             assert_sha256_digest(&output_sha256);
             panic!("byte-only child hit wall-time bound instead of byte cap: {status:?}");
@@ -537,6 +565,7 @@ fn fresh_process_timeout_reaps_stalled_child() {
         Err(ChildFailure::Timeout {
             status,
             output_sha256,
+            ..
         }) => {
             assert_sha256_digest(&output_sha256);
             assert!(
@@ -549,6 +578,7 @@ fn fresh_process_timeout_reaps_stalled_child() {
             lines,
             status,
             output_sha256,
+            ..
         }) => panic!(
             "stalled child unexpectedly hit output cap: {bytes} bytes, {lines} lines, {status:?}, {output_sha256}"
         ),
@@ -557,6 +587,49 @@ fn fresh_process_timeout_reaps_stalled_child() {
             output.bytes.len(),
             output.lines,
         ),
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn fresh_process_timeout_reaps_stalled_child_tree() {
+    match run_child_with_timeout("tree-timeout-stall", None, Duration::from_secs(5)) {
+        Err(ChildFailure::Timeout {
+            status,
+            output_sha256,
+            output_tail,
+        }) => {
+            assert_sha256_digest(&output_sha256);
+            assert!(!status.success(), "tree parent must be terminated");
+            let grandchild_pid = output_tail
+                .lines()
+                .find_map(|line| line.split_once("grandchild-pid=").map(|(_, pid)| pid))
+                .unwrap_or_else(|| {
+                    panic!("bounded tail must retain the grandchild PID: {output_tail:?}")
+                })
+                .parse::<u32>()
+                .expect("grandchild PID must be numeric");
+            let deadline = Instant::now() + Duration::from_secs(1);
+            loop {
+                let alive = Command::new("kill")
+                    .arg("-0")
+                    .arg(grandchild_pid.to_string())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null())
+                    .status()
+                    .expect("kill probe must run")
+                    .success();
+                if !alive {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "process-group termination left grandchild {grandchild_pid} alive"
+                );
+                thread::sleep(Duration::from_millis(10));
+            }
+        }
+        other => panic!("tree timeout produced unexpected receipt: {other:?}"),
     }
 }
 
@@ -609,6 +682,21 @@ fn fresh_process_child() {
             }
         }
         "timeout-stall" => thread::sleep(Duration::from_secs(1)),
+        "tree-timeout-stall" => {
+            let mut grandchild = Command::new("sleep")
+                .arg("10")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("tree child must spawn its grandchild");
+            println!("grandchild-pid={}", grandchild.id());
+            std::io::stdout()
+                .flush()
+                .expect("tree child must flush its grandchild PID");
+            thread::sleep(Duration::from_secs(10));
+            let _ = grandchild.wait();
+        }
         other => panic!("unknown fresh-process logging child case {other:?}"),
     }
 }
