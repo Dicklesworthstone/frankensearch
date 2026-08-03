@@ -15,7 +15,7 @@ use frankensearch_quill_gauntlet::{
     MachineProfileKey, PERF_ARTIFACT_SCHEMA_VERSION, PerfEvidenceArtifact, PerfEvidenceFile,
     PerfGate, PerfGateArtifact, PerfGateDecision, PerfRatchetMode, PerfRatchetRequest,
     VerifiedRunnerIdentity, evaluate_perf_ratchet, is_explicit_bootstrap,
-    is_explicit_bootstrap_for, perf_manifest_contract_sha256,
+    is_explicit_bootstrap_for, perf_manifest_contract_sha256, PERF_EVIDENCE_SCHEMA_VERSION,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -137,6 +137,7 @@ fn run() -> Result<PerfGateDecision, Box<dyn Error>> {
     let manifest_sha256 = perf_manifest_contract_sha256(manifest_text);
     let manifest = toml::from_str::<toml::Value>(manifest_text)?;
     validate_manifest_gate_set(&manifest)?;
+    validate_manifest_schema_bindings(&manifest)?;
 
     let _history_lock = acquire_promotion_history_lock(&args)?;
     let loaded_baseline = read_baseline(&args.baseline, args.baseline_evidence.as_deref())?;
@@ -1094,6 +1095,30 @@ fn validate_manifest_gate_set(manifest: &toml::Value) -> Result<(), Box<dyn Erro
     Ok(())
 }
 
+/// Bind the manifest declaration to the only artifact schemas this ratchet
+/// accepts, so an internally inconsistent manifest fails before admission.
+fn validate_manifest_schema_bindings(manifest: &toml::Value) -> Result<(), Box<dyn Error>> {
+    let schemas = manifest
+        .get("schemas")
+        .and_then(toml::Value::as_table)
+        .ok_or("manifest does not define a [schemas] table")?;
+    for (field, expected) in [
+        ("threshold_artifact", PERF_ARTIFACT_SCHEMA_VERSION),
+        ("evidence_artifact", PERF_EVIDENCE_SCHEMA_VERSION),
+    ] {
+        let found = schemas
+            .get(field)
+            .and_then(toml::Value::as_str)
+            .ok_or_else(|| format!("manifest schemas.{field} is missing or not a string"))?;
+        if found != expected {
+            return Err(
+                format!("manifest schemas.{field} is {found:?}, expected {expected:?}").into(),
+            );
+        }
+    }
+    Ok(())
+}
+
 fn evidence(role: &str, path: &Path, bytes: &[u8]) -> PerfEvidenceFile {
     PerfEvidenceFile {
         role: role.to_owned(),
@@ -1428,6 +1453,47 @@ mod tests {
         assert!(
             missing_target_error.contains("gate.QG-9.target is missing or empty"),
             "unexpected missing-target error: {missing_target_error}"
+        );
+    }
+
+    #[test]
+    fn manifest_schema_bindings_reject_stale_or_missing_artifact_versions() {
+        let manifest_text = include_str!("../../../../docs/contracts/quill-perf-gates.toml");
+        let manifest = toml::from_str::<toml::Value>(manifest_text)
+            .expect("parse normative performance manifest");
+        validate_manifest_schema_bindings(&manifest)
+            .expect("normative manifest declares current ratchet artifact schemas");
+
+        let mut stale_evidence = manifest.clone();
+        stale_evidence
+            .get_mut("schemas")
+            .and_then(toml::Value::as_table_mut)
+            .expect("schema table")
+            .insert(
+                "evidence_artifact".to_owned(),
+                toml::Value::String("quill-perf-evidence-v4".to_owned()),
+            );
+        let stale_error = validate_manifest_schema_bindings(&stale_evidence)
+            .expect_err("stale evidence schema must fail closed")
+            .to_string();
+        assert!(
+            stale_error.contains("schemas.evidence_artifact")
+                && stale_error.contains("quill-perf-evidence-v5"),
+            "unexpected stale-schema error: {stale_error}"
+        );
+
+        let mut missing_threshold = manifest;
+        missing_threshold
+            .get_mut("schemas")
+            .and_then(toml::Value::as_table_mut)
+            .expect("schema table")
+            .remove("threshold_artifact");
+        let missing_error = validate_manifest_schema_bindings(&missing_threshold)
+            .expect_err("missing threshold schema must fail closed")
+            .to_string();
+        assert!(
+            missing_error.contains("schemas.threshold_artifact is missing"),
+            "unexpected missing-schema error: {missing_error}"
         );
     }
 
