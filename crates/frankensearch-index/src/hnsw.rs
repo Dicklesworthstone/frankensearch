@@ -5257,6 +5257,53 @@ mod tests {
         assert_eq!(reloaded_hits[0].doc_id, "doc-0001");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn generation_gc_never_follows_or_removes_a_generation_named_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().expect("temporary generation root");
+        let parent = root.path().join("ann");
+        std::fs::create_dir(&parent).expect("create ANN parent");
+        let retained_generation = ".vector.fast.generation-0000000000000001-retained";
+        std::fs::create_dir(parent.join(retained_generation)).expect("create retained generation");
+
+        let external = root.path().join("external");
+        std::fs::create_dir(&external).expect("create external directory");
+        let external_sentinel = external.join("must-survive");
+        std::fs::write(&external_sentinel, b"outside generation namespace")
+            .expect("write external sentinel");
+        let linked_generation = ".vector.fast.generation-0000000000000002-link";
+        let linked_path = parent.join(linked_generation);
+        symlink(&external, &linked_path)
+            .expect("link external directory into generation namespace");
+
+        let metadata = HnswMeta {
+            format_version: HNSW_META_FORMAT_CURRENT,
+            doc_ids: Vec::new(),
+            config: HnswConfig::default(),
+            dimension: 0,
+            vector_fingerprint: 0,
+            sidecar_generation: Some(retained_generation.to_owned()),
+            sidecar_basename: Some("vector.fast".to_owned()),
+        };
+        gc_superseded_hnsw_generations(&parent, "vector.fast", &metadata)
+            .expect("GC must skip generation-named symlinks");
+
+        assert!(parent.join(retained_generation).is_dir());
+        assert!(
+            std::fs::symlink_metadata(&linked_path)
+                .expect("inspect generation-named symlink")
+                .file_type()
+                .is_symlink(),
+            "GC must not remove a symlink merely because its name matches the generation prefix"
+        );
+        assert!(
+            external_sentinel.is_file(),
+            "GC must not traverse into the target of a generation-named symlink"
+        );
+    }
+
     #[test]
     fn load_rebuilds_from_legacy_v1_metadata() {
         let fsvi_path = temp_path("persist_v1", "fsvi");

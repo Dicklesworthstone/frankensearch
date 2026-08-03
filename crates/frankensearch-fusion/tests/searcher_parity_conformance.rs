@@ -84,7 +84,7 @@ impl Embedder for FixedVecEmbedder {
     }
 }
 
-fn sync_index() -> Arc<InMemoryTwoTierIndex> {
+fn sync_index(with_quality: bool) -> Arc<InMemoryTwoTierIndex> {
     let ids = DOCS
         .iter()
         .map(|(id, _, _)| (*id).to_owned())
@@ -95,16 +95,18 @@ fn sync_index() -> Arc<InMemoryTwoTierIndex> {
         DIM,
     )
     .expect("fast in-memory index");
-    let quality = InMemoryVectorIndex::from_vectors(
-        ids,
-        DOCS.iter().map(|(_, _, q)| normalize(q.to_vec())).collect(),
-        DIM,
-    )
-    .expect("quality in-memory index");
-    Arc::new(InMemoryTwoTierIndex::new(fast, Some(quality)))
+    let quality = with_quality.then(|| {
+        InMemoryVectorIndex::from_vectors(
+            ids,
+            DOCS.iter().map(|(_, _, q)| normalize(q.to_vec())).collect(),
+            DIM,
+        )
+        .expect("quality in-memory index")
+    });
+    Arc::new(InMemoryTwoTierIndex::new(fast, quality))
 }
 
-fn async_index(tag: &str) -> Arc<TwoTierIndex> {
+fn async_index(tag: &str, with_quality: bool) -> Arc<TwoTierIndex> {
     let dir = std::env::temp_dir().join(format!(
         "fsx-parity-{tag}-{}-{}",
         std::process::id(),
@@ -115,14 +117,18 @@ fn async_index(tag: &str) -> Arc<TwoTierIndex> {
     ));
     let mut builder = TwoTierIndex::create(&dir, TwoTierConfig::default()).expect("create index");
     builder.set_fast_embedder_id("parity-fast");
-    builder.set_quality_embedder_id("parity-quality");
+    if with_quality {
+        builder.set_quality_embedder_id("parity-quality");
+    }
     for (id, fast, quality) in &DOCS {
         builder
             .add_fast_record((*id).to_owned(), &normalize(fast.to_vec()))
             .expect("add fast record");
-        builder
-            .add_quality_record((*id).to_owned(), &normalize(quality.to_vec()))
-            .expect("add quality record");
+        if with_quality {
+            builder
+                .add_quality_record((*id).to_owned(), &normalize(quality.to_vec()))
+                .expect("add quality record");
+        }
     }
     Arc::new(builder.finish().expect("finish index"))
 }
@@ -133,7 +139,17 @@ fn run_async(
     query_vec: &[f32],
     k: usize,
 ) -> (Vec<ScoredResult>, TwoTierMetrics) {
-    let index = async_index(tag);
+    run_async_with_quality_index(tag, config, query_vec, k, true)
+}
+
+fn run_async_with_quality_index(
+    tag: &str,
+    config: &TwoTierConfig,
+    query_vec: &[f32],
+    k: usize,
+    with_quality: bool,
+) -> (Vec<ScoredResult>, TwoTierMetrics) {
+    let index = async_index(tag, with_quality);
     let fast: Arc<dyn Embedder> = Arc::new(FixedVecEmbedder {
         id: "parity-fast",
         vector: query_vec.to_vec(),
@@ -164,7 +180,16 @@ fn run_sync(
     query_vec: &[f32],
     k: usize,
 ) -> (Vec<ScoredResult>, TwoTierMetrics) {
-    let searcher = SyncTwoTierSearcher::new(sync_index(), config.clone());
+    run_sync_with_quality_index(config, query_vec, k, true)
+}
+
+fn run_sync_with_quality_index(
+    config: &TwoTierConfig,
+    query_vec: &[f32],
+    k: usize,
+    with_quality: bool,
+) -> (Vec<ScoredResult>, TwoTierMetrics) {
+    let searcher = SyncTwoTierSearcher::new(sync_index(with_quality), config.clone());
     searcher
         .search_collect(query_vec, k)
         .expect("sync search_collect")
@@ -277,6 +302,27 @@ fn fast_only_agrees_and_skips_phase_two_on_both_sides() {
         sync_metrics.skip_reason, async_metrics.skip_reason,
         "fast_only skip_reason diverges"
     );
+}
+
+#[test]
+fn quality_index_unavailable_agrees_and_skips_phase_two_on_both_sides() {
+    let config = TwoTierConfig::default();
+    let query = normalize(vec![1.0, 0.0, 0.0, 0.0]);
+    let (sync_results, sync_metrics) = run_sync_with_quality_index(&config, &query, 4, false);
+    let (async_results, async_metrics) =
+        run_async_with_quality_index("quality-index-unavailable", &config, &query, 4, false);
+    assert_result_parity("quality-index-unavailable", &sync_results, &async_results);
+    assert_eq!(sync_metrics.phase2_vectors_searched, 0, "sync ran phase 2");
+    assert_eq!(
+        async_metrics.phase2_vectors_searched, 0,
+        "async ran phase 2"
+    );
+    assert_eq!(
+        sync_metrics.skip_reason.as_deref(),
+        Some("quality_index_unavailable"),
+        "sync must report the typed unavailable-index skip"
+    );
+    assert_eq!(sync_metrics.skip_reason, async_metrics.skip_reason);
 }
 
 #[test]
