@@ -11568,6 +11568,8 @@ fn checkpointed_snapshot_doc_freq(
         let delta_doc_freq = delta
             .find_term(field_ord, term)
             .map_or(0, |found| found.live_doc_freq());
+        #[cfg(feature = "profile-internals")]
+        checkpoint.record_global_doc_freq();
         total = total
             .checked_add(u64::try_from(delta_doc_freq).map_err(|_| {
                 SnapshotError::CounterOverflow {
