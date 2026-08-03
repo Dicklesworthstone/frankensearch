@@ -7082,6 +7082,13 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn linux_subreaper_scope_e2e_runs_in_a_dedicated_test_process() {
+        let mut unrelated_canary = Command::new("/bin/sh")
+            .args(["-c", "exec sleep 60"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn unrelated canary");
         let status = Command::new(std::env::current_exe().expect("current test executable"))
             .args([
                 "local_perf_runner::tests::linux_subreaper_scope_isolated_probe",
@@ -7091,7 +7098,17 @@ mod tests {
             ])
             .status()
             .expect("run isolated subreaper probe");
+        let canary_survived = unrelated_canary
+            .try_wait()
+            .expect("inspect unrelated canary")
+            .is_none();
+        let _ = unrelated_canary.kill();
+        let _ = unrelated_canary.wait();
         assert!(status.success(), "isolated subreaper probe must pass");
+        assert!(
+            canary_survived,
+            "descendant cleanup must not signal a sibling process canary"
+        );
     }
 
     #[cfg(target_os = "linux")]
