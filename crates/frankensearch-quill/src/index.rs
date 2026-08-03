@@ -12219,6 +12219,34 @@ mod tests {
         ));
     }
 
+    #[cfg(all(feature = "profile-internals", not(feature = "conformance-internals")))]
+    #[test]
+    fn profiled_checkpoint_distinguishes_admitted_and_refused_work() {
+        let cx = Cx::for_testing();
+        let session = QuillProfileSession::new(1, 1, 0, 0);
+        session
+            .bind_cache(QuillProfileCacheDisposition::Miss)
+            .expect("bind checkpoint test cache fact");
+        let checkpoint = QueryCheckpoint::new_with_profile(&cx, "profile_test", 1, 2, &session);
+        checkpoint
+            .admit(QueryWorkKind::Segment, 1)
+            .expect("admit first fuel unit");
+        assert!(matches!(
+            checkpoint.admit(QueryWorkKind::DictionaryBlock, 1),
+            Err(ArgusError::QueryFuelExhausted { .. })
+        ));
+
+        let receipt = session
+            .complete(QuillProfileOutcome::FuelExhausted)
+            .expect("complete checkpoint work receipt");
+        assert_eq!(receipt.work_units().requested(), [1, 1, 0, 0]);
+        assert_eq!(receipt.work_units().admitted(), [1, 0, 0, 0]);
+        assert_eq!(receipt.work_units().refused(), [0, 1, 0, 0]);
+        assert_eq!(receipt.counters().4, 1);
+        assert_eq!(receipt.cancellation_observations(), 0);
+        assert_eq!(receipt.outcome(), QuillProfileOutcome::FuelExhausted);
+    }
+
     #[cfg(feature = "pruning-conformance")]
     #[test]
     fn pruning_conformance_session_is_dense_one_shot_and_fail_closed() {
