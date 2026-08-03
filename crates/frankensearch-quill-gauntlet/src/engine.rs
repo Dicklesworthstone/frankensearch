@@ -7640,6 +7640,84 @@ mod tests {
         });
     }
 
+    /// E6.3 lifecycle law: the scalar campaign deliberately rejects a second
+    /// live external ID instead of silently adopting the lexical upsert
+    /// contract. The rejection must leave the already-published original as
+    /// the only observable row; accepting the replacement or partially
+    /// mutating the snapshot is an invalid lifecycle transition.
+    #[cfg(feature = "perf-harness")]
+    #[test]
+    fn e63_duplicate_live_id_is_typed_rejection_and_preserves_published_original() {
+        use frankensearch_core::IndexableDocument;
+        use frankensearch_quill::index::QuillIndexError;
+
+        const SEED: u64 = 0xe63_d0e5_5eed_0001;
+        let original = IndexableDocument::new("duplicate-id", "alpha original");
+        let replacement = IndexableDocument::new("duplicate-id", "beta replacement");
+        let mut original_case = DifferentialCase::new("e63-duplicate-original", "alpha", 16);
+        original_case.snippet_max_chars = None;
+        original_case.tie_expansion_limit = 64;
+        original_case.metadata.generator_id = Some("e6.3-duplicate-id-reject-v1".to_owned());
+        original_case.metadata.generator_seed = Some(SEED);
+        let mut replacement_case = DifferentialCase::new("e63-duplicate-replacement", "beta", 16);
+        replacement_case.snippet_max_chars = None;
+        replacement_case.tie_expansion_limit = 64;
+        replacement_case.metadata.generator_id = Some("e6.3-duplicate-id-reject-v1".to_owned());
+        replacement_case.metadata.generator_seed = Some(SEED);
+
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let mut subject = qg_position_mode_subject(true);
+            subject
+                .claim_fresh_campaign()
+                .expect("E6.3 claim duplicate-ID Quill campaign");
+            subject
+                .index_mut()
+                .expect("E6.3 open duplicate-ID Quill campaign")
+                .index_documents(&cx, std::slice::from_ref(&original))
+                .await
+                .expect("E6.3 index original duplicate-ID fixture");
+            subject
+                .index_mut()
+                .expect("E6.3 open duplicate-ID Quill campaign")
+                .commit(&cx)
+                .await
+                .expect("E6.3 publish original duplicate-ID fixture");
+
+            let error = subject
+                .index_mut()
+                .expect("E6.3 reopen duplicate-ID Quill campaign")
+                .index_documents(&cx, std::slice::from_ref(&replacement))
+                .await
+                .expect_err("E6.3 duplicate live ID must be rejected");
+            assert!(matches!(
+                error,
+                QuillIndexError::InvalidState { ref detail }
+                    if detail.contains("duplicate live document id")
+            ));
+
+            subject
+                .mark_committed()
+                .expect("E6.3 preserve original duplicate-ID publication");
+            let original_observation = subject
+                .observe(&cx, &original_case)
+                .await
+                .expect("E6.3 original remains observable after rejection");
+            assert_eq!(original_observation.doc_count, 1);
+            assert_eq!(original_observation.hits.len(), 1);
+            assert_eq!(original_observation.hits[0].doc_id, "duplicate-id");
+
+            let replacement_observation = subject
+                .observe(&cx, &replacement_case)
+                .await
+                .expect("E6.3 rejected replacement query remains observable");
+            assert_eq!(replacement_observation.doc_count, 1);
+            assert!(
+                replacement_observation.hits.is_empty(),
+                "E6.3 rejected duplicate must not partially publish replacement content"
+            );
+        });
+    }
+
     #[cfg(feature = "tantivy-oracle")]
     #[test]
     fn e410_controlled_public_search_semantics_match_oracle() {
