@@ -31,7 +31,7 @@ runner_completion_receipt = "frankensearch.perf-runner-completion.v6"
 runner_artifact_manifest = "frankensearch.perf-runner-artifact-manifest.v3"
 local_producer_contract = "frankensearch.quill-local-perf-producer.v4"
 history_pointer = "frankensearch.perf-history-pointer.v2"
-runner_attempt_receipt = "frankensearch.perf-runner-attempt.v2"
+runner_attempt_receipt = "frankensearch.perf-runner-attempt.v5"
 precommit_inventory = "frankensearch.perf-run-precommit.v5"
 
 [evidence]

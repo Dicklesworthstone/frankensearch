@@ -16,6 +16,7 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::GauntletError;
+use crate::local_perf_runner::LOCAL_PERF_ATTEMPT_RECEIPT_SCHEMA_VERSION;
 use crate::machine_class_registry::{
     DefaultFlipDisposition, ExecutionCapacitySemantics, MACHINE_CLASS_REGISTRY_SCHEMA_VERSION,
     MACHINE_CLASS_REGISTRY_SHA256, MachineClassError, MachineClassRegistry,
@@ -893,6 +894,10 @@ fn validate_perf_manifest_schema_bindings(
         ("threshold_artifact", PERF_ARTIFACT_SCHEMA_VERSION),
         ("evidence_artifact", PERF_EVIDENCE_SCHEMA_VERSION),
         ("applicability_plan", PERF_APPLICABILITY_PLAN_SCHEMA_VERSION),
+        (
+            "runner_attempt_receipt",
+            LOCAL_PERF_ATTEMPT_RECEIPT_SCHEMA_VERSION,
+        ),
     ] {
         let found = schemas
             .get(field)
@@ -4888,6 +4893,10 @@ mod tests {
         for (field, expected) in [
             ("threshold_artifact", PERF_ARTIFACT_SCHEMA_VERSION),
             ("evidence_artifact", PERF_EVIDENCE_SCHEMA_VERSION),
+            (
+                "runner_attempt_receipt",
+                LOCAL_PERF_ATTEMPT_RECEIPT_SCHEMA_VERSION,
+            ),
         ] {
             let stale_schema = PERF_MANIFEST.replacen(
                 &format!("{field} = \"{expected}\""),
