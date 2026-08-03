@@ -7393,6 +7393,94 @@ mod tests {
     }
 
     #[test]
+    fn fsvi_v2_owner_rejects_resealed_noncanonical_document_id_order() {
+        let binding = fsvi_v2_binding("v2-record-order-corruption", 4, Quantization::F16, 12, 0x67);
+        let path = temp_index_path("v2-record-order-corruption");
+        let mut writer = VectorIndex::create_v2(&path, binding.clone()).expect("create v2 fixture");
+        writer
+            .write_record("aa-order", &[1.0, 0.0, 0.0, 0.0])
+            .expect("write first equal-length id");
+        writer
+            .write_record("bb-order", &[0.0, 1.0, 0.0, 0.0])
+            .expect("write second equal-length id");
+        writer.finish().expect("finish v2 fixture");
+
+        let mut bytes = fs::read(&path).expect("read fixture bytes");
+        let header_size = usize::try_from(u32::from_le_bytes(
+            bytes[6..10].try_into().expect("header size"),
+        ))
+        .expect("header size fits");
+        let records_offset = header_size;
+        let strings_offset = header_size + (2 * RECORD_SIZE_BYTES);
+        let first_record = records_offset;
+        let second_record = first_record + RECORD_SIZE_BYTES;
+        let first_id_offset = usize::try_from(u32::from_le_bytes(
+            bytes[first_record + 8..first_record + 12]
+                .try_into()
+                .expect("first id offset"),
+        ))
+        .expect("first id offset fits");
+        let second_id_offset = usize::try_from(u32::from_le_bytes(
+            bytes[second_record + 8..second_record + 12]
+                .try_into()
+                .expect("second id offset"),
+        ))
+        .expect("second id offset fits");
+        let first_id_len = usize::from(u16::from_le_bytes(
+            bytes[first_record + 12..first_record + 14]
+                .try_into()
+                .expect("first id length"),
+        ));
+        let second_id_len = usize::from(u16::from_le_bytes(
+            bytes[second_record + 12..second_record + 14]
+                .try_into()
+                .expect("second id length"),
+        ));
+        assert_eq!(
+            first_id_len, second_id_len,
+            "fixture needs equal-length ids"
+        );
+
+        let first_id = bytes
+            [strings_offset + first_id_offset..strings_offset + first_id_offset + first_id_len]
+            .to_vec();
+        let second_id = bytes
+            [strings_offset + second_id_offset..strings_offset + second_id_offset + second_id_len]
+            .to_vec();
+        bytes[strings_offset + first_id_offset..strings_offset + first_id_offset + first_id_len]
+            .copy_from_slice(&second_id);
+        bytes[strings_offset + second_id_offset..strings_offset + second_id_offset + second_id_len]
+            .copy_from_slice(&first_id);
+        bytes[first_record..first_record + 8]
+            .copy_from_slice(&fnv1a_hash(&second_id).to_le_bytes());
+        bytes[second_record..second_record + 8]
+            .copy_from_slice(&fnv1a_hash(&first_id).to_le_bytes());
+
+        let mut docset_hasher = Sha256::new();
+        update_digest_domain(&mut docset_hasher, ORDERED_DOCSET_DIGEST_DOMAIN);
+        docset_hasher.update(2_u64.to_be_bytes());
+        for (id_offset, id_len) in [
+            (first_id_offset, first_id_len),
+            (second_id_offset, second_id_len),
+        ] {
+            docset_hasher.update(u64::try_from(id_len).expect("id length fits").to_be_bytes());
+            docset_hasher
+                .update(&bytes[strings_offset + id_offset..strings_offset + id_offset + id_len]);
+        }
+        let docset_digest: [u8; SHA256_BYTES] = docset_hasher.finalize().into();
+        bytes[FSVI_V2_DOCSET_DIGEST_OFFSET..FSVI_V2_DOCSET_DIGEST_OFFSET + SHA256_BYTES]
+            .copy_from_slice(&docset_digest);
+        refresh_v2_header_crc(&mut bytes);
+
+        assert!(matches!(
+            ValidatedFsviBytes::from_arc(Arc::<[u8]>::from(bytes), &binding),
+            Err(FsviAdmissionError::Index(
+                SearchError::IndexCorrupted { .. }
+            ))
+        ));
+    }
+
+    #[test]
     fn fsvi_v2_writer_refuses_to_publish_beside_an_existing_wal() {
         let path = temp_index_path("v2-writer-existing-wal");
         let binding = fsvi_v2_binding("v2-writer-existing-wal", 4, Quantization::F16, 11, 0x65);
