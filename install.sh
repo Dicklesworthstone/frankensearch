@@ -209,6 +209,23 @@ provision_default_semantic_models() {
   ok "Registered semantic model artifacts are present and verified."
 }
 
+verify_staged_binary() {
+  local staged_binary="$1" version_output=""
+
+  if version_output="$("$staged_binary" version 2>&1)" && [ -n "$version_output" ]; then
+    ok "Staged binary verification passed: $version_output"
+    return 0
+  fi
+
+  if version_output="$("$staged_binary" --version 2>&1)" && [ -n "$version_output" ]; then
+    ok "Staged binary verification passed (--version): $version_output"
+    return 0
+  fi
+
+  err "Staged binary failed version checks. The existing fsfs installation was not replaced."
+  return 1
+}
+
 run_installer_contract_test() {
   local action="${1:-}"
   case "$action" in
@@ -250,6 +267,10 @@ run_installer_contract_test() {
     provision)
       [ "$#" -eq 2 ] || { err "contract provision requires STAGED_BINARY"; return 2; }
       provision_default_semantic_models "$2"
+      ;;
+    verify-staged)
+      [ "$#" -eq 2 ] || { err "contract verify-staged requires STAGED_BINARY"; return 2; }
+      verify_staged_binary "$2"
       ;;
     install-built)
       [ "$#" -eq 3 ] || { err "contract install-built requires SOURCE DESTINATION"; return 2; }
@@ -609,6 +630,11 @@ if [ "$FROM_SOURCE" -eq 1 ]; then
       exit 1
     fi
   fi
+  if [ "$VERIFY" -eq 1 ]; then
+    if ! verify_staged_binary "$BIN"; then
+      exit 1
+    fi
+  fi
 
   install_binary "$BIN" "$DEST/${BINARY_NAME}"
   ok "Installed to $DEST/${BINARY_NAME} (source build)"
@@ -679,6 +705,12 @@ if [ ! -x "$BIN" ]; then
   BIN=$(find "$TMP" -maxdepth 3 -type f -name "${BINARY_NAME}" -perm -111 2>/dev/null | head -n 1)
 fi
 [ -x "$BIN" ] || { err "Binary not found in archive"; exit 1; }
+
+if [ "$VERIFY" -eq 1 ]; then
+  if ! verify_staged_binary "$BIN"; then
+    exit 1
+  fi
+fi
 
 install_binary "$BIN" "$DEST/${BINARY_NAME}"
 ok "Installed to $DEST/${BINARY_NAME}"

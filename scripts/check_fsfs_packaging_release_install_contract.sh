@@ -213,6 +213,20 @@ check_installer_behavior() {
   else
     echo "[installer][OK]   staged semantic provisioning failure preserves the destination path"
   fi
+
+  if FSFS_INSTALL_CONTRACT_TEST=1 "$installer_shell" "$installer" verify-staged /bin/true >/dev/null; then
+    echo "[installer][OK]   staged binary verification admits a runnable candidate"
+  else
+    echo "[installer][FAIL] staged binary verification rejected a runnable candidate"
+    FAILURES=$((FAILURES + 1))
+  fi
+
+  if FSFS_INSTALL_CONTRACT_TEST=1 "$installer_shell" "$installer" verify-staged /bin/false >/dev/null 2>&1; then
+    echo "[installer][FAIL] staged binary verification failure unexpectedly admitted"
+    FAILURES=$((FAILURES + 1))
+  else
+    echo "[installer][OK]   staged binary verification fails before destination replacement"
+  fi
 }
 
 check_model_features() {
