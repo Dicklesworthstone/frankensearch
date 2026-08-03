@@ -122,7 +122,11 @@ fn read_bounded_child(mut child: Child) -> ChildOutput {
         match rx.recv_timeout(Duration::from_millis(10)) {
             Ok((_is_stderr, chunk)) if chunk.is_empty() => closed_streams += 1,
             Ok((_is_stderr, chunk)) => {
-                lines += chunk.iter().filter(|byte| **byte == b'\n').count();
+                for byte in chunk {
+                    if byte == b'\n' {
+                        lines += 1;
+                    }
+                }
                 if bytes.len() + chunk.len() > MAX_OUTPUT_BYTES || lines > MAX_OUTPUT_LINES {
                     terminate_and_reap(&mut child);
                     panic!(
@@ -173,7 +177,7 @@ fn run_child(case: &str, rust_log: Option<&str>) -> ChildOutput {
     )
 }
 
-fn assert_child_passed(case: &str, output: ChildOutput) -> String {
+fn assert_child_passed(case: &str, output: &ChildOutput) -> String {
     let text = String::from_utf8_lossy(&output.bytes).into_owned();
     assert!(
         output.status.success(),
@@ -185,34 +189,31 @@ fn assert_child_passed(case: &str, output: ChildOutput) -> String {
 
 #[test]
 fn real_tokenizers_log_output_requires_explicit_bridge_and_trace() {
-    let default = assert_child_passed("default", run_child("default", None));
+    let default_child = run_child("default", None);
+    let default = assert_child_passed("default", &default_child);
     assert!(
         !default.contains(TOKENIZERS_TRACE_MARKER),
         "safe default must not bridge tokenizers log records:\n{default}"
     );
 
-    let valid_without_bridge = assert_child_passed(
-        "valid-trace-without-bridge",
-        run_child("valid-trace-without-bridge", Some("trace")),
-    );
+    let valid_without_bridge_child = run_child("valid-trace-without-bridge", Some("trace"));
+    let valid_without_bridge =
+        assert_child_passed("valid-trace-without-bridge", &valid_without_bridge_child);
     assert!(
         !valid_without_bridge.contains(TOKENIZERS_TRACE_MARKER),
         "TRACE alone must not bridge tokenizers log records:\n{valid_without_bridge}"
     );
 
-    let bridge_without_trace = assert_child_passed(
-        "bridge-without-trace",
-        run_child("bridge-without-trace", Some("warn")),
-    );
+    let bridge_without_trace_child = run_child("bridge-without-trace", Some("warn"));
+    let bridge_without_trace =
+        assert_child_passed("bridge-without-trace", &bridge_without_trace_child);
     assert!(
         !bridge_without_trace.contains(TOKENIZERS_TRACE_MARKER),
         "the explicit bridge must still respect a non-TRACE filter:\n{bridge_without_trace}"
     );
 
-    let explicit = assert_child_passed(
-        "explicit-bridge",
-        run_child("explicit-bridge", Some("trace")),
-    );
+    let explicit_child = run_child("explicit-bridge", Some("trace"));
+    let explicit = assert_child_passed("explicit-bridge", &explicit_child);
     assert!(
         explicit.contains(TOKENIZERS_TRACE_MARKER),
         "explicit LogTracer plus TRACE must expose real tokenizers logs:\n{explicit}"
