@@ -166,12 +166,18 @@ pub const GENERATION_AUTHORITY_SCHEMA_V1: u16 = 1;
 pub const GENERATION_AUTHORITY_SLOT_BYTES_V1: usize = 4_096;
 /// Maximum canonical activation-manifest size accepted before decoding.
 pub const GENERATION_ACTIVATION_MANIFEST_MAX_BYTES_V1: usize = 4_096;
+/// Exact byte size of one physical `LOCK` owner or attempt frame.
+pub const GENERATION_LOCK_FRAME_BYTES_V1: usize = 4_096;
 
 const AUTHORITY_SLOT_DIGEST_BYTES: usize = 32;
 const AUTHORITY_SLOT_BODY_BYTES: usize =
     GENERATION_AUTHORITY_SLOT_BYTES_V1 - AUTHORITY_SLOT_DIGEST_BYTES;
 const AUTHORITY_SLOT_MAGIC_V1: [u8; 8] = *b"FSAUTH01";
 const AUTHORITY_SLOT_HEADER_BYTES: usize = 131;
+const LOCK_FRAME_DIGEST_BYTES: usize = 32;
+const LOCK_FRAME_BODY_BYTES: usize = GENERATION_LOCK_FRAME_BYTES_V1 - LOCK_FRAME_DIGEST_BYTES;
+const LOCK_FRAME_MAGIC_V1: [u8; 8] = *b"FSLOCK01";
+const LOCK_FRAME_HEADER_BYTES: usize = 104;
 
 /// A bounded reason why an authority reference, physical slot, or slot pair was
 /// rejected. The error deliberately contains no paths, opaque object contents,
@@ -347,6 +353,179 @@ pub struct AuthoritySlotV1 {
     pub root_id: [u8; 16],
     /// Immutable authority reference carried by the frame.
     pub authority: AuthorityRefV1,
+}
+
+/// Kind of fixed `LOCK` frame. Owner and attempt remain distinct on disk so an
+/// interrupted attempt cannot be silently mistaken for authority ownership.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum GenerationLockFrameKindV1 {
+    /// Current writer ownership record.
+    Owner,
+    /// In-progress publication attempt record.
+    Attempt,
+}
+
+impl GenerationLockFrameKindV1 {
+    const fn tag(self) -> u8 {
+        match self {
+            Self::Owner => 1,
+            Self::Attempt => 2,
+        }
+    }
+
+    fn from_tag(tag: u8) -> Result<Self, GenerationAuthorityErrorV1> {
+        match tag {
+            1 => Ok(Self::Owner),
+            2 => Ok(Self::Attempt),
+            _ => Err(GenerationAuthorityErrorV1::InvalidField {
+                field: "generation_lock.kind",
+            }),
+        }
+    }
+}
+
+/// Bounded owner/attempt evidence for the fixed generation-root `LOCK` path.
+///
+/// It is an immutable byte contract only: taking a filesystem lock or deciding
+/// whether an attempt may publish belongs to the publisher lane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct GenerationLockFrameV1 {
+    /// Owner or attempt frame classification.
+    pub kind: GenerationLockFrameKindV1,
+    /// Root ID that prevents cross-root frame replay.
+    pub root_id: [u8; 16],
+    /// Opaque writer identity.
+    pub writer_id: [u8; 16],
+    /// Opaque immutable publication attempt identity.
+    pub attempt_id: [u8; 16],
+    /// Monotone writer fence, beginning at one.
+    pub fence: u64,
+    /// Fingerprint of the authority reference the lock state observed.
+    pub authority_fingerprint: [u8; 32],
+}
+
+impl GenerationLockFrameV1 {
+    /// Construct and validate a bounded lock owner/attempt frame.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed error when any identity or fence is reserved.
+    pub fn new(
+        kind: GenerationLockFrameKindV1,
+        root_id: [u8; 16],
+        writer_id: [u8; 16],
+        attempt_id: [u8; 16],
+        fence: u64,
+        authority_fingerprint: [u8; 32],
+    ) -> Result<Self, GenerationAuthorityErrorV1> {
+        let frame = Self {
+            kind,
+            root_id,
+            writer_id,
+            attempt_id,
+            fence,
+            authority_fingerprint,
+        };
+        frame.validate()?;
+        Ok(frame)
+    }
+
+    /// Validate the fixed lock-frame facts.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed error when any fact is reserved or cannot identify a
+    /// specific publication attempt.
+    pub fn validate(&self) -> Result<(), GenerationAuthorityErrorV1> {
+        if self.root_id == [0; 16]
+            || self.writer_id == [0; 16]
+            || self.attempt_id == [0; 16]
+            || self.fence == 0
+            || self.authority_fingerprint == [0; 32]
+        {
+            return Err(GenerationAuthorityErrorV1::InvalidField {
+                field: "generation_lock.frame",
+            });
+        }
+        Ok(())
+    }
+
+    /// Encode this owner/attempt frame into its fixed canonical form.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed error instead of serializing a reserved frame.
+    pub fn encode(
+        self,
+    ) -> Result<[u8; GENERATION_LOCK_FRAME_BYTES_V1], GenerationAuthorityErrorV1> {
+        self.validate()?;
+        let mut bytes = [0_u8; GENERATION_LOCK_FRAME_BYTES_V1];
+        bytes[..8].copy_from_slice(&LOCK_FRAME_MAGIC_V1);
+        bytes[8..10].copy_from_slice(&GENERATION_AUTHORITY_SCHEMA_V1.to_be_bytes());
+        bytes[10] = self.kind.tag();
+        bytes[16..32].copy_from_slice(&self.root_id);
+        bytes[32..48].copy_from_slice(&self.writer_id);
+        bytes[48..64].copy_from_slice(&self.attempt_id);
+        bytes[64..72].copy_from_slice(&self.fence.to_be_bytes());
+        bytes[72..104].copy_from_slice(&self.authority_fingerprint);
+        let digest = Sha256::digest(&bytes[..LOCK_FRAME_BODY_BYTES]);
+        bytes[LOCK_FRAME_BODY_BYTES..].copy_from_slice(&digest);
+        Ok(bytes)
+    }
+
+    /// Parse and authenticate a fixed `LOCK` frame for the expected root.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed error for malformed, copied, tampered, or noncanonical
+    /// owner/attempt frames.
+    pub fn from_authenticated_bytes(
+        bytes: &[u8],
+        expected_root_id: [u8; 16],
+    ) -> Result<Self, GenerationAuthorityErrorV1> {
+        if bytes.len() != GENERATION_LOCK_FRAME_BYTES_V1 {
+            return Err(GenerationAuthorityErrorV1::InvalidSlotLength);
+        }
+        if !bytes[..8].eq(LOCK_FRAME_MAGIC_V1.as_slice())
+            || !bytes[8..10].eq(GENERATION_AUTHORITY_SCHEMA_V1.to_be_bytes().as_slice())
+            || !bytes[11..16].iter().all(|byte| byte.eq(&0))
+        {
+            return Err(GenerationAuthorityErrorV1::InvalidField {
+                field: "generation_lock.header",
+            });
+        }
+        if !bytes[16..32].eq(expected_root_id.as_slice()) {
+            return Err(GenerationAuthorityErrorV1::RootMismatch);
+        }
+        let expected_digest = Sha256::digest(&bytes[..LOCK_FRAME_BODY_BYTES]);
+        if !bytes[LOCK_FRAME_BODY_BYTES..].eq(&expected_digest[..]) {
+            return Err(GenerationAuthorityErrorV1::ChecksumMismatch);
+        }
+        if bytes[LOCK_FRAME_HEADER_BYTES..LOCK_FRAME_BODY_BYTES]
+            .iter()
+            .any(|byte| !byte.eq(&0))
+        {
+            return Err(GenerationAuthorityErrorV1::NonCanonicalPadding);
+        }
+        let mut writer_id = [0_u8; 16];
+        writer_id.copy_from_slice(&bytes[32..48]);
+        let mut attempt_id = [0_u8; 16];
+        attempt_id.copy_from_slice(&bytes[48..64]);
+        let mut authority_fingerprint = [0_u8; 32];
+        authority_fingerprint.copy_from_slice(&bytes[72..104]);
+        Self::new(
+            GenerationLockFrameKindV1::from_tag(bytes[10])?,
+            expected_root_id,
+            writer_id,
+            attempt_id,
+            u64::from_be_bytes(bytes[64..72].try_into().map_err(|_| {
+                GenerationAuthorityErrorV1::InvalidField {
+                    field: "generation_lock.fence",
+                }
+            })?),
+            authority_fingerprint,
+        )
+    }
 }
 
 impl AuthoritySlotV1 {
@@ -3443,6 +3622,11 @@ mod tests {
         }
     }
 
+    fn lock_frame(kind: GenerationLockFrameKindV1) -> GenerationLockFrameV1 {
+        GenerationLockFrameV1::new(kind, [0x71; 16], [0x72; 16], [0x73; 16], 1, [0x74; 32])
+            .expect("valid test lock frame")
+    }
+
     fn component_receipts() -> GenerationComponentReceiptsV1 {
         GenerationComponentReceiptsV1 {
             vector: GenerationComponentReceiptV1 {
@@ -3519,6 +3703,37 @@ mod tests {
             ),
             Err(GenerationAuthorityErrorV1::SlotIndexMismatch),
             "a frame copied between physical slots must fail closed"
+        );
+    }
+
+    #[test]
+    fn lock_owner_and_attempt_frames_are_distinct_authenticated_contracts() {
+        let owner = lock_frame(GenerationLockFrameKindV1::Owner);
+        let owner_bytes = owner.encode().expect("encode owner lock frame");
+        assert_eq!(
+            GenerationLockFrameV1::from_authenticated_bytes(&owner_bytes, [0x71; 16])
+                .expect("decode owner lock frame"),
+            owner
+        );
+
+        let attempt = lock_frame(GenerationLockFrameKindV1::Attempt);
+        assert_ne!(
+            attempt.encode().expect("encode attempt lock frame"),
+            owner_bytes,
+            "an attempt must never serialize as an owner record"
+        );
+
+        let mut tampered = owner_bytes;
+        tampered[300] ^= 1;
+        assert_eq!(
+            GenerationLockFrameV1::from_authenticated_bytes(&tampered, [0x71; 16]),
+            Err(GenerationAuthorityErrorV1::ChecksumMismatch),
+            "padding bytes remain authenticated"
+        );
+        assert_eq!(
+            GenerationLockFrameV1::from_authenticated_bytes(&owner_bytes, [0x75; 16]),
+            Err(GenerationAuthorityErrorV1::RootMismatch),
+            "a lock frame copied across roots must fail closed"
         );
     }
 
