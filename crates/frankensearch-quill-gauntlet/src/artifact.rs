@@ -1228,16 +1228,35 @@ pub enum ArtifactStoreV4SourceEntryKind {
     Symlink,
 }
 
+/// Why the compiler-visible source entry must be part of the snapshot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ArtifactStoreV4SourceInclusionReason {
+    Tracked,
+    Untracked,
+    IgnoredGenerated,
+    WorkspaceMember,
+    PathDependency,
+    CargoLock,
+    CargoConfig,
+    ToolchainConfig,
+    TargetConfig,
+    BuildScriptInput,
+    BuildScriptOutput,
+}
+
 /// One canonical, content-addressed compiler-visible source input.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ArtifactStoreV4SourceEntry {
     pub relative_path: String,
     pub kind: ArtifactStoreV4SourceEntryKind,
+    pub inclusion_reasons: Vec<ArtifactStoreV4SourceInclusionReason>,
     pub mode: u32,
     pub byte_len: u64,
     pub sha256: String,
     pub symlink_target: Option<String>,
+    pub resolved_target_path: Option<String>,
 }
 
 /// Immutable ordered source-input witness for `ArtifactStore` v4.
@@ -1288,6 +1307,11 @@ impl ArtifactStoreV4SourceSnapshot {
         for entry in &self.entries {
             if !is_canonical_source_relative_path(&entry.relative_path)
                 || !is_lower_sha256(&entry.sha256)
+                || entry.inclusion_reasons.is_empty()
+                || entry
+                    .inclusion_reasons
+                    .windows(2)
+                    .any(|pair| pair[0] >= pair[1])
                 || previous.is_some_and(|path: &str| path >= entry.relative_path.as_str())
             {
                 return Err(GauntletError::InvalidPreparedArtifact {
@@ -1295,8 +1319,14 @@ impl ArtifactStoreV4SourceSnapshot {
                 });
             }
             match (&entry.kind, &entry.symlink_target) {
-                (ArtifactStoreV4SourceEntryKind::File, None) => {}
-                (ArtifactStoreV4SourceEntryKind::Symlink, Some(target)) if !target.is_empty() => {}
+                (ArtifactStoreV4SourceEntryKind::File, None)
+                    if entry.resolved_target_path.is_none() => {}
+                (ArtifactStoreV4SourceEntryKind::Symlink, Some(target))
+                    if !target.is_empty()
+                        && entry
+                            .resolved_target_path
+                            .as_deref()
+                            .is_some_and(is_canonical_source_relative_path) => {}
                 _ => {
                     return Err(GauntletError::InvalidPreparedArtifact {
                         reason:
@@ -1306,6 +1336,28 @@ impl ArtifactStoreV4SourceSnapshot {
                 }
             }
             previous = Some(entry.relative_path.as_str());
+        }
+        for entry in &self.entries {
+            let Some(resolved_target_path) = entry.resolved_target_path.as_deref() else {
+                continue;
+            };
+            let target = self
+                .entries
+                .binary_search_by(|candidate| {
+                    candidate.relative_path.as_str().cmp(resolved_target_path)
+                })
+                .ok()
+                .and_then(|index| self.entries.get(index));
+            if !matches!(
+                target.map(|target| target.kind),
+                Some(ArtifactStoreV4SourceEntryKind::File)
+            ) {
+                return Err(GauntletError::InvalidPreparedArtifact {
+                    reason:
+                        "ArtifactStore v4 source snapshot symlink target is not a captured file"
+                            .to_owned(),
+                });
+            }
         }
         Ok(())
     }
@@ -3213,18 +3265,25 @@ mod tests {
             ArtifactStoreV4SourceEntry {
                 relative_path: "Cargo.lock".to_owned(),
                 kind: ArtifactStoreV4SourceEntryKind::File,
+                inclusion_reasons: vec![
+                    ArtifactStoreV4SourceInclusionReason::Tracked,
+                    ArtifactStoreV4SourceInclusionReason::CargoLock,
+                ],
                 mode: 0o100644,
                 byte_len: 42,
                 sha256: file_hash,
                 symlink_target: None,
+                resolved_target_path: None,
             },
             ArtifactStoreV4SourceEntry {
                 relative_path: "crates/current".to_owned(),
                 kind: ArtifactStoreV4SourceEntryKind::Symlink,
+                inclusion_reasons: vec![ArtifactStoreV4SourceInclusionReason::PathDependency],
                 mode: 0o120777,
                 byte_len: 18,
                 sha256: link_hash,
-                symlink_target: Some("../shared/current".to_owned()),
+                symlink_target: Some("../Cargo.lock".to_owned()),
+                resolved_target_path: Some("Cargo.lock".to_owned()),
             },
         ])
         .expect("construct canonical source snapshot");
@@ -3254,10 +3313,12 @@ mod tests {
             ArtifactStoreV4SourceSnapshot::new(vec![ArtifactStoreV4SourceEntry {
                 relative_path: "../Cargo.toml".to_owned(),
                 kind: ArtifactStoreV4SourceEntryKind::File,
+                inclusion_reasons: vec![ArtifactStoreV4SourceInclusionReason::Tracked],
                 mode: 0o100644,
                 byte_len: 1,
                 sha256: hash.clone(),
                 symlink_target: None,
+                resolved_target_path: None,
             }]),
             Err(GauntletError::InvalidPreparedArtifact { .. })
         ));
@@ -3265,10 +3326,12 @@ mod tests {
             ArtifactStoreV4SourceSnapshot::new(vec![ArtifactStoreV4SourceEntry {
                 relative_path: "current".to_owned(),
                 kind: ArtifactStoreV4SourceEntryKind::Symlink,
+                inclusion_reasons: vec![ArtifactStoreV4SourceInclusionReason::PathDependency],
                 mode: 0o120777,
                 byte_len: 0,
                 sha256: hash,
                 symlink_target: None,
+                resolved_target_path: None,
             }]),
             Err(GauntletError::InvalidPreparedArtifact { .. })
         ));
