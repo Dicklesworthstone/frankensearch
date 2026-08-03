@@ -843,6 +843,7 @@ impl MetamorphicLawRegistry {
             ));
         }
         let mut ids = BTreeSet::new();
+        let mut generator_ids = BTreeSet::new();
         for law in &self.laws {
             let scopes = law.scopes.iter().copied().collect::<BTreeSet<_>>();
             let fields = [
@@ -866,6 +867,7 @@ impl MetamorphicLawRegistry {
                         || value.chars().any(char::is_control)
                 })
                 || !ids.insert(law.id.as_str())
+                || !generator_ids.insert(law.generator_id.as_str())
             {
                 return Err(campaign_error(
                     "metamorphic law registry has incomplete or duplicate declarations",
@@ -8989,6 +8991,18 @@ mod tests {
         assert!(
             registry.validate().is_err(),
             "a law declaration must reject duplicate scopes even when they are non-adjacent"
+        );
+    }
+
+    #[test]
+    fn e63_metamorphic_registry_rejects_reused_generator_identity() {
+        let mut registry = MetamorphicLawRegistry::scalar_g1a_v1();
+        let reused_generator_id = registry.laws[0].generator_id.clone();
+        registry.laws[1].generator_id = reused_generator_id;
+
+        assert!(
+            registry.validate().is_err(),
+            "distinct laws must not silently reuse one metamorphic generator identity"
         );
     }
 
