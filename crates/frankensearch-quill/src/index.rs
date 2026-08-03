@@ -15124,6 +15124,66 @@ mod tests {
 
     #[cfg(feature = "profile-internals")]
     #[test]
+    fn profiled_search_returns_fuel_exhaustion_with_work_disposition() {
+        run_with_cx(|cx| async move {
+            let directory = tempfile::tempdir().expect("fuel profile directory");
+            let config = QuillConfig {
+                query_fuel_budget: 1,
+                deterministic_ingest: true,
+                ..QuillConfig::default()
+            };
+            let writer = QuillIndex::create(&cx, directory.path(), config.clone())
+                .await
+                .expect("create fuel profile writer");
+            LexicalSearch::index_document(
+                &writer,
+                &cx,
+                &IndexableDocument::new("first", "profiled alpha"),
+            )
+            .await
+            .expect("stage fuel profile document");
+            LexicalSearch::commit(&writer, &cx)
+                .await
+                .expect("publish fuel profile segment");
+            let reader = QuillSearchIndex::open(&cx, directory.path(), config)
+                .await
+                .expect("open fuel profile reader");
+            let outcome = reader
+                .search_paginated_with_profile(&cx, "alpha", 10, 0, false)
+                .expect("profile admission must preserve fuel exhaustion");
+            let (error, receipt) = match outcome {
+                QuillProfiledSearchOutcome::Completed { .. } => {
+                    panic!("fuel-limited profiled search unexpectedly completed")
+                }
+                QuillProfiledSearchOutcome::Failed { error, receipt } => (error, receipt),
+            };
+            assert!(matches!(
+                error,
+                QuillIndexError::QueryFuelExhausted {
+                    budget: 1,
+                    consumed: 1,
+                    ..
+                }
+            ));
+            assert_eq!(receipt.cache(), QuillProfileCacheDisposition::Miss);
+            assert_eq!(receipt.fanout_eligible(), Some(false));
+            assert_eq!(receipt.execution(), Some(QuillProfileExecutionMode::Serial));
+            let Some((work_upper_bound, metering)) = receipt.work_plan() else {
+                panic!("fuel-limited profiled search did not bind work plan")
+            };
+            assert!(work_upper_bound > 1);
+            assert!(metering);
+            assert_eq!(receipt.work_units().requested(), [1, 1, 0, 0]);
+            assert_eq!(receipt.work_units().admitted(), [1, 0, 0, 0]);
+            assert_eq!(receipt.work_units().refused(), [0, 1, 0, 0]);
+            assert_eq!(receipt.counters(), (1, 1, 1, 1, 1));
+            assert_eq!(receipt.cancellation_observations(), 0);
+            assert_eq!(receipt.outcome(), QuillProfileOutcome::FuelExhausted);
+        });
+    }
+
+    #[cfg(feature = "profile-internals")]
+    #[test]
     fn profiled_empty_snapshot_has_no_sealed_execution_branch() {
         run_with_cx(|cx| async move {
             let directory = tempfile::tempdir().expect("empty profile directory");
