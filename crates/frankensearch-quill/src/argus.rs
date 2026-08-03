@@ -10433,6 +10433,118 @@ mod tests {
                 let cache_payload_bytes = cached_metadata.iter().fold(0_usize, |bytes, term| {
                     bytes.saturating_add(term.heap_bytes())
                 });
+                let cached_trusted_validation = timed_encoded_grouped_union_with_contract(
+                    &encoded_doclens,
+                    encoded_terms,
+                    Some(&cached_metadata),
+                    &snapshot,
+                    rows_by_term,
+                    boosts,
+                    num_docs,
+                    10,
+                    group_size,
+                    false,
+                    true,
+                )?;
+                let cached_forced_validation = timed_encoded_grouped_union_with_contract(
+                    &encoded_doclens,
+                    encoded_terms,
+                    Some(&cached_metadata),
+                    &snapshot,
+                    rows_by_term,
+                    boosts,
+                    num_docs,
+                    10,
+                    group_size,
+                    false,
+                    false,
+                )?;
+                assert_hits_bit_exact(&cached_trusted_validation.1, &cached_forced_validation.1);
+
+                // This is a maintenance diagnostic: both arms run the same
+                // sealed cursor and cache payload in one invocation. It
+                // controls only the redundant post-move validation branch;
+                // it does not put an incumbent in the comparison.
+                let h3_null = frankensearch_core::bench_support::paired_median_ratio(
+                    PAIRED_ROUNDS,
+                    1,
+                    || {
+                        let _ = std::hint::black_box(
+                            timed_encoded_grouped_union_with_contract(
+                                &encoded_doclens,
+                                encoded_terms,
+                                Some(&cached_metadata),
+                                &snapshot,
+                                rows_by_term,
+                                boosts,
+                                num_docs,
+                                10,
+                                group_size,
+                                false,
+                                true,
+                            )
+                            .expect("run first trusted H3 null arm"),
+                        );
+                    },
+                    || {
+                        let _ = std::hint::black_box(
+                            timed_encoded_grouped_union_with_contract(
+                                &encoded_doclens,
+                                encoded_terms,
+                                Some(&cached_metadata),
+                                &snapshot,
+                                rows_by_term,
+                                boosts,
+                                num_docs,
+                                10,
+                                group_size,
+                                false,
+                                true,
+                            )
+                            .expect("run second trusted H3 null arm"),
+                        );
+                    },
+                );
+                let h3_trusted_over_forced = frankensearch_core::bench_support::paired_median_ratio(
+                    PAIRED_ROUNDS,
+                    1,
+                    || {
+                        let _ = std::hint::black_box(
+                            timed_encoded_grouped_union_with_contract(
+                                &encoded_doclens,
+                                encoded_terms,
+                                Some(&cached_metadata),
+                                &snapshot,
+                                rows_by_term,
+                                boosts,
+                                num_docs,
+                                10,
+                                group_size,
+                                false,
+                                false,
+                            )
+                            .expect("run forced-validation H3 control arm"),
+                        );
+                    },
+                    || {
+                        let _ = std::hint::black_box(
+                            timed_encoded_grouped_union_with_contract(
+                                &encoded_doclens,
+                                encoded_terms,
+                                Some(&cached_metadata),
+                                &snapshot,
+                                rows_by_term,
+                                boosts,
+                                num_docs,
+                                10,
+                                group_size,
+                                false,
+                                true,
+                            )
+                            .expect("run trusted-validation H3 control arm"),
+                        );
+                    },
+                );
 
                 let null = frankensearch_core::bench_support::paired_median_ratio(
                     PAIRED_ROUNDS,
@@ -10617,6 +10729,9 @@ mod tests {
                      pruned_median_us={pruned_median_us} trials={TRIALS} hits={} \
                      checksum={checksum} null_median={:.6} null_p5={:.6} null_p95={:.6} \
                      lever_median={:.6} lever_p5={:.6} lever_p95={:.6} \
+                     h3_null_median={:.6} h3_null_p5={:.6} h3_null_p95={:.6} \
+                     h3_trusted_over_forced_median={:.6} \
+                     h3_trusted_over_forced_p5={:.6} h3_trusted_over_forced_p95={:.6} \
                      paired_rounds={PAIRED_ROUNDS}",
                     cold_exhaustive.0,
                     cold_pruned.0,
@@ -10628,6 +10743,12 @@ mod tests {
                     lever.median,
                     lever.p5,
                     lever.p95,
+                    h3_null.median,
+                    h3_null.p5,
+                    h3_null.p95,
+                    h3_trusted_over_forced.median,
+                    h3_trusted_over_forced.p5,
+                    h3_trusted_over_forced.p95,
                 );
             }
         }
