@@ -6009,6 +6009,20 @@ mod tests {
     }
 
     #[test]
+    fn lease_crash_recovery_helper() {
+        let Some(path) = std::env::var_os("QUILL_PERF_TEST_CRASH_LEASE_PATH") else {
+            return;
+        };
+        let (_lease, _identity) =
+            acquire_family_lease(Path::new(&path)).expect("helper acquires crash-test lease");
+        println!("crash-lease-ready");
+        std::io::stdout()
+            .flush()
+            .expect("flush crash helper readiness");
+        std::process::exit(42);
+    }
+
+    #[test]
     fn lease_inherited_fd_child_helper() {
         if std::env::var_os("QUILL_PERF_TEST_INHERITED_LEASE_CHILD").is_none() {
             return;
@@ -6110,6 +6124,26 @@ mod tests {
         holder_output
             .read_to_string(&mut remainder)
             .expect("drain holder output");
+    }
+
+    #[test]
+    fn family_lease_recovers_after_holder_process_crash() {
+        let directory = tempfile::tempdir().expect("lease crash recovery directory");
+        let lease_path = directory.path().join("crash-recovery.lock");
+        let current_test = std::env::current_exe().expect("current test executable");
+        let helper_name = "local_perf_runner::tests::lease_crash_recovery_helper";
+        let output = Command::new(&current_test)
+            .args(["--exact", helper_name, "--nocapture"])
+            .env("QUILL_PERF_TEST_CRASH_LEASE_PATH", &lease_path)
+            .output()
+            .expect("run crash recovery lease holder");
+        assert_eq!(output.status.code(), Some(42), "crash helper exit status");
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("crash-lease-ready"),
+            "crash helper must prove it acquired the lease before exiting"
+        );
+        let (_reacquired, _identity) = acquire_family_lease(&lease_path)
+            .expect("lease must recover after holder process exits");
     }
 
     #[test]
