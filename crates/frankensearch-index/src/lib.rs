@@ -6487,6 +6487,90 @@ mod tests {
     }
 
     #[test]
+    fn sealed_owner_survives_path_truncation_and_extension_after_admission() {
+        let directory = tempfile::tempdir().expect("private publication directory");
+        let path = directory.path().join("current.fsvi");
+        let binding = fsvi_v2_binding("length-mutation", 4, Quantization::F16, 23, 0x83);
+
+        let mut writer = VectorIndex::create_v2(&path, binding.clone()).expect("original writer");
+        writer
+            .write_record("doc-alpha", &[1.0, 0.0, 0.0, 0.0])
+            .expect("original alpha");
+        writer
+            .write_record("doc-beta", &[0.0, 1.0, 0.0, 0.0])
+            .expect("original beta");
+        writer.finish().expect("finish original");
+
+        let owner =
+            ValidatedFsviBytes::open_published(&path, &binding).expect("admit original owner");
+        let expected_witness = owner.witness().clone();
+        let expected_hits = owner
+            .search_top_k(&[1.0, 0.0, 0.0, 0.0], 2, None)
+            .expect("search original");
+        let expected_rows: Vec<(String, Vec<u8>, FsviRecordFlags)> = (0..owner.record_count())
+            .map(|index| {
+                let row = owner.row(index).expect("original row");
+                (
+                    row.doc_id().to_owned(),
+                    row.vector_bytes().to_vec(),
+                    row.flags(),
+                )
+            })
+            .collect();
+        let original_bytes = owner.bytes.to_vec();
+
+        OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .expect("open path for truncation")
+            .set_len(0)
+            .expect("truncate admitted pathname");
+        assert!(
+            ValidatedFsviBytes::open_published(&path, &binding).is_err(),
+            "a truncated pathname must never be admitted as the retained owner"
+        );
+        assert_eq!(owner.witness(), &expected_witness);
+        assert_eq!(
+            owner
+                .search_top_k(&[1.0, 0.0, 0.0, 0.0], 2, None)
+                .expect("search retained owner after truncation"),
+            expected_hits
+        );
+
+        fs::write(&path, &original_bytes).expect("restore original pathname bytes");
+        let mut extended = OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .expect("open path for extension");
+        extended
+            .write_all(b"unexpected-trailing-bytes")
+            .expect("extend admitted pathname");
+        extended.sync_all().expect("sync extension");
+        assert!(
+            ValidatedFsviBytes::open_published(&path, &binding).is_err(),
+            "a length-extended pathname must never be admitted as the retained owner"
+        );
+        assert_eq!(owner.witness(), &expected_witness);
+        let observed_rows: Vec<(String, Vec<u8>, FsviRecordFlags)> = (0..owner.record_count())
+            .map(|index| {
+                let row = owner.row(index).expect("retained owner row");
+                (
+                    row.doc_id().to_owned(),
+                    row.vector_bytes().to_vec(),
+                    row.flags(),
+                )
+            })
+            .collect();
+        assert_eq!(observed_rows, expected_rows);
+        assert_eq!(
+            owner
+                .search_top_k(&[1.0, 0.0, 0.0, 0.0], 2, None)
+                .expect("search retained owner after extension"),
+            expected_hits
+        );
+    }
+
+    #[test]
     fn same_display_strings_and_dimension_cannot_cross_open_distinct_identity_bundles() {
         let path_a = temp_index_path("v2-same-display-identity-a");
         let path_b = temp_index_path("v2-same-display-identity-b");
