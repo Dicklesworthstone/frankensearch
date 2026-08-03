@@ -844,6 +844,7 @@ impl MetamorphicLawRegistry {
         }
         let mut ids = BTreeSet::new();
         for law in &self.laws {
+            let scopes = law.scopes.iter().copied().collect::<BTreeSet<_>>();
             let fields = [
                 &law.id,
                 &law.generator_id,
@@ -857,7 +858,7 @@ impl MetamorphicLawRegistry {
                 &law.shrinker_id,
             ];
             if law.scopes.is_empty()
-                || law.scopes.windows(2).any(|pair| pair[0] == pair[1])
+                || scopes.len() != law.scopes.len()
                 || fields.iter().any(|value| {
                     value.is_empty()
                         || value.len() > MAX_METAMORPHIC_TEXT_BYTES
@@ -8973,6 +8974,21 @@ mod tests {
         assert_eq!(
             actual, expected,
             "E6.3 required metamorphic law set drifted"
+        );
+    }
+
+    #[test]
+    fn e63_metamorphic_registry_rejects_nonadjacent_duplicate_scope() {
+        let mut registry = MetamorphicLawRegistry::scalar_g1a_v1();
+        registry.laws[0].scopes = vec![
+            MetamorphicLawScope::Quill,
+            MetamorphicLawScope::Tantivy,
+            MetamorphicLawScope::Quill,
+        ];
+
+        assert!(
+            registry.validate().is_err(),
+            "a law declaration must reject duplicate scopes even when they are non-adjacent"
         );
     }
 
