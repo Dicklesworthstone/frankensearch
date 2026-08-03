@@ -51,6 +51,8 @@ const PRODUCER_CONTRACT_SCHEMA_VERSION: &str =
     "frankensearch.quill-local-perf-producer-contract.v1";
 /// Strict wire schema for one local-run process-attempt receipt.
 pub const LOCAL_PERF_ATTEMPT_RECEIPT_SCHEMA_VERSION: &str = "frankensearch.perf-runner-attempt.v5";
+/// Strict schema for the diagnostic inventory retained before runner completion.
+pub const PERF_RUN_PRECOMMIT_SCHEMA_VERSION: &str = "frankensearch.perf-run-precommit.v5";
 const MAX_IDENTITY_COMPONENT_BYTES: usize = 96;
 const MAX_OUTPUT_COMPONENT_BYTES: usize = 128;
 const MIN_MEASUREMENT_RUNS: usize = 10;
@@ -1686,7 +1688,7 @@ fn run_local_perf_command_inner(
         .join(format!("{}.bound.evidence.json", config.gate.label()));
     let inventory_path = config.output_dir.join("PRECOMMIT.json");
     let inventory = PrecommitInventory {
-        schema_version: "frankensearch.perf-run-precommit.v5".to_owned(),
+        schema_version: PERF_RUN_PRECOMMIT_SCHEMA_VERSION.to_owned(),
         gate: config.gate.label().to_owned(),
         profile: config.profile,
         execution_capacity: run_profile.execution_capacity,
