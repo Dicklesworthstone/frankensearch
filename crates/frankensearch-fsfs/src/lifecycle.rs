@@ -2575,13 +2575,23 @@ impl std::error::Error for PublicationLeaseBusy {}
 /// The authority is an exclusive non-blocking `flock(2)` on
 /// `<index_root>/fsfs.publication.lock` — the same primitive the Quill keeper
 /// uses one layer down for its engine directory. The kernel releases the lock
-/// when the holder dies, so there is no stale-lease recovery protocol. The
-/// PID record inside the file is diagnostic only and written best-effort.
+/// when the holder dies, so there is no stale-lease recovery protocol.
 /// Non-flock platforms fail closed rather than pretending exclusion.
+///
+/// Holders must call [`Self::fence`] immediately before each publication
+/// boundary (bd-p6z6.3.1): the flock binds to an inode, not a pathname, so a
+/// deleted-and-recreated lock file would admit a second holder on the new
+/// inode while this holder still believes it is exclusive.
 #[derive(Debug)]
 pub struct PublicationLease {
     lock_path: PathBuf,
     lock_file: std::fs::File,
+    #[cfg(unix)]
+    lock_device: u64,
+    #[cfg(unix)]
+    lock_inode: u64,
+    #[cfg(unix)]
+    owner_record: String,
 }
 
 impl PublicationLease {
@@ -2637,7 +2647,9 @@ impl PublicationLease {
             }
             return Err(std::io::Error::from(errno).into());
         }
-        // Diagnostic record only; the flock above is the authority.
+        // Sealed owner record. The flock above is the exclusion authority;
+        // `fence` rechecks this record and the lock inode before each
+        // publication boundary, so the write must be durable, not best-effort.
         let record = format!(
             "{} {}\n",
             std::process::id(),
@@ -2645,14 +2657,24 @@ impl PublicationLease {
                 .duration_since(SystemTime::UNIX_EPOCH)
                 .map_or(0, |elapsed| elapsed.as_secs())
         );
-        let _ = lock_file.set_len(0);
-        let _ = lock_file.seek(SeekFrom::Start(0));
-        let _ = lock_file.write_all(record.as_bytes());
-        let _ = lock_file.sync_all();
-        Ok(Self {
+        lock_file.set_len(0)?;
+        lock_file.seek(SeekFrom::Start(0))?;
+        lock_file.write_all(record.as_bytes())?;
+        lock_file.sync_all()?;
+        let lock_metadata = {
+            use std::os::unix::fs::MetadataExt;
+            let metadata = lock_file.metadata()?;
+            (metadata.dev(), metadata.ino())
+        };
+        let lease = Self {
             lock_path,
             lock_file,
-        })
+            lock_device: lock_metadata.0,
+            lock_inode: lock_metadata.1,
+            owner_record: record,
+        };
+        lease.fence("publication-lease admission")?;
+        Ok(lease)
     }
 
     /// Non-Unix targets cannot provide flock exclusion semantics; fail closed.
@@ -2667,6 +2689,86 @@ impl PublicationLease {
             format!(
                 "cross-process fsfs publication exclusion requires flock semantics (index root {})",
                 index_root.display()
+            ),
+        )
+        .into())
+    }
+
+    /// Revalidate the held lock immediately before a publication boundary.
+    ///
+    /// Confirms that the still-open descriptor and the lock pathname both
+    /// resolve to the inode observed at acquisition and that the sealed owner
+    /// record is unchanged. A deleted/recreated (or symlink-substituted) lock
+    /// file fails the check, so a holder racing a second acquirer aborts its
+    /// publication instead of coexisting with it.
+    ///
+    /// # Errors
+    ///
+    /// Returns `SearchError::SubsystemError` (subsystem `publication-lease`)
+    /// when the lock identity or owner record changed, and `SearchError::Io`
+    /// for filesystem failures (including a lock file that no longer exists).
+    #[cfg(unix)]
+    pub fn fence(&self, boundary: &'static str) -> frankensearch_core::SearchResult<()> {
+        use std::os::unix::fs::{FileExt, MetadataExt};
+
+        let fenced = |detail: String| frankensearch_core::SearchError::SubsystemError {
+            subsystem: "publication-lease",
+            source: Box::new(std::io::Error::new(std::io::ErrorKind::InvalidData, detail)),
+        };
+
+        let descriptor = self.lock_file.metadata()?;
+        if !descriptor.file_type().is_file()
+            || descriptor.dev() != self.lock_device
+            || descriptor.ino() != self.lock_inode
+        {
+            return Err(fenced(format!(
+                "{boundary}: held publication-lock descriptor identity changed at {}",
+                self.lock_path.display()
+            )));
+        }
+        let pathname = std::fs::symlink_metadata(&self.lock_path)?;
+        if !pathname.file_type().is_file()
+            || pathname.dev() != self.lock_device
+            || pathname.ino() != self.lock_inode
+        {
+            return Err(fenced(format!(
+                "{boundary}: publication lock at {} was replaced; a second holder may exist",
+                self.lock_path.display()
+            )));
+        }
+        let mut observed = Vec::with_capacity(self.owner_record.len() + 1);
+        let mut chunk = [0_u8; 64];
+        let mut offset = 0_u64;
+        while observed.len() <= self.owner_record.len() {
+            let read = self.lock_file.read_at(&mut chunk, offset)?;
+            if read == 0 {
+                break;
+            }
+            observed.extend_from_slice(&chunk[..read]);
+            offset += read as u64;
+        }
+        if observed != self.owner_record.as_bytes() {
+            return Err(fenced(format!(
+                "{boundary}: publication-lease owner record changed at {}",
+                self.lock_path.display()
+            )));
+        }
+        Ok(())
+    }
+
+    /// Non-Unix targets never construct a lease ([`Self::acquire`] fails
+    /// closed), so fencing one fails closed for the same reason.
+    ///
+    /// # Errors
+    ///
+    /// Always returns `SearchError::Io` with `ErrorKind::Unsupported`.
+    #[cfg(not(unix))]
+    pub fn fence(&self, _boundary: &'static str) -> frankensearch_core::SearchResult<()> {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::Unsupported,
+            format!(
+                "cross-process fsfs publication exclusion requires flock semantics (lock {})",
+                self.lock_path.display()
             ),
         )
         .into())
@@ -2726,6 +2828,63 @@ mod tests {
         std::fs::create_dir_all(root.path().join(PUBLICATION_LOCK_FILE_NAME))
             .expect("occupy the lock path with a directory");
         assert!(PublicationLease::acquire(root.path()).is_err());
+    }
+
+    #[test]
+    fn publication_lease_fence_passes_while_lock_identity_is_unchanged() {
+        let root = tempfile::tempdir().expect("index root");
+        let lease = PublicationLease::acquire(root.path()).expect("acquire");
+        lease
+            .fence("test publication boundary")
+            .expect("fence must pass while the lock inode and record are intact");
+    }
+
+    #[test]
+    fn publication_lease_fence_rejects_deleted_and_recreated_lock_file() {
+        let root = tempfile::tempdir().expect("index root");
+        let lease = PublicationLease::acquire(root.path()).expect("acquire");
+        let lock_path = lease.lock_path().to_path_buf();
+
+        std::fs::remove_file(&lock_path).expect("delete lock file out from under the holder");
+        lease
+            .fence("post-delete boundary")
+            .expect_err("fence must fail once the lock pathname is gone");
+
+        std::fs::write(&lock_path, b"999999 0\n").expect("recreate lock file on a new inode");
+        let error = lease
+            .fence("post-recreate boundary")
+            .expect_err("fence must fail on a recreated lock inode");
+        match error {
+            frankensearch_core::SearchError::SubsystemError { subsystem, .. } => {
+                assert_eq!(subsystem, "publication-lease");
+            }
+            other => panic!("expected publication-lease fence refusal, got {other:?}"),
+        }
+
+        // A second process CAN acquire the recreated inode; the fence is what
+        // keeps the original holder from publishing alongside it.
+        let second = PublicationLease::acquire(root.path())
+            .expect("second holder admitted by the substituted lock inode");
+        second
+            .fence("second holder boundary")
+            .expect("second holder fences cleanly on its own inode");
+    }
+
+    #[test]
+    fn publication_lease_fence_rejects_tampered_owner_record() {
+        let root = tempfile::tempdir().expect("index root");
+        let lease = PublicationLease::acquire(root.path()).expect("acquire");
+
+        std::fs::write(lease.lock_path(), b"424242 7\n").expect("overwrite owner record in place");
+        let error = lease
+            .fence("post-tamper boundary")
+            .expect_err("fence must fail when the sealed owner record changes");
+        match error {
+            frankensearch_core::SearchError::SubsystemError { subsystem, .. } => {
+                assert_eq!(subsystem, "publication-lease");
+            }
+            other => panic!("expected publication-lease fence refusal, got {other:?}"),
+        }
     }
 
     // ── DaemonPhase ──
