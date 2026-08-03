@@ -4680,6 +4680,10 @@ mod tests {
 
     #[test]
     fn qg1_profile_plans_have_frozen_exhaustive_applicability_counts() {
+        // GOLDEN-CHANGE (attempt receipt v8): the manifest now binds the
+        // Linux child-subreaper descendant-quiescence contract. Matrix cells
+        // and applicability counts are unchanged; only their manifest-bound
+        // plan identities advance together with that schema transition.
         let registry = MachineClassRegistry::frozen().expect("frozen machine registry");
         let cases = [
             (
@@ -4689,7 +4693,7 @@ mod tests {
                 16,
                 Some(64),
                 Some(64),
-                "2b9d450b21a3b051a5b05a479709dbbca482d7d27f1221ddd77adaed2934f5b3",
+                "64c33ba478328c0d4dc548e115daf2bdded5a0a152a5c2aae724c6fc9f51898f",
             ),
             (
                 ExecutionProfileId::Smt2_128,
@@ -4698,7 +4702,7 @@ mod tests {
                 0,
                 Some(128),
                 Some(128),
-                "bb66e93d76bee49640023abbc56738361dc6d9729eb4f8739af228df9785a56e",
+                "65d95151cbbcc900287c25fd447fe6d49d5415fbe9d36bec7d9721c71391abab",
             ),
             (
                 ExecutionProfileId::Scheduler10,
@@ -4707,7 +4711,7 @@ mod tests {
                 40,
                 Some(10),
                 Some(8),
-                "24787b922c8ce58fd6166a7475def35e498986500b7fa27e88a05a566a0bbdc5",
+                "329af4962a18a8d0ab3371db0971f7f11e121d41148320aeb48260b447ca58ae",
             ),
         ];
         let mut plan_hashes = BTreeSet::new();
@@ -5513,9 +5517,12 @@ mod tests {
     fn manifest_contract_hash_ignores_only_activation_state() {
         let manifest = PERF_MANIFEST;
         assert_eq!(manifest.matches("activated = false").count(), 10);
+        // GOLDEN-CHANGE (attempt receipt v8): the manifest now names the
+        // descendant containment/reconciliation requirement. Activation is
+        // still the sole administrative normalization exception.
         assert_eq!(
             perf_manifest_contract_sha256(manifest),
-            "404c0e24c9f3f4919e3b9c3213e722c77bcdb89ea2f991d0a66dc67eafd0fc89",
+            "1cbcc1735366fa681841215cd9ccf92920b932b8a35010d4b277d8432cd24db8",
             "the normalized all-inactive manifest digest must remain frozen"
         );
         assert_eq!(

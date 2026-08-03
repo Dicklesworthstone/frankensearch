@@ -26,7 +26,10 @@ use rustix::fs::{
 use rustix::io::{FdFlags, fcntl_getfd, fcntl_setfd};
 use rustix::process::geteuid;
 #[cfg(target_os = "linux")]
-use rustix::process::{Pid, Signal, kill_process_group};
+use rustix::process::{
+    Pid, Signal, WaitId, WaitIdOptions, child_subreaper, getpid, kill_process_group, pidfd_open,
+    pidfd_send_signal, set_child_subreaper, waitid,
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -52,7 +55,7 @@ use crate::{PerfCellApplicability, PerfCellApplicabilityReason};
 const PRODUCER_CONTRACT_SCHEMA_VERSION: &str =
     "frankensearch.quill-local-perf-producer-contract.v1";
 /// Strict wire schema for one local-run process-attempt receipt.
-pub const LOCAL_PERF_ATTEMPT_RECEIPT_SCHEMA_VERSION: &str = "frankensearch.perf-runner-attempt.v7";
+pub const LOCAL_PERF_ATTEMPT_RECEIPT_SCHEMA_VERSION: &str = "frankensearch.perf-runner-attempt.v8";
 /// Strict schema for the diagnostic inventory retained before runner completion.
 pub const PERF_RUN_PRECOMMIT_SCHEMA_VERSION: &str = "frankensearch.perf-run-precommit.v5";
 const MAX_IDENTITY_COMPONENT_BYTES: usize = 96;
@@ -205,6 +208,17 @@ pub enum LocalPerfRunError {
         wait_error_kind: LocalPerfIoErrorKind,
         /// Error or bounded-deadline classification from kill/reap recovery.
         recovery_error_kind: LocalPerfIoErrorKind,
+    },
+    /// The direct child exited, but bounded descendant reconciliation could
+    /// not establish that the contained benchmark tree was terminal. No
+    /// attempt receipt is emitted while a descendant might still mutate logs
+    /// or artifacts.
+    #[error(
+        "local performance runner could not prove descendant-tree quiescence after direct-child reap: {error_kind:?}"
+    )]
+    UnreapedProcessTree {
+        /// Bounded descendant reconciliation failure class.
+        error_kind: LocalPerfIoErrorKind,
     },
 }
 
@@ -372,6 +386,7 @@ pub enum LocalPerfRejectionStage {
     FinishedTimestamp,
     EndPlatformCapture,
     RootProcessIdentity,
+    ProcessTreeQuiescence,
     PostRunIdentity,
     ArtifactRead,
     ArtifactDurability,
@@ -427,6 +442,8 @@ pub struct LocalPerfProcessLifecycle {
     run_log_synced: bool,
     run_log_captured: bool,
     process_group_recovery: LocalPerfProcessGroupRecovery,
+    process_tree_quiescence: LocalPerfProcessTreeQuiescence,
+    descendant_processes_observed: u32,
 }
 
 /// Exact bounded recovery action after an OS wait failure.
@@ -450,7 +467,15 @@ pub enum LocalPerfProcessGroupRecovery {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LocalPerfProcessTreeQuiescence {
+    /// Only direct-child completion is available on this platform or attempt.
     DirectChildOnly,
+    /// Linux child-subreaper containment observed no descendants after the
+    /// direct child reached a terminal state.
+    LinuxSubreaperVerifiedEmpty,
+    /// Linux child-subreaper containment found escaped descendants, terminated
+    /// them by pidfd, and reaped their terminal states. This rejects promotion:
+    /// the direct child's success did not delimit the measured process tree.
+    LinuxSubreaperReapedEscapedDescendants,
 }
 
 /// Root-process authority retained by a local producer attempt.
@@ -534,13 +559,23 @@ impl LocalPerfProcessLifecycle {
     /// Return the strongest process-tree conclusion this receipt can prove.
     #[must_use]
     pub const fn process_tree_quiescence(self) -> LocalPerfProcessTreeQuiescence {
-        LocalPerfProcessTreeQuiescence::DirectChildOnly
+        self.process_tree_quiescence
     }
 
     /// Whether this receipt proves every descendant reached a terminal state.
     #[must_use]
     pub const fn descendant_process_tree_quiescence_is_proven(self) -> bool {
-        false
+        matches!(
+            self.process_tree_quiescence,
+            LocalPerfProcessTreeQuiescence::LinuxSubreaperVerifiedEmpty
+        )
+    }
+
+    /// Number of descendants seen after the direct child reached a terminal
+    /// state. A completed receipt requires this to remain zero.
+    #[must_use]
+    pub const fn descendant_processes_observed(self) -> u32 {
+        self.descendant_processes_observed
     }
 }
 
@@ -1320,6 +1355,7 @@ fn run_local_perf_command_inner(
     let run_log = create_new_file_at(&run_directories.run.handle, "run.log")?;
     let run_log_sync = run_log.try_clone()?;
     let run_log_stderr = run_log.try_clone()?;
+    let mut descendant_scope = LocalPerfDescendantScope::enter()?;
     let mut child = Command::new(descriptor_path(&captured_build.executable)?);
     child
         .arg0(&captured_build.command[0])
@@ -1334,6 +1370,7 @@ fn run_local_perf_command_inner(
             (child, root_process_identity)
         }
         Err(error) => {
+            descendant_scope.restore()?;
             let run_log_synced = run_log_sync.sync_all().is_ok();
             let run_log_bytes = read_file_at(&run_directories.run.handle, "run.log").ok();
             let _ = write_new_sync_at(
@@ -1352,6 +1389,8 @@ fn run_local_perf_command_inner(
                 run_log_synced,
                 run_log_captured: run_log_bytes.is_some(),
                 process_group_recovery: LocalPerfProcessGroupRecovery::NotRequired,
+                process_tree_quiescence: LocalPerfProcessTreeQuiescence::DirectChildOnly,
+                descendant_processes_observed: 0,
             };
             let attempt_path = write_failed_attempt_receipt(
                 config,
@@ -1392,6 +1431,10 @@ fn run_local_perf_command_inner(
             }
         }
     };
+    let (process_tree_quiescence, descendant_processes_observed) = descendant_scope
+        .reconcile_after_root_exit()
+        .map_err(|error_kind| LocalPerfRunError::UnreapedProcessTree { error_kind })?;
+    descendant_scope.restore()?;
     let run_log_synced = run_log_sync.sync_all().is_ok();
     let run_log_result = read_file_at(&run_directories.run.handle, "run.log");
     let process_lifecycle = LocalPerfProcessLifecycle {
@@ -1402,6 +1445,8 @@ fn run_local_perf_command_inner(
         run_log_synced,
         run_log_captured: run_log_result.is_ok(),
         process_group_recovery,
+        process_tree_quiescence,
+        descendant_processes_observed,
     };
     if !run_log_synced {
         let outcome = LocalPerfAttemptOutcome::PostExitRejected {
@@ -1569,6 +1614,11 @@ fn run_local_perf_command_inner(
             outcome,
         })
     };
+    if !process_lifecycle.descendant_process_tree_quiescence_is_proven() {
+        return Err(post_exit_rejection(
+            LocalPerfRejectionStage::ProcessTreeQuiescence,
+        )?);
+    }
     let end = match capture_platform(config) {
         Ok(end) => end,
         Err(_) => {
@@ -1811,6 +1861,7 @@ fn run_local_perf_command_inner(
         &end,
         &bound_evidence_bytes,
         &run_log_bytes,
+        process_lifecycle,
         root_process_identity,
         &started_at_utc,
         &finished_at_utc,
@@ -4304,6 +4355,7 @@ fn completed_attempt_receipt_bytes(
     end: &PlatformCapture,
     bound_evidence_bytes: &[u8],
     run_log_bytes: &[u8],
+    process_lifecycle: LocalPerfProcessLifecycle,
     root_process_identity: LocalPerfRootProcessIdentity,
     started_at_utc: &str,
     finished_at_utc: &str,
@@ -4351,15 +4403,7 @@ fn completed_attempt_receipt_bytes(
         None,
         LocalPerfAttemptOutcome::Completed,
         run_selection,
-        LocalPerfProcessLifecycle {
-            spawn_attempted: true,
-            spawn_succeeded: true,
-            wait_completed: true,
-            child_reaped: true,
-            run_log_synced: true,
-            run_log_captured: true,
-            process_group_recovery: LocalPerfProcessGroupRecovery::NotRequired,
-        },
+        process_lifecycle,
         root_process_identity,
         Some(run_log_bytes),
         Some(bound_evidence_bytes),
@@ -4641,6 +4685,207 @@ fn local_perf_io_error_kind(error: &std::io::Error) -> LocalPerfIoErrorKind {
     }
 }
 
+/// Scoped authority for the process tree rooted at one benchmark child.
+///
+/// Linux subreaper mode makes a benchmark's orphaned descendants children of
+/// this runner rather than silently handing them to the host init process. The
+/// runner starts only when it has no pre-existing children, so every child
+/// observed during the scope belongs to the benchmark tree. This is the
+/// containment boundary that the direct `Child::wait` handle alone cannot
+/// provide.
+struct LocalPerfDescendantScope {
+    #[cfg(target_os = "linux")]
+    linux: LinuxSubreaperScope,
+}
+
+impl LocalPerfDescendantScope {
+    fn enter() -> Result<Self, LocalPerfRunError> {
+        #[cfg(target_os = "linux")]
+        {
+            return Ok(Self {
+                linux: LinuxSubreaperScope::enter()?,
+            });
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            Ok(Self {})
+        }
+    }
+
+    fn reconcile_after_root_exit(
+        &mut self,
+    ) -> Result<(LocalPerfProcessTreeQuiescence, u32), LocalPerfIoErrorKind> {
+        #[cfg(target_os = "linux")]
+        {
+            return self.linux.reconcile_after_root_exit();
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            Ok((LocalPerfProcessTreeQuiescence::DirectChildOnly, 0))
+        }
+    }
+
+    fn restore(&mut self) -> Result<(), LocalPerfRunError> {
+        #[cfg(target_os = "linux")]
+        {
+            self.linux.restore()?;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "linux")]
+struct LinuxSubreaperScope {
+    was_subreaper: bool,
+    restored: bool,
+}
+
+#[cfg(target_os = "linux")]
+impl LinuxSubreaperScope {
+    fn enter() -> Result<Self, LocalPerfRunError> {
+        if !linux_descendant_pids()?.is_empty() {
+            return Err(LocalPerfRunError::Invalid(
+                "benchmark runner cannot establish descendant containment with pre-existing children"
+                    .to_owned(),
+            ));
+        }
+        let was_subreaper = child_subreaper().map_err(std::io::Error::from)?.is_some();
+        set_child_subreaper(Some(getpid())).map_err(std::io::Error::from)?;
+        if !linux_descendant_pids()?.is_empty() {
+            let _ = set_child_subreaper(was_subreaper.then_some(getpid()));
+            return Err(LocalPerfRunError::Invalid(
+                "benchmark runner observed a child while establishing descendant containment"
+                    .to_owned(),
+            ));
+        }
+        Ok(Self {
+            was_subreaper,
+            restored: false,
+        })
+    }
+
+    fn reconcile_after_root_exit(
+        &mut self,
+    ) -> Result<(LocalPerfProcessTreeQuiescence, u32), LocalPerfIoErrorKind> {
+        reap_linux_descendants()?;
+        let descendants =
+            linux_descendant_pids().map_err(|error| local_perf_io_error_kind(&error))?;
+        if descendants.is_empty() {
+            return Ok((
+                LocalPerfProcessTreeQuiescence::LinuxSubreaperVerifiedEmpty,
+                0,
+            ));
+        }
+
+        let observed = u32::try_from(descendants.len()).map_err(|_| LocalPerfIoErrorKind::Other)?;
+        for pid in descendants {
+            let pid = i32::try_from(pid)
+                .ok()
+                .and_then(Pid::from_raw)
+                .ok_or(LocalPerfIoErrorKind::Other)?;
+            let pidfd = pidfd_open(pid, rustix::process::PidfdFlags::empty())
+                .map_err(|error| local_perf_io_error_kind(&std::io::Error::from(error)))?;
+            pidfd_send_signal(&pidfd, Signal::KILL)
+                .map_err(|error| local_perf_io_error_kind(&std::io::Error::from(error)))?;
+        }
+        for _ in 0..WAIT_RECOVERY_POLL_ATTEMPTS {
+            reap_linux_descendants()?;
+            if linux_descendant_pids()
+                .map_err(|error| local_perf_io_error_kind(&error))?
+                .is_empty()
+            {
+                return Ok((
+                    LocalPerfProcessTreeQuiescence::LinuxSubreaperReapedEscapedDescendants,
+                    observed,
+                ));
+            }
+            std::thread::sleep(WAIT_RECOVERY_POLL_INTERVAL);
+        }
+        Err(LocalPerfIoErrorKind::ResourceBusy)
+    }
+
+    fn restore(&mut self) -> Result<(), LocalPerfRunError> {
+        if !self.restored {
+            set_child_subreaper(self.was_subreaper.then_some(getpid()))
+                .map_err(std::io::Error::from)?;
+            self.restored = true;
+        }
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for LinuxSubreaperScope {
+    fn drop(&mut self) {
+        let _ = self.restore();
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn reap_linux_descendants() -> Result<(), LocalPerfIoErrorKind> {
+    loop {
+        match waitid(WaitId::All, WaitIdOptions::NOHANG | WaitIdOptions::EXITED) {
+            Ok(Some(_)) => {}
+            Ok(None) => return Ok(()),
+            Err(error) if error == rustix::io::Errno::CHILD => return Ok(()),
+            Err(error) => {
+                return Err(local_perf_io_error_kind(&std::io::Error::from(error)));
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_descendant_pids() -> Result<BTreeSet<u32>, std::io::Error> {
+    let current_pid = u32::try_from(getpid().as_raw_nonzero().get()).map_err(|_| {
+        std::io::Error::other("current process identifier does not fit the /proc namespace")
+    })?;
+    let mut children_by_parent = BTreeMap::<u32, BTreeSet<u32>>::new();
+    for entry in fs::read_dir("/proc")? {
+        let entry = entry?;
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<u32>().ok())
+            .filter(|pid| *pid > 0)
+        else {
+            continue;
+        };
+        let stat_path = entry.path().join("stat");
+        let Ok(stat) = fs::read_to_string(stat_path) else {
+            continue;
+        };
+        let Some(parent_pid) = parse_linux_proc_parent_pid(&stat) else {
+            continue;
+        };
+        children_by_parent
+            .entry(parent_pid)
+            .or_default()
+            .insert(pid);
+    }
+
+    let mut descendants = BTreeSet::new();
+    let mut pending = vec![current_pid];
+    while let Some(parent_pid) = pending.pop() {
+        if let Some(children) = children_by_parent.get(&parent_pid) {
+            for child_pid in children {
+                if descendants.insert(*child_pid) {
+                    pending.push(*child_pid);
+                }
+            }
+        }
+    }
+    Ok(descendants)
+}
+
+#[cfg(target_os = "linux")]
+fn parse_linux_proc_parent_pid(stat: &str) -> Option<u32> {
+    let (_, suffix) = stat.rsplit_once(')')?;
+    let mut fields = suffix.split_ascii_whitespace();
+    let _state = fields.next()?;
+    fields.next()?.parse::<u32>().ok().filter(|pid| *pid > 0)
+}
+
 fn force_kill_and_reap(
     child: &mut Child,
     root_process_identity: LocalPerfRootProcessIdentity,
@@ -4783,6 +5028,26 @@ fn validate_process_lifecycle(
     if !valid {
         return Err(LocalPerfRunError::Invalid(
             "attempt process lifecycle disagrees with its typed terminal outcome".to_owned(),
+        ));
+    }
+    let tree_matches_outcome = match lifecycle.process_tree_quiescence {
+        LocalPerfProcessTreeQuiescence::DirectChildOnly => {
+            lifecycle.descendant_processes_observed == 0
+        }
+        LocalPerfProcessTreeQuiescence::LinuxSubreaperVerifiedEmpty => {
+            lifecycle.spawn_succeeded && lifecycle.descendant_processes_observed == 0
+        }
+        LocalPerfProcessTreeQuiescence::LinuxSubreaperReapedEscapedDescendants => {
+            lifecycle.spawn_succeeded && lifecycle.descendant_processes_observed > 0
+        }
+    };
+    if !tree_matches_outcome
+        || (outcome == LocalPerfAttemptOutcome::Completed
+            && !lifecycle.descendant_process_tree_quiescence_is_proven())
+    {
+        return Err(LocalPerfRunError::Invalid(
+            "attempt process lifecycle lacks a completed descendant-tree quiescence proof"
+                .to_owned(),
         ));
     }
     let recovery_matches_outcome = match outcome {
@@ -5044,6 +5309,8 @@ pub fn completed_attempt_receipt_for_test(
             run_log_synced: true,
             run_log_captured: true,
             process_group_recovery: LocalPerfProcessGroupRecovery::NotRequired,
+            process_tree_quiescence: LocalPerfProcessTreeQuiescence::LinuxSubreaperVerifiedEmpty,
+            descendant_processes_observed: 0,
         },
         root_process_identity: LocalPerfRootProcessIdentity::LinuxProcStartTime {
             pid: 37,
@@ -5240,6 +5507,8 @@ mod tests {
                 run_log_synced: true,
                 run_log_captured: true,
                 process_group_recovery: LocalPerfProcessGroupRecovery::NotRequired,
+                process_tree_quiescence: LocalPerfProcessTreeQuiescence::DirectChildOnly,
+                descendant_processes_observed: 0,
             },
             LocalPerfAttemptOutcome::WaitRecoveredByKill { .. } => LocalPerfProcessLifecycle {
                 spawn_attempted: true,
@@ -5249,6 +5518,8 @@ mod tests {
                 run_log_synced: true,
                 run_log_captured: true,
                 process_group_recovery: LocalPerfProcessGroupRecovery::SignaledOwnedGroup,
+                process_tree_quiescence: LocalPerfProcessTreeQuiescence::DirectChildOnly,
+                descendant_processes_observed: 0,
             },
             LocalPerfAttemptOutcome::PostExitRejected {
                 stage: LocalPerfRejectionStage::RunLogSync,
@@ -5260,6 +5531,8 @@ mod tests {
                 run_log_synced: false,
                 run_log_captured: true,
                 process_group_recovery: LocalPerfProcessGroupRecovery::NotRequired,
+                process_tree_quiescence: LocalPerfProcessTreeQuiescence::DirectChildOnly,
+                descendant_processes_observed: 0,
             },
             LocalPerfAttemptOutcome::PostExitRejected {
                 stage: LocalPerfRejectionStage::RunLogRead,
@@ -5271,6 +5544,8 @@ mod tests {
                 run_log_synced: true,
                 run_log_captured: false,
                 process_group_recovery: LocalPerfProcessGroupRecovery::NotRequired,
+                process_tree_quiescence: LocalPerfProcessTreeQuiescence::DirectChildOnly,
+                descendant_processes_observed: 0,
             },
             _ => LocalPerfProcessLifecycle {
                 spawn_attempted: true,
@@ -5280,6 +5555,12 @@ mod tests {
                 run_log_synced: true,
                 run_log_captured: true,
                 process_group_recovery: LocalPerfProcessGroupRecovery::NotRequired,
+                process_tree_quiescence: if outcome == LocalPerfAttemptOutcome::Completed {
+                    LocalPerfProcessTreeQuiescence::LinuxSubreaperVerifiedEmpty
+                } else {
+                    LocalPerfProcessTreeQuiescence::DirectChildOnly
+                },
+                descendant_processes_observed: 0,
             },
         };
         let completed = outcome == LocalPerfAttemptOutcome::Completed;
@@ -5605,7 +5886,10 @@ mod tests {
             source,
             "create_new_file_at(&run_directories.run.handle, \"run.log\")",
         );
-        let child_spawn = unique_marker_offset(source, "let mut child = match child.spawn()");
+        let child_spawn = unique_marker_offset(
+            source,
+            "let (mut child, root_process_identity) = match child.spawn()",
+        );
         assert!(preflight < log_creation);
         assert!(log_creation < child_spawn);
     }
@@ -6681,7 +6965,7 @@ mod tests {
         let source = production_source();
         let wait_start = unique_marker_offset(
             source,
-            "let (status, recovered_wait_error) = match child.wait()",
+            "let (status, recovered_wait_error, process_group_recovery) = match child.wait()",
         );
         let wait_tail = &source[wait_start..];
         let log_capture = wait_start
@@ -6695,6 +6979,11 @@ mod tests {
                 .matches("force_kill_and_reap(&mut child, root_process_identity)")
                 .count(),
             1
+        );
+        assert_eq!(
+            wait_slice.matches(".reconcile_after_root_exit()").count(),
+            1,
+            "root recovery must still reconcile adopted descendants before logs are sealed"
         );
         assert_eq!(
             wait_slice
@@ -6718,6 +7007,8 @@ mod tests {
             run_log_synced: true,
             run_log_captured: true,
             process_group_recovery: LocalPerfProcessGroupRecovery::SignaledOwnedGroup,
+            process_tree_quiescence: LocalPerfProcessTreeQuiescence::DirectChildOnly,
+            descendant_processes_observed: 0,
         };
         assert!(validate_process_lifecycle(recovered, reaped, true).is_ok());
         assert_eq!(
@@ -6755,7 +7046,7 @@ mod tests {
         );
         let waited = unique_marker_offset(
             source,
-            "let (status, recovered_wait_error) = match child.wait()",
+            "let (status, recovered_wait_error, process_group_recovery) = match child.wait()",
         );
         assert!(spawned < captured);
         assert!(captured < waited);
@@ -6788,6 +7079,71 @@ mod tests {
         assert_eq!(recovery, LocalPerfProcessGroupRecovery::SignaledOwnedGroup);
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_subreaper_scope_e2e_runs_in_a_dedicated_test_process() {
+        let status = Command::new(std::env::current_exe().expect("current test executable"))
+            .args([
+                "local_perf_runner::tests::linux_subreaper_scope_isolated_probe",
+                "--exact",
+                "--ignored",
+                "--test-threads=1",
+            ])
+            .status()
+            .expect("run isolated subreaper probe");
+        assert!(status.success(), "isolated subreaper probe must pass");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "must not toggle process-wide subreaper state in the shared unit-test process"]
+    fn linux_subreaper_scope_isolated_probe() {
+        let mut scope =
+            LocalPerfDescendantScope::enter().expect("establish empty descendant scope");
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", "exit 0"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn zero-descendant child");
+        assert!(child.wait().expect("wait zero-descendant child").success());
+        let (quiescence, observed) = scope
+            .reconcile_after_root_exit()
+            .expect("reconcile empty descendant tree");
+        scope.restore().expect("restore subreaper state");
+        assert_eq!(
+            quiescence,
+            LocalPerfProcessTreeQuiescence::LinuxSubreaperVerifiedEmpty
+        );
+        assert_eq!(observed, 0);
+
+        let mut scope =
+            LocalPerfDescendantScope::enter().expect("establish empty descendant scope");
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", "sleep 60 & exit 0"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn background-descendant child");
+        assert!(child.wait().expect("wait root child").success());
+        let (quiescence, observed) = scope
+            .reconcile_after_root_exit()
+            .expect("reap adopted descendant");
+        scope.restore().expect("restore subreaper state");
+        assert_eq!(
+            quiescence,
+            LocalPerfProcessTreeQuiescence::LinuxSubreaperReapedEscapedDescendants
+        );
+        assert!(observed >= 1);
+        assert!(
+            linux_descendant_pids()
+                .expect("scan post-reap child tree")
+                .is_empty()
+        );
+    }
+
     #[test]
     fn completed_receipt_rejects_an_unverifiable_root_pid() {
         let (receipt, _, _) = attempt_fixture(LocalPerfAttemptOutcome::Completed, Some(b"bound"));
@@ -6807,6 +7163,23 @@ mod tests {
             start_time_ticks: 81,
         };
         let bytes = seal_attempt_receipt(receipt).expect("reseal process-group mutation");
+        assert!(LocalPerfAttemptReceipt::from_verified_slice(&bytes).is_err());
+    }
+
+    #[test]
+    fn completed_receipt_rejects_direct_child_only_or_escaped_tree_claims() {
+        let (receipt, _, _) = attempt_fixture(LocalPerfAttemptOutcome::Completed, Some(b"bound"));
+        let mut direct_child_only = receipt.clone();
+        direct_child_only.process_lifecycle.process_tree_quiescence =
+            LocalPerfProcessTreeQuiescence::DirectChildOnly;
+        let bytes = seal_attempt_receipt(direct_child_only).expect("reseal direct-child mutation");
+        assert!(LocalPerfAttemptReceipt::from_verified_slice(&bytes).is_err());
+
+        let mut escaped = receipt;
+        escaped.process_lifecycle.process_tree_quiescence =
+            LocalPerfProcessTreeQuiescence::LinuxSubreaperReapedEscapedDescendants;
+        escaped.process_lifecycle.descendant_processes_observed = 1;
+        let bytes = seal_attempt_receipt(escaped).expect("reseal escaped-tree mutation");
         assert!(LocalPerfAttemptReceipt::from_verified_slice(&bytes).is_err());
     }
 
