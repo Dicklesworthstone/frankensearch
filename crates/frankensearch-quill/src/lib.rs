@@ -56,7 +56,7 @@ pub use index::{
 #[doc(hidden)]
 pub use index::{
     QuillProfileCacheDisposition, QuillProfileExecutionMode, QuillProfileOutcome,
-    QuillProfileReceipt, QuillProfileSession,
+    QuillProfileReceipt,
 };
 #[cfg(feature = "durability")]
 pub use keeper::UnrepairableSegmentPolicy;
