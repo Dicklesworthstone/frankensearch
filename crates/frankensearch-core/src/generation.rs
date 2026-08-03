@@ -234,6 +234,9 @@ pub enum GenerationAuthorityErrorV1 {
     /// The immutable authority counter cannot advance beyond `u64::MAX`.
     #[error("generation authority sequence is exhausted")]
     SequenceExhausted,
+    /// A selected authority is missing or predates the required external floor.
+    #[error("generation authority does not satisfy the required external floor")]
+    AuthorityBelowFloor,
     /// The immutable activation manifest did not match its stored self-seal.
     #[error("generation activation manifest self-seal mismatch")]
     ManifestSelfSealMismatch,
@@ -454,6 +457,44 @@ pub struct AuthoritySlotV1 {
     pub root_id: [u8; 16],
     /// Immutable authority reference carried by the frame.
     pub authority: AuthorityRefV1,
+}
+
+/// An externally retained immutable authority that bounds acceptable recovery.
+///
+/// It is pure evidence, not a filesystem pointer: consumers may require an
+/// exact floor or its immediately predecessor-linked successor without
+/// silently accepting a stale or unprovable authority head.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct AuthorityFloorV1 {
+    /// Root identity that prevents a floor from being replayed across roots.
+    pub root_id: [u8; 16],
+    /// Exact externally retained authority reference.
+    pub authority: AuthorityRefV1,
+}
+
+impl AuthorityFloorV1 {
+    /// Construct and validate one bounded external authority floor.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed error for reserved root or authority values.
+    pub fn new(
+        root_id: [u8; 16],
+        authority: AuthorityRefV1,
+    ) -> Result<Self, GenerationAuthorityErrorV1> {
+        let floor = Self { root_id, authority };
+        floor.validate()?;
+        Ok(floor)
+    }
+
+    fn validate(&self) -> Result<(), GenerationAuthorityErrorV1> {
+        if self.root_id == [0; 16] {
+            return Err(GenerationAuthorityErrorV1::InvalidField {
+                field: "authority_floor.root_id",
+            });
+        }
+        self.authority.validate()
+    }
 }
 
 /// Kind of fixed `LOCK` frame. Owner and attempt remain distinct on disk so an
@@ -879,6 +920,54 @@ pub fn resolve_authority_slot_frames_v1(
         .map(|bytes| AuthoritySlotV1::from_authenticated_bytes(bytes, 1, expected_root_id))
         .transpose()?;
     resolve_authority_slots_v1(first, second)
+}
+
+/// Resolve two authority slots against one exact externally retained floor.
+///
+/// The selected authority must be the exact floor or its immediate
+/// predecessor-linked successor. A later but unprovable head is not selected;
+/// callers must supply its intervening authority evidence explicitly.
+///
+/// # Errors
+///
+/// Returns a typed error for missing/stale authorities, cross-root floors,
+/// equal-sequence divergence, gaps, or sequence exhaustion.
+pub fn resolve_authority_slots_at_floor_v1(
+    first: Option<AuthoritySlotV1>,
+    second: Option<AuthoritySlotV1>,
+    floor: AuthorityFloorV1,
+) -> Result<AuthoritySlotV1, GenerationAuthorityErrorV1> {
+    floor.validate()?;
+    let resolved = resolve_authority_slots_v1(first, second)?
+        .ok_or(GenerationAuthorityErrorV1::AuthorityBelowFloor)?;
+    // ubs:ignore — root IDs are public structural identities.
+    if resolved.root_id != floor.root_id {
+        return Err(GenerationAuthorityErrorV1::RootMismatch);
+    }
+    if resolved.authority.sequence < floor.authority.sequence {
+        return Err(GenerationAuthorityErrorV1::AuthorityBelowFloor);
+    }
+    // ubs:ignore — authority sequences are public monotone counters.
+    if resolved.authority.sequence == floor.authority.sequence {
+        // ubs:ignore — authority references are public immutable identities.
+        if resolved.authority != floor.authority {
+            return Err(GenerationAuthorityErrorV1::EqualSequenceFork);
+        }
+        return Ok(resolved);
+    }
+    let successor = floor
+        .authority
+        .next_sequence()
+        .map_err(|_| GenerationAuthorityErrorV1::SequenceExhausted)?;
+    // ubs:ignore — authority sequences are public monotone counters.
+    if resolved.authority.sequence != successor {
+        return Err(GenerationAuthorityErrorV1::BrokenPredecessorLink);
+    }
+    // ubs:ignore — predecessor fingerprints are public immutable history identities.
+    if resolved.authority.predecessor != Some(floor.authority.fingerprint()) {
+        return Err(GenerationAuthorityErrorV1::BrokenPredecessorLink);
+    }
+    Ok(resolved)
 }
 
 /// Resolve authority slots while refusing to silently step around a valid
@@ -4166,6 +4255,48 @@ mod tests {
             resolve_authority_slot_frames_v1(Some(&first), Some(&corrupt_second), [0x5a; 16]),
             Err(GenerationAuthorityErrorV1::ChecksumMismatch),
             "a present corrupt frame must not be silently treated as absent"
+        );
+    }
+
+    #[test]
+    fn authority_floor_resolver_rejects_stale_forked_and_gapped_heads() {
+        let genesis = authority_reference(1, None);
+        let floor = AuthorityFloorV1::new([0x5a; 16], genesis).expect("valid authority floor");
+        assert_eq!(
+            resolve_authority_slots_at_floor_v1(Some(authority_slot(0, genesis)), None, floor),
+            Ok(authority_slot(0, genesis)),
+            "the exact retained authority is selectable"
+        );
+
+        let successor = authority_reference(2, Some(genesis.fingerprint()));
+        assert_eq!(
+            resolve_authority_slots_at_floor_v1(Some(authority_slot(0, successor)), None, floor),
+            Ok(authority_slot(0, successor)),
+            "the immediate predecessor-linked successor is selectable"
+        );
+
+        let fork = AuthorityRefV1::new(1, [0x91; 16], 4_097, [0x92; 32], None)
+            .expect("well-formed forked authority");
+        assert_eq!(
+            resolve_authority_slots_at_floor_v1(Some(authority_slot(1, fork)), None, floor),
+            Err(GenerationAuthorityErrorV1::EqualSequenceFork),
+            "equal floor sequence with another immutable object is a fork"
+        );
+
+        let gap = AuthorityRefV1::new(3, [0x93; 16], 4_099, [0x94; 32], Some([0x95; 32]))
+            .expect("well-formed but unprovable authority gap");
+        assert_eq!(
+            resolve_authority_slots_at_floor_v1(Some(authority_slot(1, gap)), None, floor),
+            Err(GenerationAuthorityErrorV1::BrokenPredecessorLink),
+            "a head beyond the immediate anchored successor requires more evidence"
+        );
+
+        let mut foreign_root = authority_slot(0, successor);
+        foreign_root.root_id = [0x96; 16];
+        assert_eq!(
+            resolve_authority_slots_at_floor_v1(Some(foreign_root), None, floor),
+            Err(GenerationAuthorityErrorV1::RootMismatch),
+            "an externally retained floor cannot be replayed across roots"
         );
     }
 
