@@ -11738,19 +11738,25 @@ mod tests {
         expected: ComparisonReport,
     }
 
+    fn load_pinned_stored_v7_rank_corpus(
+        bytes: &[u8],
+    ) -> Result<Vec<StoredV7RankCorpusCase>, String> {
+        const PINNED_SHA256: &str =
+            "7499b43d0b6fd0d024266ae793a9f9a6690b054cfee292b1ba872354d77996a1";
+        match lower_hex(&Sha256::digest(bytes)).as_str() {
+            PINNED_SHA256 => {}
+            _ => {
+                return Err("stored V7 rank corpus bytes differ from the pinned SHA-256".to_owned());
+            }
+        }
+        serde_json::from_slice(bytes).map_err(|error| error.to_string())
+    }
+
     #[test]
     fn pinned_stored_v7_rank_corpus_replays_without_live_creation() {
         const PINNED_BYTES: &[u8] =
             include_bytes!("../fixtures/campaign-report-v7-rank-corpus.json");
-        const PINNED_SHA256: &str =
-            "7499b43d0b6fd0d024266ae793a9f9a6690b054cfee292b1ba872354d77996a1";
-
-        assert_eq!(
-            lower_hex(&Sha256::digest(PINNED_BYTES)),
-            PINNED_SHA256,
-            "stored V7 rank corpus bytes must remain pinned"
-        );
-        let cases = serde_json::from_slice::<Vec<StoredV7RankCorpusCase>>(PINNED_BYTES)
+        let cases = load_pinned_stored_v7_rank_corpus(PINNED_BYTES)
             .expect("stored V7 rank corpus must decode");
         assert_eq!(cases.len(), 2, "bounded corpus cardinality");
 
@@ -11763,5 +11769,15 @@ mod tests {
                 case.name
             );
         }
+
+        let mut substituted = PINNED_BYTES.to_vec();
+        let Some(first_byte) = substituted.first_mut() else {
+            return;
+        };
+        *first_byte ^= 1;
+        assert!(
+            load_pinned_stored_v7_rank_corpus(&substituted).is_err(),
+            "a regenerated or substituted rank corpus must be refused before replay"
+        );
     }
 }
