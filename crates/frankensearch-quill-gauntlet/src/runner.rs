@@ -17325,39 +17325,54 @@ mod tests {
             }
 
             // Typed-error lane: phrase slop is a declared Quill capability gap.
-            // The subject must refuse with its exact typed error while the
-            // oracle executes — never a fabricated comparison, never a silent
-            // wrong result.
-            let slop_query = format!(
-                "\"{} {}\"~2",
-                vocabulary[0],
-                vocabulary[1.min(vocabulary.len() - 1)]
-            );
-            let slop_case = DifferentialCase {
-                fixture_id: "bsjw-typed-error-slop".to_owned(),
-                query: slop_query.clone(),
-                limit: 20,
-                offset: 0,
-                tie_expansion_limit: 256,
-                count_requested: false,
-                snippet_max_chars: None,
-                metadata: DifferentialCaseMetadata {
-                    generator_id: Some("bsjw-query-tree-v1".to_owned()),
-                    generator_seed: None,
-                    corpus_hash: Some(corpus_hash.clone()),
-                },
-            };
-            let subject_outcome =
-                crate::engine::GauntletEngine::observe(&subject, &cx, &slop_case).await;
-            let subject_error = subject_outcome
-                .expect_err("phrase slop must be a typed Quill refusal, not a silent execution");
-            assert!(
-                subject_error.to_string().contains("slop"),
-                "slop refusal must name the capability: {subject_error}"
-            );
-            crate::engine::GauntletEngine::observe(&oracle, &cx, &slop_case)
-                .await
-                .expect("the oracle executes the slop query the subject refuses");
+            // The subject must refuse every generated slop AST with its exact
+            // typed error while the oracle executes. Crucially, the ordinary
+            // differential harness must also stop at that error instead of
+            // fabricating a comparison report from one engine's result.
+            for (label, slop) in [("one", 1_u32), ("two", 2), ("wide", 9)] {
+                let slop_query = format!(
+                    "\"{} {}\"~{slop}",
+                    vocabulary[0],
+                    vocabulary[1.min(vocabulary.len() - 1)]
+                );
+                let slop_case = DifferentialCase {
+                    fixture_id: format!("bsjw-typed-error-slop-{label}"),
+                    query: slop_query.clone(),
+                    limit: 20,
+                    offset: 0,
+                    tie_expansion_limit: 256,
+                    count_requested: false,
+                    snippet_max_chars: None,
+                    metadata: DifferentialCaseMetadata {
+                        generator_id: Some("bsjw-query-tree-v1".to_owned()),
+                        generator_seed: Some(u64::from(slop)),
+                        corpus_hash: Some(corpus_hash.clone()),
+                    },
+                };
+                let subject_error =
+                    crate::engine::GauntletEngine::observe(&subject, &cx, &slop_case)
+                        .await
+                        .expect_err(
+                            "phrase slop must be a typed Quill refusal, not a silent execution",
+                        );
+                assert!(
+                    subject_error.to_string().contains("slop"),
+                    "slop refusal must name the capability for {label}: {subject_error}"
+                );
+                crate::engine::GauntletEngine::observe(&oracle, &cx, &slop_case)
+                    .await
+                    .unwrap_or_else(|error| {
+                        panic!("the oracle must execute slop case {label}: {error}")
+                    });
+                let harness_error = harness
+                    .run(&cx, &subject, &oracle, &slop_case)
+                    .await
+                    .expect_err("a typed subject refusal must not manufacture a comparison report");
+                assert!(
+                    harness_error.to_string().contains("slop"),
+                    "harness must preserve the typed slop refusal for {label}: {harness_error}"
+                );
+            }
         });
     }
 
