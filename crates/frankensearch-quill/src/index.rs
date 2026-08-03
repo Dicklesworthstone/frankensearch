@@ -10016,6 +10016,9 @@ enum QueryLoweringMode {
     Unscored,
 }
 
+// `'a` is load-bearing under `pruning-conformance`, where the checkpoint
+// parameter shares it; elision only type-checks with the feature off.
+#[allow(clippy::elidable_lifetime_names)]
 fn lower_boolean<'a>(
     clauses: Vec<ScorerClause<'a>>,
     mode: QueryLoweringMode,

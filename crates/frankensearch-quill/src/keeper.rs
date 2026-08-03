@@ -17312,7 +17312,7 @@ mod tests {
         use rustix::fs::{AtFlags, statat};
 
         let directory = tempdir()?;
-        let unreachable = write_test_segment(directory.path(), 0xc0ff_ee, 1, 0, 2)?;
+        let unreachable = write_test_segment(directory.path(), 0x00c0_ffee, 1, 0, 2)?;
         let segment_name = canonical_segment_name(unreachable.segment_id);
         let segment_path = directory.path().join(&segment_name);
         File::options()
