@@ -3109,6 +3109,15 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "perf-harness")]
+    fn e63_seeded_flush_batch_size(seed: u64) -> usize {
+        match seed % 3 {
+            0 => 1,
+            1 => 2,
+            _ => 3,
+        }
+    }
+
     struct CountingEngine {
         descriptor: EngineDescriptor,
         observe_calls: Arc<AtomicUsize>,
@@ -6581,6 +6590,157 @@ mod tests {
                     ComparisonStatus::Failed,
                     "E6.3 {engine} incorrectly accepted a content mutation as bulk cadence",
                 );
+            }
+        });
+    }
+
+    /// E6.3 seeded property campaign for the qualified flush-batch schedule
+    /// law. A tight segment geometry makes every batch boundary observable to
+    /// the writer lifecycle, while the final corpus, stable IDs, query policy,
+    /// and scalar scoring contract stay fixed. The batch schedule is generated
+    /// from a replayable seed rather than selected per fixture. A changed
+    /// document payload remains an intentionally invalid control for each arm.
+    #[cfg(feature = "perf-harness")]
+    #[test]
+    fn e63_flush_batch_seed_matrix_preserves_observations_but_content_mutation_does_not() {
+        use frankensearch_core::IndexableDocument;
+
+        const SEEDS: [u64; 3] = [
+            0xe63_f1a5_5eed_0001,
+            0xe63_f1a5_5eed_0002,
+            0xe63_f1a5_5eed_0003,
+        ];
+        let documents = vec![
+            IndexableDocument::new("doc-1", "alpha beta beta").with_title("guide"),
+            IndexableDocument::new("doc-2", "alpha gamma").with_title("alpha overview"),
+            IndexableDocument::new("doc-3", "beta gamma gamma gamma").with_title("alpha"),
+            IndexableDocument::new("doc-4", "alpha beta gamma delta").with_title("reference"),
+            IndexableDocument::new("doc-5", "delta epsilon").with_title("quiet"),
+        ];
+        let queries = [
+            ("bare-term", "alpha"),
+            ("boolean-and", "alpha AND beta"),
+            ("negative-sentinel", "saffron"),
+        ];
+        let tight_geometry = QuillConfig {
+            scribe_shard_budget_bytes: 1,
+            delta_budget_bytes: 1,
+            tier_fanout: 2,
+            ..e55_config()
+        };
+        let mut content_mutated = documents.clone();
+        content_mutated[3] =
+            IndexableDocument::new("doc-4", "alpha beta saffron").with_title("reference");
+
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            for seed in SEEDS {
+                let batch_size = e63_seeded_flush_batch_size(seed);
+                assert_ne!(
+                    batch_size,
+                    documents.len(),
+                    "E6.3 seed {seed:#x} must exercise a real flush-batch transform",
+                );
+                assert_eq!(
+                    batch_size,
+                    e63_seeded_flush_batch_size(seed),
+                    "E6.3 seed {seed:#x} must replay its batch schedule byte-identically",
+                );
+                let baseline = e63_observations_with_config_and_batch_size(
+                    &cx,
+                    &documents,
+                    &queries,
+                    seed,
+                    "e6.3-flush-batch-schedule-v1",
+                    tight_geometry.clone(),
+                    documents.len(),
+                )
+                .await;
+                let transformed = e63_observations_with_config_and_batch_size(
+                    &cx,
+                    &documents,
+                    &queries,
+                    seed,
+                    "e6.3-flush-batch-schedule-v1",
+                    tight_geometry.clone(),
+                    batch_size,
+                )
+                .await;
+                let invalid = e63_observations_with_config_and_batch_size(
+                    &cx,
+                    &content_mutated,
+                    &queries,
+                    seed,
+                    "e6.3-flush-batch-schedule-v1",
+                    tight_geometry.clone(),
+                    batch_size,
+                )
+                .await;
+
+                for (
+                    (baseline_id, baseline_quill, baseline_tantivy),
+                    (transformed_id, transformed_quill, transformed_tantivy),
+                ) in baseline.iter().zip(&transformed)
+                {
+                    assert_eq!(
+                        baseline_id, transformed_id,
+                        "E6.3 seed {seed:#x} flush-batch case identity drifted"
+                    );
+                    for (engine, before, after) in [
+                        ("Quill", baseline_quill, transformed_quill),
+                        ("Tantivy", baseline_tantivy, transformed_tantivy),
+                    ] {
+                        let comparison = compare_observations(
+                            before.clone(),
+                            after.clone(),
+                            ComparatorConfig::default(),
+                        )
+                        .unwrap_or_else(|error| {
+                            panic!(
+                                "E6.3 {engine} seed {seed:#x} {baseline_id} flush-batch comparison failed: {error}"
+                            )
+                        });
+                        assert!(
+                            matches!(
+                                comparison.rank_class,
+                                RankClass::RankExact | RankClass::TieOrder
+                            ) && comparison
+                                .divergences
+                                .iter()
+                                .all(|divergence| divergence.class == DivergenceClass::TieOrder),
+                            "E6.3 {engine} seed {seed:#x} {baseline_id} produced a non-tie divergence under flush batching: {:?}",
+                            comparison.divergences,
+                        );
+                    }
+                }
+
+                let baseline_sentinel = baseline
+                    .iter()
+                    .find(|(case_id, _, _)| case_id == "negative-sentinel")
+                    .expect("E6.3 baseline flush-batch negative fixture");
+                let invalid_sentinel = invalid
+                    .iter()
+                    .find(|(case_id, _, _)| case_id == "negative-sentinel")
+                    .expect("E6.3 invalid flush-batch negative fixture");
+                for (engine, before, after) in [
+                    ("Quill", &baseline_sentinel.1, &invalid_sentinel.1),
+                    ("Tantivy", &baseline_sentinel.2, &invalid_sentinel.2),
+                ] {
+                    let comparison = compare_observations(
+                        before.clone(),
+                        after.clone(),
+                        ComparatorConfig::default(),
+                    )
+                    .unwrap_or_else(|error| {
+                        panic!(
+                            "E6.3 {engine} seed {seed:#x} invalid flush-batch comparison failed: {error}"
+                        )
+                    });
+                    assert_eq!(
+                        comparison.status,
+                        ComparisonStatus::Failed,
+                        "E6.3 {engine} seed {seed:#x} incorrectly accepted a content mutation as flush batching",
+                    );
+                }
             }
         });
     }
