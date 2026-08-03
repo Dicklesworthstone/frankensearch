@@ -55,7 +55,7 @@ use crate::{PerfCellApplicability, PerfCellApplicabilityReason};
 const PRODUCER_CONTRACT_SCHEMA_VERSION: &str =
     "frankensearch.quill-local-perf-producer-contract.v1";
 /// Strict wire schema for one local-run process-attempt receipt.
-pub const LOCAL_PERF_ATTEMPT_RECEIPT_SCHEMA_VERSION: &str = "frankensearch.perf-runner-attempt.v8";
+pub const LOCAL_PERF_ATTEMPT_RECEIPT_SCHEMA_VERSION: &str = "frankensearch.perf-runner-attempt.v9";
 /// Strict schema for the diagnostic inventory retained before runner completion.
 pub const PERF_RUN_PRECOMMIT_SCHEMA_VERSION: &str = "frankensearch.perf-run-precommit.v5";
 const MAX_IDENTITY_COMPONENT_BYTES: usize = 96;
@@ -256,7 +256,8 @@ struct LocalPerfProducerContract {
     producer: RunnerProducer,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct LeaseFileIdentity {
     device: String,
     inode: String,
@@ -668,6 +669,7 @@ pub struct LocalPerfAttemptReceipt {
     run_id: String,
     run_window: String,
     registry_sha256: String,
+    lease_file_identity: LeaseFileIdentity,
     hardware: RunnerHardware,
     execution_request: RunnerExecutionRequest,
     execution_start: RunnerExecutionSnapshot,
@@ -1020,6 +1022,7 @@ impl LocalPerfAttemptReceipt {
         }
         validate_component(&self.run_id, "attempt run ID")?;
         validate_component(&self.run_window, "attempt run window")?;
+        validate_lease_file_identity(&self.lease_file_identity)?;
         let gate = self.gate.parse::<PerfGate>().map_err(|error| {
             LocalPerfRunError::Invalid(format!("attempt receipt names an invalid gate: {error}"))
         })?;
@@ -1402,6 +1405,7 @@ fn run_local_perf_command_inner(
                 &producer_before,
                 &external_paths,
                 &start,
+                &lease_identity,
                 outcome,
                 process_lifecycle,
                 LocalPerfRootProcessIdentity::NotSpawned,
@@ -1462,6 +1466,7 @@ fn run_local_perf_command_inner(
             &producer_before,
             &external_paths,
             &start,
+            &lease_identity,
             outcome,
             process_lifecycle,
             root_process_identity,
@@ -1489,6 +1494,7 @@ fn run_local_perf_command_inner(
                 &producer_before,
                 &external_paths,
                 &start,
+                &lease_identity,
                 outcome,
                 process_lifecycle,
                 root_process_identity,
@@ -1522,6 +1528,7 @@ fn run_local_perf_command_inner(
             &producer_before,
             &external_paths,
             &start,
+            &lease_identity,
             outcome,
             process_lifecycle,
             root_process_identity,
@@ -1545,6 +1552,7 @@ fn run_local_perf_command_inner(
             &producer_before,
             &external_paths,
             &start,
+            &lease_identity,
             outcome,
             process_lifecycle,
             root_process_identity,
@@ -1579,6 +1587,7 @@ fn run_local_perf_command_inner(
             &producer_before,
             &external_paths,
             &start,
+            &lease_identity,
             outcome,
             process_lifecycle,
             root_process_identity,
@@ -1603,6 +1612,7 @@ fn run_local_perf_command_inner(
             &producer_before,
             &external_paths,
             &start,
+            &lease_identity,
             outcome,
             process_lifecycle,
             root_process_identity,
@@ -1859,6 +1869,7 @@ fn run_local_perf_command_inner(
         &captured_build,
         &start,
         &end,
+        &lease_identity,
         &bound_evidence_bytes,
         &run_log_bytes,
         process_lifecycle,
@@ -3566,6 +3577,18 @@ fn checked_lease_identity(lease_file: &impl AsFd) -> Result<LeaseFileIdentity, L
     })
 }
 
+fn validate_lease_file_identity(identity: &LeaseFileIdentity) -> Result<(), LocalPerfRunError> {
+    for (label, value) in [("device", &identity.device), ("inode", &identity.inode)] {
+        if value.is_empty() || value.len() > 20 || !value.bytes().all(|byte| byte.is_ascii_digit())
+        {
+            return Err(LocalPerfRunError::Invalid(format!(
+                "attempt receipt lease {label} identity is not a bounded decimal value"
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn verify_family_lease_path(
     lease_path: &Path,
     expected: &LeaseFileIdentity,
@@ -4249,6 +4272,7 @@ fn write_failed_attempt_receipt(
     producer: &ExecutingProducer,
     paths: &ExternalRunPaths,
     start: &PlatformCapture,
+    lease_file_identity: &LeaseFileIdentity,
     outcome: LocalPerfAttemptOutcome,
     process_lifecycle: LocalPerfProcessLifecycle,
     root_process_identity: LocalPerfRootProcessIdentity,
@@ -4323,6 +4347,7 @@ fn write_failed_attempt_receipt(
         directories,
         build,
         start,
+        lease_file_identity,
         execution_end,
         end_capture_error,
         post_run_identity_verified,
@@ -4353,6 +4378,7 @@ fn completed_attempt_receipt_bytes(
     build: &CapturedBuild,
     start: &PlatformCapture,
     end: &PlatformCapture,
+    lease_file_identity: &LeaseFileIdentity,
     bound_evidence_bytes: &[u8],
     run_log_bytes: &[u8],
     process_lifecycle: LocalPerfProcessLifecycle,
@@ -4397,6 +4423,7 @@ fn completed_attempt_receipt_bytes(
         durability,
         build,
         start,
+        lease_file_identity,
         Some(end.snapshot.clone()),
         None,
         true,
@@ -4421,6 +4448,7 @@ fn persist_attempt_receipt(
     directories: &RunDirectories,
     build: &CapturedBuild,
     start: &PlatformCapture,
+    lease_file_identity: &LeaseFileIdentity,
     execution_end: Option<RunnerExecutionSnapshot>,
     end_capture_error: Option<String>,
     post_run_identity_verified: bool,
@@ -4441,6 +4469,7 @@ fn persist_attempt_receipt(
         durability,
         build,
         start,
+        lease_file_identity,
         execution_end,
         end_capture_error,
         post_run_identity_verified,
@@ -4473,6 +4502,7 @@ fn build_attempt_receipt_bytes(
     durability: &RunnerDurability,
     build: &CapturedBuild,
     start: &PlatformCapture,
+    lease_file_identity: &LeaseFileIdentity,
     execution_end: Option<RunnerExecutionSnapshot>,
     end_capture_error: Option<String>,
     post_run_identity_verified: bool,
@@ -4520,6 +4550,7 @@ fn build_attempt_receipt_bytes(
         run_id: config.run_id.clone(),
         run_window: config.run_window.clone(),
         registry_sha256: MACHINE_CLASS_REGISTRY_SHA256.to_owned(),
+        lease_file_identity: lease_file_identity.clone(),
         hardware: start.hardware.clone(),
         execution_request: start.request.clone(),
         execution_start: start.snapshot.clone(),
@@ -5288,6 +5319,10 @@ pub fn completed_attempt_receipt_for_test(
         run_id: artifact.provenance.run_id.clone(),
         run_window: artifact.provenance.run_window.clone(),
         registry_sha256: MACHINE_CLASS_REGISTRY_SHA256.to_owned(),
+        lease_file_identity: LeaseFileIdentity {
+            device: "1".to_owned(),
+            inode: "2".to_owned(),
+        },
         hardware: runner.hardware,
         execution_request: runner.execution.request,
         execution_start: runner.execution.start,
@@ -5609,6 +5644,10 @@ mod tests {
             run_id: "attempt-1".to_owned(),
             run_window: "window-1".to_owned(),
             registry_sha256: MACHINE_CLASS_REGISTRY_SHA256.to_owned(),
+            lease_file_identity: LeaseFileIdentity {
+                device: "1".to_owned(),
+                inode: "2".to_owned(),
+            },
             hardware: runner.hardware,
             execution_request: runner.execution.request,
             execution_start: runner.execution.start,
@@ -6625,6 +6664,12 @@ mod tests {
         let mut timestamp_tamper = receipt.clone();
         timestamp_tamper.finished_at_utc = "0001-01-01T00:00:00Z".to_owned();
         let bytes = seal_attempt_receipt(timestamp_tamper).expect("reseal timestamp tamper");
+        assert!(LocalPerfAttemptReceipt::from_verified_slice(&bytes).is_err());
+
+        let mut lease_identity_tamper = receipt.clone();
+        lease_identity_tamper.lease_file_identity.inode = "not-an-inode".to_owned();
+        let bytes =
+            seal_attempt_receipt(lease_identity_tamper).expect("reseal lease identity tamper");
         assert!(LocalPerfAttemptReceipt::from_verified_slice(&bytes).is_err());
 
         let mut window_tamper = receipt;
