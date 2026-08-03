@@ -181,6 +181,12 @@ pub struct GenerationRootFileWitnessV1 {
     pub mtime: (i64, u64),
     /// Status-change timestamp seconds and nanoseconds.
     pub ctime: (i64, u64),
+    /// Last-access timestamp seconds and nanoseconds.
+    ///
+    /// This is part of the retained descriptor's mutation witness: an
+    /// out-of-band reader that mutates access time must invalidate admission
+    /// instead of being silently invisible to the before/after comparison.
+    pub atime: (i64, u64),
 }
 
 /// A descriptor-retained, byte-exact immutable file admitted below a trusted
@@ -401,6 +407,7 @@ fn file_witness(
         size,
         mtime: (stat.st_mtime, stat.st_mtime_nsec),
         ctime: (stat.st_ctime, stat.st_ctime_nsec),
+        atime: (stat.st_atime, stat.st_atime_nsec),
     })
 }
 
@@ -559,6 +566,11 @@ mod tests {
         assert_eq!(retained.bytes().as_ref(), b"immutable authority bytes");
         assert_eq!(retained.witness().uid, metadata.uid());
         assert_eq!(retained.witness().size, 25);
+        assert_eq!(
+            retained.witness().atime,
+            (metadata.atime(), metadata.atime_nsec() as u64),
+            "the retained descriptor witness includes access-time identity"
+        );
 
         assert!(
             matches!(
