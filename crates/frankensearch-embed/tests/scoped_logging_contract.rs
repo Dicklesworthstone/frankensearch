@@ -211,6 +211,16 @@ fn terminate_and_reap(child: &mut Child) -> ExitStatus {
     if let Some(status) = child.try_wait().expect("child status must be observable") {
         return status;
     }
+    #[cfg(unix)]
+    {
+        let process_group = format!("-{}", child.id());
+        let _ = Command::new("kill")
+            .arg("-TERM")
+            .arg("--")
+            .arg(process_group)
+            .status();
+    }
+    #[cfg(not(unix))]
     let _ = child.kill();
     child.wait().expect("terminated child must be reaped")
 }
@@ -286,6 +296,12 @@ fn spawn_child(case: &str, rust_log: Option<OsString>) -> Child {
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+
+        command.process_group(0);
+    }
     if let Some(rust_log) = rust_log {
         command.env("RUST_LOG", rust_log);
     }
