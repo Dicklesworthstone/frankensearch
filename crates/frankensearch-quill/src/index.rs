@@ -1951,6 +1951,42 @@ pub enum QuillProfileOutcome {
     OtherError,
 }
 
+/// Per-kind query-work observations from the ordinary checkpoint path.
+///
+/// Each tuple is ordered as segment, dictionary block, posting block, and
+/// position document. Requested units reached the checkpoint; admitted units
+/// were allowed to enter shipping work; refused units exceeded the shipping
+/// fuel budget. Cancellation is reported separately on [`QuillProfileReceipt`].
+#[cfg(feature = "profile-internals")]
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct QuillProfileWorkUnits {
+    requested: [u64; 4],
+    admitted: [u64; 4],
+    refused: [u64; 4],
+}
+
+#[cfg(feature = "profile-internals")]
+impl QuillProfileWorkUnits {
+    /// Requested units by kind: segment, dictionary, posting, position.
+    #[must_use]
+    pub const fn requested(&self) -> [u64; 4] {
+        self.requested
+    }
+
+    /// Admitted units by kind: segment, dictionary, posting, position.
+    #[must_use]
+    pub const fn admitted(&self) -> [u64; 4] {
+        self.admitted
+    }
+
+    /// Fuel-refused units by kind: segment, dictionary, posting, position.
+    #[must_use]
+    pub const fn refused(&self) -> [u64; 4] {
+        self.refused
+    }
+}
+
 /// Immutable counters and single-assignment facts from one diagnostic query.
 #[cfg(feature = "profile-internals")]
 #[doc(hidden)]
@@ -1968,6 +2004,7 @@ pub struct QuillProfileReceipt {
     term_dictionary_views: u64,
     segments_lowered: u64,
     fuel_units: u64,
+    work_units: QuillProfileWorkUnits,
     cancellation_observations: u64,
     overflowed: bool,
     outcome: QuillProfileOutcome,
@@ -2047,6 +2084,12 @@ impl QuillProfileReceipt {
         )
     }
 
+    /// Requested, admitted, and fuel-refused work units by checkpoint kind.
+    #[must_use]
+    pub const fn work_units(&self) -> QuillProfileWorkUnits {
+        self.work_units
+    }
+
     /// Number of cancellation checks that observed an already-cancelled Cx.
     #[must_use]
     pub const fn cancellation_observations(&self) -> u64 {
@@ -2085,6 +2128,9 @@ pub struct QuillProfileSession {
     term_dictionary_views: AtomicU64,
     segments_lowered: AtomicU64,
     fuel_units: AtomicU64,
+    work_requested: [AtomicU64; 4],
+    work_admitted: [AtomicU64; 4],
+    work_refused: [AtomicU64; 4],
     cancellation_observations: AtomicU64,
     overflowed: AtomicBool,
     state: StdMutex<QuillProfileSessionState>,
@@ -2119,6 +2165,9 @@ impl QuillProfileSession {
             term_dictionary_views: AtomicU64::new(0),
             segments_lowered: AtomicU64::new(0),
             fuel_units: AtomicU64::new(0),
+            work_requested: std::array::from_fn(|_| AtomicU64::new(0)),
+            work_admitted: std::array::from_fn(|_| AtomicU64::new(0)),
+            work_refused: std::array::from_fn(|_| AtomicU64::new(0)),
             cancellation_observations: AtomicU64::new(0),
             overflowed: AtomicBool::new(false),
             state: StdMutex::new(QuillProfileSessionState {
@@ -2226,6 +2275,28 @@ impl QuillProfileSession {
         self.record_counter(&self.cancellation_observations, 1);
     }
 
+    fn record_work_requested(&self, kind: QueryWorkKind, units: u64) {
+        self.record_work_counter(&self.work_requested, kind, units);
+    }
+
+    fn record_work_admitted(&self, kind: QueryWorkKind, units: u64) {
+        self.record_work_counter(&self.work_admitted, kind, units);
+    }
+
+    fn record_work_refused(&self, kind: QueryWorkKind, units: u64) {
+        self.record_work_counter(&self.work_refused, kind, units);
+    }
+
+    fn record_work_counter(&self, counters: &[AtomicU64; 4], kind: QueryWorkKind, units: u64) {
+        let index = match kind {
+            QueryWorkKind::Segment => 0,
+            QueryWorkKind::DictionaryBlock => 1,
+            QueryWorkKind::PostingBlock => 2,
+            QueryWorkKind::PositionDocument => 3,
+        };
+        self.record_counter(&counters[index], units);
+    }
+
     fn record_counter(&self, counter: &AtomicU64, units: u64) {
         if units == 0 {
             return;
@@ -2285,6 +2356,20 @@ impl QuillProfileSession {
             term_dictionary_views: self.term_dictionary_views.load(Ordering::Acquire),
             segments_lowered: self.segments_lowered.load(Ordering::Acquire),
             fuel_units: self.fuel_units.load(Ordering::Acquire),
+            work_units: QuillProfileWorkUnits {
+                requested: self
+                    .work_requested
+                    .each_ref()
+                    .map(|counter| counter.load(Ordering::Acquire)),
+                admitted: self
+                    .work_admitted
+                    .each_ref()
+                    .map(|counter| counter.load(Ordering::Acquire)),
+                refused: self
+                    .work_refused
+                    .each_ref()
+                    .map(|counter| counter.load(Ordering::Acquire)),
+            },
             cancellation_observations: self.cancellation_observations.load(Ordering::Acquire),
             overflowed,
             outcome,
@@ -3289,6 +3374,13 @@ impl QueryWorkCheckpoint for QueryCheckpoint<'_> {
         #[cfg(feature = "conformance-internals")]
         self.conformance_controller
             .checkpoint(ConformanceCancellationStage::QueryCollection, self.cx);
+        if units == 0 {
+            return Ok(());
+        }
+        #[cfg(feature = "profile-internals")]
+        if let Some(profile) = self.profile {
+            profile.record_work_requested(kind, units);
+        }
         if self.cx.is_cancel_requested() {
             #[cfg(feature = "profile-internals")]
             if let Some(profile) = self.profile {
@@ -3296,13 +3388,11 @@ impl QueryWorkCheckpoint for QueryCheckpoint<'_> {
             }
             return Err(ArgusError::QueryCancelled { phase: self.phase });
         }
-        if units == 0 {
-            return Ok(());
-        }
         if !self.metering {
             #[cfg(feature = "profile-internals")]
             if let Some(profile) = self.profile {
                 profile.record_fuel_units(units);
+                profile.record_work_admitted(kind, units);
             }
             return Ok(());
         }
@@ -3316,7 +3406,13 @@ impl QueryWorkCheckpoint for QueryCheckpoint<'_> {
                 });
         let previous = match admitted {
             Ok(previous) => previous,
-            Err(consumed) => return Err(self.exhausted(consumed)),
+            Err(consumed) => {
+                #[cfg(feature = "profile-internals")]
+                if let Some(profile) = self.profile {
+                    profile.record_work_refused(kind, units);
+                }
+                return Err(self.exhausted(consumed));
+            }
         };
         debug_assert!(previous.saturating_add(units) <= self.budget);
         let counter = match kind {
@@ -3329,6 +3425,7 @@ impl QueryWorkCheckpoint for QueryCheckpoint<'_> {
         #[cfg(feature = "profile-internals")]
         if let Some(profile) = self.profile {
             profile.record_fuel_units(units);
+            profile.record_work_admitted(kind, units);
         }
         Ok(())
     }
@@ -14842,6 +14939,10 @@ mod tests {
             assert_eq!(repeat_receipt.execution(), None);
             assert_eq!(repeat_receipt.work_plan(), None);
             assert_eq!(repeat_receipt.counters(), (0, 0, 0, 0, 0));
+            assert_eq!(
+                repeat_receipt.work_units(),
+                QuillProfileWorkUnits::default()
+            );
             assert_eq!(repeat_receipt.outcome(), QuillProfileOutcome::Completed);
         });
     }
@@ -14875,6 +14976,7 @@ mod tests {
             assert_eq!(receipt.execution(), None);
             assert_eq!(receipt.work_plan(), None);
             assert_eq!(receipt.counters(), (0, 0, 0, 0, 0));
+            assert_eq!(receipt.work_units(), QuillProfileWorkUnits::default());
             assert_eq!(receipt.cancellation_observations(), 1);
             assert_eq!(receipt.outcome(), QuillProfileOutcome::Cancelled);
         });
@@ -14905,6 +15007,7 @@ mod tests {
             assert_eq!(receipt.execution(), None);
             assert!(receipt.work_plan().is_some());
             assert_eq!(receipt.counters(), (0, 0, 0, 0, 0));
+            assert_eq!(receipt.work_units(), QuillProfileWorkUnits::default());
             assert_eq!(receipt.outcome(), QuillProfileOutcome::Completed);
         });
     }
