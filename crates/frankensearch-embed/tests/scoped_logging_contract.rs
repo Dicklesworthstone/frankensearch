@@ -8,6 +8,7 @@
 use std::{
     ffi::OsString,
     io::{Read, Write},
+    path::PathBuf,
     process::{Child, Command, ExitStatus, Stdio},
     sync::mpsc::{self, RecvTimeoutError},
     thread,
@@ -317,6 +318,58 @@ fn assert_marker_is_suppressed(case: &str, output: &ChildOutput) {
     assert!(
         !output.contains(TOKENIZERS_TRACE_MARKER),
         "{case} must not expose tokenizers TRACE records:\n{output}"
+    );
+}
+
+fn workspace_root() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(|path| path.parent())
+        .expect("embed manifest must be two directories below the workspace root")
+        .to_path_buf()
+}
+
+fn lock_package_block<'a>(lock: &'a str, name: &str, version: &str) -> &'a str {
+    lock.split("\n[[package]]")
+        .find(|block| {
+            block.contains(&format!("name = \"{name}\""))
+                && block.contains(&format!("version = \"{version}\""))
+        })
+        .unwrap_or_else(|| panic!("Cargo.lock must contain {name} {version}"))
+}
+
+#[test]
+fn fresh_process_contract_binds_pinned_dependency_and_source_identities() {
+    let root = workspace_root();
+    let lock = std::fs::read_to_string(root.join("Cargo.lock"))
+        .expect("fresh-process contract must read the workspace Cargo.lock");
+    for (name, version) in [("asupersync", "0.3.10"), ("tokenizers", "0.23.1")] {
+        let block = lock_package_block(&lock, name, version);
+        assert!(
+            block.contains("source = \"registry+https://github.com/rust-lang/crates.io-index\""),
+            "{name} {version} must be a registry-pinned dependency"
+        );
+        let checksum = block
+            .lines()
+            .find_map(|line| line.strip_prefix("checksum = \"")?.strip_suffix('"'))
+            .expect("registry package must carry a Cargo.lock checksum");
+        assert_eq!(checksum.len(), 64, "checksum must be a SHA-256 hex digest");
+        assert!(
+            checksum.bytes().all(|byte| byte.is_ascii_hexdigit()),
+            "checksum must be hexadecimal"
+        );
+    }
+
+    assert!(
+        std::env::current_exe()
+            .expect("fresh-process test binary must exist")
+            .is_file(),
+        "fresh-process contract must execute a concrete test binary"
+    );
+    assert!(
+        root.join("crates/frankensearch-embed/tests/scoped_logging_contract.rs")
+            .is_file(),
+        "fresh-process contract source must be present"
     );
 }
 
