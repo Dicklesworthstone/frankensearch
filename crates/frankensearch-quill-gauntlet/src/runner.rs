@@ -17381,6 +17381,39 @@ mod tests {
                     "harness must preserve the typed slop refusal for {label}: {harness_error}"
                 );
             }
+
+            let overflowing_boost =
+                format!("{} {}^{}", vocabulary[0], vocabulary[0], "9".repeat(400));
+            // DIV-005 is deliberately outside the ordinary exact lane. Quill
+            // recovers the invalid boost, but the pinned oracle can emit an
+            // infinite score. The harness must reject that observation before
+            // it could be mistaken for a classified cross-engine result.
+            let overflow_case = DifferentialCase {
+                fixture_id: "bsjw-div005-nonfinite-refusal".to_owned(),
+                query: overflowing_boost,
+                limit: 20,
+                offset: 0,
+                tie_expansion_limit: 256,
+                count_requested: false,
+                snippet_max_chars: None,
+                metadata: DifferentialCaseMetadata {
+                    generator_id: Some("bsjw-query-tree-v1".to_owned()),
+                    generator_seed: None,
+                    corpus_hash: Some(corpus_hash),
+                },
+            };
+            let overflow_error = harness
+                .run(&cx, &subject, &oracle, &overflow_case)
+                .await
+                .expect_err("DIV-005 non-finite oracle score must fail closed before comparison");
+            assert!(
+                matches!(
+                    overflow_error,
+                    GauntletError::InvalidObservation { ref reason }
+                        if reason.contains("oracle.hits") && reason.contains("non-finite score")
+                ),
+                "DIV-005 must remain a non-finite observation refusal: {overflow_error}"
+            );
         });
     }
 
