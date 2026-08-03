@@ -36,6 +36,18 @@ struct ChildOutput {
     lines: usize,
 }
 
+#[derive(Debug)]
+enum ChildFailure {
+    OutputLimit {
+        bytes: usize,
+        lines: usize,
+        status: ExitStatus,
+    },
+    Timeout {
+        status: ExitStatus,
+    },
+}
+
 fn normalizer() -> Sequence {
     Sequence::new(vec![NFD.into(), StripAccents.into()])
 }
@@ -168,18 +180,15 @@ where
     });
 }
 
-fn terminate_and_reap(child: &mut Child) {
-    if child
-        .try_wait()
-        .expect("child status must be observable")
-        .is_none()
-    {
-        let _ = child.kill();
+fn terminate_and_reap(child: &mut Child) -> ExitStatus {
+    if let Some(status) = child.try_wait().expect("child status must be observable") {
+        return status;
     }
-    let _ = child.wait();
+    let _ = child.kill();
+    child.wait().expect("terminated child must be reaped")
 }
 
-fn read_bounded_child(mut child: Child) -> ChildOutput {
+fn read_bounded_child(mut child: Child) -> Result<ChildOutput, ChildFailure> {
     let stdout = child.stdout.take().expect("child stdout must be piped");
     let stderr = child.stderr.take().expect("child stderr must be piped");
     let (tx, rx) = mpsc::channel();
@@ -193,8 +202,9 @@ fn read_bounded_child(mut child: Child) -> ChildOutput {
     let mut terminal_status = None;
     loop {
         if started.elapsed() > CHILD_TIMEOUT {
-            terminate_and_reap(&mut child);
-            panic!("fresh-process logging child exceeded {CHILD_TIMEOUT:?}");
+            return Err(ChildFailure::Timeout {
+                status: terminate_and_reap(&mut child),
+            });
         }
 
         match rx.recv_timeout(Duration::from_millis(10)) {
@@ -206,11 +216,11 @@ fn read_bounded_child(mut child: Child) -> ChildOutput {
                     }
                 }
                 if bytes.len() + chunk.len() > MAX_OUTPUT_BYTES || lines > MAX_OUTPUT_LINES {
-                    terminate_and_reap(&mut child);
-                    panic!(
-                        "fresh-process logging child exceeded output bound: {} bytes, {lines} lines",
-                        bytes.len() + chunk.len(),
-                    );
+                    return Err(ChildFailure::OutputLimit {
+                        bytes: bytes.len() + chunk.len(),
+                        lines,
+                        status: terminate_and_reap(&mut child),
+                    });
                 }
                 bytes.extend_from_slice(&chunk);
             }
@@ -226,14 +236,17 @@ fn read_bounded_child(mut child: Child) -> ChildOutput {
         }
     }
 
-    ChildOutput {
+    Ok(ChildOutput {
         status: terminal_status.expect("exited child must have a status"),
         bytes,
         lines,
-    }
+    })
 }
 
-fn run_child_with_rust_log(case: &str, rust_log: Option<OsString>) -> ChildOutput {
+fn run_child_with_rust_log(
+    case: &str,
+    rust_log: Option<OsString>,
+) -> Result<ChildOutput, ChildFailure> {
     let mut command = Command::new(std::env::current_exe().expect("test binary must exist"));
     command
         .arg(CHILD_TEST)
@@ -255,15 +268,28 @@ fn run_child_with_rust_log(case: &str, rust_log: Option<OsString>) -> ChildOutpu
     )
 }
 
-fn run_child(case: &str, rust_log: Option<&str>) -> ChildOutput {
+fn run_child(case: &str, rust_log: Option<&str>) -> Result<ChildOutput, ChildFailure> {
     run_child_with_rust_log(case, rust_log.map(OsString::from))
 }
 
+fn run_passing_child(case: &str, rust_log: Option<&str>) -> ChildOutput {
+    run_child(case, rust_log).unwrap_or_else(|failure| {
+        panic!("fresh-process case {case:?} exceeded a bound: {failure:?}");
+    })
+}
+
 #[cfg(unix)]
-fn run_child_with_non_unicode_rust_log(case: &str) -> ChildOutput {
+fn run_child_with_non_unicode_rust_log(case: &str) -> Result<ChildOutput, ChildFailure> {
     use std::os::unix::ffi::OsStringExt;
 
     run_child_with_rust_log(case, Some(OsString::from_vec(vec![b't', 0x80])))
+}
+
+#[cfg(unix)]
+fn run_passing_child_with_non_unicode_rust_log(case: &str) -> ChildOutput {
+    run_child_with_non_unicode_rust_log(case).unwrap_or_else(|failure| {
+        panic!("fresh-process case {case:?} exceeded a bound: {failure:?}");
+    })
 }
 
 fn assert_child_passed(case: &str, output: &ChildOutput) -> String {
@@ -286,45 +312,72 @@ fn assert_marker_is_suppressed(case: &str, output: &ChildOutput) {
 
 #[test]
 fn real_tokenizers_log_output_requires_explicit_bridge_and_trace() {
-    let default_child = run_child("default", None);
+    let default_child = run_passing_child("default", None);
     assert_marker_is_suppressed("default", &default_child);
 
-    let valid_without_bridge_child = run_child("valid-trace-without-bridge", Some("trace"));
+    let valid_without_bridge_child = run_passing_child("valid-trace-without-bridge", Some("trace"));
     assert_marker_is_suppressed("valid-trace-without-bridge", &valid_without_bridge_child);
 
-    let empty_filter_child = run_child("empty-rust-log", Some(""));
+    let empty_filter_child = run_passing_child("empty-rust-log", Some(""));
     assert_marker_is_suppressed("empty-rust-log", &empty_filter_child);
 
-    let malformed_filter_child = run_child("malformed-rust-log", Some("["));
+    let malformed_filter_child = run_passing_child("malformed-rust-log", Some("["));
     assert_marker_is_suppressed("malformed-rust-log", &malformed_filter_child);
 
     #[cfg(unix)]
     {
-        let non_unicode_filter_child = run_child_with_non_unicode_rust_log("nonunicode-rust-log");
+        let non_unicode_filter_child =
+            run_passing_child_with_non_unicode_rust_log("nonunicode-rust-log");
         assert_marker_is_suppressed("nonunicode-rust-log", &non_unicode_filter_child);
     }
 
-    let bridge_without_trace_child = run_child("bridge-without-trace", Some("warn"));
+    let bridge_without_trace_child = run_passing_child("bridge-without-trace", Some("warn"));
     assert_marker_is_suppressed("bridge-without-trace", &bridge_without_trace_child);
 
-    let bridge_off_child = run_child("bridge-off", Some("off"));
+    let bridge_off_child = run_passing_child("bridge-off", Some("off"));
     assert_marker_is_suppressed("bridge-off", &bridge_off_child);
 
-    let panic_restoration_child = run_child("panic-restoration", Some("trace"));
+    let panic_restoration_child = run_passing_child("panic-restoration", Some("trace"));
     assert_marker_is_suppressed("panic-restoration", &panic_restoration_child);
 
-    let worker_dispatch_child = run_child("worker-dispatch", Some("trace"));
+    let worker_dispatch_child = run_passing_child("worker-dispatch", Some("trace"));
     assert_marker_is_suppressed("worker-dispatch", &worker_dispatch_child);
 
-    let overlapping_runtimes_child = run_child("overlapping-runtimes", Some("trace"));
+    let overlapping_runtimes_child = run_passing_child("overlapping-runtimes", Some("trace"));
     assert_marker_is_suppressed("overlapping-runtimes", &overlapping_runtimes_child);
 
-    let explicit_child = run_child("explicit-bridge", Some("trace"));
+    let explicit_child = run_passing_child("explicit-bridge", Some("trace"));
     let explicit = assert_child_passed("explicit-bridge", &explicit_child);
     assert!(
         explicit.contains(TOKENIZERS_TRACE_MARKER),
         "explicit LogTracer plus TRACE must expose real tokenizers logs:\n{explicit}"
     );
+}
+
+#[test]
+fn fresh_process_output_limit_reaps_noisy_child() {
+    match run_child("line-overflow", None) {
+        Err(ChildFailure::OutputLimit {
+            bytes,
+            lines,
+            status,
+        }) => {
+            assert!(bytes > 0, "bounded receipt must record observed output");
+            assert!(lines > MAX_OUTPUT_LINES, "line limit did not trigger");
+            assert!(
+                !status.success(),
+                "overflowing child must be terminated rather than succeed"
+            );
+        }
+        Err(ChildFailure::Timeout { status }) => {
+            panic!("noisy child hit wall-time bound instead of line cap: {status:?}");
+        }
+        Ok(output) => panic!(
+            "noisy child unexpectedly passed after {} bytes and {} lines",
+            output.bytes.len(),
+            output.lines,
+        ),
+    }
 }
 
 #[test]
@@ -360,6 +413,9 @@ fn fresh_process_child() {
         }
         "worker-dispatch" => witness_worker_dispatch_contract(),
         "overlapping-runtimes" => witness_overlapping_runtimes(),
+        "line-overflow" => loop {
+            println!("bounded-child-output-overflow");
+        },
         other => panic!("unknown fresh-process logging child case {other:?}"),
     }
 }
