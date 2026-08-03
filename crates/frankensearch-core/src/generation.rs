@@ -211,6 +211,9 @@ pub enum GenerationAuthorityErrorV1 {
     /// A duplicate authority was not the permitted sequence-one genesis form.
     #[error("generation authority slots contain a non-genesis duplicate")]
     NonGenesisDuplicate,
+    /// Both resolver inputs claimed the same physical authority slot.
+    #[error("generation authority resolver received one physical slot twice")]
+    DuplicatePhysicalSlot,
     /// A non-genesis authority was stored in the wrong physical slot.
     #[error("generation authority slot does not match its sequence parity")]
     SlotSequenceParity,
@@ -325,17 +328,17 @@ impl AuthorityRefV1 {
 
     /// Canonical bytes used to link consecutive authority references.
     #[must_use]
-    pub fn canonical_bytes(&self) -> [u8; 99] {
-        let mut bytes = [0_u8; 99];
-        bytes[..8].copy_from_slice(b"FSAUTHREF");
-        bytes[8..10].copy_from_slice(&self.schema_version.to_be_bytes());
-        bytes[10..18].copy_from_slice(&self.sequence.to_be_bytes());
-        bytes[18..34].copy_from_slice(&self.object_id);
-        bytes[34..42].copy_from_slice(&self.manifest_len.to_be_bytes());
-        bytes[42..74].copy_from_slice(&self.manifest_sha256);
-        bytes[74] = u8::from(self.predecessor.is_some());
+    pub fn canonical_bytes(&self) -> [u8; 100] {
+        let mut bytes = [0_u8; 100];
+        bytes[..9].copy_from_slice(b"FSAUTHREF");
+        bytes[9..11].copy_from_slice(&self.schema_version.to_be_bytes());
+        bytes[11..19].copy_from_slice(&self.sequence.to_be_bytes());
+        bytes[19..35].copy_from_slice(&self.object_id);
+        bytes[35..43].copy_from_slice(&self.manifest_len.to_be_bytes());
+        bytes[43..75].copy_from_slice(&self.manifest_sha256);
+        bytes[75] = u8::from(self.predecessor.is_some());
         if let Some(predecessor) = self.predecessor {
-            bytes[75..].copy_from_slice(&predecessor);
+            bytes[76..].copy_from_slice(&predecessor);
         }
         bytes
     }
@@ -709,13 +712,22 @@ pub fn resolve_authority_slots_v1(
     }
     match (first, second) {
         (None, None) => Ok(None),
-        (Some(slot), None) | (None, Some(slot)) => Ok(Some(slot)),
+        (Some(slot), None) | (None, Some(slot)) => {
+            if !slot_matches_authority_sequence(slot) {
+                return Err(GenerationAuthorityErrorV1::SlotSequenceParity);
+            }
+            Ok(Some(slot))
+        }
         (Some(first), Some(second)) => {
             // ubs:ignore — slot indices and root IDs are public structural identities.
             if first.root_id != second.root_id {
                 return Err(GenerationAuthorityErrorV1::InvalidField {
                     field: "authority_slot.pair",
                 });
+            }
+            // ubs:ignore — physical slot indices are public structural identities.
+            if first.slot_index == second.slot_index {
+                return Err(GenerationAuthorityErrorV1::DuplicatePhysicalSlot);
             }
             // ubs:ignore — authority sequences are public monotone counters.
             if first.authority.sequence == second.authority.sequence {
@@ -737,11 +749,6 @@ pub fn resolve_authority_slots_v1(
             if !slot_matches_authority_sequence(older) || !slot_matches_authority_sequence(newer) {
                 return Err(GenerationAuthorityErrorV1::SlotSequenceParity);
             }
-            if older.slot_index == newer.slot_index {
-                return Err(GenerationAuthorityErrorV1::InvalidField {
-                    field: "authority_slot.pair",
-                });
-            }
             // ubs:ignore — sequence/predecessor fingerprints are public history identities.
             if newer.authority.sequence != older.authority.sequence.saturating_add(1)
                 // ubs:ignore — predecessor fingerprints are public immutable history identities.
@@ -758,7 +765,7 @@ fn slot_matches_authority_sequence(slot: AuthoritySlotV1) -> bool {
     if slot.authority.sequence == 1 {
         return true;
     }
-    let expected_slot = u8::try_from(slot.authority.sequence & 1).unwrap_or(u8::MAX);
+    let expected_slot = (slot.authority.sequence & 1) as u8;
     slot.slot_index == expected_slot
 }
 
@@ -3791,6 +3798,42 @@ mod tests {
             Err(GenerationAuthorityErrorV1::SlotSequenceParity),
             "a non-genesis authority copied into the opposite physical slot must fail"
         );
+    }
+
+    #[test]
+    fn authority_resolver_rejects_repeated_physical_slots_and_lone_parity_tears() {
+        let genesis = authority_reference(1, None);
+        let successor = authority_reference(2, Some(genesis.fingerprint()));
+        assert_eq!(
+            resolve_authority_slots_v1(
+                Some(authority_slot(0, genesis)),
+                Some(authority_slot(0, successor)),
+            ),
+            Err(GenerationAuthorityErrorV1::DuplicatePhysicalSlot),
+            "two inputs claiming one physical slot cannot represent a recoverable pair"
+        );
+        assert_eq!(
+            resolve_authority_slots_v1(Some(authority_slot(1, successor)), None),
+            Err(GenerationAuthorityErrorV1::SlotSequenceParity),
+            "one surviving non-genesis slot must still bind its publication parity"
+        );
+        assert_eq!(
+            resolve_authority_slots_v1(
+                Some(authority_slot(0, successor)),
+                Some(authority_slot(1, genesis)),
+            ),
+            Ok(Some(authority_slot(0, successor))),
+            "resolver input order never changes the selected consecutive head"
+        );
+    }
+
+    #[test]
+    fn authority_reference_fingerprint_uses_its_full_domain_separator() {
+        let genesis = authority_reference(1, None);
+        let bytes = genesis.canonical_bytes();
+        assert_eq!(&bytes[..9], b"FSAUTHREF");
+        assert_eq!(bytes.len(), 100);
+        assert_ne!(genesis.fingerprint(), [0; 32]);
     }
 
     #[test]
