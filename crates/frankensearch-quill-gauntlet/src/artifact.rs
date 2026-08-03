@@ -1302,6 +1302,47 @@ impl ArtifactStoreV4SourceSnapshot {
         Ok(())
     }
 
+    /// Capture selected compiler-visible inputs through descriptor-stable reads.
+    ///
+    /// The caller must provide the complete compiler-visible path set. This
+    /// primitive rejects any selected input that is not a regular file or an
+    /// in-snapshot symlink to a captured regular file.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for ambiguous paths, unsupported file kinds, invalid
+    /// inclusion reasons, an unstable input read, or a symlink that escapes
+    /// the selected source tree.
+    pub fn capture_selected(
+        root: &Path,
+        selected: BTreeMap<String, Vec<ArtifactStoreV4SourceInclusionReason>>,
+        max_entry_bytes: u64,
+    ) -> Result<Self, GauntletError> {
+        if selected.is_empty() || max_entry_bytes == 0 {
+            return Err(GauntletError::InvalidPreparedArtifact {
+                reason:
+                    "ArtifactStore v4 source capture requires selected inputs and a byte budget"
+                        .to_owned(),
+            });
+        }
+        let root_directory = PinnedDirectory::open_path(root)?;
+        let mut entries = Vec::with_capacity(selected.len());
+        for (relative_path, inclusion_reasons) in selected {
+            if !is_canonical_source_relative_path(&relative_path) {
+                return Err(GauntletError::InvalidPreparedArtifact {
+                    reason: "ArtifactStore v4 source capture received an ambiguous selected path"
+                        .to_owned(),
+                });
+            }
+            entries.push(root_directory.capture_v4_source_entry(
+                &relative_path,
+                inclusion_reasons,
+                max_entry_bytes,
+            )?);
+        }
+        Self::new(entries)
+    }
+
     fn validate_entries(&self) -> Result<(), GauntletError> {
         let mut previous = None;
         for entry in &self.entries {
@@ -1381,6 +1422,55 @@ fn is_canonical_source_relative_path(path: &str) -> bool {
         && path
             .split('/')
             .all(|component| !component.is_empty() && component != "." && component != "..")
+}
+
+fn resolve_source_symlink_target(
+    source_path: &str,
+    raw_target: &str,
+) -> Result<String, GauntletError> {
+    if raw_target.is_empty() || raw_target.starts_with('/') || raw_target.contains('\\') {
+        return Err(GauntletError::InvalidPreparedArtifact {
+            reason:
+                "ArtifactStore v4 source symlink target is ambiguous or escapes the source root"
+                    .to_owned(),
+        });
+    }
+    let mut components = source_path
+        .rsplit_once('/')
+        .map_or_else(Vec::new, |(parent, _)| {
+            parent.split('/').map(str::to_owned).collect()
+        });
+    for component in raw_target.split('/') {
+        match component {
+            "" | "." => {
+                return Err(GauntletError::InvalidPreparedArtifact {
+                    reason: "ArtifactStore v4 source symlink target is not canonical".to_owned(),
+                });
+            }
+            ".." => {
+                if components.pop().is_none() {
+                    return Err(GauntletError::InvalidPreparedArtifact {
+                        reason: "ArtifactStore v4 source symlink target escapes the source root"
+                            .to_owned(),
+                    });
+                }
+            }
+            component if component.contains('\\') => {
+                return Err(GauntletError::InvalidPreparedArtifact {
+                    reason: "ArtifactStore v4 source symlink target is not canonical".to_owned(),
+                });
+            }
+            component => components.push(component.to_owned()),
+        }
+    }
+    let resolved = components.join("/");
+    if !is_canonical_source_relative_path(&resolved) {
+        return Err(GauntletError::InvalidPreparedArtifact {
+            reason: "ArtifactStore v4 source symlink target is not a source-relative path"
+                .to_owned(),
+        });
+    }
+    Ok(resolved)
 }
 
 /// Mutable run provenance referencing one immutable object hash.
@@ -2860,6 +2950,160 @@ impl PinnedDirectory {
         Ok(names)
     }
 
+    fn capture_v4_source_entry(
+        &self,
+        relative_path: &str,
+        inclusion_reasons: Vec<ArtifactStoreV4SourceInclusionReason>,
+        max_entry_bytes: u64,
+    ) -> Result<ArtifactStoreV4SourceEntry, GauntletError> {
+        use rustix::fs::{AtFlags, FileType, statat};
+
+        let (parent, name) = relative_path
+            .rsplit_once('/')
+            .map_or(("", relative_path), |(parent, name)| (parent, name));
+        let mut directory = Self {
+            file: self.file.try_clone()?,
+            display_path: self.display_path.clone(),
+        };
+        for component in parent.split('/').filter(|component| !component.is_empty()) {
+            directory = directory.open_child(OsStr::new(component))?;
+        }
+        let name = OsStr::new(name);
+        let before = statat(&directory.file, name, AtFlags::SYMLINK_NOFOLLOW)
+            .map_err(std::io::Error::from)?;
+        match FileType::from_raw_mode(before.st_mode) {
+            FileType::RegularFile => {
+                let (mode, byte_len, sha256) =
+                    directory.read_regular_v4_source_entry(name, max_entry_bytes)?;
+                let after = statat(&directory.file, name, AtFlags::SYMLINK_NOFOLLOW)
+                    .map_err(std::io::Error::from)?;
+                if before.st_dev != after.st_dev
+                    || before.st_ino != after.st_ino
+                    || before.st_mode != after.st_mode
+                    || before.st_size != after.st_size
+                {
+                    return Err(GauntletError::InvalidPreparedArtifact {
+                        reason:
+                            "ArtifactStore v4 source file changed during descriptor-stable capture"
+                                .to_owned(),
+                    });
+                }
+                Ok(ArtifactStoreV4SourceEntry {
+                    relative_path: relative_path.to_owned(),
+                    kind: ArtifactStoreV4SourceEntryKind::File,
+                    inclusion_reasons,
+                    mode,
+                    byte_len,
+                    sha256,
+                    symlink_target: None,
+                    resolved_target_path: None,
+                })
+            }
+            FileType::Symlink => {
+                let target_bytes = rustix::fs::readlinkat(&directory.file, name, Vec::new())
+                    .map_err(std::io::Error::from)?;
+                let target_bytes = target_bytes.as_bytes();
+                if u64::try_from(target_bytes.len()).unwrap_or(u64::MAX) > max_entry_bytes {
+                    return Err(GauntletError::InvalidPreparedArtifact {
+                        reason: "ArtifactStore v4 source symlink exceeds its byte budget"
+                            .to_owned(),
+                    });
+                }
+                let target = std::str::from_utf8(target_bytes).map_err(|_| {
+                    GauntletError::InvalidPreparedArtifact {
+                        reason: "ArtifactStore v4 source symlink target is not UTF-8".to_owned(),
+                    }
+                })?;
+                let after = statat(&directory.file, name, AtFlags::SYMLINK_NOFOLLOW)
+                    .map_err(std::io::Error::from)?;
+                if before.st_dev != after.st_dev
+                    || before.st_ino != after.st_ino
+                    || before.st_mode != after.st_mode
+                    || before.st_size != after.st_size
+                {
+                    return Err(GauntletError::InvalidPreparedArtifact {
+                        reason: "ArtifactStore v4 source symlink changed during descriptor-stable capture"
+                            .to_owned(),
+                    });
+                }
+                Ok(ArtifactStoreV4SourceEntry {
+                    relative_path: relative_path.to_owned(),
+                    kind: ArtifactStoreV4SourceEntryKind::Symlink,
+                    inclusion_reasons,
+                    mode: before.st_mode,
+                    byte_len: u64::try_from(target_bytes.len()).unwrap_or(u64::MAX),
+                    sha256: lower_hex(&Sha256::digest(target_bytes)),
+                    symlink_target: Some(target.to_owned()),
+                    resolved_target_path: Some(resolve_source_symlink_target(
+                        relative_path,
+                        target,
+                    )?),
+                })
+            }
+            _ => Err(GauntletError::InvalidPreparedArtifact {
+                reason: "ArtifactStore v4 source capture rejects non-file compiler inputs"
+                    .to_owned(),
+            }),
+        }
+    }
+
+    fn read_regular_v4_source_entry(
+        &self,
+        name: &OsStr,
+        max_entry_bytes: u64,
+    ) -> Result<(u32, u64, String), GauntletError> {
+        use rustix::fs::{FileType, Mode, OFlags, fstat, openat};
+
+        let descriptor = openat(
+            &self.file,
+            name,
+            OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW | OFlags::NONBLOCK,
+            Mode::empty(),
+        )
+        .map_err(std::io::Error::from)?;
+        let before = fstat(&descriptor).map_err(std::io::Error::from)?;
+        let byte_len =
+            u64::try_from(before.st_size).map_err(|_| GauntletError::InvalidPreparedArtifact {
+                reason: "ArtifactStore v4 source file length is invalid".to_owned(),
+            })?;
+        if FileType::from_raw_mode(before.st_mode) != FileType::RegularFile
+            || byte_len > max_entry_bytes
+        {
+            return Err(GauntletError::InvalidPreparedArtifact {
+                reason: "ArtifactStore v4 source capture rejects oversized or non-regular files"
+                    .to_owned(),
+            });
+        }
+        let mut file = File::from(descriptor);
+        let capacity =
+            usize::try_from(byte_len).map_err(|_| GauntletError::InvalidPreparedArtifact {
+                reason: "ArtifactStore v4 source file length does not fit this platform".to_owned(),
+            })?;
+        let mut bytes = Vec::new();
+        bytes.try_reserve_exact(capacity).map_err(|error| {
+            std::io::Error::new(
+                std::io::ErrorKind::OutOfMemory,
+                format!("unable to reserve bounded source read: {error}"),
+            )
+        })?;
+        (&mut file)
+            .take(max_entry_bytes.saturating_add(1))
+            .read_to_end(&mut bytes)?;
+        let after = fstat(&file).map_err(std::io::Error::from)?;
+        if before.st_dev != after.st_dev
+            || before.st_ino != after.st_ino
+            || before.st_mode != after.st_mode
+            || before.st_size != after.st_size
+            || u64::try_from(bytes.len()).unwrap_or(u64::MAX) != byte_len
+        {
+            return Err(GauntletError::InvalidPreparedArtifact {
+                reason: "ArtifactStore v4 source file changed during descriptor-stable capture"
+                    .to_owned(),
+            });
+        }
+        Ok((before.st_mode, byte_len, lower_hex(&Sha256::digest(bytes))))
+    }
+
     fn publish_no_clobber(&self, name: &OsStr, bytes: &[u8]) -> Result<(), GauntletError> {
         self.publish_no_clobber_io(name, bytes).map_err(Into::into)
     }
@@ -3104,6 +3348,15 @@ impl PinnedDirectory {
         Self::unsupported()
     }
 
+    fn capture_v4_source_entry(
+        &self,
+        _relative_path: &str,
+        _inclusion_reasons: Vec<ArtifactStoreV4SourceInclusionReason>,
+        _max_entry_bytes: u64,
+    ) -> Result<ArtifactStoreV4SourceEntry, GauntletError> {
+        Self::unsupported()
+    }
+
     fn open_child_optional(&self, _name: &OsStr) -> Result<Option<Self>, GauntletError> {
         Self::unsupported()
     }
@@ -3335,6 +3588,49 @@ mod tests {
             }]),
             Err(GauntletError::InvalidPreparedArtifact { .. })
         ));
+    }
+
+    #[cfg(all(target_family = "unix", not(target_os = "wasi")))]
+    #[test]
+    fn artifactstore_v4_source_snapshot_capture_binds_file_and_symlink_bytes() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().expect("temporary source root");
+        std::fs::write(root.path().join("Cargo.lock"), b"locked dependency graph\n")
+            .expect("write source lockfile");
+        std::fs::create_dir(root.path().join("crates")).expect("create source subdirectory");
+        symlink("../Cargo.lock", root.path().join("crates/current"))
+            .expect("create source symlink");
+
+        let snapshot = ArtifactStoreV4SourceSnapshot::capture_selected(
+            root.path(),
+            BTreeMap::from([
+                (
+                    "Cargo.lock".to_owned(),
+                    vec![
+                        ArtifactStoreV4SourceInclusionReason::Tracked,
+                        ArtifactStoreV4SourceInclusionReason::CargoLock,
+                    ],
+                ),
+                (
+                    "crates/current".to_owned(),
+                    vec![ArtifactStoreV4SourceInclusionReason::PathDependency],
+                ),
+            ]),
+            1024,
+        )
+        .expect("capture descriptor-stable source snapshot");
+
+        snapshot.validate().expect("validate captured snapshot");
+        assert_eq!(snapshot.entries[0].byte_len, 24);
+        assert_eq!(
+            snapshot.entries[1].symlink_target.as_deref(),
+            Some("../Cargo.lock")
+        );
+        assert_eq!(
+            snapshot.entries[1].resolved_target_path.as_deref(),
+            Some("Cargo.lock")
+        );
     }
 
     #[test]
