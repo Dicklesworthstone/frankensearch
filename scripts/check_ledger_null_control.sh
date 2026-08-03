@@ -174,7 +174,11 @@ candidate_preflight() {
   awk -v candidate="${CANDIDATE}" -v surface="${SURFACE}" \
       -v ledger="${LEDGER_REL}" '
     function is_entry_heading(line) {
-      return line ~ /^##+ 20[0-9][0-9]-[0-9][0-9]-[0-9][0-9]/
+      # Ledger rows have historically appeared as conventional ATX headings,
+      # indented headings, no-space headings, and bolded date titles.  Do not
+      # make evidence admission depend on one preferred Markdown spelling.
+      return line ~ /^[[:space:]]{0,3}#{2,6}[[:space:]]*(\*\*)?20[0-9][0-9]-[0-9][0-9]-[0-9][0-9]/ ||
+             line ~ /^[[:space:]]{0,3}\*\*20[0-9][0-9]-[0-9][0-9]-[0-9][0-9]/
     }
     function flush(    low, retry_text) {
       if (header == "") return
@@ -286,9 +290,11 @@ lint_one_materialized() {
       return 0
     }
     function is_entry_heading(line) {
-      # This ledger has used both ## and ### for entries. Date-bearing headings
-      # are entries; undated headings are grouping labels.
-      return line ~ /^##+ 20[0-9][0-9]-[0-9][0-9]-[0-9][0-9]/
+      # Date-bearing ledger rows have appeared as conventional ATX headings,
+      # indented headings, no-space headings, and bolded date titles.  All are
+      # evidence entries; undated headings remain grouping labels.
+      return line ~ /^[[:space:]]{0,3}#{2,6}[[:space:]]*(\*\*)?20[0-9][0-9]-[0-9][0-9]-[0-9][0-9]/ ||
+             line ~ /^[[:space:]]{0,3}\*\*20[0-9][0-9]-[0-9][0-9]-[0-9][0-9]/
     }
     function note_line(line,    low, absent, metric, decisive, value) {
       low = tolower(line)
@@ -686,6 +692,9 @@ Decision: KEEP." || SELF_CHECK_FAILED=1
   run_selfcheck_case "unclassified verdict word is blocked" 2 "${ledger}" $'### 2099-01-14 — synthetic adopted row\nA/B median CI: 0.900 [0.880, 0.920]\nDecision: ADOPTED into the build.' || SELF_CHECK_FAILED=1
   run_selfcheck_case "body-only edit of an existing entry is gated" 2 "${ledger}" $'### 2099-01-15 — REJECT: synthetic historical row\nA/B median ratio: 1.02\nDecision: reject as no improvement.' 2 || SELF_CHECK_FAILED=1
   run_selfcheck_case "body-only edit of a conformant entry stays admitted" 0 "${ledger}" $'### 2099-01-16 — REJECT: synthetic null-contained row\nA/A null: 1.000 [0.980, 1.020], same invocation\nDecision: no-ship because the effect remains inside the A/A null floor.' 2 || SELF_CHECK_FAILED=1
+  run_selfcheck_case "indented bold heading is gated" 2 "${ledger}" $'   ### **2099-01-17 — REJECT: indented bold heading without evidence**\nDecision: REJECT — reverted.' || SELF_CHECK_FAILED=1
+  run_selfcheck_case "no-space heading is gated" 2 "${ledger}" $'##2099-01-18 — REJECT: no-space heading without evidence\nDecision: REJECT — reverted.' || SELF_CHECK_FAILED=1
+  run_selfcheck_case "bold date title is gated" 2 "${ledger}" $'**2099-01-19 — REJECT: bold date title without evidence**\nDecision: REJECT — reverted.' || SELF_CHECK_FAILED=1
 }
 
 run_selfcheck() {
