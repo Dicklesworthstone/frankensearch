@@ -149,6 +149,71 @@ fn profiled_search_sidecar_executes_through_public_durable_reader() {
     });
 }
 
+#[cfg(feature = "profile-internals")]
+#[test]
+fn profiled_search_public_reader_preserves_fuel_exhaustion_receipt() {
+    asupersync::test_utils::run_test_with_cx(|cx| async move {
+        let directory = tempfile::tempdir().expect("fuel profile sidecar directory");
+        let config = QuillConfig {
+            deterministic_ingest: true,
+            query_fuel_budget: 1,
+            ..QuillConfig::default()
+        };
+        let writer = QuillIndex::create(&cx, directory.path(), config.clone())
+            .await
+            .expect("create durable fuel fixture");
+        LexicalWrite::index_document(
+            &writer,
+            &cx,
+            &IndexableDocument::new("fuel-profiled-doc", "alpha fuel sidecar document"),
+        )
+        .await
+        .expect("ingest durable fuel fixture");
+        LexicalWrite::commit(&writer, &cx)
+            .await
+            .expect("publish durable fuel fixture");
+
+        let reader = QuillSearchIndex::open(&cx, directory.path(), config)
+            .await
+            .expect("open public durable fuel reader");
+        let outcome = reader
+            .search_paginated_with_profile(&cx, QUERY, LIMIT, 0, false)
+            .expect("profile admission must preserve ordinary fuel exhaustion");
+        let (error, receipt) = match outcome {
+            QuillProfiledSearchOutcome::Completed { .. } => {
+                panic!("fuel-limited profiled search unexpectedly completed")
+            }
+            QuillProfiledSearchOutcome::Failed { error, receipt } => (error, receipt),
+        };
+        assert!(matches!(
+            error,
+            QuillIndexError::QueryFuelExhausted {
+                budget: 1,
+                consumed: 1,
+                ..
+            }
+        ));
+        assert_eq!(receipt.cache(), QuillProfileCacheDisposition::Miss);
+        assert_eq!(receipt.fanout_eligible(), Some(false));
+        assert_eq!(
+            receipt.execution(),
+            Some(QuillProfileExecutionMode::Serial),
+            "one sealed segment reaches the serial branch before fuel refusal"
+        );
+        let Some((work_upper_bound, metering)) = receipt.work_plan() else {
+            panic!("fuel-limited profiled search did not bind a work plan");
+        };
+        assert!(work_upper_bound > 1);
+        assert!(metering);
+        assert_eq!(receipt.work_units().requested(), [1, 1, 0, 0]);
+        assert_eq!(receipt.work_units().admitted(), [1, 0, 0, 0]);
+        assert_eq!(receipt.work_units().refused(), [0, 1, 0, 0]);
+        assert_eq!(receipt.counters(), (1, 1, 1, 1, 1));
+        assert_eq!(receipt.cancellation_observations(), 0);
+        assert_eq!(receipt.outcome(), QuillProfileOutcome::FuelExhausted);
+    });
+}
+
 #[cfg(feature = "pruning-conformance")]
 async fn two_segment_pruning_trace_fixture(cx: &Cx) -> QuillIndex {
     let index = QuillIndex::in_memory(deterministic_config()).expect("in-memory index");
