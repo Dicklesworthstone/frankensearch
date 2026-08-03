@@ -25,6 +25,8 @@ use rustix::fs::{
 };
 use rustix::io::{FdFlags, fcntl_getfd, fcntl_setfd};
 use rustix::process::geteuid;
+#[cfg(target_os = "linux")]
+use rustix::process::{Pid, Signal, kill_process_group};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
@@ -424,6 +426,20 @@ pub struct LocalPerfProcessLifecycle {
     child_reaped: bool,
     run_log_synced: bool,
     run_log_captured: bool,
+    process_group_recovery: LocalPerfProcessGroupRecovery,
+}
+
+/// Exact bounded recovery action after an OS wait failure.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum LocalPerfProcessGroupRecovery {
+    /// No wait recovery was needed for this attempt.
+    NotRequired,
+    /// A revalidated dedicated child group received SIGKILL before reaping.
+    SignaledOwnedGroup,
+    /// Group identity was unavailable or changed, so only the owned child
+    /// handle received the bounded fallback signal.
+    DirectChildFallback,
 }
 
 /// Process-tree authority available from one local producer attempt.
@@ -507,6 +523,12 @@ impl LocalPerfProcessLifecycle {
     #[must_use]
     pub const fn run_log_captured(self) -> bool {
         self.run_log_captured
+    }
+
+    /// Exact wait-error recovery authority observed by this receipt.
+    #[must_use]
+    pub const fn process_group_recovery(self) -> LocalPerfProcessGroupRecovery {
+        self.process_group_recovery
     }
 
     /// Return the strongest process-tree conclusion this receipt can prove.
@@ -1329,6 +1351,7 @@ fn run_local_perf_command_inner(
                 child_reaped: false,
                 run_log_synced,
                 run_log_captured: run_log_bytes.is_some(),
+                process_group_recovery: LocalPerfProcessGroupRecovery::NotRequired,
             };
             let attempt_path = write_failed_attempt_receipt(
                 config,
@@ -1352,12 +1375,14 @@ fn run_local_perf_command_inner(
             });
         }
     };
-    let (status, recovered_wait_error) = match child.wait() {
-        Ok(status) => (status, None),
+    let (status, recovered_wait_error, process_group_recovery) = match child.wait() {
+        Ok(status) => (status, None, LocalPerfProcessGroupRecovery::NotRequired),
         Err(error) => {
             let wait_error_kind = local_perf_io_error_kind(&error);
-            match force_kill_and_reap(&mut child) {
-                Ok(status) => (status, Some(wait_error_kind)),
+            match force_kill_and_reap(&mut child, root_process_identity) {
+                Ok((status, process_group_recovery)) => {
+                    (status, Some(wait_error_kind), process_group_recovery)
+                }
                 Err(recovery_error_kind) => {
                     return Err(LocalPerfRunError::UnreapedChild {
                         wait_error_kind,
@@ -1376,6 +1401,7 @@ fn run_local_perf_command_inner(
         child_reaped: true,
         run_log_synced,
         run_log_captured: run_log_result.is_ok(),
+        process_group_recovery,
     };
     if !run_log_synced {
         let outcome = LocalPerfAttemptOutcome::PostExitRejected {
@@ -4332,6 +4358,7 @@ fn completed_attempt_receipt_bytes(
             child_reaped: true,
             run_log_synced: true,
             run_log_captured: true,
+            process_group_recovery: LocalPerfProcessGroupRecovery::NotRequired,
         },
         root_process_identity,
         Some(run_log_bytes),
@@ -4614,19 +4641,49 @@ fn local_perf_io_error_kind(error: &std::io::Error) -> LocalPerfIoErrorKind {
     }
 }
 
-fn force_kill_and_reap(child: &mut Child) -> Result<ExitStatus, LocalPerfIoErrorKind> {
-    let kill_error = child
-        .kill()
-        .err()
-        .map(|error| local_perf_io_error_kind(&error));
+fn force_kill_and_reap(
+    child: &mut Child,
+    root_process_identity: LocalPerfRootProcessIdentity,
+) -> Result<(ExitStatus, LocalPerfProcessGroupRecovery), LocalPerfIoErrorKind> {
+    let (process_group_recovery, kill_error) =
+        match signal_owned_process_group(child, root_process_identity) {
+            Ok(()) => (LocalPerfProcessGroupRecovery::SignaledOwnedGroup, None),
+            Err(_) => (
+                LocalPerfProcessGroupRecovery::DirectChildFallback,
+                child
+                    .kill()
+                    .err()
+                    .map(|error| local_perf_io_error_kind(&error)),
+            ),
+        };
     for _ in 0..WAIT_RECOVERY_POLL_ATTEMPTS {
         match child.try_wait() {
-            Ok(Some(status)) => return Ok(status),
+            Ok(Some(status)) => return Ok((status, process_group_recovery)),
             Ok(None) => std::thread::sleep(WAIT_RECOVERY_POLL_INTERVAL),
             Err(error) => return Err(local_perf_io_error_kind(&error)),
         }
     }
     Err(kill_error.unwrap_or(LocalPerfIoErrorKind::ResourceBusy))
+}
+
+#[cfg(target_os = "linux")]
+fn signal_owned_process_group(
+    child: &Child,
+    root_process_identity: LocalPerfRootProcessIdentity,
+) -> Result<(), LocalPerfIoErrorKind> {
+    if capture_root_process_identity(child) != root_process_identity {
+        return Err(LocalPerfIoErrorKind::Other);
+    }
+    kill_process_group(Pid::from_child(child), Signal::KILL)
+        .map_err(|error| local_perf_io_error_kind(&std::io::Error::from(error)))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn signal_owned_process_group(
+    _child: &Child,
+    _root_process_identity: LocalPerfRootProcessIdentity,
+) -> Result<(), LocalPerfIoErrorKind> {
+    Err(LocalPerfIoErrorKind::Other)
 }
 
 fn attempt_derived_facts(
@@ -4726,6 +4783,20 @@ fn validate_process_lifecycle(
     if !valid {
         return Err(LocalPerfRunError::Invalid(
             "attempt process lifecycle disagrees with its typed terminal outcome".to_owned(),
+        ));
+    }
+    let recovery_matches_outcome = match outcome {
+        LocalPerfAttemptOutcome::WaitRecoveredByKill { .. } => matches!(
+            lifecycle.process_group_recovery,
+            LocalPerfProcessGroupRecovery::SignaledOwnedGroup
+                | LocalPerfProcessGroupRecovery::DirectChildFallback
+        ),
+        _ => lifecycle.process_group_recovery == LocalPerfProcessGroupRecovery::NotRequired,
+    };
+    if !recovery_matches_outcome {
+        return Err(LocalPerfRunError::Invalid(
+            "attempt process-group recovery authority disagrees with its terminal outcome"
+                .to_owned(),
         ));
     }
     Ok(())
@@ -4972,6 +5043,7 @@ pub fn completed_attempt_receipt_for_test(
             child_reaped: true,
             run_log_synced: true,
             run_log_captured: true,
+            process_group_recovery: LocalPerfProcessGroupRecovery::NotRequired,
         },
         root_process_identity: LocalPerfRootProcessIdentity::LinuxProcStartTime {
             pid: 37,
@@ -5167,6 +5239,7 @@ mod tests {
                 child_reaped: false,
                 run_log_synced: true,
                 run_log_captured: true,
+                process_group_recovery: LocalPerfProcessGroupRecovery::NotRequired,
             },
             LocalPerfAttemptOutcome::WaitRecoveredByKill { .. } => LocalPerfProcessLifecycle {
                 spawn_attempted: true,
@@ -5175,6 +5248,7 @@ mod tests {
                 child_reaped: true,
                 run_log_synced: true,
                 run_log_captured: true,
+                process_group_recovery: LocalPerfProcessGroupRecovery::SignaledOwnedGroup,
             },
             LocalPerfAttemptOutcome::PostExitRejected {
                 stage: LocalPerfRejectionStage::RunLogSync,
@@ -5185,6 +5259,7 @@ mod tests {
                 child_reaped: true,
                 run_log_synced: false,
                 run_log_captured: true,
+                process_group_recovery: LocalPerfProcessGroupRecovery::NotRequired,
             },
             LocalPerfAttemptOutcome::PostExitRejected {
                 stage: LocalPerfRejectionStage::RunLogRead,
@@ -5195,6 +5270,7 @@ mod tests {
                 child_reaped: true,
                 run_log_synced: true,
                 run_log_captured: false,
+                process_group_recovery: LocalPerfProcessGroupRecovery::NotRequired,
             },
             _ => LocalPerfProcessLifecycle {
                 spawn_attempted: true,
@@ -5203,6 +5279,7 @@ mod tests {
                 child_reaped: true,
                 run_log_synced: true,
                 run_log_captured: true,
+                process_group_recovery: LocalPerfProcessGroupRecovery::NotRequired,
             },
         };
         let completed = outcome == LocalPerfAttemptOutcome::Completed;
@@ -6615,7 +6692,7 @@ mod tests {
         let wait_slice = &source[wait_start..log_capture];
         assert_eq!(
             wait_slice
-                .matches("force_kill_and_reap(&mut child)")
+                .matches("force_kill_and_reap(&mut child, root_process_identity)")
                 .count(),
             1
         );
@@ -6640,6 +6717,7 @@ mod tests {
             child_reaped: true,
             run_log_synced: true,
             run_log_captured: true,
+            process_group_recovery: LocalPerfProcessGroupRecovery::SignaledOwnedGroup,
         };
         assert!(validate_process_lifecycle(recovered, reaped, true).is_ok());
         assert_eq!(
@@ -6696,15 +6774,18 @@ mod tests {
         let mut child = command
             .spawn()
             .expect("spawn dedicated process-group child");
+        let root_process_identity = capture_root_process_identity(&child);
         assert!(matches!(
-            capture_root_process_identity(&child),
+            root_process_identity,
             LocalPerfRootProcessIdentity::LinuxProcStartTime {
                 pid,
                 process_group_id,
                 ..
             } if pid == child.id() && process_group_id == pid
         ));
-        force_kill_and_reap(&mut child).expect("reap dedicated process-group child");
+        let (_, recovery) = force_kill_and_reap(&mut child, root_process_identity)
+            .expect("reap dedicated process-group child");
+        assert_eq!(recovery, LocalPerfProcessGroupRecovery::SignaledOwnedGroup);
     }
 
     #[test]
@@ -6738,8 +6819,14 @@ mod tests {
             .stderr(Stdio::null())
             .spawn()
             .expect("spawn wait-recovery child");
-        let status = force_kill_and_reap(&mut child).expect("bounded kill and reap");
+        let child_pid = child.id();
+        let (status, recovery) = force_kill_and_reap(
+            &mut child,
+            LocalPerfRootProcessIdentity::Unverifiable { pid: child_pid },
+        )
+        .expect("bounded kill and reap");
         assert!(!status.success());
+        assert_eq!(recovery, LocalPerfProcessGroupRecovery::DirectChildFallback);
         assert!(child.try_wait().expect("post-recovery try_wait").is_some());
     }
 
