@@ -1821,6 +1821,22 @@ impl IntegrityCheckedCampaign {
     }
 }
 
+/// Load the immutable `CampaignReport` V7 replay receipt shipped with this crate.
+///
+/// This diagnostic receipt is read from compiled-in bytes, rather than
+/// regenerated from the caller's checkout. The loader checks both the fixture
+/// bytes and domain-separated report identity before exposing the report.
+///
+/// # Errors
+///
+/// Returns an error if the embedded bytes, their canonical JSON encoding, or
+/// their `CampaignReport` V7 identity do not match the pinned receipt.
+pub fn pinned_campaign_report_v7() -> Result<IntegrityCheckedCampaign, GauntletError> {
+    let report = crate::runner::load_pinned_campaign_report_v7()?;
+    report.validate_contract()?;
+    Ok(IntegrityCheckedCampaign { report })
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CampaignEvidenceValidation {
     Stored,

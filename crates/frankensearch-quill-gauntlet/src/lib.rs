@@ -33,7 +33,7 @@ pub use artifact::{
     CampaignArtifactContext, GauntletProducerBuildIdentity, GauntletProducerSourceVerification,
     IntegrityCheckedCampaign, OBJECT_SCHEMA_VERSION, PreparedArtifact, RUN_MANIFEST_SCHEMA_VERSION,
     RunManifest, SerializedSchemaDisposition, classify_artifact_object_schema,
-    classify_campaign_report_schema,
+    classify_campaign_report_schema, pinned_campaign_report_v7,
 };
 #[cfg(feature = "tantivy-oracle")]
 pub use comparator::observe_tantivy_cass_profile;

@@ -85,6 +85,12 @@ const LEXICAL_MISMATCH_SIGNATURE_DOMAIN: &[u8] =
 const LEXICAL_QUERY_CONTRACT_DOMAIN: &[u8] = b"frankensearch/quill/lexical-query-contract/v1\0";
 const LEXICAL_INDEX_IDENTITY_DOMAIN: &[u8] = b"frankensearch/quill/lexical-index-identity/v1\0";
 const CAMPAIGN_REPORT_V7_HASH_DOMAIN: &[u8] = b"frankensearch/quill/campaign-report/v7\0";
+const PINNED_CAMPAIGN_REPORT_V7_BYTES: &[u8] =
+    include_bytes!("../fixtures/campaign-report-v7.json");
+const PINNED_CAMPAIGN_REPORT_V7_FIXTURE_SHA256: &str =
+    "62cf2484d04949589f8954ff661f2a2b8b633e3c6bda261d706355ea3060042d";
+const PINNED_CAMPAIGN_REPORT_V7_REPORT_SHA256: &str =
+    "339ea20afd54901894b14243b92f57b687559b2806a9c837c313359ce9dbfb57";
 const DIVERGENCE_REGISTRY_HASH_DOMAIN: &[u8] = b"frankensearch/quill/divergence-registry/v1\0";
 const DIVERGENCE_REGISTER_LEDGER_HASH_DOMAIN: &[u8] =
     b"frankensearch/quill/divergence-register-ledger/v2\0";
@@ -4062,6 +4068,48 @@ impl CampaignReport {
         hasher.update(self.canonical_bytes_unchecked()?);
         Ok(lower_hex(&hasher.finalize()))
     }
+}
+
+/// Load the immutable stored `CampaignReport` V7 historical fixture.
+///
+/// The fixture is a diagnostic receipt, not a live-build template. Its exact
+/// canonical payload has one terminal LF in source control; the report bytes
+/// intentionally exclude that presentation LF.
+///
+/// # Errors
+///
+/// Returns an error if the checked-in bytes, canonical report encoding, or
+/// domain-separated report identity differs from the pinned historical object.
+pub fn load_pinned_campaign_report_v7() -> Result<CampaignReport, GauntletError> {
+    load_pinned_campaign_report_v7_bytes(PINNED_CAMPAIGN_REPORT_V7_BYTES)
+}
+
+fn load_pinned_campaign_report_v7_bytes(bytes: &[u8]) -> Result<CampaignReport, GauntletError> {
+    let canonical = bytes.strip_suffix(b"\n").ok_or_else(|| {
+        campaign_error("pinned CampaignReport V7 fixture must end in exactly one LF")
+    })?;
+    if canonical.ends_with(b"\n") {
+        return Err(campaign_error(
+            "pinned CampaignReport V7 fixture must not contain multiple terminal LFs",
+        ));
+    }
+    if lower_hex(&Sha256::digest(bytes)) != PINNED_CAMPAIGN_REPORT_V7_FIXTURE_SHA256 {
+        return Err(campaign_error(
+            "pinned CampaignReport V7 fixture bytes differ from their sealed SHA-256",
+        ));
+    }
+    let report = serde_json::from_slice::<CampaignReport>(canonical)?;
+    if report.canonical_bytes()? != canonical {
+        return Err(campaign_error(
+            "pinned CampaignReport V7 bytes are not the report canonical encoding",
+        ));
+    }
+    if report.report_hash()? != PINNED_CAMPAIGN_REPORT_V7_REPORT_SHA256 {
+        return Err(campaign_error(
+            "pinned CampaignReport V7 report identity differs from its sealed SHA-256",
+        ));
+    }
+    Ok(report)
 }
 
 /// Streaming cross-artifact validator for one structurally valid campaign report.
@@ -14942,6 +14990,28 @@ mod tests {
                 canonical
             );
         });
+    }
+
+    #[test]
+    fn pinned_campaign_report_v7_is_exact_and_rejects_regeneration() {
+        let report = crate::artifact::pinned_campaign_report_v7()
+            .expect("load pinned CampaignReport V7")
+            .report()
+            .clone();
+        assert_eq!(report.schema_version, CAMPAIGN_REPORT_V7_SCHEMA_VERSION);
+        assert_eq!(
+            report.report_hash().expect("pinned report hash"),
+            PINNED_CAMPAIGN_REPORT_V7_REPORT_SHA256
+        );
+
+        let mut regenerated = report.canonical_bytes().expect("pinned canonical report");
+        regenerated[0] ^= 1;
+        let mut altered_fixture = regenerated;
+        altered_fixture.push(b'\n');
+        assert!(
+            load_pinned_campaign_report_v7_bytes(&altered_fixture).is_err(),
+            "a regenerated or otherwise mismatched report must not replace the pinned fixture"
+        );
     }
 
     #[test]
