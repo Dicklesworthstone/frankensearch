@@ -237,6 +237,12 @@ pub enum GenerationAuthorityErrorV1 {
     /// A selected authority is missing or predates the required external floor.
     #[error("generation authority does not satisfy the required external floor")]
     AuthorityBelowFloor,
+    /// A required-external profile was selected without an injected floor.
+    #[error("generation authority required-external profile has no external floor")]
+    ExternalFloorRequired,
+    /// A mutation was attempted through an inspection-only profile.
+    #[error("generation authority read-only profile forbids mutation")]
+    ReadOnlyProfile,
     /// The immutable activation manifest did not match its stored self-seal.
     #[error("generation activation manifest self-seal mismatch")]
     ManifestSelfSealMismatch,
@@ -494,6 +500,45 @@ impl AuthorityFloorV1 {
             });
         }
         self.authority.validate()
+    }
+}
+
+/// Explicit security posture for opening one generation root.
+///
+/// There is deliberately no `Default` implementation: a caller must choose a
+/// posture instead of silently falling back from an externally anchored root.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum GenerationRootSecurityProfileV1 {
+    /// Require a consumer-owned, externally retained authority floor before a
+    /// root can be selected for use.
+    RequiredExternal,
+    /// Permit owner-controlled local recovery while reporting that it cannot
+    /// detect a hostile whole-store rollback.
+    CooperativeLocal,
+    /// Permit inspection only; publication, repair, rollback, and garbage
+    /// collection must be rejected by the caller before mutation.
+    ReadOnlyUnanchored,
+}
+
+impl GenerationRootSecurityProfileV1 {
+    /// Whether this profile authorizes a caller to mutate a generation root.
+    #[must_use]
+    pub const fn permits_mutation(self) -> bool {
+        !matches!(self, Self::ReadOnlyUnanchored)
+    }
+
+    /// Reject a mutation through an inspection-only profile.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GenerationAuthorityErrorV1::ReadOnlyProfile`] when this is
+    /// [`Self::ReadOnlyUnanchored`].
+    pub const fn require_mutation_authorized(self) -> Result<(), GenerationAuthorityErrorV1> {
+        if self.permits_mutation() {
+            Ok(())
+        } else {
+            Err(GenerationAuthorityErrorV1::ReadOnlyProfile)
+        }
     }
 }
 
@@ -937,9 +982,16 @@ pub fn resolve_authority_slots_at_floor_v1(
     second: Option<AuthoritySlotV1>,
     floor: AuthorityFloorV1,
 ) -> Result<AuthoritySlotV1, GenerationAuthorityErrorV1> {
-    floor.validate()?;
     let resolved = resolve_authority_slots_v1(first, second)?
         .ok_or(GenerationAuthorityErrorV1::AuthorityBelowFloor)?;
+    resolve_selected_authority_at_floor_v1(resolved, floor)
+}
+
+fn resolve_selected_authority_at_floor_v1(
+    resolved: AuthoritySlotV1,
+    floor: AuthorityFloorV1,
+) -> Result<AuthoritySlotV1, GenerationAuthorityErrorV1> {
+    floor.validate()?;
     // ubs:ignore — root IDs are public structural identities.
     if resolved.root_id != floor.root_id {
         return Err(GenerationAuthorityErrorV1::RootMismatch);
@@ -1033,6 +1085,37 @@ pub fn resolve_authority_slots_with_locks_v1(
         }
     }
     Ok(resolved)
+}
+
+/// Resolve authority slots under one explicit generation-root security profile.
+///
+/// The lock-aware resolver always runs first, so an unresolved publication
+/// attempt cannot be bypassed by selecting a weaker profile. Required external
+/// roots additionally require an injected retained floor; local and inspection
+/// profiles intentionally remain unanchored and are distinguishable to callers.
+///
+/// # Errors
+///
+/// Returns a typed error when lock reconciliation fails, an external floor is
+/// absent or not satisfied, or the underlying slots are malformed.
+pub fn resolve_authority_slots_with_profile_v1(
+    first: Option<AuthoritySlotV1>,
+    second: Option<AuthoritySlotV1>,
+    owner: Option<GenerationLockFrameV1>,
+    attempt: Option<GenerationLockFrameV1>,
+    profile: GenerationRootSecurityProfileV1,
+    external_floor: Option<AuthorityFloorV1>,
+) -> Result<Option<AuthoritySlotV1>, GenerationAuthorityErrorV1> {
+    let resolved = resolve_authority_slots_with_locks_v1(first, second, owner, attempt)?;
+    match profile {
+        GenerationRootSecurityProfileV1::RequiredExternal => {
+            let floor = external_floor.ok_or(GenerationAuthorityErrorV1::ExternalFloorRequired)?;
+            let resolved = resolved.ok_or(GenerationAuthorityErrorV1::AuthorityBelowFloor)?;
+            resolve_selected_authority_at_floor_v1(resolved, floor).map(Some)
+        }
+        GenerationRootSecurityProfileV1::CooperativeLocal
+        | GenerationRootSecurityProfileV1::ReadOnlyUnanchored => Ok(resolved),
+    }
 }
 
 fn slot_matches_authority_sequence(slot: AuthoritySlotV1) -> bool {
@@ -4389,6 +4472,74 @@ mod tests {
             resolve_authority_slots_at_floor_v1(Some(foreign_root), None, floor),
             Err(GenerationAuthorityErrorV1::RootMismatch),
             "an externally retained floor cannot be replayed across roots"
+        );
+    }
+
+    #[test]
+    fn required_external_profile_never_silently_downgrades_to_local() {
+        let genesis = authority_reference(1, None);
+        let slot = authority_slot(0, genesis);
+        assert_eq!(
+            resolve_authority_slots_with_profile_v1(
+                Some(slot),
+                None,
+                None,
+                None,
+                GenerationRootSecurityProfileV1::RequiredExternal,
+                None,
+            ),
+            Err(GenerationAuthorityErrorV1::ExternalFloorRequired),
+            "a valid local authority alone is insufficient for required-external admission"
+        );
+
+        let floor = AuthorityFloorV1::new([0x5a; 16], genesis).expect("valid external floor");
+        assert_eq!(
+            resolve_authority_slots_with_profile_v1(
+                Some(slot),
+                None,
+                None,
+                None,
+                GenerationRootSecurityProfileV1::RequiredExternal,
+                Some(floor),
+            ),
+            Ok(Some(slot)),
+            "the exact retained external authority admits the root"
+        );
+    }
+
+    #[test]
+    fn local_and_inspection_profiles_keep_lock_reconciliation_mandatory() {
+        let genesis = authority_reference(1, None);
+        let slot = authority_slot(0, genesis);
+        let attempt = authority_lock(GenerationLockFrameKindV1::Attempt, genesis);
+        for profile in [
+            GenerationRootSecurityProfileV1::CooperativeLocal,
+            GenerationRootSecurityProfileV1::ReadOnlyUnanchored,
+        ] {
+            assert_eq!(
+                resolve_authority_slots_with_profile_v1(
+                    Some(slot),
+                    None,
+                    None,
+                    Some(attempt),
+                    profile,
+                    None,
+                ),
+                Err(GenerationAuthorityErrorV1::UnresolvedAttempt),
+                "{profile:?} cannot bypass an unresolved publication attempt"
+            );
+        }
+    }
+
+    #[test]
+    fn root_security_profiles_explicitly_separate_mutation_authority() {
+        assert!(GenerationRootSecurityProfileV1::RequiredExternal.permits_mutation());
+        assert!(GenerationRootSecurityProfileV1::CooperativeLocal.permits_mutation());
+        assert!(!GenerationRootSecurityProfileV1::ReadOnlyUnanchored.permits_mutation());
+        assert_eq!(
+            GenerationRootSecurityProfileV1::ReadOnlyUnanchored.require_mutation_authorized(),
+            Err(GenerationAuthorityErrorV1::ReadOnlyProfile),
+            "inspection-only admission cannot be reused for mutation"
         );
     }
 
