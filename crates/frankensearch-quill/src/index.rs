@@ -6641,6 +6641,10 @@ impl QuillReader {
 
     #[cfg(all(feature = "profile-internals", not(feature = "conformance-internals")))]
     #[inline]
+    #[allow(
+        clippy::unused_self,
+        reason = "keeps profile checkpoint call sites cfg-symmetric with the controller-backed variant"
+    )]
     fn profile_query_checkpoint<'a>(
         &self,
         cx: &'a Cx,
@@ -7246,6 +7250,8 @@ impl QuillReader {
             topdocs_root,
             #[cfg(feature = "pruning-conformance")]
             None,
+            #[cfg(feature = "profile-internals")]
+            None,
             fan_out && !metering,
         )?;
         let collected = collector.finish()?;
@@ -7367,10 +7373,16 @@ impl QuillReader {
             topdocs_root,
             #[cfg(feature = "pruning-conformance")]
             pruning_trace,
+            #[cfg(feature = "profile-internals")]
+            profile,
             fan_out,
         )?;
         for delta in snapshot.delta_snapshots() {
             checkpoint.admit(QueryWorkKind::Segment, 1)?;
+            #[cfg(feature = "profile-internals")]
+            if let Some(profile) = profile {
+                profile.record_segment_lowered(1);
+            }
             let score_span = tracing::info_span!(
                 target: crate::tracing_conventions::TARGET,
                 crate::tracing_conventions::ARGUS_SCORE,
@@ -7470,6 +7482,7 @@ impl QuillReader {
         #[cfg(feature = "pruning-conformance")] pruning_trace: Option<
             &ConformancePruningTraceSession,
         >,
+        #[cfg(feature = "profile-internals")] profile: Option<&QuillProfileSession>,
         fan_out: bool,
     ) -> Result<(), QuillIndexError> {
         let keeper = snapshot.keeper_snapshot();
@@ -7494,6 +7507,10 @@ impl QuillReader {
                 .map(|(segment_ordinal, segment)| {
                     debug_assert!(segment_ordinal < segment_count);
                     checkpoint.admit(QueryWorkKind::Segment, 1)?;
+                    #[cfg(feature = "profile-internals")]
+                    if let Some(profile) = profile {
+                        profile.record_segment_lowered(1);
+                    }
                     let mut local = template.empty_like()?;
                     let score_span = tracing::info_span!(
                         target: crate::tracing_conventions::TARGET,
@@ -7549,6 +7566,10 @@ impl QuillReader {
             for (segment_ordinal, segment) in keeper.segments().iter().enumerate() {
                 debug_assert!(segment_ordinal < segment_count);
                 checkpoint.admit(QueryWorkKind::Segment, 1)?;
+                #[cfg(feature = "profile-internals")]
+                if let Some(profile) = profile {
+                    profile.record_segment_lowered(1);
+                }
                 let score_span = tracing::info_span!(
                     target: crate::tracing_conventions::TARGET,
                     crate::tracing_conventions::ARGUS_SCORE,
@@ -8227,6 +8248,8 @@ impl QuillIndex {
             rank_pruning,
             topdocs_root,
             #[cfg(feature = "pruning-conformance")]
+            None,
+            #[cfg(feature = "profile-internals")]
             None,
             fan_out && !metering,
         )
@@ -14683,6 +14706,11 @@ mod tests {
             assert!(
                 receipt.counters().4 > 0,
                 "profiled ordinary query did not record any accepted work checkpoints"
+            );
+            assert_eq!(
+                receipt.counters().3,
+                1,
+                "profiled ordinary query must record its one sealed lowering"
             );
             assert_eq!(receipt.outcome(), QuillProfileOutcome::Completed);
         });
