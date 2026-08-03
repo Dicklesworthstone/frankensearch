@@ -2,6 +2,72 @@
   "schema": "artifactstore-v4-f0.schema.json",
   "cases": [
     {
+      "name": "source_requires_and_accepts_source_publisher_role",
+      "expect_valid": true,
+      "instance": {
+        "schema_version": 4,
+        "object_kind": "source",
+        "principal_role": "source_publisher",
+        "identity_scheme": "sha256-domain-separated-v1",
+        "object_identity": "sha256:0101010101010101010101010101010101010101010101010101010101010101",
+        "authentication": "integrity_only",
+        "admission": "unadmitted",
+        "decision": "no_decision",
+        "release": "not_qualified",
+        "coverage": "incomplete",
+        "privacy": "public",
+        "redaction_witness": "sha256:0202020202020202020202020202020202020202020202020202020202020202",
+        "issued_at_unix_ns": 10,
+        "source_digest": "sha256:0303030303030303030303030303030303030303030303030303030303030303"
+      }
+    },
+    {
+      "name": "build_requires_and_accepts_build_service_role",
+      "expect_valid": true,
+      "instance": {
+        "schema_version": 4,
+        "object_kind": "build",
+        "principal_role": "build_service",
+        "identity_scheme": "sha256-domain-separated-v1",
+        "object_identity": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        "predecessor_identity": "sha256:0101010101010101010101010101010101010101010101010101010101010101",
+        "authentication": "integrity_only",
+        "admission": "unadmitted",
+        "decision": "no_decision",
+        "release": "not_qualified",
+        "coverage": "incomplete",
+        "privacy": "restricted",
+        "redaction_witness": "sha256:1212121212121212121212121212121212121212121212121212121212121212",
+        "issued_at_unix_ns": 11,
+        "source_digest": "sha256:0303030303030303030303030303030303030303030303030303030303030303",
+        "cargo_lock_digest": "sha256:1313131313131313131313131313131313131313131313131313131313131313",
+        "executable_digest": "sha256:1414141414141414141414141414141414141414141414141414141414141414"
+      }
+    },
+    {
+      "name": "execution_requires_and_accepts_execution_supervisor_role",
+      "expect_valid": true,
+      "instance": {
+        "schema_version": 4,
+        "object_kind": "execution",
+        "principal_role": "execution_supervisor",
+        "identity_scheme": "sha256-domain-separated-v1",
+        "object_identity": "sha256:2121212121212121212121212121212121212121212121212121212121212121",
+        "predecessor_identity": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+        "authentication": "integrity_only",
+        "admission": "no_decision",
+        "decision": "no_decision",
+        "release": "not_qualified",
+        "coverage": "incomplete",
+        "privacy": "restricted",
+        "redaction_witness": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+        "issued_at_unix_ns": 12,
+        "execution_nonce": "1234567890abcdef1234567890abcdef",
+        "nonce_expires_at_unix_ns": 13,
+        "command_digest": "sha256:2323232323232323232323232323232323232323232323232323232323232323"
+      }
+    },
+    {
       "name": "verified_admitted_complete_pass_can_be_qualified",
       "expect_valid": true,
       "instance": {
