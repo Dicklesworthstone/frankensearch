@@ -1064,6 +1064,22 @@ fn validate_manifest_gate_set(manifest: &toml::Value) -> Result<(), Box<dyn Erro
         if !policy.is_table() {
             return Err(format!("manifest gate.{label} is not a table").into());
         }
+        for field in ["name", "fixture", "target"] {
+            if policy
+                .get(field)
+                .and_then(toml::Value::as_str)
+                .is_none_or(|value| value.trim().is_empty())
+            {
+                return Err(format!("manifest gate.{label}.{field} is missing or empty").into());
+            }
+        }
+        if policy
+            .get("activated")
+            .and_then(toml::Value::as_bool)
+            .is_none()
+        {
+            return Err(format!("manifest gate.{label}.activated is missing or not boolean").into());
+        }
     }
 
     for label in gates.keys() {
@@ -1396,6 +1412,22 @@ mod tests {
         assert!(
             extra_error.contains("unexpected gate.QG-11"),
             "unexpected extra-gate error: {extra_error}"
+        );
+
+        let mut missing_target = manifest.clone();
+        missing_target
+            .get_mut("gate")
+            .and_then(toml::Value::as_table_mut)
+            .and_then(|gates| gates.get_mut("QG-9"))
+            .and_then(toml::Value::as_table_mut)
+            .expect("QG-9 policy table")
+            .remove("target");
+        let missing_target_error = validate_manifest_gate_set(&missing_target)
+            .expect_err("missing normative target must fail closed")
+            .to_string();
+        assert!(
+            missing_target_error.contains("gate.QG-9.target is missing or empty"),
+            "unexpected missing-target error: {missing_target_error}"
         );
     }
 
