@@ -471,6 +471,14 @@ impl SyncTwoTierSearcher {
                 metrics,
             });
         }
+        if query_vec.iter().all(|&value| value == 0.0) {
+            metrics.zero_signal = Some(ZeroSignalReason::ZeroNormQuery);
+            return Ok(SyncSearchOutcome {
+                phases,
+                final_results: Vec::new(),
+                metrics,
+            });
+        }
         let fetch = candidate_count(k, 0, self.config.candidate_multiplier.max(1)).max(k);
 
         let phase1_started = Instant::now();

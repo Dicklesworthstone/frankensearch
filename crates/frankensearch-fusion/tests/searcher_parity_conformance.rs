@@ -570,6 +570,18 @@ fn zero_k_agrees_without_scanning_or_refining() {
 }
 
 #[test]
+fn zero_norm_query_agrees_on_typed_zero_signal_and_skips_refinement() {
+    let query = vec![0.0, 0.0, 0.0, 0.0];
+    let (sync_results, sync_metrics) = run_sync(&TwoTierConfig::default(), &query, 4);
+    let (async_results, async_metrics) =
+        run_async("zero-norm", &TwoTierConfig::default(), &query, 4);
+    assert_result_parity("zero-norm", &sync_results, &async_results);
+    assert_eq!(sync_metrics.zero_signal, async_metrics.zero_signal);
+    assert_eq!(sync_metrics.phase2_vectors_searched, 0);
+    assert_eq!(async_metrics.phase2_vectors_searched, 0);
+}
+
+#[test]
 fn fast_only_agrees_and_skips_phase_two_on_both_sides() {
     let config = TwoTierConfig {
         fast_only: true,
