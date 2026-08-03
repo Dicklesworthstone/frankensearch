@@ -750,6 +750,7 @@ impl InMemoryAntiRollbackFloorStoreV1 {
                 result,
             },
         );
+        drop(state);
         Ok(result)
     }
 }
@@ -4817,6 +4818,32 @@ mod tests {
             })
         );
         assert_eq!(store.load([0x5a; 16]), Ok(None));
+    }
+
+    #[test]
+    fn in_memory_anti_rollback_floor_allows_exactly_one_same_base_publisher() {
+        let store = std::sync::Arc::new(InMemoryAntiRollbackFloorStoreV1::new());
+        let genesis = authority_reference(1, None);
+        let floor = AuthorityFloorV1::new([0x5a; 16], genesis).expect("valid floor");
+        let results = std::thread::scope(|scope| {
+            let handles = (1..=8)
+                .map(|key_byte| {
+                    let store = std::sync::Arc::clone(&store);
+                    scope.spawn(move || store.compare_and_advance(None, floor, [key_byte; 16]))
+                })
+                .collect::<Vec<_>>();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().expect("publisher thread must not panic"))
+                .collect::<Vec<_>>()
+        });
+        let successful = results
+            .into_iter()
+            .filter_map(Result::ok)
+            .collect::<Vec<_>>();
+        assert_eq!(successful.len(), 1, "exactly one empty-base CAS may win");
+        assert_eq!(successful[0].cas_version, 1);
+        assert_eq!(store.load([0x5a; 16]), Ok(Some(successful[0])));
     }
 
     #[test]
