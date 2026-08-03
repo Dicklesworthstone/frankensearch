@@ -14713,6 +14713,20 @@ mod tests {
                 "profiled ordinary query must record its one sealed lowering"
             );
             assert_eq!(receipt.outcome(), QuillProfileOutcome::Completed);
+
+            let repeat = reader
+                .search_paginated_with_profile(&cx, "alpha", 10, 0, false)
+                .expect("repeat profiled ordinary search");
+            let repeat_receipt = match repeat {
+                QuillProfiledSearchOutcome::Completed { receipt, .. } => receipt,
+                QuillProfiledSearchOutcome::Failed { error, .. } => {
+                    panic!("repeat profiled ordinary search unexpectedly failed: {error}")
+                }
+            };
+            assert_eq!(repeat_receipt.cache(), QuillProfileCacheDisposition::Hit);
+            assert_eq!(repeat_receipt.execution(), None);
+            assert_eq!(repeat_receipt.counters(), (0, 0, 0, 0, 0));
+            assert_eq!(repeat_receipt.outcome(), QuillProfileOutcome::Completed);
         });
     }
 
