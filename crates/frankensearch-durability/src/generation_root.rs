@@ -354,7 +354,7 @@ impl GenerationRootCapabilityV1 {
                 | rustix::fs::OFlags::NONBLOCK
                 // The atime witness must not be mutated by this admission
                 // read. Refuse admission if Linux denies this flag.
-                | rustix::fs::OFlags::from_bits_retain(libc::O_NOATIME),
+                | rustix::fs::OFlags::from_bits_retain(libc::O_NOATIME as u32),
             rustix::fs::Mode::empty(),
         )
         .map_err(|error| match error {
