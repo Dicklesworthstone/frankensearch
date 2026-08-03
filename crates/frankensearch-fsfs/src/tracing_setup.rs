@@ -189,7 +189,15 @@ pub fn resolve_log_filter(
 
 #[must_use]
 pub fn current_unicode_environment() -> HashMap<String, String> {
-    std::env::vars_os()
+    unicode_environment_from(std::env::vars_os())
+}
+
+fn unicode_environment_from<I>(variables: I) -> HashMap<String, String>
+where
+    I: IntoIterator<Item = (OsString, OsString)>,
+{
+    variables
+        .into_iter()
         .filter_map(|(key, value)| Some((key.into_string().ok()?, value.into_string().ok()?)))
         .collect()
 }
@@ -258,6 +266,34 @@ mod tests {
         assert_eq!(resolution.source, LogFilterSource::FrankensearchLog);
         assert_eq!(resolution.directives, "warn");
         assert!(resolution.diagnostic.is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unicode_environment_projection_skips_non_unicode_keys_and_values() {
+        use std::os::unix::ffi::OsStringExt;
+
+        let environment = unicode_environment_from([
+            (OsString::from("FSFS_VALID"), OsString::from("present")),
+            (
+                OsString::from_vec(vec![b'F', 0xff]),
+                OsString::from("ignored-key"),
+            ),
+            (
+                OsString::from("FSFS_INVALID_VALUE"),
+                OsString::from_vec(vec![0xff]),
+            ),
+        ]);
+
+        assert_eq!(
+            environment.get("FSFS_VALID").map(String::as_str),
+            Some("present")
+        );
+        assert!(
+            !environment.contains_key("FSFS_INVALID_VALUE"),
+            "a non-Unicode value must be omitted instead of panicking or being lossy-decoded"
+        );
+        assert_eq!(environment.len(), 1);
     }
 
     // Note: init_subscriber can only be called once per process, so we test
