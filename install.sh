@@ -247,6 +247,10 @@ run_installer_contract_test() {
       [ "$#" -eq 2 ] || { err "contract unsupported requires TARGET"; return 2; }
       fail_unsupported_semantic_platform "$2"
       ;;
+    provision)
+      [ "$#" -eq 2 ] || { err "contract provision requires STAGED_BINARY"; return 2; }
+      provision_default_semantic_models "$2"
+      ;;
     install-built)
       [ "$#" -eq 3 ] || { err "contract install-built requires SOURCE DESTINATION"; return 2; }
       SYSTEM=0

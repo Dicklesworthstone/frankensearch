@@ -199,6 +199,20 @@ check_installer_behavior() {
     echo "[installer][FAIL] Intel macOS unsupported outcome status=$unsupported_status output=$unsupported_output"
     FAILURES=$((FAILURES + 1))
   fi
+
+  if FSFS_INSTALL_CONTRACT_TEST=1 "$installer_shell" "$installer" provision /bin/true >/dev/null; then
+    echo "[installer][OK]   staged semantic provisioning admits verified success"
+  else
+    echo "[installer][FAIL] staged semantic provisioning rejected verified success"
+    FAILURES=$((FAILURES + 1))
+  fi
+
+  if FSFS_INSTALL_CONTRACT_TEST=1 "$installer_shell" "$installer" provision /bin/false >/dev/null 2>&1; then
+    echo "[installer][FAIL] staged semantic provisioning failure unexpectedly admitted"
+    FAILURES=$((FAILURES + 1))
+  else
+    echo "[installer][OK]   staged semantic provisioning failure preserves the destination path"
+  fi
 }
 
 check_model_features() {
