@@ -1968,6 +1968,7 @@ pub struct QuillProfileReceipt {
     term_dictionary_views: u64,
     segments_lowered: u64,
     fuel_units: u64,
+    cancellation_observations: u64,
     overflowed: bool,
     outcome: QuillProfileOutcome,
 }
@@ -2046,6 +2047,12 @@ impl QuillProfileReceipt {
         )
     }
 
+    /// Number of cancellation checks that observed an already-cancelled Cx.
+    #[must_use]
+    pub const fn cancellation_observations(&self) -> u64 {
+        self.cancellation_observations
+    }
+
     /// Whether a counter saturated before the receipt could be finalized.
     #[must_use]
     pub const fn overflowed(&self) -> bool {
@@ -2078,6 +2085,7 @@ pub struct QuillProfileSession {
     term_dictionary_views: AtomicU64,
     segments_lowered: AtomicU64,
     fuel_units: AtomicU64,
+    cancellation_observations: AtomicU64,
     overflowed: AtomicBool,
     state: StdMutex<QuillProfileSessionState>,
 }
@@ -2111,6 +2119,7 @@ impl QuillProfileSession {
             term_dictionary_views: AtomicU64::new(0),
             segments_lowered: AtomicU64::new(0),
             fuel_units: AtomicU64::new(0),
+            cancellation_observations: AtomicU64::new(0),
             overflowed: AtomicBool::new(false),
             state: StdMutex::new(QuillProfileSessionState {
                 cache: None,
@@ -2212,6 +2221,11 @@ impl QuillProfileSession {
         self.record_counter(&self.fuel_units, units);
     }
 
+    /// Record one cancellation check that observed cancellation.
+    pub fn record_cancellation_observation(&self) {
+        self.record_counter(&self.cancellation_observations, 1);
+    }
+
     fn record_counter(&self, counter: &AtomicU64, units: u64) {
         if units == 0 {
             return;
@@ -2271,6 +2285,7 @@ impl QuillProfileSession {
             term_dictionary_views: self.term_dictionary_views.load(Ordering::Acquire),
             segments_lowered: self.segments_lowered.load(Ordering::Acquire),
             fuel_units: self.fuel_units.load(Ordering::Acquire),
+            cancellation_observations: self.cancellation_observations.load(Ordering::Acquire),
             overflowed,
             outcome,
         })
@@ -3275,6 +3290,10 @@ impl QueryWorkCheckpoint for QueryCheckpoint<'_> {
         self.conformance_controller
             .checkpoint(ConformanceCancellationStage::QueryCollection, self.cx);
         if self.cx.is_cancel_requested() {
+            #[cfg(feature = "profile-internals")]
+            if let Some(profile) = self.profile {
+                profile.record_cancellation_observation();
+            }
             return Err(ArgusError::QueryCancelled { phase: self.phase });
         }
         if units == 0 {
@@ -6906,6 +6925,7 @@ impl QuillReader {
             #[cfg(feature = "profile-internals")]
             if let Some(profile) = profile {
                 profile.bind_cache(QuillProfileCacheDisposition::NotChecked)?;
+                profile.record_cancellation_observation();
             }
             return Err(error);
         }
@@ -14855,6 +14875,7 @@ mod tests {
             assert_eq!(receipt.execution(), None);
             assert_eq!(receipt.work_plan(), None);
             assert_eq!(receipt.counters(), (0, 0, 0, 0, 0));
+            assert_eq!(receipt.cancellation_observations(), 1);
             assert_eq!(receipt.outcome(), QuillProfileOutcome::Cancelled);
         });
     }
