@@ -4485,6 +4485,14 @@ mod tests {
             ActivationManifestV1::from_canonical_bytes(&bytes[..bytes.len() - 1]).is_err(),
             "a truncated self-seal must fail before selecting the manifest"
         );
+        let oversized = vec![0; GENERATION_ACTIVATION_MANIFEST_MAX_BYTES_V1 + 1];
+        assert_eq!(
+            ActivationManifestV1::from_canonical_bytes(&oversized),
+            Err(GenerationAuthorityErrorV1::InvalidField {
+                field: "activation_manifest.canonical_bytes"
+            }),
+            "the manifest ceiling is enforced before decode"
+        );
 
         let mut future = manifest;
         future.schema_version = GENERATION_AUTHORITY_SCHEMA_V1 + 1;
@@ -4536,6 +4544,37 @@ mod tests {
             Err(GenerationAuthorityErrorV1::BrokenPredecessorLink),
             "an activation manifest may not skip an authority sequence"
         );
+    }
+
+    #[test]
+    fn rollback_uses_a_new_authority_without_reusing_artifact_identity() {
+        let genesis = activation_manifest(1, None);
+        let (genesis_len, genesis_sha256) = genesis.object_receipt();
+        let first = AuthorityRefV1::new(1, [0x41; 16], genesis_len, genesis_sha256, None)
+            .expect("first authority reference");
+        let second = AuthorityRefV1::new(
+            2,
+            [0x42; 16],
+            genesis_len,
+            genesis_sha256,
+            Some(first.fingerprint()),
+        )
+        .expect("second authority reference");
+        let rollback = ActivationManifestV1::new(
+            3,
+            Some(second),
+            GenerationAuthorityActionV1::Rollback,
+            ArtifactGenerationIdentityV1::new(7, [0x21; 16]).expect("reselected generation"),
+            [0x31; 32],
+            [0x32; 32],
+            [0x33; 32],
+            component_receipts(),
+        )
+        .expect("higher-authority rollback is canonical");
+        assert_eq!(rollback.authority_sequence, 3);
+        assert_eq!(rollback.generation.sequence, 7);
+        assert_eq!(rollback.action, GenerationAuthorityActionV1::Rollback);
+        rollback.validate().expect("rollback self-seal validates");
     }
 
     #[test]
