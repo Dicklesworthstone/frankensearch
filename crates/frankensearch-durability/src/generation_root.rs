@@ -221,6 +221,8 @@ pub struct GenerationRootCapabilityV1 {
     directory: File,
     #[cfg(target_os = "linux")]
     device: u64,
+    #[cfg(target_os = "linux")]
+    directory_policy: GenerationRootDirectoryPolicyV1,
 }
 
 impl GenerationRootCapabilityV1 {
@@ -249,6 +251,7 @@ impl GenerationRootCapabilityV1 {
         Ok(Self {
             directory,
             device: stat.st_dev,
+            directory_policy: policy,
         })
     }
 
@@ -303,11 +306,18 @@ impl GenerationRootCapabilityV1 {
             if stat.st_dev != self.device {
                 return Err(GenerationRootAdmissionErrorV1::CrossDevice);
             }
+            if stat.st_uid != self.directory_policy.expected_uid {
+                return Err(GenerationRootAdmissionErrorV1::OwnerMismatch);
+            }
+            if stat.st_mode & 0o7777 != self.directory_policy.expected_mode {
+                return Err(GenerationRootAdmissionErrorV1::ModeMismatch);
+            }
             current = File::from(descriptor);
         }
         Ok(Self {
             directory: current,
             device: self.device,
+            directory_policy: self.directory_policy,
         })
     }
 
@@ -614,10 +624,16 @@ mod tests {
     #[test]
     fn descriptor_descent_keeps_normal_children_and_rejects_symlink_ancestors() {
         use std::fs;
-        use std::os::unix::fs::symlink;
+        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _, symlink};
 
         let directory = tempfile::tempdir().expect("temporary trusted root");
         fs::create_dir(directory.path().join("generations")).expect("create child directory");
+        let root_metadata = fs::metadata(directory.path()).expect("trusted root metadata");
+        fs::set_permissions(
+            directory.path().join("generations"),
+            fs::Permissions::from_mode(root_metadata.mode() & 0o7777),
+        )
+        .expect("align child directory policy with trusted root");
         let root = admit_test_root(&directory);
         let normal = GenerationRootRouteV1::parse(Path::new("generations"))
             .expect("normal descendant route");
@@ -631,6 +647,27 @@ mod tests {
         assert!(matches!(
             root.descend(&redirected),
             Err(GenerationRootAdmissionErrorV1::NotDirectory)
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn descriptor_descent_rejects_child_directory_mode_outside_root_policy() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let directory = tempfile::tempdir().expect("temporary trusted root");
+        let child = directory.path().join("untrusted-child");
+        fs::create_dir(&child).expect("create child directory");
+        fs::set_permissions(&child, fs::Permissions::from_mode(0o777))
+            .expect("make child directory policy-incompatible");
+        let root = admit_test_root(&directory);
+        let route = GenerationRootRouteV1::parse(Path::new("untrusted-child"))
+            .expect("syntactically normal route");
+
+        assert!(matches!(
+            root.descend(&route),
+            Err(GenerationRootAdmissionErrorV1::ModeMismatch)
         ));
     }
 
