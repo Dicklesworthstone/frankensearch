@@ -312,6 +312,15 @@ pub trait QueryWorkCheckpoint: Send + Sync {
 
 /// Forward-only posting access shared by sealed and future delta segments.
 ///
+/// Unforgeable evidence that a cursor's backing codec validates each
+/// post-move scorer invariant.
+///
+/// The private field prevents custom [`PostingCursor`] implementations from
+/// claiming this contract. Only the sealed Quiver adapter and wrappers that
+/// preserve its exact cursor semantics may return this token.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ValidatedPostMoveContract(());
+
 /// A cursor starts on its first posting. `advance` is an inclusive lower-bound
 /// seek and does not move when the current document already satisfies the
 /// target. Exhaustion is fused and represented by `None`.
@@ -352,15 +361,16 @@ pub trait PostingCursor {
     /// storage invariants.
     fn advance(&mut self, target: u32) -> Result<Option<u32>, ArgusError>;
 
-    /// Whether this cursor's backing storage validates every post-move
-    /// invariant required by a term scorer.
+    /// Return evidence that this cursor's backing storage validates every
+    /// post-move invariant required by a term scorer.
     ///
     /// The default keeps defensive post-move validation enabled for custom
     /// and Delta cursors. The sealed Quiver adapter may opt in only because
     /// its validated codec guarantees ordered document ids and positive
-    /// frequencies for every decoded posting.
-    fn has_validated_post_move_contract(&self) -> bool {
-        false
+    /// frequencies for every decoded posting. The marker is unforgeable by a
+    /// custom cursor implementation.
+    fn validated_post_move_contract(&self) -> Option<ValidatedPostMoveContract> {
+        None
     }
 
     /// Fork the current position into an independent cursor suitable for
@@ -470,8 +480,8 @@ where
         (**self).advance(target)
     }
 
-    fn has_validated_post_move_contract(&self) -> bool {
-        (**self).has_validated_post_move_contract()
+    fn validated_post_move_contract(&self) -> Option<ValidatedPostMoveContract> {
+        (**self).validated_post_move_contract()
     }
 
     fn fork_for_pruning(&self) -> Option<Box<dyn PostingCursor + '_>> {
@@ -612,8 +622,8 @@ impl PostingCursor for CheckpointPostingCursor<'_> {
         Ok(moved)
     }
 
-    fn has_validated_post_move_contract(&self) -> bool {
-        self.inner.has_validated_post_move_contract()
+    fn validated_post_move_contract(&self) -> Option<ValidatedPostMoveContract> {
+        self.inner.validated_post_move_contract()
     }
 
     fn fork_for_pruning(&self) -> Option<Box<dyn PostingCursor + '_>> {
@@ -846,8 +856,8 @@ impl PostingCursor for SealedPostingCursor<'_> {
         }
     }
 
-    fn has_validated_post_move_contract(&self) -> bool {
-        true
+    fn validated_post_move_contract(&self) -> Option<ValidatedPostMoveContract> {
+        Some(ValidatedPostMoveContract(()))
     }
 
     fn fork_for_pruning(&self) -> Option<Box<dyn PostingCursor + '_>> {
@@ -1406,7 +1416,7 @@ impl<'a> TermScorer<'a> {
         let size_hint = cursor.size_hint();
         let cost = cursor.cost();
         let segment_num_docs = cursor.segment_num_docs();
-        let validated_post_move_contract = cursor.has_validated_post_move_contract();
+        let validated_post_move_contract = cursor.validated_post_move_contract().is_some();
         if u64::from(segment_num_docs) > snapshot.doc_count() {
             return Err(ArgusError::InvalidSnapshot {
                 field_ord: snapshot.field_ord(),
