@@ -10,9 +10,7 @@ use std::ops::{Bound, Deref};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 #[cfg(any(feature = "conformance-internals", feature = "profile-internals"))]
-use std::sync::Mutex as StdMutex;
-#[cfg(feature = "profile-internals")]
-use std::sync::atomic::AtomicBool;
+use std::sync::{Mutex as StdMutex, atomic::AtomicBool};
 #[cfg(feature = "conformance-internals")]
 use std::sync::atomic::AtomicU8;
 use std::sync::atomic::{AtomicU64, Ordering};
