@@ -175,7 +175,7 @@ const AUTHORITY_SLOT_BODY_BYTES: usize =
 const AUTHORITY_SLOT_MAGIC_V1: [u8; 8] = *b"FSAUTH01";
 const AUTHORITY_SLOT_HEADER_BYTES: usize = 131;
 const AUTHORITY_REF_MAGIC_V1: [u8; 9] = *b"FSAUTHREF";
-const AUTHORITY_REF_BYTES_V1: usize = 100;
+const AUTHORITY_REF_BYTES_V1: usize = 108;
 const LOCK_FRAME_DIGEST_BYTES: usize = 32;
 const LOCK_FRAME_BODY_BYTES: usize = GENERATION_LOCK_FRAME_BYTES_V1 - LOCK_FRAME_DIGEST_BYTES;
 const LOCK_FRAME_MAGIC_V1: [u8; 8] = *b"FSLOCK01";
@@ -4294,12 +4294,12 @@ mod tests {
     fn raw_authority_frame_resolver_preserves_corruption_as_an_error() {
         let genesis = authority_reference(1, None);
         let successor = authority_reference(2, Some(genesis.fingerprint()));
-        let first = authority_slot(1, genesis)
-            .encode()
-            .expect("encode genesis frame");
-        let second = authority_slot(0, successor)
+        let first = authority_slot(0, successor)
             .encode()
             .expect("encode successor frame");
+        let second = authority_slot(1, genesis)
+            .encode()
+            .expect("encode genesis frame");
         assert_eq!(
             resolve_authority_slot_frames_v1(Some(&first), Some(&second), [0x5a; 16]),
             Ok(Some(authority_slot(0, successor))),
@@ -4307,8 +4307,8 @@ mod tests {
         );
         assert_eq!(
             resolve_authority_slot_frames_v1(Some(&first), None, [0x5a; 16]),
-            Ok(Some(authority_slot(1, genesis))),
-            "only a genuinely absent second frame permits one-slot survival"
+            Ok(Some(authority_slot(0, successor))),
+            "only a genuinely absent second frame permits first-slot survival"
         );
 
         let mut corrupt_second = second;
@@ -4324,12 +4324,12 @@ mod tests {
     fn raw_authority_frame_resolver_rejects_length_and_order_tears() {
         let genesis = authority_reference(1, None);
         let successor = authority_reference(2, Some(genesis.fingerprint()));
-        let first = authority_slot(1, genesis)
-            .encode()
-            .expect("encode genesis frame");
-        let second = authority_slot(0, successor)
+        let first = authority_slot(0, successor)
             .encode()
             .expect("encode successor frame");
+        let second = authority_slot(1, genesis)
+            .encode()
+            .expect("encode genesis frame");
 
         assert_eq!(
             resolve_authority_slot_frames_v1(Some(&first[..first.len() - 1]), None, [0x5a; 16]),
@@ -4397,7 +4397,7 @@ mod tests {
         let genesis = authority_reference(1, None);
         let bytes = genesis.canonical_bytes();
         assert_eq!(&bytes[..9], b"FSAUTHREF");
-        assert_eq!(bytes.len(), 100);
+        assert_eq!(bytes.len(), 108);
         assert_ne!(genesis.fingerprint(), [0; 32]);
     }
 
