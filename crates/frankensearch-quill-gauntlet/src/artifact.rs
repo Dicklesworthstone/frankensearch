@@ -1219,6 +1219,10 @@ const ARTIFACTSTORE_V4_SOURCE_SNAPSHOT_SCHEMA_VERSION: u32 = 1;
 const ARTIFACTSTORE_V4_SOURCE_SNAPSHOT_HASH_DOMAIN: &[u8] =
     b"frankensearch.artifactstore.v4.source\0";
 const MAX_ARTIFACTSTORE_V4_SOURCE_SNAPSHOT_BYTES: u64 = 16 * 1024 * 1024;
+const ARTIFACTSTORE_V4_BUILD_SNAPSHOT_SCHEMA_VERSION: u32 = 1;
+const ARTIFACTSTORE_V4_BUILD_SNAPSHOT_HASH_DOMAIN: &[u8] =
+    b"frankensearch.artifactstore.v4.build\0";
+const MAX_ARTIFACTSTORE_V4_BUILD_SNAPSHOT_BYTES: u64 = 16 * 1024 * 1024;
 
 /// File-kind witness for one compiler-visible source input.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -1473,6 +1477,138 @@ fn resolve_source_symlink_target(
     Ok(resolved)
 }
 
+/// Class of compiler-visible Build input bound into `ArtifactStore` v4.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ArtifactStoreV4BuildInputKind {
+    CargoLock,
+    RegistryChecksum,
+    GitDependency,
+    Toolchain,
+    Compiler,
+    Linker,
+    TargetConfig,
+    CargoConfig,
+    Environment,
+    BuildScriptInput,
+    BuildScriptOutput,
+    GeneratedSource,
+    FeatureSelection,
+    Profile,
+    Rustflags,
+    Executable,
+    DebugMetadata,
+}
+
+/// Exact canonical bytes for one compiler-visible Build input.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ArtifactStoreV4BuildInput {
+    pub key: String,
+    pub kind: ArtifactStoreV4BuildInputKind,
+    pub canonical_bytes: Vec<u8>,
+    pub sha256: String,
+}
+
+/// Immutable Build object bound to one immutable Source object.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ArtifactStoreV4BuildSnapshot {
+    pub schema_version: u32,
+    pub source_identity_sha256: String,
+    pub inputs: Vec<ArtifactStoreV4BuildInput>,
+    pub identity_sha256: String,
+}
+
+impl ArtifactStoreV4BuildSnapshot {
+    /// Construct a byte-exact Build snapshot bound to an admitted Source identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for malformed source identities, unordered inputs, or
+    /// an input digest that does not bind its canonical bytes.
+    pub fn new(
+        source_identity_sha256: String,
+        inputs: Vec<ArtifactStoreV4BuildInput>,
+    ) -> Result<Self, GauntletError> {
+        let mut snapshot = Self {
+            schema_version: ARTIFACTSTORE_V4_BUILD_SNAPSHOT_SCHEMA_VERSION,
+            source_identity_sha256,
+            inputs,
+            identity_sha256: String::new(),
+        };
+        snapshot.validate_inputs()?;
+        snapshot.identity_sha256 = snapshot.computed_identity_sha256()?;
+        Ok(snapshot)
+    }
+
+    /// Revalidate a decoded Build snapshot and all byte bindings.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a schema, source binding, input, or identity mismatch.
+    pub fn validate(&self) -> Result<(), GauntletError> {
+        if self.schema_version != ARTIFACTSTORE_V4_BUILD_SNAPSHOT_SCHEMA_VERSION
+            || !is_lower_sha256(&self.source_identity_sha256)
+            || !is_lower_sha256(&self.identity_sha256)
+        {
+            return Err(GauntletError::InvalidPreparedArtifact {
+                reason: "ArtifactStore v4 Build snapshot has an invalid schema or identity"
+                    .to_owned(),
+            });
+        }
+        self.validate_inputs()?;
+        if self.identity_sha256 != self.computed_identity_sha256()? {
+            return Err(GauntletError::InvalidPreparedArtifact {
+                reason: "ArtifactStore v4 Build snapshot identity does not match canonical inputs"
+                    .to_owned(),
+            });
+        }
+        Ok(())
+    }
+
+    fn validate_inputs(&self) -> Result<(), GauntletError> {
+        let mut previous = None;
+        for input in &self.inputs {
+            if !is_canonical_build_input_key(&input.key)
+                || !is_lower_sha256(&input.sha256)
+                || input.sha256 != lower_hex(&Sha256::digest(&input.canonical_bytes))
+                || previous.is_some_and(|key: &str| key >= input.key.as_str())
+            {
+                return Err(GauntletError::InvalidPreparedArtifact {
+                    reason: "ArtifactStore v4 Build inputs are not canonical and strictly ordered"
+                        .to_owned(),
+                });
+            }
+            previous = Some(input.key.as_str());
+        }
+        Ok(())
+    }
+
+    fn computed_identity_sha256(&self) -> Result<String, GauntletError> {
+        let bytes = serialize_json_bounded(
+            &(
+                self.schema_version,
+                &self.source_identity_sha256,
+                &self.inputs,
+            ),
+            MAX_ARTIFACTSTORE_V4_BUILD_SNAPSHOT_BYTES,
+            "ArtifactStore v4 Build snapshot exceeds its byte budget",
+        )?;
+        let mut hasher = Sha256::new();
+        hasher.update(ARTIFACTSTORE_V4_BUILD_SNAPSHOT_HASH_DOMAIN);
+        hasher.update(bytes);
+        Ok(lower_hex(&hasher.finalize()))
+    }
+}
+
+fn is_canonical_build_input_key(key: &str) -> bool {
+    !key.is_empty()
+        && key.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b'/' | b':')
+        })
+}
+
 /// Mutable run provenance referencing one immutable object hash.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1721,6 +1857,19 @@ impl ArtifactStore {
         entries: Vec<ArtifactStoreV4SourceEntry>,
     ) -> Result<ArtifactStoreV4SourceSnapshot, GauntletError> {
         ArtifactStoreV4SourceSnapshot::new(entries)
+    }
+
+    /// Bind compiler-visible Build inputs to an `ArtifactStore` v4 Source object.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the Source identity or any Build input is malformed.
+    pub fn bind_v4_build_snapshot(
+        source: &ArtifactStoreV4SourceSnapshot,
+        inputs: Vec<ArtifactStoreV4BuildInput>,
+    ) -> Result<ArtifactStoreV4BuildSnapshot, GauntletError> {
+        source.validate()?;
+        ArtifactStoreV4BuildSnapshot::new(source.identity_sha256.clone(), inputs)
     }
 
     #[cfg(test)]
@@ -3631,6 +3780,35 @@ mod tests {
             snapshot.entries[1].resolved_target_path.as_deref(),
             Some("Cargo.lock")
         );
+    }
+
+    #[test]
+    fn artifactstore_v4_build_snapshot_binds_exact_build_input_bytes() {
+        let mut inputs = vec![
+            ArtifactStoreV4BuildInput {
+                key: "cargo.profile".to_owned(),
+                kind: ArtifactStoreV4BuildInputKind::Profile,
+                canonical_bytes: b"release".to_vec(),
+                sha256: lower_hex(&Sha256::digest(b"release")),
+            },
+            ArtifactStoreV4BuildInput {
+                key: "cargo.rustflags".to_owned(),
+                kind: ArtifactStoreV4BuildInputKind::Rustflags,
+                canonical_bytes: b"-Ctarget-cpu=native".to_vec(),
+                sha256: lower_hex(&Sha256::digest(b"-Ctarget-cpu=native")),
+            },
+        ];
+        let snapshot = ArtifactStoreV4BuildSnapshot::new("d".repeat(64), inputs.clone())
+            .expect("construct canonical Build snapshot");
+        snapshot
+            .validate()
+            .expect("validate constructed Build snapshot");
+
+        inputs[1].canonical_bytes.push(b' ');
+        assert!(matches!(
+            ArtifactStoreV4BuildSnapshot::new("d".repeat(64), inputs),
+            Err(GauntletError::InvalidPreparedArtifact { .. })
+        ));
     }
 
     #[test]
