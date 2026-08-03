@@ -371,6 +371,53 @@ fn phase_snapshots(
     (sync, async_phases)
 }
 
+fn lexical_phase_snapshots(
+    query_vec: &[f32],
+    config: TwoTierConfig,
+) -> (
+    Vec<(&'static str, Vec<ScoredResult>)>,
+    Vec<(&'static str, Vec<ScoredResult>)>,
+) {
+    let sync = SyncTwoTierSearcher::new(sync_index(true), config.clone())
+        .with_lexical(Arc::new(StaticLexical {
+            hits: lexical_hits(),
+        }))
+        .search_iter(query_vec, 3)
+        .map(|phase| (phase_label(&phase), phase_results(&phase).to_vec()))
+        .collect();
+    let index = async_index("lexical-phase-snapshots", true);
+    let fast: Arc<dyn Embedder> = Arc::new(FixedVecEmbedder {
+        id: "parity-fast",
+        vector: query_vec.to_vec(),
+    });
+    let quality: Arc<dyn Embedder> = Arc::new(FixedVecEmbedder {
+        id: "parity-quality",
+        vector: query_vec.to_vec(),
+    });
+    let lexical = Arc::new(StaticLexical {
+        hits: lexical_hits(),
+    });
+    let mut async_phases = Vec::new();
+    asupersync::test_utils::run_test_with_cx(|cx| {
+        let slot = &mut async_phases;
+        async move {
+            TwoTierSearcher::new(index, fast, config)
+                .with_quality_embedder(quality)
+                .with_lexical(lexical)
+                .search(
+                    &cx,
+                    "how does this parity conformance query retrieve results",
+                    3,
+                    |_| None,
+                    |phase| slot.push((phase_label(&phase), phase_results(&phase).to_vec())),
+                )
+                .await
+                .expect("async lexical phase search");
+        }
+    });
+    (sync, async_phases)
+}
+
 fn phase_labels(
     query_vec: &[f32],
     with_quality: bool,
@@ -842,6 +889,44 @@ fn explain_mode_preserves_field_parity_in_each_progressive_phase() {
     for ((label, sync_results), (_, async_results)) in sync_phases.iter().zip(async_phases.iter()) {
         assert_result_parity(
             &format!("phase-{label}-explain"),
+            sync_results,
+            async_results,
+        );
+        assert!(
+            sync_results
+                .iter()
+                .all(|result| result.explanation.is_some())
+        );
+        assert!(
+            async_results
+                .iter()
+                .all(|result| result.explanation.is_some())
+        );
+    }
+}
+
+#[test]
+fn lexical_explain_mode_preserves_field_parity_in_each_progressive_phase() {
+    let config = TwoTierConfig {
+        candidate_multiplier: 3,
+        explain: true,
+        ..TwoTierConfig::default()
+    };
+    let query = normalize(vec![1.0, 0.0, 0.0, 0.0]);
+    let (sync_phases, async_phases) = lexical_phase_snapshots(&query, config);
+    let sync_labels = sync_phases
+        .iter()
+        .map(|(label, _)| *label)
+        .collect::<Vec<_>>();
+    let async_labels = async_phases
+        .iter()
+        .map(|(label, _)| *label)
+        .collect::<Vec<_>>();
+    assert_eq!(sync_labels, ["initial", "refined"]);
+    assert_eq!(sync_labels, async_labels);
+    for ((label, sync_results), (_, async_results)) in sync_phases.iter().zip(async_phases.iter()) {
+        assert_result_parity(
+            &format!("lexical-phase-{label}-explain"),
             sync_results,
             async_results,
         );
