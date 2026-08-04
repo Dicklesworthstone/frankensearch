@@ -10314,7 +10314,7 @@ impl<'a> BorrowedStoredMetaSection<'a> {
         docid_lo: u64,
         docid_hi: u64,
         lease_docid_base: u64,
-        accumulator: &ColumnarAccumulator<A>,
+        accumulator: &'a ColumnarAccumulator<A>,
     ) -> Result<Self, StoredMetaCodecError> {
         Self::encode_accumulator_with_limits(
             docid_lo,
@@ -10335,7 +10335,7 @@ impl<'a> BorrowedStoredMetaSection<'a> {
         docid_lo: u64,
         docid_hi: u64,
         lease_docid_base: u64,
-        accumulator: &ColumnarAccumulator<A>,
+        accumulator: &'a ColumnarAccumulator<A>,
         limits: StoredMetaLimits,
     ) -> Result<Self, StoredMetaCodecError> {
         let span = checked_stored_meta_span(docid_lo, docid_hi, limits)?;
@@ -10629,6 +10629,9 @@ impl<'a> BorrowedStoredMetaSection<'a> {
             total_len,
         })
     }
+}
+
+impl EncodedStoredMetaSection {
 
     /// Concatenate ordered non-overlapping STOREDMETA sections.
     ///
