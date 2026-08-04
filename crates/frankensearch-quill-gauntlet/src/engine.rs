@@ -8438,40 +8438,45 @@ mod tests {
         });
     }
 
-    /// E6.3 `e6.3-duplicate-then-delete-v1`: the law's precondition is
-    /// UNSATISFIABLE on the live scalar writer, and this test is the
-    /// measurement that earns its `SkipWithReason`.
+    /// E6.3 `e6.3-duplicate-then-delete-v1`: the law's precondition now HOLDS,
+    /// and this test is the measurement that discharges its old skip reason.
     ///
-    /// The law wants the bead's contractual sequence: a duplicate-ID batch is
-    /// rejected before either row publishes, so deleting that ID afterwards is
-    /// the same lifecycle as deleting an ID that was never added. Measured on
-    /// the shipping writer, every step of that sentence fails:
+    /// This test previously measured the opposite and earned the law's
+    /// `SkipWithReason(RejectedIngestPublishesPartialBatch)`: the serial ingest
+    /// route detected a duplicate only after accumulating the batch's earlier
+    /// rows, so the rejection left them staged, `delete_document` was refused
+    /// while they were staged, and the next `commit()` PUBLISHED them — making
+    /// the rejected ID live rather than never-added, so the two lifecycles
+    /// diverged at the delete itself.
     ///
-    ///   1. the rejection leaves `has_uncommitted_changes()` true — the serial
-    ///      route accumulates each row and only then detects the duplicate, so
-    ///      the batch's EARLIER rows stay staged;
-    ///   2. `delete_document` is therefore refused with an exact typed error,
-    ///      so the transform cannot even be executed at that point;
-    ///   3. the next `commit()` succeeds and PUBLISHES the staged first row —
-    ///      `doc_count` becomes 1. The rejected ID is live, not never-added;
-    ///   4. so its delete then reports `true`, while the never-added control
-    ///      reports `false`. The two lifecycles diverge at the delete itself.
+    /// `bd-quill-rejected-ingest-publishes-partial-batch-aihri` fixed that:
+    /// admission now runs over the whole batch before any of it is
+    /// accumulated, on every route, so a rejected batch stages nothing. Every
+    /// step of the law's sentence is therefore measurable, and measured here:
     ///
-    /// Step 3 is an engine finding, not a fixture problem: an ingest that
-    /// returned `Err` still publishes part of its batch on the next commit.
-    /// It is filed as its own blocker —
-    /// `bd-quill-rejected-ingest-publishes-partial-batch-aihri` — rather than
-    /// absorbed here, and this law stays a skip until that blocker is ruled
-    /// on. Weakening the law to
-    /// "membership only" or committing before the delete would both hide the
-    /// partial publication instead of reporting it.
+    ///   1. the rejection leaves `has_uncommitted_changes()` FALSE;
+    ///   2. `delete_document` is accepted, not refused, and reports `false`;
+    ///   3. the next `commit()` publishes nothing — `doc_count` stays 0;
+    ///   4. so the rejected-then-delete lifecycle AGREES with the never-added
+    ///      control, which is exactly the law's equivalence relation.
     ///
-    /// The registry assertion at the end binds this measurement to the
-    /// descriptor, so the skip cannot be flipped back to `Applies` without
-    /// re-running the measurement that justifies it.
+    /// The invalid fixture at the end is the planted negative that keeps this
+    /// honest: a UNIQUELY ADMITTED and committed ID reports `true` from the
+    /// same delete, so the agreement above is a property of rejection and not
+    /// of the assertion being trivially satisfiable.
+    ///
+    /// THE REGISTRY IS DELIBERATELY NOT FLIPPED HERE, and the assertion at the
+    /// end still pins the skip. Two reasons, both of them somebody else's call:
+    /// this is the registry's LAST remaining `SkipWithReason`, so the
+    /// "a skip is never a pass" plant in
+    /// `runner::tests::e63_metamorphic_accounting_excludes_skips_from_passes`
+    /// would lose its subject and stop testing anything; and flipping a law to
+    /// `Applies` is a coverage claim owned by
+    /// `bd-quill-e6-gauntlet-scale-rm3q.3`. The stale skip is tracked, not
+    /// forgotten — see the follow-up filed on that bead.
     #[cfg(feature = "perf-harness")]
     #[test]
-    fn e63_duplicate_then_delete_precondition_fails_because_a_rejected_batch_publishes() {
+    fn e63_duplicate_then_delete_precondition_holds_now_that_rejection_stages_nothing() {
         use frankensearch_core::IndexableDocument;
         use frankensearch_quill::index::QuillIndexError;
 
@@ -8517,34 +8522,29 @@ mod tests {
                     QuillIndexError::InvalidState { ref detail }
                         if detail.contains("duplicate live document id")
                 ));
-                // 1. The rejected batch left its earlier row staged.
+                // 1. The rejected batch staged nothing.
                 assert!(
-                    rejected
+                    !rejected
                         .index()
                         .expect("E6.3 read rejected duplicate lifecycle campaign")
                         .has_uncommitted_changes(),
-                    "E6.3 seed {seed:#x} rejected batch must be measured, not assumed, to leave staged rows"
+                    "E6.3 seed {seed:#x} a rejected batch must leave no staged row behind"
                 );
 
-                // 2. So the transform's own operation is refused, exactly.
-                let refusal = rejected
+                // 2. So the transform's own operation is now executable, and
+                //    reports the ID as absent rather than being refused.
+                let rejected_delete = rejected
                     .index_mut()
                     .expect("E6.3 rejected duplicate campaign remains open")
                     .delete_document(&cx, &document_id)
                     .await
-                    .expect_err("E6.3 delete after a rejected duplicate batch must be refused");
+                    .expect("E6.3 delete after a rejected duplicate batch must be executable");
                 assert!(
-                    matches!(
-                        refusal,
-                        QuillIndexError::InvalidState { ref detail }
-                            if detail == "delete_document requires a fully committed scalar index"
-                    ),
-                    "E6.3 seed {seed:#x} unexpected refusal: {refusal:?}"
+                    !rejected_delete,
+                    "E6.3 seed {seed:#x} the rejected ID must report absent, not live"
                 );
 
-                // 3. THE BLOCKER: committing after the rejection publishes the
-                //    staged first row. The batch is atomic against automatic
-                //    publication only, never against the caller's next commit.
+                // 3. And committing after the rejection publishes nothing.
                 rejected
                     .index_mut()
                     .expect("E6.3 rejected duplicate campaign remains open")
@@ -8556,17 +8556,9 @@ mod tests {
                         .index()
                         .expect("E6.3 read rejected duplicate lifecycle campaign")
                         .doc_count(),
-                    1,
+                    0,
                     "E6.3 seed {seed:#x} a rejected ingest must not publish part of its batch"
                 );
-
-                // 4. And so the two lifecycles diverge at the delete itself.
-                let rejected_delete = rejected
-                    .index_mut()
-                    .expect("E6.3 rejected duplicate campaign remains open")
-                    .delete_document(&cx, &document_id)
-                    .await
-                    .expect("E6.3 delete the published row of the rejected batch");
                 rejected
                     .mark_committed()
                     .expect("E6.3 publish rejected duplicate lifecycle campaign");
@@ -8597,10 +8589,13 @@ mod tests {
                     .await
                     .expect("E6.3 observe never-added lifecycle campaign");
 
-                assert_ne!(
+                // 4. The two lifecycles AGREE, which is the law's equivalence
+                //    relation. They disagreed before the atomic-ingest fix.
+                assert_eq!(
                     rejected_delete, never_added_delete,
-                    "E6.3 seed {seed:#x} the two lifecycles are measured as DIFFERENT; if they \
-                     ever agree, re-measure the blocker and revisit the registry skip"
+                    "E6.3 seed {seed:#x} rejected-then-delete must be the same lifecycle as \
+                     never-added; if these ever diverge again, the ingest atomicity fix \
+                     regressed and the registry skip has to come back"
                 );
 
                 // WHY THE PROJECTION MATTERS. Both terminal corpora are empty,
@@ -8652,9 +8647,13 @@ mod tests {
                 );
             }
 
-            // Bind the measurement to the declaration. A future change that
-            // makes the rejected batch leave nothing staged must come here,
-            // re-run this test, and flip the descriptor deliberately.
+            // Bind the measurement to the declaration. That change has now
+            // happened — the rejected batch leaves nothing staged — so this
+            // assertion no longer records a justified skip. It records a STALE
+            // one, deliberately, so the descriptor cannot drift out of sight:
+            // whoever flips it to `Applies` must also give
+            // `e63_metamorphic_accounting_excludes_skips_from_passes` another
+            // skip to plant on, since this is the registry's last one.
             let descriptor = crate::runner::MetamorphicLawRegistry::scalar_g1a_v1()
                 .laws
                 .into_iter()
@@ -8666,7 +8665,8 @@ mod tests {
                     reason:
                         crate::runner::MetamorphicSkipReason::RejectedIngestPublishesPartialBatch,
                 },
-                "the measurement above is the only thing that justifies this law's skip"
+                "this skip is STALE: the measurement above shows its reason is discharged, and \
+                 flipping it is tracked on bd-quill-e6-gauntlet-scale-rm3q.3"
             );
         });
     }

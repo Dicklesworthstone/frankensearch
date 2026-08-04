@@ -4955,6 +4955,11 @@ impl QuillWriterState {
             .saturating_div(PARALLEL_ARENA_BUDGET_DIVISOR)
             .clamp(MIN_ARENA_CHUNK_BYTES, DEFAULT_ARENA_CHUNK_BYTES);
 
+        // Redundant when reached through `index_documents_with_replacements`,
+        // which admits the whole batch first, and deliberately kept anyway:
+        // this helper is also called directly by tests, so it owns its own
+        // precondition rather than inheriting one. Removing it would leave
+        // those callers unvalidated (bd-quill-rejected-ingest-publishes-partial-batch-aihri).
         let mut batch_ids = BTreeSet::new();
         for document in documents {
             check_cancel(cx, "internal parallel index validation")?;
@@ -5187,6 +5192,9 @@ impl QuillWriterState {
             return Ok(None);
         }
 
+        // Same as the internal-parallel route: redundant under
+        // `index_documents_with_replacements`, retained because direct callers
+        // exist and this helper owns its own precondition.
         let mut batch_ids = BTreeSet::new();
         for document in documents {
             check_cancel(cx, "parallel index validation")?;
@@ -5511,6 +5519,11 @@ impl QuillWriterState {
             if documents.is_empty() {
                 return Ok(());
             }
+            // Admit or refuse the WHOLE batch before any route touches shard,
+            // allocator or uncommitted-id state, and before the commit-retry
+            // guard is armed, so a refused batch leaves the writer exactly as
+            // it found it (bd-quill-rejected-ingest-publishes-partial-batch-aihri).
+            self.validate_batch_admission(cx, documents, replacement_ids)?;
             let parallel_receipt = match parallelism_policy {
                 IngestParallelismPolicy::Adaptive => {
                     if let Some(receipt) = self
@@ -5611,16 +5624,10 @@ impl QuillWriterState {
             let (arena_bytes_used_high_water, arena_bytes_reserved_high_water) = if fanout_shards
                 >= 2
             {
-                self.index_batch_fanout(
-                    cx,
-                    documents,
-                    replacement_ids,
-                    allow_automatic_publication,
-                    fanout_shards,
-                )
-                .await?
+                self.index_batch_fanout(cx, documents, allow_automatic_publication, fanout_shards)
+                    .await?
             } else {
-                self.index_batch_serial(cx, documents, replacement_ids, allow_automatic_publication)
+                self.index_batch_serial(cx, documents, allow_automatic_publication)
                     .await?
             };
             let visibility_due = self.unpublished_since.is_some_and(|started| {
@@ -5649,21 +5656,81 @@ impl QuillWriterState {
         .await
     }
 
+    /// Admit or refuse a whole batch before ANY of it is accumulated
+    /// (bd-quill-rejected-ingest-publishes-partial-batch-aihri).
+    ///
+    /// This is deliberately PURE: it inserts nothing, allocates no document
+    /// ids, and touches no shard. That is what makes a refused batch a no-op —
+    /// there is no partial state to roll back, and no rollback API to need. The
+    /// serial route used to run this check per document *inside* its
+    /// accumulation loop, so a batch whose last document was a duplicate left
+    /// every earlier document staged, and the next `commit()` published them.
+    ///
+    /// Purity is also load-bearing for correctness, not just for style: both
+    /// parallel routes run before the serial/fan-out dispatch and re-check
+    /// `uncommitted_ids` themselves, so an admission pass that inserted its ids
+    /// up front would make every document of a legal batch look like a
+    /// duplicate to them.
+    ///
+    /// The predicate reproduces the routes' original one exactly, including its
+    /// precedence: an id already staged in `uncommitted_ids` is a duplicate
+    /// unconditionally, while an id live in the published snapshot is a
+    /// duplicate only when it is not being replaced. In-batch repeats are
+    /// refused even for replacement ids, which is what the per-document version
+    /// did by inserting as it went.
+    ///
+    /// # Errors
+    ///
+    /// Returns typed cancellation, empty-id, or duplicate-id failures.
+    fn validate_batch_admission(
+        &self,
+        cx: &Cx,
+        documents: &[IndexableDocument],
+        replacement_ids: &BTreeSet<&str>,
+    ) -> Result<(), QuillIndexError> {
+        let mut batch_ids = BTreeSet::new();
+        for document in documents {
+            check_cancel(cx, "index admission")?;
+            if document.id.is_empty() {
+                return Err(invalid_state("document id must be nonempty"));
+            }
+            if !batch_ids.insert(document.id.as_str())
+                || self.uncommitted_ids.contains(&document.id)
+                || self
+                    .backend
+                    .snapshot()
+                    .resolve_document_id(&document.id)?
+                    .is_some()
+                    && !replacement_ids.contains(document.id.as_str())
+            {
+                return Err(invalid_state(format!(
+                    "duplicate live document id {:?}",
+                    document.id
+                )));
+            }
+        }
+        Ok(())
+    }
+
     /// Route and accumulate one bounded batch into a single shard.
     ///
     /// This is the original single-shard path, retained verbatim: it is the
     /// only path taken when `deterministic_ingest` resolves the router to one
     /// shard, so single-shard ingest is bit-identical to before the fan-out.
     ///
+    /// Admission is a precondition here: every document is already known to be
+    /// nonempty and unique against the batch, the uncommitted set and the
+    /// published snapshot, because
+    /// [`Self::validate_batch_admission`] ran before any state was touched.
+    ///
     /// # Errors
     ///
-    /// Returns typed cancellation, duplicate-id, accumulation, flush, or
-    /// publication failures.
+    /// Returns typed cancellation, accumulation, flush, or publication
+    /// failures.
     async fn index_batch_serial(
         &mut self,
         cx: &Cx,
         documents: &[IndexableDocument],
-        replacement_ids: &BTreeSet<&str>,
         allow_automatic_publication: bool,
     ) -> Result<(usize, usize), QuillIndexError> {
         let shard_id = self.shard_router.route_batch();
@@ -5700,22 +5767,6 @@ impl QuillWriterState {
                 let document = &documents[document_index];
                 document_index += 1;
                 check_cancel(cx, "index")?;
-                if document.id.is_empty() {
-                    return Err(invalid_state("document id must be nonempty"));
-                }
-                if self.uncommitted_ids.contains(&document.id)
-                    || self
-                        .backend
-                        .snapshot()
-                        .resolve_document_id(&document.id)?
-                        .is_some()
-                        && !replacement_ids.contains(document.id.as_str())
-                {
-                    return Err(invalid_state(format!(
-                        "duplicate live document id {:?}",
-                        document.id
-                    )));
-                }
                 let doc_ord = span
                     .ord_start
                     .checked_add(span_offset)
@@ -5793,10 +5844,10 @@ impl QuillWriterState {
     ///
     /// Three things must stay serial and do:
     ///
-    /// - **Admission.** The duplicate-id probe reads the published snapshot and
-    ///   the uncommitted-id set and mutates the latter, so it runs first, in
-    ///   input order. That reports the same first offending document, with the
-    ///   same message, as [`Self::index_batch_serial`].
+    /// - **Id claiming.** The uncommitted-id set is shared, so ids are claimed
+    ///   first, in input order. Admission itself already ran for the whole
+    ///   batch in [`Self::validate_batch_admission`], before any route was
+    ///   chosen, so both routes refuse the same document with the same message.
     /// - **Docid allocation.** Leases are per shard but the allocator is
     ///   shared, so every span is allocated before the parallel region opens.
     /// - **Sealing.** A flush is `async` and mutates shared publication state,
@@ -5808,37 +5859,22 @@ impl QuillWriterState {
     ///
     /// # Errors
     ///
-    /// Returns typed cancellation, duplicate-id, accumulation, flush, or
-    /// publication failures.
+    /// Returns typed cancellation, accumulation, flush, or publication
+    /// failures.
     async fn index_batch_fanout(
         &mut self,
         cx: &Cx,
         documents: &[IndexableDocument],
-        replacement_ids: &BTreeSet<&str>,
         allow_automatic_publication: bool,
         shard_count: usize,
     ) -> Result<(usize, usize), QuillIndexError> {
         use rayon::prelude::*;
 
-        // Admission, in input order, before anything is accumulated.
+        // Admission already ran, for the whole batch, before any state was
+        // touched (`validate_batch_admission`). Claiming the ids is all that
+        // is left, and it happens in input order.
         for document in documents {
             check_cancel(cx, "index")?;
-            if document.id.is_empty() {
-                return Err(invalid_state("document id must be nonempty"));
-            }
-            if self.uncommitted_ids.contains(&document.id)
-                || self
-                    .backend
-                    .snapshot()
-                    .resolve_document_id(&document.id)?
-                    .is_some()
-                    && !replacement_ids.contains(document.id.as_str())
-            {
-                return Err(invalid_state(format!(
-                    "duplicate live document id {:?}",
-                    document.id
-                )));
-            }
             self.uncommitted_ids.insert(document.id.clone());
         }
         if !documents.is_empty() {
@@ -20289,6 +20325,206 @@ mod tests {
         });
     }
 
+    /// bd-quill-rejected-ingest-publishes-partial-batch-aihri: a rejected
+    /// scalar ingest is a NO-OP, on every ingest route.
+    ///
+    /// The defect this pins was route-dependent, which is why the assertions
+    /// run over both routes from one body: the serial route checked duplicates
+    /// per document INSIDE its accumulation loop, so the unique prefix of a
+    /// rejected batch stayed staged and the next `commit()` published it, while
+    /// the wider routes validated the whole batch up front and did not. A fix
+    /// applied to one route only leaves this test red.
+    ///
+    /// Three things must hold after a rejected batch, and each fails
+    /// differently if partial staging comes back:
+    ///   1. the next `commit()` publishes nothing from the rejected batch;
+    ///   2. the rejected batch's unique prefix is not searchable;
+    ///   3. the prefix id is not CLAIMED — re-ingesting it later succeeds,
+    ///      which fails if `uncommitted_ids` kept it.
+    ///
+    /// The fourth property — that rejection does not arm the commit-retry
+    /// guard — is pinned separately by
+    /// [`a_rejected_batch_does_not_arm_the_commit_retry_guard`], because a
+    /// single test that can fail for two unrelated reasons reports the wrong
+    /// one: the guard fires before any commit and would mask the publication
+    /// evidence entirely.
+    #[test]
+    fn a_rejected_batch_publishes_nothing_on_the_next_commit_on_every_route() {
+        run_with_cx(|cx| async move {
+            // (serial route, fan-out-eligible route): `deterministic_ingest`
+            // resolves the router to one shard and forces the serial path;
+            // the wider config lets the planner take a parallel route. The
+            // batch size is what makes the second one eligible.
+            for (label, config, filler_count) in [
+                ("serial", deterministic_config(), 0_usize),
+                (
+                    "wide",
+                    QuillConfig {
+                        deterministic_ingest: false,
+                        max_ingest_shards: 4,
+                        ..QuillConfig::default()
+                    },
+                    600,
+                ),
+            ] {
+                let index = QuillIndex::in_memory(config).expect("atomic-ingest index");
+                index
+                    .index_documents(
+                        &cx,
+                        &[IndexableDocument::new("aihri-live", "alpha original")],
+                    )
+                    .await
+                    .unwrap_or_else(|error| panic!("{label}: seed ingest: {error}"));
+                index
+                    .commit(&cx)
+                    .await
+                    .unwrap_or_else(|error| panic!("{label}: seed commit: {error}"));
+                assert_eq!(index.doc_count(), 1, "{label}: seed");
+
+                // A batch whose LAST document duplicates a committed id. Every
+                // document before it is unique and would be accepted one at a
+                // time -- that prefix is exactly what must not survive.
+                let mut rejected = Vec::with_capacity(filler_count + 2);
+                rejected.push(IndexableDocument::new(
+                    "aihri-prefix",
+                    "prefix beta searchable",
+                ));
+                for ordinal in 0..filler_count {
+                    rejected.push(IndexableDocument::new(
+                        format!("aihri-filler-{ordinal}"),
+                        "filler beta searchable",
+                    ));
+                }
+                rejected.push(IndexableDocument::new("aihri-live", "gamma duplicate"));
+
+                let error = index
+                    .index_documents(&cx, &rejected)
+                    .await
+                    .expect_err("duplicate id must reject the batch");
+                assert!(
+                    error.to_string().contains("duplicate live document id"),
+                    "{label}: unexpected rejection: {error}",
+                );
+
+                index
+                    .commit(&cx)
+                    .await
+                    .unwrap_or_else(|error| panic!("{label}: commit after rejection: {error}"));
+
+                // 1. nothing from the rejected batch was published.
+                assert_eq!(
+                    index.doc_count(),
+                    1,
+                    "{label}: the rejected batch published fragments",
+                );
+                // 2. its unique prefix is not searchable.
+                assert_eq!(
+                    index
+                        .search_paginated(&cx, "beta", 10, 0, true)
+                        .unwrap_or_else(|error| panic!("{label}: search beta: {error}"))
+                        .hits
+                        .len(),
+                    0,
+                    "{label}: a fragment of the rejected batch is searchable",
+                );
+                // 3. the prefix id was not claimed by the rejected batch.
+                index
+                    .index_documents(
+                        &cx,
+                        &[IndexableDocument::new("aihri-prefix", "epsilon reingested")],
+                    )
+                    .await
+                    .unwrap_or_else(|error| {
+                        panic!("{label}: rejected id must not stay claimed: {error}")
+                    });
+                index
+                    .commit(&cx)
+                    .await
+                    .unwrap_or_else(|error| panic!("{label}: reingest commit: {error}"));
+                assert_eq!(index.doc_count(), 2, "{label}: reingest");
+            }
+        });
+    }
+
+    /// bd-quill-rejected-ingest-publishes-partial-batch-aihri, second property:
+    /// a rejected batch does not arm the commit-retry guard.
+    ///
+    /// This is the caller-visible half of "all-or-nothing". If a rejection
+    /// leaves nothing staged, there is nothing to reconcile, so forcing a
+    /// commit before the caller may retry a corrected batch is a spurious
+    /// obligation — and one that USED to be load-bearing, because the commit
+    /// it forced was the very commit that published the rejected prefix.
+    #[test]
+    fn a_rejected_batch_does_not_arm_the_commit_retry_guard() {
+        run_with_cx(|cx| async move {
+            for (label, config, filler_count) in [
+                ("serial", deterministic_config(), 0_usize),
+                (
+                    "wide",
+                    QuillConfig {
+                        deterministic_ingest: false,
+                        max_ingest_shards: 4,
+                        ..QuillConfig::default()
+                    },
+                    600,
+                ),
+            ] {
+                let index = QuillIndex::in_memory(config).expect("retry-guard index");
+                index
+                    .index_documents(
+                        &cx,
+                        &[IndexableDocument::new("aihri-guard-live", "alpha original")],
+                    )
+                    .await
+                    .unwrap_or_else(|error| panic!("{label}: seed ingest: {error}"));
+                index
+                    .commit(&cx)
+                    .await
+                    .unwrap_or_else(|error| panic!("{label}: seed commit: {error}"));
+
+                let mut rejected = Vec::with_capacity(filler_count + 2);
+                rejected.push(IndexableDocument::new(
+                    "aihri-guard-prefix",
+                    "prefix beta searchable",
+                ));
+                for ordinal in 0..filler_count {
+                    rejected.push(IndexableDocument::new(
+                        format!("aihri-guard-filler-{ordinal}"),
+                        "filler beta searchable",
+                    ));
+                }
+                rejected.push(IndexableDocument::new(
+                    "aihri-guard-live",
+                    "gamma duplicate",
+                ));
+                index
+                    .index_documents(&cx, &rejected)
+                    .await
+                    .expect_err("duplicate id must reject the batch");
+
+                // No intervening commit: the retry guard, if armed, refuses here.
+                index
+                    .index_documents(
+                        &cx,
+                        &[IndexableDocument::new("aihri-guard-after", "delta ok")],
+                    )
+                    .await
+                    .unwrap_or_else(|error| {
+                        panic!("{label}: a rejected batch must not block the next ingest: {error}")
+                    });
+                index
+                    .commit(&cx)
+                    .await
+                    .unwrap_or_else(|error| panic!("{label}: commit: {error}"));
+                assert_eq!(
+                    index.doc_count(),
+                    2,
+                    "{label}: seed plus the accepted batch"
+                );
+            }
+        });
+    }
+
     /// Scalar ingestion refuses duplicate live document ids, both in-batch
     /// and against the committed snapshot: the Delta lane owns logical
     /// upserts, so the scalar lane pins the reject posture that the lexical
@@ -23046,8 +23282,20 @@ mod tests {
         });
     }
 
+    /// Bounded seal-producing batches compose across commits, and a REJECTED
+    /// batch composes with them by contributing nothing.
+    ///
+    /// bd-quill-rejected-ingest-publishes-partial-batch-aihri rewrote the
+    /// second half of this test. It previously asserted the opposite contract
+    /// in these words — "duplicate batch must fail after accepting its unique
+    /// prefix", then an armed retry guard, then `commit()` "reconciling" the
+    /// partial batch into `doc_count() == 3`. That was the defect, written down
+    /// as intent: the reconciling commit was publishing rows the caller had
+    /// been told were rejected. What the bounded-seal half of this test covers
+    /// — many small batches each producing a sealed segment, composing into one
+    /// committed generation — is unchanged and still asserted below.
     #[test]
-    fn successful_sealed_batches_compose_but_failed_batches_require_commit_retry() {
+    fn successful_sealed_batches_compose_and_a_rejected_batch_contributes_nothing() {
         run_with_cx(|cx| async move {
             let config = QuillConfig {
                 scribe_shard_budget_bytes: 1,
@@ -23077,27 +23325,11 @@ mod tests {
             ];
             assert!(
                 index.index_documents(&cx, &duplicate_batch).await.is_err(),
-                "duplicate batch must fail after accepting its unique prefix"
+                "an in-batch duplicate must reject the whole batch"
             );
-            assert!(index.writer_mut().ingest_retry_required);
-            assert!(
-                index
-                    .index_documents(
-                        &cx,
-                        &[IndexableDocument::new(
-                            "bounded-3",
-                            "bounded batch searchable",
-                        )],
-                    )
-                    .await
-                    .is_err(),
-                "an ambiguous partial batch must fail closed until commit"
-            );
-
-            index.commit(&cx).await.expect("reconcile partial batch");
-            assert_eq!(index.doc_count(), 3);
+            // The rejected batch staged nothing, so there is nothing to
+            // reconcile and no retry obligation to impose on the caller.
             assert!(!index.writer_mut().ingest_retry_required);
-
             index
                 .index_documents(
                     &cx,
@@ -23107,7 +23339,37 @@ mod tests {
                     )],
                 )
                 .await
-                .expect("index after retry commit");
+                .expect("a rejected batch must not block the next ingest");
+
+            index
+                .commit(&cx)
+                .await
+                .expect("commit the accepted batches");
+            // bounded-0, bounded-1, bounded-3. bounded-2 was rejected and
+            // contributed nothing: this is the count that was 3-with-bounded-2
+            // before the fix, and it is the whole point of the bead.
+            assert_eq!(index.doc_count(), 3);
+            assert!(!index.writer_mut().ingest_retry_required);
+            assert!(
+                index
+                    .search_paginated(&cx, "duplicate", 10, 0, true)
+                    .expect("search for the rejected document's text")
+                    .hits
+                    .is_empty(),
+                "no text from the rejected batch may be searchable",
+            );
+
+            // The rejected id was never claimed, so it still ingests cleanly.
+            index
+                .index_documents(
+                    &cx,
+                    &[IndexableDocument::new(
+                        "bounded-2",
+                        "bounded batch searchable",
+                    )],
+                )
+                .await
+                .expect("the rejected id must remain available");
             index.commit(&cx).await.expect("final bounded-batch commit");
             assert_eq!(
                 index

@@ -477,14 +477,18 @@ pub enum MetamorphicSkipReason {
     PositionsUnavailable,
     /// The scalar-G1A preconditions do not hold for the selected profile.
     ProfileOutsideScalarG1a,
-    /// A scalar ingest that returned `Err` still leaves its earlier rows
-    /// staged, so the next `commit()` publishes part of the rejected batch.
+    /// DISCHARGED — retained only so the descriptor that still cites it stays
+    /// decodable. Do not apply this reason to a new law.
     ///
-    /// This blocks any law whose transform requires a rejected ID to remain
-    /// never-added: the delete is refused while the rows are staged, and once
-    /// committed the ID is live. Measured in
-    /// `engine::tests::e63_duplicate_then_delete_precondition_fails_because_a_rejected_batch_publishes`
-    /// and filed as `bd-quill-rejected-ingest-publishes-partial-batch-aihri`.
+    /// A scalar ingest that returned `Err` used to leave its earlier rows
+    /// staged, so the next `commit()` published part of the rejected batch.
+    /// That blocked any law whose transform required a rejected ID to remain
+    /// never-added: the delete was refused while the rows were staged, and once
+    /// committed the ID was live. Fixed under
+    /// `bd-quill-rejected-ingest-publishes-partial-batch-aihri` by admitting
+    /// the whole batch before accumulating any of it, on every ingest route;
+    /// `engine::tests::e63_duplicate_then_delete_precondition_holds_now_that_rejection_stages_nothing`
+    /// is the measurement that discharges it.
     RejectedIngestPublishesPartialBatch,
 }
 
@@ -627,7 +631,7 @@ impl MetamorphicLawRegistry {
                     "e6.3-duplicate-live-id-rejection-v1",
                     "scalar Quill live-ID uniqueness contract, observed with NO commit between the rejection and the observation",
                     "typed lifecycle error plus published corpus observation",
-                    "duplicate input is rejected without partial publication into the observed snapshot; a later commit does publish the staged row, which is e6.3-duplicate-then-delete-v1's blocker",
+                    "duplicate input is rejected without partial publication, and a later commit publishes nothing from the rejected batch either, since admission now runs over the whole batch before any of it is accumulated (bd-quill-rejected-ingest-publishes-partial-batch-aihri)",
                     "none",
                     "e63-duplicate-live-id-positive",
                     "e63-duplicate-live-id-partial-publication",
@@ -642,11 +646,11 @@ impl MetamorphicLawRegistry {
                     },
                     preconditions: "a rejected duplicate-ID batch that leaves no staged row behind, so the rejected ID can still be deleted as a never-added ID".to_owned(),
                     observable_projection: "typed delete outcome plus total lexical observation".to_owned(),
-                    equivalence_relation: "rejected duplicate then delete would equal a never-added ID; unreachable while a rejected batch stages its earlier rows".to_owned(),
+                    equivalence_relation: "rejected duplicate then delete equals a never-added ID; measured as holding since bd-quill-rejected-ingest-publishes-partial-batch-aihri made rejection stage nothing, so this skip is STALE and its flip is owned by bd-quill-e6-gauntlet-scale-rm3q.3".to_owned(),
                     allowed_divergence: "none".to_owned(),
                     positive_fixture_id: "e63-duplicate-then-delete-positive".to_owned(),
                     invalid_fixture_id: "e63-duplicate-then-delete-unique-admission".to_owned(),
-                    replay_test: "engine::tests::e63_duplicate_then_delete_precondition_fails_because_a_rejected_batch_publishes".to_owned(),
+                    replay_test: "engine::tests::e63_duplicate_then_delete_precondition_holds_now_that_rejection_stages_nothing".to_owned(),
                     shrinker_id: "e6.3-total-lexical-ddmin-v1".to_owned(),
                     scopes: vec![MetamorphicLawScope::Quill],
                 },
