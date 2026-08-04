@@ -1,71 +1,90 @@
 {
-  "schema_version": 2,
-  "register_id": "quill-e6-divergence-register-live",
-  "redaction_policy_version": "quill-divergence-redaction-v1",
-  "events": [
-    {
-      "event_type": "observation",
-      "event": {
-        "header": {
-          "sequence": 1,
-          "supersedes": null,
-          "recorded_by": "Claude-pane12",
-          "recorded_at": "2026-08-04T19:00:00Z"
-        },
-        "divergence_id": "DIV-008",
-        "class": "rank_mismatch",
-        "first_recorded_witness_case_id": "e68-div007-witness",
-        "first_recorded_witness_artifact_object": {
-          "scheme": "frankensearch-quill-gauntlet/artifact-object/v7/sha256",
-          "object_schema_version": 7,
-          "digest": "65b1e4e89a3d1a2cc2202634fa448c397a48376fab90afb9a89390dfd823e763"
-        },
-        "revisions": {
-          "producer_build_identity_sha256": "403aa21f5c5a45be470400d158978d5fbf627da49bec528efd885135009150fd",
-          "oracle_dependency_contract_sha256": "58988c117389e3222fc6c2202d311fc70158ef0e65e069100181be5fd98d3ba3",
-          "oracle_lexical_contract_audit_revision": "062a5e5b2d41653b1c8b07888eda1a765e421f49",
-          "corpus_manifest_sha256": "28640a81dce43433fd33b16b62c265b51ad7e0973466d1f790f688b4441e39c9",
-          "query_manifest_sha256": "ce272cf10d8107176d59c9633b7d30a6733d5a9603b148d13f580131a89e4249",
-          "query_suite_source": "explicit_cases",
-          "query_source_identity_sha256": "cd73ae224715612c32d81a6bccce644da7e6b016ce4e85eebaf1d967c4d5811e"
-        },
-        "fixture": {
-          "fixture_id": "e68-div007-witness",
-          "fixture_sha256": "210e480537e2cc6750df1699989cc1c818c8dab14ca71251772ddfe205136cb0",
-          "regression_test": "runner::tests::three_clause_or_diverges_at_one_ulp_without_the_div007_envelope",
-          "minimized": true
-        },
-        "mismatch_signatures": [
-          "15c251dd6671f6766082fc47e653cda26b72cb7b6e1b642ba4b795fb906133ec"
-        ],
-        "observed_behavior": "Quill scores one document in a plain three-clause disjunction one ULP away from the pinned oracle; the returned document set and every rank position are identical.",
-        "expected_behavior": "the pinned oracle's score for that document, bit for bit, under the campaign comparator's zero-tolerance default configuration.",
-        "root_cause": "the DIV-007 mechanism outside its documented qualifiers: Quill's Term scorer fuses each unfielded term's [content, 2.0x title] expansion into one summed contribution while the pinned oracle accumulates interleaved per-field clause outputs, so f32 summation association differs. Observed at three leaves with no boost and no mixed-occur nesting, where DIV-007 documents eight leaves.",
-        "consumer_impact": "result sets are unchanged; only the order of two ULP-adjacent scores can flip. The campaign impact is the load-bearing one: the default-profile lane does not opt into the typed summation-association reason, so this emits as a raw RankMismatch and fails closed as unclassified.",
-        "diagnostic": {
-          "payload_sha256": "99e9c676fb566e08279c599f6d55f3bb892b151ebf40758241e7f4702f0fca29",
-          "marker": "<redacted:e68-div007-rank-mismatch>"
-        }
-      }
+ "schema_version": 2,
+ "register_id": "quill-e6-divergence-register-live",
+ "redaction_policy_version": "quill-divergence-redaction-v1",
+ "events": [
+  {
+   "event_type": "observation",
+   "event": {
+    "header": {
+     "sequence": 1,
+     "supersedes": null,
+     "recorded_by": "Claude-pane12",
+     "recorded_at": "2026-08-04T19:00:00Z"
     },
-    {
-      "event_type": "disposition",
-      "event": {
-        "header": {
-          "sequence": 2,
-          "supersedes": null,
-          "recorded_by": "Claude-pane12",
-          "recorded_at": "2026-08-04T19:00:00Z"
-        },
-        "divergence_id": "DIV-008",
-        "disposition": {
-          "kind": "blocking",
-          "bead_id": "bd-gx7n4",
-          "rationale": "the bd-55mvg owner ruling accepts this mechanism only as a bounded ScoreEpsilon class that campaign lanes opt into with the typed reason, and keeps the comparator default zero-tolerance. The default-profile lane does not opt in, so the emitted mismatch is a raw failure class that no acceptance may bless. It blocks until the lane's envelope scope is decided; moving it off blocking requires an independent reviewer.",
-          "reviewer": "Claude-pane12",
-          "reviewed_at": "2026-08-04T19:00:00Z"
-        }
-      }
+    "divergence_id": "DIV-008",
+    "class": "rank_mismatch",
+    "first_recorded_witness_case_id": "e68-div007-witness",
+    "first_recorded_witness_artifact_object": {
+     "scheme": "frankensearch-quill-gauntlet/artifact-object/v7/sha256",
+     "object_schema_version": 7,
+     "digest": "65b1e4e89a3d1a2cc2202634fa448c397a48376fab90afb9a89390dfd823e763"
+    },
+    "revisions": {
+     "producer_build_identity_sha256": "403aa21f5c5a45be470400d158978d5fbf627da49bec528efd885135009150fd",
+     "oracle_dependency_contract_sha256": "58988c117389e3222fc6c2202d311fc70158ef0e65e069100181be5fd98d3ba3",
+     "oracle_lexical_contract_audit_revision": "062a5e5b2d41653b1c8b07888eda1a765e421f49",
+     "corpus_manifest_sha256": "28640a81dce43433fd33b16b62c265b51ad7e0973466d1f790f688b4441e39c9",
+     "query_manifest_sha256": "ce272cf10d8107176d59c9633b7d30a6733d5a9603b148d13f580131a89e4249",
+     "query_suite_source": "explicit_cases",
+     "query_source_identity_sha256": "cd73ae224715612c32d81a6bccce644da7e6b016ce4e85eebaf1d967c4d5811e"
+    },
+    "fixture": {
+     "fixture_id": "e68-div007-witness",
+     "fixture_sha256": "210e480537e2cc6750df1699989cc1c818c8dab14ca71251772ddfe205136cb0",
+     "regression_test": "runner::tests::three_clause_or_diverges_at_one_ulp_without_the_div007_envelope",
+     "minimized": true
+    },
+    "mismatch_signatures": [
+     "15c251dd6671f6766082fc47e653cda26b72cb7b6e1b642ba4b795fb906133ec"
+    ],
+    "observed_behavior": "Quill scores one document in a plain three-clause disjunction one ULP away from the pinned oracle; the returned document set and every rank position are identical.",
+    "expected_behavior": "the pinned oracle's score for that document, bit for bit, under the campaign comparator's zero-tolerance default configuration.",
+    "root_cause": "the DIV-007 mechanism outside its documented qualifiers: Quill's Term scorer fuses each unfielded term's [content, 2.0x title] expansion into one summed contribution while the pinned oracle accumulates interleaved per-field clause outputs, so f32 summation association differs. Observed at three leaves with no boost and no mixed-occur nesting, where DIV-007 documents eight leaves.",
+    "consumer_impact": "result sets are unchanged; only the order of two ULP-adjacent scores can flip. The campaign impact is the load-bearing one: the default-profile lane does not opt into the typed summation-association reason, so this emits as a raw RankMismatch and fails closed as unclassified.",
+    "diagnostic": {
+     "payload_sha256": "99e9c676fb566e08279c599f6d55f3bb892b151ebf40758241e7f4702f0fca29",
+     "marker": "<redacted:e68-div007-rank-mismatch>"
     }
-  ]
+   }
+  },
+  {
+   "event_type": "disposition",
+   "event": {
+    "header": {
+     "sequence": 2,
+     "supersedes": null,
+     "recorded_by": "Claude-pane12",
+     "recorded_at": "2026-08-04T19:00:00Z"
+    },
+    "divergence_id": "DIV-008",
+    "disposition": {
+     "kind": "blocking",
+     "bead_id": "bd-gx7n4",
+     "rationale": "the bd-55mvg owner ruling accepts this mechanism only as a bounded ScoreEpsilon class that campaign lanes opt into with the typed reason, and keeps the comparator default zero-tolerance. The default-profile lane does not opt in, so the emitted mismatch is a raw failure class that no acceptance may bless. It blocks until the lane's envelope scope is decided; moving it off blocking requires an independent reviewer.",
+     "reviewer": "Claude-pane12",
+     "reviewed_at": "2026-08-04T19:00:00Z"
+    }
+   }
+  },
+  {
+   "event_type": "disposition",
+   "event": {
+    "header": {
+     "sequence": 3,
+     "supersedes": 2,
+     "recorded_by": "BlueOriole",
+     "recorded_at": "2026-08-04T23:45:00Z"
+    },
+    "divergence_id": "DIV-008",
+    "disposition": {
+     "kind": "fixed",
+     "fixing_commit": "78a2a189dd473ef641db7e99ac50b31b5500b1a1",
+     "regression_test": "comparator::tests::the_lexical_axis_defers_only_to_a_rank_axis_that_actually_classified",
+     "reviewer": "BlueOriole",
+     "reviewed_at": "2026-08-04T23:45:00Z"
+    }
+   }
+  }
+ ]
 }

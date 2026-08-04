@@ -272,7 +272,9 @@ not this row. This row is the human projection of it.
 - Class: `RankMismatch` (raw failure class — it may be fixed or blocked, never accepted)
 - Machine record: `crates/frankensearch-quill-gauntlet/fixtures/divergence-register-v2-live.json`
   (register `quill-e6-divergence-register-live`, ledger SHA-256
-  `6dfd9d1c7d9d07bbc261e1703c2bc1bc61b536adea5d17fd5daf9bd9b0ba276d`)
+  `b36c47186f47f119bc9469c75b852c0025282be9c96e5a5d58ee7e60498d2e3b` after the sequence-3
+  disposition below; `6dfd9d1c7d9d07bbc261e1703c2bc1bc61b536adea5d17fd5daf9bd9b0ba276d` at
+  sequence 2, when this row was first written)
 - First seen: 2026-08-04 · live default-profile oracle-differential campaign, run `e68-live-ingestion`,
   minted from a clean checkout at `4efe400cc80f55e85079400a7c54674116ab6f98`. Retained v7 witness object
   `65b1e4e89a3d1a2cc2202634fa448c397a48376fab90afb9a89390dfd823e763`, committed at
@@ -295,12 +297,36 @@ not this row. This row is the human projection of it.
   `runner::tests::three_clause_or_diverges_at_one_ulp_without_the_div007_envelope`, which pins both
   halves of the bd-55mvg ruling: raw `RankMismatch` under the default comparator,
   `ScoreEpsilon`/`SummationAssociation` once a lane opts in.
-- Decision: **blocking** (bead `bd-gx7n4`). DIV-007's acceptance is expressed through the typed
-  reason, and a raw failure class can never be accepted, so blocking is the only admissible machine
-  record while the lane's envelope scope is undecided. Resolving it means one of: opt the
-  default-profile lane into `with_score_epsilon_reason(SummationAssociation)`; widen DIV-007's
-  documented envelope to cover three-clause disjunctions and then opt in; or re-associate Quill's
-  fused multi-field summation, which bd-55mvg declined on QG-6 latency grounds.
+- Decision: **fixed** 2026-08-04 (bead `bd-gx7n4`; fixing commit
+  `78a2a189dd473ef641db7e99ac50b31b5500b1a1`), superseding the original **blocking** disposition by
+  an APPENDED sequence-3 event — the blocking event is retained, not edited. The route taken was
+  option (b) then (a) of the three the entry originally listed: DIV-007's documented envelope was
+  first corrected by measurement to admit three-clause disjunctions (see the leaf-count boundary
+  note on DIV-007), and only then did the default-profile lane opt in with
+  `with_score_epsilon_reason(SummationAssociation)`. Doing (a) alone would have cited an envelope
+  whose own text placed this shape outside the class. Option (c), re-associating Quill's fused
+  summation, remains declined on the QG-6 latency grounds bd-55mvg recorded.
+- Resolution: the lane refused this case on TWO axes, and both are closed. The rank axis is closed by
+  the lane's typed reason. The lexical axis was the load-bearing one: `classify_case_with_lexical`
+  short-circuits on any total-lexical-contract mismatch before `classify_case` runs, and
+  `compare_score_bits` compares `normalized_score_bits` with plain `u32` equality and takes no
+  comparator config at all, so the same one-ULP difference stayed a raw lexical mismatch whatever the
+  rank comparator was told. `lexical_mismatches_are_the_classified_rank_divergence` now lets the
+  lexical axis defer to a rank axis that ALREADY classified the case under a typed reason, and only
+  when every lexical mismatch is that same score difference inside that reason's envelope. Nothing is
+  hidden: the contract still reports `status == Mismatch` with every mismatch listed, and only the
+  campaign disposition changes.
+- Regression: `comparator::tests::the_lexical_axis_defers_only_to_a_rank_axis_that_actually_classified`
+  (composed gate, rank axis built by the real comparator) and
+  `comparator::tests::the_reviewed_score_envelope_refuses_everything_it_should` (six planted
+  negatives: wider drift, non-Score class, another subsystem's score, presence asymmetry,
+  unparseable diagnostic, wrong reason's envelope). The pre-existing
+  `runner::tests::three_clause_or_diverges_at_one_ulp_without_the_div007_envelope` is unchanged and
+  still pins both halves of the bd-55mvg ruling.
+- Reviewer for the fix: `BlueOriole`. No independent reviewer is claimed and none is required —
+  `DivergenceDisposition::validate` enforces `reviewer != recorded_by` only for **accepted**, which
+  is precisely the decision this record does NOT make. Acceptance was never available here: the
+  observation's class is the raw `RankMismatch` and a raw failure class can never be accepted.
 - Reviewer: recorded and blocked by `Claude-pane12`. No independent review is claimed, and none is
   required to block: `DivergenceDisposition::validate` enforces an independent reviewer only for
   acceptance, which is exactly the decision that needs one.
