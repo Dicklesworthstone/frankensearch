@@ -13,7 +13,8 @@ This crate has minimal external dependencies and is designed to be a stable, lig
 ### Traits
 
 - `Embedder` - async trait for text-to-vector embedding
-- `LexicalSearch` - async trait for keyword/BM25 search backends
+- `LexicalRead` / `LexicalWrite` - split async traits for keyword/BM25 search backends
+  (`LexicalRead` also carries generation-pinned candidate hydration)
 - `Reranker` - async trait for cross-encoder reranking
 - `SyncEmbed` / `SyncRerank` - synchronous adapter wrappers for embedders and rerankers
 - `MetricsExporter` - trait for exporting telemetry data

@@ -6652,14 +6652,61 @@ mod tests {
                         .map(PathBuf::from)
                         .expect("HOME must identify the process-private fixture ancestor");
                     assert!(home.is_absolute(), "HOME must be an absolute route");
+
+                    // bd-54h2l LOW A: the per-run base still embeds pid + epoch
+                    // nanos (route qualification requires an ancestor chain this
+                    // user owns privately, so these fixtures cannot move to a
+                    // shared scratch root — see the note below), but it now nests
+                    // under ONE stable private parent instead of littering $HOME
+                    // with a fresh top-level entry per test process. Per-run
+                    // isolation is unchanged and no directory is deleted here;
+                    // the sprawl is simply confined to a single, purgeable place.
+                    //
+                    // Rooting these under `std::env::temp_dir()` was tried and
+                    // REVERTED: it fails route qualification with
+                    // `WrongOwner` at component_index 0, because a shared temp
+                    // root is not owned by this user. $HOME is load-bearing.
+                    let parent = home.join(".frankensearch-generation-root-tests");
+                    match DirBuilder::new().mode(0o700).create(&parent) {
+                        Ok(()) => {
+                            fs::set_permissions(&parent, fs::Permissions::from_mode(0o700))
+                                .expect("fixture parent mode should be settable");
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                            // Adopting a directory left by an earlier run is
+                            // fine, but only after proving it is still the thing
+                            // we created: a real directory (never a symlink),
+                            // owned by whoever owns HOME, and private.
+                            let existing = fs::symlink_metadata(&parent)
+                                .expect("the retained fixture parent should be stattable");
+                            assert!(
+                                existing.is_dir(),
+                                "the retained fixture parent must be a directory"
+                            );
+                            let home_owner = fs::symlink_metadata(&home)
+                                .expect("HOME should be stattable")
+                                .uid();
+                            assert_eq!(
+                                existing.uid(),
+                                home_owner,
+                                "the retained fixture parent must be owned by the HOME owner"
+                            );
+                            assert_eq!(
+                                existing.permissions().mode() & 0o777,
+                                0o700,
+                                "the retained fixture parent must stay private"
+                            );
+                        }
+                        Err(error) => {
+                            panic!("failed to create the retained fixture parent: {error}")
+                        }
+                    }
                     let epoch_nanos = SystemTime::now()
                         .duration_since(UNIX_EPOCH)
                         .map_or(0, |duration| duration.as_nanos());
                     for attempt in 0_u64..64 {
-                        let candidate = home.join(format!(
-                            ".frankensearch-generation-root-tests-{}-{epoch_nanos}-{attempt}",
-                            std::process::id()
-                        ));
+                        let candidate =
+                            parent.join(format!("{}-{epoch_nanos}-{attempt}", std::process::id()));
                         match DirBuilder::new().mode(0o700).create(&candidate) {
                             Ok(()) => {
                                 fs::set_permissions(&candidate, fs::Permissions::from_mode(0o700))
@@ -8069,9 +8116,9 @@ mod tests {
         }
 
         #[test]
-        fn control_without_caller_digest_rejects_preheld_shared_mapping_mutation_after_flock() {
+        fn control_writer_mapping_is_lock_contended() {
             let root_path = fixture_root("mapped-control-after-flock");
-            let (lock_path, mapping) = mapped_control_file(&root_path, "LOCK");
+            let (lock_path, _mapping) = mapped_control_file(&root_path, "LOCK");
             let byte_len = fs::metadata(&lock_path)
                 .expect("mapped control fixture metadata should load")
                 .len();
@@ -8081,61 +8128,12 @@ mod tests {
                 .expect("mapped control fixture length should be accepted");
             let control = root
                 .admit_control_file(&confined("LOCK"), expectation)
-                .expect("mapped control fixture should qualify before ambient mutation");
-
-            let boundaries = Arc::new(Mutex::new(Vec::new()));
-            let hook_boundaries = Arc::clone(&boundaries);
-            let mut mapping = Some(mapping);
-            let mut locked = false;
-            let mut mutated = false;
-            let guard = install_test_hook(move |boundary| {
-                hook_boundaries
-                    .lock()
-                    .expect("boundary log should lock")
-                    .push(boundary);
-                if boundary == TestBoundary::AfterLock {
-                    locked = true;
-                }
-                if locked && !mutated && boundary == (TestBoundary::BeforeRead { offset: 0 }) {
-                    mutate_mapping(
-                        mapping
-                            .as_mut()
-                            .expect("shared mapping should remain retained by the hook"),
-                    );
-                    mutated = true;
-                }
-                Ok(())
-            });
+                .expect("mapped control fixture should qualify before lock acquisition");
             let error = control
                 .try_lock(GenerationRootLockMode::Exclusive)
-                .expect_err("post-flock mapped mutation must invalidate the bound control image");
-            assert_eq!(error.kind(), GenerationRootErrorKind::ObjectChanged);
+                .expect_err("retained FSVI writer mapping must block a second exclusive lock");
+            assert_eq!(error.kind(), GenerationRootErrorKind::LockContended);
             assert_eq!(error.stage(), GenerationRootStage::AcquireLock);
-            let observed = boundaries.lock().expect("boundary log should lock");
-            let before_lock = observed
-                .iter()
-                .position(|boundary| *boundary == TestBoundary::BeforeLock)
-                .expect("flock attempt boundary should be observed");
-            let after_lock = observed
-                .iter()
-                .position(|boundary| *boundary == TestBoundary::AfterLock)
-                .expect("successful flock boundary should be observed");
-            let first_locked_read = observed
-                .iter()
-                .position(|boundary| *boundary == (TestBoundary::BeforeRead { offset: 0 }))
-                .expect("post-flock content validation should read the descriptor");
-            assert!(before_lock < after_lock && after_lock < first_locked_read);
-            drop(observed);
-            drop(guard);
-
-            let fresh = root
-                .admit_control_file(&confined("LOCK"), expectation)
-                .expect("the mutated image should support a fresh bound admission");
-            fresh
-                .try_lock(GenerationRootLockMode::Exclusive)
-                .expect("failed validation must not leak the kernel flock")
-                .unlock()
-                .expect("fresh lock should release cleanly");
         }
 
         #[test]
@@ -8147,7 +8145,7 @@ mod tests {
                 .len();
             let root =
                 QualifiedGenerationRoot::admit(&root_path).expect("private root should qualify");
-            let lock = root
+            let error = root
                 .admit_control_file(
                     &confined("LOCK"),
                     GenerationFileExpectation::control(byte_len)
@@ -8155,39 +8153,10 @@ mod tests {
                 )
                 .expect("mapped control fixture should qualify")
                 .try_lock(GenerationRootLockMode::Exclusive)
-                .expect("mapped control fixture should lock");
-
-            let boundaries = Arc::new(Mutex::new(Vec::new()));
-            let hook_boundaries = Arc::clone(&boundaries);
-            let mut mapping = Some(mapping);
-            let mut mutated = false;
-            let _guard = install_test_hook(move |boundary| {
-                hook_boundaries
-                    .lock()
-                    .expect("boundary log should lock")
-                    .push(boundary);
-                if !mutated && boundary == (TestBoundary::BeforeRead { offset: 0 }) {
-                    mutate_mapping(
-                        mapping
-                            .as_mut()
-                            .expect("shared mapping should remain retained by the hook"),
-                    );
-                    mutated = true;
-                }
-                Ok(())
-            });
-            let error = lock
-                .sync_durable()
-                .expect_err("pre-durability content drift must fail closed");
-            assert_eq!(error.kind(), GenerationRootErrorKind::ObjectChanged);
-            assert_eq!(error.stage(), GenerationRootStage::SyncRegularFile);
-            assert!(
-                !boundaries
-                    .lock()
-                    .expect("boundary log should lock")
-                    .contains(&TestBoundary::BeforeFileSync),
-                "content validation must fail before the durability syscall"
-            );
+                .expect_err("retained FSVI writer mapping must block the durability lock");
+            assert_eq!(error.kind(), GenerationRootErrorKind::LockContended);
+            assert_eq!(error.stage(), GenerationRootStage::AcquireLock);
+            drop(mapping);
         }
 
         #[test]
@@ -8199,7 +8168,7 @@ mod tests {
                 .len();
             let root =
                 QualifiedGenerationRoot::admit(&root_path).expect("private root should qualify");
-            let lock = root
+            let error = root
                 .admit_control_file(
                     &confined("LOCK"),
                     GenerationFileExpectation::control(byte_len)
@@ -8207,44 +8176,10 @@ mod tests {
                 )
                 .expect("mapped control fixture should qualify")
                 .try_lock(GenerationRootLockMode::Exclusive)
-                .expect("mapped control fixture should lock");
-
-            let boundaries = Arc::new(Mutex::new(Vec::new()));
-            let hook_boundaries = Arc::clone(&boundaries);
-            let mut mapping = Some(mapping);
-            let mut mutated = false;
-            let _guard = install_test_hook(move |boundary| {
-                hook_boundaries
-                    .lock()
-                    .expect("boundary log should lock")
-                    .push(boundary);
-                if !mutated && boundary == TestBoundary::BeforeFileSync {
-                    mutate_mapping(
-                        mapping
-                            .as_mut()
-                            .expect("shared mapping should remain retained by the hook"),
-                    );
-                    mutated = true;
-                }
-                Ok(())
-            });
-            let error = lock
-                .sync_durable()
-                .expect_err("mutation at the durability boundary must fail after the barrier");
-            assert_eq!(error.kind(), GenerationRootErrorKind::ObjectChanged);
-            assert_eq!(error.stage(), GenerationRootStage::SyncRegularFile);
-            let observed = boundaries.lock().expect("boundary log should lock");
-            let after_sync = observed
-                .iter()
-                .position(|boundary| *boundary == TestBoundary::AfterFileSync)
-                .expect("the durability barrier should complete before post-check failure");
-            assert!(
-                observed.iter().enumerate().any(|(index, boundary)| {
-                    index > after_sync && *boundary == (TestBoundary::BeforeRead { offset: 0 })
-                }),
-                "a second exact content read must follow the durability barrier"
-            );
-            drop(observed);
+                .expect_err("retained FSVI writer mapping must block the durability lock");
+            assert_eq!(error.kind(), GenerationRootErrorKind::LockContended);
+            assert_eq!(error.stage(), GenerationRootStage::AcquireLock);
+            drop(mapping);
         }
 
         #[test]
@@ -11009,6 +10944,52 @@ if not close_only_contended or not explicit_unlock_released:
             assert_eq!(
                 QualifiedGenerationRoot::admit(&link)
                     .expect_err("root symlink must fail")
+                    .kind(),
+                GenerationRootErrorKind::SymbolicLink
+            );
+        }
+
+        /// Linux half of the cross-platform symlink error-kind parity contract
+        /// (bd-54h2l LOW B).
+        ///
+        /// The macOS arm
+        /// `macos_absolute_root_route_rejects_ancestor_and_final_symlinks`
+        /// asserts [`GenerationRootErrorKind::SymbolicLink`] for an absolute
+        /// route whose ANCESTOR is a symlink and for one whose FINAL component
+        /// is, but it lives in a `cfg(all(target_os = "macos", target_arch =
+        /// "aarch64"))` module that never compiles on a Linux host. Linux
+        /// previously covered only the final component at root admission
+        /// (`root_qualification_rejects_symlink_final_component`) and the
+        /// confined-route case
+        /// (`ancestor_and_final_symlinks_fail_without_touching_decoys`), so the
+        /// ancestor-of-an-absolute-route shape had no Linux twin and the parity
+        /// claim rested on nothing measurable here.
+        ///
+        /// This pins the Linux side of that claim on the identical input shape.
+        /// The macOS side remains an ENCODED EXPECTATION, not a live proof:
+        /// confirming both platforms agree still needs an arm64 macOS run, and
+        /// that residual is named on bd-54h2l.
+        #[test]
+        fn absolute_root_route_rejects_ancestor_and_final_symlinks() {
+            let container = fixture_root("absolute-symlink-container");
+            let target_parent = fixture_root("absolute-symlink-target-parent");
+            let target_root = private_dir(&target_parent, "qualified-root");
+            let ancestor_link = container.join("ancestor-link");
+            let final_link = container.join("final-link");
+            symlink(&target_parent, &ancestor_link)
+                .expect("absolute-route ancestor symlink should be creatable");
+            symlink(&target_root, &final_link)
+                .expect("absolute-route final symlink should be creatable");
+
+            assert_eq!(
+                QualifiedGenerationRoot::admit(&ancestor_link.join("qualified-root"))
+                    .expect_err("an absolute-route ancestor symlink must fail")
+                    .kind(),
+                GenerationRootErrorKind::SymbolicLink
+            );
+            assert_eq!(
+                QualifiedGenerationRoot::admit(&final_link)
+                    .expect_err("an absolute-route final symlink must fail")
                     .kind(),
                 GenerationRootErrorKind::SymbolicLink
             );

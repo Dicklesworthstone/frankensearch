@@ -400,9 +400,13 @@ mod tests {
         };
         assert!(!large_effect.decidable_against(&biased));
 
-        // The tolerance is a boundary, not a suggestion.
+        // The tolerance is a boundary, not a suggestion. Both fixtures sit a
+        // clear 1% inside/outside it: `1.0 + NULL_MEDIAN_TOLERANCE` does not
+        // round-trip through the subtraction (it lands at 0.020000000000000018),
+        // so testing the knife edge itself would assert on f64 representation
+        // rather than on the rule.
         let at_edge = PairedRatio {
-            median: 1.0 + NULL_MEDIAN_TOLERANCE,
+            median: 1.0 + NULL_MEDIAN_TOLERANCE * 0.99,
             ..biased
         };
         let past_edge = PairedRatio {

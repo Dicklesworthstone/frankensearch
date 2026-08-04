@@ -5641,6 +5641,22 @@ original:
 | 2, final | writer ingestion | 1.030091 [0.805651, 1.229080] | **0.628700** [0.579356, 0.751003] | decidable isolated win |
 | 2, final | transfer + stable sort + encode + fsync | 0.937580 [0.825111, 1.170674] | **0.853127** [0.735856, 0.969935] | **INSIDE NULL FLOOR** |
 
+**Re-adjudicated 2026-08-04 (`bd-npdmj`), verdict REJECT.** `bd-pjh09` replaced A/A null admission
+with an accuracy test: a control is admissible when its median sits within 2% of 1.0, and its CI
+width is telemetry rather than a veto. Re-scoring the same-invocation A/A nulls above on that rule
+withdraws two rows; the third keeps its disposition on a stronger reason.
+
+- run 1, writer ingestion: `decidable isolated win` → **INADMISSIBLE CONTROL**. Deciding A/A null
+  median 0.971933 [0.765276, 1.140919], same invocation — drifts 2.81% from 1.0.
+- run 2 final, writer ingestion: `decidable isolated win` → **INADMISSIBLE CONTROL**. Deciding A/A
+  null median 1.030091 [0.805651, 1.229080], same invocation — drifts 3.01% from 1.0.
+- run 2 final, transfer + stable sort + encode + fsync: `INSIDE NULL FLOOR` → **INADMISSIBLE
+  CONTROL**. Deciding A/A null median 0.937580 [0.825111, 1.170674], same invocation — drifts 6.24%
+  from 1.0. Disposition unchanged; the row was already not a win.
+
+The isolated-handoff speedups are therefore unmeasured on this evidence rather than smaller than
+recorded, and the entry's shipping verdict below is unaffected.
+
 The first full-path result cleared its null p5 by only 0.014420. The required rerun kept the same faster
 direction but widened the measured floor: candidate median 0.853127 was **above** null p5 0.825111. The isolated
 handoff is reproducibly faster, but f16 encoding, sort, filesystem work, and fleet noise dilute that effect below
@@ -5924,6 +5940,18 @@ sweep, exact output parity, 31 alternating paired rounds, and an A/A null contro
 | 128 | 0.988 [0.359, 1.374] | 1.012 [0.446, 2.281] | short path preserved |
 | 256 | 1.011 [0.612, 2.840] | **0.791** [0.631, 1.098] | inside null floor |
 | 512 | 1.032 [0.846, 1.337] | **0.809** [0.692, 1.097] | clears null floor |
+
+**Re-adjudicated 2026-08-04 (`bd-npdmj`), verdict REJECT.** Re-scoring the same-invocation A/A
+nulls above under `bd-pjh09`'s accuracy rule (admissible when the null median is within 2% of 1.0;
+CI width is telemetry, not a veto) withdraws the 512-token row.
+
+- 512 tokens: `clears null floor` → **INADMISSIBLE CONTROL**. Deciding A/A null median 1.032
+  [0.846, 1.337], same invocation — drifts 3.20% from 1.0. The 128- and 256-token rows are
+  unaffected (nulls 0.988 and 1.011, drifts 1.20% and 1.10%).
+
+The 512-token mechanism is therefore unmeasured on this evidence. It was already route-next only,
+so nothing downstream rested on it; see the separate `bd-vxki` entry below, which re-measured the
+512+ threshold and is the row that any 512 claim should cite.
 
 **Decision:** production restored byte-for-byte because the exact 256-token onset does not clear its null floor.
 The feature-gated exact oracle and reproducer are retained. The 512-token mechanism win is route-next only: a
@@ -8744,3 +8772,43 @@ generation outside every timed interval; retained matched work-unit,
 byte-count, terminal-quiescence, source, ELF, host, and actual-concurrency
 facts; genuine pinned-incumbent screening; and valid same-invocation A/A
 controls before any new QG-1 decision is considered.
+
+## 2026-08-04 — CORRECTION: A/A null re-adjudication of the 2026-07-22 columnar/radix bulk-seal cells (`bd-npdmj`, `bd-pjh09`)
+
+`bd-pjh09` replaced A/A null admission with an accuracy test: a control is admissible when its
+median sits within 2% of 1.0, and its median-CI width is telemetry rather than a veto. The retired
+clause required the CI to contain 1.0, which vetoed a null for being *precise*. Re-scoring the
+same-invocation Delta/Delta A/A nulls recorded in the 2026-07-22 entry above moves cells in both
+directions. The verdicts below re-adjudicate admissibility only; no cell was re-measured and no new
+performance claim is made here.
+
+- golden-small / 1 thread: `radix clears null floor` → **REJECT, inadmissible control**. Deciding
+  A/A null median 1.0310 [0.9951, 1.0892], same invocation — drifts 3.10% from 1.0.
+- golden-medium / 1 thread: `radix clears null floor` → **REJECT, inadmissible control**. Deciding
+  A/A null median 0.9721 [0.8726, 1.0726], same invocation — drifts 2.79% from 1.0.
+- golden-small / 8 threads: `radix clears null floor` → **unchanged, now on an admissible control**.
+  Its same-invocation A/A null median 0.9827 [0.9110, 0.9883] drifts 1.73% from 1.0, but its spread
+  lies entirely below 1.0, so the retired straddle clause would have vetoed the row for its
+  precision alone. This is the one recorded instance in either ledger of the `bd-pjh09` defect
+  shape actually occurring.
+- golden-medium / 8 threads, synthetic-xlarge-max-lease / 1 thread, synthetic-xlarge-max-lease /
+  8 threads: unaffected. Same-invocation A/A null medians 1.0085, 1.0132, 0.9949 — drifts 0.85%,
+  1.32%, 0.51%.
+
+Both withdrawn cells are 1-thread, and the 2026-07-22 entry already declined to cite golden-small
+at 1 thread as a stable win. Its lane separation rests on the 8-thread and xlarge cells, which are
+unaffected.
+
+**Why this is a separate entry rather than an in-place edit.** The 2026-07-22 entry states an
+affirmative lane decision but records no executing ELF/binary SHA-256 and no comparison class, so
+it does not satisfy the affirmative-verdict contract the gate enforces today; it has never been
+re-gated because it has never been touched. Editing it in place makes the gate judge the whole entry and block on that
+pre-existing gap, and the missing SHA-256 is not recoverable — its strict-remote job id appears
+nowhere outside the two ledgers and no matching `.bench-history` artifact exists. Supplying a
+fabricated identity to clear the block, or rewriting another agent's recorded verdict, are both
+worse than leaving the original entry intact and recording the re-adjudication here. Closing that
+provenance gap belongs to the owner of `bd-quill-e1-scribe-bejd.7`.
+
+The other four re-adjudicated rows from this sweep were corrected in place, in their own entries:
+2026-07-11 `bd-5973` (two cells) and 2026-07-14 `bd-r3lf` (one cell), with matching corrections in
+`docs/NEGATIVE_EVIDENCE.md`.

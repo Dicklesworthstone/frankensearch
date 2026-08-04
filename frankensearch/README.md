@@ -33,7 +33,7 @@ Consumers receive results progressively via `SearchPhase` callbacks, so UIs can 
 - `TwoTierIndex` / `VectorIndex` - two-tier and low-level vector index types
 - `ScoredResult` / `FusedHit` / `VectorHit` - result types with provenance tracking
 - `FederatedSearcher` / `FederatedFusion` - multi-index federated search
-- `Embedder` / `LexicalSearch` / `Reranker` - core traits for pluggable backends
+- `Embedder` / `LexicalRead` + `LexicalWrite` / `Reranker` - core traits for pluggable backends
 - `QueryClass` - automatic query classification
 - `Canonicalizer` / `DocumentFingerprint` - text normalization and change detection
 

@@ -571,7 +571,11 @@ mod tests {
         assert_eq!(retained.witness().size, 25);
         assert_eq!(
             retained.witness().atime,
-            (metadata.atime(), metadata.atime_nsec() as u64),
+            (
+                metadata.atime(),
+                u64::try_from(metadata.atime_nsec())
+                    .expect("access-time nanoseconds are never negative"),
+            ),
             "the retained descriptor witness includes access-time identity"
         );
 

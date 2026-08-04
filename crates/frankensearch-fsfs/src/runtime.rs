@@ -18746,8 +18746,12 @@ mod tests {
     use asupersync::runtime::RuntimeBuilder;
     use asupersync::test_utils::run_test_with_cx;
     use frankensearch_core::{
-        Embedder, IndexableDocument, LexicalSearch, ModelCategory, SearchError, SearchFuture,
+        Embedder, IndexableDocument, LexicalRead as _, ModelCategory, SearchError, SearchFuture,
     };
+    // QuillIndex writes go through its inherent methods; the only trait-dispatched
+    // writer here is the Tantivy oracle, which lives behind `shadow-oracle`.
+    #[cfg(feature = "shadow-oracle")]
+    use frankensearch_core::LexicalWrite as _;
     #[cfg(feature = "embedded-models")]
     use frankensearch_embed::verify_dir_cached;
     use frankensearch_embed::{HashEmbedder, ModelManifest};

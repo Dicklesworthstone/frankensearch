@@ -4,8 +4,8 @@ use std::sync::Arc;
 
 use asupersync::Cx;
 use frankensearch_core::{
-    ExplanationPhase, HitExplanation, IndexableDocument, LexicalRead, LexicalSearch, LexicalWrite,
-    QueryClass, ScoreSource, ScoredResult, SearchError,
+    ExplanationPhase, HitExplanation, IndexableDocument, LexicalHydrationContext, LexicalRead,
+    LexicalWrite, QueryClass, ScoreSource, ScoredResult, SearchError,
 };
 use frankensearch_quill::index::{
     ConformanceCancellationController, ConformanceCancellationStage, QuillIndex,
@@ -143,7 +143,7 @@ pub struct LexicalExposureContract {
 }
 
 impl LexicalExposureContract {
-    /// Ordinary `LexicalSearch` returns no count/snippet/highlight supplement.
+    /// Ordinary `LexicalRead` returns no count/snippet/highlight supplement.
     pub const CORE_LEXICAL_SEARCH: Self = Self {
         metadata: LexicalFieldExposure::Exposed,
         explanation: LexicalFieldExposure::Exposed,
@@ -220,7 +220,7 @@ impl LexicalNormalizedQuery {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LexicalBoundary {
-    /// Ordinary [`frankensearch_core::LexicalSearch::search`] output.
+    /// Ordinary [`frankensearch_core::LexicalRead::search`] output.
     FullSearch,
     /// Fusion candidates before optional metadata hydration.
     FusionCandidates,
@@ -350,7 +350,7 @@ impl LexicalObservationContext {
     /// Bind normalized bytes emitted by a specific named public transform.
     ///
     /// This is deliberately separate from [`Self::new`]: ordinary
-    /// `LexicalSearch` does not expose its internal parser/analyzer transform
+    /// `LexicalRead` does not expose its internal parser/analyzer transform
     /// and therefore must retain `NotExposed`.
     #[cfg(test)]
     pub(crate) fn with_normalized_query(
@@ -813,7 +813,8 @@ pub struct LexicalContractBundle {
     pub(crate) engine_role: LexicalEngineRole,
     /// SHA-256 identity of the immutable committed snapshot queried here.
     pub(crate) snapshot_sha256: String,
-    /// Capability read from `LexicalSearch::fusion_metadata_is_deferred`.
+    /// Observed from the candidate batch's shape: deferred iff it carried a
+    /// snapshot pin. Replaces the retired `fusion_metadata_is_deferred` flag.
     pub(crate) fusion_metadata_deferred: bool,
     /// Ordinary full search result.
     pub(crate) full_search: LexicalObservation,
@@ -2538,7 +2539,13 @@ fn synthetic_non_lexical_control(
 
 async fn observe_hydration_attempt(
     cx: &Cx,
-    engine: &dyn LexicalSearch,
+    engine: &dyn LexicalRead,
+    // The candidate batch's snapshot pin, threaded from the scoring call so
+    // hydration reads the generation that produced the candidates rather than
+    // whatever is current. `None` for synthetic controls that never came from a
+    // batch; a pinning backend rejects that with a typed error, and the
+    // rejection is retained as evidence exactly like any other outcome.
+    pin: Option<&LexicalHydrationContext>,
     build: &LexicalContractBuildContext<'_>,
     selection: LexicalHydrationSelection,
     input_boundary: LexicalBoundary,
@@ -2549,7 +2556,7 @@ async fn observe_hydration_attempt(
         build.observation_context(input_boundary)?,
         results.clone(),
     )?;
-    let hydration_result = engine.hydrate_fusion_metadata(cx, &mut results).await;
+    let hydration_result = engine.hydrate_candidates(cx, pin, &mut results).await;
     let post_state =
         observe_successful_lexical_state(build.observation_context(post_boundary)?, results)?;
     Ok(LexicalHydrationTransition {
@@ -2570,13 +2577,20 @@ async fn observe_hydration_attempt(
 /// post-call state so partial mutation remains observable.
 pub async fn observe_live_lexical_contract(
     cx: &Cx,
-    engine: &dyn LexicalSearch,
+    engine: &dyn LexicalRead,
     build: LexicalContractBuildContext<'_>,
 ) -> Result<LexicalContractBundle, GauntletError> {
     let full_result = engine.search(cx, build.query, build.limit).await;
-    let candidate_result = engine
-        .search_fusion_candidates(cx, build.query, build.limit)
-        .await;
+    // Split the batch into the rows the observer records and the pin the
+    // hydration attempts below must use.
+    let (candidate_result, candidate_pin) =
+        match engine.search_candidates(cx, build.query, build.limit).await {
+            Ok(batch) => {
+                let (rows, pin) = batch.into_parts();
+                (Ok(rows), pin)
+            }
+            Err(error) => (Err(error), None),
+        };
     let full_search = observe_borrowed_lexical_outcome(
         build.observation_context(LexicalBoundary::FullSearch)?,
         &full_result,
@@ -2585,7 +2599,10 @@ pub async fn observe_live_lexical_contract(
         build.observation_context(LexicalBoundary::FusionCandidates)?,
         &candidate_result,
     )?;
-    let fusion_metadata_deferred = engine.fusion_metadata_is_deferred();
+    // Deferred iff the batch carried a pin. This replaces the retired
+    // `fusion_metadata_is_deferred` capability flag with the observed shape of
+    // the batch the engine actually returned.
+    let fusion_metadata_deferred = candidate_pin.is_some();
 
     let limit = u64::try_from(build.limit).map_err(|_| GauntletError::InvalidObservation {
         reason: "lexical request limit does not fit persisted hydration evidence".to_owned(),
@@ -2599,6 +2616,7 @@ pub async fn observe_live_lexical_contract(
         observe_hydration_attempt(
             cx,
             engine,
+            candidate_pin.as_ref(),
             &build,
             LexicalHydrationSelection::SemanticOnlyControl { control_id: 0 },
             LexicalBoundary::FusionHydrationSemanticOnlyInput,
@@ -2649,6 +2667,7 @@ pub async fn observe_live_lexical_contract(
                 let all_lexical_winners_hydration = observe_hydration_attempt(
                     cx,
                     engine,
+                    candidate_pin.as_ref(),
                     &build,
                     LexicalHydrationSelection::AllLexicalWinners,
                     LexicalBoundary::FusionHydrationAllLexicalInput,
@@ -2662,6 +2681,7 @@ pub async fn observe_live_lexical_contract(
                     observe_hydration_attempt(
                         cx,
                         engine,
+                        candidate_pin.as_ref(),
                         &build,
                         LexicalHydrationSelection::StrictHybridWinnerSubset {
                             candidate_ranks: vec![u64::try_from(candidate_rank).map_err(|_| {
@@ -2780,6 +2800,7 @@ pub async fn observe_live_lexical_contract(
                     observe_hydration_attempt(
                         cx,
                         engine,
+                        candidate_pin.as_ref(),
                         &build,
                         LexicalHydrationSelection::MixedFinalWinners { origins },
                         LexicalBoundary::FusionHydrationMixedInput,
@@ -9155,7 +9176,7 @@ mod tests {
         }
     }
 
-    impl LexicalSearch for LexicalContractSpy {
+    impl LexicalRead for LexicalContractSpy {
         fn search<'a>(
             &'a self,
             _cx: &'a Cx,
@@ -9179,18 +9200,33 @@ mod tests {
             Box::pin(async move { result })
         }
 
-        fn search_fusion_candidates<'a>(
+        fn search_candidates<'a>(
             &'a self,
             _cx: &'a Cx,
             query: &'a str,
             limit: usize,
-        ) -> frankensearch_core::SearchFuture<'a, Vec<ScoredResult>> {
+        ) -> frankensearch_core::SearchFuture<'a, frankensearch_core::LexicalCandidateBatch>
+        {
             self.record(format!("candidates:{query}:{limit}"));
+            let deferred = self.deferred;
             let result = match self.candidate_outcome {
                 SpySearchOutcome::Success => {
-                    let mut results = Self::results(!self.deferred);
+                    let mut results = Self::results(!deferred);
                     results.truncate(limit);
-                    Ok(results)
+                    // The spy's `deferred` flag now shows up as the batch shape
+                    // rather than a separate capability call, mirroring how the
+                    // split surface reports it.
+                    Ok(if deferred {
+                        frankensearch_core::LexicalCandidateBatch::deferred(
+                            results,
+                            frankensearch_core::LexicalHydrationContext::new(
+                                "lexical-contract-spy",
+                                Box::new(()),
+                            ),
+                        )
+                    } else {
+                        frankensearch_core::LexicalCandidateBatch::eager(results)
+                    })
                 }
                 SpySearchOutcome::Cancelled => Err(SearchError::Cancelled {
                     phase: "spy candidate search".to_owned(),
@@ -9204,14 +9240,10 @@ mod tests {
             Box::pin(async move { result })
         }
 
-        fn fusion_metadata_is_deferred(&self) -> bool {
-            self.record("capability");
-            self.deferred
-        }
-
-        fn hydrate_fusion_metadata<'a>(
+        fn hydrate_candidates<'a>(
             &'a self,
             _cx: &'a Cx,
+            _context: Option<&'a frankensearch_core::LexicalHydrationContext>,
             results: &'a mut [ScoredResult],
         ) -> frankensearch_core::SearchFuture<'a, ()> {
             Box::pin(async move {
@@ -9246,6 +9278,12 @@ mod tests {
             })
         }
 
+        fn doc_count(&self) -> usize {
+            2
+        }
+    }
+
+    impl LexicalWrite for LexicalContractSpy {
         fn index_document<'a>(
             &'a self,
             _cx: &'a Cx,
@@ -9256,10 +9294,6 @@ mod tests {
 
         fn commit<'a>(&'a self, _cx: &'a Cx) -> frankensearch_core::SearchFuture<'a, ()> {
             Box::pin(async { Ok(()) })
-        }
-
-        fn doc_count(&self) -> usize {
-            2
         }
     }
 
@@ -9321,9 +9355,11 @@ mod tests {
                     .map(String::as_str)
                     .collect::<Vec<_>>(),
                 vec![
+                    // No "capability" call: deferral is now read from the
+                    // batch's shape rather than a separate trait method, so the
+                    // observer makes one fewer engine call for the same evidence.
                     "search:rust search:10",
                     "candidates:rust search:10",
-                    "capability",
                     "hydrate:1",
                     "hydrate:2",
                     "hydrate:1",
@@ -9339,9 +9375,11 @@ mod tests {
                     .map(String::as_str)
                     .collect::<Vec<_>>(),
                 vec![
+                    // No "capability" call: deferral is now read from the
+                    // batch's shape rather than a separate trait method, so the
+                    // observer makes one fewer engine call for the same evidence.
                     "search:rust search:10",
                     "candidates:rust search:10",
-                    "capability",
                     "hydrate:1",
                     "hydrate:2",
                     "hydrate:1",
@@ -9410,7 +9448,6 @@ mod tests {
                 vec![
                     "search:rust search:10",
                     "candidates:rust search:10",
-                    "capability",
                     "hydrate:1",
                 ]
             );
@@ -11627,7 +11664,7 @@ mod tests {
     #[cfg(feature = "tantivy-oracle")]
     #[test]
     fn lexical_observation_real_quill_tantivy_public_boundary_is_exact() {
-        use frankensearch_core::{IndexableDocument, LexicalSearch};
+        use frankensearch_core::{IndexableDocument, LexicalWrite};
         use frankensearch_lexical::TantivyIndex;
         use frankensearch_quill::{QuillConfig, QuillIndex};
 
@@ -11649,24 +11686,24 @@ mod tests {
             let tantivy =
                 TantivyIndex::in_memory_single_threaded_oracle().expect("create Tantivy oracle");
 
-            LexicalSearch::index_documents(&quill, &cx, &documents)
+            LexicalWrite::index_documents(&quill, &cx, &documents)
                 .await
                 .expect("index Quill corpus");
-            LexicalSearch::index_documents(&tantivy, &cx, &documents)
+            LexicalWrite::index_documents(&tantivy, &cx, &documents)
                 .await
                 .expect("index Tantivy corpus");
-            LexicalSearch::commit(&quill, &cx)
+            LexicalWrite::commit(&quill, &cx)
                 .await
                 .expect("commit Quill corpus");
-            LexicalSearch::commit(&tantivy, &cx)
+            LexicalWrite::commit(&tantivy, &cx)
                 .await
                 .expect("commit Tantivy corpus");
 
             let query = "rust";
-            let quill_results = LexicalSearch::search(&quill, &cx, query, 10)
+            let quill_results = LexicalRead::search(&quill, &cx, query, 10)
                 .await
                 .expect("search Quill");
-            let tantivy_results = LexicalSearch::search(&tantivy, &cx, query, 10)
+            let tantivy_results = LexicalRead::search(&tantivy, &cx, query, 10)
                 .await
                 .expect("search Tantivy");
             for results in [&quill_results, &tantivy_results] {

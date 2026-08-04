@@ -2859,6 +2859,202 @@ impl PerfEvidenceArtifact {
         let contents = fs::read(path)?;
         Self::from_verified_slice(&contents)
     }
+
+    /// Load one artifact as ADMISSIBLE EVIDENCE: verified exactly as
+    /// [`Self::load_verified`] does, then screened against the append-only
+    /// quarantine register.
+    ///
+    /// [`Self::load_verified`] answers "are these bytes an intact artifact?".
+    /// That is a strictly weaker question than "may this artifact support a
+    /// claim?", and the difference is the entire point of a quarantine: the
+    /// structurally invalid sweep is intact, seals correctly, and recomputes
+    /// from its own samples. Every consumer that treats an artifact as evidence
+    /// must come through here; [`Self::load_verified`] remains available for
+    /// diagnosis and for reading history, which stays readable forever.
+    ///
+    /// # Errors
+    ///
+    /// Returns every [`EvidenceArtifactError`] [`Self::load_verified`] can, plus
+    /// [`EvidenceArtifactError::QuarantinedRevision`] when the measured
+    /// revision is registered as structurally invalid.
+    pub fn load_admissible_evidence(
+        path: &Path,
+        register: &PerfQuarantineRegister,
+    ) -> Result<Self, EvidenceArtifactError> {
+        let artifact = Self::load_verified(path)?;
+        register.screen(&artifact)?;
+        Ok(artifact)
+    }
+}
+
+/// Schema tag carried by every append-only quarantine record.
+pub const PERF_QUARANTINE_SCHEMA_VERSION: &str = "quill-perf-quarantine-v1";
+
+/// File name of the append-only quarantine register inside `.bench-history`.
+pub const PERF_QUARANTINE_FILE_NAME: &str = "QUARANTINE.jsonl";
+
+/// Shortest revision prefix a quarantine record may carry.
+///
+/// A prefix shorter than this could collide with an unrelated revision and
+/// quarantine evidence that was never in the invalid sweep, so it is rejected
+/// when the register is parsed rather than silently over-matching at screen
+/// time.
+const MIN_QUARANTINE_REVISION_PREFIX: usize = 7;
+
+/// One append-only record marking a measured revision structurally invalid.
+///
+/// Records are never edited or removed. Retracting a quarantine means appending
+/// a later record through whatever supersession process the ledger defines, not
+/// rewriting this file — the same append-only discipline the evidence ledgers
+/// themselves follow.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PerfQuarantineRecord {
+    /// Always [`PERF_QUARANTINE_SCHEMA_VERSION`].
+    pub schema_version: String,
+    /// Lowercase hex git-revision prefix identifying the quarantined sweep.
+    pub git_revision_prefix: String,
+    /// Why the sweep cannot support a claim.
+    pub reason: String,
+    /// Tracker identifier that recorded the quarantine.
+    pub recorded_by: String,
+}
+
+/// Append-only register of structurally invalid measured revisions.
+///
+/// The register is deliberately OUT OF BAND. `PerfEvidenceArtifact` already
+/// carries an in-band [`PerfEvidenceArtifact::admission_no_claim`], but setting
+/// it on a historical artifact would mean rewriting sealed evidence that has
+/// already been published — precisely the deletion-and-reinterpretation this
+/// correction forbids. Keying the quarantine on immutable identity instead lets
+/// history stay byte-identical and still stop supporting claims.
+#[derive(Clone, Debug, Default)]
+pub struct PerfQuarantineRegister {
+    records: Vec<PerfQuarantineRecord>,
+}
+
+impl PerfQuarantineRegister {
+    /// Parse an append-only JSONL register.
+    ///
+    /// Blank lines and `#` comment lines are ignored so the file can carry
+    /// human context; every other line must be a complete record.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EvidenceArtifactError::Malformed`] for a line that is not a
+    /// record, carries a foreign schema tag, or names a revision prefix shorter
+    /// than [`MIN_QUARANTINE_REVISION_PREFIX`] or containing non-hex bytes.
+    pub fn from_jsonl(contents: &str) -> Result<Self, EvidenceArtifactError> {
+        let mut records = Vec::new();
+        for (index, line) in contents.lines().enumerate() {
+            let trimmed = line.trim();
+            if trimmed.is_empty() || trimmed.starts_with('#') {
+                continue;
+            }
+            let record: PerfQuarantineRecord = serde_json::from_str(trimmed).map_err(|error| {
+                EvidenceArtifactError::Malformed {
+                    reason: format!(
+                        "quarantine register line {} is not a record: {error}",
+                        index + 1
+                    ),
+                }
+            })?;
+            if record.schema_version != PERF_QUARANTINE_SCHEMA_VERSION {
+                return Err(EvidenceArtifactError::Malformed {
+                    reason: format!(
+                        "quarantine register line {} carries schema {}; current is {PERF_QUARANTINE_SCHEMA_VERSION}",
+                        index + 1,
+                        record.schema_version
+                    ),
+                });
+            }
+            let prefix = record.git_revision_prefix.trim().to_ascii_lowercase();
+            if prefix.len() < MIN_QUARANTINE_REVISION_PREFIX
+                || !prefix.bytes().all(|byte| byte.is_ascii_hexdigit())
+            {
+                return Err(EvidenceArtifactError::Malformed {
+                    reason: format!(
+                        "quarantine register line {} names revision prefix {:?}, which must be at \
+                         least {MIN_QUARANTINE_REVISION_PREFIX} lowercase hex characters",
+                        index + 1,
+                        record.git_revision_prefix
+                    ),
+                });
+            }
+            records.push(PerfQuarantineRecord {
+                git_revision_prefix: prefix,
+                ..record
+            });
+        }
+        Ok(Self { records })
+    }
+
+    /// Load the append-only register from a path.
+    ///
+    /// A MISSING register is an empty register, not an error: a checkout with
+    /// no quarantined revisions is a legitimate state. A present-but-unreadable
+    /// or malformed register is an error, so a corrupted file can never be
+    /// mistaken for "nothing is quarantined".
+    ///
+    /// # Errors
+    ///
+    /// Returns the I/O or parse error for a register that exists but cannot be
+    /// read as a valid append-only register.
+    pub fn load(path: &Path) -> Result<Self, EvidenceArtifactError> {
+        match fs::read_to_string(path) {
+            Ok(contents) => Self::from_jsonl(&contents),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Self::default()),
+            Err(error) => Err(EvidenceArtifactError::Io(error)),
+        }
+    }
+
+    /// Load the register that belongs to a `.bench-history`-style directory.
+    ///
+    /// Callers own the history directory, not the register's file name, so this
+    /// is the call the promotion path wants: it keeps
+    /// [`PERF_QUARANTINE_FILE_NAME`] an implementation detail of this module
+    /// instead of a string every call site has to repeat and keep in sync.
+    ///
+    /// # Errors
+    ///
+    /// Same contract as [`Self::load`]: an absent register is empty, a present
+    /// but unreadable or malformed one is an error.
+    pub fn load_from_history_dir(history_dir: &Path) -> Result<Self, EvidenceArtifactError> {
+        Self::load(&history_dir.join(PERF_QUARANTINE_FILE_NAME))
+    }
+
+    /// The record quarantining `git_revision`, when one exists.
+    #[must_use]
+    pub fn quarantine_of(&self, git_revision: &str) -> Option<&PerfQuarantineRecord> {
+        let revision = git_revision.trim().to_ascii_lowercase();
+        self.records
+            .iter()
+            .find(|record| revision.starts_with(&record.git_revision_prefix))
+    }
+
+    /// Every record in append order.
+    #[must_use]
+    pub fn records(&self) -> &[PerfQuarantineRecord] {
+        &self.records
+    }
+
+    /// Refuse an artifact whose measured revision is quarantined.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`EvidenceArtifactError::QuarantinedRevision`] naming the
+    /// artifact revision, the matched record, and its reason.
+    pub fn screen(&self, artifact: &PerfEvidenceArtifact) -> Result<(), EvidenceArtifactError> {
+        let revision = &artifact.provenance.build.git_revision;
+        if let Some(record) = self.quarantine_of(revision) {
+            return Err(EvidenceArtifactError::QuarantinedRevision {
+                git_revision: revision.clone(),
+                git_revision_prefix: record.git_revision_prefix.clone(),
+                reason: record.reason.clone(),
+                recorded_by: record.recorded_by.clone(),
+            });
+        }
+        Ok(())
+    }
 }
 
 /// Derive the operator table from an authoritative JSON string.
@@ -2984,6 +3180,28 @@ pub enum EvidenceArtifactError {
     InconsistentArtifact {
         /// Bounded description.
         reason: String,
+    },
+    /// The artifact is intact but its measured revision is registered as
+    /// structurally invalid, so it can never support a claim.
+    ///
+    /// This is deliberately distinct from every "broken artifact" variant: the
+    /// bytes verify, the seal matches, and the summaries recompute. What fails
+    /// is admissibility, not integrity, and conflating the two would let an
+    /// operator read this as corruption and "fix" it by re-measuring the same
+    /// invalid shape.
+    #[error(
+        "evidence artifact revision {git_revision} is quarantined by {recorded_by} \
+         (prefix {git_revision_prefix}): {reason}"
+    )]
+    QuarantinedRevision {
+        /// Measured revision recorded in the artifact.
+        git_revision: String,
+        /// Register prefix that matched it.
+        git_revision_prefix: String,
+        /// Why the sweep cannot support a claim.
+        reason: String,
+        /// Tracker identifier that recorded the quarantine.
+        recorded_by: String,
     },
     /// Paired estimator rejected the raw streams.
     #[error(transparent)]
@@ -4085,6 +4303,150 @@ mod tests {
             PerfEvidenceArtifact::load_verified(&path),
             Err(EvidenceArtifactError::InvalidProvenance { .. })
         ));
+    }
+
+    /// The shipped append-only register is the one the repository actually
+    /// carries, so a malformed edit to it fails the build rather than silently
+    /// disarming the quarantine.
+    const SHIPPED_QUARANTINE_REGISTER: &str =
+        include_str!("../../../.bench-history/QUARANTINE.jsonl");
+
+    /// Build an intact, sealed artifact whose measured revision is `revision`.
+    ///
+    /// The runner receipt has to be minted at the SAME revision as the
+    /// provenance: `bind_machine_class_identity` cross-checks them and rejects
+    /// a mismatch with `InvalidProvenance`. That check is doing its job, so the
+    /// fixture binds a receipt at `revision` rather than reusing the default
+    /// `admitted_identity` helper, which hardcodes `"d".repeat(40)`. The point
+    /// of these tests is an artifact that is flawless everywhere EXCEPT that
+    /// its revision is quarantined; an artifact with a desynchronized receipt
+    /// would be refused for the wrong reason and prove nothing.
+    fn artifact_measured_at(revision: &str) -> PerfEvidenceArtifact {
+        let mut provenance = evidence_provenance(PerfGate::Qg2);
+        provenance.build.git_revision = revision.to_owned();
+        let mut artifact = PerfEvidenceArtifact::assemble(
+            PerfGate::Qg2,
+            plan_binding(PerfGate::Qg2),
+            policy(),
+            provenance,
+            vec![provisional_qg2_cell()],
+        )
+        .expect("artifact at the requested revision");
+        let source = seal_unbound_artifact(&mut artifact);
+        let identity = crate::machine_class_registry::admitted_test_identity_for_artifacts(
+            PerfGate::Qg2.label(),
+            revision,
+            &"c".repeat(64),
+            &"a".repeat(64),
+            &"f".repeat(64),
+            &"e".repeat(64),
+            "qg2-primary",
+            "run-a",
+            "window-1",
+            b"qg2-threshold",
+            &source,
+        );
+        artifact
+            .bind_machine_class_identity(identity, b"qg2-threshold", &source)
+            .expect("bind an admitted receipt minted at the same revision");
+        artifact
+    }
+
+    /// PLANTED NEGATIVE for the QG-1 invalid-sweep quarantine.
+    ///
+    /// The artifact here is not broken in any way an integrity check can see:
+    /// current schema, exact canonical pretty JSON, intact seal, summaries that
+    /// recompute from their own raw samples. Only its measured revision is
+    /// quarantined. Both halves are asserted deliberately — that the naive
+    /// loader ADMITS it is the defect being closed, and asserting only the
+    /// refusal would leave a test that still passes if the quarantine stopped
+    /// discriminating and simply refused everything.
+    #[test]
+    fn quarantined_revision_is_refused_although_the_naive_loader_admits_it() {
+        let artifact = artifact_measured_at("193d2e3fa1b2c3d4e5f60718293a4b5c6d7e8f90");
+        let directory = tempfile::tempdir().expect("quarantine directory");
+        let paths = artifact
+            .write_atomic(directory.path())
+            .expect("write quarantined artifact");
+
+        PerfEvidenceArtifact::load_verified(&paths.json)
+            .expect("an intact artifact from a quarantined sweep still passes integrity checks");
+
+        let register = PerfQuarantineRegister::from_jsonl(SHIPPED_QUARANTINE_REGISTER)
+            .expect("the shipped register parses");
+        let error = PerfEvidenceArtifact::load_admissible_evidence(&paths.json, &register)
+            .expect_err("a quarantined revision must never load as evidence");
+        let EvidenceArtifactError::QuarantinedRevision {
+            git_revision,
+            git_revision_prefix,
+            recorded_by,
+            ..
+        } = error
+        else {
+            panic!("expected a quarantine refusal, got {error:?}");
+        };
+        assert_eq!(git_revision, "193d2e3fa1b2c3d4e5f60718293a4b5c6d7e8f90");
+        assert_eq!(git_revision_prefix, "193d2e3f");
+        assert_eq!(recorded_by, "bd-qg1-invalid-sweep-quarantine-h4sqj");
+    }
+
+    /// The quarantine must discriminate: an artifact from any other revision is
+    /// still admissible through the same loader.
+    #[test]
+    fn an_unquarantined_revision_still_loads_as_evidence() {
+        let artifact = artifact_measured_at("0f1e2d3c4b5a69788796a5b4c3d2e1f009182736");
+        let directory = tempfile::tempdir().expect("admissible directory");
+        let paths = artifact
+            .write_atomic(directory.path())
+            .expect("write admissible artifact");
+        let register = PerfQuarantineRegister::from_jsonl(SHIPPED_QUARANTINE_REGISTER)
+            .expect("the shipped register parses");
+
+        PerfEvidenceArtifact::load_admissible_evidence(&paths.json, &register)
+            .expect("an unquarantined revision remains admissible evidence");
+    }
+
+    /// The shipped register must actually cover the three sweep revisions this
+    /// correction names, so the file cannot drift into a decorative comment.
+    #[test]
+    fn the_shipped_register_quarantines_every_named_sweep_revision() {
+        let register = PerfQuarantineRegister::from_jsonl(SHIPPED_QUARANTINE_REGISTER)
+            .expect("the shipped register parses");
+        assert_eq!(register.records().len(), 3);
+        for revision in [
+            "193d2e3fa1b2c3d4e5f60718293a4b5c6d7e8f90",
+            "544ffeb0112233445566778899aabbccddeeff00",
+            "e0dc6ba3ffeeddccbbaa99887766554433221100",
+        ] {
+            assert!(
+                register.quarantine_of(revision).is_some(),
+                "{revision} must be quarantined by the shipped register"
+            );
+        }
+    }
+
+    /// A register that exists but cannot be parsed must be an error, never an
+    /// empty register: a corrupted file must not read as "nothing is
+    /// quarantined". A genuinely absent register is still empty and fine.
+    #[test]
+    fn a_corrupt_register_fails_closed_but_an_absent_one_is_empty() {
+        assert!(matches!(
+            PerfQuarantineRegister::from_jsonl(
+                r#"{"schema_version":"quill-perf-quarantine-v1","git_revision_prefix":"193d","reason":"too short","recorded_by":"t"}"#
+            ),
+            Err(EvidenceArtifactError::Malformed { .. })
+        ));
+        assert!(matches!(
+            PerfQuarantineRegister::from_jsonl(
+                r#"{"schema_version":"quill-perf-quarantine-v0","git_revision_prefix":"193d2e3f","reason":"foreign schema","recorded_by":"t"}"#
+            ),
+            Err(EvidenceArtifactError::Malformed { .. })
+        ));
+
+        let directory = tempfile::tempdir().expect("absent register directory");
+        let absent = PerfQuarantineRegister::load_from_history_dir(directory.path())
+            .expect("an absent register is an empty register");
+        assert!(absent.records().is_empty());
     }
 
     #[test]

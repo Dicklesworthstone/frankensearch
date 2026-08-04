@@ -1,6 +1,7 @@
 //! Core traits, types, and error types for the frankensearch hybrid search library.
 //!
-//! This crate defines the shared interfaces (`Embedder`, `Reranker`, `LexicalSearch`),
+//! This crate defines the shared interfaces (`Embedder`, `Reranker`,
+//! `LexicalRead`/`LexicalWrite`),
 //! result types (`ScoredResult`, `VectorHit`, `FusedHit`), error types (`SearchError`),
 //! text canonicalization, and query classification used across all frankensearch crates.
 //!
@@ -188,10 +189,10 @@ pub use asupersync::Cx;
 pub use query_class::QueryClass;
 pub use traits::{
     Embedder, IdentityBoundEmbedding, LexicalCandidateBatch, LexicalHydrationContext, LexicalRead,
-    LexicalSearch, LexicalWrite, MetricsExporter, ModelCategory, ModelInfo, ModelTier,
-    NoOpMetricsExporter, RerankDocument, RerankScore, Reranker, SearchFuture,
-    SharedMetricsExporter, SyncEmbed, SyncEmbedderAdapter, SyncRerank, SyncRerankerAdapter,
-    cosine_similarity, l2_normalize, truncate_embedding,
+    LexicalWrite, MetricsExporter, ModelCategory, ModelInfo, ModelTier, NoOpMetricsExporter,
+    RerankDocument, RerankScore, Reranker, SearchFuture, SharedMetricsExporter, SyncEmbed,
+    SyncEmbedderAdapter, SyncRerank, SyncRerankerAdapter, cosine_similarity, l2_normalize,
+    truncate_embedding,
 };
 pub use types::{
     BoundQueryEmbedding, CoverageBasisV1, CoverageCountsV1, CoverageRelationV1, CoverageScopeV1,

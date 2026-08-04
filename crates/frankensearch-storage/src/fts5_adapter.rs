@@ -1,7 +1,8 @@
 //! FTS5 alternative lexical search adapter.
 //!
 //! Uses `FrankenSQLite`'s built-in FTS5 implementation as an alternative to
-//! Tantivy for BM25 full-text search. Both implement the [`LexicalSearch`]
+//! Tantivy for BM25 full-text search. Both implement the split
+//! [`frankensearch_core::LexicalRead`] / [`frankensearch_core::LexicalWrite`]
 //! trait from `frankensearch-core`.
 //!
 //! # Advantages over Tantivy
@@ -21,7 +22,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use asupersync::Cx;
 use frankensearch_core::error::{SearchError, SearchResult};
-use frankensearch_core::traits::{LexicalSearch, SearchFuture};
+use frankensearch_core::traits::SearchFuture;
 use frankensearch_core::types::{IndexableDocument, ScoreSource, ScoredResult};
 use fsqlite_ext_fts5::{Fts5Table, snippet as fts5_snippet};
 use serde::{Deserialize, Serialize};
@@ -145,7 +146,7 @@ impl RowIdMap {
 
 // ─── FTS5 Lexical Search ────────────────────────────────────────────────────
 
-/// FTS5-backed implementation of [`LexicalSearch`].
+/// FTS5-backed implementation of the split lexical capabilities.
 ///
 /// Uses `FrankenSQLite`'s `Fts5Table` directly for full-text indexing
 /// and BM25-ranked search. Thread-safe via internal `Mutex`.
@@ -335,10 +336,10 @@ impl Fts5LexicalSearch {
     }
 }
 
-// ─── LexicalSearch trait implementation ─────────────────────────────────────
+// ─── Split lexical trait implementations ────────────────────────────────────
 
 #[allow(clippy::significant_drop_tightening)]
-impl LexicalSearch for Fts5LexicalSearch {
+impl frankensearch_core::LexicalRead for Fts5LexicalSearch {
     #[instrument(skip_all, fields(query = %query, limit = limit))]
     fn search<'a>(
         &'a self,
@@ -398,6 +399,15 @@ impl LexicalSearch for Fts5LexicalSearch {
         })
     }
 
+    /// FTS5 attaches full metadata during `search`, so the inherited eager
+    /// `search_candidates` and its no-op hydration are exact for this backend:
+    /// there is no deferred path to lose and no snapshot to pin.
+    fn doc_count(&self) -> usize {
+        self.doc_count.load(Ordering::Relaxed)
+    }
+}
+
+impl frankensearch_core::LexicalWrite for Fts5LexicalSearch {
     fn index_document<'a>(
         &'a self,
         _cx: &'a Cx,
@@ -454,51 +464,6 @@ impl LexicalSearch for Fts5LexicalSearch {
         // FTS5 in-memory table has no separate commit phase.
         Box::pin(async { Ok(()) })
     }
-
-    fn doc_count(&self) -> usize {
-        self.doc_count.load(Ordering::Relaxed)
-    }
-}
-
-// bd-8nqz.1 slice B: split-trait surface. Delegates to the combined-trait
-// impl above; bodies move here when `LexicalSearch` is removed. FTS5 returns
-// full metadata from `search`, so the default eager `search_candidates` and
-// no-op hydration are exact.
-impl frankensearch_core::LexicalRead for Fts5LexicalSearch {
-    fn search<'a>(
-        &'a self,
-        cx: &'a Cx,
-        query: &'a str,
-        limit: usize,
-    ) -> SearchFuture<'a, Vec<ScoredResult>> {
-        LexicalSearch::search(self, cx, query, limit)
-    }
-
-    fn doc_count(&self) -> usize {
-        LexicalSearch::doc_count(self)
-    }
-}
-
-impl frankensearch_core::LexicalWrite for Fts5LexicalSearch {
-    fn index_document<'a>(
-        &'a self,
-        cx: &'a Cx,
-        doc: &'a IndexableDocument,
-    ) -> SearchFuture<'a, ()> {
-        LexicalSearch::index_document(self, cx, doc)
-    }
-
-    fn index_documents<'a>(
-        &'a self,
-        cx: &'a Cx,
-        docs: &'a [IndexableDocument],
-    ) -> SearchFuture<'a, ()> {
-        LexicalSearch::index_documents(self, cx, docs)
-    }
-
-    fn commit<'a>(&'a self, cx: &'a Cx) -> SearchFuture<'a, ()> {
-        LexicalSearch::commit(self, cx)
-    }
 }
 
 // ─── Hit type for snippet-aware search ──────────────────────────────────────
@@ -534,6 +499,9 @@ mod tests {
     use std::future::Future;
 
     use super::*;
+    // The split capabilities, so `adapter.search(..)` / `.index_document(..)`
+    // / `.doc_count()` resolve now that the combined trait is gone.
+    use frankensearch_core::{LexicalRead as _, LexicalWrite as _};
 
     /// Helper: run async test code with a `Cx` (asupersync, NO tokio).
     fn run_with_cx<F, Fut>(f: F)

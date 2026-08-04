@@ -38,11 +38,12 @@ use frankensearch_index::{
     TwoTierIndex, TwoTierIndexBuilder, VECTOR_INDEX_FALLBACK_FILENAME, VECTOR_INDEX_FAST_FILENAME,
     VECTOR_INDEX_QUALITY_FILENAME,
 };
-#[cfg(all(feature = "lexical", not(feature = "quill")))]
+#[cfg(feature = "lexical-tantivy")]
 use frankensearch_lexical::TantivyIndex;
 #[cfg(feature = "quill")]
 use frankensearch_quill::{
-    BlueGreenEngine, LexicalLayout, QuillConfig, QuillIndex, inspect_lexical_layout,
+    BlueGreenEngine, LexicalLayout, QuillConfig, QuillIndex, RootBoundQuillSearchIndex,
+    inspect_lexical_layout,
 };
 
 /// Per-arm byte accounting for a completed build (bd-8nqz.3).
@@ -845,34 +846,47 @@ pub async fn open_hybrid(
 
 #[cfg(feature = "quill")]
 async fn open_lexical_reader(cx: &Cx, dir: &Path) -> SearchResult<Option<Arc<dyn LexicalRead>>> {
-    // bd-8nqz.2: dispatch on the inspected layout instead of blindly opening
-    // the root — a blue-green root opens its ACTIVE engine dir, a foreign or
-    // damaged layout is a typed error, and inspection never adopts/publishes.
+    // bd-8nqz.2: the Quill path stays bound to the lexical *root*, not the
+    // engine child selected during this call. `RootBoundQuillSearchIndex`
+    // validates CURRENT before its atomic refresh swap, so a future refresh
+    // can follow a later Quill publication without ever mutating this root.
     let layout = inspect_lexical_layout(dir).map_err(|source| SearchError::SubsystemError {
         subsystem: "facade.lexical.layout",
         source: Box::new(source),
     })?;
-    let target = match layout {
+    match layout {
         LexicalLayout::Empty => return Ok(None),
-        LexicalLayout::DirectQuill => dir.to_path_buf(),
+        LexicalLayout::DirectQuill
+        |
         LexicalLayout::BlueGreen { ref pointer, .. }
             if pointer.engine() == BlueGreenEngine::Quill =>
         {
-            pointer.engine_dir(dir)
+            let index = RootBoundQuillSearchIndex::open(cx, dir, QuillConfig::default()).await?;
+            Ok(Some(Arc::new(index)))
+        }
+        #[cfg(feature = "lexical-tantivy")]
+        LexicalLayout::DirectTantivy => {
+            let index = TantivyIndex::open(dir)?;
+            Ok(Some(Arc::new(index)))
+        }
+        #[cfg(feature = "lexical-tantivy")]
+        LexicalLayout::BlueGreen { ref pointer, .. }
+            if pointer.engine() == BlueGreenEngine::Tantivy =>
+        {
+            let index = TantivyIndex::open(pointer.engine_dir(dir))?;
+            Ok(Some(Arc::new(index)))
         }
         ref layout => {
-            return Err(SearchError::InvalidConfig {
+            Err(SearchError::InvalidConfig {
                 field: "data_dir/lexical".to_owned(),
                 value: dir.display().to_string(),
                 reason: format!(
-                    "lexical layout is {}, which this Quill-backed build cannot open",
+                    "lexical layout is {}, which this build cannot open",
                     layout.label()
                 ),
-            });
+            })
         }
-    };
-    let index = QuillIndex::open(cx, target, QuillConfig::default()).await?;
-    Ok(Some(Arc::new(index)))
+    }
 }
 
 #[cfg(all(feature = "lexical", not(feature = "quill")))]
@@ -1080,12 +1094,15 @@ mod tests {
     use frankensearch_durability::FsviProtector;
     #[cfg(all(feature = "durability", feature = "quill"))]
     use frankensearch_durability::{DefaultSymbolCodec, DurabilityConfig, FsviVerifyResult};
-    #[cfg(all(feature = "lexical", not(feature = "quill")))]
+    #[cfg(feature = "lexical-tantivy")]
     use frankensearch_lexical::TantivyIndex;
+    #[cfg(feature = "lexical-tantivy")]
+    use frankensearch_core::traits::LexicalWrite;
     #[cfg(feature = "quill")]
     use frankensearch_quill::{
-        DEFAULT_SCHEMA, EncodedSegment, SectionInput, SectionKind, SegmentHeaderInput,
-        SegmentReader, load_manifest_pair,
+        BlueGreenEngine, CurrentPointer, DEFAULT_SCHEMA, EncodedSegment, FSLX_FORMAT_VERSION,
+        SectionInput, SectionKind, SegmentHeaderInput, SegmentReader, load_manifest_pair,
+        publish_current,
     };
 
     use super::*;

@@ -1,6 +1,7 @@
 //! Non-interfering lexical shadow-oracle support.
 //!
-//! [`ShadowLexical`] wraps the existing [`LexicalSearch`] seam. The serving
+//! [`ShadowLexical`] wraps the split lexical seam — [`crate::traits::LexicalRead`]
+//! for queries and [`crate::traits::LexicalWrite`] for mutations. The serving
 //! backend is always awaited and returned unchanged. Eligible shadow work is
 //! detached into the caller's asupersync region behind a bounded admission
 //! gate, so sampling, pressure shedding, a full gate, spawn failure, shadow
@@ -19,9 +20,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tracing::{Instrument, info, info_span, warn};
 
-use crate::{
-    Cx, IndexableDocument, LexicalSearch, ScoredResult, SearchError, SearchFuture, SearchResult,
-};
+use crate::{Cx, IndexableDocument, ScoredResult, SearchError, SearchFuture, SearchResult};
 
 /// Version of one production divergence JSONL record.
 pub const SHADOW_DIVERGENCE_SCHEMA_VERSION: u32 = 2;
@@ -850,14 +849,14 @@ fn shadow_status(state: &Arc<ShadowState>) -> ShadowStatus {
 }
 
 /// Query-only bridge for serving adapters whose richer direct result API
-/// cannot itself implement [`LexicalSearch`].
+/// cannot itself implement [`crate::traits::LexicalRead`].
 ///
 /// The bridge accepts an already-produced serving result slice and schedules
 /// the same bounded comparison used by [`ShadowLexical`]. It exists for fsfs's
 /// snippet-preserving direct Quill path; the serving results are never changed.
 #[derive(Clone)]
 pub struct ShadowLexicalObserver {
-    shadow: Arc<dyn LexicalSearch>,
+    shadow: Arc<dyn crate::traits::LexicalRead>,
     state: Arc<ShadowState>,
 }
 
@@ -867,7 +866,10 @@ impl ShadowLexicalObserver {
     /// # Errors
     ///
     /// Returns [`SearchError::InvalidConfig`] for an invalid policy.
-    pub fn new(shadow: Arc<dyn LexicalSearch>, config: ShadowLexicalConfig) -> SearchResult<Self> {
+    pub fn new(
+        shadow: Arc<dyn crate::traits::LexicalRead>,
+        config: ShadowLexicalConfig,
+    ) -> SearchResult<Self> {
         Self::with_load_probe(shadow, config, Arc::new(AlwaysAdmitShadowLoad))
     }
 
@@ -877,7 +879,7 @@ impl ShadowLexicalObserver {
     ///
     /// Returns [`SearchError::InvalidConfig`] for an invalid policy.
     pub fn with_load_probe(
-        shadow: Arc<dyn LexicalSearch>,
+        shadow: Arc<dyn crate::traits::LexicalRead>,
         config: ShadowLexicalConfig,
         load_probe: Arc<dyn ShadowLoadProbe>,
     ) -> SearchResult<Self> {
@@ -952,10 +954,33 @@ impl ShadowLexicalObserver {
     }
 }
 
+/// A lexical backend addressed through both split capabilities.
+///
+/// `dyn LexicalRead + LexicalWrite` is not expressible, so a backend that is
+/// used for both is held as two coerced handles to the same object rather than
+/// behind a re-unified trait — which would be the compatibility shim the split
+/// exists to remove.
+struct SplitLexical {
+    read: Arc<dyn crate::traits::LexicalRead>,
+    write: Arc<dyn crate::traits::LexicalWrite>,
+}
+
+impl SplitLexical {
+    fn new<B>(backend: Arc<B>) -> Self
+    where
+        B: crate::traits::LexicalRead + crate::traits::LexicalWrite + 'static,
+    {
+        Self {
+            read: backend.clone(),
+            write: backend,
+        }
+    }
+}
+
 /// A serving-first lexical adapter with bounded, region-owned shadow queries.
 pub struct ShadowLexical {
-    serving: Arc<dyn LexicalSearch>,
-    shadow: Arc<dyn LexicalSearch>,
+    serving: SplitLexical,
+    shadow: SplitLexical,
     state: Arc<ShadowState>,
 }
 
@@ -966,11 +991,15 @@ impl ShadowLexical {
     ///
     /// Returns [`SearchError::InvalidConfig`] for an invalid sampling, task,
     /// score, or artifact policy.
-    pub fn new(
-        serving: Arc<dyn LexicalSearch>,
-        shadow: Arc<dyn LexicalSearch>,
+    pub fn new<S, D>(
+        serving: Arc<S>,
+        shadow: Arc<D>,
         config: ShadowLexicalConfig,
-    ) -> SearchResult<Self> {
+    ) -> SearchResult<Self>
+    where
+        S: crate::traits::LexicalRead + crate::traits::LexicalWrite + 'static,
+        D: crate::traits::LexicalRead + crate::traits::LexicalWrite + 'static,
+    {
         Self::with_load_probe(serving, shadow, config, Arc::new(AlwaysAdmitShadowLoad))
     }
 
@@ -979,15 +1008,19 @@ impl ShadowLexical {
     /// # Errors
     ///
     /// Returns [`SearchError::InvalidConfig`] for an invalid policy.
-    pub fn with_load_probe(
-        serving: Arc<dyn LexicalSearch>,
-        shadow: Arc<dyn LexicalSearch>,
+    pub fn with_load_probe<S, D>(
+        serving: Arc<S>,
+        shadow: Arc<D>,
         config: ShadowLexicalConfig,
         load_probe: Arc<dyn ShadowLoadProbe>,
-    ) -> SearchResult<Self> {
+    ) -> SearchResult<Self>
+    where
+        S: crate::traits::LexicalRead + crate::traits::LexicalWrite + 'static,
+        D: crate::traits::LexicalRead + crate::traits::LexicalWrite + 'static,
+    {
         Ok(Self {
-            serving,
-            shadow,
+            serving: SplitLexical::new(serving),
+            shadow: SplitLexical::new(shadow),
             state: build_shadow_state(config, load_probe)?,
         })
     }
@@ -1030,7 +1063,7 @@ impl ShadowLexical {
         serve_latency_micros: u64,
     ) {
         Self::submit_shadow_parts(
-            &self.shadow,
+            &self.shadow.read,
             &self.state,
             cx,
             query,
@@ -1043,7 +1076,7 @@ impl ShadowLexical {
 
     #[allow(clippy::too_many_arguments)]
     fn submit_shadow_parts(
-        shadow: &Arc<dyn LexicalSearch>,
+        shadow: &Arc<dyn crate::traits::LexicalRead>,
         state: &Arc<ShadowState>,
         cx: &Cx,
         query: &str,
@@ -1107,11 +1140,13 @@ impl ShadowLexical {
                 let shadow_started = Instant::now();
                 let outcome = match path {
                     ShadowSearchPath::Search => shadow.search(&task_cx, &query, limit).await,
-                    ShadowSearchPath::FusionCandidates => {
-                        shadow
-                            .search_fusion_candidates(&task_cx, &query, limit)
-                            .await
-                    }
+                    ShadowSearchPath::FusionCandidates => shadow
+                        .search_candidates(&task_cx, &query, limit)
+                        .await
+                        // The comparison ranks candidates; it never reads their
+                        // metadata, so the shadow side does not hydrate and the
+                        // oracle's own pin is dropped with the batch.
+                        .map(|batch| batch.into_parts().0),
                 };
                 let shadow_latency_micros = micros(shadow_started.elapsed());
                 tracing::Span::current().record("shadow_latency_micros", shadow_latency_micros);
@@ -1233,7 +1268,7 @@ impl ShadowLexical {
         {
             return;
         }
-        if let Err(error) = self.shadow.index_documents(cx, documents).await {
+        if let Err(error) = self.shadow.write.index_documents(cx, documents).await {
             self.state.shadow_ready.store(false, Ordering::Release);
             self.state.record_degradation(
                 self.state.manifest_generation.load(Ordering::Acquire),
@@ -1245,7 +1280,7 @@ impl ShadowLexical {
     }
 }
 
-impl LexicalSearch for ShadowLexical {
+impl crate::traits::LexicalRead for ShadowLexical {
     fn search<'a>(
         &'a self,
         cx: &'a Cx,
@@ -1254,7 +1289,7 @@ impl LexicalSearch for ShadowLexical {
     ) -> SearchFuture<'a, Vec<ScoredResult>> {
         Box::pin(async move {
             let serve_started = Instant::now();
-            let results = self.serving.search(cx, query, limit).await?;
+            let results = self.serving.read.search(cx, query, limit).await?;
             self.submit_shadow(
                 cx,
                 query,
@@ -1267,49 +1302,66 @@ impl LexicalSearch for ShadowLexical {
         })
     }
 
-    fn search_fusion_candidates<'a>(
+    /// Forward the serving backend's candidate batch, pin and all.
+    ///
+    /// The batch's hydration context belongs to the serving backend, and
+    /// [`Self::hydrate_candidates`] forwards there too, so the pin stays
+    /// coherent end to end and the decorator never mints or inspects one.
+    ///
+    /// A previous note here claimed the eager default was deliberate because
+    /// threading the serving backend's private context through the shadow
+    /// comparison was unsound. It is not needed: the comparison consumes
+    /// `batch.results()`, exactly the metadata-less rows the combined trait's
+    /// `search_fusion_candidates` already submitted. Taking the eager default
+    /// instead silently dropped the serving backend's deferred path — the same
+    /// regression `bd-8nqz.1` fixed for Tantivy.
+    fn search_candidates<'a>(
         &'a self,
         cx: &'a Cx,
         query: &'a str,
         limit: usize,
-    ) -> SearchFuture<'a, Vec<ScoredResult>> {
+    ) -> SearchFuture<'a, crate::traits::LexicalCandidateBatch> {
         Box::pin(async move {
             let serve_started = Instant::now();
-            let results = self
+            let batch = self
                 .serving
-                .search_fusion_candidates(cx, query, limit)
+                .read
+                .search_candidates(cx, query, limit)
                 .await?;
             self.submit_shadow(
                 cx,
                 query,
                 limit,
-                &results,
+                batch.results(),
                 ShadowSearchPath::FusionCandidates,
                 micros(serve_started.elapsed()),
             );
-            Ok(results)
+            Ok(batch)
         })
     }
 
-    fn fusion_metadata_is_deferred(&self) -> bool {
-        self.serving.fusion_metadata_is_deferred()
-    }
-
-    fn hydrate_fusion_metadata<'a>(
+    fn hydrate_candidates<'a>(
         &'a self,
         cx: &'a Cx,
+        context: Option<&'a crate::traits::LexicalHydrationContext>,
         results: &'a mut [ScoredResult],
     ) -> SearchFuture<'a, ()> {
-        self.serving.hydrate_fusion_metadata(cx, results)
+        self.serving.read.hydrate_candidates(cx, context, results)
     }
 
+    fn doc_count(&self) -> usize {
+        self.serving.read.doc_count()
+    }
+}
+
+impl crate::traits::LexicalWrite for ShadowLexical {
     fn index_document<'a>(
         &'a self,
         cx: &'a Cx,
         document: &'a IndexableDocument,
     ) -> SearchFuture<'a, ()> {
         Box::pin(async move {
-            self.serving.index_document(cx, document).await?;
+            self.serving.write.index_document(cx, document).await?;
             self.record_corpus_documents(std::slice::from_ref(document));
             self.mirror_documents(cx, std::slice::from_ref(document))
                 .await;
@@ -1323,7 +1375,7 @@ impl LexicalSearch for ShadowLexical {
         documents: &'a [IndexableDocument],
     ) -> SearchFuture<'a, ()> {
         Box::pin(async move {
-            self.serving.index_documents(cx, documents).await?;
+            self.serving.write.index_documents(cx, documents).await?;
             self.record_corpus_documents(documents);
             self.mirror_documents(cx, documents).await;
             Ok(())
@@ -1332,7 +1384,7 @@ impl LexicalSearch for ShadowLexical {
 
     fn commit<'a>(&'a self, cx: &'a Cx) -> SearchFuture<'a, ()> {
         Box::pin(async move {
-            self.serving.commit(cx).await?;
+            self.serving.write.commit(cx).await?;
             let generation = self
                 .state
                 .manifest_generation
@@ -1340,7 +1392,7 @@ impl LexicalSearch for ShadowLexical {
                 .saturating_add(1);
             if self.state.enabled.load(Ordering::Acquire)
                 && self.state.shadow_ready.load(Ordering::Acquire)
-                && let Err(error) = self.shadow.commit(cx).await
+                && let Err(error) = self.shadow.write.commit(cx).await
             {
                 self.state.shadow_ready.store(false, Ordering::Release);
                 self.state.record_degradation(
@@ -1352,53 +1404,6 @@ impl LexicalSearch for ShadowLexical {
             }
             Ok(())
         })
-    }
-
-    fn doc_count(&self) -> usize {
-        self.serving.doc_count()
-    }
-}
-
-// bd-8nqz.1 slice B: split-trait surface. Delegates to the combined-trait
-// impl above; bodies move here when `LexicalSearch` is removed. The default
-// eager `search_candidates` is deliberate: the serving backend may defer
-// metadata, and an eager batch built from full `search` results is the only
-// shape that stays correct without threading the serving backend's private
-// hydration context through the shadow comparison.
-impl crate::traits::LexicalRead for ShadowLexical {
-    fn search<'a>(
-        &'a self,
-        cx: &'a Cx,
-        query: &'a str,
-        limit: usize,
-    ) -> SearchFuture<'a, Vec<ScoredResult>> {
-        LexicalSearch::search(self, cx, query, limit)
-    }
-
-    fn doc_count(&self) -> usize {
-        LexicalSearch::doc_count(self)
-    }
-}
-
-impl crate::traits::LexicalWrite for ShadowLexical {
-    fn index_document<'a>(
-        &'a self,
-        cx: &'a Cx,
-        doc: &'a IndexableDocument,
-    ) -> SearchFuture<'a, ()> {
-        LexicalSearch::index_document(self, cx, doc)
-    }
-
-    fn index_documents<'a>(
-        &'a self,
-        cx: &'a Cx,
-        docs: &'a [IndexableDocument],
-    ) -> SearchFuture<'a, ()> {
-        LexicalSearch::index_documents(self, cx, docs)
-    }
-
-    fn commit<'a>(&'a self, cx: &'a Cx) -> SearchFuture<'a, ()> {
-        LexicalSearch::commit(self, cx)
     }
 }
 
@@ -1521,6 +1526,10 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
+    // The split capabilities, so `wrapper.search(..)` / `.index_document(..)`
+    // resolve now that the combined trait no longer covers both.
+    use crate::traits::{LexicalRead as _, LexicalWrite as _};
+
     use asupersync::Budget;
     use asupersync::lab::{LabConfig, LabRuntime};
     use asupersync::runtime::RuntimeBuilder;
@@ -1545,7 +1554,7 @@ mod tests {
         }
     }
 
-    impl LexicalSearch for StaticLexical {
+    impl crate::traits::LexicalRead for StaticLexical {
         fn search<'a>(
             &'a self,
             _cx: &'a Cx,
@@ -1558,6 +1567,12 @@ mod tests {
             })
         }
 
+        fn doc_count(&self) -> usize {
+            self.results.len()
+        }
+    }
+
+    impl crate::traits::LexicalWrite for StaticLexical {
         fn index_document<'a>(
             &'a self,
             _cx: &'a Cx,
@@ -1579,17 +1594,13 @@ mod tests {
         fn commit<'a>(&'a self, _cx: &'a Cx) -> SearchFuture<'a, ()> {
             Box::pin(async { Ok(()) })
         }
-
-        fn doc_count(&self) -> usize {
-            self.results.len()
-        }
     }
 
     struct SlowShadow {
         delay: std::time::Duration,
     }
 
-    impl LexicalSearch for SlowShadow {
+    impl crate::traits::LexicalRead for SlowShadow {
         fn search<'a>(
             &'a self,
             _cx: &'a Cx,
@@ -1602,6 +1613,12 @@ mod tests {
             })
         }
 
+        fn doc_count(&self) -> usize {
+            0
+        }
+    }
+
+    impl crate::traits::LexicalWrite for SlowShadow {
         fn index_document<'a>(
             &'a self,
             _cx: &'a Cx,
@@ -1612,10 +1629,6 @@ mod tests {
 
         fn commit<'a>(&'a self, _cx: &'a Cx) -> SearchFuture<'a, ()> {
             Box::pin(async { Ok(()) })
-        }
-
-        fn doc_count(&self) -> usize {
-            0
         }
     }
 

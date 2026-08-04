@@ -136,6 +136,12 @@ fn incumbent_batch(corpus: &Array2<f32>, queries: &Array2<f32>, k: usize) -> Vec
         .axis_iter(Axis(0))
         .map(|row| {
             let contiguous;
+            // `option_if_let_else` is wrong for this idiom: the fallback buffer
+            // must outlive the borrow, which is exactly why `contiguous` is
+            // declared before the match and initialized inside it. A
+            // `map_or_else` closure owns its temporary, so the slice it yields
+            // would not live long enough.
+            #[allow(clippy::option_if_let_else)]
             let slice = match row.as_slice() {
                 Some(s) => s,
                 None => {
@@ -231,7 +237,7 @@ const fn american_paren() -> char {
 
 // ───────────────────────────────────────────────────────────── statistics ──
 
-fn median(v: &mut Vec<f64>) -> f64 {
+fn median(v: &mut [f64]) -> f64 {
     v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(Ordering::Equal));
     let n = v.len();
     if n == 0 {
@@ -240,7 +246,7 @@ fn median(v: &mut Vec<f64>) -> f64 {
     if n % 2 == 1 {
         v[n / 2]
     } else {
-        (v[n / 2 - 1] + v[n / 2]) / 2.0
+        f64::midpoint(v[n / 2 - 1], v[n / 2])
     }
 }
 
@@ -248,7 +254,14 @@ fn percentile(sorted: &[f64], p: f64) -> f64 {
     if sorted.is_empty() {
         return f64::NAN;
     }
-    let idx = ((sorted.len() - 1) as f64 * p).round() as usize;
+    let scaled = (sorted.len() - 1) as f64 * p.clamp(0.0, 1.0);
+    // `cast_sign_loss` cannot see that this is non-negative, but it is: both
+    // factors are clamped to >= 0 above and `max(0.0)` pins the rounded value.
+    // The arithmetic is deliberately left exactly as it was — this index picks
+    // the A/A null band that decides FASTER/WASH/SLOWER, so switching to
+    // integer rounding to satisfy the lint would shift a verdict at the margin.
+    #[allow(clippy::cast_sign_loss)]
+    let idx = scaled.round().max(0.0) as usize;
     sorted[idx]
 }
 
@@ -460,6 +473,10 @@ fn main() {
                 })
                 .collect::<Vec<_>>()
         };
+        // `option_if_let_else` is wrong here: `work` is a FnOnce consumed by
+        // whichever branch runs, so a `map_or_else` form would have to move it
+        // into two closures at once.
+        #[allow(clippy::option_if_let_else)]
         match pool {
             Some(p) => p.install(work),
             None => work(),
@@ -484,7 +501,7 @@ fn main() {
     let _ = run_cand(None);
     let _ = run_ours_flat();
 
-    let mut arms: Vec<Arm> = subject_names.iter().map(|n| Arm::new(*n)).collect();
+    let mut arms: Vec<Arm> = subject_names.iter().map(|n| Arm::new(n)).collect();
     let mut inc_arm = Arm::new("incumbent_batch32_bracket");
     let mut ratios: Vec<Vec<f64>> = vec![Vec::new(); SUBJECTS];
 
@@ -497,12 +514,12 @@ fn main() {
             let t = match s {
                 S_CAND_T1 => time_one(&mut arms[s], || run_cand(Some(&pool1))),
                 S_CAND_DEF => time_one(&mut arms[s], || run_cand(None)),
-                S_OURS_FLAT => time_one(&mut arms[s], || run_ours_flat()),
+                S_OURS_FLAT => time_one(&mut arms[s], run_ours_flat),
                 S_INC_NULL => time_one(&mut arms[s], || incumbent_batch(&corpus, &queries, K)),
                 _ => time_one(&mut arms[s], || incumbent_single(&corpus, &queries, K)),
             };
             let next = time_one(&mut inc_arm, || incumbent_batch(&corpus, &queries, K));
-            ratios[s].push(t / ((prev + next) / 2.0));
+            ratios[s].push(t / f64::midpoint(prev, next));
             prev = next;
         }
     }
@@ -511,8 +528,8 @@ fn main() {
     let mut null_ratios = ratios[S_INC_NULL].clone();
     let null_median = median(&mut null_ratios);
     let null_sorted = null_ratios.clone();
-    let null_p5 = percentile(&null_sorted, 0.05);
-    let null_p95 = percentile(&null_sorted, 0.95);
+    let null_lower_bound = percentile(&null_sorted, 0.05);
+    let null_upper_bound = percentile(&null_sorted, 0.95);
     let null_clean = (null_median - 1.0).abs() <= 0.03;
 
     let per_q = |ns: f64| ns / QUERIES as f64 / 1000.0; // us/query
@@ -546,7 +563,9 @@ process-wide and cannot distinguish arms)"
     );
 
     println!("\n--- A/A NULL (incumbent bracketed by incumbents, same rule as every ratio) ---");
-    println!("null_median = {null_median:.4}   null_p5 = {null_p5:.4}   null_p95 = {null_p95:.4}");
+    println!(
+        "null_median = {null_median:.4}   null_p5 = {null_lower_bound:.4}   null_p95 = {null_upper_bound:.4}"
+    );
     println!(
         "null_gate(median within 1.000+/-0.030) = {}",
         if null_clean {
@@ -563,9 +582,9 @@ process-wide and cannot distinguish arms)"
     let decide = |r: f64| -> &'static str {
         if !null_clean {
             "UNDECIDABLE (dirty null)"
-        } else if r < null_p5 {
+        } else if r < null_lower_bound {
             "SUBJECT FASTER than incumbent (outside null)"
-        } else if r > null_p95 {
+        } else if r > null_upper_bound {
             "SUBJECT SLOWER than incumbent (outside null)"
         } else {
             "WASH (inside null)"

@@ -353,7 +353,7 @@ jobs:
       - name: cargo check (fsfs explicit embedded-models lane)
         run: cargo check -p frankensearch-fsfs --no-default-features --features embedded-models
 
-      - name: Pre-flip lexical feature graph guard (bd-quill-e7.4)
+      - name: QG-10 facade lexical feature graph guard (bd-8nqz.4.2)
         if: matrix.os == 'ubuntu-latest'
         shell: bash
         run: |
@@ -362,6 +362,17 @@ jobs:
           if grep -Eq '^frankensearch-(lexical|quill) v' <<< "${default_tree}"; then
             echo "Default facade graph unexpectedly contains a lexical engine:" >&2
             grep -E '^frankensearch-(lexical|quill) v' <<< "${default_tree}" >&2
+            exit 1
+          fi
+
+          quill_semantic_tantivy_count="$(
+            cargo tree -p frankensearch --no-default-features --features quill,semantic \
+              --edges normal --prefix none | grep -c tantivy || true
+          )"
+          if [[ "${quill_semantic_tantivy_count}" != "0" ]]; then
+            echo "QG-10 failure: Quill+semantic facade graph contains Tantivy:" >&2
+            cargo tree -p frankensearch --no-default-features --features quill,semantic \
+              --edges normal --prefix none | grep tantivy >&2 || true
             exit 1
           fi
 
@@ -564,12 +575,47 @@ jobs:
         timeout-minutes: 30
         run: cargo test --profile release -p frankensearch-quill-gauntlet engine::tests::e55_seeded_mixed_residency_conformance_is_exact -- --ignored --exact
 
-      - name: Nightly full validation (all features)
+      # frankensearch-quill declares a deliberate feature-exclusivity invariant:
+      # `profile-internals` is a diagnostic sidecar that must never be linked
+      # into a `bench-internals` timing build, because profile instrumentation
+      # corrupts the timings this repo treats as evidence. It is enforced by a
+      # compile_error! in crates/frankensearch-quill/src/lib.rs. `--all-features`
+      # unions both, so a workspace-wide --all-features build CANNOT compile by
+      # design -- this lane failed before it ran a single test, and had done so
+      # unnoticed long enough for a genuinely broken feature to hide behind the
+      # noise (bd-rg18d). A feature graph with a declared exclusivity invariant
+      # simply has no single all-features build.
+      #
+      # Quill is therefore deselected here. It is still COMPILED as a dependency,
+      # with bench-internals, via frankensearch-quill-gauntlet, so no coverage is
+      # lost from that direction. Quill's own feature matrix is covered instead
+      # by the two explicit arms below, one per side of the exclusion. Do NOT
+      # "fix" this lane by deleting the compile_error! or by unioning the pair.
+      - name: Nightly full validation (all features except the quill exclusivity pair)
         if: matrix.os == 'ubuntu-latest' && steps.validation_profile.outputs.profile == 'nightly'
         env:
           QUILL_E3_9_RANDOM_SEEDS: "32"
           QUILL_E6_5_RANDOM_SEEDS: "16"
-        run: cargo test --workspace --all-features -- --nocapture
+        run: cargo test --workspace --all-features --exclude frankensearch-quill -- --nocapture
+
+      # The two arms bd-57cyv deferred and bd-46mo7 gated. Between them every
+      # quill feature is exercised while respecting the compile_error!
+      # exclusion, which no single build can do. They were held out of CI only
+      # while they were red -- adding a known-red gate is what let bd-rg18d hide
+      # for four days -- and both went green when bd-qoswh landed the GC
+      # first-unreachable receipt, which was their single remaining failure
+      # (arm A 621 passed/0 failed, arm B 622 passed/0 failed, measured in this
+      # exact command form). If either arm goes red, fix the crate: do not
+      # weaken, merge, or delete an arm.
+      - name: Nightly quill feature matrix, timing arm (bd-57cyv)
+        if: matrix.os == 'ubuntu-latest' && steps.validation_profile.outputs.profile == 'nightly'
+        timeout-minutes: 45
+        run: cargo test -p frankensearch-quill --features durability,bench-internals,conformance-internals,pruning-conformance,tantivy-oracle -- --nocapture
+
+      - name: Nightly quill feature matrix, diagnostic arm (bd-57cyv)
+        if: matrix.os == 'ubuntu-latest' && steps.validation_profile.outputs.profile == 'nightly'
+        timeout-minutes: 45
+        run: cargo test -p frankensearch-quill --features durability,profile-internals,conformance-internals,pruning-conformance,tantivy-oracle -- --nocapture
 
       - name: E2E contract smoke (fsfs)
         if: matrix.os == 'ubuntu-latest'
@@ -701,7 +747,7 @@ jobs:
               },
               "nightly": {
                 "description": "Full validation sweep",
-                "required_lanes": ["premerge","cargo test --workspace --all-features -- --nocapture"]
+                "required_lanes": ["premerge","cargo test --workspace --all-features --exclude frankensearch-quill -- --nocapture","cargo test -p frankensearch-quill --features durability,bench-internals,conformance-internals,pruning-conformance,tantivy-oracle -- --nocapture","cargo test -p frankensearch-quill --features durability,profile-internals,conformance-internals,pruning-conformance,tantivy-oracle -- --nocapture"]
               }
             }
           }
@@ -774,7 +820,7 @@ jobs:
             "gate_active": false,
             "enforcement": "artifact_contract_only",
             "details": "baseline/current artifacts present but evaluation lane not yet fully wired in this workflow",
-            "replay_command": "cargo test --workspace --all-features -- --nocapture"
+            "replay_command": "cargo test --workspace --all-features --exclude frankensearch-quill -- --nocapture"
           }
           EOF
           else
@@ -786,7 +832,7 @@ jobs:
             "gate_active": false,
             "enforcement": "artifact_contract_only",
             "details": "benchmark metric artifacts not yet present in ci_artifacts/",
-            "replay_command": "cargo test --workspace --all-features -- --nocapture"
+            "replay_command": "cargo test --workspace --all-features --exclude frankensearch-quill -- --nocapture"
           }
           EOF
           fi

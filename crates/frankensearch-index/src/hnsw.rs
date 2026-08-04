@@ -27,12 +27,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use frankensearch_core::config::ZeroSignalReason;
+use frankensearch_core::generation::ArtifactGenerationIdentityV1;
 use frankensearch_core::{SearchError, SearchResult, VectorHit};
 use hnsw_rs::prelude::{AnnT, DistDot, Hnsw, HnswIo, Neighbour, PointId};
 use serde::{Deserialize, Serialize};
 
-use crate::VectorIndex;
 use crate::recall_certificate::{EfCalibration, calibrate_certified_ef};
+use crate::{SHA256_BYTES, VectorIndex};
 
 /// Default HNSW `M` (max connections per node).
 pub const HNSW_DEFAULT_M: usize = 16;
@@ -132,6 +133,75 @@ struct HnswMeta {
     /// invalidate current-format native loading and force a rebuild.
     #[serde(default)]
     sidecar_basename: Option<String>,
+    /// Exact identity of the FSVI generation this graph was built from
+    /// (`bd-r65a`).
+    ///
+    /// Absent in every sidecar written before identity binding, and absent
+    /// when the source index is a legacy v1 artifact that has no identity to
+    /// bind. Absence is never treated as a match: see
+    /// [`HnswSourceIdentityV1::admits`].
+    #[serde(default)]
+    source_identity: Option<HnswSourceIdentityV1>,
+}
+
+/// The source-generation identity a persisted ANN sidecar is bound to.
+///
+/// Content equality is NOT identity equality. `vector_fingerprint` and the
+/// doc-id sequence prove the graph indexes the same vectors in the same order;
+/// they cannot prove those vectors came from the same published generation or
+/// the same embedding space. Two FSVI generations can hold byte-identical live
+/// content and still be different artifacts — a re-publication carries a new
+/// generation nonce, and a model revision bump changes the space fingerprint
+/// without necessarily changing a single vector. Serving a sidecar across that
+/// boundary is silent reuse of a stale graph.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HnswSourceIdentityV1 {
+    /// Full-width artifact generation of the source FSVI.
+    generation: ArtifactGenerationIdentityV1,
+    /// SHA-256 of the canonical full-width generation identity.
+    generation_fingerprint: [u8; SHA256_BYTES],
+    /// SHA-256 of the complete embedding identity bundle.
+    identity_bundle_fingerprint: [u8; SHA256_BYTES],
+    /// SHA-256 of the mathematical embedding space.
+    space_fingerprint: [u8; SHA256_BYTES],
+    /// SHA-256 of the physical vector storage identity (format, quantization,
+    /// endianness).
+    storage_fingerprint: [u8; SHA256_BYTES],
+    /// SHA-256 of the ordered live document identifiers.
+    ordered_live_docset_digest: [u8; SHA256_BYTES],
+}
+
+impl HnswSourceIdentityV1 {
+    /// Capture the identity of `index`, or `None` for a legacy v1 source that
+    /// carries no identity at all.
+    fn capture(index: &VectorIndex) -> Option<Self> {
+        let identity = index.metadata().identity_v2.as_ref()?;
+        Some(Self {
+            generation: identity.generation,
+            generation_fingerprint: identity.generation_fingerprint,
+            identity_bundle_fingerprint: identity.identity_bundle_fingerprint,
+            space_fingerprint: identity.space_fingerprint,
+            storage_fingerprint: identity.storage_fingerprint,
+            ordered_live_docset_digest: identity.ordered_live_docset_digest,
+        })
+    }
+
+    /// Whether a sidecar bound to `persisted` may be served against `live`.
+    ///
+    /// Both directions of absence fail closed. A sidecar with no recorded
+    /// identity cannot be proven to belong to an identity-bearing generation,
+    /// and a sidecar that names a generation cannot be served against a source
+    /// that cannot name one. The only admissible cases are "both absent"
+    /// (legacy v1 on both sides, where there is nothing to bind and the
+    /// content checks stand alone) and "both present and equal".
+    fn admits(persisted: Option<&Self>, live: Option<&Self>) -> bool {
+        match (persisted, live) {
+            (None, None) => true,
+            (Some(persisted), Some(live)) => persisted == live,
+            _ => false,
+        }
+    }
 }
 
 /// Durable proof that an immutable native generation finished writing before
@@ -257,6 +327,9 @@ pub struct HnswIndex {
     /// Fingerprint of the vectors the graph was built from. See
     /// [`HnswMeta::vector_fingerprint`].
     vector_fingerprint: u64,
+    /// Exact identity of the source FSVI generation, when it has one
+    /// (`bd-r65a`). `None` for a legacy v1 source with no identity to bind.
+    source_identity: Option<HnswSourceIdentityV1>,
     /// Whether this graph instance has already warned about an underfill.
     ///
     /// Graph instances are per-generation (rebuilt on reload), so gating the
@@ -298,6 +371,9 @@ impl HnswIndex {
             live_positions.push(i);
         }
         let mut ann = Self::build_from_parts(doc_ids, vectors, dimension, config)?;
+        // Bind the graph to the exact generation it was built from, so a later
+        // load cannot serve it against a different one (bd-r65a).
+        ann.source_identity = HnswSourceIdentityV1::capture(index);
         ann.source_record_count = index.record_count();
         ann.source_positions = live_positions
             .into_iter()
@@ -481,6 +557,26 @@ impl HnswIndex {
             return None;
         }
 
+        // Validate the SOURCE GENERATION IDENTITY before anything else about
+        // the content (bd-r65a). Content equality is not identity equality:
+        // two generations can hold byte-identical live vectors under the same
+        // doc ids and still be different published artifacts — a
+        // re-publication carries a new generation nonce, and a model revision
+        // bump moves the space fingerprint without necessarily moving a single
+        // vector. Every check below this one would pass in that case, so
+        // ordering this first is what stops a stale graph being served.
+        let live_identity = HnswSourceIdentityV1::capture(source_index);
+        if !HnswSourceIdentityV1::admits(meta.source_identity.as_ref(), live_identity.as_ref()) {
+            tracing::warn!(
+                path = %path.display(),
+                sidecar_bound = meta.source_identity.is_some(),
+                source_bound = live_identity.is_some(),
+                "HNSW sidecar is bound to a different FSVI generation identity than the live \
+                 source; native load unavailable and the graph will be rebuilt"
+            );
+            return None;
+        }
+
         // Validate doc-id sequence against the live VectorIndex *before*
         // touching the (potentially expensive) hnsw_rs load.
         if !meta_matches_live_doc_ids(meta, source_index).ok()? {
@@ -579,6 +675,7 @@ impl HnswIndex {
             dimension: meta.dimension,
             config: meta.config,
             vector_fingerprint: meta.vector_fingerprint,
+            source_identity: meta.source_identity.clone(),
         })
     }
 
@@ -718,6 +815,7 @@ impl HnswIndex {
             vector_fingerprint: self.vector_fingerprint,
             sidecar_generation: Some(generation.to_owned()),
             sidecar_basename: Some(basename.to_owned()),
+            source_identity: self.source_identity.clone(),
         }
     }
 
@@ -1288,6 +1386,15 @@ impl HnswIndex {
         if self.dimension != index.dimension() {
             return Ok(false);
         }
+        // Same generation-identity gate as the native load path (bd-r65a):
+        // matching dimension, doc ids, ordering, and vector fingerprint prove
+        // the CONTENT is the same, never that the artifact is.
+        if !HnswSourceIdentityV1::admits(
+            self.source_identity.as_ref(),
+            HnswSourceIdentityV1::capture(index).as_ref(),
+        ) {
+            return Ok(false);
+        }
         let mut live_position = 0_usize;
         for i in 0..index.record_count() {
             if index.is_deleted(i) {
@@ -1414,6 +1521,7 @@ impl HnswIndex {
             dimension,
             config,
             vector_fingerprint,
+            source_identity: None,
         })
     }
 }
@@ -4877,10 +4985,16 @@ mod tests {
         ann.save(&metadata_path)
             .expect("save past mismatched retained receipt");
         let after = ready_generation_paths(&metadata_path, ann.vector_fingerprint);
+        // bd-v03xp made publish reclaim every sibling generation the published
+        // metadata does not reference, precisely so corrupt-but-receipt-valid
+        // generations stop being re-probed with a full native load on every
+        // save. The rejected generation is therefore reclaimed, not retained;
+        // what this test pins is that save REFUSED TO REUSE it and published a
+        // fresh one instead, which the assert_ne! below carries.
         assert_eq!(
             after.len(),
-            2,
-            "invalid retained receipt must remain untouched while a fresh generation is published"
+            1,
+            "publish must reclaim the superseded invalid generation"
         );
         let metadata: HnswMeta =
             serde_json::from_slice(&std::fs::read(&metadata_path).expect("read metadata"))
@@ -4923,8 +5037,9 @@ mod tests {
         let after = ready_generation_paths(&metadata_path, ann.vector_fingerprint);
         assert_eq!(
             after.len(),
-            2,
-            "an unloadable generation must not trap rebuild-save in a reuse loop"
+            1,
+            "an unloadable generation must not trap rebuild-save in a reuse loop, \
+             and publish reclaims it once a fresh generation supersedes it (bd-v03xp)"
         );
         let metadata: HnswMeta =
             serde_json::from_slice(&std::fs::read(&metadata_path).expect("read metadata"))
@@ -5005,6 +5120,11 @@ mod tests {
             .expect_err("retain unpublished READY generation");
         let before = ready_generation_paths(&metadata_path, ann.vector_fingerprint);
         assert_eq!(before.len(), 1);
+        let rejected_generation = before[0]
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("generation name")
+            .to_owned();
         let receipt_path = before[0].join(HNSW_GENERATION_RECEIPT_FILENAME);
         std::fs::write(
             receipt_path,
@@ -5016,8 +5136,19 @@ mod tests {
             .expect("save past oversized retained receipt");
         assert_eq!(
             ready_generation_paths(&metadata_path, ann.vector_fingerprint).len(),
-            2,
-            "oversized retained receipt must be ignored without removing it"
+            1,
+            "publish must reclaim the superseded oversized-receipt generation"
+        );
+        // The load-bearing contract, which this test previously left implicit
+        // in the directory count: the oversized receipt must not be REUSED.
+        // Without this the count alone would pass even if save adopted it.
+        let metadata: HnswMeta =
+            serde_json::from_slice(&std::fs::read(&metadata_path).expect("read metadata"))
+                .expect("parse metadata");
+        assert_ne!(
+            metadata.sidecar_generation.as_deref(),
+            Some(rejected_generation.as_str()),
+            "save must publish a fresh generation, never reuse the oversized-receipt one"
         );
         let (_, disposition) = HnswIndex::load_with_disposition(&metadata_path, &source_index)
             .expect("native load after rejecting oversized receipt");
@@ -5308,6 +5439,7 @@ mod tests {
             vector_fingerprint: 0,
             sidecar_generation: Some(retained_generation.to_owned()),
             sidecar_basename: Some("vector.fast".to_owned()),
+            source_identity: None,
         };
         gc_superseded_hnsw_generations(&parent, "vector.fast", &metadata)
             .expect("GC must skip generation-named symlinks");
@@ -5453,6 +5585,7 @@ mod tests {
             vector_fingerprint: 0,
             sidecar_generation: None,
             sidecar_basename: None,
+            source_identity: None,
         };
         std::fs::write(
             &legacy_path,
@@ -5910,5 +6043,178 @@ mod tests {
             new_hits[0].doc_id, "doc-0007",
             "rebuild path must have picked up the swapped vector for doc-0007"
         );
+    }
+
+    // ─── bd-r65a: ANN sidecars are bound to the source FSVI generation ───
+
+    /// Two v2 generations holding byte-identical live content, differing only
+    /// in their published generation identity.
+    fn identity_bound_pair() -> (crate::ValidatedFsviBytes, crate::ValidatedFsviBytes) {
+        use frankensearch_core::generation::{
+            ArtifactGenerationIdentityV1, EmbeddingIdentityBundleV1, QuantizationFormat,
+        };
+        use std::sync::Arc;
+
+        let make = |sequence: u64, nonce: u8, tag: &str| {
+            let mut identity = EmbeddingIdentityBundleV1::explicit_test_model("r65a-ann-source", 8);
+            identity.storage.format = "fsvi-v2".to_owned();
+            identity.storage.quantization = QuantizationFormat::F32;
+            identity.storage.endianness = "little-endian".to_owned();
+            let binding = crate::FsviV2IdentityBinding::new(
+                ArtifactGenerationIdentityV1::new(sequence, [nonce; 16])
+                    .expect("valid test generation"),
+                identity.freeze().expect("valid frozen identity"),
+            )
+            .expect("valid FSVI v2 binding");
+            let path = temp_path(tag, "fsvi");
+            let mut writer =
+                VectorIndex::create_v2(&path, binding.clone()).expect("create v2 source");
+            for row in 0..6_usize {
+                writer
+                    .write_record(&format!("doc-{row:04}"), &normalized_vector(row + 1, 8))
+                    .expect("write v2 row");
+            }
+            writer.finish().expect("finish v2 source");
+            let bytes = std::fs::read(&path).expect("read v2 source");
+            let _ = std::fs::remove_file(&path);
+            crate::ValidatedFsviBytes::from_arc(Arc::<[u8]>::from(bytes), &binding)
+                .expect("admit v2 source")
+        };
+
+        (
+            make(41, 0xa1, "r65a-generation-a"),
+            make(42, 0xa2, "r65a-generation-b"),
+        )
+    }
+
+    /// Planted negative: a stale sidecar whose CONTENT matches perfectly.
+    ///
+    /// Same path shape, same dimension, same doc ids in the same order, and —
+    /// asserted below — the same vector fingerprint, so every content check
+    /// the loader performs says "this graph belongs to this index". Only the
+    /// published generation identity differs. An implementation that bound
+    /// sidecars to content alone would serve the stale graph.
+    #[test]
+    fn a_sidecar_is_refused_against_a_content_identical_different_generation() {
+        let (owner_a, owner_b) = identity_bound_pair();
+        let index_a = &owner_a.index;
+        let index_b = &owner_b.index;
+
+        // The content checks cannot tell these apart.
+        assert_eq!(index_a.dimension(), index_b.dimension());
+        assert_eq!(index_a.record_count(), index_b.record_count());
+        let doc_ids_a: Vec<String> = (0..index_a.record_count())
+            .map(|row| index_a.doc_id_at(row).expect("doc id").to_owned())
+            .collect();
+        let doc_ids_b: Vec<String> = (0..index_b.record_count())
+            .map(|row| index_b.doc_id_at(row).expect("doc id").to_owned())
+            .collect();
+        assert_eq!(doc_ids_a, doc_ids_b, "the fixture must share its doc set");
+        let fingerprint_a = fingerprint_live_vector_index(index_a, doc_ids_a.len(), 8)
+            .expect("fingerprint generation a");
+        let fingerprint_b = fingerprint_live_vector_index(index_b, doc_ids_b.len(), 8)
+            .expect("fingerprint generation b");
+        assert_eq!(
+            fingerprint_a, fingerprint_b,
+            "the planted negative requires an identical vector fingerprint; \
+             otherwise the content guard alone would catch it and prove nothing"
+        );
+
+        // Only the identity differs.
+        assert_ne!(
+            owner_a.identity_v2().generation,
+            owner_b.identity_v2().generation
+        );
+
+        let ann = HnswIndex::build_from_vector_index(index_a, HnswConfig::default())
+            .expect("build from generation a");
+        assert!(
+            ann.source_identity.is_some(),
+            "a graph built from a v2 source must record its identity"
+        );
+        assert!(
+            ann.matches_vector_index(index_a).expect("match against a"),
+            "the graph must still match the generation it was built from"
+        );
+        assert!(
+            !ann.matches_vector_index(index_b).expect("match against b"),
+            "a graph built from generation a must NOT match generation b"
+        );
+    }
+
+    /// The same refusal at the persisted-load boundary: the sidecar must be
+    /// rebuilt rather than served natively.
+    #[test]
+    fn a_persisted_sidecar_rebuilds_against_a_different_generation() {
+        let (owner_a, owner_b) = identity_bound_pair();
+        let metadata_path = temp_path("r65a-sidecar", "hnsw");
+        let ann = HnswIndex::build_from_vector_index(&owner_a.index, HnswConfig::default())
+            .expect("build from generation a");
+        ann.save(&metadata_path).expect("persist sidecar");
+
+        let (_, native) = HnswIndex::load_with_disposition(&metadata_path, &owner_a.index)
+            .expect("load against its own generation");
+        assert_eq!(
+            native,
+            HnswLoadDisposition::Native,
+            "the sidecar must load natively against the generation that built it"
+        );
+
+        let (rebuilt, disposition) =
+            HnswIndex::load_with_disposition(&metadata_path, &owner_b.index)
+                .expect("load against a different generation");
+        assert_eq!(
+            disposition,
+            HnswLoadDisposition::Rebuilt,
+            "a different generation must force a rebuild, never a native serve"
+        );
+        assert_eq!(rebuilt.len(), owner_b.index.record_count());
+
+        // The strict read-only API must refuse it outright rather than
+        // reporting a native load.
+        assert!(
+            HnswIndex::try_load_native(&metadata_path, &owner_b.index)
+                .expect("strict load call")
+                .is_none(),
+            "the strict native API must not report a cross-generation sidecar as native"
+        );
+    }
+
+    /// Absence is not a match, in either direction: a sidecar with no recorded
+    /// identity cannot be proven to belong to an identity-bearing generation,
+    /// and vice versa. Without this, every pre-binding sidecar would be served
+    /// against any v2 source forever.
+    #[test]
+    fn unbound_and_bound_sidecars_never_admit_each_other() {
+        let (owner_a, _) = identity_bound_pair();
+        let bound = HnswSourceIdentityV1::capture(&owner_a.index).expect("v2 source is bound");
+
+        assert!(HnswSourceIdentityV1::admits(None, None));
+        assert!(HnswSourceIdentityV1::admits(Some(&bound), Some(&bound)));
+        assert!(!HnswSourceIdentityV1::admits(None, Some(&bound)));
+        assert!(!HnswSourceIdentityV1::admits(Some(&bound), None));
+    }
+
+    /// A legacy v1 source has no identity to bind, so the content checks stand
+    /// alone and existing behavior is preserved.
+    #[test]
+    fn a_legacy_v1_source_still_loads_natively() {
+        let source_path = temp_path("r65a-legacy-source", "fsvi");
+        let source = write_index(
+            &source_path,
+            &[normalized_vector(1, 8), normalized_vector(2, 8)],
+        )
+        .expect("legacy source");
+        assert!(
+            HnswSourceIdentityV1::capture(&source).is_none(),
+            "a v1 source carries no identity"
+        );
+        let ann = HnswIndex::build_from_vector_index(&source, HnswConfig::default())
+            .expect("build from legacy source");
+        let metadata_path = temp_path("r65a-legacy-sidecar", "hnsw");
+        ann.save(&metadata_path).expect("persist legacy sidecar");
+        let (_, disposition) =
+            HnswIndex::load_with_disposition(&metadata_path, &source).expect("load legacy sidecar");
+        assert_eq!(disposition, HnswLoadDisposition::Native);
     }
 }

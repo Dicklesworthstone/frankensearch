@@ -11116,6 +11116,8 @@ variance collapses and a real ~1.09× median can clear the floor repeatably. Sel
 replaces the 44.54%-self-time `dot_i8_i8_avx2` frame (cod's `perf`), so the Amdahl ceiling is fixed and
 real; only the measurement is blocked. No production behaviour changed; all builds/benches remote.
 
+Verdict: REJECT — classification only (bd-g2pxg, for the bd-z4lqq fail-closed verdict rule); nothing above is altered. This row already states its own verdict in prose — "a REJECT of the scan-level speedup claim on this substrate, not of the kernel" — but on a line the gate does not read as a decision line. Evidence for the REJECT contract: run 2's same-invocation tight alternating-round A/A null 0.9972 [0.9651, 1.0706] contains that run's A/B median 0.9821 [0.9544, 1.0211]. Resurrection class VALID-AB (a recorded A/A null with the effect inside it), so the refusal to ship stands and the row is not VOID; the retry predicate above remains the way to reopen it.
+
 ### 2026-07-10 — cc_fse — REJECTED: FMA in the f16 flat-scan dot buys nothing — the kernel is `cvtph2ps`-DECODE-bound, not FP-port-bound (fma/ORIG median 1.0351, inside the null floor)
 
 **Profile-first was blocked**, so this is measure-the-lever with a strong prior. The f16 flat scan
@@ -11648,6 +11650,16 @@ relevance claim). On worker `vmi1227854`, the isolated handoff cleared its null 
 0.872784 versus 0.887204. The required final rerun did not reproduce decisibility: candidate median
 **0.853127** [0.735856, 0.969935] was inside the A/A floor of 0.937580 [0.825111, 1.170674]. Faster direction is
 not enough; the full operation is the shipping gate.
+
+**Re-adjudicated 2026-08-04 (`bd-npdmj`), verdict REJECT — unchanged, narrower support.** Under
+`bd-pjh09`'s corrected A/A admissibility (a control is admissible when its median sits within 2% of
+1.0; CI width is telemetry, not a veto), the two isolated-handoff cells cited above lose their
+controls: their same-invocation A/A null medians are 0.971933 [0.765276, 1.140919] and 1.030091
+[0.805651, 1.229080], drifting 2.81% and 3.01% from 1.0. So "cleared its null floor twice" is
+withdrawn — that speedup is unmeasured on this evidence rather than merely diluted. The final
+full-path rerun's control (0.937580 [0.825111, 1.170674], same invocation) drifts 6.24% and is also
+inadmissible. This entry's REJECT stands on the restored-production decision, not on those cells.
+Corresponding correction in `docs/PERF_LEDGER.md` under the same bead.
 
 **Decision/boundary.** Production source was restored to HEAD; only the feature-gated comparator, benchmark,
 parity test, and this evidence remain. Do not retry this second-copy handoff without a quieter full-write fixture
@@ -13078,6 +13090,8 @@ A/B). **CONCLUSION: the autonomously-completable work on this feature is DONE** 
 proven). The one remaining step is a product-gated integration (sample source + opt-in wiring + A/B), precisely
 scoped here. Handing off — further autonomous increments on this feature would be premature hot-path churn.
 
+Verdict: ROUTE-NEXT — classification only (bd-g2pxg, for the bd-z4lqq fail-closed verdict rule); nothing above is altered. This row ran no A/B and proposed nothing for the default path: it establishes where the injection attaches, states that the substantive remainder is the cv-sample source, and hands off. It is a scoping/route-next row, not a verdict on a lever, so no null control or comparison class applies to it.
+
 ### 2026-07-12 — Codex — FINAL HOLD: FSFS one-lookup hybrid merge remains inside the higher-inner remote null floor
 
 Negative-ledger-first routing selected the retained FSFS hybrid-fuse candidate rather than reopening the mined
@@ -14394,6 +14408,15 @@ Candidate/original ratios below 1 favor prefetch:
 | 128 | 0.988 [0.359, 1.374] | 1.012 [0.446, 2.281] | short path preserved |
 | 256 | 1.011 [0.612, 2.840] | **0.791** [0.631, 1.098] | inside null floor |
 | 512 | 1.032 [0.846, 1.337] | **0.809** [0.692, 1.097] | clears null floor |
+
+**Re-adjudicated 2026-08-04 (`bd-npdmj`), verdict REJECT/HOLD — unchanged, narrower support.** Under
+`bd-pjh09`'s corrected A/A admissibility (admissible when the null median sits within 2% of 1.0; CI
+width is telemetry, not a veto), the 512-token row loses its control: same-invocation A/A null
+median 1.032 [0.846, 1.337], drifting 3.20% from 1.0. "The 512-token result confirms the mechanism"
+is therefore withdrawn on this evidence. The 128- and 256-token rows are unaffected (nulls 0.988 and
+1.011, drifts 1.20% and 1.10%), so the 256-token REJECT/HOLD below is unchanged. The separate
+`bd-vxki` entry re-measured the 512+ threshold and is what any 512 claim should cite. Corresponding
+correction in `docs/PERF_LEDGER.md` under the same bead.
 
 **Decision. REJECT/HOLD.** The chosen 256-token shipping onset does not clear the same-binary null floor, so the
 production path was restored byte-for-byte. The exact oracle and boundary reproducer remain feature-gated behind
@@ -15934,6 +15957,18 @@ eight, but an independent nine-round `ovh-a` run put the one-thread lever at
 `0.9714` inside its `0.9488..1.0241` null spread. Only its 8-thread result was
 decisive (`0.7489`, null `0.9625..1.0594`).
 
+**Re-adjudicated 2026-08-04 (`bd-npdmj`), verdict REJECT — unchanged, narrower support.** Under
+`bd-pjh09`'s corrected A/A admissibility (admissible when the null median sits within 2% of 1.0; CI
+width is telemetry, not a veto), the two one-thread cells cited above lose their controls:
+golden-medium 1-thread `0.7763` rests on a same-invocation A/A null median 0.9721 [0.8726, 1.0726]
+drifting 2.79%, and golden-small 1-thread `0.7266` on 1.0310 [0.9951, 1.0892] drifting 3.10%. The
+claim "every lever median cleared its cell's null p5" therefore no longer holds for those two; both
+are withdrawn as unmeasured. Conversely golden-small 8-thread `0.6165` gains an admissible control
+(null 0.9827 [0.9110, 0.9883], drift 1.73%) whose spread sits entirely below 1.0 — the retired
+straddle clause would have vetoed it. The 8-thread and xlarge cells (`0.6858`, `0.8736`, `0.6697`)
+are unaffected, so the decision below is unchanged. Corresponding correction in
+`docs/PERF_LEDGER.md` under the same bead.
+
 **Decision: REJECT hash/arena chains as the bulk seal above the small-batch
 crossover.** Retry that topology only below roughly 10,000 live terms or for a
 one-thread small batch, using the same paired null-controlled harness; Delta
@@ -16554,6 +16589,8 @@ decisive cells so compile + measurement fit inside the 1800s window, capture
 `activated = true`. Do not raise the global `build_timeout_sec`; that file is
 shared by 11 repos and lengthening leases starves the Lane M measurement window.
 
+Verdict: REJECT — classification only (bd-g2pxg, for the bd-z4lqq fail-closed verdict rule); nothing above is altered. The candidate misses this gate's own >=3.0x target by roughly an order of magnitude: incumbent ratio 0.1297 at bulk/medium/8/positions_on, range 0.1066-0.1725 across medium, recorded beside the named actual legacy incumbent in one invocation with the same-invocation Tantivy/Tantivy A/A null 0.9945 [0.9336, 1.0790]. The A/B intervals sit far outside that null, so this is a measured loss that stands on its own evidence rather than an undecidable run. The heading's PROVISIONAL scope is unchanged: the gate remains inactive and this row asserts no activation.
+
 ### 2026-07-28 — QG-2 MISS (gate inactive): single-thread Quill indexing reaches 0.1087x Tantivy 0.26.1 (`bd-h6eh`, FoggySquirrel)
 
 **Comparison class: INCUMBENT.** This is a competitive gate measurement, not a
@@ -16595,6 +16632,8 @@ gap, and a candidate reduces whole-operation cycles or instructions per
 document by at least 10x without changing indexed bytes or query results.
 Then repeat the full same-ELF, same-invocation A/A+A/B median-CI gate against
 Tantivy 0.26.1.
+
+Verdict: REJECT — classification only (bd-g2pxg, for the bd-z4lqq fail-closed verdict rule); nothing above is altered. Quill/Tantivy paired median 0.108698 [0.107024, 0.111538] against a >=1.5x target, recorded side-by-side with the same-invocation Tantivy/Tantivy A/A null 0.993436 [0.980159, 1.019927], whose interval contains 1.0 and passes every predeclared null law. The effect interval lies far outside that null, so the MISS is decidable and the loss stands. The gate remains inactive.
 
 ### 2026-07-28 — QG-2 reproduction hold: the valid rerun misses the predeclared 2% agreement bound (`bd-h6eh`, FoggySquirrel)
 
@@ -17540,6 +17579,8 @@ interpreting any A/B magnitude, and require the full normative matrix plus an
 immediate same-ELF reproduction before activation. Never weaken a null law,
 select a favorable row, or gate on CV.
 
+Verdict: REJECT — classification only (bd-g2pxg, for the bd-z4lqq fail-closed verdict rule); nothing above is altered. Both scoreable widths miss against the named actual legacy incumbent: 1 thread 0.256083 [0.250163, 0.258549] and 96 threads 0.236489 [0.233668, 0.239445], each recorded in the same invocation as its own A/A controls (Tantivy/Tantivy 1.009191 [0.973456, 1.036773] at 1 thread and 0.982554 [0.956492, 1.026133] at 96 threads). Both effect intervals sit far outside their nulls, so the absence of a high-thread advantage is a decidable measured loss.
+
 ### 2026-07-29 — Hand-written canonical encoder is no-ship after a contaminated adverse diagnostic (`bd-e8h-w2-canonical-encode-si8mk`, YellowSparrow)
 
 **Comparison class: SELF-SPEEDUP diagnostic; no incumbent or QG claim.**
@@ -18361,3 +18402,66 @@ effect blocks or bind effect order/drift explicitly; ratchet-bind continuous
 timing and work-receipt modes; preserve exact host, executable, wall, and
 worker-census receipts. Do not promote a partial slice, weaken the
 null-center law, or gate on CV.
+
+Verdict: HOLD — classification only (bd-g2pxg, for the bd-z4lqq fail-closed verdict rule); nothing above is altered. The row advances no result in either direction, as its own heading says: widths 2, 4, 16, 32, and 128 fail the corrected null gate because their Tantivy null medians drift outside 2% of 1, and a later receipt-integrity audit invalidated every CPU-derived activity field. The widths that do pass the null gate are recorded above but are not advanced as a claim here, so this row is a quarantined no-claim sweep rather than a verdict on a lever.
+
+### 2026-08-04 — REJECT: Quill STOREDMETA seal-path double-copy is real but not decidable — removing one 7.5 MB memcpy per seal is invisible (`bd-4xr99`, GreenCat)
+
+A stored byte was copied twice per fresh seal: once in
+`StoredFieldColumns::append_document`, where borrowed caller input becomes bytes
+that outlive the caller, and again in the STOREDMETA encoder, which concatenated
+every field blob into a section-sized `Vec<u8>` that the segment writer then
+copied into the durable buffer. Only the first copy is forced (`bd-iic6u`). The
+sibling Delta path never had this shape, so this looked like a sibling-path
+asymmetry worth closing.
+
+It was closed, measured, and reverted. `SectionInput` gained an ordered
+`runs: &[&[u8]]` payload so the seal could hand the writer the accumulator's
+borrowed blobs directly; `encode_canonical_segment` took `Option<&[&[u8]]>`; the
+fresh-seal path passed `BorrowedStoredMetaSection::runs()`, which collects slice
+pointers and copies no payload. That removed the intermediate copy entirely.
+
+MEASURED on the exact operation the change alters — STOREDMETA emission,
+materialize-then-copy versus borrowed runs written straight into the buffer —
+one maximum lease of 65,535 documents carrying 7,536,525 stored blob bytes
+(section 8,888,255 bytes). Shared alternating-round `paired_median_ratio` with a
+same-invocation A/A null control, 81 rounds, `taskset`-pinned, governor
+`performance`, on `thinkstation1`. Ratios are candidate/original, `< 1` favors
+the candidate:
+
+| core | A/A null median [ci95], same invocation | half-width | new/old median [ci95] | verdict |
+|---:|---:|---:|---:|---|
+| 5 | 0.998078 [0.975359, 1.025351] | 2.535% | 1.009055 [0.989676, 1.026897] | INSIDE NULL FLOOR |
+| 19 | 0.998612 [0.981719, 1.012933] | 1.828% | 0.998735 [0.991255, 1.013776] | INSIDE NULL FLOOR |
+
+Both A/A nulls are admissible under the corrected `bd-pjh09` rule. Neither
+candidate median clears its own null floor, and the two pinned cores disagree on
+the sign — 1.0091 on core 5, 0.9987 on core 19. Absolute emission cost was 1.4527
+ms versus 1.4319 ms on core 5 and 1.3246 ms versus 1.3491 ms on core 19, i.e. a
+difference of ±0.02 ms on a ~1.4 ms step. Emission is itself a small share of a
+full lease seal, so the whole-seal effect is smaller still. Removing a 7.5 MB
+memcpy is simply not visible against this path's other costs.
+
+Comparison class: SELF-SPEEDUP, so this is maintenance and never a campaign
+number. The live-incumbent QG-2 run at 200k documents was NOT performed and is
+moot for the decision — a lever that cannot clear its own A/A null in isolation
+cannot support a vs-incumbent claim. For the record it is also blocked on this
+host on two registered preconditions, both checked against
+`scripts/perf-runner.sh` rather than assumed: `k10temp` exposes zero
+`temp*_max`/`temp*_crit` attributes while the promotion producer hard-requires an
+observable thermal limit, and the host is a Threadripper PRO 5975WX with 32
+physical cores where the registered `trj-zen3-5995wx` + `physical-64` profile
+expects 64.
+
+Byte-identity was never in doubt and is recorded so a retry need not redo it: the
+same three-document seal produced the same 1590-byte FSLX file, FNV-1a
+`399eb3e8b79a820d`, `file_xxh3` `85b01e35d4cb9d3b`, at `699e269b` (before any
+work), at `d558b90b`, and with the change applied; `fslx-v1-golden.hex` never
+moved.
+
+Decision: REJECT and revert. `SectionInput::runs`/`from_runs` and the
+`Option<&[&[u8]]>` parameter are gone. `BorrowedStoredMetaSection` predates this
+lever, is byte-identical, and was left in place. Retry only with a fixture whose
+stored-byte volume is a materially larger share of seal cost than 7.5 MB per
+65,535-document lease, or once seal cost elsewhere has dropped far enough for a
+~1 ms step to matter.

@@ -138,7 +138,7 @@
 //! | `hash`       | FNV-1a hash embedder (default, zero dependencies)      |
 //! | `model2vec`  | potion-128M static embedder (fast tier, ~0.57ms)       |
 //! | `fastembed`  | MiniLM-L6-v2 ONNX embedder (quality tier, ~128ms)      |
-//! | `lexical`    | Pre-flip Tantivy BM25 compatibility lane               |
+//! | `lexical`    | Native Quill production lexical backend                |
 //! | `quill`      | Native Quill lexical engine and builder integration     |
 //! | `lexical-tantivy` | Explicit Tantivy oracle/comparator surface       |
 //! | `cass-compat` | External CASS schema-v8 Tantivy-format interoperability |
@@ -199,8 +199,11 @@ pub use frankensearch_fusion as fusion;
 pub use frankensearch_index as index;
 
 #[cfg(feature = "lexical")]
-/// Pre-flip Tantivy lexical backend.
-pub use frankensearch_lexical as lexical;
+/// Native Quill production lexical backend.
+///
+/// Tantivy remains available only from [`lexical_tantivy`] when the explicit
+/// `lexical-tantivy` feature is selected.
+pub use frankensearch_quill as lexical;
 
 #[cfg(feature = "lexical-tantivy")]
 /// Explicit Tantivy-native backend for oracle and foreign-index consumers.
@@ -277,15 +280,11 @@ pub use frankensearch_core::types::{EmbeddingMetrics, IndexMetrics, SearchMetric
 
 // Traits
 pub use frankensearch_core::traits::{
-    Embedder, LexicalRead, MetricsExporter, ModelCategory, ModelInfo, ModelTier,
-    NoOpMetricsExporter, Reranker, SearchFuture, SharedMetricsExporter, SyncEmbed,
-    SyncEmbedderAdapter, SyncRerank, SyncRerankerAdapter,
+    Embedder, LexicalCandidateBatch, LexicalHydrationContext, LexicalRead, LexicalWrite,
+    MetricsExporter, ModelCategory, ModelInfo, ModelTier, NoOpMetricsExporter, Reranker,
+    SearchFuture, SharedMetricsExporter, SyncEmbed, SyncEmbedderAdapter, SyncRerank,
+    SyncRerankerAdapter,
 };
-// The combined read/write contract remains available for explicit legacy
-// consumers until the coordinated bd-8nqz.1 B2 removal. It is intentionally
-// omitted from the prelude so wildcard imports cannot make `LexicalRead`
-// methods ambiguous.
-pub use frankensearch_core::traits::LexicalSearch;
 pub use frankensearch_core::{
     AttestedDaemonEmbeddingResponseV1, DAEMON_ATTESTATION_SCHEMA_V1, DAEMON_CHALLENGE_SCHEMA_V1,
     DAEMON_CONNECTION_IDENTITY_SCHEMA_V1, DaemonChallengeV1, DaemonClient,
@@ -470,7 +469,8 @@ mod tests {
     fn traits_are_object_safe() {
         fn _takes_embedder(_: &dyn Embedder) {}
         fn _takes_reranker(_: &dyn Reranker) {}
-        fn _takes_lexical(_: &dyn LexicalSearch) {}
+        fn _takes_lexical_read(_: &dyn LexicalRead) {}
+        fn _takes_lexical_write(_: &dyn LexicalWrite) {}
         fn _takes_metrics(_: &dyn MetricsExporter) {}
     }
 
@@ -550,7 +550,7 @@ mod feature_matrix_smoke {
         eprintln!(
             "{}",
             serde_json::json!({
-                "schema": "frankensearch-feature-behavior-v1",
+                "schema": "frankensearch-feature-behavior-v2",
                 "lane": lane,
                 "behavior": behavior,
                 "status": "pass",
@@ -596,15 +596,45 @@ mod feature_matrix_smoke {
     #[cfg(feature = "hybrid")]
     #[test]
     fn hybrid_lane_behavior() {
-        let dir = tempfile::tempdir().expect("hybrid lexical tempdir");
-        let index = frankensearch_lexical::TantivyIndex::create(dir.path())
-            .expect("create hybrid lexical index");
-        assert_eq!(LexicalRead::doc_count(&index), 0);
-        emit_evidence(
-            "hybrid",
-            "tantivy_lexical_create",
-            &serde_json::json!({"documents": LexicalRead::doc_count(&index)}),
-        );
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let dir = tempfile::tempdir().expect("hybrid lexical tempdir");
+            let index = QuillIndex::create(
+                &cx,
+                dir.path(),
+                QuillConfig {
+                    bulk_load_mode: true,
+                    deterministic_ingest: true,
+                    max_ingest_shards: 1,
+                    ..QuillConfig::default()
+                },
+            )
+            .await
+            .expect("create hybrid Quill index");
+            let document = IndexableDocument::new("doc-hybrid", "hybrid quill lexical fixture");
+            index
+                .index_document(&cx, &document)
+                .await
+                .expect("index hybrid Quill document");
+            index
+                .finish_bulk_load(&cx)
+                .await
+                .expect("finalize hybrid Quill index");
+            let hits = index
+                .search_results(&cx, "hybrid", 5)
+                .expect("search hybrid Quill index");
+            assert_eq!(hits.len(), 1);
+            assert_eq!(hits[0].doc_id, "doc-hybrid");
+            emit_evidence(
+                "hybrid",
+                "quill_lexical_build_search",
+                &serde_json::json!({
+                    "documents": 1,
+                    "hits": hits.len(),
+                    "lexical_backend": "quill",
+                    "selected_backend": "quill",
+                }),
+            );
+        });
     }
 
     #[cfg(feature = "storage")]
@@ -713,7 +743,7 @@ mod feature_matrix_smoke {
             let adapter = Fts5LexicalSearch::new(Fts5Config::default());
             let document =
                 IndexableDocument::new("doc-fts5", "fts5 feature matrix integration fixture");
-            LexicalSearch::index_document(&adapter, &cx, &document)
+            LexicalWrite::index_document(&adapter, &cx, &document)
                 .await
                 .expect("index FTS5 document");
             let hits = LexicalRead::search(&adapter, &cx, "integration", 5)
@@ -769,7 +799,44 @@ mod feature_matrix_smoke {
             emit_evidence(
                 "quill",
                 "real_index_build_search",
-                &serde_json::json!({"documents": documents.len(), "hits": hits.len()}),
+                &serde_json::json!({
+                    "documents": documents.len(),
+                    "hits": hits.len(),
+                    "lexical_backend": "quill",
+                    "selected_backend": "quill",
+                }),
+            );
+        });
+    }
+
+    #[cfg(feature = "lexical")]
+    #[test]
+    fn lexical_lane_behavior() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let index = lexical::QuillIndex::in_memory(lexical::QuillConfig::default())
+                .expect("create lexical Quill index");
+            index
+                .index_document(
+                    &cx,
+                    &IndexableDocument::new("doc-lexical", "lexical feature uses quill"),
+                )
+                .await
+                .expect("index lexical Quill document");
+            index.commit(&cx).await.expect("commit lexical Quill index");
+            let hits = index
+                .search_results(&cx, "lexical", 5)
+                .expect("search lexical Quill index");
+            assert_eq!(hits.len(), 1);
+            assert_eq!(hits[0].doc_id, "doc-lexical");
+            emit_evidence(
+                "lexical",
+                "quill_index_build_search",
+                &serde_json::json!({
+                    "documents": 1,
+                    "hits": hits.len(),
+                    "lexical_backend": "quill",
+                    "selected_backend": "quill",
+                }),
             );
         });
     }
@@ -785,10 +852,10 @@ mod feature_matrix_smoke {
                 IndexableDocument::new("doc-alpha", "alpha tantivy oracle matrix"),
                 IndexableDocument::new("doc-beta", "beta consumer integration"),
             ];
-            LexicalSearch::index_documents(&index, &cx, &documents)
+            LexicalWrite::index_documents(&index, &cx, &documents)
                 .await
                 .expect("index Tantivy documents");
-            LexicalSearch::commit(&index, &cx)
+            LexicalWrite::commit(&index, &cx)
                 .await
                 .expect("commit Tantivy index");
             let hits = LexicalRead::search(&index, &cx, "alpha", 5)

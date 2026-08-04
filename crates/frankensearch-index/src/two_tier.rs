@@ -5,9 +5,9 @@
 //! - optional quality-tier rescoring from `vector.quality.idx`
 //! - doc-id alignment between both tiers
 
-use std::collections::HashMap;
 #[cfg(feature = "ann")]
 use std::collections::HashSet;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::{Read as _, Seek as _, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -17,7 +17,10 @@ use std::sync::atomic::{AtomicU8, Ordering as AtomicOrdering};
 
 use frankensearch_core::config::ZeroSignalReason;
 use frankensearch_core::generation::EmbeddingIdentityBundleV1;
-use frankensearch_core::{SearchError, SearchResult, TwoTierConfig, VectorHit};
+use frankensearch_core::{
+    BoundQueryEmbedding, RetrievalTopology, SearchError, SearchResult, SpaceIdentityAdmission,
+    TieredQueryEmbeddings, TwoTierConfig, VectorHit,
+};
 use tracing::{debug, info, warn};
 
 #[cfg(all(feature = "ann", test))]
@@ -994,6 +997,147 @@ impl TwoTierIndex {
         self.fast_source.admitted_owner()
     }
 
+    /// Admit a candidate generation and install it only if every tier of it
+    /// is admitted (bd-typed-fsvi-owner-retention C5).
+    ///
+    /// The candidate is opened in full — path validation, per-tier exact
+    /// admission against its own binding, alignment planning and ANN
+    /// planning — BEFORE anything of `self` is disturbed. Any failure
+    /// returns the typed error with the previously retained owners still
+    /// installed and still serving byte-identically: there is no window in
+    /// which this index is neither the old generation nor the new one, and a
+    /// rejected candidate can neither modify nor evict the incumbent.
+    ///
+    /// A reader that opened its own [`TwoTierIndex`] over the same artifacts
+    /// is unaffected either way — each index retains its own admitted byte
+    /// image, so an installed successor never invalidates a live predecessor.
+    ///
+    /// # Errors
+    ///
+    /// Returns exactly the errors of [`Self::open_admitted_v2_with_paths`],
+    /// and returns them before any state change.
+    pub fn try_replace_admitted_v2(
+        &mut self,
+        paths: &TwoTierIndexPaths,
+        fast_binding: &FsviV2IdentityBinding,
+        quality_binding: Option<&FsviV2IdentityBinding>,
+    ) -> SearchResult<()> {
+        let candidate = match Self::open_admitted_v2_with_paths(
+            paths,
+            self.config.clone(),
+            fast_binding,
+            quality_binding,
+        ) {
+            Ok(candidate) => candidate,
+            Err(error) => {
+                // Bounded digests only: generation sequence and truncated
+                // fingerprint prefixes of the RETAINED owner, plus the typed
+                // reason. Never vectors, queries, document text, or paths.
+                warn!(
+                    incumbent_generation = self.admitted_generation_sequence(),
+                    incumbent_space = self.bounded_fast_space_digest(),
+                    reason = %error,
+                    "candidate generation was refused; the retained owner keeps serving"
+                );
+                return Err(error);
+            }
+        };
+        info!(
+            previous_generation = self.admitted_generation_sequence(),
+            installed_generation = candidate.admitted_generation_sequence(),
+            installed_space = candidate.bounded_fast_space_digest(),
+            installed_records = candidate.doc_count(),
+            "installed an admitted successor generation"
+        );
+        *self = candidate;
+        Ok(())
+    }
+
+    /// Generation sequence of the retained fast owner, or `None` for a tier
+    /// that was not admitted as FSVI v2.
+    fn admitted_generation_sequence(&self) -> Option<u64> {
+        self.fast_admitted_owner()
+            .map(|owner| owner.witness().generation.sequence)
+    }
+
+    /// First 16 hex characters of the fast tier's space fingerprint — enough
+    /// to correlate an event, bounded so a log line can never carry a full
+    /// identity image.
+    fn bounded_fast_space_digest(&self) -> Option<String> {
+        self.fast_space_fingerprint_hex
+            .as_ref()
+            .map(|hex| hex.chars().take(16).collect())
+    }
+
+    /// Activate typed owner-backed exact search for one query
+    /// (bd-core-vector-space-search-guard-ctzo).
+    ///
+    /// Every identity join happens HERE, before a single vector byte is
+    /// read: requested topology against the tiers actually retained, the
+    /// artifact's own canonical identity against the caller's admitted
+    /// binding, the complete bd-9xuj admission law (space fingerprints join
+    /// AND the producer is identical — a certified-foreign producer is
+    /// comparison-grade telemetry and is refused here), storage identity,
+    /// dimension, and the generation and live-docset witnesses used for
+    /// coverage. The returned [`ActivatedTierSearch`] is the only route to a
+    /// vector read, so no search method can run ahead of its validation:
+    /// there is nothing to instrument for "zero work before rejection"
+    /// because the work is unreachable, not merely unreached.
+    ///
+    /// The expected identity bundle comes from `fast_binding` /
+    /// `quality_binding` rather than from the owner, because
+    /// `EmbeddingIdentityBundleV1` canonical bytes are one-way (there is no
+    /// decoder). That is not a caller-trust hole: the binding's canonical
+    /// bytes are checked here against the artifact's own retained bytes, so
+    /// a caller cannot present an identity the artifact does not carry.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError::InvalidConfig`] naming the exact tier and
+    /// contract field for a topology, identity, producer, storage,
+    /// dimension or generation mismatch, and for a tier the query requests
+    /// that this index does not retain as an admitted v2 owner.
+    pub fn activate_owner_backed_search<'index, 'query>(
+        &'index self,
+        embeddings: &'query TieredQueryEmbeddings,
+        fast_binding: Option<&FsviV2IdentityBinding>,
+        quality_binding: Option<&FsviV2IdentityBinding>,
+    ) -> SearchResult<ActivatedTierSearch<'index, 'query>> {
+        let topology = embeddings.supported_topology();
+        let fast = match embeddings.fast() {
+            Some(query) => Some(activate_tier(
+                self.fast_admitted_owner(),
+                fast_binding,
+                query,
+                "fast",
+            )?),
+            None => None,
+        };
+        let quality = match embeddings.quality() {
+            Some(query) => Some(activate_tier(
+                self.quality_admitted_owner(),
+                quality_binding,
+                query,
+                "quality",
+            )?),
+            None => None,
+        };
+        if fast.is_none() && quality.is_none() {
+            return Err(SearchError::InvalidConfig {
+                field: "search_activation.topology".to_owned(),
+                value: format!("{topology:?}"),
+                reason: "no tier was requested; vector activation requires at least one \
+                         owner-backed tier"
+                    .to_owned(),
+            });
+        }
+        Ok(ActivatedTierSearch {
+            fast,
+            quality,
+            topology,
+        })
+    }
+
     /// Quality-tier counterpart of [`Self::fast_admitted_owner`].
     ///
     /// `None` both when no quality tier is loaded and when the loaded one is
@@ -1288,7 +1432,7 @@ impl TwoTierIndex {
         }
 
         let wal_doc_ids: HashSet<&str> = self
-            .fast_index
+            .fast_tier()
             .wal_entries
             .iter()
             .map(|entry| entry.doc_id.as_str())
@@ -2190,6 +2334,238 @@ fn ensure_identity_describes_tier(
 /// in [`TierSource::AdmittedV2`] and borrow the validated index from inside
 /// it, so the parsed v2 identity metadata (`identity_v2()` stays `Some`)
 /// still marks the tier ATTESTED on the assembled [`TwoTierIndex`].
+/// One tier that passed every identity join, paired with the query bound to
+/// it (bd-ctzo). Holding this is the proof the join happened.
+#[derive(Debug)]
+pub struct ActivatedTier<'index, 'query> {
+    owner: &'index ValidatedFsviBytes,
+    query: &'query BoundQueryEmbedding,
+}
+
+impl ActivatedTier<'_, '_> {
+    /// Exact top-k over the retained owner's own bytes.
+    ///
+    /// # Errors
+    ///
+    /// Propagates typed row/vector decode failures from the owner.
+    pub fn search_top_k(&self, k: usize) -> SearchResult<Vec<VectorHit>> {
+        self.owner.search_top_k(self.query.vector(), k, None)
+    }
+
+    /// The retained owner this tier serves from.
+    #[must_use]
+    pub const fn owner(&self) -> &ValidatedFsviBytes {
+        self.owner
+    }
+
+    /// Generation sequence witnessed by the retained owner — coverage is
+    /// reconstructed from this, never from a caller-supplied scalar.
+    #[must_use]
+    pub const fn generation_sequence(&self) -> u64 {
+        self.owner.witness().generation.sequence
+    }
+
+    /// Live document count witnessed by the retained owner.
+    #[must_use]
+    pub const fn live_count(&self) -> u64 {
+        self.owner.witness().live_count
+    }
+}
+
+/// A validated activation over one or both tiers (bd-ctzo).
+///
+/// Every method here is reachable only after
+/// [`TwoTierIndex::activate_owner_backed_search`] completed all joins, which
+/// is what makes "no vector read before validation" a structural property
+/// rather than an assertion.
+#[derive(Debug)]
+pub struct ActivatedTierSearch<'index, 'query> {
+    fast: Option<ActivatedTier<'index, 'query>>,
+    quality: Option<ActivatedTier<'index, 'query>>,
+    topology: RetrievalTopology,
+}
+
+impl<'index, 'query> ActivatedTierSearch<'index, 'query> {
+    /// Topology the validated query bindings actually support.
+    #[must_use]
+    pub const fn topology(&self) -> RetrievalTopology {
+        self.topology
+    }
+
+    /// The activated fast tier, when the query bound one.
+    #[must_use]
+    pub const fn fast(&self) -> Option<&ActivatedTier<'index, 'query>> {
+        self.fast.as_ref()
+    }
+
+    /// The activated quality tier, when the query bound one.
+    #[must_use]
+    pub const fn quality(&self) -> Option<&ActivatedTier<'index, 'query>> {
+        self.quality.as_ref()
+    }
+
+    /// Retrieve directly from the QUALITY owner with the quality-bound query.
+    ///
+    /// This is a first-class operation, not a rescoring of a fast-selected
+    /// pool: a document absent from the fast tier's top-k is still reachable
+    /// here, which is the behaviour the fast-pool-rescoring anti-pattern
+    /// silently loses.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError::InvalidConfig`] when no quality tier was
+    /// activated, and propagates typed decode failures.
+    pub fn search_quality(&self, k: usize) -> SearchResult<Vec<VectorHit>> {
+        self.quality
+            .as_ref()
+            .ok_or_else(|| SearchError::InvalidConfig {
+                field: "search_activation.quality".to_owned(),
+                value: format!("{:?}", self.topology),
+                reason: "quality retrieval requires an activated quality tier".to_owned(),
+            })?
+            .search_top_k(k)
+    }
+
+    /// Retrieve directly from the FAST owner with the fast-bound query.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError::InvalidConfig`] when no fast tier was
+    /// activated, and propagates typed decode failures.
+    pub fn search_fast(&self, k: usize) -> SearchResult<Vec<VectorHit>> {
+        self.fast
+            .as_ref()
+            .ok_or_else(|| SearchError::InvalidConfig {
+                field: "search_activation.fast".to_owned(),
+                value: format!("{:?}", self.topology),
+                reason: "fast retrieval requires an activated fast tier".to_owned(),
+            })?
+            .search_top_k(k)
+    }
+
+    /// Independent per-tier retrieval unioned by canonical document identity
+    /// (bd-ctzo C2 `FullProgressive`).
+    ///
+    /// Each tier is searched with ITS OWN bound query against ITS OWN owner;
+    /// neither pool constrains the other. The union is deterministic:
+    /// documents are keyed by canonical `doc_id`, the better score wins a
+    /// duplicate, and ties break by `doc_id` so the order never depends on
+    /// which tier happened to return first.
+    ///
+    /// # Errors
+    ///
+    /// Propagates typed decode failures from either tier.
+    pub fn search_union(&self, k: usize) -> SearchResult<Vec<VectorHit>> {
+        let mut merged: BTreeMap<String, VectorHit> = BTreeMap::new();
+        for tier in [self.fast.as_ref(), self.quality.as_ref()]
+            .into_iter()
+            .flatten()
+        {
+            for hit in tier.search_top_k(k)? {
+                merged
+                    .entry(hit.doc_id.to_string())
+                    .and_modify(|existing| {
+                        if hit.score > existing.score {
+                            *existing = hit.clone();
+                        }
+                    })
+                    .or_insert(hit);
+            }
+        }
+        let mut union: Vec<VectorHit> = merged.into_values().collect();
+        union.sort_by(|left, right| {
+            right
+                .score
+                .total_cmp(&left.score)
+                .then_with(|| left.doc_id.cmp(&right.doc_id))
+        });
+        union.truncate(k);
+        Ok(union)
+    }
+}
+
+/// Perform every identity join for one tier before any vector read (bd-ctzo).
+fn activate_tier<'index, 'query>(
+    owner: Option<&'index ValidatedFsviBytes>,
+    binding: Option<&FsviV2IdentityBinding>,
+    query: &'query BoundQueryEmbedding,
+    tier: &str,
+) -> SearchResult<ActivatedTier<'index, 'query>> {
+    let owner = owner.ok_or_else(|| SearchError::InvalidConfig {
+        field: format!("search_activation.{tier}.owner"),
+        value: "<absent>".to_owned(),
+        reason: format!(
+            "the query binds a {tier} embedding but this index retains no admitted FSVI v2 \
+             {tier} owner; a legacy or path-opened tier is not searchable under typed \
+             activation and requires a reindex"
+        ),
+    })?;
+    let binding = binding.ok_or_else(|| SearchError::InvalidConfig {
+        field: format!("search_activation.{tier}.binding"),
+        value: "<absent>".to_owned(),
+        reason: format!(
+            "typed activation of the {tier} tier requires the admitted identity binding that \
+             opened it"
+        ),
+    })?;
+    // The binding may only speak for THIS artifact: compare the caller's
+    // canonical identity bytes against the ones the owner itself retains.
+    if binding.frozen_identity().canonical_bytes
+        != owner.identity_v2().identity_bundle_canonical_bytes
+    {
+        return Err(SearchError::InvalidConfig {
+            field: format!("search_activation.{tier}.retained_identity"),
+            value: crate::fingerprint_hex(&owner.identity_v2().identity_bundle_fingerprint),
+            reason: format!(
+                "the supplied {tier} binding does not describe the identity the retained owner \
+                 carries; activation is derived from the artifact, never from the caller's claim"
+            ),
+        });
+    }
+    // The complete admission law. A certified-foreign producer is
+    // comparison-grade telemetry only, so it is refused rather than admitted.
+    match query.verify_producer_conformance(&binding.frozen_identity().identity, tier)? {
+        SpaceIdentityAdmission::SameProducer => {}
+        // Anything that is not the same attested producer -- today only
+        // ConformanceCompatibleProducer -- is comparison-grade telemetry, and
+        // a future variant must default to refusal rather than inherit
+        // admission by being added.
+        other => {
+            return Err(SearchError::InvalidConfig {
+                field: format!("search_activation.{tier}.producer_conformance"),
+                value: format!("{other:?}"),
+                reason: format!(
+                    "the query's producer is not the {tier} index's attested producer; a \
+                     certified-compatible pairing is comparison-grade telemetry and never an \
+                     admission basis"
+                ),
+            });
+        }
+    }
+    if query.vector().len() != owner.dimension() {
+        return Err(SearchError::InvalidConfig {
+            field: format!("search_activation.{tier}.dimension"),
+            value: query.vector().len().to_string(),
+            reason: format!(
+                "query vector width does not match the {tier} index dimension {}",
+                owner.dimension()
+            ),
+        });
+    }
+    if binding.generation() != owner.witness().generation {
+        return Err(SearchError::InvalidConfig {
+            field: format!("search_activation.{tier}.generation"),
+            value: binding.generation().sequence.to_string(),
+            reason: format!(
+                "the supplied {tier} binding names a different generation than the retained \
+                 owner witnesses ({})",
+                owner.witness().generation.sequence
+            ),
+        });
+    }
+    Ok(ActivatedTier { owner, query })
+}
+
 fn admit_v2_tier(
     path: &Path,
     binding: &FsviV2IdentityBinding,
@@ -3140,7 +3516,7 @@ mod tests {
 
     #[cfg(feature = "ann")]
     #[test]
-    fn ann_wal_merge_matches_canonical_resolution_before_and_after_exact_fallback() {
+    fn ann_wal_merge_matches_canonical_resolution_before_and_after_post_build_tombstone() {
         use crate::wal::WalEntry;
 
         let dir = temp_index_dir("ann-wal-canonical-resolution");
@@ -3162,13 +3538,13 @@ mod tests {
             hnsw_ef_search: 32,
             ..TwoTierConfig::default()
         };
-        let mut index = TwoTierIndex::open(&dir, config).expect("open ANN index");
+        let mut index = TwoTierIndex::open(&dir, config.clone()).expect("open ANN index");
         assert!(index.has_fast_ann());
 
         // Model the crash-recovery window in which a durable WAL update exists
         // but its best-effort main-slab tombstone did not land. Include a
         // repeated WAL identity to exercise the canonical post-rank dedup rule.
-        index.fast_index.wal_entries.extend([
+        let wal_entries = vec![
             WalEntry {
                 doc_id: "doc-a".into(),
                 doc_id_hash: crate::fnv1a_hash(b"doc-a"),
@@ -3184,12 +3560,16 @@ mod tests {
                 doc_id_hash: crate::fnv1a_hash(b"doc-new"),
                 embedding: vec![0.95, 0.312_249_9],
             },
-        ]);
+        ];
+        let fast_tier = index
+            .fast_tier_mut_for_test()
+            .expect("path-opened fast tier");
+        fast_tier.wal_entries.extend(wal_entries.clone());
 
         let query = [1.0_f32, 0.0];
         let assert_canonical = |index: &TwoTierIndex, label: &str| {
             let expected = index
-                .fast_index
+                .fast_tier()
                 .search_top_k(&query, 10, None)
                 .expect("canonical main plus WAL search");
             let actual = index.search_fast(&query, 10).expect("ANN plus WAL search");
@@ -3218,7 +3598,7 @@ mod tests {
                 .expect("WAL doc-a remains searchable");
             assert!(
                 usize::try_from(doc_a.index).expect("u32 fits usize")
-                    >= index.fast_index.record_count(),
+                    >= index.fast_tier().record_count(),
                 "{label}: WAL doc-a must supersede the stale main-slab version"
             );
         };
@@ -3226,26 +3606,44 @@ mod tests {
         assert_canonical(&index, "normal ANN");
         assert_eq!(index.ann_fallback_count(), 0);
 
-        // A post-build tombstone removes one native candidate. Fetching the
-        // entire four-point graph must therefore exact-repair the main tier,
-        // then merge the resident WAL exactly once through the same resolver.
+        // A post-build tombstone must happen through the writer role between
+        // reader-tier opens. Reopening refreshes the ANN sidecar against the
+        // live main rows, then the resident WAL must still merge through the
+        // same resolver.
+        drop(index);
+        let mut writer =
+            VectorIndex::open_writer(&fast_path).expect("writer opens after reader drops");
         assert!(
-            index
-                .fast_index
+            writer
                 .soft_delete("doc-delete")
                 .expect("post-build tombstone")
         );
-        assert_canonical(&index, "exact-underfill fallback");
+        drop(writer);
+        let mut index = TwoTierIndex::open(&dir, config).expect("reopen ANN index after tombstone");
+        index
+            .fast_tier_mut_for_test()
+            .expect("reopened path-opened fast tier")
+            .wal_entries
+            .extend(wal_entries);
+        assert!(
+            !index
+                .search_fast(&query, 10)
+                .expect("refreshed ANN search")
+                .iter()
+                .any(|hit| hit.doc_id == "doc-delete"),
+            "the writer-role tombstone must survive the reader reopen"
+        );
+        assert_canonical(&index, "post-build tombstone");
         assert_eq!(
             index.ann_fallback_count(),
-            1,
-            "one underfilled ANN request must increment the public counter once"
+            0,
+            "a sidecar refreshed for the tombstone must not report stale-graph fallback"
         );
     }
 
     #[cfg(feature = "ann")]
     #[test]
-    fn ann_wal_shadowed_top_hit_stays_suppressed_through_raw_exact_fallback() {
+    fn ann_wal_shadowed_top_hit_stays_suppressed_through_post_build_tombstone() {
         use crate::wal::WalEntry;
 
         let dir = temp_index_dir("ann-wal-shadowed-top");
@@ -3265,17 +3663,21 @@ mod tests {
             hnsw_ef_search: 32,
             ..TwoTierConfig::default()
         };
-        let mut index = TwoTierIndex::open(&dir, config).expect("open ANN index");
-        index.fast_index.wal_entries.push(WalEntry {
+        let mut index = TwoTierIndex::open(&dir, config.clone()).expect("open ANN index");
+        let wal_entry = WalEntry {
             doc_id: "doc-a".into(),
             doc_id_hash: crate::fnv1a_hash(b"doc-a"),
             embedding: vec![-1.0, 0.0],
-        });
+        };
+        let fast_tier = index
+            .fast_tier_mut_for_test()
+            .expect("path-opened fast tier");
+        fast_tier.wal_entries.push(wal_entry.clone());
 
         let normal_query = [1.0_f32, 0.0];
         assert!(
             index
-                .fast_index
+                .fast_tier()
                 .search_top_k(&normal_query, 1, None)
                 .expect("canonical normal search")
                 .is_empty(),
@@ -3290,29 +3692,42 @@ mod tests {
         );
         assert_eq!(index.ann_fallback_count(), 0);
 
+        drop(index);
+        let mut writer =
+            VectorIndex::open_writer(&fast_path).expect("writer opens after reader drops");
         assert!(
-            index
-                .fast_index
+            writer
                 .soft_delete("doc-tombstone")
                 .expect("post-build tombstone")
         );
-        let fallback_query = [0.0_f32, 1.0];
+        drop(writer);
+        let mut index = TwoTierIndex::open(&dir, config).expect("reopen ANN index after tombstone");
+        index
+            .fast_tier_mut_for_test()
+            .expect("reopened path-opened fast tier")
+            .wal_entries
+            .push(wal_entry);
+        let tombstone_query = [0.0_f32, 1.0];
         assert!(
             index
-                .fast_index
-                .search_top_k(&fallback_query, 1, None)
-                .expect("canonical fallback search")
+                .fast_tier()
+                .search_top_k(&tombstone_query, 1, None)
+                .expect("canonical tombstone search")
                 .is_empty(),
             "the exact main winner is still shadowed by the WAL"
         );
         assert!(
             index
-                .search_fast(&fallback_query, 1)
-                .expect("underfilled ANN search")
+                .search_fast(&tombstone_query, 1)
+                .expect("refreshed ANN search")
                 .is_empty(),
-            "raw exact repair must defer WAL suppression until after shared top-k selection"
+            "the refreshed ANN path must preserve WAL suppression after tombstoning"
         );
-        assert_eq!(index.ann_fallback_count(), 1);
+        assert_eq!(
+            index.ann_fallback_count(),
+            0,
+            "a sidecar refreshed for the tombstone must not report stale-graph fallback"
+        );
     }
 
     #[cfg(feature = "ann")]
@@ -3338,7 +3753,7 @@ mod tests {
         let index = TwoTierIndex::open(&dir, config).expect("open ANN index");
         let query = [1.0_f32, 0.0];
         let expected = index
-            .fast_index
+            .fast_tier()
             .search_top_k(&query, 2, None)
             .expect("canonical duplicate-ID search");
         let actual = index
@@ -3676,7 +4091,7 @@ mod tests {
         let first = TwoTierIndex::open_with_paths(&paths, config.clone())
             .expect("build custom ANN sidecar");
         assert!(first.has_fast_ann());
-        load_native_ann_sidecar(&fast_ann_path, &first.fast_index);
+        load_native_ann_sidecar(&fast_ann_path, first.fast_tier());
         drop(first);
 
         let lock_path =
@@ -3724,13 +4139,13 @@ mod tests {
         let first = TwoTierIndex::open_with_paths(&paths, config.clone())
             .expect("build ANN below a newly created custom parent");
         assert!(first.has_fast_ann());
-        load_native_ann_sidecar(&fast_ann_path, &first.fast_index);
+        load_native_ann_sidecar(&fast_ann_path, first.fast_tier());
         drop(first);
 
         let reopened =
             TwoTierIndex::open_with_paths(&paths, config).expect("native custom ANN reopen");
         assert!(reopened.has_fast_ann());
-        load_native_ann_sidecar(&fast_ann_path, &reopened.fast_index);
+        load_native_ann_sidecar(&fast_ann_path, reopened.fast_tier());
         assert!(!dir.join(VECTOR_ANN_FAST_FILENAME).exists());
     }
 
@@ -3763,10 +4178,10 @@ mod tests {
             .expect("build both custom ANN tiers");
         assert!(first.has_fast_ann());
         assert!(first.has_quality_ann());
-        load_native_ann_sidecar(&fast_ann_path, &first.fast_index);
+        load_native_ann_sidecar(&fast_ann_path, first.fast_tier());
         load_native_ann_sidecar(
             &quality_ann_path,
-            first.quality_index.as_ref().expect("quality index"),
+            first.quality_tier().expect("quality index"),
         );
         let fast_metadata = fs::read(&fast_ann_path).expect("read fast ANN metadata");
         let quality_metadata = fs::read(&quality_ann_path).expect("read quality ANN metadata");
@@ -3776,10 +4191,10 @@ mod tests {
             TwoTierIndex::open_with_paths(&paths, config).expect("reopen both custom ANN tiers");
         assert!(reopened.has_fast_ann());
         assert!(reopened.has_quality_ann());
-        load_native_ann_sidecar(&fast_ann_path, &reopened.fast_index);
+        load_native_ann_sidecar(&fast_ann_path, reopened.fast_tier());
         load_native_ann_sidecar(
             &quality_ann_path,
-            reopened.quality_index.as_ref().expect("quality index"),
+            reopened.quality_tier().expect("quality index"),
         );
         assert_eq!(
             fs::read(&fast_ann_path).expect("reread fast ANN metadata"),
@@ -3823,7 +4238,7 @@ mod tests {
         assert!(first.has_quality_ann());
         load_native_ann_sidecar(
             &quality_ann_path,
-            first.quality_index.as_ref().expect("quality index"),
+            first.quality_tier().expect("quality index"),
         );
         drop(first);
 
@@ -3833,7 +4248,7 @@ mod tests {
         assert!(reopened.has_quality_ann());
         load_native_ann_sidecar(
             &quality_ann_path,
-            reopened.quality_index.as_ref().expect("quality index"),
+            reopened.quality_tier().expect("quality index"),
         );
         assert!(!dir.join("index-fnv1a-4.hnsw").exists());
         assert!(!dir.join(VECTOR_ANN_FAST_FILENAME).exists());
@@ -4524,7 +4939,7 @@ mod tests {
         assert!(first_open.has_fast_ann());
 
         let ann_path = dir.join(VECTOR_ANN_FAST_FILENAME);
-        let before = load_native_ann_sidecar(&ann_path, &first_open.fast_index);
+        let before = load_native_ann_sidecar(&ann_path, first_open.fast_tier());
         let before_config = before.config();
         assert_eq!(before_config.m, 8);
         assert_eq!(before_config.ef_construction, 64);
@@ -4540,7 +4955,7 @@ mod tests {
         let second_open = TwoTierIndex::open(&dir, updated).expect("open with updated ann config");
         assert!(second_open.has_fast_ann());
 
-        let after = load_native_ann_sidecar(&ann_path, &second_open.fast_index);
+        let after = load_native_ann_sidecar(&ann_path, second_open.fast_tier());
         let after_config = after.config();
         assert_eq!(after_config.m, 24);
         assert_eq!(after_config.ef_construction, 96);
@@ -4582,7 +4997,7 @@ mod tests {
         let reopened = TwoTierIndex::open(&dir, config).expect("reopen");
         assert!(reopened.has_fast_ann());
         let ann_path = dir.join(VECTOR_ANN_FAST_FILENAME);
-        load_native_ann_sidecar(&ann_path, &reopened.fast_index);
+        load_native_ann_sidecar(&ann_path, reopened.fast_tier());
         let after = reopened
             .search_fast(&[1.0, 0.0, 0.0], 1)
             .expect("search after");
@@ -4626,13 +5041,13 @@ mod tests {
         )
         .expect("write legacy metadata");
 
-        let (_, disposition) = HnswIndex::load_with_disposition(&ann_path, &initial.fast_index)
+        let (_, disposition) = HnswIndex::load_with_disposition(&ann_path, initial.fast_tier())
             .expect("legacy fallback rebuild");
         assert_eq!(disposition, HnswLoadDisposition::Rebuilt);
 
         let reopened = TwoTierIndex::open(&dir, config).expect("self-heal legacy ANN sidecar");
         assert!(reopened.has_fast_ann());
-        load_native_ann_sidecar(&ann_path, &reopened.fast_index);
+        load_native_ann_sidecar(&ann_path, reopened.fast_tier());
     }
 
     #[cfg(feature = "ann")]
@@ -4667,13 +5082,13 @@ mod tests {
         )
         .expect("write degraded metadata");
 
-        let (_, disposition) = HnswIndex::load_with_disposition(&ann_path, &initial.fast_index)
+        let (_, disposition) = HnswIndex::load_with_disposition(&ann_path, initial.fast_tier())
             .expect("degraded fallback rebuild");
         assert_eq!(disposition, HnswLoadDisposition::Rebuilt);
 
         let reopened = TwoTierIndex::open(&dir, config).expect("self-heal degraded ANN sidecar");
         assert!(reopened.has_fast_ann());
-        load_native_ann_sidecar(&ann_path, &reopened.fast_index);
+        load_native_ann_sidecar(&ann_path, reopened.fast_tier());
         let repaired: serde_json::Value =
             serde_json::from_slice(&fs::read(&ann_path).expect("read repaired metadata"))
                 .expect("parse repaired metadata");
@@ -4729,7 +5144,7 @@ mod tests {
         .expect("write legacy metadata");
 
         let rebuilt = maybe_load_or_build_ann_with_save(
-            &initial.fast_index,
+            initial.fast_tier(),
             &ann_path,
             1,
             &config,
@@ -4742,7 +5157,7 @@ mod tests {
         // The injected failure left legacy metadata installed, proving the
         // error occurred after a successful rebuild rather than after a native
         // reload. That means the next startup will retry the repair.
-        let (_, disposition) = HnswIndex::load_with_disposition(&ann_path, &initial.fast_index)
+        let (_, disposition) = HnswIndex::load_with_disposition(&ann_path, initial.fast_tier())
             .expect("legacy sidecar still rebuilds after failed persistence");
         assert_eq!(disposition, HnswLoadDisposition::Rebuilt);
 
@@ -4781,6 +5196,10 @@ mod tests {
             .soft_delete("doc-b")
             .expect("soft delete should succeed");
         assert!(deleted);
+        // Release the writable mapping before reopening: since bd-x06p5 the
+        // two-tier open acquires a SHARED READER lock on the same FSVI, which
+        // a live writer handle would block.
+        drop(fast_index);
 
         let config = TwoTierConfig {
             hnsw_threshold: 1,
@@ -4824,6 +5243,9 @@ mod tests {
         // VectorIndex positions = {0:doc-a, 1:doc-b(deleted), 2:doc-c, 3:doc-d}
         let mut fast_index = VectorIndex::open(&fast_path).expect("open for delete");
         assert!(fast_index.soft_delete("doc-b").expect("soft_delete"));
+        // See the note in `ann_search_excludes_tombstoned_docs`: the writable
+        // mapping must be released before the two-tier reader lock is taken.
+        drop(fast_index);
 
         let config = TwoTierConfig {
             hnsw_threshold: 1,
@@ -5864,6 +6286,919 @@ mod tests {
         );
         assert_eq!(owner.row(0).expect("row 0").doc_id(), "doc-a");
         assert_eq!(index.doc_count(), 2);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// C2, the mutation classes `admitted_owner_reads_survive_path_replacement`
+    /// does not reach. Rename-then-plant only proves the owner ignores the
+    /// PATHNAME. These three mutate the admitted inode itself -- truncated in
+    /// place, overwritten in place with a same-length foreign image, and
+    /// replaced by a fresh file that reuses the freed descriptor slot -- which
+    /// is what a mapping-backed or lazily re-read owner would actually
+    /// observe. Every borrowed view, the witness, and the served rows must be
+    /// unchanged, because the admitted bytes are the authority.
+    #[test]
+    fn admitted_owner_survives_in_place_truncation_swap_and_descriptor_reuse() {
+        let dir = temp_index_dir("admitted-v2-inode-mutation");
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let fast_path = dir.join(VECTOR_INDEX_FAST_FILENAME);
+        let (fast_binding, _) = fsvi_v2_binding("inode-mutation-model", 4, 11);
+        let rows: [(&str, &[f32]); 2] = [
+            ("doc-a", &[1.0, 0.0, 0.0, 0.0]),
+            ("doc-b", &[0.0, 1.0, 0.0, 0.0]),
+        ];
+        write_v2_tier(&fast_path, &fast_binding, &rows);
+        let admitted_bytes = fs::read(&fast_path).expect("read admitted image");
+
+        let paths = TwoTierIndexPaths::new(&fast_path);
+        let index = TwoTierIndex::open_admitted_v2_with_paths(
+            &paths,
+            TwoTierConfig::default(),
+            &fast_binding,
+            None,
+        )
+        .expect("admit fast v2 tier");
+        let witness_before = index
+            .fast_admitted_owner()
+            .expect("retained owner")
+            .witness()
+            .clone();
+        let fingerprint_before = index.fast_space_fingerprint_hex().map(str::to_owned);
+
+        let assert_owner_intact = |label: &str| {
+            let owner = index.fast_admitted_owner().expect("retained owner");
+            assert_eq!(owner.witness(), &witness_before, "{label}: witness");
+            assert_eq!(
+                owner.owned_byte_len(),
+                admitted_bytes.len(),
+                "{label}: owned byte length"
+            );
+            assert_eq!(
+                owner.row(0).expect("row 0").doc_id(),
+                "doc-a",
+                "{label}: borrowed row view"
+            );
+            assert_eq!(
+                index.fast_space_fingerprint_hex().map(str::to_owned),
+                fingerprint_before,
+                "{label}: space fingerprint"
+            );
+            assert_eq!(index.doc_count(), 2, "{label}: doc count");
+            let hits = index
+                .search_fast(&[0.0, 1.0, 0.0, 0.0], 1)
+                .unwrap_or_else(|error| panic!("{label}: search failed: {error}"));
+            assert_eq!(hits[0].doc_id, "doc-b", "{label}: served rows");
+        };
+        assert_owner_intact("before any mutation");
+
+        // (i) truncate the admitted inode to nothing, in place.
+        fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&fast_path)
+            .expect("truncate admitted inode");
+        assert_eq!(
+            fs::metadata(&fast_path).expect("stat truncated").len(),
+            0,
+            "the fixture must really have truncated the source"
+        );
+        assert_owner_intact("after in-place truncation");
+
+        // (ii) overwrite the same inode with a same-length foreign image, so
+        // no length check could notice the substitution.
+        let foreign = vec![0x5a_u8; admitted_bytes.len()];
+        assert_ne!(foreign, admitted_bytes);
+        fs::write(&fast_path, &foreign).expect("overwrite admitted inode in place");
+        assert_owner_intact("after same-length in-place byte swap");
+
+        // (iii) unlink and recreate, so the pathname resolves to a brand new
+        // inode and the freed descriptor slot is reused by an unrelated open.
+        fs::remove_file(&fast_path).expect("unlink admitted source");
+        let decoy = dir.join("descriptor-reuse-decoy");
+        let decoy_handle = fs::File::create(&decoy).expect("claim the freed descriptor slot");
+        write_v2_tier(
+            &fast_path,
+            &fsvi_v2_binding("descriptor-reuse-impostor", 4, 12).0,
+            &[("doc-impostor", &[0.0, 0.0, 1.0, 0.0])],
+        );
+        assert_owner_intact("after unlink, descriptor reuse, and re-creation");
+        drop(decoy_handle);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// C3: fast and quality owners are independent even when their identities
+    /// agree on every field a subset comparison would look at. Both tiers here
+    /// carry the same model id, dimension, storage identity and generation
+    /// sequence, so anything that keyed off "identities compare equal" would
+    /// happily serve one owner for both; the owners must still be two distinct
+    /// admissions over two distinct byte images, and each tier must serve its
+    /// own rows.
+    #[test]
+    fn same_identity_fast_and_quality_tiers_retain_independent_owners() {
+        let dir = temp_index_dir("admitted-v2-independent-owners");
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let fast_path = dir.join(VECTOR_INDEX_FAST_FILENAME);
+        let quality_path = dir.join(VECTOR_INDEX_QUALITY_FILENAME);
+        let (fast_binding, _) = fsvi_v2_binding("indistinguishable-model", 4, 21);
+        let (quality_binding, _) = fsvi_v2_binding("indistinguishable-model", 4, 21);
+        let fast_rows: [(&str, &[f32]); 2] = [
+            ("doc-a", &[1.0, 0.0, 0.0, 0.0]),
+            ("doc-b", &[0.0, 1.0, 0.0, 0.0]),
+        ];
+        let quality_rows: [(&str, &[f32]); 2] = [
+            ("doc-a", &[1.0, 0.0, 0.0, 0.0]),
+            ("doc-b", &[0.0, 0.0, 1.0, 0.0]),
+        ];
+        write_v2_tier(&fast_path, &fast_binding, &fast_rows);
+        write_v2_tier(&quality_path, &quality_binding, &quality_rows);
+
+        let paths = TwoTierIndexPaths::new(&fast_path).with_quality_index(&quality_path);
+        let index = TwoTierIndex::open_admitted_v2_with_paths(
+            &paths,
+            TwoTierConfig::default(),
+            &fast_binding,
+            Some(&quality_binding),
+        )
+        .expect("admit both v2 tiers");
+
+        let fast_owner = index.fast_admitted_owner().expect("fast owner");
+        let quality_owner = index.quality_admitted_owner().expect("quality owner");
+        assert_eq!(
+            fast_owner.identity_v2().space_fingerprint,
+            quality_owner.identity_v2().space_fingerprint,
+            "the fixture is only meaningful while the two identities are indistinguishable"
+        );
+        assert!(
+            !std::ptr::eq(fast_owner, quality_owner),
+            "each tier retains its own admission owner"
+        );
+        // Distinct byte images: doc-b's vector differs between the tiers, so
+        // an aliased owner would serve the fast vectors for quality reads.
+        assert_ne!(
+            fast_owner.witness().whole_image_sha256,
+            quality_owner.witness().whole_image_sha256,
+            "two independent admissions over two artifacts must witness \
+             different images"
+        );
+        assert_eq!(
+            index
+                .quality_vector_for_doc_id("doc-b")
+                .expect("quality vector lookup")
+                .expect("doc-b is present in the quality tier"),
+            vec![0.0, 0.0, 1.0, 0.0],
+            "the quality tier must serve its own vectors, not the fast tier's"
+        );
+        assert_eq!(
+            index
+                .search_fast(&[0.0, 1.0, 0.0, 0.0], 1)
+                .expect("fast search")[0]
+                .doc_id,
+            "doc-b",
+            "the fast tier keeps serving its own vectors"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// C5 + C2 refresh: a refused candidate leaves the retained owner
+    /// serving byte-identically, an accepted one installs, and a reader that
+    /// opened its own index over the same artifacts is unaffected by either
+    /// outcome. The failed and successful halves run against the SAME index
+    /// in the same test, so neither can pass by the seam being inert.
+    #[test]
+    fn refused_candidate_leaves_the_retained_owner_serving_and_accepted_one_installs() {
+        let dir = temp_index_dir("admitted-v2-candidate-refresh");
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let fast_path = dir.join(VECTOR_INDEX_FAST_FILENAME);
+        let (generation_one, _) = fsvi_v2_binding("refresh-model", 4, 31);
+        let incumbent_rows: [(&str, &[f32]); 2] = [
+            ("doc-a", &[1.0, 0.0, 0.0, 0.0]),
+            ("doc-b", &[0.0, 1.0, 0.0, 0.0]),
+        ];
+        write_v2_tier(&fast_path, &generation_one, &incumbent_rows);
+
+        let paths = TwoTierIndexPaths::new(&fast_path);
+        let mut index = TwoTierIndex::open_admitted_v2_with_paths(
+            &paths,
+            TwoTierConfig::default(),
+            &generation_one,
+            None,
+        )
+        .expect("admit generation one");
+        // An independent reader over the same artifact, held across both
+        // refresh attempts.
+        let reader = TwoTierIndex::open_admitted_v2_with_paths(
+            &paths,
+            TwoTierConfig::default(),
+            &generation_one,
+            None,
+        )
+        .expect("second reader admits generation one");
+
+        let incumbent_witness = index
+            .fast_admitted_owner()
+            .expect("retained owner")
+            .witness()
+            .clone();
+        let reader_witness = reader
+            .fast_admitted_owner()
+            .expect("reader owner")
+            .witness()
+            .clone();
+
+        // (i) REFUSED: the artifact on disk is still generation one, but the
+        // caller presents generation two's binding. Admission must reject it.
+        let (generation_two, _) = fsvi_v2_binding("refresh-model", 4, 32);
+        let refusal = index
+            .try_replace_admitted_v2(&paths, &generation_two, None)
+            .expect_err("a candidate whose identity does not match the artifact is refused");
+        assert!(
+            matches!(
+                refusal,
+                SearchError::InvalidConfig { ref field, .. } if field == "two_tier.fast_v2_admission"
+            ),
+            "got {refusal:?}"
+        );
+        assert_eq!(
+            index
+                .fast_admitted_owner()
+                .expect("incumbent still retained")
+                .witness(),
+            &incumbent_witness,
+            "a refused candidate must not modify or evict the retained owner"
+        );
+        assert_eq!(
+            index
+                .search_fast(&[0.0, 1.0, 0.0, 0.0], 1)
+                .expect("incumbent still serves")[0]
+                .doc_id,
+            "doc-b"
+        );
+        assert_eq!(index.doc_count(), 2);
+
+        // (ii) ACCEPTED: publish a real generation two and refresh into it.
+        let successor_rows: [(&str, &[f32]); 3] = [
+            ("doc-a", &[1.0, 0.0, 0.0, 0.0]),
+            ("doc-b", &[0.0, 1.0, 0.0, 0.0]),
+            ("doc-c", &[0.0, 0.0, 1.0, 0.0]),
+        ];
+        write_v2_tier(&fast_path, &generation_two, &successor_rows);
+        index
+            .try_replace_admitted_v2(&paths, &generation_two, None)
+            .expect("a matching candidate installs");
+        let installed = index.fast_admitted_owner().expect("successor retained");
+        assert_eq!(installed.witness().generation.sequence, 32);
+        assert_ne!(
+            installed.witness(),
+            &incumbent_witness,
+            "the successor is a different admission"
+        );
+        assert_eq!(index.doc_count(), 3);
+        assert_eq!(
+            index
+                .search_fast(&[0.0, 0.0, 1.0, 0.0], 1)
+                .expect("successor serves")[0]
+                .doc_id,
+            "doc-c"
+        );
+
+        // (iii) The independent reader is untouched by either outcome: it
+        // still serves generation one from its own retained bytes, even
+        // though the pathname now holds generation two.
+        assert_eq!(
+            reader
+                .fast_admitted_owner()
+                .expect("reader owner")
+                .witness(),
+            &reader_witness,
+            "installing a successor must not disturb a live predecessor reader"
+        );
+        assert_eq!(reader.doc_count(), 2);
+        assert_eq!(
+            reader
+                .search_fast(&[0.0, 1.0, 0.0, 0.0], 1)
+                .expect("reader still serves generation one")[0]
+                .doc_id,
+            "doc-b"
+        );
+        assert!(
+            !reader
+                .search_fast(&[0.0, 0.0, 1.0, 0.0], 3)
+                .expect("reader exhaustive search")
+                .iter()
+                .any(|hit| hit.doc_id == "doc-c"),
+            "generation one has no doc-c; the reader must not observe the successor"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// C5, the partial-install case: a refresh whose FAST tier admits but
+    /// whose QUALITY tier is refused must leave BOTH incumbent tiers exactly
+    /// as they were. This is the shape a half-installed generation would
+    /// take, and it is the only shape that distinguishes "admit everything,
+    /// then install" from "install each tier as it admits".
+    #[test]
+    fn a_refused_quality_tier_leaves_both_incumbent_tiers_installed() {
+        let dir = temp_index_dir("admitted-v2-partial-install");
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let fast_path = dir.join(VECTOR_INDEX_FAST_FILENAME);
+        let quality_path = dir.join(VECTOR_INDEX_QUALITY_FILENAME);
+        let (generation_one, _) = fsvi_v2_binding("partial-install-model", 4, 61);
+        let rows: [(&str, &[f32]); 2] = [
+            ("doc-a", &[1.0, 0.0, 0.0, 0.0]),
+            ("doc-b", &[0.0, 1.0, 0.0, 0.0]),
+        ];
+        write_v2_tier(&fast_path, &generation_one, &rows);
+        write_v2_tier(&quality_path, &generation_one, &rows);
+
+        let paths = TwoTierIndexPaths::new(&fast_path).with_quality_index(&quality_path);
+        let mut index = TwoTierIndex::open_admitted_v2_with_paths(
+            &paths,
+            TwoTierConfig::default(),
+            &generation_one,
+            Some(&generation_one),
+        )
+        .expect("admit generation one on both tiers");
+        let fast_witness = index
+            .fast_admitted_owner()
+            .expect("fast owner")
+            .witness()
+            .clone();
+        let quality_witness = index
+            .quality_admitted_owner()
+            .expect("quality owner")
+            .witness()
+            .clone();
+
+        // Publish a real generation two for the FAST tier only, and leave the
+        // quality artifact at generation one. The candidate's fast binding
+        // therefore admits and its quality binding cannot.
+        let (generation_two, _) = fsvi_v2_binding("partial-install-model", 4, 62);
+        let successor_rows: [(&str, &[f32]); 3] = [
+            ("doc-a", &[1.0, 0.0, 0.0, 0.0]),
+            ("doc-b", &[0.0, 1.0, 0.0, 0.0]),
+            ("doc-c", &[0.0, 0.0, 1.0, 0.0]),
+        ];
+        write_v2_tier(&fast_path, &generation_two, &successor_rows);
+        let refusal = index
+            .try_replace_admitted_v2(&paths, &generation_two, Some(&generation_two))
+            .expect_err("a candidate whose quality tier cannot be admitted is refused whole");
+        assert!(
+            matches!(
+                refusal,
+                SearchError::InvalidConfig { ref field, .. }
+                    if field == "two_tier.quality_v2_admission"
+            ),
+            "the refusal must name the quality tier: got {refusal:?}"
+        );
+
+        assert_eq!(
+            index.fast_admitted_owner().expect("fast owner").witness(),
+            &fast_witness,
+            "the incumbent FAST owner must survive a quality-tier refusal"
+        );
+        assert_eq!(
+            index
+                .quality_admitted_owner()
+                .expect("quality owner")
+                .witness(),
+            &quality_witness,
+            "the incumbent QUALITY owner must survive too"
+        );
+        assert_eq!(index.doc_count(), 2, "no half-installed successor");
+        assert!(
+            !index
+                .search_fast(&[0.0, 0.0, 1.0, 0.0], 3)
+                .expect("incumbent still serves")
+                .iter()
+                .any(|hit| hit.doc_id == "doc-c"),
+            "the successor's doc-c must not be observable after a refused refresh"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// C3, the enumerated mismatch classes, driven through the two-tier open
+    /// rather than only through the admission layer. Each candidate differs
+    /// from the artifact in exactly ONE identity component, and every one
+    /// must be refused; the unmodified binding is the positive control in the
+    /// same test, so a seam that rejected everything could not pass.
+    #[test]
+    fn each_single_component_identity_mismatch_is_refused_at_two_tier_open() {
+        let dir = temp_index_dir("admitted-v2-mismatch-table");
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let fast_path = dir.join(VECTOR_INDEX_FAST_FILENAME);
+        let (binding, identity) = fsvi_v2_binding("mismatch-table-model", 4, 41);
+        let rows: [(&str, &[f32]); 2] = [
+            ("doc-a", &[1.0, 0.0, 0.0, 0.0]),
+            ("doc-b", &[0.0, 1.0, 0.0, 0.0]),
+        ];
+        write_v2_tier(&fast_path, &binding, &rows);
+        let paths = TwoTierIndexPaths::new(&fast_path);
+
+        // Positive control first: the exact binding admits.
+        let index = TwoTierIndex::open_admitted_v2_with_paths(
+            &paths,
+            TwoTierConfig::default(),
+            &binding,
+            None,
+        )
+        .expect("the exact binding admits");
+        assert_eq!(index.doc_count(), 2);
+        drop(index);
+
+        let generation =
+            ArtifactGenerationIdentityV1::new(41, [0x4d; 16]).expect("valid test generation");
+        // The defence is TWO layers, and this test measures both rather than
+        // assuming one. The bundle is SELF-BINDING: producer.space_fingerprint
+        // must bind the bundled space identity and space.input_contract_
+        // fingerprint must bind the bundled input contract, so a candidate
+        // whose model, tokenizer, dimension or input contract disagrees with
+        // the rest of its own bundle cannot even be FROZEN -- it is refused
+        // before an admission call is reachable. Components that are legally
+        // independent freeze fine and must then be refused by admission.
+        for (label, mutation) in [
+            (
+                "tokenizer",
+                Box::new(|bundle: &mut EmbeddingIdentityBundleV1| {
+                    "a-different-tokenizer".clone_into(&mut bundle.space.tokenizer_fingerprint);
+                }) as Box<dyn Fn(&mut EmbeddingIdentityBundleV1)>,
+            ),
+            (
+                "input contract",
+                Box::new(|bundle: &mut EmbeddingIdentityBundleV1| {
+                    "a-different-canonicalization".clone_into(&mut bundle.input.canonicalization);
+                }),
+            ),
+            (
+                "storage endianness",
+                Box::new(|bundle: &mut EmbeddingIdentityBundleV1| {
+                    "big-endian".clone_into(&mut bundle.storage.endianness);
+                }),
+            ),
+        ] {
+            let mut mutated = identity.clone();
+            mutation(&mut mutated);
+            assert!(
+                mutated.freeze().is_err(),
+                "{label}: an identity the format cannot represent must not be constructible"
+            );
+        }
+
+        let mutate = |mutation: &dyn Fn(&mut EmbeddingIdentityBundleV1)| {
+            let mut mutated = identity.clone();
+            mutation(&mut mutated);
+            FsviV2IdentityBinding::new(
+                generation,
+                mutated.freeze().expect("freeze mutated identity"),
+            )
+            .expect("valid binding over a mutated identity")
+        };
+
+        type IdentityMutation = Box<dyn Fn(&mut EmbeddingIdentityBundleV1)>;
+        let cases: [(&str, IdentityMutation); 2] = [
+            (
+                "producer attestation",
+                Box::new(|bundle: &mut EmbeddingIdentityBundleV1| {
+                    "a-different-backend".clone_into(&mut bundle.producer.backend);
+                }),
+            ),
+            (
+                "quantization",
+                Box::new(|bundle: &mut EmbeddingIdentityBundleV1| {
+                    bundle.storage.quantization = QuantizationFormat::F32;
+                }),
+            ),
+        ];
+
+        // Space-level classes, as coherent bundles: a different model and a
+        // different output dimension each produce a valid but different
+        // embedding space, which is what a caller would actually present
+        // after a re-embed.
+        for (label, candidate) in [
+            ("model", fsvi_v2_binding("a-different-model", 4, 41).0),
+            (
+                "dimension",
+                fsvi_v2_binding("mismatch-table-model", 8, 41).0,
+            ),
+        ] {
+            let error = TwoTierIndex::open_admitted_v2_with_paths(
+                &paths,
+                TwoTierConfig::default(),
+                &candidate,
+                None,
+            )
+            .err()
+            .unwrap_or_else(|| panic!("{label} mismatch must be refused"));
+            assert!(
+                matches!(
+                    error,
+                    SearchError::InvalidConfig { ref field, .. }
+                        if field == "two_tier.fast_v2_admission"
+                ),
+                "{label}: got {error:?}"
+            );
+        }
+
+        for (label, mutation) in &cases {
+            let candidate = mutate(mutation.as_ref());
+            let error = TwoTierIndex::open_admitted_v2_with_paths(
+                &paths,
+                TwoTierConfig::default(),
+                &candidate,
+                None,
+            )
+            .expect_err(&format!("{label} mismatch must be refused"));
+            assert!(
+                matches!(
+                    error,
+                    SearchError::InvalidConfig { ref field, .. }
+                        if field == "two_tier.fast_v2_admission"
+                ),
+                "{label}: got {error:?}"
+            );
+        }
+
+        // A wrong GENERATION over an otherwise identical identity is refused
+        // too, so "same space, newer generation" cannot be laundered in.
+        let wrong_generation = FsviV2IdentityBinding::new(
+            ArtifactGenerationIdentityV1::new(42, [0x4d; 16]).expect("valid generation"),
+            identity.clone().freeze().expect("freeze identity"),
+        )
+        .expect("valid binding");
+        assert!(
+            TwoTierIndex::open_admitted_v2_with_paths(
+                &paths,
+                TwoTierConfig::default(),
+                &wrong_generation,
+                None,
+            )
+            .is_err(),
+            "generation mismatch must be refused"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// C6, discharged structurally rather than with a compile-fail harness
+    /// (adding one would mean a new dev-dependency, which this bead is not
+    /// the place to decide). The property is that a retained owner is only
+    /// reachable through admission: `TierSource` is private, `TwoTierIndex`
+    /// exposes owners by reference only, and the only public constructors of
+    /// an owner-backed index are the admitting ones. A v1 open — the sole
+    /// public path that takes no binding — yields no owner at all, so no
+    /// public API returns an owner that was not admitted.
+    #[test]
+    fn owners_are_reachable_only_through_admission() {
+        let dir = temp_index_dir("owner-reachability");
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let fast_path = dir.join(VECTOR_INDEX_FAST_FILENAME);
+        write_index_file(&fast_path, &[("doc-a", &[1.0, 0.0, 0.0, 0.0])])
+            .expect("write v1 fixture");
+
+        // Every non-admitting public constructor: no owner, and no fabricated
+        // identity to stand in for one.
+        let opened = TwoTierIndex::open(&dir, TwoTierConfig::default()).expect("v1 open");
+        assert!(opened.fast_admitted_owner().is_none());
+        assert!(opened.quality_admitted_owner().is_none());
+        assert!(!opened.fast_identity_is_attested());
+        assert!(opened.fast_space_fingerprint_hex().is_none());
+
+        let by_paths = TwoTierIndex::open_with_paths(
+            &TwoTierIndexPaths::new(&fast_path),
+            TwoTierConfig::default(),
+        )
+        .expect("v1 open_with_paths");
+        assert!(by_paths.fast_admitted_owner().is_none());
+        assert!(!by_paths.fast_identity_is_attested());
+
+        // And v2 bytes cannot reach either of them: the v1 opener rejects the
+        // image outright, so there is no non-admitting route to an owner.
+        let v2_dir = temp_index_dir("owner-reachability-v2");
+        fs::create_dir_all(&v2_dir).expect("create temp dir");
+        let v2_path = v2_dir.join(VECTOR_INDEX_FAST_FILENAME);
+        let (binding, _) = fsvi_v2_binding("reachability-model", 4, 51);
+        write_v2_tier(&v2_path, &binding, &[("doc-a", &[1.0, 0.0, 0.0, 0.0])]);
+        assert!(
+            TwoTierIndex::open(&v2_dir, TwoTierConfig::default()).is_err(),
+            "a v2 artifact must not be reachable through the v1 opener"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&v2_dir);
+    }
+
+    /// Build a bound query embedding in the same SPACE as an artifact's
+    /// identity, so the admission law joins and only the tested component can
+    /// diverge.
+    ///
+    /// The query's storage identity is deliberately NOT the artifact's: a
+    /// query embedding is an in-process `Vec<f32>` and must carry an f32
+    /// storage identity, while the artifact persists f16. Storage is a
+    /// separate component from the embedding space, so the space fingerprints
+    /// still join — which is exactly why activation verifies space and
+    /// producer, and leaves persisted storage identity to admission, where
+    /// the artifact's own binding is the authority.
+    fn bound_query(identity: &EmbeddingIdentityBundleV1, vector: &[f32]) -> BoundQueryEmbedding {
+        let mut query_identity = identity.clone();
+        query_identity.storage.quantization = QuantizationFormat::F32;
+        "in-memory-f32".clone_into(&mut query_identity.storage.format);
+        "native-f32-values".clone_into(&mut query_identity.storage.endianness);
+        BoundQueryEmbedding::new(vector.to_vec(), query_identity)
+            .expect("bind a query embedding in the fixture's space")
+    }
+
+    /// bd-ctzo C2: the document that matters is ABSENT from the fast tier's
+    /// top-k, so `QualityOnly` must reach it by searching the quality owner
+    /// directly, and `FullProgressive` must reach it through an independent
+    /// per-tier union -- not by rescoring a fast-selected pool.
+    ///
+    /// The fixture is deliberately adversarial: the fast tier's vectors put
+    /// doc-far last, so any implementation that takes the fast top-1 and
+    /// rescores it can never surface doc-far. The final assertion is the
+    /// planted negative for exactly that anti-pattern.
+    #[test]
+    fn quality_only_and_union_reach_a_document_outside_the_fast_pool() {
+        let dir = temp_index_dir("ctzo-out-of-fast-pool");
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let fast_path = dir.join(VECTOR_INDEX_FAST_FILENAME);
+        let quality_path = dir.join(VECTOR_INDEX_QUALITY_FILENAME);
+        let (fast_binding, fast_identity) = fsvi_v2_binding("ctzo-fast-model", 4, 71);
+        let (quality_binding, quality_identity) = fsvi_v2_binding("ctzo-quality-model", 4, 71);
+
+        // doc-far is orthogonal to the fast query and adjacent to it in the
+        // quality space: the tiers genuinely disagree about relevance.
+        write_v2_tier(
+            &fast_path,
+            &fast_binding,
+            &[
+                ("doc-near", &[1.0, 0.0, 0.0, 0.0]),
+                ("doc-far", &[0.0, 0.0, 1.0, 0.0]),
+            ],
+        );
+        // The quality tier additionally holds a document the FAST TIER DOES
+        // NOT CONTAIN AT ALL. No amount of rescoring a fast-selected pool can
+        // ever produce it, which is what makes the union assertion below able
+        // to tell independent retrieval from fast-pool rescoring.
+        write_v2_tier(
+            &quality_path,
+            &quality_binding,
+            &[
+                ("doc-near", &[0.0, 0.0, 1.0, 0.0]),
+                ("doc-far", &[0.0, 0.5, 0.0, 0.0]),
+                ("doc-quality-only", &[0.0, 1.0, 0.0, 0.0]),
+            ],
+        );
+
+        let paths = TwoTierIndexPaths::new(&fast_path).with_quality_index(&quality_path);
+        let index = TwoTierIndex::open_admitted_v2_with_paths(
+            &paths,
+            TwoTierConfig::default(),
+            &fast_binding,
+            Some(&quality_binding),
+        )
+        .expect("admit both tiers");
+
+        let fast_query = bound_query(&fast_identity, &[1.0, 0.0, 0.0, 0.0]);
+        let quality_query = bound_query(&quality_identity, &[0.0, 1.0, 0.0, 0.0]);
+
+        // The fast pool at k=1 contains ONLY doc-near.
+        let fast_only_embeddings = TieredQueryEmbeddings::fast_only(fast_query.clone());
+        let fast_only = index
+            .activate_owner_backed_search(&fast_only_embeddings, Some(&fast_binding), None)
+            .expect("fast-only activation");
+        assert_eq!(fast_only.topology(), RetrievalTopology::FastOnly);
+        let fast_pool = fast_only.search_fast(1).expect("fast search");
+        assert_eq!(fast_pool[0].doc_id, "doc-near");
+        assert!(
+            !fast_pool.iter().any(|hit| hit.doc_id == "doc-far"),
+            "the fixture is only meaningful while doc-far is outside the fast pool"
+        );
+
+        // QualityOnly retrieves from the quality owner directly and reaches it.
+        let quality_only_embeddings = TieredQueryEmbeddings::quality_only(quality_query.clone());
+        let quality_only = index
+            .activate_owner_backed_search(&quality_only_embeddings, None, Some(&quality_binding))
+            .expect("quality-only activation");
+        assert_eq!(quality_only.topology(), RetrievalTopology::QualityOnly);
+        assert_eq!(
+            quality_only.search_quality(1).expect("quality search")[0].doc_id,
+            "doc-quality-only",
+            "QualityOnly must reach a document the fast tier does not even contain"
+        );
+        assert!(
+            quality_only.search_fast(1).is_err(),
+            "a quality-only activation exposes no fast retrieval"
+        );
+
+        // FullProgressive unions independent per-tier retrieval.
+        let progressive_embeddings = TieredQueryEmbeddings::progressive(fast_query, quality_query);
+        let progressive = index
+            .activate_owner_backed_search(
+                &progressive_embeddings,
+                Some(&fast_binding),
+                Some(&quality_binding),
+            )
+            .expect("progressive activation");
+        assert_eq!(progressive.topology(), RetrievalTopology::FullProgressive);
+        let union = progressive.search_union(2).expect("union");
+        let union_ids: Vec<&str> = union.iter().map(|hit| hit.doc_id.as_str()).collect();
+        // THE DISCRIMINATING ASSERTION: doc-quality-only exists in no fast
+        // pool, so a union that quietly degraded to fast-pool retrieval --
+        // or to rescoring one -- cannot satisfy this.
+        assert!(
+            union_ids.contains(&"doc-quality-only"),
+            "the union must carry independent quality retrieval, got {union_ids:?}"
+        );
+        assert!(
+            union_ids.contains(&"doc-near"),
+            "the union must also carry the fast tier's own selection, got {union_ids:?}"
+        );
+        // Deterministic order: scores descending, doc_id breaking ties, so the
+        // result never depends on which tier answered first.
+        for pair in union.windows(2) {
+            assert!(
+                pair[0].score > pair[1].score
+                    || (pair[0].score.to_bits() == pair[1].score.to_bits()
+                        && pair[0].doc_id <= pair[1].doc_id),
+                "union ordering must be deterministic, got {union_ids:?}"
+            );
+        }
+
+        // The same fixture states the anti-pattern directly: the fast pool
+        // this document would have to be rescored from never contained it.
+        assert!(
+            !fast_pool.iter().any(|hit| hit.doc_id == "doc-quality-only"),
+            "rescoring a fast-selected pool can never surface doc-quality-only; that is \
+             precisely why direct quality retrieval and the union are first-class operations"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// bd-ctzo C1/C3: every identity join happens at activation, before any
+    /// vector read is reachable. Each case diverges in exactly one component
+    /// and must be refused by field name; the matching activation in the same
+    /// test is the positive control.
+    #[test]
+    fn activation_refuses_every_identity_divergence_before_any_read() {
+        let dir = temp_index_dir("ctzo-activation-refusals");
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let fast_path = dir.join(VECTOR_INDEX_FAST_FILENAME);
+        let (binding, identity) = fsvi_v2_binding("ctzo-guard-model", 4, 81);
+        write_v2_tier(
+            &fast_path,
+            &binding,
+            &[
+                ("doc-a", &[1.0, 0.0, 0.0, 0.0]),
+                ("doc-b", &[0.0, 1.0, 0.0, 0.0]),
+            ],
+        );
+        let paths = TwoTierIndexPaths::new(&fast_path);
+        let index = TwoTierIndex::open_admitted_v2_with_paths(
+            &paths,
+            TwoTierConfig::default(),
+            &binding,
+            None,
+        )
+        .expect("admit the fast tier");
+
+        // Positive control: the matching query activates and serves.
+        let matching =
+            TieredQueryEmbeddings::fast_only(bound_query(&identity, &[1.0, 0.0, 0.0, 0.0]));
+        let activated = index
+            .activate_owner_backed_search(&matching, Some(&binding), None)
+            .expect("the matching query activates");
+        assert_eq!(activated.search_fast(1).expect("search")[0].doc_id, "doc-a");
+
+        // (i) Same dimension, different embedding space: the case raw vector
+        // APIs silently accept.
+        let (_, foreign_identity) = fsvi_v2_binding("a-foreign-model", 4, 81);
+        let foreign =
+            TieredQueryEmbeddings::fast_only(bound_query(&foreign_identity, &[1.0, 0.0, 0.0, 0.0]));
+        let error = index
+            .activate_owner_backed_search(&foreign, Some(&binding), None)
+            .expect_err("a same-dimension foreign space must be refused");
+        assert!(
+            matches!(
+                error,
+                SearchError::InvalidConfig { ref field, .. }
+                    if field == "query_embedding.fast.space_identity"
+            ),
+            "got {error:?}"
+        );
+
+        // (ii) A binding that does not describe the retained artifact.
+        let (other_binding, other_identity) = fsvi_v2_binding("another-model", 4, 81);
+        let other_query =
+            TieredQueryEmbeddings::fast_only(bound_query(&other_identity, &[1.0, 0.0, 0.0, 0.0]));
+        let error = index
+            .activate_owner_backed_search(&other_query, Some(&other_binding), None)
+            .expect_err("a binding foreign to the artifact must be refused");
+        assert!(
+            matches!(
+                error,
+                SearchError::InvalidConfig { ref field, .. }
+                    if field == "search_activation.fast.retained_identity"
+            ),
+            "got {error:?}"
+        );
+
+        // (iii) No binding at all: activation cannot proceed on the owner's
+        // word alone, because the expected bundle is not decodable from it.
+        let error = index
+            .activate_owner_backed_search(&matching, None, None)
+            .expect_err("activation requires the admitted binding");
+        assert!(
+            matches!(
+                error,
+                SearchError::InvalidConfig { ref field, .. }
+                    if field == "search_activation.fast.binding"
+            ),
+            "got {error:?}"
+        );
+
+        // (iv) A quality-bound query against an index that retains no quality
+        // owner: typed refusal, never a silent fast-tier substitution.
+        let quality_bound =
+            TieredQueryEmbeddings::quality_only(bound_query(&identity, &[1.0, 0.0, 0.0, 0.0]));
+        let error = index
+            .activate_owner_backed_search(&quality_bound, None, Some(&binding))
+            .expect_err("a missing quality owner must be refused");
+        assert!(
+            matches!(
+                error,
+                SearchError::InvalidConfig { ref field, .. }
+                    if field == "search_activation.quality.owner"
+            ),
+            "got {error:?}"
+        );
+
+        // (v) A legacy v1 index retains no owner at all, so typed activation
+        // is unreachable rather than degraded.
+        let legacy_dir = temp_index_dir("ctzo-legacy");
+        fs::create_dir_all(&legacy_dir).expect("create temp dir");
+        let legacy_path = legacy_dir.join(VECTOR_INDEX_FAST_FILENAME);
+        write_index_file(&legacy_path, &[("doc-a", &[1.0, 0.0, 0.0, 0.0])])
+            .expect("write v1 fixture");
+        let legacy =
+            TwoTierIndex::open(&legacy_dir, TwoTierConfig::default()).expect("open legacy v1");
+        let error = legacy
+            .activate_owner_backed_search(&matching, Some(&binding), None)
+            .expect_err("a legacy tier is not searchable under typed activation");
+        assert!(
+            matches!(
+                error,
+                SearchError::InvalidConfig { ref field, .. }
+                    if field == "search_activation.fast.owner"
+            ),
+            "got {error:?}"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&legacy_dir);
+    }
+
+    /// bd-ctzo C4: coverage is reconstructed from the retained owner's own
+    /// witnesses, never from a caller-supplied scalar.
+    #[test]
+    fn activated_coverage_comes_from_the_owner_witness() {
+        let dir = temp_index_dir("ctzo-coverage");
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let fast_path = dir.join(VECTOR_INDEX_FAST_FILENAME);
+        let (binding, identity) = fsvi_v2_binding("ctzo-coverage-model", 4, 91);
+        write_v2_tier(
+            &fast_path,
+            &binding,
+            &[
+                ("doc-a", &[1.0, 0.0, 0.0, 0.0]),
+                ("doc-b", &[0.0, 1.0, 0.0, 0.0]),
+                ("doc-c", &[0.0, 0.0, 1.0, 0.0]),
+            ],
+        );
+        let index = TwoTierIndex::open_admitted_v2_with_paths(
+            &TwoTierIndexPaths::new(&fast_path),
+            TwoTierConfig::default(),
+            &binding,
+            None,
+        )
+        .expect("admit the fast tier");
+        let embeddings =
+            TieredQueryEmbeddings::fast_only(bound_query(&identity, &[1.0, 0.0, 0.0, 0.0]));
+        let activated = index
+            .activate_owner_backed_search(&embeddings, Some(&binding), None)
+            .expect("activate");
+        let tier = activated.fast().expect("fast tier activated");
+        assert_eq!(tier.generation_sequence(), 91);
+        assert_eq!(tier.live_count(), 3);
+        assert_eq!(
+            tier.owner().witness().record_count,
+            3,
+            "coverage is read from the retained witness, not from the caller"
+        );
 
         let _ = fs::remove_dir_all(&dir);
     }

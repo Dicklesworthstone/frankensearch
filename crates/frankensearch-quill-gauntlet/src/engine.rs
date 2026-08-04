@@ -2240,7 +2240,7 @@ impl TantivyOracle {
         cx: &Cx,
         documents: &[frankensearch_core::IndexableDocument],
     ) -> Result<(), GauntletError> {
-        use frankensearch_core::LexicalSearch;
+        use frankensearch_core::LexicalWrite;
 
         self.campaign_freshness_verified = false;
         self.index.index_documents(cx, documents).await?;
@@ -2269,7 +2269,7 @@ pub async fn scalar_g1a_fuzz_pair(
     cx: &Cx,
     documents: &[frankensearch_core::IndexableDocument],
 ) -> Result<(QuillSubject, TantivyOracle), GauntletError> {
-    use frankensearch_core::LexicalSearch;
+    use frankensearch_core::LexicalRead;
 
     let config = QuillConfig {
         deterministic_ingest: true,
@@ -2752,7 +2752,11 @@ mod tests {
     };
 
     use super::*;
-    use crate::comparator::{ComparisonStatus, DivergenceClass, RankClass};
+    use crate::comparator::{ComparisonStatus, RankClass};
+    // Every `DivergenceClass` reference in this module sits inside a
+    // `perf-harness` block, so the import carries the same gate.
+    #[cfg(feature = "perf-harness")]
+    use crate::comparator::DivergenceClass;
 
     const E55_ID_FIELD: u16 = 0;
     const E55_CONTENT_FIELD: u16 = 1;
@@ -8182,7 +8186,7 @@ mod tests {
     #[cfg(feature = "tantivy-oracle")]
     #[test]
     fn e410_deferred_fusion_candidate_envelope_matches_on_both_engines() {
-        use frankensearch_core::{LexicalSearch, ScoreSource, ScoredResult};
+        use frankensearch_core::{LexicalRead, ScoreSource, ScoredResult};
 
         const E410_FUSION_QUERY: &str = "rust";
         const E410_FUSION_LIMIT: usize = 10;
@@ -8191,7 +8195,7 @@ mod tests {
         /// return its hydrated candidates for cross-engine comparison.
         async fn assert_deferred_envelope(
             cx: &Cx,
-            engine: &dyn LexicalSearch,
+            engine: &dyn LexicalRead,
             label: &str,
         ) -> Vec<ScoredResult> {
             let full = engine
@@ -8204,14 +8208,15 @@ mod tests {
                 full.len(),
             );
 
-            let mut candidates = engine
-                .search_fusion_candidates(cx, E410_FUSION_QUERY, E410_FUSION_LIMIT)
+            let batch = engine
+                .search_candidates(cx, E410_FUSION_QUERY, E410_FUSION_LIMIT)
                 .await
                 .unwrap_or_else(|error| panic!("{label}: fusion candidates failed: {error}"));
             assert!(
-                engine.fusion_metadata_is_deferred(),
+                batch.is_deferred(),
                 "{label}: the candidate path must advertise deferred metadata",
             );
+            let (mut candidates, pin) = batch.into_parts();
             assert_eq!(
                 candidates.len(),
                 full.len(),
@@ -8263,7 +8268,7 @@ mod tests {
             // what the full path returned for that document.
             let mut winner = candidates[..1].to_vec();
             engine
-                .hydrate_fusion_metadata(cx, &mut winner)
+                .hydrate_candidates(cx, pin.as_ref(), &mut winner)
                 .await
                 .unwrap_or_else(|error| panic!("{label}: winner-subset hydration failed: {error}"));
             assert_eq!(
@@ -8272,7 +8277,7 @@ mod tests {
             );
 
             engine
-                .hydrate_fusion_metadata(cx, &mut candidates)
+                .hydrate_candidates(cx, pin.as_ref(), &mut candidates)
                 .await
                 .unwrap_or_else(|error| panic!("{label}: hydration failed: {error}"));
             for (rank, (candidate, expected)) in candidates.iter().zip(&full).enumerate() {
@@ -8299,7 +8304,7 @@ mod tests {
             semantic_only[0].lexical_score = None;
             semantic_only[0].source = ScoreSource::SemanticFast;
             engine
-                .hydrate_fusion_metadata(cx, &mut semantic_only)
+                .hydrate_candidates(cx, pin.as_ref(), &mut semantic_only)
                 .await
                 .unwrap_or_else(|error| panic!("{label}: semantic-only hydration failed: {error}"));
             assert!(

@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tracing::Instrument as _;
 
-use frankensearch_core::LexicalSearch;
+use frankensearch_core::LexicalRead;
 
 use crate::GauntletError;
 use crate::artifact::{
@@ -245,13 +245,13 @@ pub trait DifferentialCampaignEngine: Send + Sync {
     ///
     /// CASS adapters intentionally retain the default `None`: their richer
     /// retrieval, hydration, post-filter, and CLI projection contract is not
-    /// representable by the ordinary [`LexicalSearch`] boundary.
+    /// representable by the ordinary [`LexicalRead`] boundary.
     ///
     /// # Errors
     ///
     /// Implementations may return a typed adapter error when their ordinary
     /// lexical facade cannot be exposed safely for the current lifecycle.
-    fn core_lexical_search(&self) -> Result<Option<&dyn LexicalSearch>, GauntletError> {
+    fn core_lexical_search(&self) -> Result<Option<&dyn LexicalRead>, GauntletError> {
         Ok(None)
     }
 
@@ -3164,7 +3164,7 @@ pub struct CampaignReport {
     pub execution_role: ArtifactExecutionRole,
     #[serde(default)]
     pub producer_build_identity: GauntletProducerBuildIdentity,
-    /// Optional reference to the separately persisted ArtifactStore v4
+    /// Optional reference to the separately persisted `ArtifactStore` v4
     /// Source-to-Build chain. This reference does not raise the v7 report's
     /// integrity-only trust ceiling.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -4660,7 +4660,7 @@ impl DifferentialCampaignRunner {
         })
     }
 
-    /// Attach a distinct ArtifactStore v4 Source-to-Build chain for this
+    /// Attach a distinct `ArtifactStore` v4 Source-to-Build chain for this
     /// campaign. The chain is persisted before run reservation and its two
     /// immutable identities are bound into both reservation and report.
     ///
@@ -4675,6 +4675,21 @@ impl DifferentialCampaignRunner {
         snapshots.binding()?;
         self.v4_source_build_snapshots = Some(snapshots);
         Ok(self)
+    }
+
+    /// Collect and attach the current Linux producer's sealed v4 Source and
+    /// Build objects. This records the running `/proc/self/exe` digest in the
+    /// Build object before the campaign reservation is created.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the checkout is not clean and Git-verified, a
+    /// compiler-visible input cannot be captured, or the running executable
+    /// cannot be bound through the Linux kernel-held image path.
+    pub fn with_collected_v4_source_build_snapshots(self) -> Result<Self, GauntletError> {
+        self.with_v4_source_build_snapshots(
+            ArtifactStoreV4SourceBuildSnapshots::collect_current_linux()?,
+        )
     }
 
     /// Attach immutable production provenance (bd-quill-e6-gauntlet-scale-rm3q.9).
@@ -6385,7 +6400,7 @@ async fn observe_core_lexical_bundle(
     )?;
     let lexical = engine.core_lexical_search()?.ok_or_else(|| {
         campaign_error(format!(
-            "engine {} does not expose the required ordinary LexicalSearch contract",
+            "engine {} does not expose the required ordinary LexicalRead contract",
             descriptor.implementation
         ))
     })?;
@@ -6722,7 +6737,7 @@ impl DifferentialCampaignEngine for crate::engine::QuillSubject {
         SemanticContract::scalar_g1a()
     }
 
-    fn core_lexical_search(&self) -> Result<Option<&dyn LexicalSearch>, GauntletError> {
+    fn core_lexical_search(&self) -> Result<Option<&dyn LexicalRead>, GauntletError> {
         self.require_committed()?;
         Ok(Some(self.index()?))
     }
@@ -6838,7 +6853,7 @@ impl DifferentialCampaignEngine for crate::engine::TantivyOracle {
         self.campaign_semantic_contract().clone()
     }
 
-    fn core_lexical_search(&self) -> Result<Option<&dyn LexicalSearch>, GauntletError> {
+    fn core_lexical_search(&self) -> Result<Option<&dyn LexicalRead>, GauntletError> {
         self.require_committed()?;
         Ok(Some(self.index()))
     }
@@ -6850,7 +6865,7 @@ impl DifferentialCampaignEngine for crate::engine::TantivyOracle {
         _semantic_contract: &'a SemanticContract,
     ) -> CampaignFuture<'a, ()> {
         Box::pin(async move {
-            use frankensearch_core::LexicalSearch;
+            use frankensearch_core::LexicalRead;
 
             if self.index().doc_count() != 0 {
                 return Err(campaign_error(
@@ -6868,7 +6883,7 @@ impl DifferentialCampaignEngine for crate::engine::TantivyOracle {
         documents: &'a [GeneratedDocument],
     ) -> CampaignFuture<'a, ()> {
         Box::pin(async move {
-            use frankensearch_core::LexicalSearch;
+            use frankensearch_core::LexicalWrite;
 
             self.require_ingesting()?;
             let indexable = documents
@@ -6888,7 +6903,7 @@ impl DifferentialCampaignEngine for crate::engine::TantivyOracle {
         semantic_contract: &'a SemanticContract,
     ) -> CampaignFuture<'a, EngineIndexReceipt> {
         Box::pin(async move {
-            use frankensearch_core::LexicalSearch;
+            use frankensearch_core::{LexicalRead, LexicalWrite};
 
             self.require_ingesting()?;
             self.index().commit(cx).await?;
@@ -14843,7 +14858,7 @@ mod tests {
                 inclusion_reasons: vec![
                     crate::artifact::ArtifactStoreV4SourceInclusionReason::CargoLock,
                 ],
-                mode: 0o100644,
+                mode: 0o100_644,
                 byte_len: 5,
                 sha256: sha256_bytes(b"lock\n"),
                 symlink_target: None,
@@ -17404,7 +17419,7 @@ mod tests {
     #[cfg(feature = "tantivy-oracle")]
     #[test]
     fn tantivy_campaign_adapter_rejects_wrapped_delete_to_zero_history() {
-        use frankensearch_core::LexicalSearch;
+        use frankensearch_core::{LexicalRead, LexicalWrite};
 
         let fixture = make_fixture();
         let lexical_revision = oracle_version_contract()
@@ -18314,6 +18329,8 @@ mod tests {
         }
 
         asupersync::test_utils::run_test_with_cx(|cx| async move {
+            use frankensearch_core::LexicalWrite;
+
             let fixture = make_scalar_g1a_regression_fixture();
             let (mut subject, mut oracle) = live_campaign_engines();
             subject
@@ -18781,6 +18798,8 @@ mod tests {
     #[test]
     fn mixed_chain_duplicates_and_fielded_literals_match_oracle_exactly() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
+            use frankensearch_core::LexicalWrite;
+
             let fixture = make_scalar_g1a_regression_fixture();
             let (mut subject, mut oracle) = live_campaign_engines();
             subject.claim_fresh_campaign().expect("claim subject");

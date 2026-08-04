@@ -11,11 +11,17 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ops::{Bound, Deref};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+#[cfg(any(feature = "conformance-internals", feature = "profile-internals"))]
+use std::sync::Mutex as StdMutex;
+// `AtomicBool` is needed by the profile/conformance sessions above AND by the
+// `#[cfg(test)]` RootRefreshPause below; one import covering both avoids the
+// duplicate definition that used to break `--all-targets` whenever tests ran
+// with either feature enabled.
+#[cfg(any(test, feature = "conformance-internals", feature = "profile-internals"))]
+use std::sync::atomic::AtomicBool;
 #[cfg(feature = "conformance-internals")]
 use std::sync::atomic::AtomicU8;
 use std::sync::atomic::{AtomicU64, Ordering};
-#[cfg(any(feature = "conformance-internals", feature = "profile-internals"))]
-use std::sync::{Mutex as StdMutex, atomic::AtomicBool};
 #[cfg(feature = "pruning-conformance")]
 use std::thread::ThreadId;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -28,7 +34,7 @@ use asupersync::runtime::yield_now;
 use asupersync::sync::{LockError, Mutex, OwnedMutexGuard, TryLockError};
 use frankensearch_core::{
     DocId, IndexableDocument, LexicalCandidateBatch, LexicalHydrationContext, LexicalRead,
-    LexicalSearch, LexicalWrite, ScoreSource, ScoredResult, SearchError, SearchFuture,
+    LexicalWrite, ScoreSource, ScoredResult, SearchError, SearchFuture,
 };
 #[cfg(feature = "durability")]
 use frankensearch_durability::FileProtector;
@@ -37,8 +43,6 @@ use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 #[cfg(feature = "conformance-internals")]
 use sha2::{Digest, Sha256};
-#[cfg(test)]
-use std::sync::atomic::AtomicBool;
 use thiserror::Error;
 use tracing::Instrument;
 use xxhash_rust::xxh3::{Xxh3, xxh3_64};
@@ -3611,6 +3615,18 @@ impl QueryWorkCheckpoint for QueryCheckpoint<'_> {
         self.conformance_controller
             .checkpoint(ConformanceCancellationStage::QueryCollection, self.cx);
         if units == 0 {
+            // A zero-unit admit still has to SURFACE cancellation. The
+            // conformance checkpoints above run before this guard, so they can
+            // request cancellation and then have the caller told `Ok(())`,
+            // leaving a cancelled query to keep walking its plan. No work is
+            // metered here, so only the observation and the typed error apply.
+            if self.cx.is_cancel_requested() {
+                #[cfg(feature = "profile-internals")]
+                if let Some(profile) = self.profile {
+                    profile.record_cancellation_observation();
+                }
+                return Err(ArgusError::QueryCancelled { phase: self.phase });
+            }
             return Ok(());
         }
         #[cfg(feature = "profile-internals")]
@@ -3816,7 +3832,7 @@ struct QuillReader {
 
 /// Shared Quill index handle with lock-free readers and one cancel-aware writer.
 ///
-/// The same handle implements [`LexicalSearch`] for progressive fusion and
+/// The same handle implements [`LexicalRead`] for progressive fusion and
 /// exposes synchronous reader methods for direct and synchronous consumers.
 ///
 /// ```no_run
@@ -9541,102 +9557,6 @@ impl SegmentStatsProvider for RootBoundQuillSearchIndex {
     }
 }
 
-impl LexicalSearch for QuillIndex {
-    fn search<'a>(
-        &'a self,
-        cx: &'a Cx,
-        query: &'a str,
-        limit: usize,
-    ) -> SearchFuture<'a, Vec<ScoredResult>> {
-        Box::pin(async move {
-            self.reader
-                .scored_results(cx, query, limit, true)
-                .map_err(SearchError::from)
-        })
-    }
-
-    fn search_fusion_candidates<'a>(
-        &'a self,
-        cx: &'a Cx,
-        query: &'a str,
-        limit: usize,
-    ) -> SearchFuture<'a, Vec<ScoredResult>> {
-        Box::pin(async move {
-            self.reader
-                .scored_results(cx, query, limit, false)
-                .map_err(SearchError::from)
-        })
-    }
-
-    fn fusion_metadata_is_deferred(&self) -> bool {
-        true
-    }
-
-    fn hydrate_fusion_metadata<'a>(
-        &'a self,
-        cx: &'a Cx,
-        results: &'a mut [ScoredResult],
-    ) -> SearchFuture<'a, ()> {
-        Box::pin(async move {
-            check_cancel(cx, "fusion metadata hydration").map_err(SearchError::from)?;
-            let snapshot = self.search_snapshot();
-            for result in results
-                .iter_mut()
-                .filter(|result| result.lexical_score.is_some())
-            {
-                let Some(global_docid) = snapshot
-                    .resolve_document_id(result.doc_id.as_str())
-                    .map_err(SearchError::from)?
-                else {
-                    result.metadata = None;
-                    continue;
-                };
-                result.metadata = snapshot
-                    .materialize_metadata(global_docid)
-                    .map_err(SearchError::from)?;
-            }
-            Ok(())
-        })
-    }
-
-    fn index_document<'a>(
-        &'a self,
-        cx: &'a Cx,
-        doc: &'a IndexableDocument,
-    ) -> SearchFuture<'a, ()> {
-        Box::pin(async move {
-            self.upsert_documents(cx, std::slice::from_ref(doc))
-                .await
-                .map_err(SearchError::from)
-        })
-    }
-
-    fn index_documents<'a>(
-        &'a self,
-        cx: &'a Cx,
-        docs: &'a [IndexableDocument],
-    ) -> SearchFuture<'a, ()> {
-        Box::pin(async move {
-            self.upsert_documents(cx, docs)
-                .await
-                .map_err(SearchError::from)
-        })
-    }
-
-    fn commit<'a>(&'a self, cx: &'a Cx) -> SearchFuture<'a, ()> {
-        Box::pin(async move {
-            Self::commit(self, cx)
-                .await
-                .map(drop)
-                .map_err(SearchError::from)
-        })
-    }
-
-    fn doc_count(&self) -> usize {
-        usize::try_from(Self::doc_count(self)).unwrap_or(usize::MAX)
-    }
-}
-
 /// Backend tag carried by Quill hydration contexts (bd-8nqz.1).
 pub const QUILL_LEXICAL_BACKEND: &str = "quill";
 
@@ -11103,11 +11023,18 @@ fn lower_boolean<'a>(
         QueryLoweringMode::Scored if topdocs_root => {
             #[cfg(feature = "pruning-conformance")]
             if let Some(checkpoint) = checkpoint {
-                return ReferenceScorer::boolean_topdocs_with_checkpoint(
-                    clauses,
-                    Arc::clone(checkpoint),
-                )
-                .map_err(QuillIndexError::from);
+                // `QueryCheckpointHandle` is the concrete `Arc<QueryCheckpoint>`
+                // under `profile-internals` and already `Arc<dyn ..>` otherwise.
+                // The clone must infer its type parameter from the ARGUMENT, so
+                // it is bound unannotated first; annotating it directly makes
+                // `Arc::clone` unify against `Arc<dyn ..>` and reject the
+                // concrete handle before any unsize coercion can apply. The
+                // second binding is the coercion site, and is an identity when
+                // the alias is already the trait object.
+                let handle = Arc::clone(checkpoint);
+                let checkpoint: Arc<dyn QueryWorkCheckpoint + 'a> = handle;
+                return ReferenceScorer::boolean_topdocs_with_checkpoint(clauses, checkpoint)
+                    .map_err(QuillIndexError::from);
             }
             ReferenceScorer::boolean_topdocs(clauses)
         }
@@ -13414,7 +13341,7 @@ mod tests {
 
         let cancel_context = Arc::clone(&refresh_cx);
         let cancel_pause = Arc::clone(&pause);
-        let (canceller, _) = lab
+        let (cancel_task, _) = lab
             .state
             .create_task(region, Budget::INFINITE, async move {
                 while !cancel_pause.arrived.load(Ordering::Acquire) {
@@ -13426,7 +13353,7 @@ mod tests {
             .expect("create root-bound cancellation task");
 
         lab.scheduler.lock().schedule(refresh, 0);
-        lab.scheduler.lock().schedule(canceller, 0);
+        lab.scheduler.lock().schedule(cancel_task, 0);
         let report = lab.run_until_quiescent_with_report();
         assert!(cancelled.load(Ordering::SeqCst));
         assert!(report.quiescent, "root-bound refresh schedule must quiesce");
@@ -14696,7 +14623,7 @@ mod tests {
 
     async fn e6_5_watch_oracle(cx: &Cx) -> Vec<E6_5QueryArtifact> {
         let index = QuillIndex::in_memory(deterministic_config()).expect("E6.5 watch oracle");
-        LexicalSearch::index_documents(
+        LexicalWrite::index_documents(
             &index,
             cx,
             &[
@@ -14706,12 +14633,12 @@ mod tests {
         )
         .await
         .expect("seed E6.5 watch oracle");
-        LexicalSearch::commit(&index, cx)
+        LexicalWrite::commit(&index, cx)
             .await
             .expect("publish E6.5 watch oracle");
         let mut artifacts = vec![e6_5_query_artifact(&index, cx)];
 
-        LexicalSearch::index_documents(
+        LexicalWrite::index_documents(
             &index,
             cx,
             &[
@@ -14731,14 +14658,14 @@ mod tests {
         );
         artifacts.push(e6_5_query_artifact(&index, cx));
 
-        LexicalSearch::index_document(
+        LexicalWrite::index_document(
             &index,
             cx,
             &IndexableDocument::new("third", "newcomer gamma epoch"),
         )
         .await
         .expect("stage E6.5 watch oracle newcomer");
-        LexicalSearch::commit(&index, cx)
+        LexicalWrite::commit(&index, cx)
             .await
             .expect("publish E6.5 watch oracle newcomer");
         artifacts.push(e6_5_query_artifact(&index, cx));
@@ -15477,15 +15404,15 @@ mod tests {
             let original = IndexableDocument::new("quill-doc", "native quill ownership backend")
                 .with_metadata("path", "src/lib.rs")
                 .with_metadata("lang", "rust");
-            LexicalSearch::index_document(&index, &cx, &original)
+            LexicalWrite::index_document(&index, &cx, &original)
                 .await
                 .expect("index through lexical trait");
-            LexicalSearch::commit(&index, &cx)
+            LexicalWrite::commit(&index, &cx)
                 .await
                 .expect("commit through lexical trait");
-            assert_eq!(LexicalSearch::doc_count(&index), 1);
+            assert_eq!(LexicalRead::doc_count(&index), 1);
 
-            let full = LexicalSearch::search(&index, &cx, "ownership", 10)
+            let full = LexicalRead::search(&index, &cx, "ownership", 10)
                 .await
                 .expect("full lexical search");
             assert_eq!(full.len(), 1);
@@ -15495,9 +15422,8 @@ mod tests {
             });
             assert_eq!(full[0].metadata.as_deref(), Some(&expected_metadata));
 
-            let mut candidate_future =
-                LexicalSearch::search_fusion_candidates(&index, &cx, "ownership", 10);
-            let candidates = {
+            let mut candidate_future = LexicalRead::search_candidates(&index, &cx, "ownership", 10);
+            let batch = {
                 let waker = Waker::noop();
                 let mut task_cx = Context::from_waker(waker);
                 match candidate_future.as_mut().poll(&mut task_cx) {
@@ -15506,14 +15432,17 @@ mod tests {
                 }
             };
             drop(candidate_future);
-            assert!(index.fusion_metadata_is_deferred());
+            // `is_deferred` replaces the retired `fusion_metadata_is_deferred`
+            // capability flag: the batch itself now reports the shape.
+            assert!(batch.is_deferred());
+            let (candidates, pin) = batch.into_parts();
             assert_eq!(candidates.len(), full.len());
             assert_eq!(candidates[0].doc_id, full[0].doc_id);
             assert_eq!(candidates[0].score.to_bits(), full[0].score.to_bits());
             assert!(candidates[0].metadata.is_none());
 
             let mut hydrated = candidates;
-            LexicalSearch::hydrate_fusion_metadata(&index, &cx, &mut hydrated)
+            LexicalRead::hydrate_candidates(&index, &cx, pin.as_ref(), &mut hydrated)
                 .await
                 .expect("hydrate fusion winners");
             assert_eq!(hydrated[0].metadata, full[0].metadata);
@@ -15535,32 +15464,32 @@ mod tests {
 
             let replacement = IndexableDocument::new("quill-doc", "python replacement backend")
                 .with_metadata("lang", "python");
-            LexicalSearch::index_document(&index, &cx, &replacement)
+            LexicalWrite::index_document(&index, &cx, &replacement)
                 .await
                 .expect("upsert replacement through lexical trait");
             assert!(
-                LexicalSearch::search(&index, &cx, "ownership", 10)
+                LexicalRead::search(&index, &cx, "ownership", 10)
                     .await
                     .expect("search removed content before explicit commit")
                     .is_empty()
             );
             assert_eq!(
-                LexicalSearch::search(&index, &cx, "replacement", 10)
+                LexicalRead::search(&index, &cx, "replacement", 10)
                     .await
                     .expect("search replacement before explicit commit")
                     .len(),
                 1
             );
-            LexicalSearch::commit(&index, &cx)
+            LexicalWrite::commit(&index, &cx)
                 .await
                 .expect("no-op commit after atomic replacement");
             assert!(
-                LexicalSearch::search(&index, &cx, "ownership", 10)
+                LexicalRead::search(&index, &cx, "ownership", 10)
                     .await
                     .expect("search removed content")
                     .is_empty()
             );
-            let replacement_hits = LexicalSearch::search(&index, &cx, "replacement", 10)
+            let replacement_hits = LexicalRead::search(&index, &cx, "replacement", 10)
                 .await
                 .expect("search replacement content");
             assert_eq!(replacement_hits.len(), 1);
@@ -15584,7 +15513,7 @@ mod tests {
             );
             assert_eq!(index.doc_count(), 0);
 
-            LexicalSearch::index_documents(
+            LexicalWrite::index_documents(
                 &index,
                 &cx,
                 &[
@@ -15595,7 +15524,7 @@ mod tests {
             )
             .await
             .expect("repopulate through lexical trait");
-            LexicalSearch::commit(&index, &cx)
+            LexicalWrite::commit(&index, &cx)
                 .await
                 .expect("commit repopulated backend");
             assert_eq!(
@@ -15607,7 +15536,7 @@ mod tests {
             );
             assert_eq!(index.doc_count(), 1);
             assert_eq!(
-                LexicalSearch::search(&index, &cx, "gamma", 10)
+                LexicalRead::search(&index, &cx, "gamma", 10)
                     .await
                     .expect("search batch-delete survivor")
                     .len(),
@@ -15619,11 +15548,11 @@ mod tests {
             let cancelled = cx.clone();
             cancelled.set_cancel_requested(true);
             assert!(matches!(
-                LexicalSearch::search(&index, &cancelled, "alpha", 10).await,
+                LexicalRead::search(&index, &cancelled, "alpha", 10).await,
                 Err(SearchError::Cancelled { ref phase, .. }) if phase == "search"
             ));
             assert!(matches!(
-                LexicalSearch::index_document(
+                LexicalWrite::index_document(
                     &index,
                     &cancelled,
                     &IndexableDocument::new("cancelled", "never indexed"),
@@ -15644,10 +15573,10 @@ mod tests {
                 IndexableDocument::new("second", "old beta"),
                 IndexableDocument::new("third", "old gamma"),
             ];
-            LexicalSearch::index_documents(&index, &cx, &original)
+            LexicalWrite::index_documents(&index, &cx, &original)
                 .await
                 .expect("seed lexical documents");
-            LexicalSearch::commit(&index, &cx)
+            LexicalWrite::commit(&index, &cx)
                 .await
                 .expect("publish seed generation");
             let seed_generation = index.segment_stats().published_generation;
@@ -15657,7 +15586,7 @@ mod tests {
                 IndexableDocument::new("second", "new beta"),
                 IndexableDocument::new("third", "new gamma"),
             ];
-            LexicalSearch::index_documents(&index, &cx, &replacements)
+            LexicalWrite::index_documents(&index, &cx, &replacements)
                 .await
                 .expect("publish replacement batch");
             assert_eq!(
@@ -15674,7 +15603,7 @@ mod tests {
                 3
             );
 
-            LexicalSearch::commit(&index, &cx)
+            LexicalWrite::commit(&index, &cx)
                 .await
                 .expect("commit after replacement is a no-op");
             assert_eq!(
@@ -15689,7 +15618,7 @@ mod tests {
     fn lexical_trait_disjoint_batches_accumulate_before_commit() {
         run_with_cx(|cx| async move {
             let index = QuillIndex::in_memory(deterministic_config()).expect("memory index");
-            LexicalSearch::index_documents(
+            LexicalWrite::index_documents(
                 &index,
                 &cx,
                 &[
@@ -15699,7 +15628,7 @@ mod tests {
             )
             .await
             .expect("stage first disjoint batch");
-            LexicalSearch::index_documents(
+            LexicalWrite::index_documents(
                 &index,
                 &cx,
                 &[
@@ -15710,7 +15639,7 @@ mod tests {
             .await
             .expect("stage second disjoint batch");
 
-            LexicalSearch::commit(&index, &cx)
+            LexicalWrite::commit(&index, &cx)
                 .await
                 .expect("publish both disjoint batches");
             assert_eq!(index.doc_count(), 4);
@@ -15725,14 +15654,14 @@ mod tests {
             let writer = QuillIndex::create(&cx, directory.path(), deterministic_config())
                 .await
                 .expect("create profiled writer");
-            LexicalSearch::index_document(
+            LexicalWrite::index_document(
                 &writer,
                 &cx,
                 &IndexableDocument::new("first", "profiled alpha"),
             )
             .await
             .expect("stage profiled document");
-            LexicalSearch::commit(&writer, &cx)
+            LexicalWrite::commit(&writer, &cx)
                 .await
                 .expect("publish profiled document");
             let reader = QuillSearchIndex::open(&cx, directory.path(), deterministic_config())
@@ -15847,14 +15776,14 @@ mod tests {
             let writer = QuillIndex::create(&cx, directory.path(), deterministic_config())
                 .await
                 .expect("create disabled-cache profile writer");
-            LexicalSearch::index_document(
+            LexicalWrite::index_document(
                 &writer,
                 &cx,
                 &IndexableDocument::new("first", "profiled alpha"),
             )
             .await
             .expect("stage disabled-cache profile document");
-            LexicalSearch::commit(&writer, &cx)
+            LexicalWrite::commit(&writer, &cx)
                 .await
                 .expect("publish disabled-cache profile segment");
             let reader = QuillSearchIndex::open(&cx, directory.path(), deterministic_config())
@@ -15896,14 +15825,14 @@ mod tests {
             let writer = QuillIndex::create(&cx, directory.path(), deterministic_config())
                 .await
                 .expect("create checkpoint-cancel profile writer");
-            LexicalSearch::index_document(
+            LexicalWrite::index_document(
                 &writer,
                 &cx,
                 &IndexableDocument::new("first", "profiled alpha"),
             )
             .await
             .expect("stage checkpoint-cancel profile document");
-            LexicalSearch::commit(&writer, &cx)
+            LexicalWrite::commit(&writer, &cx)
                 .await
                 .expect("publish checkpoint-cancel profile segment");
             let reader = QuillSearchIndex::open(&cx, directory.path(), deterministic_config())
@@ -15950,14 +15879,14 @@ mod tests {
             let writer = QuillIndex::create(&cx, directory.path(), config.clone())
                 .await
                 .expect("create fuel profile writer");
-            LexicalSearch::index_document(
+            LexicalWrite::index_document(
                 &writer,
                 &cx,
                 &IndexableDocument::new("first", "profiled alpha"),
             )
             .await
             .expect("stage fuel profile document");
-            LexicalSearch::commit(&writer, &cx)
+            LexicalWrite::commit(&writer, &cx)
                 .await
                 .expect("publish fuel profile segment");
             let reader = QuillSearchIndex::open(&cx, directory.path(), config)
@@ -16040,10 +15969,10 @@ mod tests {
                 IndexableDocument::new("first", "profiled alpha first"),
                 IndexableDocument::new("second", "profiled alpha second"),
             ] {
-                LexicalSearch::index_document(&writer, &cx, &document)
+                LexicalWrite::index_document(&writer, &cx, &document)
                     .await
                     .expect("stage two-segment profile document");
-                LexicalSearch::commit(&writer, &cx)
+                LexicalWrite::commit(&writer, &cx)
                     .await
                     .expect("publish one sealed profile segment");
             }
@@ -16051,7 +15980,10 @@ mod tests {
                 .await
                 .expect("open two-segment profile reader");
             let outcome = reader
-                .search_paginated_with_profile(&cx, "alpha", 10, 0, false)
+                // Field-qualified on purpose: see the fragmented-snapshot test.
+                // A bare term fans out over both parser default fields, which
+                // doubles every counter independently of segment fan-out.
+                .search_paginated_with_profile(&cx, "content:alpha", 10, 0, false)
                 .expect("execute two-segment profiled search");
             let (result, receipt) = match outcome {
                 QuillProfiledSearchOutcome::Completed { result, receipt } => (result, receipt),
@@ -16077,7 +16009,20 @@ mod tests {
     fn profiled_fragmented_snapshot_records_fanout_eligibility_and_rayon() {
         run_with_cx(|cx| async move {
             let directory = tempfile::tempdir().expect("fragmented profile directory");
-            let writer = QuillIndex::create(&cx, directory.path(), deterministic_config())
+            // The fixture needs SEGMENT_COUNT_FANOUT_THRESHOLD segments to stay
+            // LIVE so the search actually fans out. `deterministic_config()`
+            // leaves tier_fanout at DEFAULT_TIER_FANOUT, which is the same 8, so
+            // the eighth commit tripped the same-tier merge and the receipt
+            // truthfully reported one segment. Give the tier policy headroom,
+            // exactly as segment_fanout_fixture_index does for the non-profiled
+            // fan-out tests.
+            let fragmented_config = QuillConfig {
+                tier_fanout: SEGMENT_COUNT_FANOUT_THRESHOLD
+                    .checked_add(1)
+                    .expect("fan-out threshold leaves room for its tier policy"),
+                ..deterministic_config()
+            };
+            let writer = QuillIndex::create(&cx, directory.path(), fragmented_config.clone())
                 .await
                 .expect("create fragmented profile writer");
             for ordinal in 0..SEGMENT_COUNT_FANOUT_THRESHOLD {
@@ -16085,18 +16030,23 @@ mod tests {
                     format!("fragmented-{ordinal}"),
                     format!("profiled alpha fragmented {ordinal}"),
                 );
-                LexicalSearch::index_document(&writer, &cx, &document)
+                LexicalWrite::index_document(&writer, &cx, &document)
                     .await
                     .expect("stage fragmented profile document");
-                LexicalSearch::commit(&writer, &cx)
+                LexicalWrite::commit(&writer, &cx)
                     .await
                     .expect("publish fragmented profile segment");
             }
-            let reader = QuillSearchIndex::open(&cx, directory.path(), deterministic_config())
+            let reader = QuillSearchIndex::open(&cx, directory.path(), fragmented_config)
                 .await
                 .expect("open fragmented profile reader");
             let outcome = reader
-                .search_paginated_with_profile(&cx, "alpha", 16, 0, false)
+                // Field-qualified on purpose: a bare term expands across BOTH
+                // parser default fields (content and title), so every counter
+                // below would be doubled by field fan-out rather than by
+                // segment fan-out. The counter algebra this test documents --
+                // (N, N*N, N*N + N) -- is the single-field model.
+                .search_paginated_with_profile(&cx, "content:alpha", 16, 0, false)
                 .expect("execute fragmented profiled search");
             let (result, receipt) = match outcome {
                 QuillProfiledSearchOutcome::Completed { result, receipt } => (result, receipt),
@@ -16128,14 +16078,14 @@ mod tests {
             let writer = QuillIndex::create(&cx, directory.path(), deterministic_config())
                 .await
                 .expect("create durable writer");
-            LexicalSearch::index_document(
+            LexicalWrite::index_document(
                 &writer,
                 &cx,
                 &IndexableDocument::new("first", "published alpha"),
             )
             .await
             .expect("stage first document");
-            LexicalSearch::commit(&writer, &cx)
+            LexicalWrite::commit(&writer, &cx)
                 .await
                 .expect("publish first document");
 
@@ -16151,14 +16101,14 @@ mod tests {
                 "first"
             );
 
-            LexicalSearch::index_document(
+            LexicalWrite::index_document(
                 &writer,
                 &cx,
                 &IndexableDocument::new("second", "published beta"),
             )
             .await
             .expect("stage second document");
-            LexicalSearch::commit(&writer, &cx)
+            LexicalWrite::commit(&writer, &cx)
                 .await
                 .expect("publish second document");
 
@@ -18441,7 +18391,7 @@ mod tests {
                         .await
                         .expect("create E6.5 watch index"),
                 );
-                LexicalSearch::index_documents(
+                LexicalWrite::index_documents(
                     index.as_ref(),
                     &cx,
                     &[
@@ -18451,7 +18401,7 @@ mod tests {
                 )
                 .await
                 .expect("seed E6.5 watch index");
-                LexicalSearch::commit(index.as_ref(), &cx)
+                LexicalWrite::commit(index.as_ref(), &cx)
                     .await
                     .expect("publish E6.5 watch seed");
                 assert_eq!(e6_5_query_artifact(&index, &cx), allowed[0]);
@@ -18503,7 +18453,7 @@ mod tests {
                             yield_now().await;
                         }
                         let task_cx = Cx::for_testing();
-                        LexicalSearch::index_documents(
+                        LexicalWrite::index_documents(
                             writer_index.as_ref(),
                             &task_cx,
                             &[
@@ -18531,7 +18481,7 @@ mod tests {
                             yield_now().await;
                         }
 
-                        LexicalSearch::index_document(
+                        LexicalWrite::index_document(
                             writer_index.as_ref(),
                             &task_cx,
                             &IndexableDocument::new("third", "newcomer gamma epoch"),
@@ -18545,7 +18495,7 @@ mod tests {
                             writer_allowed[2],
                             "seed={seed:#018x}: uncommitted watch row became visible"
                         );
-                        LexicalSearch::commit(writer_index.as_ref(), &task_cx)
+                        LexicalWrite::commit(writer_index.as_ref(), &task_cx)
                             .await
                             .unwrap_or_else(|error| {
                                 panic!("seed={seed:#018x}: watch commit failed: {error}")
@@ -20437,16 +20387,17 @@ mod tests {
 
             // The deferred-fusion lane re-attaches winners' metadata through
             // the same boundary, so hydration must agree hit for hit.
-            let mut candidates = LexicalSearch::search_fusion_candidates(&index, &cx, "alpha", 10)
+            let batch = LexicalRead::search_candidates(&index, &cx, "alpha", 10)
                 .await
                 .expect("deferred fusion candidates");
+            let (mut candidates, pin) = batch.into_parts();
             assert!(
                 candidates
                     .iter()
                     .all(|candidate| candidate.metadata.is_none()),
                 "deferred candidates carry no metadata before hydration",
             );
-            LexicalSearch::hydrate_fusion_metadata(&index, &cx, &mut candidates)
+            LexicalRead::hydrate_candidates(&index, &cx, pin.as_ref(), &mut candidates)
                 .await
                 .expect("hydrate fusion winners");
             for candidate in &candidates {
@@ -23985,16 +23936,29 @@ mod tests {
                 "hydration must read the scoring snapshot, not the newest one"
             );
 
-            // Differential control: the legacy combined-trait hydration reads
-            // the CURRENT snapshot and returns v2 for the same retained
-            // candidates — the exact generation race.
-            LexicalSearch::hydrate_fusion_metadata(&index, &cx, &mut legacy_path)
+            // Differential control. This used to hydrate through the combined
+            // trait, which read whatever snapshot was current and so returned
+            // v2. That trait is gone, but the demonstration must not go with
+            // it — otherwise this test would only assert the happy path and
+            // would still pass if pinning silently stopped working.
+            //
+            // The replacement is stricter, because it varies ONLY the pin: the
+            // same retained generation-N candidates are hydrated against a pin
+            // taken at N+1. Getting v2 proves the snapshot the context carries
+            // is what decides the answer, which is precisely the property the
+            // split buys.
+            let (_fresh_candidates, newer_pin) =
+                LexicalRead::search_candidates(&index, &cx, "pinned", 10)
+                    .await
+                    .expect("candidates on N+1")
+                    .into_parts();
+            LexicalRead::hydrate_candidates(&index, &cx, newer_pin.as_ref(), &mut legacy_path)
                 .await
-                .expect("legacy hydration");
+                .expect("hydration against a newer pin");
             assert_eq!(
                 rev_of(&legacy_path[0]).as_deref(),
                 Some("v2"),
-                "legacy path demonstrates the race the split fixes"
+                "a newer pin must surface the newer generation — the race the split fixes"
             );
 
             // Missing context: typed rejection, never a silent no-op.

@@ -9961,6 +9961,109 @@ pub struct EncodedStoredMetaSection {
     blob_bytes: u64,
 }
 
+/// Canonical STOREDMETA bytes that keep the accumulator's field blobs borrowed.
+///
+/// Byte-for-byte the same section as
+/// [`EncodedStoredMetaSection::encode_accumulator`], emitted without
+/// materializing it first.
+///
+/// # Why this exists (`bd-4xr99`)
+///
+/// A stored byte used to be copied twice per seal: once from the caller's
+/// borrowed input into [`StoredFieldColumns`]'s owned blob, and again from that
+/// blob into the section's owned `Vec<u8>` — which the segment assembler then
+/// copied a third time into the durable buffer. Only the first copy is forced:
+/// it is where borrowed input becomes bytes that outlive the caller. The
+/// second buys nothing, because each field's blob is already contiguous and
+/// already in final order; the section merely concatenates prefixes and blobs.
+///
+/// The sibling Delta seal path never had this shape — `build_delta_stored_meta`
+/// assembles `Vec<Option<&[u8]>>` of borrowed slices — so this closes a
+/// sibling-path asymmetry rather than inventing a new representation.
+///
+/// A section is an alternating run of owned prefixes and borrowed blobs: the
+/// field directory, then per field a presence bitmap, an offset table, and that
+/// field's blob last. [`Self::write_into`] emits them in order, so the durable
+/// buffer receives each stored byte exactly once.
+#[derive(Debug)]
+pub struct BorrowedStoredMetaSection<'a> {
+    /// Owned prefix runs: `prefixes[0]` is the field directory, and
+    /// `prefixes[i + 1]` is field `i`'s presence bitmap plus offset table.
+    prefixes: Vec<Vec<u8>>,
+    /// Field blobs, borrowed from the accumulator in field order.
+    blobs: Vec<&'a [u8]>,
+    docid_lo: u64,
+    docid_hi: u64,
+    field_count: usize,
+    blob_bytes: u64,
+    total_len: usize,
+}
+
+impl BorrowedStoredMetaSection<'_> {
+    /// Exact durable length of the section this will emit.
+    #[must_use]
+    pub const fn len(&self) -> usize {
+        self.total_len
+    }
+
+    /// Whether the section carries no bytes at all.
+    #[must_use]
+    pub const fn is_empty(&self) -> bool {
+        self.total_len == 0
+    }
+
+    /// Inclusive-exclusive global docid span this section covers.
+    #[must_use]
+    pub const fn docid_range(&self) -> (u64, u64) {
+        (self.docid_lo, self.docid_hi)
+    }
+
+    /// Number of stored fields represented.
+    #[must_use]
+    pub const fn field_count(&self) -> usize {
+        self.field_count
+    }
+
+    /// Total opaque value bytes across every field.
+    #[must_use]
+    pub const fn blob_bytes(&self) -> u64 {
+        self.blob_bytes
+    }
+
+    /// Append the exact durable section bytes to `output`.
+    ///
+    /// Emits directory, then per field the prefix followed by that field's
+    /// borrowed blob — the same order the owned writer materializes.
+    pub fn write_into(&self, output: &mut Vec<u8>) {
+        let start = output.len();
+        if let Some(directory) = self.prefixes.first() {
+            output.extend_from_slice(directory);
+        }
+        for (prefix, blob) in self.prefixes.iter().skip(1).zip(&self.blobs) {
+            output.extend_from_slice(prefix);
+            output.extend_from_slice(blob);
+        }
+        debug_assert_eq!(output.len() - start, self.total_len);
+    }
+
+    /// Materialize the section into owned bytes.
+    ///
+    /// This reintroduces the copy the borrowed form exists to avoid, so it is
+    /// for tests and for callers that genuinely need an owned section.
+    #[must_use]
+    pub fn to_encoded(&self) -> EncodedStoredMetaSection {
+        let mut bytes = Vec::with_capacity(self.total_len);
+        self.write_into(&mut bytes);
+        EncodedStoredMetaSection {
+            bytes,
+            docid_lo: self.docid_lo,
+            docid_hi: self.docid_hi,
+            field_count: self.field_count,
+            blob_bytes: self.blob_bytes,
+        }
+    }
+}
+
 /// Validated exact layout for directly concatenating STOREDMETA source views.
 pub(crate) struct StoredMetaConcatPlan {
     docid_lo: u64,
@@ -10144,6 +10247,57 @@ impl EncodedStoredMetaSection {
         })
     }
 
+    /// Seal the stored columns of one Scribe accumulator into owned bytes.
+    ///
+    /// Materializes what [`BorrowedStoredMetaSection::encode_accumulator`]
+    /// produces. Prefer the borrowed form on the seal path: it emits the same
+    /// bytes without copying every field blob first (`bd-4xr99`).
+    ///
+    /// # Errors
+    ///
+    /// Returns the same typed failures as
+    /// [`BorrowedStoredMetaSection::encode_accumulator`].
+    pub fn encode_accumulator<A: TokenAnalyzer>(
+        docid_lo: u64,
+        docid_hi: u64,
+        lease_docid_base: u64,
+        accumulator: &ColumnarAccumulator<A>,
+    ) -> Result<Self, StoredMetaCodecError> {
+        Ok(BorrowedStoredMetaSection::encode_accumulator(
+            docid_lo,
+            docid_hi,
+            lease_docid_base,
+            accumulator,
+        )?
+        .to_encoded())
+    }
+
+    /// Owned counterpart of
+    /// [`BorrowedStoredMetaSection::encode_accumulator_with_limits`].
+    ///
+    /// # Errors
+    ///
+    /// Returns the same typed failures as
+    /// [`BorrowedStoredMetaSection::encode_accumulator`].
+    pub fn encode_accumulator_with_limits<A: TokenAnalyzer>(
+        docid_lo: u64,
+        docid_hi: u64,
+        lease_docid_base: u64,
+        accumulator: &ColumnarAccumulator<A>,
+        limits: StoredMetaLimits,
+    ) -> Result<Self, StoredMetaCodecError> {
+        Ok(BorrowedStoredMetaSection::encode_accumulator_with_limits(
+            docid_lo,
+            docid_hi,
+            lease_docid_base,
+            accumulator,
+            limits,
+        )?
+        .to_encoded())
+    }
+}
+
+impl<'a> BorrowedStoredMetaSection<'a> {
     /// Seal the stored columns of one Scribe accumulator directly into the
     /// segment's positional global-docid span.
     ///
@@ -10160,7 +10314,7 @@ impl EncodedStoredMetaSection {
         docid_lo: u64,
         docid_hi: u64,
         lease_docid_base: u64,
-        accumulator: &ColumnarAccumulator<A>,
+        accumulator: &'a ColumnarAccumulator<A>,
     ) -> Result<Self, StoredMetaCodecError> {
         Self::encode_accumulator_with_limits(
             docid_lo,
@@ -10181,7 +10335,7 @@ impl EncodedStoredMetaSection {
         docid_lo: u64,
         docid_hi: u64,
         lease_docid_base: u64,
-        accumulator: &ColumnarAccumulator<A>,
+        accumulator: &'a ColumnarAccumulator<A>,
         limits: StoredMetaLimits,
     ) -> Result<Self, StoredMetaCodecError> {
         let span = checked_stored_meta_span(docid_lo, docid_hi, limits)?;
@@ -10356,12 +10510,31 @@ impl EncodedStoredMetaSection {
 
         let (field_offsets, total_len) =
             stored_meta_layout(&expected_field_ords, span, &blob_lengths, limits)?;
+        // One owned prefix run per field, plus the directory at index 0. Each
+        // field's blob stays borrowed and is emitted straight into the durable
+        // buffer by `write_into`, so a stored byte is copied once per seal
+        // rather than twice (`bd-4xr99`).
+        let mut prefixes: Vec<Vec<u8>> = Vec::new();
+        prefixes
+            .try_reserve_exact(stored_fields.len() + 1)
+            .map_err(|_| StoredMetaCodecError::Allocation {
+                resource: "section prefix runs",
+                bytes: (stored_fields.len() + 1) * std::mem::size_of::<Vec<u8>>(),
+            })?;
+        let mut blobs: Vec<&'a [u8]> = Vec::new();
+        blobs.try_reserve_exact(stored_fields.len()).map_err(|_| {
+            StoredMetaCodecError::Allocation {
+                resource: "section blob views",
+                bytes: stored_fields.len() * std::mem::size_of::<&[u8]>(),
+            }
+        })?;
+
         let mut bytes = Vec::new();
         bytes
-            .try_reserve_exact(total_len)
+            .try_reserve_exact(expected_field_ords.len() * STORED_META_DIRECTORY_ENTRY_LEN)
             .map_err(|_| StoredMetaCodecError::Allocation {
-                resource: "section bytes",
-                bytes: total_len,
+                resource: "section directory bytes",
+                bytes: expected_field_ords.len() * STORED_META_DIRECTORY_ENTRY_LEN,
             })?;
         for (&field_ord, &offset) in expected_field_ords.iter().zip(&field_offsets) {
             bytes.extend_from_slice(&field_ord.to_le_bytes());
@@ -10369,13 +10542,22 @@ impl EncodedStoredMetaSection {
                 .map_err(|_| StoredMetaCodecError::OffsetUnrepresentable { field_ord, offset })?;
             bytes.extend_from_slice(&offset.to_le_bytes());
         }
+        // Running length of the section emitted so far, which the per-field
+        // `field_offset` assertions below are stated against. The owned writer
+        // read this off `bytes.len()`; the prefixes are separate buffers now,
+        // so it is tracked explicitly and means exactly the same thing.
+        let mut emitted = bytes.len();
+        prefixes.push(bytes);
 
         let presence_len = stored_meta_presence_len(span)?;
         for ((field, &field_offset), &blob_len) in
             stored_fields.iter().zip(&field_offsets).zip(&blob_lengths)
         {
-            debug_assert_eq!(bytes.len(), field_offset);
-            let presence_start = bytes.len();
+            debug_assert_eq!(emitted, field_offset);
+            // Prefix-local: this field's presence bitmap starts at 0 of its own
+            // run, where the owned writer indexed from the section start.
+            let mut bytes = Vec::new();
+            let presence_start = 0_usize;
             let presence_end = presence_start.checked_add(presence_len).ok_or(
                 StoredMetaCodecError::ArithmeticOverflow {
                     field: "presence end",
@@ -10416,29 +10598,40 @@ impl EncodedStoredMetaSection {
             }
             debug_assert_eq!(source_index, document_ords.len());
             debug_assert_eq!(usize::try_from(current_offset).ok(), Some(blob_len));
-            bytes.extend_from_slice(field.blob());
+            emitted = emitted
+                .checked_add(bytes.len())
+                .and_then(|used| used.checked_add(blob_len))
+                .ok_or(StoredMetaCodecError::ArithmeticOverflow {
+                    field: "emitted section length",
+                })?;
+            prefixes.push(bytes);
+            blobs.push(field.blob());
             tracing::debug!(
                 field_ord = field.field_ord(),
                 blob_bytes = blob_len,
                 "encoded Quill STOREDMETA accumulator field blob"
             );
         }
-        debug_assert_eq!(bytes.len(), total_len);
+        debug_assert_eq!(emitted, total_len);
         tracing::debug!(
             field_count = stored_fields.len(),
             blob_bytes = total_blob_bytes,
             section_bytes = total_len,
             "encoded Quill STOREDMETA section from Scribe accumulator"
         );
-        Ok(Self {
-            bytes,
+        Ok(BorrowedStoredMetaSection {
+            prefixes,
+            blobs,
             docid_lo,
             docid_hi,
             field_count: stored_fields.len(),
             blob_bytes: total_blob_bytes,
+            total_len,
         })
     }
+}
 
+impl EncodedStoredMetaSection {
     /// Concatenate ordered non-overlapping STOREDMETA sections.
     ///
     /// Inter-segment docid gaps become holes. Source values remain opaque; the

@@ -294,9 +294,9 @@ impl InMemoryVectorIndex {
     ///
     /// # Errors
     ///
-    /// Returns errors from [`VectorIndex::open`] or vector decoding failures.
+    /// Returns errors from [`VectorIndex::open_read_only`] or vector decoding failures.
     pub fn from_fsvi(path: &Path) -> SearchResult<Self> {
-        let index = VectorIndex::open(path)?;
+        let index = VectorIndex::open_read_only(path)?;
         Self::from_open_index(&index)
     }
 
@@ -626,7 +626,7 @@ impl InMemoryVectorIndex {
     /// Results are **bit-identical** to [`Self::search_top_k`] whenever pass-1
     /// retains the true top-k (recall = 1). Measured ~1.4–1.5× faster than the
     /// parallel exact path across 10k–100k at `candidate_multiplier = 5` (int8 is
-    /// half the bytes + an integer `mul_widen` MAC — see `docs/PERF_LEDGER.md`), at
+    /// half the bytes + an integer `widening_mul` MAC — see `docs/PERF_LEDGER.md`), at
     /// the cost of *approximate* recall.
     ///
     /// **Tuning `candidate_multiplier`:** recall@10 = 1.0 held down to `mult = 2`
@@ -1694,7 +1694,7 @@ mod tests {
         }
         writer.finish().unwrap();
 
-        let file_index = crate::VectorIndex::open(&path).unwrap();
+        let file_index = crate::VectorIndex::open_read_only(&path).unwrap();
         let memory_index = InMemoryVectorIndex::from_fsvi(&path).unwrap();
         assert_eq!(memory_index.record_count(), docs);
         assert_eq!(memory_index.dimension(), dim);

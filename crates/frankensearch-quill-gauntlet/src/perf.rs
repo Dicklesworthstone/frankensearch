@@ -4629,7 +4629,8 @@ mod tests {
 
     #[test]
     fn qg5_matrix_is_repinned_to_xlarge_after_generator_landing() {
-        let qg5 = PerfMatrixSpec::complete().for_gate(PerfGate::Qg5);
+        let matrix = PerfMatrixSpec::complete();
+        let qg5 = matrix.for_gate(PerfGate::Qg5);
         assert_eq!(qg5.len(), 3);
 
         for (cell, density) in qg5.into_iter().zip([5, 20, 50]) {

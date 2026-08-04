@@ -363,8 +363,6 @@ pub trait QueryWorkCheckpoint: Send + Sync {
     fn set_conformance_query_work_context(&self, _context: Option<ConformanceQueryWorkContext>) {}
 }
 
-/// Forward-only posting access shared by sealed and future delta segments.
-///
 /// Unforgeable evidence that a cursor's backing codec validates each
 /// post-move scorer invariant.
 ///
@@ -374,6 +372,8 @@ pub trait QueryWorkCheckpoint: Send + Sync {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct ValidatedPostMoveContract(());
 
+/// Forward-only posting access shared by sealed and future delta segments.
+///
 /// A cursor starts on its first posting. `advance` is an inclusive lower-bound
 /// seek and does not move when the current document already satisfies the
 /// target. Exhaustion is fused and represented by `None`.
@@ -5748,7 +5748,7 @@ mod tests {
         let sealed = SealedPostingCursor::new(&list, segment_num_docs)?;
         let mut cursor = CheckpointPostingCursor::new(sealed, checkpoint_for_cursor)?;
 
-        assert!(PostingCursor::has_validated_post_move_contract(&cursor));
+        assert!(PostingCursor::validated_post_move_contract(&cursor).is_some());
 
         while cursor.next()?.is_some() {}
 
@@ -7131,9 +7131,10 @@ mod tests {
             )
         };
 
-        assert!(!PostingCursor::has_validated_post_move_contract(
-            &FaultCursor::new(CursorFault::StickyNext)
-        ));
+        assert!(
+            PostingCursor::validated_post_move_contract(&FaultCursor::new(CursorFault::StickyNext))
+                .is_none()
+        );
 
         let mut sticky = scorer(CursorFault::StickyNext)?;
         assert!(matches!(sticky.next(), Err(ArgusError::CursorInvariant(_))));
@@ -7184,7 +7185,7 @@ mod tests {
         let positions = encoded_positions.position_list(&list)?;
         let mut cursor = SealedPostingCursor::with_positions(&positions, 3)?;
 
-        assert!(PostingCursor::has_validated_post_move_contract(&cursor));
+        assert!(PostingCursor::validated_post_move_contract(&cursor).is_some());
         assert_eq!(PostingCursor::doc(&cursor), Some(3));
         assert_eq!(PostingCursor::freq(&cursor), Some(2));
         let handle = PostingCursor::positions_handle(&cursor).expect("position handle");
@@ -7214,7 +7215,7 @@ mod tests {
         assert!(PostingCursor::positions_handle(&cursor).is_none());
 
         let cursor = SealedPostingCursor::new(&list, 3)?;
-        assert!(PostingCursor::has_validated_post_move_contract(&cursor));
+        assert!(PostingCursor::validated_post_move_contract(&cursor).is_some());
         assert_eq!(PostingCursor::doc(&cursor), Some(3));
         assert!(PostingCursor::positions_handle(&cursor).is_none());
         Ok(())
@@ -7242,7 +7243,7 @@ mod tests {
                 Box::new(ForcedPostMoveValidationCursor { inner: cursor })
             };
             assert_eq!(
-                cursor.has_validated_post_move_contract(),
+                cursor.validated_post_move_contract().is_some(),
                 trusted_post_move_contract,
                 "the control must select the intended post-move contract"
             );

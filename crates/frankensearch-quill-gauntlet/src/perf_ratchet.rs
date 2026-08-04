@@ -32,6 +32,12 @@ pub const PERF_MAX_REGRESSION_PCT: f64 = 5.0;
 pub const PERF_MAX_REPRODUCTION_DELTA_PCT: f64 = 5.0;
 /// Robust-z value retained as diagnostic provenance beside CI-gated decisions.
 pub const PERF_REGRESSION_ROBUST_Z: f64 = 3.0;
+/// Largest drift from identity admitted for an A/A null control's median.
+///
+/// Bounds the null's *accuracy*. Its precision is bounded separately, and in
+/// the opposite direction, by the paired A/A floor a claim must clear. See
+/// [`validate_null_control`].
+pub const PERF_MAX_NULL_MEDIAN_DRIFT_PCT: f64 = 2.0;
 
 const MAD_SCALE: f64 = 1.4826;
 const MAD_EPSILON: f64 = 1.0e-12;
@@ -426,6 +432,59 @@ pub fn evaluate_perf_ratchet(request: PerfRatchetRequest<'_>) -> PerfRatchetEval
     evaluate_perf_ratchet_inner(request, state, require_current_evidence)
 }
 
+/// The append-only quarantine register, embedded at build time.
+///
+/// bd-h4sqj: embedding rather than reading a path is deliberate. The register
+/// travels with the binary, so a structurally invalid sweep cannot be admitted
+/// by pointing the tool at some other `.bench-history` directory — a refusal
+/// that can be sidestepped by changing the working directory is not a refusal.
+/// The cost is that appending a record needs a rebuild to take effect, which for
+/// an append-only, git-versioned evidence register is the correct propagation
+/// path anyway. This mirrors how the QG sentinels are already embedded here.
+const EMBEDDED_QUARANTINE_REGISTER: &str = include_str!("../../../.bench-history/QUARANTINE.jsonl");
+
+/// Refuse promotion of evidence measured at a structurally invalid revision.
+///
+/// INTEGRITY IS NOT ADMISSIBILITY. An artifact from a quarantined sweep passes
+/// every check above this one: its bytes verify, its seal matches, and its
+/// summaries recompute from their own raw samples. That is precisely why the
+/// quarantine has to be a separate screen — nothing else in this function can
+/// see the defect, because the defect is in how the numbers were produced, not
+/// in the artifact that records them.
+///
+/// The refusal is `fatal` rather than `quarantine` on purpose.
+/// [`PerfGateDecision::Quarantine`] means evidence is "noisy, incomplete,
+/// incompatible, or still provisional" — a state a rerun can leave. A
+/// structurally invalid sweep never leaves it: re-measuring reproduces the same
+/// invalid shape, so inviting a retry would be misleading. `fatal` yields
+/// [`PerfGateDecision::Block`], and matches this file's convention that `fatal`
+/// carries contract violations while `block` carries measurement outcomes.
+fn reject_quarantined_revision(
+    role: &str,
+    evidence: &PerfEvidenceArtifact,
+    state: &mut DecisionState,
+) {
+    match crate::perf_evidence::PerfQuarantineRegister::from_jsonl(EMBEDDED_QUARANTINE_REGISTER) {
+        Ok(register) => {
+            if let Err(error) = register.screen(evidence) {
+                state.fatal(
+                    "perf.ratchet.quarantined_revision",
+                    format!("{role} {error}"),
+                );
+            }
+        }
+        Err(error) => {
+            // A register that will not parse must never read as "nothing is
+            // quarantined". Failing closed here means a malformed register
+            // blocks promotion instead of silently disarming the screen.
+            state.fatal(
+                "perf.ratchet.quarantine_register_unusable",
+                format!("embedded quarantine register cannot be read: {error}"),
+            );
+        }
+    }
+}
+
 fn validate_machine_profile_promotion(
     request: &PerfRatchetRequest<'_>,
     plan: &PerfApplicabilityPlan,
@@ -580,6 +639,9 @@ fn validate_machine_profile_promotion(
             );
             continue;
         }
+        // Screened immediately after integrity, because a quarantined artifact
+        // passes that check: it is intact evidence of an invalid measurement.
+        reject_quarantined_revision(role, evidence, state);
         let Some(bound_identity) = evidence.machine_class.identity() else {
             state.quarantine(
                 "perf.ratchet.machine_identity_unverified",
@@ -2538,25 +2600,48 @@ fn compare_reproduction(
     }
 }
 
+/// Admit an A/A control on its **accuracy** — is its median at 1.0? — and never
+/// on how precisely it was measured.
+///
+/// # Why not "the median CI must contain 1.0"
+///
+/// That clause, which this replaced (`bd-pjh09`), coupled admission to the
+/// null's precision in the wrong direction: a tighter null has a narrower CI,
+/// so it is *more* likely to exclude 1.0 and quarantine its own row — whatever
+/// its residual bias, and whatever the size of the effect being measured. It
+/// punished exactly the measurement quality this harness exists to buy, and it
+/// made admission a property of the host's noise rather than of the code.
+///
+/// Measured on one ELF across `taskset`-pinned cores, a reproducible planted
+/// effect held its ratio to 1.16% while that clause flipped its verdict on 6 of
+/// 20 cells, purely as a function of which core and how many rounds. Every one
+/// of those vetoed nulls had a median within 0.21% of 1.0 — they were rejected
+/// for being precise, not for being wrong.
+///
+/// The CI stays in the quarantine message as provenance, and the null's spread
+/// still sets the floor a claim has to clear elsewhere; only the median decides
+/// whether the sampler itself can be trusted.
 fn validate_null_control(cell: &PerfCellResult, role: &str, state: &mut DecisionState) -> bool {
-    let contains_identity =
-        cell.distribution.median_ci95_low <= 1.0 && 1.0 <= cell.distribution.median_ci95_high;
-    if !contains_identity {
+    let drift_pct = (cell.distribution.p50 - 1.0).abs() * 100.0;
+    let unbiased = drift_pct <= PERF_MAX_NULL_MEDIAN_DRIFT_PCT;
+    if !unbiased {
         state.quarantine(
             "perf.ratchet.invalid_null_control",
             format!(
-                "{role} {}/{}/{} A/A median CI [{:.6}, {:.6}] does not contain 1.0 \
-                 (cv_pct={:.3} is provenance only)",
+                "{role} {}/{}/{} A/A median {:.6} drifts {drift_pct:.3}% from 1.0 \
+                 (limit {PERF_MAX_NULL_MEDIAN_DRIFT_PCT:.3}%; median CI [{:.6}, {:.6}] \
+                 and cv_pct={:.3} are provenance only)",
                 cell.fixture,
                 cell.metric,
                 cell.engine,
+                cell.distribution.p50,
                 cell.distribution.median_ci95_low,
                 cell.distribution.median_ci95_high,
                 cell.distribution.cv_pct,
             ),
         );
     }
-    contains_identity
+    unbiased
 }
 
 fn confidence_interval_confirms_regression(
@@ -3240,6 +3325,71 @@ mod tests {
         }
     }
 
+    /// An A/A control is admitted on its median, not on how wide its CI is.
+    ///
+    /// Both fixtures are shapes the retired straddle clause got backwards
+    /// (`bd-pjh09`): it quarantined the precise one for excluding 1.0, and
+    /// waved the biased one through because its wide CI happened to span 1.0.
+    #[test]
+    fn null_control_admits_on_median_accuracy_not_on_ci_width() {
+        let null_cell = |p50: f64, low: f64, high: f64| PerfCellResult {
+            fixture: "bulk/medium/1/positions_on".to_owned(),
+            metric: "docs_per_second_tantivy_over_tantivy".to_owned(),
+            engine: "paired_null".to_owned(),
+            unit: "ratio".to_owned(),
+            distribution: DistributionSummary {
+                median_ci95_low: low,
+                median_ci95_high: high,
+                ..distribution(p50)
+            },
+        };
+
+        // Precise: a CI 0.0007% wide sitting entirely above 1.0, median 0.02%
+        // off identity. The retired clause quarantined this.
+        let precise = null_cell(1.0002, 1.000_201, 1.000_208);
+        assert!(
+            !(precise.distribution.median_ci95_low <= 1.0
+                && 1.0 <= precise.distribution.median_ci95_high),
+            "fixture must exclude 1.0 or it does not exercise the retired clause"
+        );
+        let mut state = DecisionState::default();
+        assert!(validate_null_control(&precise, "candidate", &mut state));
+        assert!(
+            state.reasons.is_empty(),
+            "a precise null must not be quarantined: {:?}",
+            state.reasons
+        );
+
+        // Biased: median 5% off identity, CI spanning 1.0 with room. The
+        // retired clause admitted this without complaint.
+        let biased = null_cell(1.05, 0.90, 1.20);
+        assert!(
+            biased.distribution.median_ci95_low <= 1.0
+                && 1.0 <= biased.distribution.median_ci95_high,
+            "fixture must contain 1.0 or it does not exercise the retired clause"
+        );
+        let mut state = DecisionState::default();
+        assert!(!validate_null_control(&biased, "candidate", &mut state));
+        assert!(
+            state
+                .reasons
+                .iter()
+                .any(|reason| reason.code == "perf.ratchet.invalid_null_control"),
+            "a biased null must quarantine: {:?}",
+            state.reasons
+        );
+
+        // The tolerance is a boundary. Both fixtures sit a clear 1% inside and
+        // outside it rather than exactly on it, so neither assertion depends on
+        // f64 rounding through the subtraction.
+        let drift = PERF_MAX_NULL_MEDIAN_DRIFT_PCT / 100.0;
+        let at_edge = null_cell(1.0 + drift * 0.99, 0.90, 1.20);
+        let past_edge = null_cell(1.0 + drift * 1.01, 0.90, 1.20);
+        let mut state = DecisionState::default();
+        assert!(validate_null_control(&at_edge, "candidate", &mut state));
+        assert!(!validate_null_control(&past_edge, "candidate", &mut state));
+    }
+
     fn test_profile() -> MachineProfileKey {
         MachineProfileKey::new(
             crate::HardwareClassId::TrjZen35995wx,
@@ -3395,7 +3545,7 @@ mod tests {
     fn qg5_xlarge_rebaseline_rejects_a_fourfold_loss() {
         let state = qg5_target_decision(0.25);
 
-        assert_eq!(state.decision(), PerfGateDecision::Blocked);
+        assert_eq!(state.decision(), PerfGateDecision::Block);
         assert!(state.reasons.iter().any(|reason| {
             reason.code == "perf.ratchet.gate_target_missed"
                 && reason.message.contains("QG-5 20% compaction")
@@ -3406,7 +3556,7 @@ mod tests {
     fn qg5_xlarge_rebaseline_accepts_the_fivefold_threshold() {
         let state = qg5_target_decision(0.20);
 
-        assert_eq!(state.decision(), PerfGateDecision::Accepted);
+        assert_eq!(state.decision(), PerfGateDecision::Allow);
     }
 
     fn qg2_current_pair(
@@ -4003,6 +4153,75 @@ mod tests {
             ["qg6.tail_protocol_not_implemented"],
             "strict-tail QG-6 evidence reached another adjudication path: {result:#?}"
         );
+    }
+
+    /// bd-h4sqj: the whole point of the quarantine. This artifact is INTACT —
+    /// it was assembled and bound by the same helper every other promotion test
+    /// uses, so it verifies, seals, and recomputes. Only its measured revision
+    /// belongs to the structurally invalid 193d2e3f sweep, and that alone must
+    /// block promotion.
+    #[test]
+    fn evidence_measured_at_a_quarantined_revision_blocks_promotion() {
+        let (_artifact, mut evidence) = qg6_complete_pair("baseline", [[1.0; 3]; 4]);
+        evidence.provenance.build.git_revision =
+            "193d2e3fa1b2c3d4e5f60718293a4b5c6d7e8f90".to_owned();
+
+        let mut state = DecisionState::default();
+        reject_quarantined_revision("baseline", &evidence, &mut state);
+
+        assert_eq!(
+            state.decision(),
+            PerfGateDecision::Block,
+            "a quarantined revision must BLOCK, not merely quarantine: Quarantine means \
+             'rerun may help', and re-measuring a structurally invalid sweep reproduces the \
+             same invalid shape"
+        );
+        assert!(
+            state.reasons.iter().any(|reason| {
+                reason.code == "perf.ratchet.quarantined_revision"
+                    && reason.message.contains("baseline")
+            }),
+            "the refusal must name its role and reason: {:#?}",
+            state.reasons
+        );
+    }
+
+    /// The screen must DISCRIMINATE. Asserting only the refusal above would
+    /// still pass if the quarantine degenerated into blocking every artifact,
+    /// which would take the whole ratchet offline while looking like coverage.
+    #[test]
+    fn evidence_from_an_unquarantined_revision_is_not_blocked_by_the_quarantine_screen() {
+        let (_artifact, evidence) = qg6_complete_pair("baseline", [[1.0; 3]; 4]);
+        let mut state = DecisionState::default();
+        reject_quarantined_revision("baseline", &evidence, &mut state);
+
+        assert_eq!(
+            state.decision(),
+            PerfGateDecision::Allow,
+            "an unquarantined revision must pass the quarantine screen untouched: {:#?}",
+            state.reasons
+        );
+    }
+
+    /// Guards the `include_str!` wiring itself. If the register path breaks, the
+    /// file is emptied, or a record is dropped, the screen would silently admit
+    /// the sweep it exists to refuse — so the embedded bytes are asserted to
+    /// still cover every named revision.
+    #[test]
+    fn the_embedded_quarantine_register_covers_every_named_sweep_revision() {
+        let register =
+            crate::perf_evidence::PerfQuarantineRegister::from_jsonl(EMBEDDED_QUARANTINE_REGISTER)
+                .expect("the embedded quarantine register must parse");
+        for revision in [
+            "193d2e3fa1b2c3d4e5f60718293a4b5c6d7e8f90",
+            "544ffeb0112233445566778899aabbccddeeff00",
+            "e0dc6ba3ffeeddccbbaa99887766554433221100",
+        ] {
+            assert!(
+                register.quarantine_of(revision).is_some(),
+                "{revision} must remain quarantined by the embedded register"
+            );
+        }
     }
 
     #[test]

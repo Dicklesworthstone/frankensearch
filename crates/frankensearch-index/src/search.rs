@@ -2569,7 +2569,7 @@ mod tests {
             ],
         )
         .expect("write index");
-        let file_backed = VectorIndex::open(&path).expect("open index");
+        let file_backed = VectorIndex::open_read_only(&path).expect("open index");
         let in_memory = crate::InMemoryVectorIndex::from_fsvi(&path).expect("load in-memory copy");
 
         // k = 0.

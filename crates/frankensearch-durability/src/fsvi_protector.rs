@@ -122,8 +122,8 @@ impl FsviProtector {
     pub fn protect_atomic(&self, fsvi_path: &Path) -> SearchResult<FsviProtectionResult> {
         let start = Instant::now();
 
-        let _source_lock = fs::File::open(fsvi_path).map_err(SearchError::Io)?;
-        acquire_shared_fsvi_map_lock(&_source_lock, fsvi_path)?;
+        let source_lock = fs::File::open(fsvi_path).map_err(SearchError::Io)?;
+        acquire_shared_fsvi_map_lock(&source_lock, fsvi_path)?;
 
         // Generate repair symbols via the inner protector.
         // FileProtector::protect_file now handles atomic write (temp + rename) internally.

@@ -865,6 +865,117 @@ pub(crate) fn read_wal(
     parse_wal_bytes(&data, expected_dimension, quantization, path)
 }
 
+/// Load WAL entries for a WRITE-capable open, quarantining a torn header.
+///
+/// [`read_wal`] is deliberately side-effect-free because the classification
+/// path ([`crate::two_tier::observe_tier`]) shares it, so a sidecar whose
+/// header is torn at or above [`WAL_HEADER_SIZE`] makes it — and therefore
+/// every future open — fail forever, while a sidecar SHORTER than the header
+/// is ignored and a torn batch TAIL is tolerated. This resolves that
+/// asymmetry for the writer path only: the corrupt sidecar is moved aside and
+/// the open continues with no WAL entries.
+///
+/// The corrupt bytes are never destroyed. They are moved, whole, to a
+/// no-clobber `<sidecar>.corrupt.<n>` sibling: stage the successor name with
+/// `create_new`, move authority to it with one atomic rename, and only then
+/// is the live pathname retired. A crash at any point leaves either the
+/// original sidecar or the quarantine copy — never neither, and never a
+/// truncated remnant. This is why the recovery cannot be a `set_len` or a
+/// `remove_file`: a green recovery test that discarded the evidence would be
+/// blessing the loss of every append the sidecar still held.
+///
+/// The quarantine runs only while holding the exclusive writer lock, so it
+/// cannot race a live appender. If another writer holds the sidecar, the
+/// original corruption error is returned unchanged rather than fighting it.
+///
+/// # Errors
+///
+/// Returns the underlying corruption error when the sidecar cannot be
+/// quarantined, and I/O errors from the quarantine itself.
+pub(crate) fn read_wal_recovering_torn_header(
+    path: &Path,
+    expected_dimension: usize,
+    quantization: Quantization,
+) -> SearchResult<(Vec<WalEntry>, u8, u64)> {
+    match read_wal(path, expected_dimension, quantization) {
+        Ok(loaded) => Ok(loaded),
+        Err(error @ SearchError::IndexCorrupted { .. }) => {
+            quarantine_torn_wal_header(path, error)?;
+            Ok((Vec::new(), 0, 0))
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// Move a sidecar with an unusable header aside, preserving every byte.
+fn quarantine_torn_wal_header(path: &Path, cause: SearchError) -> SearchResult<()> {
+    let live = match OpenOptions::new().write(true).open(path) {
+        Ok(file) => file,
+        // The sidecar vanished under us; there is nothing left to quarantine
+        // and nothing was lost that a fresh append cannot recreate.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    // Proving no appender is live is what makes moving the pathname safe.
+    // Without it this recovery would race a writer mid-batch.
+    if let Err(lock_error) = acquire_wal_writer_lock(path, &live) {
+        warn!(
+            path = %path.display(),
+            %lock_error,
+            "torn WAL header cannot be quarantined while another writer holds the sidecar"
+        );
+        return Err(cause);
+    }
+
+    let quarantine = stage_quarantine_path(path)?;
+    fs::rename(path, &quarantine)?;
+    drop(live);
+    crate::sync_parent_directory(path)?;
+    warn!(
+        path = %path.display(),
+        quarantine = %quarantine.display(),
+        cause = %cause,
+        "WAL header is unusable; sidecar quarantined and the open continues without it"
+    );
+    Ok(())
+}
+
+/// Reserve the first free `<sidecar>.corrupt.<n>` sibling.
+///
+/// `create_new` is what makes this no-clobber: an earlier quarantine copy is
+/// never overwritten, so repeated recoveries accumulate evidence instead of
+/// destroying it.
+fn stage_quarantine_path(path: &Path) -> SearchResult<PathBuf> {
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| SearchError::InvalidConfig {
+            field: "wal.quarantine".to_owned(),
+            value: path.display().to_string(),
+            reason: "WAL sidecar path has no file name component".to_owned(),
+        })?
+        .to_owned();
+    let directory = snapshot_parent_or_current(path).to_path_buf();
+    for attempt in 0..u16::MAX {
+        let mut candidate_name = file_name.clone();
+        candidate_name.push(format!(".corrupt.{attempt}"));
+        let candidate = directory.join(candidate_name);
+        match OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(_) => return Ok(candidate),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => (),
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Err(SearchError::InvalidConfig {
+        field: "wal.quarantine".to_owned(),
+        value: path.display().to_string(),
+        reason: "every quarantine name for this sidecar is already taken".to_owned(),
+    })
+}
+
 fn parse_wal_bytes(
     data: &[u8],
     expected_dimension: usize,
@@ -1087,6 +1198,7 @@ pub(crate) fn append_wal_batch(
     let mut created_fresh = false;
     let mut file = match created {
         Ok(mut file) => {
+            acquire_wal_writer_lock(wal_path, &file)?;
             created_fresh = true;
             write_wal_header(&mut file, dimension, quantization, compaction_gen)?;
             file
@@ -1105,6 +1217,11 @@ pub(crate) fn append_wal_batch(
                 .create(true)
                 .truncate(false)
                 .open(wal_path)?;
+            // Before any length is observed or offset resolved: a second
+            // appender that reads the end offset concurrently would clobber
+            // this batch, and the refusal must happen before a single byte
+            // of this one is written.
+            acquire_wal_writer_lock(wal_path, &file)?;
             let existing_len = file.metadata()?.len();
             if existing_len < WAL_HEADER_SIZE as u64 {
                 // Empty or truncated file — the creator likely crashed before
@@ -1288,6 +1405,34 @@ fn wal_corrupted(path: &Path, detail: impl Into<String>) -> SearchError {
         path: path.to_path_buf(),
         detail: detail.into(),
     }
+}
+
+fn wal_writer_lock_error(path: &Path, error: &dyn std::fmt::Display) -> SearchError {
+    SearchError::InvalidConfig {
+        field: "wal.writer_lock".to_owned(),
+        value: path.display().to_string(),
+        reason: format!(
+            "cannot acquire the exclusive WAL writer lock: {error}; this sidecar is \
+             single-writer, so the appender that holds it must finish or exit first"
+        ),
+    }
+}
+
+/// Take the sidecar's exclusive advisory lock for the duration of a mutation.
+///
+/// The lock must be held BEFORE the append offset is resolved. Two appenders
+/// that each resolve `SeekFrom::End(0)` independently derive the same offset
+/// and the second `write_all` lands on top of the first batch, so an
+/// acknowledged append disappears. Serializing after the seek would not help:
+/// the lost update is decided by when the offset is read, not by when the
+/// bytes are written.
+///
+/// This is the same retained-descriptor idiom the FSVI main file uses
+/// (`fsvi.map_lock`, bd-x06p5); it arbitrates cooperating writers and makes
+/// no claim about a process that ignores the lock entirely.
+fn acquire_wal_writer_lock(path: &Path, file: &fs::File) -> SearchResult<()> {
+    file.try_lock()
+        .map_err(|error| wal_writer_lock_error(path, &error))
 }
 
 // ─── Tests ──────────────────────────────────────────────────────────────────
@@ -2501,4 +2646,188 @@ mod tests {
     }
 
     // ─── bd-vbzm tests end ───
+
+    // ─── bd-xx286: WAL torn-header policy and single-writer arbitration ───
+
+    /// A second appender must be refused, not allowed to resolve its own
+    /// append offset behind the first one's back.
+    ///
+    /// The planted negative is the exact interleaving the unarbitrated path
+    /// permits: a foreign writer holds the sidecar while this call resolves
+    /// `SeekFrom::End(0)`. Without an arbiter both writers derive the same
+    /// end offset and the second `write_all` lands on top of the first
+    /// batch, so an acknowledged append is silently lost.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn a_second_wal_appender_is_refused_while_a_foreign_writer_holds_the_sidecar() {
+        let path = temp_wal_path("single-writer-arbitration");
+        let dimension = 4;
+        let quantization = Quantization::F16;
+
+        append_wal_batch(
+            &path,
+            &[make_entry("doc-first", 1.0, dimension)],
+            dimension,
+            quantization,
+            0,
+            false,
+        )
+        .expect("first append establishes the sidecar");
+        let committed_len = fs::metadata(&path)
+            .expect("sidecar metadata after the first append")
+            .len();
+
+        // A foreign writer — another process under the single-writer
+        // invariant — holds the sidecar for the duration of its own append.
+        let foreign = OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .expect("foreign writer opens the sidecar");
+        foreign
+            .try_lock()
+            .expect("foreign writer takes the sidecar writer lock");
+
+        let refused = append_wal_batch(
+            &path,
+            &[make_entry("doc-second", 2.0, dimension)],
+            dimension,
+            quantization,
+            0,
+            false,
+        );
+        assert!(
+            matches!(
+                &refused,
+                Err(SearchError::InvalidConfig { field, .. }) if field == "wal.writer_lock"
+            ),
+            "a second appender must be refused while another writer holds the sidecar, observed {refused:?}"
+        );
+        assert_eq!(
+            fs::metadata(&path)
+                .expect("sidecar metadata after the refusal")
+                .len(),
+            committed_len,
+            "a refused append must not have written any bytes"
+        );
+
+        // Once the foreign writer is done, the same append succeeds and the
+        // already-committed batch is still there.
+        drop(foreign);
+        append_wal_batch(
+            &path,
+            &[make_entry("doc-second", 2.0, dimension)],
+            dimension,
+            quantization,
+            0,
+            false,
+        )
+        .expect("append succeeds once the sidecar is free");
+
+        let (entries, _, _) =
+            read_wal(&path, dimension, quantization).expect("read the arbitrated sidecar");
+        let ids: Vec<&str> = entries.iter().map(|entry| entry.doc_id.as_str()).collect();
+        assert_eq!(
+            ids,
+            vec!["doc-first", "doc-second"],
+            "both acknowledged batches must survive arbitration"
+        );
+
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// A torn header at or above `WAL_HEADER_SIZE` must be quarantined, not
+    /// left to brick every future open of the index.
+    ///
+    /// The planted negative is the asymmetry the bead names: a sidecar
+    /// shorter than the header is already ignored, and a torn batch TAIL is
+    /// already tolerated, but a torn header of exactly this length is a hard
+    /// error forever. The corrupt bytes must survive the recovery — a
+    /// quarantine that deletes or truncates the evidence would make this
+    /// test pass while destroying the only copy of the lost appends.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    #[test]
+    fn a_torn_wal_header_is_quarantined_instead_of_bricking_every_read() {
+        let path = temp_wal_path("torn-header-quarantine");
+        let dimension = 4;
+        let quantization = Quantization::F16;
+
+        append_wal_batch(
+            &path,
+            &[make_entry("doc-live", 1.0, dimension)],
+            dimension,
+            quantization,
+            0,
+            false,
+        )
+        .expect("establish a valid sidecar");
+        let valid = fs::read(&path).expect("read the valid sidecar");
+        assert!(valid.len() > WAL_HEADER_SIZE);
+
+        // A torn write that landed a full-length header with the wrong magic.
+        // Shorter than this is already ignored; a torn batch tail is already
+        // tolerated; only this window is fatal today.
+        let mut torn = valid.clone();
+        torn[0] ^= 0xff;
+        fs::write(&path, &torn).expect("write the torn header");
+
+        // The pure reader must still fail, and must still leave the bytes
+        // alone: `observe_tier` documents that classification is
+        // side-effect-free and shares this exact function.
+        assert!(
+            matches!(
+                read_wal(&path, dimension, quantization),
+                Err(SearchError::IndexCorrupted { .. })
+            ),
+            "the side-effect-free reader must keep reporting the corruption"
+        );
+        assert_eq!(
+            fs::read(&path).expect("sidecar after the pure read"),
+            torn,
+            "the side-effect-free reader must not touch the sidecar"
+        );
+
+        let recovered = read_wal_recovering_torn_header(&path, dimension, quantization)
+            .expect("a torn header must not brick a write-capable open");
+        assert!(
+            recovered.0.is_empty(),
+            "a quarantined sidecar must yield no entries, observed {:?}",
+            recovered.0
+        );
+        assert!(
+            !path.exists(),
+            "the torn sidecar must be moved out of the live pathname"
+        );
+
+        let directory = snapshot_parent_or_current(&path);
+        let quarantined: Vec<_> = fs::read_dir(directory)
+            .expect("read the sidecar directory")
+            .filter_map(|entry| {
+                let entry = entry.expect("read a directory entry");
+                let name = entry.file_name();
+                name.to_string_lossy()
+                    .starts_with(&format!(
+                        "{}.corrupt",
+                        path.file_name()
+                            .expect("sidecar file name")
+                            .to_string_lossy()
+                    ))
+                    .then(|| entry.path())
+            })
+            .collect();
+        assert_eq!(
+            quarantined.len(),
+            1,
+            "exactly one quarantine copy must exist, observed {quarantined:?}"
+        );
+        assert_eq!(
+            fs::read(&quarantined[0]).expect("read the quarantined bytes"),
+            torn,
+            "the quarantine must preserve the corrupt bytes verbatim"
+        );
+
+        for stale in quarantined {
+            std::fs::remove_file(stale).ok();
+        }
+        std::fs::remove_file(&path).ok();
+    }
 }
