@@ -9433,6 +9433,7 @@ impl RootBoundQuillSearchIndex {
     /// snapshot validation. Keeping this visibility boundary separate makes
     /// cancellation linearizable: no mutable reader state is touched before
     /// the final check immediately preceding the `ArcSwap` store.
+    #[allow(clippy::unused_async_trait_impl)]
     async fn install_validated_replacement(
         &self,
         cx: &Cx,
