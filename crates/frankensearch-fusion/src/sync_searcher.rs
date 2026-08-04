@@ -18,15 +18,79 @@ use frankensearch_core::explanation::{
     ExplainedSource, ExplanationPhase, HitExplanation, RankMovement, ScoreComponent,
 };
 use frankensearch_core::filter::SearchFilter;
+use frankensearch_core::types::{BoundQueryEmbedding, TieredQueryEmbeddings};
 use frankensearch_core::{
     FusedHit, PhaseMetrics, ScoreSource, ScoredResult, SearchError, SearchPhase, SearchResult,
     TwoTierConfig, TwoTierMetrics, VectorHit, ZeroSignalReason,
 };
-use frankensearch_index::{InMemoryTwoTierIndex, SearchParams};
+use frankensearch_index::{InMemoryTwoTierIndex, InMemoryVectorIndex, SearchParams};
 
-use crate::blend::{blend_two_tier_aligned_vector_index, compute_rank_changes};
+use crate::blend::{blend_two_tier, blend_two_tier_aligned_vector_index, compute_rank_changes};
 use crate::normalize::{AdaptiveNqcDenseWeight, NqcDenseWeight, nqc_cv_iter};
 use crate::rrf::{RrfConfig, RrfTiebreak, candidate_count, fuse_by_strategy};
+
+/// The per-tier query embeddings this search is authorized to read with
+/// (bd-sync-searcher-tiered-query-embeddings-dbp10).
+///
+/// Produced by [`SyncTwoTierSearcher::admit`] BEFORE any vector is touched.
+/// Holding one is the proof that every tier this search will consult has had
+/// its space identity joined against the query bound to it — or has been
+/// typed as legacy-unidentified, which is a state, not an omission.
+struct AdmittedSyncQuery<'query> {
+    /// The fast-tier query. Always present: the sync contract is
+    /// fast-then-refine, so a search with no fast arm has no phase 1.
+    fast: &'query BoundQueryEmbedding,
+    /// The quality-tier query, when the caller bound one AND this index has a
+    /// quality tier. `None` is why phase 2 is skipped, not a licence to reuse
+    /// `fast` against the quality index.
+    quality: Option<&'query BoundQueryEmbedding>,
+}
+
+/// What the quality tier contributed to a synchronous refinement.
+///
+/// Same distinction the async searcher draws: `Retrieved` is the quality
+/// tier's OWN top-k and can name documents the fast tier never selected;
+/// `RescoredFastPool` can only re-rank what the fast tier already chose.
+/// Which one runs is decided by whether the quality tier's space identity is
+/// attested — never by convenience — so the two searchers expand the returned
+/// candidate set under the same condition.
+enum SyncQualityPool {
+    /// The quality tier's own top-k for the quality-bound query.
+    Retrieved(Vec<VectorHit>),
+    /// Quality scores aligned positionally to the fast pool. Still computed
+    /// from the QUALITY-bound query: the aligned SHAPE was never the bug, the
+    /// vector fed into it was.
+    RescoredFastPool(Vec<Option<f32>>),
+}
+
+/// Join one bound query against one tier's retained space identity, before
+/// any vector read.
+///
+/// `space_fingerprint_hex` is `None` for a legacy artifact (v1 FSVI, or the
+/// identity-less `from_vectors` constructor). That is a legal typed state:
+/// there is no identity to join against, so the query is admitted and the
+/// search proceeds exactly as it did before this type existed. Fabricating a
+/// fingerprint to "have something to check" would be worse than checking
+/// nothing, because it would look like a passing join.
+///
+/// The join is [`BoundQueryEmbedding::verify_space_identity`], the
+/// fingerprint-only check — NOT the full bd-9xuj admission law. That is a
+/// real limit and it is the index type's, not this function's:
+/// [`InMemoryVectorIndex`] retains only the space fingerprint, never the
+/// expected identity bundle, so there is nothing here to attest a producer
+/// against. A matching space fingerprint is necessary, not sufficient; the
+/// persistent `TwoTierIndex` path applies the complete law because it retains
+/// the admitted binding.
+fn admit_tier_space(
+    tier_index: &InMemoryVectorIndex,
+    query: &BoundQueryEmbedding,
+    tier: &str,
+) -> SearchResult<()> {
+    match tier_index.space_fingerprint_hex() {
+        Some(expected) => query.verify_space_identity(expected, tier),
+        None => Ok(()),
+    }
+}
 
 /// Optional synchronous lexical backend used by [`SyncTwoTierSearcher`].
 pub trait SyncLexicalSearch: Send + Sync {
@@ -391,70 +455,118 @@ impl SyncTwoTierSearcher {
 
     /// Execute a synchronous search and return the final result set + metrics.
     ///
+    /// `query` carries one bound embedding PER TIER. The former signature took
+    /// a single `&[f32]` and used it for both tiers, which meant the quality
+    /// index was scored with the fast tier's query — a cross-space read that
+    /// no dimension check can catch, because the two tiers usually have the
+    /// same width. That vector is no longer representable here.
+    ///
     /// # Errors
     ///
-    /// Returns dimension/filter errors from vector search and lexical backend
-    /// failures (when lexical fusion is enabled).
+    /// Returns [`SearchError::InvalidConfig`] when the query binds no fast
+    /// embedding, or when a tier's retained space identity does not match the
+    /// query bound to it; plus dimension/filter errors from vector search and
+    /// lexical backend failures (when lexical fusion is enabled).
     pub fn search_collect(
         &self,
-        query_vec: &[f32],
+        query: &TieredQueryEmbeddings,
         k: usize,
     ) -> SearchResult<(Vec<ScoredResult>, TwoTierMetrics)> {
-        self.search_collect_with_filter(query_vec, k, None)
+        self.search_collect_with_filter(query, k, None)
     }
 
     /// Execute a synchronous search with an optional doc-level filter.
     ///
     /// # Errors
     ///
-    /// Returns dimension/filter errors from vector search and lexical backend
-    /// failures (when lexical fusion is enabled).
+    /// Identical to [`Self::search_collect`].
     pub fn search_collect_with_filter(
         &self,
-        query_vec: &[f32],
+        query: &TieredQueryEmbeddings,
         k: usize,
         filter: Option<&dyn SearchFilter>,
     ) -> SearchResult<(Vec<ScoredResult>, TwoTierMetrics)> {
         // `search_collect` discards `outcome.phases`, so skip building them — that
         // avoids cloning the full `Vec<ScoredResult>` (N owned doc_ids each) once
         // per phase (Initial + Refined), pure waste at large `k` (limit_all).
-        let outcome = self.search_internal(query_vec, k, filter, false)?;
+        let outcome = self.search_internal(query, k, filter, false)?;
         Ok((outcome.final_results, outcome.metrics))
     }
 
     /// Execute a synchronous search and stream progressive phases via iterator.
     ///
-    /// When phase-1 retrieval fails (for example dimension mismatch), this
-    /// returns an iterator yielding a single `RefinementFailed` phase carrying
-    /// an empty `initial_results` payload.
+    /// When admission or phase-1 retrieval fails (for example a query bound to
+    /// a different embedding space than the index was built in, or a dimension
+    /// mismatch), this returns an iterator yielding a single
+    /// `RefinementFailed` phase carrying an empty `initial_results` payload.
     #[must_use]
-    pub fn search_iter(&self, query_vec: &[f32], k: usize) -> SyncSearchIterator {
-        self.search_iter_with_filter(query_vec, k, None)
+    pub fn search_iter(&self, query: &TieredQueryEmbeddings, k: usize) -> SyncSearchIterator {
+        self.search_iter_with_filter(query, k, None)
     }
 
     /// Execute a synchronous filtered search and stream progressive phases.
     #[must_use]
     pub fn search_iter_with_filter(
         &self,
-        query_vec: &[f32],
+        query: &TieredQueryEmbeddings,
         k: usize,
         filter: Option<&dyn SearchFilter>,
     ) -> SyncSearchIterator {
         // The iterator streams the progressive phases, so build them.
-        match self.search_internal(query_vec, k, filter, true) {
+        match self.search_internal(query, k, filter, true) {
             Ok(outcome) => SyncSearchIterator::new(outcome.phases),
             Err(error) => SyncSearchIterator::from_error(error),
         }
     }
 
+    /// Join every tier this search will consult against the query bound to it,
+    /// before any vector is read.
+    ///
+    /// This runs first in [`Self::search_internal`], ahead of the `k == 0` and
+    /// zero-norm short circuits, so a query in the wrong space is refused even
+    /// when the search would otherwise have exited without touching an index.
+    /// A refusal that depended on the search getting far enough to do work
+    /// would not be a guard.
+    fn admit<'query>(
+        &self,
+        query: &'query TieredQueryEmbeddings,
+    ) -> SearchResult<AdmittedSyncQuery<'query>> {
+        let fast = query.fast().ok_or_else(|| SearchError::InvalidConfig {
+            field: "sync_search.topology".to_owned(),
+            value: format!("{:?}", query.supported_topology()),
+            reason: "the synchronous progressive contract is fast-then-refine, so it requires a \
+                     fast-tier query embedding; a quality-only retrieval has no Initial phase \
+                     and belongs on the owner-backed activation surface instead"
+                .to_owned(),
+        })?;
+        admit_tier_space(self.index.fast_index(), fast, "fast")?;
+
+        let quality = match (query.quality(), self.index.quality_index()) {
+            (Some(bound), Some(quality_index)) => {
+                admit_tier_space(quality_index, bound, "quality")?;
+                Some(bound)
+            }
+            // A quality-bound query against an index with no quality tier is
+            // not an error — it is the ordinary fast-only index — and a
+            // quality tier the caller bound no embedding for is simply never
+            // consulted. Neither case licenses reusing the fast embedding.
+            _ => None,
+        };
+        Ok(AdmittedSyncQuery { fast, quality })
+    }
+
     #[allow(clippy::too_many_lines)]
     fn search_internal(
         &self,
-        query_vec: &[f32],
+        query: &TieredQueryEmbeddings,
         k: usize,
         filter: Option<&dyn SearchFilter>,
         want_phases: bool,
     ) -> SearchResult<SyncSearchOutcome> {
+        // Identity first, before k == 0, before the zero-norm check, and
+        // before any index is touched.
+        let admitted = self.admit(query)?;
+        let query_vec = admitted.fast.vector();
         let mut metrics = TwoTierMetrics::default();
         // Only the streaming iterator path consumes `phases`; `search_collect`
         // discards them. When they are not wanted, skip the allocation and the
@@ -570,12 +682,20 @@ impl SyncTwoTierSearcher {
             });
         }
 
-        if self.config.fast_only || !self.index.has_quality_index() {
+        // The quality arm needs three things: it must not be switched off, the
+        // index must have a quality tier, and — new here — the caller must
+        // have bound a QUALITY-space embedding for it. Without the third, the
+        // refined phase used to run anyway, scoring the quality index with the
+        // fast tier's vector.
+        let quality_query = admitted.quality.filter(|_| !self.config.fast_only);
+        let Some(quality_query) = quality_query else {
             // Same vocabulary as the async searcher (searcher.rs) — the two
             // sides share one skip_reason contract; "fast_only" is the string
             // the fsfs surfaces document (bd-k3089 parity suite pins this).
             metrics.skip_reason = Some(if self.config.fast_only {
                 "fast_only".to_owned()
+            } else if self.index.has_quality_index() {
+                "quality_query_embedding_absent".to_owned()
             } else {
                 "quality_index_unavailable".to_owned()
             });
@@ -584,11 +704,41 @@ impl SyncTwoTierSearcher {
                 final_results: initial_results,
                 metrics,
             });
-        }
+        };
+        let quality_index = self
+            .index
+            .quality_index()
+            .expect("admission binds a quality query only when a quality tier exists");
 
         let phase2_started = Instant::now();
-        let quality_scores = match self.index.quality_scores_for_hits(query_vec, &fast_hits) {
-            Ok(scores) => scores,
+        // TWO THINGS CHANGE HERE, and only one of them is unconditional.
+        //
+        // Unconditional: the quality tier is scored with the QUALITY-bound
+        // query. It used to be scored with the fast tier's vector, which is a
+        // cross-space read no dimension check can catch because the two tiers
+        // usually have the same width. That was the defect.
+        //
+        // Conditional: independent RETRIEVAL from the quality tier — which can
+        // surface a document the fast pool never selected (bd-ctzo C2) — runs
+        // only when the quality tier's space identity is ATTESTED, i.e. read
+        // out of an admitted FSVI v2 artifact's own header. That gate is not
+        // timidity; it keeps this path behaviourally identical to the async
+        // searcher, which can only retrieve through the owner-backed
+        // activation and rescores on a legacy artifact. Expanding the returned
+        // candidate set is conditioned on being able to prove the pool being
+        // expanded into is the right space, on both sides. A legacy pair keeps
+        // the aligned rescoring shape — with the correct vector.
+        let quality_pool = if quality_index.space_identity_is_attested() {
+            quality_index
+                .search_top_k(quality_query.vector(), fetch, filter)
+                .map(SyncQualityPool::Retrieved)
+        } else {
+            self.index
+                .quality_scores_for_hits(quality_query.vector(), &fast_hits)
+                .map(SyncQualityPool::RescoredFastPool)
+        };
+        let quality_pool = match quality_pool {
+            Ok(pool) => pool,
             Err(error) => {
                 let latency = phase2_started.elapsed();
                 metrics.phase2_total_ms = ms(latency);
@@ -609,17 +759,53 @@ impl SyncTwoTierSearcher {
         };
 
         let blend_started = Instant::now();
-        // The quality tier is a re-scored subset of `fast_hits` (same doc_ids).
-        // Blend straight from the aligned `quality_scores` so we never clone one
-        // `String` doc_id per quality hit into an intermediate `Vec<VectorHit>`
-        // whose doc_ids are only ever read as `&str` (bit-identical output).
-        let quality_count = quality_scores.iter().filter(|s| s.is_some()).count();
+        // Per-tier evidence is keyed by canonical doc_id in BOTH shapes. The
+        // retired `AlignedScoreLookup` keyed it by fast-tier row ordinal, which
+        // is only expressible while the quality tier is a subset of the fast
+        // pool; a doc_id key costs one hash per row and is the only key an
+        // independently retrieved pool can share.
+        let fast_scores_by_doc: AHashMap<&str, f32> = fast_hits
+            .iter()
+            .map(|hit| (hit.doc_id.as_str(), hit.score))
+            .collect();
+        let quality_scores_by_doc: AHashMap<&str, f32> = match &quality_pool {
+            SyncQualityPool::Retrieved(hits) => hits
+                .iter()
+                .map(|hit| (hit.doc_id.as_str(), hit.score))
+                .collect(),
+            SyncQualityPool::RescoredFastPool(scores) => fast_hits
+                .iter()
+                .zip(scores.iter())
+                .filter_map(|(hit, score)| score.map(|s| (hit.doc_id.as_str(), s)))
+                .collect(),
+        };
+        let quality_count = quality_scores_by_doc.len();
         metrics.phase2_vectors_searched = quality_count;
-        let blended = blend_two_tier_aligned_vector_index(
-            &fast_hits,
-            &quality_scores,
-            saturating_f64_to_f32(self.config.quality_weight),
-        );
+        let quality_weight = saturating_f64_to_f32(self.config.quality_weight);
+        let blended = match &quality_pool {
+            SyncQualityPool::RescoredFastPool(scores) => {
+                blend_two_tier_aligned_vector_index(&fast_hits, scores, quality_weight)
+            }
+            SyncQualityPool::Retrieved(hits) => {
+                let mut blended = blend_two_tier(&fast_hits, hits, quality_weight);
+                // `VectorHit::index` is a FAST-tier row ordinal for every
+                // consumer downstream. A document only the quality tier
+                // returned has no fast row, so it carries the "no index"
+                // sentinel rather than a quality ordinal that would silently
+                // read as a fast one.
+                let fast_indices: AHashMap<&str, u32> = fast_hits
+                    .iter()
+                    .map(|hit| (hit.doc_id.as_str(), hit.index))
+                    .collect();
+                for hit in &mut blended {
+                    hit.index = fast_indices
+                        .get(hit.doc_id.as_str())
+                        .copied()
+                        .unwrap_or(u32::MAX);
+                }
+                blended
+            }
+        };
         metrics.blend_ms = ms(blend_started.elapsed());
         metrics.quality_search_ms = ms(phase2_started.elapsed());
         metrics.quality_embed_ms = 0.0;
@@ -651,13 +837,7 @@ impl SyncTwoTierSearcher {
                 &self.config,
             )
         } else {
-            unique_vector_hits_to_scored_results_aligned_owned(
-                blended,
-                k,
-                ScoreSource::SemanticQuality,
-                &fast_hits,
-                &quality_scores,
-            )
+            unique_vector_hits_to_scored_results_owned(blended, k, ScoreSource::SemanticQuality)
         };
 
         // Re-fusion ranks on blended semantic scores, but `fast_score` and
@@ -665,14 +845,12 @@ impl SyncTwoTierSearcher {
         // per-tier values. The async searcher restores this provenance after
         // lexical re-fusion; leaving the blended score in `fast_score` here
         // made the two APIs report different evidence for identical hits.
-        let aligned_scores = AlignedScoreLookup::new(&fast_hits, &quality_scores);
+        // A document present in only one pool now truthfully reports `None`
+        // for the tier that never saw it, instead of borrowing a neighbour's
+        // row ordinal.
         for result in &mut refined_results {
-            if let Some(index) = result.index
-                && let Some((fast_score, quality_score)) = aligned_scores.get(index)
-            {
-                result.fast_score = Some(fast_score);
-                result.quality_score = quality_score;
-            }
+            result.fast_score = fast_scores_by_doc.get(result.doc_id.as_str()).copied();
+            result.quality_score = quality_scores_by_doc.get(result.doc_id.as_str()).copied();
         }
 
         if self.config.explain {
@@ -696,8 +874,7 @@ impl SyncTwoTierSearcher {
             };
             let (fast_min, fast_max) = finite_score_bounds(fast_hits.iter().map(|hit| hit.score));
             let (quality_min, quality_max) =
-                finite_score_bounds(quality_scores.iter().flatten().copied());
-            let quality_weight = saturating_f64_to_f32(self.config.quality_weight);
+                finite_score_bounds(quality_scores_by_doc.values().copied());
             for (rank, result) in refined_results.iter_mut().enumerate() {
                 result.explanation = Some(Box::new(build_refined_explanation(
                     result.score,
@@ -1113,100 +1290,34 @@ fn vector_hits_to_scored_results(
         .collect()
 }
 
-type AlignedScores = (f32, Option<f32>);
-
-enum AlignedScoreLookup {
-    Dense {
-        base: u32,
-        scores: Vec<Option<AlignedScores>>,
-    },
-    Hash(AHashMap<u32, AlignedScores>),
-    Empty,
-}
-
-impl AlignedScoreLookup {
-    fn new(fast_hits: &[VectorHit], quality_scores: &[Option<f32>]) -> Self {
-        let Some(first) = fast_hits.first() else {
-            return Self::Empty;
-        };
-        let (mut min_index, mut max_index) = (first.index, first.index);
-        for hit in &fast_hits[1..] {
-            min_index = min_index.min(hit.index);
-            max_index = max_index.max(hit.index);
-        }
-
-        let span = max_index.saturating_sub(min_index).saturating_add(1);
-        let dense_limit = u32::try_from(fast_hits.len().saturating_mul(4).saturating_add(1024))
-            .unwrap_or(u32::MAX);
-
-        if span <= dense_limit {
-            let span = usize::try_from(span).expect("dense score lookup span fits usize");
-            let mut scores = vec![None; span];
-            for (position, hit) in fast_hits.iter().enumerate() {
-                let slot = usize::try_from(hit.index.saturating_sub(min_index))
-                    .expect("dense score lookup offset fits usize");
-                scores[slot] = Some((hit.score, quality_scores.get(position).copied().flatten()));
-            }
-            Self::Dense {
-                base: min_index,
-                scores,
-            }
-        } else {
-            let mut scores = AHashMap::with_capacity(fast_hits.len());
-            for (position, hit) in fast_hits.iter().enumerate() {
-                scores.insert(
-                    hit.index,
-                    (hit.score, quality_scores.get(position).copied().flatten()),
-                );
-            }
-            Self::Hash(scores)
-        }
-    }
-
-    fn get(&self, index: u32) -> Option<AlignedScores> {
-        match self {
-            Self::Dense { base, scores } => index
-                .checked_sub(*base)
-                .and_then(|offset| usize::try_from(offset).ok())
-                .and_then(|offset| scores.get(offset))
-                .copied()
-                .flatten(),
-            Self::Hash(scores) => scores.get(&index).copied(),
-            Self::Empty => None,
-        }
-    }
-}
-
-fn unique_vector_hits_to_scored_results_aligned_owned(
+/// Convert blended union hits into scored results, carrying the blended score
+/// and the no-index sentinel through.
+///
+/// The former `*_aligned_owned` variant recovered per-tier evidence through a
+/// numeric `AlignedScoreLookup` keyed by fast-tier row ordinal. That was
+/// correct only while the quality tier was a re-scored SUBSET of the fast pool
+/// (bd-ctzo C2 retired that): under independent retrieval the pools share no
+/// index space, and a quality-only document has no fast ordinal to look up.
+/// Per-tier evidence is now attached by the caller from its two
+/// `doc_id`-keyed maps, which is the only key both pools agree on.
+fn unique_vector_hits_to_scored_results_owned(
     hits: Vec<VectorHit>,
     k: usize,
     source: ScoreSource,
-    fast_hits: &[VectorHit],
-    quality_scores: &[Option<f32>],
 ) -> Vec<ScoredResult> {
-    // `blend_two_tier_aligned_vector_index` is only used with vector-index hits,
-    // whose `(index, doc_id)` pairs are unique. The blended output preserves the
-    // original vector index, so we can recover fast/quality scores through a
-    // numeric aligned lookup instead of building two `doc_id`-hashed maps and
-    // probing both for every output row.
-    let score_lookup = AlignedScoreLookup::new(fast_hits, quality_scores);
     hits.into_iter()
         .take(k)
-        .map(|hit| {
-            let (fast_score, quality_score) =
-                score_lookup.get(hit.index).unwrap_or((hit.score, None));
-            ScoredResult {
-                doc_id: hit.doc_id,
-                score: hit.score,
-                source,
-                index: Some(hit.index),
-                fast_score: Some(fast_score),
-                quality_score,
-                lexical_score: None,
-                rerank_score: None,
-                explanation: None,
-                metadata: None,
-            }
+        .map(|hit| ScoredResult {
+            doc_id: hit.doc_id,
+            score: hit.score,
+            source,
+            index: (hit.index != u32::MAX).then_some(hit.index),
+            fast_score: None,
+            quality_score: None,
+            lexical_score: None,
+            rerank_score: None,
+            explanation: None,
+            metadata: None,
         })
         .collect()
 }
@@ -1215,7 +1326,102 @@ fn unique_vector_hits_to_scored_results_aligned_owned(
 mod tests {
     use super::*;
     use frankensearch_core::ScoreSource;
+    use frankensearch_core::generation::EmbeddingIdentityBundleV1;
     use frankensearch_index::{InMemoryTwoTierIndex, InMemoryVectorIndex};
+
+    /// Bind one synthetic vector to an explicitly synthetic identity.
+    ///
+    /// `explicit_test_model` is the sanctioned constructor for exactly this:
+    /// its own docs say it is "intentionally named and tagged as synthetic so
+    /// it cannot be mistaken for verified semantic availability". These
+    /// fixtures build vectors by hand, so a synthetic identity is the true
+    /// one — the alternative would be fabricating a model name, which is what
+    /// this whole surface exists to prevent.
+    fn bound(model: &str, vector: Vec<f32>) -> BoundQueryEmbedding {
+        let dimension = u32::try_from(vector.len()).expect("fixture dimension fits u32");
+        BoundQueryEmbedding::new(
+            vector,
+            EmbeddingIdentityBundleV1::explicit_test_model(model, dimension),
+        )
+        .expect("synthetic fixture query binds")
+    }
+
+    /// The fixture indexes below build both tiers from vectors of the same
+    /// synthetic space, so one bundle legitimately describes both arms. A
+    /// production pair (potion fast + MiniLM quality) would bind two DIFFERENT
+    /// bundles here, and `admit` would join each against its own tier.
+    fn tiered(vector: Vec<f32>) -> TieredQueryEmbeddings {
+        TieredQueryEmbeddings::progressive(
+            bound("sync-fixture", vector.clone()),
+            bound("sync-fixture", vector),
+        )
+    }
+
+    fn fast_only_query(vector: Vec<f32>) -> TieredQueryEmbeddings {
+        TieredQueryEmbeddings::fast_only(bound("sync-fixture", vector))
+    }
+
+    /// An in-memory tier loaded through exact FSVI v2 admission, so it carries
+    /// an ATTESTED space identity read out of the artifact's own header.
+    ///
+    /// This is the only way to reach the attested branch: `from_vectors` is
+    /// legacy-unidentified by construction, and fabricating a fingerprint on
+    /// it would make the identity join pass without proving anything.
+    fn attested_tier(
+        dir: &std::path::Path,
+        file: &str,
+        model: &str,
+        sequence: u64,
+        rows: &[(&str, &[f32])],
+    ) -> (InMemoryVectorIndex, EmbeddingIdentityBundleV1) {
+        let dimension = u32::try_from(rows[0].1.len()).expect("fixture dimension fits u32");
+        let mut artifact = EmbeddingIdentityBundleV1::explicit_test_model(model, dimension);
+        "fsvi-v2".clone_into(&mut artifact.storage.format);
+        artifact.storage.quantization = frankensearch_core::generation::QuantizationFormat::F16;
+        "little-endian".clone_into(&mut artifact.storage.endianness);
+        let binding = frankensearch_index::FsviV2IdentityBinding::new(
+            frankensearch_core::generation::ArtifactGenerationIdentityV1::new(sequence, [0x7a; 16])
+                .expect("test generation"),
+            artifact.freeze().expect("freeze artifact identity"),
+        )
+        .expect("valid FSVI v2 binding");
+
+        let path = dir.join(file);
+        let mut writer = frankensearch_index::VectorIndex::create_v2(&path, binding.clone())
+            .expect("create_v2 fixture");
+        for (doc_id, vector) in rows {
+            writer.write_record(doc_id, vector).expect("write v2 row");
+        }
+        writer.finish().expect("finish v2 fixture");
+
+        let owner = frankensearch_index::VectorIndex::open_admitted_v2(&path, &binding)
+            .expect("admit the v2 fixture");
+        let tier = InMemoryVectorIndex::from_admitted_v2(&owner).expect("load admitted tier");
+        assert!(
+            tier.space_identity_is_attested(),
+            "the fixture is only meaningful while the tier's identity is header-attested"
+        );
+        // The query-side bundle of the SAME space: in-process f32 storage,
+        // which can never be byte-equal to the persisted f16 one. That is why
+        // the join is on the space, not the whole bundle.
+        (
+            tier,
+            EmbeddingIdentityBundleV1::explicit_test_model(model, dimension),
+        )
+    }
+
+    fn temp_dir(label: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "frankensearch-sync-dbp10-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        dir
+    }
 
     fn make_index() -> Arc<InMemoryTwoTierIndex> {
         let doc_ids = vec!["a".to_owned(), "b".to_owned(), "c".to_owned()];
@@ -1271,72 +1477,242 @@ mod tests {
         }
     }
 
-    fn assert_aligned_result_scores(indices: [u32; 3]) {
-        let fast_hits = vec![
-            vector_hit("a", indices[0], 0.9),
-            vector_hit("b", indices[1], 0.7),
-            vector_hit("c", indices[2], 0.5),
-        ];
-        let quality_scores = vec![Some(0.2), None, Some(0.95)];
+    /// The union conversion carries the blended score and the no-index
+    /// sentinel through, and fabricates NO per-tier evidence.
+    ///
+    /// This replaces `aligned_numeric_score_lookup_matches_doc_id_maps`,
+    /// whose subject — a numeric lookup keyed by fast-tier row ordinal — was
+    /// only sound while the quality tier was a re-scored subset of the fast
+    /// pool. Under independent retrieval a quality-only document has no fast
+    /// ordinal, and the old helper's `.unwrap_or((hit.score, None))` fallback
+    /// would have reported the BLENDED score as that document's fast score.
+    #[test]
+    fn union_conversion_reports_no_index_and_no_fabricated_evidence() {
         let blended = vec![
-            vector_hit("c", indices[2], 0.91),
-            vector_hit("a", indices[0], 0.88),
-            vector_hit("b", indices[1], 0.77),
+            vector_hit("quality-only", u32::MAX, 0.91),
+            vector_hit("a", 10, 0.88),
         ];
-
-        let fast_by_doc = fast_hits
-            .iter()
-            .map(|hit| (hit.doc_id.as_str(), hit.score))
-            .collect::<AHashMap<&str, f32>>();
-        let quality_by_doc = fast_hits
-            .iter()
-            .zip(quality_scores.iter())
-            .filter_map(|(hit, score)| score.map(|s| (hit.doc_id.as_str(), s)))
-            .collect::<AHashMap<&str, f32>>();
-        let expected_scores = blended
-            .iter()
-            .map(|hit| {
-                (
-                    hit.doc_id.clone(),
-                    hit.score,
-                    fast_by_doc
-                        .get(hit.doc_id.as_str())
-                        .copied()
-                        .or(Some(hit.score)),
-                    quality_by_doc.get(hit.doc_id.as_str()).copied(),
-                )
-            })
-            .collect::<Vec<_>>();
-
-        let actual = unique_vector_hits_to_scored_results_aligned_owned(
-            blended,
-            3,
-            ScoreSource::SemanticQuality,
-            &fast_hits,
-            &quality_scores,
+        let actual =
+            unique_vector_hits_to_scored_results_owned(blended, 2, ScoreSource::SemanticQuality);
+        assert_eq!(actual.len(), 2);
+        assert_eq!(actual[0].doc_id, "quality-only");
+        assert_eq!(
+            actual[0].index, None,
+            "a document with no fast-tier row must not report one"
         );
-        assert_eq!(actual.len(), expected_scores.len());
-        for (actual, (doc_id, score, fast_score, quality_score)) in
-            actual.iter().zip(expected_scores)
-        {
-            assert_eq!(actual.doc_id, doc_id);
-            assert_eq!(actual.score.to_bits(), score.to_bits());
-            assert_eq!(actual.fast_score, fast_score);
-            assert_eq!(actual.quality_score, quality_score);
-            assert_eq!(actual.source, ScoreSource::SemanticQuality);
+        assert_eq!(actual[1].index, Some(10));
+        for result in &actual {
+            assert_eq!(
+                (result.fast_score, result.quality_score),
+                (None, None),
+                "per-tier evidence is attached from the pools, never invented here"
+            );
+            assert_eq!(result.source, ScoreSource::SemanticQuality);
         }
     }
 
+    /// bd-dbp10 acceptance 4, THE PLANTED NEGATIVE: the quality tier must be
+    /// scored with the QUALITY-bound query, never the fast one.
+    ///
+    /// The fixture makes the two tiers disagree on purpose. The fast tier puts
+    /// `a` first for the fast query; in the quality tier the fast query's
+    /// direction points at `a` too, but the QUALITY query points at `c`. So
+    /// the refined winner is `c` if and only if the quality tier saw its own
+    /// query. Feeding it the fast vector — which is exactly what this code did
+    /// before — returns `a`, and the assertion below is what says so.
+    ///
+    /// Note the two vectors have the SAME WIDTH. That is the whole reason this
+    /// bug could live in production: every dimension check passes.
     #[test]
-    fn aligned_numeric_score_lookup_matches_doc_id_maps() {
-        assert_aligned_result_scores([10, 11, 12]);
-        assert_aligned_result_scores([7, 50_000, 90_000]);
+    fn the_quality_tier_is_scored_with_the_quality_query_not_the_fast_one() {
+        let doc_ids = vec!["a".to_owned(), "b".to_owned(), "c".to_owned()];
+        // Fast space: the fast query [1,0] ranks a > b > c.
+        let fast = InMemoryVectorIndex::from_vectors(
+            doc_ids.clone(),
+            vec![vec![1.0, 0.0], vec![0.7, 0.7], vec![0.0, 1.0]],
+            2,
+        )
+        .unwrap();
+        // Quality space: the fast query [1,0] would rank a first here too,
+        // but the quality query [0,1] ranks c first.
+        let quality = InMemoryVectorIndex::from_vectors(
+            doc_ids,
+            vec![vec![1.0, 0.0], vec![0.5, 0.5], vec![0.0, 1.0]],
+            2,
+        )
+        .unwrap();
+        let index = Arc::new(InMemoryTwoTierIndex::new(fast, Some(quality)));
+        let searcher = SyncTwoTierSearcher::new(
+            index,
+            TwoTierConfig {
+                // Quality-dominant blend so the quality tier's opinion decides
+                // the refined order rather than merely nudging it.
+                quality_weight: 1.0,
+                ..TwoTierConfig::default()
+            },
+        );
+
+        let query = TieredQueryEmbeddings::progressive(
+            bound("sync-fixture", vec![1.0, 0.0]),
+            bound("sync-fixture", vec![0.0, 1.0]),
+        );
+        let (results, _) = searcher.search_collect(&query, 3).unwrap();
+        assert_eq!(
+            results[0].doc_id,
+            "c",
+            "the refined winner must come from the QUALITY query's ranking; got {:?}",
+            results
+                .iter()
+                .map(|r| r.doc_id.as_str())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    /// bd-dbp10 acceptance 2: on an attested index every identity join
+    /// completes before any vector read, and a query from another space is
+    /// refused by field name.
+    #[test]
+    fn an_attested_tier_refuses_a_foreign_space_query() {
+        let dir = temp_dir("attested-refusal");
+        let (fast, fast_identity) = attested_tier(
+            &dir,
+            "vector.fast.idx",
+            "dbp10-fast",
+            11,
+            &[("a", &[1.0, 0.0]), ("b", &[0.0, 1.0])],
+        );
+        let index = Arc::new(InMemoryTwoTierIndex::new(fast, None));
+        let searcher = SyncTwoTierSearcher::new(index, TwoTierConfig::default());
+
+        // Positive control: the space this tier was written in.
+        let (results, _) = searcher
+            .search_collect(
+                &TieredQueryEmbeddings::fast_only(
+                    BoundQueryEmbedding::new(vec![1.0, 0.0], fast_identity).expect("bind"),
+                ),
+                2,
+            )
+            .expect("the producing space is admitted");
+        assert_eq!(results[0].doc_id, "a");
+
+        // Same width, different space: refused, by the same contract field the
+        // async searcher and the owner-backed activation use.
+        let error = searcher
+            .search_collect(&fast_only_query(vec![1.0, 0.0]), 2)
+            .expect_err("a foreign embedding space must be refused");
+        assert!(
+            matches!(
+                error,
+                SearchError::InvalidConfig { ref field, .. }
+                    if field == "query_embedding.fast.space_identity"
+            ),
+            "got {error:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// bd-ctzo C2 on the sync path: with an ATTESTED quality tier the refined
+    /// phase retrieves independently, so a document the fast tier does not
+    /// contain at all becomes reachable.
+    #[test]
+    fn an_attested_quality_tier_reaches_a_document_outside_the_fast_pool() {
+        let dir = temp_dir("attested-union");
+        let (fast, fast_identity) = attested_tier(
+            &dir,
+            "vector.fast.idx",
+            "dbp10-union-fast",
+            21,
+            &[
+                ("doc-near", &[1.0, 0.0, 0.0]),
+                ("doc-far", &[0.0, 0.0, 1.0]),
+            ],
+        );
+        // The quality tier holds a document the FAST TIER DOES NOT CONTAIN.
+        // No rescoring of a fast-selected pool can produce it.
+        let (quality, quality_identity) = attested_tier(
+            &dir,
+            "vector.quality.idx",
+            "dbp10-union-quality",
+            21,
+            &[
+                ("doc-near", &[0.0, 0.0, 1.0]),
+                ("doc-far", &[0.0, 0.5, 0.0]),
+                ("doc-quality-only", &[0.0, 1.0, 0.0]),
+            ],
+        );
+        let index = Arc::new(InMemoryTwoTierIndex::new(fast, Some(quality)));
+        let searcher = SyncTwoTierSearcher::new(index, TwoTierConfig::default());
+
+        let query = TieredQueryEmbeddings::progressive(
+            BoundQueryEmbedding::new(vec![1.0, 0.0, 0.0], fast_identity).expect("bind fast"),
+            BoundQueryEmbedding::new(vec![0.0, 1.0, 0.0], quality_identity).expect("bind quality"),
+        );
+        let (results, _) = searcher.search_collect(&query, 3).unwrap();
+        let ids: Vec<&str> = results.iter().map(|r| r.doc_id.as_str()).collect();
+        assert!(
+            ids.contains(&"doc-quality-only"),
+            "independent quality retrieval must reach a document the fast tier lacks; got {ids:?}"
+        );
+        let quality_only = results
+            .iter()
+            .find(|r| r.doc_id == "doc-quality-only")
+            .expect("present");
+        assert_eq!(
+            quality_only.index, None,
+            "a document with no fast-tier row must not report one"
+        );
+        assert_eq!(
+            quality_only.fast_score, None,
+            "the fast tier never saw it, so it has no fast evidence"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// bd-dbp10 acceptance 3: a legacy tier carries no identity to join
+    /// against, and must stay searchable rather than becoming a refusal.
+    #[test]
+    fn a_legacy_unidentified_index_stays_searchable() {
+        let index = make_index();
+        assert!(
+            index.fast_index().space_fingerprint_hex().is_none(),
+            "the fixture is only meaningful while the index is legacy-unidentified"
+        );
+        let searcher = SyncTwoTierSearcher::new(index, TwoTierConfig::default());
+        let (results, metrics) = searcher
+            .search_collect(&tiered(vec![1.0, 0.0]), 3)
+            .expect("a legacy index stays searchable");
+        assert!(
+            !results.is_empty(),
+            "the legacy lane must still return hits"
+        );
+        assert_eq!(
+            metrics.skip_reason, None,
+            "the legacy lane still refines; it is unidentified, not degraded"
+        );
+    }
+
+    /// A quality tier the caller bound no quality embedding for is SKIPPED
+    /// with a typed reason — never served by reusing the fast embedding.
+    #[test]
+    fn a_fast_only_query_skips_the_quality_tier_instead_of_reusing_the_fast_vector() {
+        let searcher = SyncTwoTierSearcher::new(make_index(), TwoTierConfig::default());
+        let (_, metrics) = searcher
+            .search_collect(&fast_only_query(vec![1.0, 0.0]), 3)
+            .unwrap();
+        assert_eq!(
+            metrics.skip_reason.as_deref(),
+            Some("quality_query_embedding_absent"),
+            "the index HAS a quality tier; the query simply bound nothing for it"
+        );
+        assert_eq!(metrics.phase2_vectors_searched, 0);
     }
 
     #[test]
     fn search_collect_returns_refined_results() {
         let searcher = SyncTwoTierSearcher::new(make_index(), TwoTierConfig::default());
-        let (results, metrics) = searcher.search_collect(&[1.0, 0.0], 2).unwrap();
+        let (results, metrics) = searcher.search_collect(&tiered(vec![1.0, 0.0]), 2).unwrap();
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].source, ScoreSource::SemanticQuality);
         assert!(metrics.phase1_total_ms >= 0.0);
@@ -1350,7 +1726,7 @@ mod tests {
         let fast = InMemoryVectorIndex::from_vectors(Vec::new(), Vec::new(), 2).unwrap();
         let index = Arc::new(InMemoryTwoTierIndex::new(fast, None));
         let searcher = SyncTwoTierSearcher::new(index, TwoTierConfig::default());
-        let (results, metrics) = searcher.search_collect(&[1.0, 0.0], 3).unwrap();
+        let (results, metrics) = searcher.search_collect(&tiered(vec![1.0, 0.0]), 3).unwrap();
         assert!(results.is_empty());
         assert_eq!(
             metrics.zero_signal,
@@ -1372,7 +1748,7 @@ mod tests {
         }
         let searcher = SyncTwoTierSearcher::new(make_index(), TwoTierConfig::default());
         let (results, metrics) = searcher
-            .search_collect_with_filter(&[1.0, 0.0], 3, Some(&ExcludeAll))
+            .search_collect_with_filter(&tiered(vec![1.0, 0.0]), 3, Some(&ExcludeAll))
             .unwrap();
         assert!(results.is_empty());
         assert_eq!(
@@ -1388,7 +1764,9 @@ mod tests {
         let fast = InMemoryVectorIndex::from_vectors(Vec::new(), Vec::new(), 2).unwrap();
         let index = Arc::new(InMemoryTwoTierIndex::new(fast, None));
         let searcher = SyncTwoTierSearcher::new(index, TwoTierConfig::default());
-        let (results, metrics) = searcher.search_collect(&[0.0, 0.0], 3).unwrap();
+        let (results, metrics) = searcher
+            .search_collect(&fast_only_query(vec![0.0, 0.0]), 3)
+            .unwrap();
         assert!(results.is_empty());
         assert_eq!(metrics.zero_signal, Some(ZeroSignalReason::ZeroNormQuery));
     }
@@ -1403,7 +1781,7 @@ mod tests {
                 hits: vec![lexical_result("c", 10.0), lexical_result("b", 5.0)],
             })
         };
-        let q = [1.0_f32, 0.0];
+        let q = tiered(vec![1.0_f32, 0.0]);
 
         let sem_heavy = SyncTwoTierSearcher::new(make_index(), TwoTierConfig::default())
             .with_lexical(make_lex())
@@ -1446,7 +1824,7 @@ mod tests {
                 hits: vec![lexical_result("c", 10.0), lexical_result("b", 5.0)],
             })
         };
-        let q = [1.0_f32, 0.0];
+        let q = tiered(vec![1.0_f32, 0.0]);
 
         let neutral = SyncTwoTierSearcher::new(make_index(), TwoTierConfig::default())
             .with_lexical(make_lex())
@@ -1543,7 +1921,9 @@ mod tests {
     #[test]
     fn search_iter_yields_initial_then_refined() {
         let searcher = SyncTwoTierSearcher::new(make_index(), TwoTierConfig::default());
-        let phases = searcher.search_iter(&[1.0, 0.0], 2).collect::<Vec<_>>();
+        let phases = searcher
+            .search_iter(&tiered(vec![1.0, 0.0]), 2)
+            .collect::<Vec<_>>();
         assert_eq!(phases.len(), 2);
         assert!(matches!(phases[0], SearchPhase::Initial { .. }));
         assert!(matches!(phases[1], SearchPhase::Refined { .. }));
@@ -1556,7 +1936,9 @@ mod tests {
             ..TwoTierConfig::default()
         };
         let searcher = SyncTwoTierSearcher::new(make_index(), config);
-        let phases = searcher.search_iter(&[1.0, 0.0], 2).collect::<Vec<_>>();
+        let phases = searcher
+            .search_iter(&tiered(vec![1.0, 0.0]), 2)
+            .collect::<Vec<_>>();
         assert_eq!(phases.len(), 1);
         assert!(matches!(phases[0], SearchPhase::Initial { .. }));
     }
@@ -1565,16 +1947,32 @@ mod tests {
     fn filter_is_applied_to_fast_and_refined_results() {
         let searcher = SyncTwoTierSearcher::new(make_index(), TwoTierConfig::default());
         let (results, _) = searcher
-            .search_collect_with_filter(&[1.0, 0.0], 3, Some(&ExcludeB))
+            .search_collect_with_filter(&tiered(vec![1.0, 0.0]), 3, Some(&ExcludeB))
             .unwrap();
         assert!(results.iter().all(|result| result.doc_id != "b"));
     }
 
+    /// An empty query vector is now refused at BIND time, not at search time.
+    ///
+    /// This test previously called `search_collect(&[], 3)` and asserted the
+    /// searcher returned `DimensionMismatch`. It had been failing on trunk:
+    /// the empty slice reached the scan and came back `Ok` with a
+    /// `ZeroNormQuery` classification instead. The typed query surface makes
+    /// the question moot — a zero-length vector cannot be bound to a
+    /// two-dimensional space at all, so the refusal now happens strictly
+    /// earlier and cannot be reached by a search. Same defect, moved to where
+    /// it is provable.
     #[test]
-    fn empty_query_returns_dimension_mismatch() {
-        let searcher = SyncTwoTierSearcher::new(make_index(), TwoTierConfig::default());
-        let err = searcher.search_collect(&[], 3).unwrap_err();
-        assert!(matches!(err, SearchError::DimensionMismatch { .. }));
+    fn an_empty_query_vector_cannot_even_be_bound() {
+        let error = BoundQueryEmbedding::new(
+            Vec::new(),
+            EmbeddingIdentityBundleV1::explicit_test_model("sync-fixture", 2),
+        )
+        .expect_err("a zero-length vector is not a member of a 2-dimensional space");
+        assert!(
+            matches!(error, SearchError::DimensionMismatch { .. }),
+            "got {error:?}"
+        );
     }
 
     #[test]
@@ -1584,7 +1982,7 @@ mod tests {
         });
         let searcher =
             SyncTwoTierSearcher::new(make_index(), TwoTierConfig::default()).with_lexical(lexical);
-        let (results, _) = searcher.search_collect(&[1.0, 0.0], 3).unwrap();
+        let (results, _) = searcher.search_collect(&tiered(vec![1.0, 0.0]), 3).unwrap();
         assert!(results.iter().any(|result| result.doc_id == "lex-only"));
         assert!(
             results
@@ -1649,7 +2047,7 @@ mod tests {
             let searcher = SyncTwoTierSearcher::new(make_index(), TwoTierConfig::default())
                 .with_lexical(lexical);
             let (fused, _) = searcher
-                .search_collect(&[1.0, 0.0], 3)
+                .search_collect(&tiered(vec![1.0, 0.0]), 3)
                 .expect("hybrid sync search");
             assert!(fused.iter().any(|hit| hit.doc_id == "quill-only"));
 
