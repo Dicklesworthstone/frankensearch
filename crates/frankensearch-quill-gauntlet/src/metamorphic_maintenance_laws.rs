@@ -100,6 +100,29 @@ pub const REOPEN_RECOVERY_ALLOWED: &[DivergenceClass] = &[DivergenceClass::TieOr
 /// resurrected a deleted document or lost a live one — the two failures this
 /// law exists to catch — so it is NOT admitted, despite counts being the most
 /// tempting thing to excuse when a compaction reclaims space.
+///
+/// # This relation is CONTINGENT on a precondition that is not yet met
+///
+/// Admitting only [`DivergenceClass::TieOrder`] is correct **only under the
+/// score-insensitive projection this law's preconditions demand**. The registry
+/// records `e6.3-tombstone-compaction-v1` as
+/// `SkipWithReason(ScoreSensitiveCorpusStatistics)` with the precondition "a
+/// score-insensitive projection approved by the runner", and that precondition
+/// is currently unmet.
+///
+/// Under the CURRENT score-sensitive total lexical observation this relation
+/// would be wrong, not merely strict: deleting documents changes corpus
+/// statistics, so surviving documents legitimately shift in score and rank, and
+/// those shifts would surface as [`DivergenceClass::ScoreEpsilon`] or
+/// [`DivergenceClass::RankMismatch`] and be reported as violations of a law
+/// they do not actually violate.
+///
+/// So whoever builds the executor must bind this relation to a score-insensitive
+/// projection, exactly as the precondition says. Binding it to the score-
+/// sensitive observation would manufacture false failures — the mirror image of
+/// the vacuous-pass trap the rest of this module guards against, and just as
+/// misleading. The relation is inert until then, because the law is skipped and
+/// nothing calls it.
 pub const TOMBSTONE_COMPACTION_ALLOWED: &[DivergenceClass] = &[DivergenceClass::TieOrder];
 
 /// Equivalence relation for `e6.3-merge-schedule-v1`.
