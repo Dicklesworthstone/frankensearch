@@ -4985,10 +4985,16 @@ mod tests {
         ann.save(&metadata_path)
             .expect("save past mismatched retained receipt");
         let after = ready_generation_paths(&metadata_path, ann.vector_fingerprint);
+        // bd-v03xp made publish reclaim every sibling generation the published
+        // metadata does not reference, precisely so corrupt-but-receipt-valid
+        // generations stop being re-probed with a full native load on every
+        // save. The rejected generation is therefore reclaimed, not retained;
+        // what this test pins is that save REFUSED TO REUSE it and published a
+        // fresh one instead, which the assert_ne! below carries.
         assert_eq!(
             after.len(),
-            2,
-            "invalid retained receipt must remain untouched while a fresh generation is published"
+            1,
+            "publish must reclaim the superseded invalid generation"
         );
         let metadata: HnswMeta =
             serde_json::from_slice(&std::fs::read(&metadata_path).expect("read metadata"))
@@ -5031,8 +5037,9 @@ mod tests {
         let after = ready_generation_paths(&metadata_path, ann.vector_fingerprint);
         assert_eq!(
             after.len(),
-            2,
-            "an unloadable generation must not trap rebuild-save in a reuse loop"
+            1,
+            "an unloadable generation must not trap rebuild-save in a reuse loop, \
+             and publish reclaims it once a fresh generation supersedes it (bd-v03xp)"
         );
         let metadata: HnswMeta =
             serde_json::from_slice(&std::fs::read(&metadata_path).expect("read metadata"))
@@ -5113,6 +5120,11 @@ mod tests {
             .expect_err("retain unpublished READY generation");
         let before = ready_generation_paths(&metadata_path, ann.vector_fingerprint);
         assert_eq!(before.len(), 1);
+        let rejected_generation = before[0]
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("generation name")
+            .to_owned();
         let receipt_path = before[0].join(HNSW_GENERATION_RECEIPT_FILENAME);
         std::fs::write(
             receipt_path,
@@ -5124,8 +5136,19 @@ mod tests {
             .expect("save past oversized retained receipt");
         assert_eq!(
             ready_generation_paths(&metadata_path, ann.vector_fingerprint).len(),
-            2,
-            "oversized retained receipt must be ignored without removing it"
+            1,
+            "publish must reclaim the superseded oversized-receipt generation"
+        );
+        // The load-bearing contract, which this test previously left implicit
+        // in the directory count: the oversized receipt must not be REUSED.
+        // Without this the count alone would pass even if save adopted it.
+        let metadata: HnswMeta =
+            serde_json::from_slice(&std::fs::read(&metadata_path).expect("read metadata"))
+                .expect("parse metadata");
+        assert_ne!(
+            metadata.sidecar_generation.as_deref(),
+            Some(rejected_generation.as_str()),
+            "save must publish a fresh generation, never reuse the oversized-receipt one"
         );
         let (_, disposition) = HnswIndex::load_with_disposition(&metadata_path, &source_index)
             .expect("native load after rejecting oversized receipt");
