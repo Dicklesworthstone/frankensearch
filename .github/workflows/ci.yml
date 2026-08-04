@@ -577,9 +577,8 @@ jobs:
       #
       # Quill is therefore deselected here. It is still COMPILED as a dependency,
       # with bench-internals, via frankensearch-quill-gauntlet, so no coverage is
-      # lost from that direction. Quill's own feature matrix needs two explicit
-      # arms (one per side of the exclusion); they are blocked on the crate's
-      # pre-existing feature-combination errors and tracked in bd-57cyv. Do NOT
+      # lost from that direction. Quill's own feature matrix is covered instead
+      # by the two explicit arms below, one per side of the exclusion. Do NOT
       # "fix" this lane by deleting the compile_error! or by unioning the pair.
       - name: Nightly full validation (all features except the quill exclusivity pair)
         if: matrix.os == 'ubuntu-latest' && steps.validation_profile.outputs.profile == 'nightly'
@@ -587,6 +586,25 @@ jobs:
           QUILL_E3_9_RANDOM_SEEDS: "32"
           QUILL_E6_5_RANDOM_SEEDS: "16"
         run: cargo test --workspace --all-features --exclude frankensearch-quill -- --nocapture
+
+      # The two arms bd-57cyv deferred and bd-46mo7 gated. Between them every
+      # quill feature is exercised while respecting the compile_error!
+      # exclusion, which no single build can do. They were held out of CI only
+      # while they were red -- adding a known-red gate is what let bd-rg18d hide
+      # for four days -- and both went green when bd-qoswh landed the GC
+      # first-unreachable receipt, which was their single remaining failure
+      # (arm A 621 passed/0 failed, arm B 622 passed/0 failed, measured in this
+      # exact command form). If either arm goes red, fix the crate: do not
+      # weaken, merge, or delete an arm.
+      - name: Nightly quill feature matrix, timing arm (bd-57cyv)
+        if: matrix.os == 'ubuntu-latest' && steps.validation_profile.outputs.profile == 'nightly'
+        timeout-minutes: 45
+        run: cargo test -p frankensearch-quill --features durability,bench-internals,conformance-internals,pruning-conformance,tantivy-oracle -- --nocapture
+
+      - name: Nightly quill feature matrix, diagnostic arm (bd-57cyv)
+        if: matrix.os == 'ubuntu-latest' && steps.validation_profile.outputs.profile == 'nightly'
+        timeout-minutes: 45
+        run: cargo test -p frankensearch-quill --features durability,profile-internals,conformance-internals,pruning-conformance,tantivy-oracle -- --nocapture
 
       - name: E2E contract smoke (fsfs)
         if: matrix.os == 'ubuntu-latest'
@@ -718,7 +736,7 @@ jobs:
               },
               "nightly": {
                 "description": "Full validation sweep",
-                "required_lanes": ["premerge","cargo test --workspace --all-features --exclude frankensearch-quill -- --nocapture"]
+                "required_lanes": ["premerge","cargo test --workspace --all-features --exclude frankensearch-quill -- --nocapture","cargo test -p frankensearch-quill --features durability,bench-internals,conformance-internals,pruning-conformance,tantivy-oracle -- --nocapture","cargo test -p frankensearch-quill --features durability,profile-internals,conformance-internals,pruning-conformance,tantivy-oracle -- --nocapture"]
               }
             }
           }
