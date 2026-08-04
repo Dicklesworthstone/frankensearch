@@ -4066,9 +4066,25 @@ mod tests {
         model_id: &str,
         dimension: u32,
     ) -> FsviV2IdentityBinding {
+        fsvi_v2_binding_with_quantization(
+            sequence,
+            nonce_byte,
+            model_id,
+            dimension,
+            QuantizationFormat::F16,
+        )
+    }
+
+    fn fsvi_v2_binding_with_quantization(
+        sequence: u64,
+        nonce_byte: u8,
+        model_id: &str,
+        dimension: u32,
+        quantization: QuantizationFormat,
+    ) -> FsviV2IdentityBinding {
         let mut identity = EmbeddingIdentityBundleV1::explicit_test_model(model_id, dimension);
         identity.storage.format = "fsvi-v2".to_owned();
-        identity.storage.quantization = QuantizationFormat::F16;
+        identity.storage.quantization = quantization;
         identity.storage.endianness = "little-endian".to_owned();
         let generation = ArtifactGenerationIdentityV1::new(sequence, [nonce_byte; 16])
             .expect("valid test generation");
@@ -4874,6 +4890,111 @@ mod tests {
             matches!(error, SearchError::IndexCorrupted { ref detail, .. }
                 if detail.contains("receipt FSVI whole-image SHA-256 mismatch")),
             "tombstone-layout mismatch did not fail at receipt identity: {error:?}"
+        );
+    }
+
+    /// Owner-bound ANN over an F32 owner must rank at the owner's declared
+    /// storage precision, not at F16.
+    ///
+    /// Planted negative: the two closest live rows differ by less than one F16
+    /// step at 1.0, so their F16 encodings are bit-identical (asserted), and
+    /// the physically FIRST of the pair carries the WORSE vector (asserted).
+    /// An implementation that resolved graph distances through F16 — by
+    /// assuming the F16 storage every other owner fixture uses, or by
+    /// quantizing on the way in — cannot separate the pair at all and would
+    /// fall back to physical-row order, returning the worse row first.
+    #[test]
+    fn owner_bound_ann_ranks_an_f32_owner_below_one_f16_step() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let fsvi_binding = fsvi_v2_binding_with_quantization(
+            44,
+            0x44,
+            "ann-f32-precision",
+            4,
+            QuantizationFormat::F32,
+        );
+        // Both components collapse onto the same F16 code point, so F16 storage
+        // could not represent the pair as distinct rows at all.
+        let better_component = 1.0_f32;
+        let worse_component = 0.9999_f32;
+        assert!(worse_component < better_component);
+        assert_eq!(
+            half::f16::from_f32(better_component),
+            half::f16::from_f32(worse_component),
+            "the fixture pair must be indistinguishable under F16 storage"
+        );
+
+        let one = "ann-f32-one";
+        let two = "ann-f32-two";
+        let (physically_first, physically_second) =
+            if fnv1a_hash(one.as_bytes()) < fnv1a_hash(two.as_bytes()) {
+                (one, two)
+            } else {
+                (two, one)
+            };
+        let rows = vec![
+            (
+                physically_first.to_owned(),
+                vec![worse_component, 0.0, 0.0, 0.0],
+            ),
+            (
+                physically_second.to_owned(),
+                vec![better_component, 0.0, 0.0, 0.0],
+            ),
+            ("ann-f32-far".to_owned(), vec![0.0, 0.0, 1.0, 0.0]),
+        ];
+        let owner = admitted_fsvi_owner(directory.path(), "f32-owner.fsvi", &fsvi_binding, &rows);
+
+        let dimension = owner.dimension();
+        assert_eq!(
+            owner
+                .row(0)
+                .expect("first physical row")
+                .vector_bytes()
+                .len(),
+            dimension * 4,
+            "the owner must physically store four bytes per F32 component"
+        );
+        assert_eq!(
+            owner.row(0).expect("first physical row").doc_id(),
+            physically_first,
+            "the worse vector must occupy the lower physical row"
+        );
+
+        let query = [1.0, 0.0, 0.0, 0.0];
+        let exact = owner
+            .search_top_k(&query, owner.live_count(), None)
+            .expect("exact F32 owner search");
+        assert_eq!(
+            exact
+                .iter()
+                .map(|hit| hit.doc_id.as_str())
+                .collect::<Vec<_>>(),
+            vec![physically_second, physically_first, "ann-f32-far"],
+            "exact F32 search must separate the sub-F16-step pair"
+        );
+
+        let bound = ValidatedNativeHnsw::build(Arc::clone(&owner), params(), 44)
+            .expect("build graph from F32 owner");
+        let ann = bound
+            .search(&query, owner.live_count(), Some(owner.record_count()))
+            .expect("full-beam owner-bound ANN search over F32 storage");
+        assert_eq!(
+            ann.iter()
+                .map(ValidatedNativeHnswHit::doc_id)
+                .collect::<Vec<_>>(),
+            exact
+                .iter()
+                .map(|hit| hit.doc_id.as_str())
+                .collect::<Vec<_>>(),
+            "F32 owner-bound ANN must reproduce the exact F32 ranking"
+        );
+        assert_eq!(
+            ann.iter()
+                .map(ValidatedNativeHnswHit::physical_row)
+                .collect::<Vec<_>>(),
+            exact.iter().map(|hit| hit.index).collect::<Vec<_>>(),
+            "F32 ANN hits must resolve the exact physical rows of the same owner"
         );
     }
 
