@@ -7851,18 +7851,25 @@ mod tests {
     /// declares. Its cross-engine scope is deliberately excluded, and this
     /// test measures the reason rather than asserting it.
     ///
-    /// WHY THE LAW IS NOT CROSS-ENGINE. LavenderElk found that the BASELINE
-    /// spelling `(alpha OR gamma) OR delta` — no transform applied — already
+    /// WHY THE LAW IS NOT CROSS-ENGINE. The BASELINE spelling
+    /// `(alpha OR gamma) OR delta` — no transform applied — already
     /// diverges between Quill and the pinned oracle: same document, same rank,
     /// `doc-4@3fdc09b7` versus `3fdc09b6`. The divergence is a property of
     /// that operand triple, not of re-association, and `(alpha OR beta) OR
-    /// gamma` compares cleanly. It is registered on
-    /// `bd-quill-e6-gauntlet-scale-rm3q.8.1` and is NOT classified here: by
-    /// the register's own text a 3-leaf pure-disjunctive shape is supposed to
-    /// be bit-exact and outside DIV-007, so this fixture is evidence that
-    /// either the shape is not spliceable in the sense the entry means or the
-    /// entry's boundary is too strong. Answering that is the register owner's
-    /// call, not this lane's.
+    /// gamma` compares cleanly.
+    ///
+    /// It is now DIV-008 in the Divergence Register — the register's first
+    /// machine-witnessed entry, ingested from the artifact that observed it,
+    /// disposition **blocking** on bead `bd-gx7n4`, with its own executable
+    /// regression at
+    /// `runner::tests::three_clause_or_diverges_at_one_ulp_without_the_div007_envelope`.
+    /// That disposition is exactly why this law's cross-engine cell is
+    /// omitted rather than claimed: a raw `RankMismatch` is never accepted,
+    /// so no law may assert cross-engine equivalence over it while the
+    /// envelope's scope is undecided. DIV-008 also records the same
+    /// boundary problem from the other side — the DIV-007 mechanism observed
+    /// OUTSIDE its documented qualifiers, on a shape the entry says should be
+    /// bit-exact.
     ///
     /// So the law declares `[Quill, Tantivy]` and the cross-engine cell is
     /// omitted rather than claimed. The exclusion is EARNED, not asserted:
@@ -7926,11 +7933,7 @@ mod tests {
 
                 // THE LAW, per engine, under the declared projection.
                 for (engine, before, after) in [
-                    (
-                        "Quill",
-                        &baseline_case.1.subject,
-                        &regrouped_case.1.subject,
-                    ),
+                    ("Quill", &baseline_case.1.subject, &regrouped_case.1.subject),
                     ("Tantivy", &baseline_case.1.oracle, &regrouped_case.1.oracle),
                 ] {
                     let (equivalent, score_bit_distance) =
@@ -7948,10 +7951,8 @@ mod tests {
 
                 // THE EXCLUSION, measured on the UN-transformed spelling so it
                 // cannot be blamed on re-association.
-                let (cross_equivalent, cross_distance) = e63_reassociation_projection(
-                    &baseline_case.1.oracle,
-                    &baseline_case.1.subject,
-                );
+                let (cross_equivalent, cross_distance) =
+                    e63_reassociation_projection(&baseline_case.1.oracle, &baseline_case.1.subject);
                 assert!(
                     cross_equivalent,
                     "E6.3 seed {seed:#x} cross-engine OR baseline diverged in RANKED DOCUMENTS, \
@@ -7980,6 +7981,20 @@ mod tests {
     /// operators is not an associativity transform, and the declared
     /// projection must reject it. Without this the law's projection could be
     /// weakened to something that accepts anything and still look green.
+    ///
+    /// THE OPERAND TRIPLE IS PART OF THE CONTROL, and the first one tried was
+    /// wrong. With `(alpha, beta, gamma)`, `(alpha OR beta) OR gamma` and
+    /// `alpha OR (beta AND gamma)` select the SAME four documents on this
+    /// fixture, so the projection accepted the mutation and the control failed
+    /// — correctly. A negative fixture that the transform cannot distinguish
+    /// proves nothing about the projection.
+    ///
+    /// `(alpha, beta, delta)` distinguishes it: doc-5 ("delta epsilon")
+    /// matches the baseline through the third operand alone and cannot match
+    /// `beta AND delta`, so the matched set genuinely changes. Choosing
+    /// operands so the NEGATIVE can fail is the opposite of fixture-fitting;
+    /// fitting would be choosing operands so the positive law passes, and the
+    /// positive law's seed matrix above still runs all three triples.
     #[cfg(feature = "perf-harness")]
     #[test]
     fn e63_three_term_or_mixed_operator_regrouping_is_rejected_by_the_projection() {
@@ -7998,14 +8013,14 @@ mod tests {
             let baseline = e63_or_associativity_runs(
                 &cx,
                 &documents,
-                &[("three-term-or-assoc", "(alpha OR beta) OR gamma")],
+                &[("three-term-or-assoc", "(alpha OR beta) OR delta")],
                 SEED,
             )
             .await;
             let mutated = e63_or_associativity_runs(
                 &cx,
                 &documents,
-                &[("three-term-or-assoc", "alpha OR (beta AND gamma)")],
+                &[("three-term-or-assoc", "alpha OR (beta AND delta)")],
                 SEED,
             )
             .await;

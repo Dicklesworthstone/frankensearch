@@ -748,7 +748,7 @@ impl MetamorphicLawRegistry {
                     "e6.3-three-term-or-associativity-v1",
                     "three distinct unboosted optional scalar OR operands, regrouped only",
                     "ranked document sequence, doc count, match count, and snippets; score bits EXCLUDED and separately witnessed (measured one ULP)",
-                    "same ranked documents under re-association, WITHIN each engine only; the cross-engine scope is excluded because the un-transformed baseline (alpha OR gamma) OR delta already diverges by one ULP, registered on bd-quill-e6-gauntlet-scale-rm3q.8.1",
+                    "same ranked documents under re-association, WITHIN each engine only; the cross-engine scope is excluded because the un-transformed baseline (alpha OR gamma) OR delta already diverges by one ULP — DIV-008, disposition blocking on bd-gx7n4",
                     "tie_order",
                     "e63-three-term-or-associativity-positive",
                     "e63-three-term-or-associativity-mixed-operator",
