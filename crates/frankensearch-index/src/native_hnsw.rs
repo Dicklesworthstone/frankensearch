@@ -4118,6 +4118,44 @@ mod tests {
         admit_owned_fsvi_fixture(&path, binding)
     }
 
+    /// Offset of the bd-miio8 cross-tier publication nonce in an FSVI v2 header.
+    const FSVI_V2_PUBLICATION_NONCE_OFFSET: usize = 14;
+
+    fn fsvi_v2_header_size(bytes: &[u8]) -> usize {
+        usize::try_from(u32::from_le_bytes(
+            bytes[6..10].try_into().expect("v2 header-size field"),
+        ))
+        .expect("v2 header size fits usize")
+    }
+
+    fn fsvi_v2_publication_nonce(bytes: &[u8]) -> u16 {
+        u16::from_le_bytes(
+            bytes[FSVI_V2_PUBLICATION_NONCE_OFFSET..FSVI_V2_PUBLICATION_NONCE_OFFSET + 2]
+                .try_into()
+                .expect("v2 publication-nonce field"),
+        )
+    }
+
+    fn admitted_fsvi_owner_with_publication_nonce(
+        directory: &Path,
+        basename: &str,
+        binding: &FsviV2IdentityBinding,
+        rows: &[(String, Vec<f32>)],
+        publication_nonce: u16,
+    ) -> Arc<ValidatedFsviBytes> {
+        let path = directory.join(basename);
+        let mut writer = VectorIndex::create_v2(&path, binding.clone())
+            .expect("create FSVI v2 owner fixture")
+            .with_publication_nonce(publication_nonce);
+        for (doc_id, vector) in rows {
+            writer
+                .write_record(doc_id, vector)
+                .expect("write FSVI v2 owner row");
+        }
+        writer.finish().expect("finish FSVI v2 owner fixture");
+        admit_owned_fsvi_fixture(&path, binding)
+    }
+
     fn admitted_fsvi_owner_with_flags(
         directory: &Path,
         basename: &str,
@@ -4836,6 +4874,245 @@ mod tests {
             matches!(error, SearchError::IndexCorrupted { ref detail, .. }
                 if detail.contains("receipt FSVI whole-image SHA-256 mismatch")),
             "tombstone-layout mismatch did not fail at receipt identity: {error:?}"
+        );
+    }
+
+    /// A stale sidecar from a content-identical predecessor generation must be
+    /// refused by the successor owner.
+    ///
+    /// Planted negative: the two published artifacts agree on every
+    /// content-derived binding field — embedding identity, storage, vector
+    /// content digest, ordered live-docset digest, physical row count — and
+    /// their entire post-header content region is byte-identical. An
+    /// implementation that bound an ANN graph to content alone would adopt the
+    /// predecessor's graph for the successor generation.
+    #[test]
+    fn bound_load_rejects_a_content_identical_owner_from_a_different_generation() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let predecessor_binding = fsvi_v2_binding(41, 0x41, "generation-rebind", 4);
+        let successor_binding = fsvi_v2_binding(42, 0x42, "generation-rebind", 4);
+        let rows = vec![
+            ("doc-alpha".to_owned(), vec![1.0, 0.0, 0.0, 0.0]),
+            ("doc-beta".to_owned(), vec![0.0, 1.0, 0.0, 0.0]),
+            ("doc-gamma".to_owned(), vec![0.0, 0.0, 1.0, 0.0]),
+        ];
+        let predecessor_path = directory.path().join("generation-predecessor.fsvi");
+        let successor_path = directory.path().join("generation-successor.fsvi");
+        let predecessor = admitted_fsvi_owner(
+            directory.path(),
+            "generation-predecessor.fsvi",
+            &predecessor_binding,
+            &rows,
+        );
+        let successor = admitted_fsvi_owner(
+            directory.path(),
+            "generation-successor.fsvi",
+            &successor_binding,
+            &rows,
+        );
+
+        let predecessor_bytes = std::fs::read(&predecessor_path).expect("read predecessor image");
+        let successor_bytes = std::fs::read(&successor_path).expect("read successor image");
+        let header_size = fsvi_v2_header_size(&predecessor_bytes);
+        assert_eq!(
+            header_size,
+            fsvi_v2_header_size(&successor_bytes),
+            "a pure generation change must not resize the header"
+        );
+        assert_eq!(
+            predecessor_bytes[header_size..],
+            successor_bytes[header_size..],
+            "the fixture must differ only in header identity, never in content"
+        );
+
+        let predecessor_binding_v2 =
+            NativeHnswGenerationBindingV2::from_validated_fsvi(&predecessor)
+                .expect("predecessor binding");
+        let successor_binding_v2 = NativeHnswGenerationBindingV2::from_validated_fsvi(&successor)
+            .expect("successor binding");
+        assert_eq!(
+            predecessor_binding_v2.embedding_identity_fingerprint,
+            successor_binding_v2.embedding_identity_fingerprint
+        );
+        assert_eq!(
+            predecessor_binding_v2.vector_storage_fingerprint,
+            successor_binding_v2.vector_storage_fingerprint
+        );
+        assert_eq!(
+            predecessor_binding_v2.vector_content_digest,
+            successor_binding_v2.vector_content_digest
+        );
+        assert_eq!(
+            predecessor_binding_v2.ordered_live_docset_digest,
+            successor_binding_v2.ordered_live_docset_digest
+        );
+        assert_eq!(
+            predecessor_binding_v2.fsvi_physical_row_count,
+            successor_binding_v2.fsvi_physical_row_count
+        );
+        assert_ne!(
+            predecessor_binding_v2.artifact_generation,
+            successor_binding_v2.artifact_generation
+        );
+        assert_ne!(
+            predecessor_binding_v2.fsvi_whole_image_sha256,
+            successor_binding_v2.fsvi_whole_image_sha256
+        );
+
+        let bound = ValidatedNativeHnsw::build(Arc::clone(&predecessor), params(), 41)
+            .expect("predecessor owner-bound graph");
+        let graph_path = directory.path().join("generation.fshnsw");
+        bound.save(&graph_path).expect("publish receipted graph");
+        ValidatedNativeHnsw::load(Arc::clone(&predecessor), &graph_path)
+            .expect("the sidecar must load against the generation that built it");
+
+        std::fs::write(&graph_path, b"graph bytes must not be read")
+            .expect("poison graph after receipt publication");
+        let error = ValidatedNativeHnsw::load(Arc::clone(&successor), &graph_path)
+            .expect_err("a predecessor generation's sidecar must fail");
+        assert!(
+            matches!(error, SearchError::IndexCorrupted { ref detail, .. }
+                if detail.contains("receipt artifact generation mismatch")),
+            "generation drift did not fail at receipt identity: {error:?}"
+        );
+    }
+
+    /// Two tiers of distinct publications whose FSVI images differ only in the
+    /// bd-miio8 publication nonce must not share one ANN sidecar.
+    ///
+    /// Planted negative: this is the strongest same-content forgery the format
+    /// admits. Every receipt field except the whole-image SHA-256 agrees —
+    /// including the artifact generation and its fingerprint, which separate
+    /// the content-only cases — and the two files differ in exactly the two
+    /// nonce bytes plus the header CRC that covers them. Only the exact
+    /// whole-image witness distinguishes them, so a binder that checked
+    /// identity, generation, and content digests would accept a graph built
+    /// over the other publication's bytes.
+    #[test]
+    fn bound_load_rejects_a_publication_nonce_twin_whose_every_other_receipt_field_matches() {
+        let directory = tempfile::tempdir().expect("temporary directory");
+        let fsvi_binding = fsvi_v2_binding(43, 0x43, "publication-nonce-twin", 4);
+        let rows = vec![
+            ("doc-alpha".to_owned(), vec![1.0, 0.0, 0.0, 0.0]),
+            ("doc-beta".to_owned(), vec![0.0, 1.0, 0.0, 0.0]),
+            ("doc-gamma".to_owned(), vec![0.0, 0.0, 1.0, 0.0]),
+        ];
+        let first_path = directory.path().join("nonce-first.fsvi");
+        let second_path = directory.path().join("nonce-second.fsvi");
+        let first = admitted_fsvi_owner_with_publication_nonce(
+            directory.path(),
+            "nonce-first.fsvi",
+            &fsvi_binding,
+            &rows,
+            0x0101,
+        );
+        let second = admitted_fsvi_owner_with_publication_nonce(
+            directory.path(),
+            "nonce-second.fsvi",
+            &fsvi_binding,
+            &rows,
+            0x0202,
+        );
+        let first_bytes = std::fs::read(&first_path).expect("read first image");
+        let second_bytes = std::fs::read(&second_path).expect("read second image");
+        assert_eq!(fsvi_v2_publication_nonce(&first_bytes), 0x0101);
+        assert_eq!(fsvi_v2_publication_nonce(&second_bytes), 0x0202);
+        let header_size = fsvi_v2_header_size(&first_bytes);
+        assert_eq!(header_size, fsvi_v2_header_size(&second_bytes));
+        assert_eq!(first_bytes.len(), second_bytes.len());
+        let crc_offset = header_size - 4;
+        assert_eq!(
+            first_bytes[..FSVI_V2_PUBLICATION_NONCE_OFFSET],
+            second_bytes[..FSVI_V2_PUBLICATION_NONCE_OFFSET],
+            "the fixture must not disturb the header prefix"
+        );
+        assert_ne!(
+            first_bytes[FSVI_V2_PUBLICATION_NONCE_OFFSET..FSVI_V2_PUBLICATION_NONCE_OFFSET + 2],
+            second_bytes[FSVI_V2_PUBLICATION_NONCE_OFFSET..FSVI_V2_PUBLICATION_NONCE_OFFSET + 2],
+            "the fixture must actually carry two different publication nonces"
+        );
+        assert_eq!(
+            first_bytes[FSVI_V2_PUBLICATION_NONCE_OFFSET + 2..crc_offset],
+            second_bytes[FSVI_V2_PUBLICATION_NONCE_OFFSET + 2..crc_offset],
+            "no header identity field other than the nonce may differ"
+        );
+        assert_eq!(
+            first_bytes[header_size..],
+            second_bytes[header_size..],
+            "record table, string table, padding, and vector slab must be byte-identical"
+        );
+        for index in 0..first.record_count() {
+            let first_row = first.row(index).expect("first row");
+            let second_row = second.row(index).expect("second row");
+            assert_eq!(first_row.doc_id(), second_row.doc_id());
+            assert_eq!(first_row.flags(), second_row.flags());
+            assert_eq!(first_row.vector_bytes(), second_row.vector_bytes());
+        }
+
+        let first_binding = NativeHnswGenerationBindingV2::from_validated_fsvi(&first)
+            .expect("first publication binding");
+        let second_binding = NativeHnswGenerationBindingV2::from_validated_fsvi(&second)
+            .expect("second publication binding");
+        assert_eq!(
+            first_binding.artifact_generation,
+            second_binding.artifact_generation
+        );
+        assert_eq!(
+            first_binding.artifact_generation_fingerprint,
+            second_binding.artifact_generation_fingerprint
+        );
+        assert_eq!(
+            first_binding.embedding_identity_fingerprint,
+            second_binding.embedding_identity_fingerprint
+        );
+        assert_eq!(
+            first_binding.embedding_space_fingerprint,
+            second_binding.embedding_space_fingerprint
+        );
+        assert_eq!(
+            first_binding.embedding_producer_fingerprint,
+            second_binding.embedding_producer_fingerprint
+        );
+        assert_eq!(
+            first_binding.embedding_input_fingerprint,
+            second_binding.embedding_input_fingerprint
+        );
+        assert_eq!(
+            first_binding.vector_storage_fingerprint,
+            second_binding.vector_storage_fingerprint
+        );
+        assert_eq!(
+            first_binding.vector_content_digest,
+            second_binding.vector_content_digest
+        );
+        assert_eq!(
+            first_binding.ordered_live_docset_digest,
+            second_binding.ordered_live_docset_digest
+        );
+        assert_eq!(
+            first_binding.fsvi_physical_row_count,
+            second_binding.fsvi_physical_row_count
+        );
+        assert_ne!(
+            first_binding.fsvi_whole_image_sha256, second_binding.fsvi_whole_image_sha256,
+            "the whole-image witness is the only field that separates the twins"
+        );
+
+        let bound = ValidatedNativeHnsw::build(Arc::clone(&first), params(), 43)
+            .expect("first publication owner-bound graph");
+        let graph_path = directory.path().join("nonce.fshnsw");
+        bound.save(&graph_path).expect("publish receipted graph");
+        ValidatedNativeHnsw::load(Arc::clone(&first), &graph_path)
+            .expect("the sidecar must load against the publication that built it");
+
+        std::fs::write(&graph_path, b"graph bytes must not be read")
+            .expect("poison graph after receipt publication");
+        let error = ValidatedNativeHnsw::load(Arc::clone(&second), &graph_path)
+            .expect_err("a different publication's sidecar must fail");
+        assert!(
+            matches!(error, SearchError::IndexCorrupted { ref detail, .. }
+                if detail.contains("receipt FSVI whole-image SHA-256 mismatch")),
+            "publication-nonce drift did not fail at receipt identity: {error:?}"
         );
     }
 
