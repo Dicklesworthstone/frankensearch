@@ -6696,6 +6696,391 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// C2 residual (bd-r6lwt): TRUE concurrency, not two sequentially opened
+    /// indexes.
+    ///
+    /// `refused_candidate_leaves_the_retained_owner_serving_and_accepted_one_installs`
+    /// holds a second reader across a refresh, but everything in it happens on
+    /// one thread in a fixed order, so it cannot distinguish "the owner is
+    /// immune to the pathname changing" from "nothing ran at the same time".
+    /// Here real OS threads search a retained generation-one owner while
+    /// another thread rewrites the SAME pathname to generation two and admits
+    /// and installs the successor on its own handle.
+    ///
+    /// The property under test is that a retained owner serves from its own
+    /// sealed `Arc<[u8]>` and never re-reads the path it was opened from. A
+    /// reader must therefore observe generation one on EVERY iteration: not a
+    /// torn read, not an empty result, and never `doc-c`, which exists only in
+    /// the successor.
+    ///
+    /// This is an OS-level contract (a real file being overwritten under live
+    /// readers), so it uses real threads rather than a `LabRuntime` schedule --
+    /// a deterministic scheduler would be simulating the very interleaving that
+    /// is the thing in question.
+    #[test]
+    fn retained_owners_serve_concurrent_readers_while_a_successor_installs() {
+        use std::sync::Barrier;
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::thread;
+
+        const READERS: usize = 4;
+        // Enough that the writer's rewrite+admit is overwhelmingly likely to
+        // land mid-loop rather than after every reader has finished.
+        const MIN_ITERATIONS_PER_READER: usize = 200;
+
+        let dir = temp_index_dir("admitted-v2-concurrent-refresh");
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let fast_path = dir.join(VECTOR_INDEX_FAST_FILENAME);
+
+        let (generation_one, _) = fsvi_v2_binding("concurrent-model", 4, 41);
+        let incumbent_rows: [(&str, &[f32]); 2] = [
+            ("doc-a", &[1.0, 0.0, 0.0, 0.0]),
+            ("doc-b", &[0.0, 1.0, 0.0, 0.0]),
+        ];
+        write_v2_tier(&fast_path, &generation_one, &incumbent_rows);
+
+        let paths = TwoTierIndexPaths::new(&fast_path);
+        let reader_index = TwoTierIndex::open_admitted_v2_with_paths(
+            &paths,
+            TwoTierConfig::default(),
+            &generation_one,
+            None,
+        )
+        .expect("admit generation one for the reader handle");
+        let witness_before = reader_index
+            .fast_admitted_owner()
+            .expect("retained owner")
+            .witness()
+            .clone();
+
+        // Gate every thread on the same barrier so readers are already in
+        // their loop when the rewrite starts.
+        let barrier = Barrier::new(READERS + 1);
+        let writer_done = AtomicBool::new(false);
+        let observed = AtomicUsize::new(0);
+        // Reads completed strictly BETWEEN the writer starting its rewrite and
+        // finishing its install. This is the overlap proof: a run where the
+        // writer finished before any reader looped would leave it at zero, and
+        // every assertion in the reader loop would then be about a file that
+        // was never concurrently rewritten.
+        let overlapped = AtomicUsize::new(0);
+        let index_ref = &reader_index;
+        let barrier_ref = &barrier;
+        let writer_done_ref = &writer_done;
+        let observed_ref = &observed;
+        let overlapped_ref = &overlapped;
+        let fast_path_ref = fast_path.as_path();
+
+        thread::scope(|scope| {
+            for _ in 0..READERS {
+                scope.spawn(move || {
+                    barrier_ref.wait();
+                    let mut iterations = 0_usize;
+                    // Keep going until the writer is finished AND this reader
+                    // has done enough passes for the overlap to be real.
+                    while !writer_done_ref.load(Ordering::Acquire)
+                        || iterations < MIN_ITERATIONS_PER_READER
+                    {
+                        let hits = index_ref
+                            .search_fast(&[0.0, 1.0, 0.0, 0.0], 3)
+                            .expect("a retained owner never fails a concurrent read");
+                        assert_eq!(
+                            hits.len(),
+                            2,
+                            "generation one has exactly two rows; a short read means the \
+                             owner re-read the pathname"
+                        );
+                        assert_eq!(
+                            hits[0].doc_id, "doc-b",
+                            "generation one's nearest neighbour must not change under a \
+                             concurrent install"
+                        );
+                        assert!(
+                            !hits.iter().any(|hit| hit.doc_id == "doc-c"),
+                            "doc-c exists only in the successor; a retained owner must \
+                             never observe it"
+                        );
+                        assert_eq!(index_ref.doc_count(), 2);
+                        iterations = iterations.saturating_add(1);
+                        observed_ref.fetch_add(1, Ordering::Release);
+                    }
+                });
+            }
+
+            scope.spawn(move || {
+                barrier_ref.wait();
+                let (generation_two, _) = fsvi_v2_binding("concurrent-model", 4, 42);
+                let successor_rows: [(&str, &[f32]); 3] = [
+                    ("doc-a", &[1.0, 0.0, 0.0, 0.0]),
+                    ("doc-b", &[0.0, 1.0, 0.0, 0.0]),
+                    ("doc-c", &[0.0, 0.0, 1.0, 0.0]),
+                ];
+                // Overwrite the pathname the readers' owner was opened from,
+                // then admit and install the successor on a separate handle.
+                let reads_before_rewrite = observed_ref.load(Ordering::Acquire);
+                write_v2_tier(fast_path_ref, &generation_two, &successor_rows);
+                let successor_paths = TwoTierIndexPaths::new(fast_path_ref);
+                let mut successor = TwoTierIndex::open_admitted_v2_with_paths(
+                    &successor_paths,
+                    TwoTierConfig::default(),
+                    &generation_two,
+                    None,
+                )
+                .expect("admit generation two on an independent handle");
+                successor
+                    .try_replace_admitted_v2(&successor_paths, &generation_two, None)
+                    .expect("re-admitting the installed generation succeeds");
+                assert_eq!(successor.doc_count(), 3);
+                overlapped_ref.store(
+                    observed_ref
+                        .load(Ordering::Acquire)
+                        .saturating_sub(reads_before_rewrite),
+                    Ordering::Release,
+                );
+                writer_done_ref.store(true, Ordering::Release);
+            });
+        });
+
+        // Vacuity guard, two parts. Both must hold or the assertions inside
+        // the reader loop proved nothing.
+        assert!(
+            observed.load(Ordering::Acquire) >= READERS * MIN_ITERATIONS_PER_READER,
+            "readers did not complete the minimum number of passes"
+        );
+        assert!(
+            overlapped.load(Ordering::Acquire) > 0,
+            "no read completed between the pathname rewrite and the successor install; \
+             the reads never actually raced the writer, so this run is vacuous"
+        );
+
+        // The owner is bit-for-bit what it was before the pathname changed.
+        assert_eq!(
+            reader_index
+                .fast_admitted_owner()
+                .expect("retained owner survives the concurrent install")
+                .witness(),
+            &witness_before,
+            "a concurrent successor install must not mutate a live predecessor's owner"
+        );
+        assert_eq!(reader_index.doc_count(), 2);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// C2 residual (bd-r6lwt): DROP ORDER between the owner's byte image and
+    /// the index that serves from it.
+    ///
+    /// The borrow checker covers one half of this: a borrowed view cannot be
+    /// held across a `&mut self` refresh, pinned by the `compile_fail` doctest
+    /// on [`crate::ValidatedFsviBytes`]. It does NOT cover the other half.
+    /// `ValidatedFsviBytes` declares `bytes: Arc<[u8]>` BEFORE `index`, and
+    /// Rust drops fields in declaration order, so the byte image is released
+    /// first while the index that serves from it is still alive.
+    ///
+    /// That is sound only because `index.data` is
+    /// `VectorIndexData::Immutable(Arc::clone(&bytes))` -- the SAME allocation
+    /// behind a second refcount, not a borrow and not a second copy. A naive
+    /// owner that stored a borrow, a raw pointer, or an independent copy would
+    /// be either unsound or silently double-resident under exactly this
+    /// declaration order. `owner_and_search_share_allocation` is the assertion
+    /// that distinguishes them, and it goes red if construction is ever changed
+    /// to copy the image rather than share it.
+    #[test]
+    fn owner_drop_order_is_not_load_bearing_because_the_image_is_shared_not_borrowed() {
+        use std::sync::Arc;
+
+        let dir = temp_index_dir("admitted-v2-drop-order");
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let fast_path = dir.join(VECTOR_INDEX_FAST_FILENAME);
+        let (generation, _) = fsvi_v2_binding("drop-order-model", 4, 51);
+        let rows: [(&str, &[f32]); 2] = [
+            ("doc-a", &[1.0, 0.0, 0.0, 0.0]),
+            ("doc-b", &[0.0, 1.0, 0.0, 0.0]),
+        ];
+        write_v2_tier(&fast_path, &generation, &rows);
+
+        let paths = TwoTierIndexPaths::new(&fast_path);
+        let index = TwoTierIndex::open_admitted_v2_with_paths(
+            &paths,
+            TwoTierConfig::default(),
+            &generation,
+            None,
+        )
+        .expect("admit the owner");
+
+        let owner = index.fast_admitted_owner().expect("retained owner");
+
+        // (i) The serving index and the owner name ONE allocation. This is the
+        // whole reason field drop order is not load-bearing.
+        assert!(
+            owner.owner_and_search_share_allocation(),
+            "the retained owner and its serving index must share one refcounted \
+             image; a separate copy or a borrow would make declaration order \
+             load-bearing"
+        );
+
+        // (ii) Two live handles to that one allocation: the owner's field and
+        // the index's `Immutable` data.
+        let external = Arc::clone(&owner.bytes);
+        let image_before: Vec<u8> = external.to_vec();
+        assert_eq!(
+            Arc::strong_count(&external),
+            3,
+            "owner field + serving index + this test's clone"
+        );
+
+        // (iii) Drop the ENTIRE index, and with it the owner, while holding
+        // only the external clone. If the image were borrowed rather than
+        // shared, this is where it would become dangling.
+        drop(index);
+
+        assert_eq!(
+            Arc::strong_count(&external),
+            1,
+            "dropping the owner must release exactly its own two references"
+        );
+        assert_eq!(
+            external.as_ref(),
+            image_before.as_slice(),
+            "the byte image must be unchanged and fully readable after the owner \
+             that admitted it is gone"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// C2 residual (bd-r6lwt): ANN sidecar validation against a RETAINED
+    /// OWNER, where the discriminator is identity rather than content.
+    ///
+    /// The `ann` feature was not exercised by any owner test at bd-3t52d's
+    /// closure. It matters here because `plan_load_or_build_ann` validates the
+    /// sidecar against `TierSource::index()`, which for an admitted tier is a
+    /// borrow INSIDE the sealed owner -- an index whose `path` is the synthetic
+    /// `<owned-fsvi-v2>` and whose data is the owner's own `Arc<[u8]>`. If
+    /// [`HnswSourceIdentityV1::capture`] could not read a retained owner's v2
+    /// identity, the generation gate would silently degrade to `(None, None)`,
+    /// which `admits` treats as legacy-v1 and lets through on content alone.
+    ///
+    /// So this test holds the rows BYTE-IDENTICAL across generations and varies
+    /// only the generation binding. Every content check in
+    /// `matches_vector_index` -- dimension, doc ids, ordering, source positions
+    /// -- passes by construction, which leaves the identity gate as the only
+    /// thing that can reject. Content equality is not identity equality
+    /// (bd-r65a).
+    ///
+    /// Planted negative: the generation-31 sidecar must NOT admit the
+    /// generation-32 owner. Reducing the gate to a content fingerprint turns
+    /// that assertion red. The paired positive control -- the same sidecar DOES
+    /// admit its own generation-31 owner -- means a blanket-reject regression
+    /// cannot pass either.
+    #[cfg(feature = "ann")]
+    #[test]
+    fn ann_sidecar_validation_binds_the_retained_owners_generation_not_its_content() {
+        let dir = temp_index_dir("admitted-v2-ann-identity");
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let fast_path = dir.join(VECTOR_INDEX_FAST_FILENAME);
+        let ann_path = dir.join("fast.ann");
+
+        // Identical in every observable content dimension across generations.
+        let rows: [(&str, &[f32]); 3] = [
+            ("doc-a", &[1.0, 0.0, 0.0, 0.0]),
+            ("doc-b", &[0.0, 1.0, 0.0, 0.0]),
+            ("doc-c", &[0.0, 0.0, 1.0, 0.0]),
+        ];
+        let config = TwoTierConfig {
+            hnsw_threshold: 1,
+            hnsw_ef_search: 64,
+            ..TwoTierConfig::default()
+        };
+
+        let (generation_one, _) = fsvi_v2_binding("ann-identity-model", 4, 31);
+        write_v2_tier(&fast_path, &generation_one, &rows);
+        let paths = TwoTierIndexPaths::new(&fast_path).with_fast_ann(&ann_path);
+
+        let first = TwoTierIndex::open_admitted_v2_with_paths(
+            &paths,
+            config.clone(),
+            &generation_one,
+            None,
+        )
+        .expect("admit generation 31");
+        assert!(
+            first.has_fast_ann(),
+            "an admitted owner must be able to carry an ANN sidecar"
+        );
+        // The owner is intact after ANN build and persistence ran against it.
+        let owner_one = first.fast_admitted_owner().expect("retained owner");
+        assert!(
+            owner_one.owner_and_search_share_allocation(),
+            "building an ANN sidecar must not detach the owner from its image"
+        );
+        let witness_one = owner_one.witness().clone();
+        assert_eq!(
+            first
+                .search_fast(&[0.0, 0.0, 1.0, 0.0], 1)
+                .expect("generation 31 serves")[0]
+                .doc_id,
+            "doc-c"
+        );
+        assert!(ann_path.exists(), "the sidecar was persisted");
+
+        // POSITIVE CONTROL: the persisted sidecar admits the generation it was
+        // built against, borrowed from inside the retained owner.
+        let sidecar = load_native_ann_sidecar(&ann_path, first.fast_tier());
+        assert!(
+            sidecar
+                .matches_vector_index(first.fast_tier())
+                .expect("validate sidecar against its own generation"),
+            "a sidecar must admit the retained owner it was built from; if this fails \
+             the identity capture cannot see an owner-borrowed index at all"
+        );
+
+        // Generation 32: same model, same rows, same order -- only the
+        // generation binding differs.
+        let (generation_two, _) = fsvi_v2_binding("ann-identity-model", 4, 32);
+        write_v2_tier(&fast_path, &generation_two, &rows);
+        let successor =
+            TwoTierIndex::open_admitted_v2_with_paths(&paths, config, &generation_two, None)
+                .expect("admit generation 32");
+        assert_ne!(
+            successor
+                .fast_admitted_owner()
+                .expect("successor owner")
+                .witness(),
+            &witness_one,
+            "the fixture must actually change generation, or this test is vacuous"
+        );
+
+        // PLANTED NEGATIVE: byte-identical content, different generation. Only
+        // the identity gate can tell these apart.
+        assert!(
+            !sidecar
+                .matches_vector_index(successor.fast_tier())
+                .expect("validate the generation-31 sidecar against generation 32"),
+            "an ANN sidecar bound to generation 31 must not be served against a \
+             generation-32 retained owner, even though their content is identical"
+        );
+
+        // The successor still serves correctly and its owner is intact, so the
+        // rejection produced a rebuild rather than a broken tier.
+        assert!(successor.has_fast_ann());
+        assert!(
+            successor
+                .fast_admitted_owner()
+                .expect("successor owner")
+                .owner_and_search_share_allocation()
+        );
+        assert_eq!(
+            successor
+                .search_fast(&[0.0, 0.0, 1.0, 0.0], 1)
+                .expect("generation 32 serves")[0]
+                .doc_id,
+            "doc-c"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     /// C5, the partial-install case: a refresh whose FAST tier admits but
     /// whose QUALITY tier is refused must leave BOTH incumbent tiers exactly
     /// as they were. This is the shape a half-installed generation would
