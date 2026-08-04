@@ -2021,6 +2021,21 @@ fn collect_current_linux_build_inputs(
         "rustflags/absent".to_owned(),
         build_input(ArtifactStoreV4BuildInputKind::Rustflags, b"absent".to_vec()),
     );
+    // Cargo does not preserve a complete dependency build-script output
+    // manifest in the running executable. Record that structural absence as
+    // an exact, typed diagnostic instead of silently omitting the required
+    // BuildScriptOutput class. A caller seeking sealed admission must obtain
+    // an authoritative Cargo execution manifest separately.
+    inputs.insert(
+        "build-script-output/current-process-availability".to_owned(),
+        build_input(
+            ArtifactStoreV4BuildInputKind::BuildScriptOutput,
+            serde_json::to_vec(&serde_json::json!({
+                "availability": "unavailable",
+                "reason": "running producer has no authoritative Cargo build-script output manifest",
+            }))?,
+        ),
+    );
     inputs.insert(
         "target/triple".to_owned(),
         build_input(
@@ -4589,6 +4604,24 @@ mod tests {
             producer.source_git_revision
         );
         assert_eq!(provenance["source_git_dirty"], producer.source_git_dirty);
+        let build_script_output = snapshots
+            .build()
+            .inputs
+            .iter()
+            .find(|input| input.key == "build-script-output/current-process-availability")
+            .expect("Build snapshot must disclose build-script output availability");
+        assert_eq!(
+            build_script_output.kind,
+            ArtifactStoreV4BuildInputKind::BuildScriptOutput
+        );
+        let availability: serde_json::Value =
+            serde_json::from_slice(&build_script_output.canonical_bytes)
+                .expect("decode build-script output availability receipt");
+        assert_eq!(availability["availability"], "unavailable");
+        assert_eq!(
+            availability["reason"],
+            "running producer has no authoritative Cargo build-script output manifest"
+        );
     }
 
     #[test]
