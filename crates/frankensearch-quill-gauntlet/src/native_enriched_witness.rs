@@ -369,10 +369,9 @@ impl NativeEnrichedReceiptV1 {
     /// Returns [`GauntletError::InvalidContract`] when the body cannot be
     /// canonically serialized.
     pub fn receipt_hash(&self) -> Result<String, GauntletError> {
-        let body =
-            serde_json::to_vec(self).map_err(|error| GauntletError::InvalidContract {
-                reason: format!("native enriched receipt is not canonically serializable: {error}"),
-            })?;
+        let body = serde_json::to_vec(self).map_err(|error| GauntletError::InvalidContract {
+            reason: format!("native enriched receipt is not canonically serializable: {error}"),
+        })?;
         let mut hasher = Sha256::new();
         hasher.update(RECEIPT_HASH_DOMAIN.as_bytes());
         hasher.update([0u8]);
@@ -456,19 +455,21 @@ pub fn observe_quill(
         .map_err(|error| GauntletError::InvalidContract {
             reason: format!("native Quill paginated search failed: {error}"),
         })?;
-    let total = usize::try_from(result.total_count.ok_or_else(|| {
-        GauntletError::InvalidContract {
-            reason: "native Quill exact-count was requested but not returned".to_owned(),
-        }
-    })?)
-    .map_err(|_| GauntletError::InvalidContract {
-        reason: "native Quill total does not fit usize".to_owned(),
-    })?;
-    let doc_count = usize::try_from(result.doc_count).map_err(|_| {
-        GauntletError::InvalidContract {
+    let total =
+        usize::try_from(
+            result
+                .total_count
+                .ok_or_else(|| GauntletError::InvalidContract {
+                    reason: "native Quill exact-count was requested but not returned".to_owned(),
+                })?,
+        )
+        .map_err(|_| GauntletError::InvalidContract {
+            reason: "native Quill total does not fit usize".to_owned(),
+        })?;
+    let doc_count =
+        usize::try_from(result.doc_count).map_err(|_| GauntletError::InvalidContract {
             reason: "native Quill doc_count does not fit usize".to_owned(),
-        }
-    })?;
+        })?;
     Ok(NativeObservationV1 {
         engine: NativeEngineV1::Quill,
         query: expectation.query.to_owned(),
