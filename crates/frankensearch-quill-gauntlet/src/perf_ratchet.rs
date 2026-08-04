@@ -32,6 +32,12 @@ pub const PERF_MAX_REGRESSION_PCT: f64 = 5.0;
 pub const PERF_MAX_REPRODUCTION_DELTA_PCT: f64 = 5.0;
 /// Robust-z value retained as diagnostic provenance beside CI-gated decisions.
 pub const PERF_REGRESSION_ROBUST_Z: f64 = 3.0;
+/// Largest drift from identity admitted for an A/A null control's median.
+///
+/// Bounds the null's *accuracy*. Its precision is bounded separately, and in
+/// the opposite direction, by the paired A/A floor a claim must clear. See
+/// [`validate_null_control`].
+pub const PERF_MAX_NULL_MEDIAN_DRIFT_PCT: f64 = 2.0;
 
 const MAD_SCALE: f64 = 1.4826;
 const MAD_EPSILON: f64 = 1.0e-12;
@@ -2538,25 +2544,48 @@ fn compare_reproduction(
     }
 }
 
+/// Admit an A/A control on its **accuracy** — is its median at 1.0? — and never
+/// on how precisely it was measured.
+///
+/// # Why not "the median CI must contain 1.0"
+///
+/// That clause, which this replaced (`bd-pjh09`), coupled admission to the
+/// null's precision in the wrong direction: a tighter null has a narrower CI,
+/// so it is *more* likely to exclude 1.0 and quarantine its own row — whatever
+/// its residual bias, and whatever the size of the effect being measured. It
+/// punished exactly the measurement quality this harness exists to buy, and it
+/// made admission a property of the host's noise rather than of the code.
+///
+/// Measured on one ELF across `taskset`-pinned cores, a reproducible planted
+/// effect held its ratio to 1.16% while that clause flipped its verdict on 6 of
+/// 20 cells, purely as a function of which core and how many rounds. Every one
+/// of those vetoed nulls had a median within 0.21% of 1.0 — they were rejected
+/// for being precise, not for being wrong.
+///
+/// The CI stays in the quarantine message as provenance, and the null's spread
+/// still sets the floor a claim has to clear elsewhere; only the median decides
+/// whether the sampler itself can be trusted.
 fn validate_null_control(cell: &PerfCellResult, role: &str, state: &mut DecisionState) -> bool {
-    let contains_identity =
-        cell.distribution.median_ci95_low <= 1.0 && 1.0 <= cell.distribution.median_ci95_high;
-    if !contains_identity {
+    let drift_pct = (cell.distribution.p50 - 1.0).abs() * 100.0;
+    let unbiased = drift_pct <= PERF_MAX_NULL_MEDIAN_DRIFT_PCT;
+    if !unbiased {
         state.quarantine(
             "perf.ratchet.invalid_null_control",
             format!(
-                "{role} {}/{}/{} A/A median CI [{:.6}, {:.6}] does not contain 1.0 \
-                 (cv_pct={:.3} is provenance only)",
+                "{role} {}/{}/{} A/A median {:.6} drifts {drift_pct:.3}% from 1.0 \
+                 (limit {PERF_MAX_NULL_MEDIAN_DRIFT_PCT:.3}%; median CI [{:.6}, {:.6}] \
+                 and cv_pct={:.3} are provenance only)",
                 cell.fixture,
                 cell.metric,
                 cell.engine,
+                cell.distribution.p50,
                 cell.distribution.median_ci95_low,
                 cell.distribution.median_ci95_high,
                 cell.distribution.cv_pct,
             ),
         );
     }
-    contains_identity
+    unbiased
 }
 
 fn confidence_interval_confirms_regression(
@@ -3240,6 +3269,71 @@ mod tests {
         }
     }
 
+    /// An A/A control is admitted on its median, not on how wide its CI is.
+    ///
+    /// Both fixtures are shapes the retired straddle clause got backwards
+    /// (`bd-pjh09`): it quarantined the precise one for excluding 1.0, and
+    /// waved the biased one through because its wide CI happened to span 1.0.
+    #[test]
+    fn null_control_admits_on_median_accuracy_not_on_ci_width() {
+        let null_cell = |p50: f64, low: f64, high: f64| PerfCellResult {
+            fixture: "bulk/medium/1/positions_on".to_owned(),
+            metric: "docs_per_second_tantivy_over_tantivy".to_owned(),
+            engine: "paired_null".to_owned(),
+            unit: "ratio".to_owned(),
+            distribution: DistributionSummary {
+                median_ci95_low: low,
+                median_ci95_high: high,
+                ..distribution(p50)
+            },
+        };
+
+        // Precise: a CI 0.0007% wide sitting entirely above 1.0, median 0.02%
+        // off identity. The retired clause quarantined this.
+        let precise = null_cell(1.0002, 1.000201, 1.000208);
+        assert!(
+            !(precise.distribution.median_ci95_low <= 1.0
+                && 1.0 <= precise.distribution.median_ci95_high),
+            "fixture must exclude 1.0 or it does not exercise the retired clause"
+        );
+        let mut state = DecisionState::default();
+        assert!(validate_null_control(&precise, "candidate", &mut state));
+        assert!(
+            state.reasons.is_empty(),
+            "a precise null must not be quarantined: {:?}",
+            state.reasons
+        );
+
+        // Biased: median 5% off identity, CI spanning 1.0 with room. The
+        // retired clause admitted this without complaint.
+        let biased = null_cell(1.05, 0.90, 1.20);
+        assert!(
+            biased.distribution.median_ci95_low <= 1.0
+                && 1.0 <= biased.distribution.median_ci95_high,
+            "fixture must contain 1.0 or it does not exercise the retired clause"
+        );
+        let mut state = DecisionState::default();
+        assert!(!validate_null_control(&biased, "candidate", &mut state));
+        assert!(
+            state
+                .reasons
+                .iter()
+                .any(|reason| reason.code == "perf.ratchet.invalid_null_control"),
+            "a biased null must quarantine: {:?}",
+            state.reasons
+        );
+
+        // The tolerance is a boundary. Both fixtures sit a clear 1% inside and
+        // outside it rather than exactly on it, so neither assertion depends on
+        // f64 rounding through the subtraction.
+        let drift = PERF_MAX_NULL_MEDIAN_DRIFT_PCT / 100.0;
+        let at_edge = null_cell(1.0 + drift * 0.99, 0.90, 1.20);
+        let past_edge = null_cell(1.0 + drift * 1.01, 0.90, 1.20);
+        let mut state = DecisionState::default();
+        assert!(validate_null_control(&at_edge, "candidate", &mut state));
+        assert!(!validate_null_control(&past_edge, "candidate", &mut state));
+    }
+
     fn test_profile() -> MachineProfileKey {
         MachineProfileKey::new(
             crate::HardwareClassId::TrjZen35995wx,
@@ -3395,7 +3489,7 @@ mod tests {
     fn qg5_xlarge_rebaseline_rejects_a_fourfold_loss() {
         let state = qg5_target_decision(0.25);
 
-        assert_eq!(state.decision(), PerfGateDecision::Blocked);
+        assert_eq!(state.decision(), PerfGateDecision::Block);
         assert!(state.reasons.iter().any(|reason| {
             reason.code == "perf.ratchet.gate_target_missed"
                 && reason.message.contains("QG-5 20% compaction")
@@ -3406,7 +3500,7 @@ mod tests {
     fn qg5_xlarge_rebaseline_accepts_the_fivefold_threshold() {
         let state = qg5_target_decision(0.20);
 
-        assert_eq!(state.decision(), PerfGateDecision::Accepted);
+        assert_eq!(state.decision(), PerfGateDecision::Allow);
     }
 
     fn qg2_current_pair(
