@@ -2752,7 +2752,11 @@ mod tests {
     };
 
     use super::*;
-    use crate::comparator::{ComparisonStatus, DivergenceClass, RankClass};
+    use crate::comparator::{ComparisonStatus, RankClass};
+    // Every `DivergenceClass` reference in this module sits inside a
+    // `perf-harness` block, so the import carries the same gate.
+    #[cfg(feature = "perf-harness")]
+    use crate::comparator::DivergenceClass;
 
     const E55_ID_FIELD: u16 = 0;
     const E55_CONTENT_FIELD: u16 = 1;
