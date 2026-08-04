@@ -3615,6 +3615,18 @@ impl QueryWorkCheckpoint for QueryCheckpoint<'_> {
         self.conformance_controller
             .checkpoint(ConformanceCancellationStage::QueryCollection, self.cx);
         if units == 0 {
+            // A zero-unit admit still has to SURFACE cancellation. The
+            // conformance checkpoints above run before this guard, so they can
+            // request cancellation and then have the caller told `Ok(())`,
+            // leaving a cancelled query to keep walking its plan. No work is
+            // metered here, so only the observation and the typed error apply.
+            if self.cx.is_cancel_requested() {
+                #[cfg(feature = "profile-internals")]
+                if let Some(profile) = self.profile {
+                    profile.record_cancellation_observation();
+                }
+                return Err(ArgusError::QueryCancelled { phase: self.phase });
+            }
             return Ok(());
         }
         #[cfg(feature = "profile-internals")]
@@ -16062,7 +16074,10 @@ mod tests {
                 .await
                 .expect("open two-segment profile reader");
             let outcome = reader
-                .search_paginated_with_profile(&cx, "alpha", 10, 0, false)
+                // Field-qualified on purpose: see the fragmented-snapshot test.
+                // A bare term fans out over both parser default fields, which
+                // doubles every counter independently of segment fan-out.
+                .search_paginated_with_profile(&cx, "content:alpha", 10, 0, false)
                 .expect("execute two-segment profiled search");
             let (result, receipt) = match outcome {
                 QuillProfiledSearchOutcome::Completed { result, receipt } => (result, receipt),
@@ -16120,7 +16135,12 @@ mod tests {
                 .await
                 .expect("open fragmented profile reader");
             let outcome = reader
-                .search_paginated_with_profile(&cx, "alpha", 16, 0, false)
+                // Field-qualified on purpose: a bare term expands across BOTH
+                // parser default fields (content and title), so every counter
+                // below would be doubled by field fan-out rather than by
+                // segment fan-out. The counter algebra this test documents --
+                // (N, N*N, N*N + N) -- is the single-field model.
+                .search_paginated_with_profile(&cx, "content:alpha", 16, 0, false)
                 .expect("execute fragmented profiled search");
             let (result, receipt) = match outcome {
                 QuillProfiledSearchOutcome::Completed { result, receipt } => (result, receipt),
