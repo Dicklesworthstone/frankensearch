@@ -140,7 +140,12 @@ impl MaintenanceSchedule {
     /// sequences actually do is how their exclusion stays evidenced instead of
     /// assumed, so a control needs to name its steps directly. Test-only, and
     /// never a path a campaign takes.
-    #[cfg(test)]
+    ///
+    /// Gated on `perf-harness` as well as `test`, because every caller is a
+    /// live law control and those are all `perf-harness`-only. Under `#[cfg(test)]`
+    /// alone this is dead code in a `tantivy-oracle`-only build, which is a
+    /// warning today and an error in any lane that runs `-D warnings`.
+    #[cfg(all(test, feature = "perf-harness"))]
     #[must_use]
     pub(crate) fn from_steps_for_test(
         seed: u64,
