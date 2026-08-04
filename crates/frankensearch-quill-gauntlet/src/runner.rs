@@ -19572,6 +19572,532 @@ mod tests {
         });
     }
 
+    /// The exact query the E6.8 live-ingestion witness is minted from, and the
+    /// sibling whose ULP moves the other way. Both are plain three-clause
+    /// disjunctions over the shared Core100 campaign corpus — no metamorphic
+    /// transform, no boost, no negation, no fielded literal.
+    #[cfg(feature = "tantivy-oracle")]
+    const E68_WITNESS_QUERY: &str = "(release OR require) OR return";
+    #[cfg(feature = "tantivy-oracle")]
+    const E68_WITNESS_SIBLING_QUERY: &str = "(relationships OR release) OR require";
+    #[cfg(feature = "tantivy-oracle")]
+    const E68_WITNESS_CONTROL_QUERY: &str = "release OR require";
+
+    /// Split the comparator's `doc-id@score-bits` rendering.
+    #[cfg(feature = "tantivy-oracle")]
+    fn split_scored_hit(value: &str) -> (&str, u32) {
+        let (doc_id, bits) = value
+            .rsplit_once('@')
+            .unwrap_or_else(|| panic!("scored hit must render as id@bits: {value:?}"));
+        (
+            doc_id,
+            u32::from_str_radix(bits, 16)
+                .unwrap_or_else(|error| panic!("hit score bits {bits:?} are not hex: {error}")),
+        )
+    }
+
+    /// bd-quill-e6-gauntlet-scale-rm3q.8: pin the exact live divergence the
+    /// E6.8 register witness is ingested from, in BOTH comparator
+    /// configurations, so the ingested record can never drift from the
+    /// behaviour it claims to witness.
+    ///
+    /// This is the mechanism DIV-007 documents — Quill fuses each unfielded
+    /// term's `[content, 2.0x title]` expansion into one summed contribution
+    /// while the pinned oracle accumulates 2N interleaved clause outputs — but
+    /// observed here WITHOUT any of DIV-007's original qualifiers: a plain
+    /// three-clause OR, three leaves rather than eight, no boost, no nesting
+    /// beyond one level of grouping. The bd-55mvg owner ruling states that the
+    /// comparator's default config REMAINS zero-tolerance and that campaign
+    /// lanes opt in with the typed reason; this test pins both halves of that
+    /// ruling as executable behaviour:
+    ///
+    ///   default `ComparatorConfig`  -> raw `RankMismatch`, `ComparisonStatus::Failed`
+    ///   `with_score_epsilon_reason` -> `ScoreEpsilon`/`SummationAssociation`, Classified
+    ///
+    /// The two queries move the ULP in OPPOSITE directions on the same
+    /// document, which is what makes this summation association rather than a
+    /// systematic scoring bias in either engine, and the two-clause control
+    /// stays bit-exact, which bounds it to three-or-more leaves.
+    #[cfg(feature = "tantivy-oracle")]
+    #[test]
+    fn three_clause_or_diverges_at_one_ulp_without_the_div007_envelope() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            use frankensearch_core::LexicalWrite;
+
+            let fixture = make_scalar_g1a_regression_fixture();
+            let (mut subject, mut oracle) = live_campaign_engines();
+            subject
+                .claim_fresh_campaign()
+                .expect("claim DIV-007 witness Quill subject");
+            oracle
+                .claim_fresh_campaign()
+                .expect("claim DIV-007 witness Tantivy oracle");
+            let documents = fixture
+                .documents
+                .iter()
+                .cloned()
+                .map(frankensearch_core::IndexableDocument::from)
+                .collect::<Vec<_>>();
+            subject
+                .index_mut()
+                .expect("DIV-007 witness Quill index")
+                .index_documents(&cx, &documents)
+                .await
+                .expect("index DIV-007 witness Quill corpus");
+            subject
+                .index_mut()
+                .expect("DIV-007 witness Quill index")
+                .commit(&cx)
+                .await
+                .expect("commit DIV-007 witness Quill corpus");
+            oracle
+                .index()
+                .index_documents(&cx, &documents)
+                .await
+                .expect("index DIV-007 witness Tantivy corpus");
+            oracle
+                .index()
+                .commit(&cx)
+                .await
+                .expect("commit DIV-007 witness Tantivy corpus");
+            subject
+                .mark_committed()
+                .expect("publish DIV-007 witness Quill campaign");
+            oracle
+                .mark_committed()
+                .expect("publish DIV-007 witness Tantivy campaign");
+
+            let zero_tolerance = crate::engine::DifferentialHarness::new(
+                ComparisonMode::CrossEngine,
+                ComparatorConfig::default(),
+            );
+            let enveloped = crate::engine::DifferentialHarness::new(
+                ComparisonMode::CrossEngine,
+                ComparatorConfig::default()
+                    .with_score_epsilon_reason(ScoreEpsilonReason::SummationAssociation),
+            );
+
+            let witness_case = |fixture_id: &str, query: &str| DifferentialCase {
+                fixture_id: fixture_id.to_owned(),
+                query: query.to_owned(),
+                limit: 20,
+                offset: 0,
+                tie_expansion_limit: 256,
+                count_requested: false,
+                snippet_max_chars: None,
+                metadata: DifferentialCaseMetadata {
+                    generator_id: Some("e68-div007-witness-v1".to_owned()),
+                    generator_seed: Some(0x6538_0007),
+                    corpus_hash: Some(fixture.corpus_hash.clone()),
+                },
+            };
+
+            let mut signed_ulp_deltas = Vec::new();
+            for (fixture_id, query) in [
+                ("e68-div007-witness", E68_WITNESS_QUERY),
+                ("e68-div007-witness-sibling", E68_WITNESS_SIBLING_QUERY),
+            ] {
+                let case = witness_case(fixture_id, query);
+                let raw = zero_tolerance
+                    .run(&cx, &subject, &oracle, &case)
+                    .await
+                    .unwrap_or_else(|error| panic!("{fixture_id} zero-tolerance run: {error}"));
+                assert_eq!(
+                    raw.comparison.status,
+                    ComparisonStatus::Failed,
+                    "{fixture_id} must stay a RAW failure under the default comparator: {:?}",
+                    raw.comparison.divergences
+                );
+                assert_eq!(raw.comparison.rank_class, RankClass::RankMismatch);
+                assert_eq!(
+                    raw.comparison.divergences.len(),
+                    1,
+                    "{fixture_id} must remain a single minimized divergence: {:?}",
+                    raw.comparison.divergences
+                );
+                let divergence = &raw.comparison.divergences[0];
+                assert_eq!(divergence.class, DivergenceClass::RankMismatch);
+                let (oracle_doc, oracle_bits) = split_scored_hit(&divergence.oracle);
+                let (subject_doc, subject_bits) = split_scored_hit(&divergence.subject);
+                assert_eq!(
+                    oracle_doc, subject_doc,
+                    "{fixture_id} must diverge in SCORE on one document, not in membership"
+                );
+                let delta = i64::from(subject_bits) - i64::from(oracle_bits);
+                assert_eq!(
+                    delta.abs(),
+                    1,
+                    "{fixture_id} must diverge by exactly one ULP: oracle={oracle_bits:#010x} subject={subject_bits:#010x}"
+                );
+                signed_ulp_deltas.push(delta);
+
+                let classified = enveloped
+                    .run(&cx, &subject, &oracle, &case)
+                    .await
+                    .unwrap_or_else(|error| panic!("{fixture_id} enveloped run: {error}"));
+                assert_eq!(
+                    classified.comparison.status,
+                    ComparisonStatus::Classified,
+                    "{fixture_id} must classify once the lane opts into the typed reason: {:?}",
+                    classified.comparison.divergences
+                );
+                assert_eq!(
+                    classified.comparison.score_epsilon_reason,
+                    Some(ScoreEpsilonReason::SummationAssociation)
+                );
+                assert!(
+                    classified
+                        .comparison
+                        .divergences
+                        .iter()
+                        .all(|divergence| divergence.class == DivergenceClass::ScoreEpsilon),
+                    "{fixture_id} must not widen another class under the envelope: {:?}",
+                    classified.comparison.divergences
+                );
+            }
+
+            assert!(
+                signed_ulp_deltas.contains(&1) && signed_ulp_deltas.contains(&-1),
+                "the witness pair must move the ULP in both directions, or this is a scoring bias \
+                 rather than summation association: {signed_ulp_deltas:?}"
+            );
+
+            let control = zero_tolerance
+                .run(
+                    &cx,
+                    &subject,
+                    &oracle,
+                    &witness_case("e68-div007-control", E68_WITNESS_CONTROL_QUERY),
+                )
+                .await
+                .expect("two-clause control run");
+            assert_eq!(
+                control.comparison.status,
+                ComparisonStatus::Exact,
+                "the two-clause control must stay bit-exact under the SAME zero-tolerance \
+                 comparator: {:?}",
+                control.comparison.divergences
+            );
+        });
+    }
+
+    /// Identity of the E6.8 production register and its first witness.
+    #[cfg(feature = "tantivy-oracle")]
+    const E68_LIVE_REGISTER_ID: &str = "quill-e6-divergence-register-live";
+    #[cfg(feature = "tantivy-oracle")]
+    const E68_WITNESS_CASE_ID: &str = "e68-div007-witness";
+    #[cfg(feature = "tantivy-oracle")]
+    const E68_CONTROL_CASE_ID: &str = "e68-div007-control";
+    #[cfg(feature = "tantivy-oracle")]
+    const E68_WITNESS_DIVERGENCE_ID: &str = "DIV-008";
+    #[cfg(feature = "tantivy-oracle")]
+    const E68_WITNESS_BLOCKING_BEAD: &str = "bd-gx7n4";
+    /// Fixed to the hour so the committed ledger is byte-reproducible from a
+    /// re-run of the mint. This is the hour the witness was recorded, not a
+    /// claim of second-level precision.
+    #[cfg(feature = "tantivy-oracle")]
+    const E68_RECORDED_AT: &str = "2026-08-04T19:00:00Z";
+    #[cfg(feature = "tantivy-oracle")]
+    const E68_RECORDED_BY: &str = "Claude-pane12";
+    /// Domain separation for the minimized-fixture digest recorded with the
+    /// observation. Re-derivable from the committed inputs, so the digest is a
+    /// checkable claim rather than an opaque constant.
+    #[cfg(feature = "tantivy-oracle")]
+    const E68_MINIMIZED_FIXTURE_DOMAIN: &[u8] =
+        b"frankensearch-quill-gauntlet/e68-minimized-fixture/v1";
+
+    /// The campaign fixture the E6.8 witness is minted from: the shared Core100
+    /// corpus every default-profile campaign already uses, and an explicit
+    /// two-case suite holding the pinned witness query and its bit-exact
+    /// control.
+    #[cfg(feature = "tantivy-oracle")]
+    fn make_e68_witness_fixture() -> Fixture {
+        let shared = SharedFixtureSuite::load().expect("shared fixtures");
+        let documents = shared
+            .documents(crate::generator::SharedCorpusView::Core100)
+            .to_vec();
+        let corpus_manifest = shared
+            .manifest(crate::generator::SharedCorpusView::Core100)
+            .expect("shared corpus manifest");
+        let corpus_hash = corpus_manifest.manifest_hash().expect("corpus hash");
+        let case = |id: &str, query: &str| GeneratedQueryCase {
+            id: id.to_owned(),
+            syntax: QuerySyntax::Default,
+            query_kind: GeneratedQueryKind::Boolean,
+            query: query.to_owned(),
+            limit: 20,
+            offset: 0,
+            count_requested: false,
+            filters: crate::generator::GeneratedQueryFilters::default(),
+            expected_divergence: None,
+            source: "runner.rs E6.8 live-ingestion witness".to_owned(),
+        };
+        let query_suite = GeneratedQuerySuite::from_cases(
+            QueryGeneratorSpec {
+                seed: 0x6538_0007,
+                default_limit: 20,
+                include_shared_relevance_queries: false,
+            },
+            &corpus_hash,
+            vec![
+                case(E68_WITNESS_CASE_ID, E68_WITNESS_QUERY),
+                case(E68_CONTROL_CASE_ID, E68_WITNESS_CONTROL_QUERY),
+            ],
+        )
+        .expect("E6.8 witness query suite");
+        Fixture {
+            documents,
+            corpus_manifest,
+            corpus_hash,
+            query_suite,
+        }
+    }
+
+    /// Digest of the exact minimized reproduction inputs for one campaign case.
+    ///
+    /// Deliberately derived from the corpus identity and the canonical case
+    /// rather than from free text, so any reader can recompute it and any drift
+    /// in the fixture changes it.
+    #[cfg(feature = "tantivy-oracle")]
+    fn e68_minimized_fixture_sha256(fixture: &Fixture, case_id: &str) -> String {
+        let case = fixture
+            .query_suite
+            .cases
+            .iter()
+            .find(|case| case.id == case_id)
+            .unwrap_or_else(|| panic!("E6.8 fixture is missing case {case_id}"));
+        let mut hasher = Sha256::new();
+        hasher.update(E68_MINIMIZED_FIXTURE_DOMAIN);
+        hasher.update(fixture.corpus_hash.as_bytes());
+        hasher.update([0_u8]);
+        hasher.update(serde_json::to_vec(case).expect("canonical minimized case"));
+        lower_hex(&hasher.finalize())
+    }
+
+    /// Assemble the E6.8 register ledger from one integrity-checked witness.
+    ///
+    /// Every identity field comes from the artifact through
+    /// [`DivergenceRegisterLedger::observation_from_artifact`]; nothing here can
+    /// substitute a revision, a manifest, or the witness address.
+    #[cfg(feature = "tantivy-oracle")]
+    fn e68_ingest_witness(
+        object: &ArtifactObject,
+        fixture_sha256: String,
+    ) -> (DivergenceRegisterLedger, Vec<String>) {
+        let binding = object
+            .divergence_binding()
+            .expect("the witness object must yield a sealed divergence binding");
+        let mut mismatch_signatures = binding
+            .divergences
+            .iter()
+            .filter(|divergence| !is_auto_class(divergence.class))
+            .map(|divergence| mismatch_signature(binding.rank_class, divergence))
+            .collect::<Vec<_>>();
+        mismatch_signatures.sort();
+        mismatch_signatures.dedup();
+        assert!(
+            !mismatch_signatures.is_empty(),
+            "the witness object must carry at least one raw mismatch signature"
+        );
+
+        let mut diagnostic_hasher = Sha256::new();
+        for divergence in &binding.divergences {
+            diagnostic_hasher.update(divergence.pointer.as_bytes());
+            diagnostic_hasher.update([0_u8]);
+            diagnostic_hasher.update(divergence.oracle.as_bytes());
+            diagnostic_hasher.update([0_u8]);
+            diagnostic_hasher.update(divergence.subject.as_bytes());
+            diagnostic_hasher.update([0_u8]);
+        }
+        let diagnostic = RedactedDivergenceDiagnostic {
+            payload_sha256: lower_hex(&diagnostic_hasher.finalize()),
+            marker: "<redacted:e68-div007-rank-mismatch>".to_owned(),
+        };
+
+        let observation = DivergenceRegisterLedger::observation_from_artifact(
+            object,
+            DivergenceRegisterEventHeader {
+                sequence: 1,
+                supersedes: None,
+                recorded_by: E68_RECORDED_BY.to_owned(),
+                recorded_at: E68_RECORDED_AT.to_owned(),
+            },
+            E68_WITNESS_DIVERGENCE_ID,
+            DivergenceClass::RankMismatch,
+            DivergenceFixtureEvidence {
+                fixture_id: E68_WITNESS_CASE_ID.to_owned(),
+                fixture_sha256,
+                regression_test: "runner::tests::three_clause_or_diverges_at_one_ulp_without_the_div007_envelope"
+                    .to_owned(),
+                minimized: true,
+            },
+            mismatch_signatures.clone(),
+            DivergenceObservationNarrative {
+                observed_behavior:
+                    "Quill scores one document in a plain three-clause disjunction one ULP away from the pinned oracle; the returned document set and every rank position are identical."
+                        .to_owned(),
+                expected_behavior:
+                    "the pinned oracle's score for that document, bit for bit, under the campaign comparator's zero-tolerance default configuration."
+                        .to_owned(),
+                root_cause:
+                    "the DIV-007 mechanism outside its documented qualifiers: Quill's Term scorer fuses each unfielded term's [content, 2.0x title] expansion into one summed contribution while the pinned oracle accumulates interleaved per-field clause outputs, so f32 summation association differs. Observed at three leaves with no boost and no mixed-occur nesting, where DIV-007 documents eight leaves."
+                        .to_owned(),
+                consumer_impact:
+                    "result sets are unchanged; only the order of two ULP-adjacent scores can flip. The campaign impact is the load-bearing one: the default-profile lane does not opt into the typed summation-association reason, so this emits as a raw RankMismatch and fails closed as unclassified."
+                        .to_owned(),
+            },
+            diagnostic,
+        )
+        .expect("live campaign observation must ingest from its own artifact");
+
+        let disposition = DivergenceDispositionEvent {
+            header: DivergenceRegisterEventHeader {
+                sequence: 2,
+                supersedes: None,
+                recorded_by: E68_RECORDED_BY.to_owned(),
+                recorded_at: E68_RECORDED_AT.to_owned(),
+            },
+            divergence_id: E68_WITNESS_DIVERGENCE_ID.to_owned(),
+            disposition: DivergenceDisposition::Blocking {
+                bead_id: E68_WITNESS_BLOCKING_BEAD.to_owned(),
+                rationale:
+                    "the bd-55mvg owner ruling accepts this mechanism only as a bounded ScoreEpsilon class that campaign lanes opt into with the typed reason, and keeps the comparator default zero-tolerance. The default-profile lane does not opt in, so the emitted mismatch is a raw failure class that no acceptance may bless. It blocks until the lane's envelope scope is decided; moving it off blocking requires an independent reviewer."
+                        .to_owned(),
+                reviewer: E68_RECORDED_BY.to_owned(),
+                reviewed_at: E68_RECORDED_AT.to_owned(),
+            },
+        };
+
+        let ledger = DivergenceRegisterLedger::new(
+            E68_LIVE_REGISTER_ID,
+            vec![
+                DivergenceRegisterEvent::Observation(Box::new(observation)),
+                DivergenceRegisterEvent::Disposition(disposition),
+            ],
+        )
+        .expect("the ingested ledger must satisfy the v2 contract");
+        (ledger, mismatch_signatures)
+    }
+
+    /// bd-quill-e6-gauntlet-scale-rm3q.8 LIVE INGESTION.
+    ///
+    /// Runs the real default-profile oracle-differential campaign — real
+    /// `QuillSubject`, real pinned `TantivyOracle`, real `ArtifactStore`, real
+    /// v7 objects — over a fixture that reproduces a genuine cross-engine
+    /// divergence, and drives its retained artifact through the typed ingestion
+    /// contract into an append-only register ledger.
+    ///
+    /// Two properties the acceptance names are proven here on PRODUCTION
+    /// evidence rather than on a synthetic fixture:
+    ///
+    ///   1. an emitted mismatch carrying no classification FAILS CLOSED — the
+    ///      witness case lands as `Unclassified` /
+    ///      `MissingDivergenceRegistration`, while its sibling control in the
+    ///      same suite stays `Exact`, so the fail-closed verdict is specific to
+    ///      the divergence and not a blanket refusal;
+    ///   2. that mismatch can be INGESTED with immutable first-seen evidence —
+    ///      the witness address, producer identity, oracle dependency identity,
+    ///      lexical-contract audit revision, and corpus/query manifests are all
+    ///      read out of the artifact, never typed in.
+    ///
+    /// SEAL: object creation requires a clean Git-verified producer, so this
+    /// test passes only in a clean checkout, exactly like the existing
+    /// `live_*_campaign_*` tests beside it. Setting `QUILL_E68_MINT_ROOT`
+    /// roots the campaign at a durable path and writes the ledger there, which
+    /// is how the committed fixtures were produced.
+    #[cfg(feature = "tantivy-oracle")]
+    #[test]
+    fn live_default_profile_campaign_ingests_its_unclassified_divergence() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let fixture = make_e68_witness_fixture();
+            let mint_root = std::env::var_os("QUILL_E68_MINT_ROOT").map(std::path::PathBuf::from);
+            let scratch = tempfile::tempdir().expect("E6.8 campaign root");
+            let root = mint_root
+                .clone()
+                .unwrap_or_else(|| scratch.path().to_owned());
+            if mint_root.is_some() {
+                std::fs::create_dir_all(&root).expect("E6.8 mint root");
+            }
+
+            let report =
+                run_live_default_profile_fixture(&cx, &root, "e68-live-ingestion", &fixture)
+                    .await
+                    .expect("E6.8 live default-profile campaign");
+
+            let witness = report
+                .cases
+                .iter()
+                .find(|case| case.case_id == E68_WITNESS_CASE_ID)
+                .expect("witness case is selected by the campaign");
+            assert_eq!(
+                witness.disposition,
+                CampaignDisposition::Unclassified,
+                "an unregistered production mismatch must fail closed: {:?}",
+                witness.reason
+            );
+            assert_eq!(
+                witness.reason,
+                Some(CampaignCaseReason::MissingDivergenceRegistration),
+                "the fail-closed reason must name the missing registration"
+            );
+            assert_eq!(witness.rank_class, Some(RankClass::RankMismatch));
+
+            let control = report
+                .cases
+                .iter()
+                .find(|case| case.case_id == E68_CONTROL_CASE_ID)
+                .expect("control case is selected by the campaign");
+            assert_eq!(
+                control.disposition,
+                CampaignDisposition::Exact,
+                "the control must stay exact, or the fail-closed verdict is not specific"
+            );
+
+            let object = load_campaign_case_object(&root, witness);
+            let (ledger, mismatch_signatures) = e68_ingest_witness(
+                &object,
+                e68_minimized_fixture_sha256(&fixture, E68_WITNESS_CASE_ID),
+            );
+            ledger
+                .validate_relational_integrity_against_artifact_objects(std::slice::from_ref(
+                    &object,
+                ))
+                .expect("the ingested observation must join to its own witness object");
+
+            // The witness signature is the one the campaign itself emitted.
+            assert!(
+                report
+                    .mismatches
+                    .iter()
+                    .any(|group| mismatch_signatures.contains(&group.signature)),
+                "the ingested signature must be the campaign's own emitted mismatch"
+            );
+
+            if let Some(mint) = mint_root {
+                let ledger_path = mint.join("divergence-register-v2-live.json");
+                std::fs::write(
+                    &ledger_path,
+                    serde_json::to_vec_pretty(&ledger).expect("serialize ingested ledger"),
+                )
+                .expect("write ingested ledger");
+                eprintln!("E68_LEDGER_PATH={}", ledger_path.display());
+                eprintln!(
+                    "E68_WITNESS_OBJECT_PATH={}",
+                    mint.join("objects")
+                        .join(format!(
+                            "{}.json",
+                            witness.artifact_hash.as_deref().unwrap_or_default()
+                        ))
+                        .display()
+                );
+                eprintln!(
+                    "E68_LEDGER_HASH={}",
+                    ledger.ledger_hash().expect("ingested ledger hash")
+                );
+            }
+        });
+    }
+
     /// bd-htcun: a trailing operand that duplicates an explicit-OR-run member
     /// must survive and score additively, exactly like the pinned oracle
     /// (whose grammar nests the OR run one level below the implicit
