@@ -3516,7 +3516,7 @@ mod tests {
 
     #[cfg(feature = "ann")]
     #[test]
-    fn ann_wal_merge_matches_canonical_resolution_before_and_after_exact_fallback() {
+    fn ann_wal_merge_matches_canonical_resolution_before_and_after_post_build_tombstone() {
         use crate::wal::WalEntry;
 
         let dir = temp_index_dir("ann-wal-canonical-resolution");
@@ -3607,9 +3607,9 @@ mod tests {
         assert_eq!(index.ann_fallback_count(), 0);
 
         // A post-build tombstone must happen through the writer role between
-        // reader-tier opens. Fetching the entire four-point graph must then
-        // exact-repair the main tier and merge the resident WAL once through
-        // the same resolver.
+        // reader-tier opens. Reopening refreshes the ANN sidecar against the
+        // live main rows, then the resident WAL must still merge through the
+        // same resolver.
         drop(index);
         let mut writer =
             VectorIndex::open_writer(&fast_path).expect("writer opens after reader drops");
@@ -3625,17 +3625,25 @@ mod tests {
             .expect("reopened path-opened fast tier")
             .wal_entries
             .extend(wal_entries);
-        assert_canonical(&index, "exact-underfill fallback");
+        assert!(
+            !index
+                .search_fast(&query, 10)
+                .expect("refreshed ANN search")
+                .iter()
+                .any(|hit| hit.doc_id == "doc-delete"),
+            "the writer-role tombstone must survive the reader reopen"
+        );
+        assert_canonical(&index, "post-build tombstone");
         assert_eq!(
             index.ann_fallback_count(),
-            1,
-            "one underfilled ANN request must increment the public counter once"
+            0,
+            "a sidecar refreshed for the tombstone must not report stale-graph fallback"
         );
     }
 
     #[cfg(feature = "ann")]
     #[test]
-    fn ann_wal_shadowed_top_hit_stays_suppressed_through_raw_exact_fallback() {
+    fn ann_wal_shadowed_top_hit_stays_suppressed_through_post_build_tombstone() {
         use crate::wal::WalEntry;
 
         let dir = temp_index_dir("ann-wal-shadowed-top");
@@ -3699,23 +3707,27 @@ mod tests {
             .expect("reopened path-opened fast tier")
             .wal_entries
             .push(wal_entry);
-        let fallback_query = [0.0_f32, 1.0];
+        let tombstone_query = [0.0_f32, 1.0];
         assert!(
             index
                 .fast_tier()
-                .search_top_k(&fallback_query, 1, None)
-                .expect("canonical fallback search")
+                .search_top_k(&tombstone_query, 1, None)
+                .expect("canonical tombstone search")
                 .is_empty(),
             "the exact main winner is still shadowed by the WAL"
         );
         assert!(
             index
-                .search_fast(&fallback_query, 1)
-                .expect("underfilled ANN search")
+                .search_fast(&tombstone_query, 1)
+                .expect("refreshed ANN search")
                 .is_empty(),
-            "raw exact repair must defer WAL suppression until after shared top-k selection"
+            "the refreshed ANN path must preserve WAL suppression after tombstoning"
         );
-        assert_eq!(index.ann_fallback_count(), 1);
+        assert_eq!(
+            index.ann_fallback_count(),
+            0,
+            "a sidecar refreshed for the tombstone must not report stale-graph fallback"
+        );
     }
 
     #[cfg(feature = "ann")]
