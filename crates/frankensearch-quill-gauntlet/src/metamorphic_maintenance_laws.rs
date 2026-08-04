@@ -25,6 +25,10 @@
 //! by default rather than silently tolerated.
 
 use crate::comparator::{Divergence, DivergenceClass};
+use crate::runner::{
+    MetamorphicLawApplicability, MetamorphicLawApplicabilityEntry, MetamorphicLawScope,
+    MetamorphicSkipReason,
+};
 
 /// Outcome of applying one law's equivalence relation.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -150,6 +154,10 @@ mod tests {
         merge_schedule_verdict, reopen_recovery_verdict, tombstone_compaction_verdict,
     };
     use crate::comparator::{Divergence, DivergenceClass};
+    use crate::runner::{
+        MetamorphicLawApplicability, MetamorphicLawApplicabilityEntry, MetamorphicLawScope,
+        MetamorphicSkipReason,
+    };
 
     /// Every class in the taxonomy, so the closed-set tests cannot silently
     /// stop covering a variant that gets added later.
@@ -323,5 +331,252 @@ mod tests {
                  set must be a deliberate, reviewed decision"
             );
         }
+    }
+}
+
+/// Runner lifecycle capabilities the maintenance laws depend on.
+///
+/// Declared as data so a law's precondition is an EXECUTABLE GATE rather than a
+/// sentence in a descriptor. The registry currently records each maintenance law
+/// as `SkipWithReason`, and a prose precondition cannot be checked — which means
+/// nothing detects the day the capability arrives, and nothing detects the day
+/// it silently regresses either.
+///
+/// Every field defaults to `false`: a runner must positively declare a
+/// capability to gain it. A default of `true` would make a runner that forgot to
+/// declare its limits appear fully capable, which is the failure direction that
+/// turns a skip into a false pass.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MaintenanceRunnerCapabilities {
+    /// The runner can request a merge at a chosen point in a schedule.
+    pub deterministic_merge_scheduling: bool,
+    /// The runner can close and reopen an index, exercising durable recovery.
+    pub durable_reopen_lifecycle: bool,
+    /// The runner can project observations that do not vary with corpus
+    /// statistics, so deleting documents cannot move a survivor's score.
+    pub score_insensitive_projection: bool,
+}
+
+impl MaintenanceRunnerCapabilities {
+    /// The capability set of a runner that declares nothing.
+    #[must_use]
+    pub const fn none() -> Self {
+        Self {
+            deterministic_merge_scheduling: false,
+            durable_reopen_lifecycle: false,
+            score_insensitive_projection: false,
+        }
+    }
+
+    /// Applicability of `e6.3-merge-schedule-v1` under these capabilities.
+    #[must_use]
+    pub const fn merge_schedule(self) -> MetamorphicLawApplicability {
+        if self.deterministic_merge_scheduling {
+            MetamorphicLawApplicability::Applies
+        } else {
+            MetamorphicLawApplicability::SkipWithReason {
+                reason: MetamorphicSkipReason::LifecycleCapabilityUnavailable,
+            }
+        }
+    }
+
+    /// Applicability of `e6.3-reopen-recovery-v1` under these capabilities.
+    #[must_use]
+    pub const fn reopen_recovery(self) -> MetamorphicLawApplicability {
+        if self.durable_reopen_lifecycle {
+            MetamorphicLawApplicability::Applies
+        } else {
+            MetamorphicLawApplicability::SkipWithReason {
+                reason: MetamorphicSkipReason::LifecycleCapabilityUnavailable,
+            }
+        }
+    }
+
+    /// Applicability of `e6.3-tombstone-compaction-v1` under these capabilities.
+    ///
+    /// Gated on the score-insensitive projection rather than on a lifecycle
+    /// operation: the runner can already delete and compact, but under a
+    /// score-sensitive projection the comparison is meaningless, because
+    /// removing documents legitimately moves every survivor's score. See
+    /// [`TOMBSTONE_COMPACTION_ALLOWED`].
+    #[must_use]
+    pub const fn tombstone_compaction(self) -> MetamorphicLawApplicability {
+        if self.score_insensitive_projection {
+            MetamorphicLawApplicability::Applies
+        } else {
+            MetamorphicLawApplicability::SkipWithReason {
+                reason: MetamorphicSkipReason::ScoreSensitiveCorpusStatistics,
+            }
+        }
+    }
+
+    /// The complete applicability matrix for the three maintenance laws.
+    ///
+    /// One entry per (law, scope) pair. All three are Quill-scoped only:
+    /// merge scheduling, reopen lifecycle, and compaction are properties of the
+    /// subject engine's own storage, so there is no cross-engine or Tantivy
+    /// projection to compare them against. Declaring the absent scopes rather
+    /// than omitting them would assert an applicability that was never analysed.
+    #[must_use]
+    pub fn applicability_matrix(self) -> Vec<MetamorphicLawApplicabilityEntry> {
+        vec![
+            MetamorphicLawApplicabilityEntry {
+                law_id: "e6.3-merge-schedule-v1".to_owned(),
+                scope: MetamorphicLawScope::Quill,
+                applicability: self.merge_schedule(),
+            },
+            MetamorphicLawApplicabilityEntry {
+                law_id: "e6.3-reopen-recovery-v1".to_owned(),
+                scope: MetamorphicLawScope::Quill,
+                applicability: self.reopen_recovery(),
+            },
+            MetamorphicLawApplicabilityEntry {
+                law_id: "e6.3-tombstone-compaction-v1".to_owned(),
+                scope: MetamorphicLawScope::Quill,
+                applicability: self.tombstone_compaction(),
+            },
+        ]
+    }
+}
+
+#[cfg(test)]
+mod capability_tests {
+    use super::MaintenanceRunnerCapabilities;
+    use crate::runner::{
+        MetamorphicLawApplicability, MetamorphicLawApplicabilityEntry, MetamorphicLawScope,
+        MetamorphicSkipReason,
+    };
+
+    /// The gate must reproduce the registry's CURRENT verdict exactly. If it
+    /// disagreed, one of the two would be lying about what the runner can do,
+    /// and the descriptor is what campaign accounting reads.
+    #[test]
+    fn a_runner_declaring_nothing_reproduces_the_registry_skips() {
+        let none = MaintenanceRunnerCapabilities::none();
+        assert_eq!(
+            none.merge_schedule(),
+            MetamorphicLawApplicability::SkipWithReason {
+                reason: MetamorphicSkipReason::LifecycleCapabilityUnavailable
+            }
+        );
+        assert_eq!(
+            none.reopen_recovery(),
+            MetamorphicLawApplicability::SkipWithReason {
+                reason: MetamorphicSkipReason::LifecycleCapabilityUnavailable
+            }
+        );
+        assert_eq!(
+            none.tombstone_compaction(),
+            MetamorphicLawApplicability::SkipWithReason {
+                reason: MetamorphicSkipReason::ScoreSensitiveCorpusStatistics
+            }
+        );
+    }
+
+    /// Default must equal none(): a runner that forgot to declare its limits
+    /// must not appear fully capable. That failure direction turns an honest
+    /// skip into a false pass, which is the whole thing this bead guards.
+    #[test]
+    fn default_capabilities_grant_nothing() {
+        assert_eq!(
+            MaintenanceRunnerCapabilities::default(),
+            MaintenanceRunnerCapabilities::none(),
+            "a capability must be positively declared, never assumed"
+        );
+    }
+
+    /// Each capability unlocks EXACTLY its own law. A gate that unlocked a
+    /// neighbour would run a law against a runner that cannot execute its
+    /// declared projection — the approximation trap in another guise.
+    #[test]
+    fn each_capability_unlocks_exactly_one_law() {
+        let merge_only = MaintenanceRunnerCapabilities {
+            deterministic_merge_scheduling: true,
+            ..MaintenanceRunnerCapabilities::none()
+        };
+        assert_eq!(
+            merge_only.merge_schedule(),
+            MetamorphicLawApplicability::Applies
+        );
+        assert_ne!(
+            merge_only.reopen_recovery(),
+            MetamorphicLawApplicability::Applies,
+            "merge scheduling must not unlock reopen recovery"
+        );
+        assert_ne!(
+            merge_only.tombstone_compaction(),
+            MetamorphicLawApplicability::Applies,
+            "merge scheduling must not unlock tombstone compaction"
+        );
+
+        let reopen_only = MaintenanceRunnerCapabilities {
+            durable_reopen_lifecycle: true,
+            ..MaintenanceRunnerCapabilities::none()
+        };
+        assert_eq!(
+            reopen_only.reopen_recovery(),
+            MetamorphicLawApplicability::Applies
+        );
+        assert_ne!(
+            reopen_only.merge_schedule(),
+            MetamorphicLawApplicability::Applies
+        );
+
+        let projection_only = MaintenanceRunnerCapabilities {
+            score_insensitive_projection: true,
+            ..MaintenanceRunnerCapabilities::none()
+        };
+        assert_eq!(
+            projection_only.tombstone_compaction(),
+            MetamorphicLawApplicability::Applies
+        );
+        assert_ne!(
+            projection_only.merge_schedule(),
+            MetamorphicLawApplicability::Applies
+        );
+    }
+
+    /// The matrix declares one entry per law, Quill-scoped only, and carries the
+    /// gate's verdict rather than a separately maintained copy of it.
+    #[test]
+    fn the_applicability_matrix_is_complete_and_quill_scoped() {
+        let matrix = MaintenanceRunnerCapabilities::none().applicability_matrix();
+        assert_eq!(matrix.len(), 3, "one entry per maintenance law");
+        for entry in &matrix {
+            assert_eq!(
+                entry.scope,
+                MetamorphicLawScope::Quill,
+                "{} is a subject-storage property with no cross-engine projection",
+                entry.law_id
+            );
+        }
+        let ids: Vec<&str> = matrix.iter().map(|entry| entry.law_id.as_str()).collect();
+        assert_eq!(
+            ids,
+            [
+                "e6.3-merge-schedule-v1",
+                "e6.3-reopen-recovery-v1",
+                "e6.3-tombstone-compaction-v1"
+            ]
+        );
+    }
+
+    /// The matrix must TRACK the gate, not restate it. If a capability flips,
+    /// the matrix entry flips with it; otherwise the matrix becomes a stale
+    /// second source of truth about what the runner can do.
+    #[test]
+    fn the_matrix_tracks_capability_changes() {
+        let all = MaintenanceRunnerCapabilities {
+            deterministic_merge_scheduling: true,
+            durable_reopen_lifecycle: true,
+            score_insensitive_projection: true,
+        };
+        let matrix: Vec<MetamorphicLawApplicabilityEntry> = all.applicability_matrix();
+        assert!(
+            matrix
+                .iter()
+                .all(|entry| entry.applicability == MetamorphicLawApplicability::Applies),
+            "a fully capable runner must make every maintenance law applicable"
+        );
     }
 }
