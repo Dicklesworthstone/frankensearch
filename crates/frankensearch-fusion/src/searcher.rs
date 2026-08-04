@@ -46,8 +46,9 @@ use frankensearch_core::{
     RuntimeMetricsCollector, SearchCollectorSample, SearchEventPhase, SearchStreamHealth,
     TelemetryCorrelation, TelemetryEnvelope, TelemetryEvent, TelemetryInstance,
 };
+use frankensearch_core::generation::ProducerCompatibilityErrorV1;
 use frankensearch_embed::CachedEmbedder;
-use frankensearch_index::{SearchParams, TwoTierIndex};
+use frankensearch_index::{FsviV2IdentityBinding, SearchParams, TwoTierIndex};
 
 use crate::adaptive::{AdaptiveFusion, SignalSource};
 use crate::blend::{
@@ -74,6 +75,35 @@ struct NormalizedExclusions {
     phrases: Vec<String>,
 }
 
+/// Whether this searcher's vectors may be touched by this query at all
+/// (bd-core-vector-space-search-guard-ctzo C1).
+///
+/// Decided ONCE, before the query is embedded and therefore before any
+/// vector byte, ANN graph node, or embedding cache entry is read. That
+/// ordering is the point: the identity facts this decision needs — the
+/// embedder's own bundle and the binding each tier was admitted under — are
+/// both available with no inference work done, so a query in the wrong space
+/// costs one fingerprint comparison instead of an embed plus a full scan
+/// that returns confident nonsense.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SemanticAdmission {
+    /// Every tier this query will consult is an admitted FSVI v2 owner whose
+    /// retained identity the configured embedder provably produces.
+    OwnerBacked {
+        /// The quality tier is also owner-backed and its embedder joins.
+        /// `false` when no quality tier is retained or no quality embedder is
+        /// configured — the query is then admitted for the fast tier alone.
+        quality: bool,
+    },
+    /// This index retains no admitted owner: a v1 or path-opened artifact,
+    /// which carries no space identity to join against. Typed and named
+    /// rather than silently treated as "compatible": every canonical
+    /// production index on disk today is still v1, so this is the ordinary
+    /// case and it must stay searchable, but a caller that thinks it is
+    /// running under identity enforcement is entitled to know it is not.
+    LegacyUnidentified,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct CpuJiffiesSnapshot {
     process_jiffies: u64,
@@ -91,6 +121,61 @@ fn scaled_budget(base_candidates: usize, multiplier: f32) -> usize {
     }
     let scaled = (base_candidates as f32 * multiplier).ceil() as usize;
     scaled.max(1)
+}
+
+/// Join one configured embedder against the identity its tier was admitted
+/// under, with no vector in hand (bd-ctzo C1).
+///
+/// The refusal field names are deliberately the SAME ones
+/// [`TwoTierIndex::activate_owner_backed_search`] uses for the post-embed
+/// join, because they are the same two failures: the query's space is not the
+/// index's space, or its producer is not the index's producer. A caller that
+/// greps for `query_embedding.fast.space_identity` finds both.
+fn admit_tier_embedder(
+    embedder: &dyn Embedder,
+    binding: &FsviV2IdentityBinding,
+    tier: &str,
+) -> SearchResult<()> {
+    let query_identity = embedder.identity().map_err(|error| SearchError::InvalidConfig {
+        field: format!("search_activation.{tier}.embedder_identity"),
+        value: embedder.id().to_owned(),
+        reason: format!(
+            "the {tier} tier is an admitted FSVI v2 artifact, so its vectors may only be \
+             searched by an embedder that declares a complete immutable identity; this one \
+             does not ({error})"
+        ),
+    })?;
+    match binding
+        .frozen_identity()
+        .identity
+        .verify_exact_producer_with(query_identity)
+    {
+        Ok(_) => Ok(()),
+        Err(ProducerCompatibilityErrorV1::SpaceMismatch) => Err(SearchError::InvalidConfig {
+            field: format!("query_embedding.{tier}.space_identity"),
+            value: query_identity.space.fingerprint(),
+            reason: format!(
+                "the configured {tier} embedder produces a different embedding space than the \
+                 {tier} index was written in; matching dimensions do not make two spaces \
+                 comparable, and this index must be reindexed with this embedder before it \
+                 can serve its queries"
+            ),
+        }),
+        // Every remaining variant is a refusal here, including
+        // `CertificateRequired` -- the certified-compatible pairing that
+        // `verify_producer_conformance` reports as comparison-grade telemetry
+        // and that activation likewise refuses. Listing them as one arm keeps
+        // a future variant refused by default instead of admitted by omission.
+        Err(error) => Err(SearchError::InvalidConfig {
+            field: format!("search_activation.{tier}.producer_conformance"),
+            value: query_identity.producer.fingerprint(),
+            reason: format!(
+                "the configured {tier} embedder is not the producer this index's vectors were \
+                 written by ({error}); a certified-compatible pairing is comparison-grade \
+                 telemetry and never an admission basis"
+            ),
+        }),
+    }
 }
 
 fn is_shipped_hash_embedder(embedder: &dyn Embedder) -> bool {
@@ -664,6 +749,61 @@ impl TwoTierSearcher {
         }
     }
 
+    /// Decide whether this query may touch this index's vectors, before it is
+    /// embedded (bd-ctzo C1).
+    ///
+    /// The join is between two things that exist before any inference runs:
+    /// the identity bundle the configured embedder declares, and the binding
+    /// each tier was ADMITTED under and now retains
+    /// ([`TwoTierIndex::fast_admitted_binding`]). It applies the same
+    /// bd-9xuj admission law
+    /// ([`EmbeddingIdentityBundleV1::verify_exact_producer_with`]) that
+    /// [`TwoTierIndex::activate_owner_backed_search`] applies to the bound
+    /// query afterwards, so a query this method admits cannot be refused
+    /// later for an identity reason, and one it refuses never reaches an
+    /// embedder at all.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError::InvalidConfig`] naming the tier and contract
+    /// field when a tier is owner-backed and its embedder is not identity-
+    /// aware, produces a different embedding space, or is a different
+    /// producer than the one that wrote the index — including the
+    /// certified-compatible case, which is comparison-grade telemetry and
+    /// never an admission basis.
+    fn admit_semantic_query(&self) -> SearchResult<SemanticAdmission> {
+        let Some(fast_binding) = self.index.fast_admitted_binding() else {
+            if self.index.quality_admitted_binding().is_some() {
+                return Err(SearchError::InvalidConfig {
+                    field: "search_activation.mixed_admission".to_owned(),
+                    value: "quality".to_owned(),
+                    reason: "this index retains an admitted quality owner but a legacy fast \
+                             tier; a half-attested pair has no coherent identity to search \
+                             under and requires a reindex"
+                        .to_owned(),
+                });
+            }
+            return Ok(SemanticAdmission::LegacyUnidentified);
+        };
+        admit_tier_embedder(self.fast_embedder.as_ref(), fast_binding, "fast")?;
+        // The quality tier is admitted only when BOTH halves are present. A
+        // configured quality embedder with no retained quality owner is not
+        // an error — `should_run_quality` already keeps such a search on the
+        // Initial phase — and a retained quality owner with no configured
+        // embedder is simply never consulted.
+        let quality = match (
+            self.quality_embedder.as_ref(),
+            self.index.quality_admitted_binding(),
+        ) {
+            (Some(embedder), Some(binding)) => {
+                admit_tier_embedder(embedder.as_ref(), binding, "quality")?;
+                true
+            }
+            _ => false,
+        };
+        Ok(SemanticAdmission::OwnerBacked { quality })
+    }
+
     /// Set the host adapter used to receive canonical telemetry envelopes.
     #[must_use]
     pub fn with_host_adapter(mut self, host_adapter: Arc<dyn HostAdapter>) -> Self {
@@ -805,6 +945,23 @@ impl TwoTierSearcher {
         let query_class = QueryClass::classify(semantic_query);
         metrics.query_class = Some(query_class);
         metrics.fast_embedder_id = Some(self.fast_embedder.id().to_owned());
+
+        // bd-ctzo C1: the identity join happens HERE -- before the fast
+        // embedder is invoked, before any embedding cache is consulted, and
+        // before a single vector or ANN node is read. A refusal therefore
+        // costs a fingerprint comparison, and the work it would have
+        // authorized never starts.
+        let admission = self.admit_semantic_query()?;
+        match admission {
+            SemanticAdmission::OwnerBacked { quality } => tracing::debug!(
+                quality_owner_backed = quality,
+                "query admitted against retained per-tier index identity"
+            ),
+            SemanticAdmission::LegacyUnidentified => tracing::debug!(
+                "index retains no admitted FSVI v2 owner; searching a legacy-unidentified \
+                 artifact with no space identity to join against"
+            ),
+        }
         let telemetry_root_request_id = self
             .host_adapter
             .as_ref()
