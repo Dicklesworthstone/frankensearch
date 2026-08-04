@@ -1250,6 +1250,319 @@ pub fn adjudicate_capability_probe(
 }
 
 // ---------------------------------------------------------------------------
+// Engine identity and accepted-candidate binding (slice 5)
+// ---------------------------------------------------------------------------
+
+/// How one engine expresses the identity of the schema it indexed under.
+///
+/// An enum rather than two nullable strings, because the two engines genuinely
+/// differ here and the witness records the difference instead of inventing
+/// symmetry: Quill compiles a schema DESCRIPTOR with a canonical 64-bit
+/// identity, and the Tantivy adapter exposes no equivalent surface. Giving
+/// Tantivy a fabricated schema name would put a hand-written string where an
+/// independently derived identity is claimed to be.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "surface", rename_all = "snake_case", deny_unknown_fields)]
+pub enum NativeSchemaIdentityV1 {
+    /// Quill's compile-time schema descriptor: its diagnostic name and the
+    /// canonical schema id computed over its encoding.
+    QuillDescriptor {
+        /// Descriptor name.
+        name: String,
+        /// Canonical schema id, lowercase hex.
+        schema_id_hex: String,
+    },
+    /// The engine exposes no schema-descriptor identity. Recorded as an
+    /// explicit absence so a reader cannot mistake it for one that was checked.
+    NoDescriptorSurface,
+}
+
+/// Independently derived identity of one engine arm.
+///
+/// Every field is read from the ENGINE crate's own exports — never copied into
+/// this module as a literal — so an engine that changed its backend code,
+/// crate version, or schema encoding changes this identity without anyone
+/// editing the witness.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeEngineIdentityV1 {
+    /// Which arm this identity describes.
+    pub engine: NativeEngineV1,
+    /// Backend code the engine crate publishes for itself.
+    pub backend_code: String,
+    /// Exact crate version compiled into this build.
+    pub crate_version: String,
+    /// Schema identity, or the explicit absence of one.
+    pub schema: NativeSchemaIdentityV1,
+}
+
+/// Derive the shipping-default Quill arm identity from the Quill crate itself.
+///
+/// # Errors
+///
+/// Returns [`GauntletError::InvalidContract`] when the shipping schema cannot
+/// be canonically encoded, which would mean the schema identity is
+/// unobtainable rather than merely different.
+pub fn derive_quill_engine_identity() -> Result<NativeEngineIdentityV1, GauntletError> {
+    let schema_id = frankensearch_quill::DEFAULT_SCHEMA
+        .schema_id()
+        .map_err(|error| GauntletError::InvalidContract {
+            reason: format!("shipping Quill schema has no canonical identity: {error}"),
+        })?;
+    Ok(NativeEngineIdentityV1 {
+        engine: NativeEngineV1::Quill,
+        backend_code: frankensearch_quill::QUILL_LEXICAL_BACKEND.to_owned(),
+        crate_version: frankensearch_quill::FRANKENSEARCH_QUILL_CRATE_VERSION.to_owned(),
+        schema: NativeSchemaIdentityV1::QuillDescriptor {
+            name: frankensearch_quill::DEFAULT_SCHEMA.name.to_owned(),
+            schema_id_hex: format!("{schema_id:016x}"),
+        },
+    })
+}
+
+/// Derive the Tantivy arm identity from the lexical crate itself.
+#[cfg(feature = "tantivy-oracle")]
+#[must_use]
+pub fn derive_tantivy_engine_identity() -> NativeEngineIdentityV1 {
+    NativeEngineIdentityV1 {
+        engine: NativeEngineV1::Tantivy,
+        // Not the Quill backend code, and deliberately not a fabricated
+        // schema name: see `NoDescriptorSurface`.
+        backend_code: "tantivy".to_owned(),
+        crate_version: frankensearch_lexical::FRANKENSEARCH_LEXICAL_CRATE_VERSION.to_owned(),
+        schema: NativeSchemaIdentityV1::NoDescriptorSurface,
+    }
+}
+
+impl NativeEngineIdentityV1 {
+    /// Reject a CASS engine identity.
+    ///
+    /// The semantic contract is checked alongside the identity because it is
+    /// the one CASS marker BOTH arms can answer: Quill's CASS profile is
+    /// visible in its schema descriptor, while the Tantivy CASS index exposes
+    /// its own schema hash rather than a descriptor. Checking the contract
+    /// covers both arms uniformly; the Quill-specific checks below are the
+    /// stronger, engine-local evidence layered on top.
+    ///
+    /// The schema NAME and the schema ID are checked separately on purpose. A
+    /// renamed CASS schema would slip a name check while keeping its encoding,
+    /// and content identity is what actually decides whether the CASS profile
+    /// was exercised.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GauntletError::InvalidContract`] naming the marker that
+    /// matched.
+    pub fn reject_cass_identity(
+        &self,
+        contract: &crate::runner::SemanticContract,
+    ) -> Result<(), GauntletError> {
+        if *contract == crate::runner::SemanticContract::cass() {
+            return Err(GauntletError::InvalidContract {
+                reason: "engine identity carries the CASS semantic contract".to_owned(),
+            });
+        }
+        for (label, value) in [
+            ("backend code", self.backend_code.as_str()),
+            ("crate version", self.crate_version.as_str()),
+        ] {
+            if value.to_ascii_lowercase().contains("cass") {
+                return Err(GauntletError::InvalidContract {
+                    reason: format!("engine identity {label} names a CASS profile: {value}"),
+                });
+            }
+        }
+        if let NativeSchemaIdentityV1::QuillDescriptor {
+            name,
+            schema_id_hex,
+        } = &self.schema
+        {
+            if name == frankensearch_quill::CASS_SEMANTIC_SCHEMA.name {
+                return Err(GauntletError::InvalidContract {
+                    reason: format!("engine identity names the CASS schema {name}"),
+                });
+            }
+            let cass_id = frankensearch_quill::CASS_SEMANTIC_SCHEMA
+                .schema_id()
+                .map_err(|error| GauntletError::InvalidContract {
+                    reason: format!("CASS schema has no canonical identity: {error}"),
+                })?;
+            if *schema_id_hex == format!("{cass_id:016x}") {
+                return Err(GauntletError::InvalidContract {
+                    reason: "engine identity carries the CASS schema identity under another name"
+                        .to_owned(),
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Require a shipping semantic contract.
+///
+/// The accept-set is the one the campaign runner already enforces for typed
+/// scalar evidence (`runner.rs`: shipping-default maps to `ScalarShipping`,
+/// scalar-G1a to `ScalarG1a`, anything else is refused). Binding to that
+/// existing rule rather than inventing a witness-local policy keeps one
+/// definition of "shipping" in the harness.
+///
+/// # Errors
+///
+/// Returns [`GauntletError::InvalidContract`] for the CASS contract and for
+/// any contract outside the accept-set.
+pub fn require_shipping_semantic_contract(
+    contract: &crate::runner::SemanticContract,
+) -> Result<(), GauntletError> {
+    if *contract == crate::runner::SemanticContract::shipping_default()
+        || *contract == crate::runner::SemanticContract::scalar_g1a()
+    {
+        return Ok(());
+    }
+    let reason = if *contract == crate::runner::SemanticContract::cass() {
+        "the witness requires a shipping semantic contract, but the CASS contract was supplied"
+    } else {
+        "the witness requires the shipping-default or scalar-G1a semantic contract"
+    };
+    Err(GauntletError::InvalidContract {
+        reason: reason.to_owned(),
+    })
+}
+
+/// Whether a value is a canonical lowercase 40-hex Git revision.
+fn is_canonical_git_revision(value: &str) -> bool {
+    value.len() == 40
+        && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+        && !value.bytes().any(|byte| byte.is_ascii_uppercase())
+}
+
+/// The exact accepted candidate this receipt is evidence about.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AcceptedCandidateBindingV1 {
+    /// Canonical 40-hex source revision of the accepted candidate.
+    pub candidate_source_revision: String,
+    /// Contract surface the candidate's own campaign evidence exercised.
+    pub contract_mode: crate::campaign_contract::CampaignContractModeV1,
+}
+
+impl AcceptedCandidateBindingV1 {
+    /// Derive a candidate binding from a campaign report.
+    ///
+    /// # Why `passed` is necessary and nowhere near sufficient
+    ///
+    /// `CampaignReport::passed` says a campaign met its own bar. It says
+    /// nothing about WHICH contract surface was exercised, and the repository
+    /// contains a committed counter-example: the pinned V7 report is
+    /// `passed: true` while covering only the rank envelope, carrying no
+    /// provenance, and having been produced by a dirty tree. A witness that
+    /// accepted a passed report would accept exactly that object as evidence
+    /// for a replacement it cannot support.
+    ///
+    /// Every gate below is therefore independent, and each is proved
+    /// load-bearing by repairing the real fixture one axis at a time.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GauntletError::InvalidContract`] naming the first gate the
+    /// report fails.
+    pub fn from_campaign_report(
+        report: &crate::runner::CampaignReport,
+    ) -> Result<Self, GauntletError> {
+        let reject = |reason: &str| {
+            Err(GauntletError::InvalidContract {
+                reason: reason.to_owned(),
+            })
+        };
+
+        if !report.passed {
+            return reject("candidate campaign report did not pass");
+        }
+        match &report.lexical_coverage {
+            crate::runner::CampaignLexicalCoverageSummary::CoreLexicalV3 {
+                admissible: true,
+                ..
+            } => {}
+            crate::runner::CampaignLexicalCoverageSummary::CoreLexicalV3 {
+                admissible: false,
+                ..
+            } => {
+                return reject(
+                    "candidate campaign report claims core-v3 coverage that is not admissible",
+                );
+            }
+            crate::runner::CampaignLexicalCoverageSummary::RankEnvelopeOnly => {
+                return reject(
+                    "candidate campaign report exercised only the rank-envelope contract, which \
+                     cannot bind an enriched candidate",
+                );
+            }
+            crate::runner::CampaignLexicalCoverageSummary::LegacyMissing => {
+                return reject(
+                    "candidate campaign report declares no lexical coverage scope, so passing \
+                     says nothing about the enriched contract",
+                );
+            }
+        }
+        require_shipping_semantic_contract(&report.semantic_contract)?;
+        if report.provenance.is_none() {
+            return reject("candidate campaign report carries no immutable provenance");
+        }
+        if report.producer_build_identity.source_git_dirty {
+            return reject("candidate campaign report was produced by a dirty tree");
+        }
+        if !is_canonical_git_revision(&report.producer_build_identity.source_git_revision) {
+            return reject("candidate campaign report names no canonical 40-hex source revision");
+        }
+
+        Ok(Self {
+            candidate_source_revision: report.producer_build_identity.source_git_revision.clone(),
+            contract_mode: crate::campaign_contract::CampaignContractModeV1::CoreLexicalV3,
+        })
+    }
+
+    /// Require that this receipt's producer IS the bound candidate.
+    ///
+    /// This is the stale-candidate gate. A receipt naming one candidate while
+    /// having been produced by a different binary is describing an engine it
+    /// did not run, which is precisely the failure a frozen-candidate receipt
+    /// exists to prevent.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GauntletError::ManifestMismatch`] when the producer revision
+    /// differs from the bound candidate, and
+    /// [`GauntletError::InvalidContract`] when the producer is dirty or the
+    /// bound mode is not the full core-v3 surface.
+    pub fn require_produced_by_the_candidate(
+        &self,
+        producer: &GauntletProducerBuildIdentity,
+    ) -> Result<(), GauntletError> {
+        if self.contract_mode != crate::campaign_contract::CampaignContractModeV1::CoreLexicalV3 {
+            return Err(GauntletError::InvalidContract {
+                reason: format!(
+                    "candidate binding exercises {:?}, not the full core-v3 surface",
+                    self.contract_mode
+                ),
+            });
+        }
+        if producer.source_git_dirty {
+            return Err(GauntletError::InvalidContract {
+                reason: "receipt producer provenance is dirty".to_owned(),
+            });
+        }
+        if self.candidate_source_revision != producer.source_git_revision {
+            return Err(GauntletError::ManifestMismatch {
+                reason: format!(
+                    "receipt binds candidate {} but was produced by {}",
+                    self.candidate_source_revision, producer.source_git_revision
+                ),
+            });
+        }
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Observations
 // ---------------------------------------------------------------------------
 
@@ -2318,6 +2631,322 @@ mod tests {
                 assert_eq!(docs, sorted.as_slice(), "row {} is not sorted", row.label);
             }
         }
+    }
+
+    // -----------------------------------------------------------------
+    // Engine identity and accepted-candidate binding (slice 5)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn the_derived_quill_identity_is_the_shipping_default() {
+        let identity = derive_quill_engine_identity().expect("derive the Quill arm identity");
+        assert_eq!(identity.engine, NativeEngineV1::Quill);
+        assert_eq!(
+            identity.backend_code,
+            frankensearch_quill::QUILL_LEXICAL_BACKEND
+        );
+        // The `assert!` first, so the `if let` below cannot skip silently: a
+        // conditional block whose branch never fires is a green test that
+        // asserts nothing.
+        assert!(
+            matches!(
+                identity.schema,
+                NativeSchemaIdentityV1::QuillDescriptor { .. }
+            ),
+            "Quill publishes a schema descriptor"
+        );
+        if let NativeSchemaIdentityV1::QuillDescriptor {
+            name,
+            schema_id_hex,
+        } = &identity.schema
+        {
+            assert_eq!(name, frankensearch_quill::DEFAULT_SCHEMA.name);
+            assert_eq!(schema_id_hex.len(), 16, "a 64-bit id renders as 16 hex");
+            // Derived, not transcribed: the id must track the schema's own
+            // canonical encoding.
+            let expected = frankensearch_quill::DEFAULT_SCHEMA
+                .schema_id()
+                .expect("shipping schema id");
+            assert_eq!(*schema_id_hex, format!("{expected:016x}"));
+        }
+        identity
+            .reject_cass_identity(&crate::runner::SemanticContract::shipping_default())
+            .expect("the shipping default is not a CASS identity");
+    }
+
+    /// Every CASS marker is load-bearing on its own. In particular the schema
+    /// ID is checked separately from the schema NAME, because a renamed CASS
+    /// schema keeps its encoding — content identity, not the label, decides
+    /// whether the CASS profile was exercised.
+    #[test]
+    fn each_cass_marker_is_independently_rejected() {
+        let shipping = crate::runner::SemanticContract::shipping_default();
+        let clean = derive_quill_engine_identity().expect("clean identity");
+
+        // 1. The contract alone, with an otherwise clean identity.
+        let error = clean
+            .reject_cass_identity(&crate::runner::SemanticContract::cass())
+            .expect_err("the CASS semantic contract must be rejected");
+        assert!(error.to_string().contains("CASS semantic contract"));
+
+        // 2. The backend code.
+        let mut cass_backend = clean.clone();
+        cass_backend.backend_code = "quill-cass".to_owned();
+        let error = cass_backend
+            .reject_cass_identity(&shipping)
+            .expect_err("a CASS backend code must be rejected");
+        assert!(error.to_string().contains("backend code"));
+
+        // 3. The schema NAME.
+        let mut cass_named = clean.clone();
+        cass_named.schema = NativeSchemaIdentityV1::QuillDescriptor {
+            name: frankensearch_quill::CASS_SEMANTIC_SCHEMA.name.to_owned(),
+            schema_id_hex: "0000000000000000".to_owned(),
+        };
+        let error = cass_named
+            .reject_cass_identity(&shipping)
+            .expect_err("the CASS schema name must be rejected");
+        assert!(error.to_string().contains("names the CASS schema"));
+
+        // 4. The schema ID under an innocuous NAME — the renamed-CASS case a
+        //    name check alone would pass.
+        let cass_id = frankensearch_quill::CASS_SEMANTIC_SCHEMA
+            .schema_id()
+            .expect("CASS schema id");
+        let mut renamed = clean.clone();
+        renamed.schema = NativeSchemaIdentityV1::QuillDescriptor {
+            name: "frankensearch-totally-not-cass-v1".to_owned(),
+            schema_id_hex: format!("{cass_id:016x}"),
+        };
+        let error = renamed
+            .reject_cass_identity(&shipping)
+            .expect_err("the CASS schema identity must be rejected under any name");
+        assert!(
+            error.to_string().contains("under another name"),
+            "got {error}"
+        );
+
+        // The control: the real shipping identity survives all four checks.
+        assert_ne!(
+            frankensearch_quill::DEFAULT_SCHEMA.name,
+            frankensearch_quill::CASS_SEMANTIC_SCHEMA.name
+        );
+        clean
+            .reject_cass_identity(&shipping)
+            .expect("the shipping identity must survive");
+    }
+
+    #[test]
+    fn the_semantic_contract_accept_set_admits_shipping_and_refuses_cass() {
+        for accepted in [
+            crate::runner::SemanticContract::shipping_default(),
+            crate::runner::SemanticContract::scalar_g1a(),
+        ] {
+            require_shipping_semantic_contract(&accepted).expect("a shipping contract");
+        }
+        let error = require_shipping_semantic_contract(&crate::runner::SemanticContract::cass())
+            .expect_err("CASS is not a shipping contract");
+        assert!(error.to_string().contains("CASS contract"), "got {error}");
+    }
+
+    /// Minimal provenance for the repaired baseline.
+    ///
+    /// The witness gate checks PRESENCE; the campaign layer owns provenance's
+    /// internal consistency and this module deliberately does not re-implement
+    /// it, which would create a second definition that could drift.
+    fn baseline_provenance() -> crate::runner::CampaignProvenance {
+        crate::runner::CampaignProvenance {
+            producer_build_identity_sha256: "0".repeat(64),
+            cargo_lock_sha256: "1".repeat(64),
+            rustc_version_verbose: "rustc 0.0.0 (witness baseline)".to_owned(),
+            rust_toolchain_channel: "nightly-0000-00-00".to_owned(),
+            unicode_version: "0.0.0".to_owned(),
+            unicode_normalization_version: "0.0.0".to_owned(),
+            unicode_normalization_table_version: "0.0.0".to_owned(),
+            query_generator_id: "witness-baseline".to_owned(),
+            query_generator_schema_version: 1,
+            query_seed: 0,
+            query_source_identity_sha256: "2".repeat(64),
+            query_profile_sha256: "3".repeat(64),
+            analyzer_contract_hash: "4".repeat(64),
+            schema_contract_hash: "5".repeat(64),
+            corpus_manifest_hash: "6".repeat(64),
+            query_manifest_hash: "7".repeat(64),
+            corpus_seed: None,
+        }
+    }
+
+    /// The pinned fixture repaired along every axis the witness gates.
+    fn accepted_candidate_report() -> crate::runner::CampaignReport {
+        let mut report = crate::runner::load_pinned_campaign_report_v7()
+            .expect("the pinned V7 campaign report fixture");
+        report.lexical_coverage = crate::runner::CampaignLexicalCoverageSummary::CoreLexicalV3 {
+            subject: Box::new(crate::runner::LexicalSideCoverageCounts::default()),
+            oracle: Box::new(crate::runner::LexicalSideCoverageCounts::default()),
+            admissible: true,
+        };
+        report.semantic_contract = crate::runner::SemanticContract::shipping_default();
+        report.provenance = Some(baseline_provenance());
+        report.producer_build_identity.source_git_dirty = false;
+        report
+    }
+
+    /// THE REAL ARTIFACT. The only committed `CampaignReport` in this
+    /// repository passed its campaign, and the witness still refuses it. This
+    /// is the acceptance's "generic passed `CampaignReport` /
+    /// `RankEnvelopeOnly` report is rejected" proved against a real object
+    /// rather than a hand-built straw man.
+    #[test]
+    fn the_real_pinned_campaign_report_is_rejected_although_it_passed() {
+        let report = crate::runner::load_pinned_campaign_report_v7()
+            .expect("the pinned V7 campaign report fixture");
+        assert!(
+            report.passed,
+            "the fixture must really be a PASSED report, or this test proves nothing"
+        );
+        assert!(
+            matches!(
+                report.lexical_coverage,
+                crate::runner::CampaignLexicalCoverageSummary::RankEnvelopeOnly
+            ),
+            "the fixture must really be rank-envelope-only"
+        );
+        let error = AcceptedCandidateBindingV1::from_campaign_report(&report)
+            .expect_err("a passed rank-envelope report must not bind a candidate");
+        assert!(error.to_string().contains("rank-envelope"), "got {error}");
+    }
+
+    /// One named mutation of a candidate report: its label, the edit, and the
+    /// substring the resulting rejection must contain.
+    type ReportMutation = (
+        &'static str,
+        fn(&mut crate::runner::CampaignReport),
+        &'static str,
+    );
+
+    /// Each gate is proved load-bearing by mutating ONE axis of an otherwise
+    /// admissible report. Order-independent, unlike walking the ladder.
+    #[test]
+    fn every_candidate_gate_is_independently_load_bearing() {
+        let baseline = accepted_candidate_report();
+        let binding = AcceptedCandidateBindingV1::from_campaign_report(&baseline)
+            .expect("the repaired report must bind, or the mutations prove nothing");
+        assert_eq!(
+            binding.contract_mode,
+            crate::campaign_contract::CampaignContractModeV1::CoreLexicalV3
+        );
+        assert_eq!(
+            binding.candidate_source_revision,
+            baseline.producer_build_identity.source_git_revision
+        );
+
+        let mutations: [ReportMutation; 6] = [
+            ("not passed", |report| report.passed = false, "did not pass"),
+            (
+                "rank envelope only",
+                |report| {
+                    report.lexical_coverage =
+                        crate::runner::CampaignLexicalCoverageSummary::RankEnvelopeOnly;
+                },
+                "rank-envelope",
+            ),
+            (
+                "coverage scope absent",
+                |report| {
+                    report.lexical_coverage =
+                        crate::runner::CampaignLexicalCoverageSummary::LegacyMissing;
+                },
+                "no lexical coverage scope",
+            ),
+            (
+                "CASS semantics",
+                |report| report.semantic_contract = crate::runner::SemanticContract::cass(),
+                "CASS contract",
+            ),
+            (
+                "provenance missing",
+                |report| report.provenance = None,
+                "no immutable provenance",
+            ),
+            (
+                "dirty producer",
+                |report| report.producer_build_identity.source_git_dirty = true,
+                "dirty tree",
+            ),
+        ];
+        for (name, mutate, expected) in mutations {
+            let mut mutated = baseline.clone();
+            mutate(&mut mutated);
+            let error = AcceptedCandidateBindingV1::from_campaign_report(&mutated).expect_err(name);
+            assert!(
+                error.to_string().contains(expected),
+                "the {name} mutation must be rejected for its own reason, got {error}"
+            );
+        }
+
+        // Admissible-but-not-admitted core-v3 coverage is its own rejection:
+        // claiming the scope is not the same as clearing it.
+        let mut inadmissible = baseline;
+        inadmissible.lexical_coverage =
+            crate::runner::CampaignLexicalCoverageSummary::CoreLexicalV3 {
+                subject: Box::new(crate::runner::LexicalSideCoverageCounts::default()),
+                oracle: Box::new(crate::runner::LexicalSideCoverageCounts::default()),
+                admissible: false,
+            };
+        let error = AcceptedCandidateBindingV1::from_campaign_report(&inadmissible)
+            .expect_err("inadmissible core-v3 coverage");
+        assert!(error.to_string().contains("not admissible"), "got {error}");
+    }
+
+    /// A receipt naming one candidate while produced by another binary is
+    /// describing an engine it did not run.
+    #[test]
+    fn a_stale_candidate_binding_is_rejected() {
+        let baseline = accepted_candidate_report();
+        let binding =
+            AcceptedCandidateBindingV1::from_campaign_report(&baseline).expect("baseline binds");
+        let mut producer = baseline.producer_build_identity.clone();
+
+        binding
+            .require_produced_by_the_candidate(&producer)
+            .expect("the producer IS the bound candidate");
+
+        producer.source_git_revision = "b".repeat(40);
+        let error = binding
+            .require_produced_by_the_candidate(&producer)
+            .expect_err("a different producer revision is a stale candidate");
+        assert!(
+            error.to_string().contains("but was produced by"),
+            "got {error}"
+        );
+
+        let mut dirty = baseline.producer_build_identity.clone();
+        dirty.source_git_dirty = true;
+        let error = binding
+            .require_produced_by_the_candidate(&dirty)
+            .expect_err("dirty producer provenance is rejected");
+        assert!(error.to_string().contains("dirty"), "got {error}");
+
+        let rank_only = AcceptedCandidateBindingV1 {
+            candidate_source_revision: binding.candidate_source_revision.clone(),
+            contract_mode: crate::campaign_contract::CampaignContractModeV1::RankEnvelopeOnly,
+        };
+        let error = rank_only
+            .require_produced_by_the_candidate(&baseline.producer_build_identity)
+            .expect_err("a rank-envelope binding is not the core-v3 surface");
+        assert!(error.to_string().contains("core-v3"), "got {error}");
+    }
+
+    #[test]
+    fn canonical_git_revisions_are_recognized_exactly() {
+        assert!(is_canonical_git_revision(&"a".repeat(40)));
+        assert!(is_canonical_git_revision(
+            "2c6bbf1a49c3ad663b968a08dcf260cb1e53e61b"
+        ));
+        assert!(!is_canonical_git_revision(&"a".repeat(39)));
+        assert!(!is_canonical_git_revision(&"A".repeat(40)));
+        assert!(!is_canonical_git_revision("unavailable"));
+        assert!(!is_canonical_git_revision(&"g".repeat(40)));
     }
 
     #[test]
