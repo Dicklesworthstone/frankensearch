@@ -826,14 +826,12 @@ mod feature_matrix_smoke {
             )
             .await
             .expect("create lexical Quill index");
+            let documents = [
+                IndexableDocument::new("doc-alpha", "alpha quill feature matrix"),
+                IndexableDocument::new("doc-beta", "beta consumer integration"),
+            ];
             index
-                .index_documents(
-                    &cx,
-                    &[IndexableDocument::new(
-                        "doc-lexical",
-                        "lexical feature uses quill",
-                    )],
-                )
+                .index_documents(&cx, &documents)
                 .await
                 .expect("index lexical Quill document");
             index
@@ -841,15 +839,15 @@ mod feature_matrix_smoke {
                 .await
                 .expect("finalize lexical Quill index");
             let hits = index
-                .search_results(&cx, "lexical", 5)
+                .search_results(&cx, "alpha", 5)
                 .expect("search lexical Quill index");
             assert_eq!(hits.len(), 1);
-            assert_eq!(hits[0].doc_id, "doc-lexical");
+            assert_eq!(hits[0].doc_id, "doc-alpha");
             emit_evidence(
                 "lexical",
                 "quill_index_build_search",
                 &serde_json::json!({
-                    "documents": 1,
+                    "documents": documents.len(),
                     "hits": hits.len(),
                     "lexical_backend": "quill",
                     "selected_backend": "quill",
