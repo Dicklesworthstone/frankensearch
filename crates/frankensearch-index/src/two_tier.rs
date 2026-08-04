@@ -5902,6 +5902,178 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
+    /// C2, the mutation classes `admitted_owner_reads_survive_path_replacement`
+    /// does not reach. Rename-then-plant only proves the owner ignores the
+    /// PATHNAME. These three mutate the admitted inode itself -- truncated in
+    /// place, overwritten in place with a same-length foreign image, and
+    /// replaced by a fresh file that reuses the freed descriptor slot -- which
+    /// is what a mapping-backed or lazily re-read owner would actually
+    /// observe. Every borrowed view, the witness, and the served rows must be
+    /// unchanged, because the admitted bytes are the authority.
+    #[test]
+    fn admitted_owner_survives_in_place_truncation_swap_and_descriptor_reuse() {
+        let dir = temp_index_dir("admitted-v2-inode-mutation");
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let fast_path = dir.join(VECTOR_INDEX_FAST_FILENAME);
+        let (fast_binding, _) = fsvi_v2_binding("inode-mutation-model", 4, 11);
+        let rows: [(&str, &[f32]); 2] = [
+            ("doc-a", &[1.0, 0.0, 0.0, 0.0]),
+            ("doc-b", &[0.0, 1.0, 0.0, 0.0]),
+        ];
+        write_v2_tier(&fast_path, &fast_binding, &rows);
+        let admitted_bytes = fs::read(&fast_path).expect("read admitted image");
+
+        let paths = TwoTierIndexPaths::new(&fast_path);
+        let index = TwoTierIndex::open_admitted_v2_with_paths(
+            &paths,
+            TwoTierConfig::default(),
+            &fast_binding,
+            None,
+        )
+        .expect("admit fast v2 tier");
+        let witness_before = index
+            .fast_admitted_owner()
+            .expect("retained owner")
+            .witness()
+            .clone();
+        let fingerprint_before = index.fast_space_fingerprint_hex().map(str::to_owned);
+
+        let assert_owner_intact = |label: &str| {
+            let owner = index.fast_admitted_owner().expect("retained owner");
+            assert_eq!(owner.witness(), &witness_before, "{label}: witness");
+            assert_eq!(
+                owner.owned_byte_len(),
+                admitted_bytes.len(),
+                "{label}: owned byte length"
+            );
+            assert_eq!(
+                owner.row(0).expect("row 0").doc_id(),
+                "doc-a",
+                "{label}: borrowed row view"
+            );
+            assert_eq!(
+                index.fast_space_fingerprint_hex().map(str::to_owned),
+                fingerprint_before,
+                "{label}: space fingerprint"
+            );
+            assert_eq!(index.doc_count(), 2, "{label}: doc count");
+            let hits = index
+                .search_fast(&[0.0, 1.0, 0.0, 0.0], 1)
+                .unwrap_or_else(|error| panic!("{label}: search failed: {error}"));
+            assert_eq!(hits[0].doc_id, "doc-b", "{label}: served rows");
+        };
+        assert_owner_intact("before any mutation");
+
+        // (i) truncate the admitted inode to nothing, in place.
+        fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&fast_path)
+            .expect("truncate admitted inode");
+        assert_eq!(
+            fs::metadata(&fast_path).expect("stat truncated").len(),
+            0,
+            "the fixture must really have truncated the source"
+        );
+        assert_owner_intact("after in-place truncation");
+
+        // (ii) overwrite the same inode with a same-length foreign image, so
+        // no length check could notice the substitution.
+        let foreign = vec![0x5a_u8; admitted_bytes.len()];
+        assert_ne!(foreign, admitted_bytes);
+        fs::write(&fast_path, &foreign).expect("overwrite admitted inode in place");
+        assert_owner_intact("after same-length in-place byte swap");
+
+        // (iii) unlink and recreate, so the pathname resolves to a brand new
+        // inode and the freed descriptor slot is reused by an unrelated open.
+        fs::remove_file(&fast_path).expect("unlink admitted source");
+        let decoy = dir.join("descriptor-reuse-decoy");
+        let decoy_handle = fs::File::create(&decoy).expect("claim the freed descriptor slot");
+        write_v2_tier(
+            &fast_path,
+            &fsvi_v2_binding("descriptor-reuse-impostor", 4, 12).0,
+            &[("doc-impostor", &[0.0, 0.0, 1.0, 0.0])],
+        );
+        assert_owner_intact("after unlink, descriptor reuse, and re-creation");
+        drop(decoy_handle);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// C3: fast and quality owners are independent even when their identities
+    /// agree on every field a subset comparison would look at. Both tiers here
+    /// carry the same model id, dimension, storage identity and generation
+    /// sequence, so anything that keyed off "identities compare equal" would
+    /// happily serve one owner for both; the owners must still be two distinct
+    /// admissions over two distinct byte images, and each tier must serve its
+    /// own rows.
+    #[test]
+    fn same_identity_fast_and_quality_tiers_retain_independent_owners() {
+        let dir = temp_index_dir("admitted-v2-independent-owners");
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let fast_path = dir.join(VECTOR_INDEX_FAST_FILENAME);
+        let quality_path = dir.join(VECTOR_INDEX_QUALITY_FILENAME);
+        let (fast_binding, _) = fsvi_v2_binding("indistinguishable-model", 4, 21);
+        let (quality_binding, _) = fsvi_v2_binding("indistinguishable-model", 4, 21);
+        let fast_rows: [(&str, &[f32]); 2] = [
+            ("doc-a", &[1.0, 0.0, 0.0, 0.0]),
+            ("doc-b", &[0.0, 1.0, 0.0, 0.0]),
+        ];
+        let quality_rows: [(&str, &[f32]); 2] = [
+            ("doc-a", &[1.0, 0.0, 0.0, 0.0]),
+            ("doc-b", &[0.0, 0.0, 1.0, 0.0]),
+        ];
+        write_v2_tier(&fast_path, &fast_binding, &fast_rows);
+        write_v2_tier(&quality_path, &quality_binding, &quality_rows);
+
+        let paths = TwoTierIndexPaths::new(&fast_path).with_quality_index(&quality_path);
+        let index = TwoTierIndex::open_admitted_v2_with_paths(
+            &paths,
+            TwoTierConfig::default(),
+            &fast_binding,
+            Some(&quality_binding),
+        )
+        .expect("admit both v2 tiers");
+
+        let fast_owner = index.fast_admitted_owner().expect("fast owner");
+        let quality_owner = index.quality_admitted_owner().expect("quality owner");
+        assert_eq!(
+            fast_owner.identity_v2().space_fingerprint,
+            quality_owner.identity_v2().space_fingerprint,
+            "the fixture is only meaningful while the two identities are indistinguishable"
+        );
+        assert!(
+            !std::ptr::eq(fast_owner, quality_owner),
+            "each tier retains its own admission owner"
+        );
+        // Distinct byte images: doc-b's vector differs between the tiers, so
+        // an aliased owner would serve the fast vectors for quality reads.
+        assert_ne!(
+            fast_owner.witness().whole_image_sha256,
+            quality_owner.witness().whole_image_sha256,
+            "two independent admissions over two artifacts must witness \
+             different images"
+        );
+        assert_eq!(
+            index
+                .quality_vector_for_doc_id("doc-b")
+                .expect("quality vector lookup")
+                .expect("doc-b is present in the quality tier"),
+            vec![0.0, 0.0, 1.0, 0.0],
+            "the quality tier must serve its own vectors, not the fast tier's"
+        );
+        assert_eq!(
+            index
+                .search_fast(&[0.0, 1.0, 0.0, 0.0], 1)
+                .expect("fast search")[0]
+                .doc_id,
+            "doc-b",
+            "the fast tier keeps serving its own vectors"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
     #[test]
     fn plain_v1_open_has_no_admitted_owners() {
         let dir = temp_index_dir("plain-v1-no-owners");
