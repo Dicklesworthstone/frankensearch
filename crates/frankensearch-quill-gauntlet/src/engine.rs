@@ -7922,6 +7922,219 @@ mod tests {
         });
     }
 
+    /// Execute one E6.3 replacement route through the public Quill writer
+    /// surfaces and return its normal total lexical observation.
+    ///
+    /// `LexicalWrite::index_documents` is deliberately qualified here. The
+    /// scalar inherent method has a different, intentionally strict contract:
+    /// it rejects a duplicate live ID. This helper probes the shipping writer
+    /// trait's replacement contract instead of accidentally exercising that
+    /// scalar rejection path twice.
+    #[cfg(feature = "perf-harness")]
+    async fn e63_writer_replacement_observation(
+        cx: &Cx,
+        original: &frankensearch_core::IndexableDocument,
+        replacement: &frankensearch_core::IndexableDocument,
+        case: &DifferentialCase,
+        use_writer_upsert: bool,
+    ) -> EngineObservation {
+        use frankensearch_core::LexicalWrite;
+
+        let mut subject = qg_position_mode_subject(true);
+        subject
+            .claim_fresh_campaign()
+            .expect("E6.3 claim writer replacement campaign");
+        let index = subject
+            .index_mut()
+            .expect("E6.3 open writer replacement campaign");
+
+        if use_writer_upsert {
+            <QuillIndex as LexicalWrite>::index_documents(
+                index,
+                cx,
+                std::slice::from_ref(original),
+            )
+            .await
+            .expect("E6.3 writer upsert admits original document");
+            <QuillIndex as LexicalWrite>::commit(index, cx)
+                .await
+                .expect("E6.3 writer upsert commits original document");
+            <QuillIndex as LexicalWrite>::index_documents(
+                index,
+                cx,
+                std::slice::from_ref(replacement),
+            )
+            .await
+            .expect("E6.3 writer upsert replaces live document");
+            <QuillIndex as LexicalWrite>::commit(index, cx)
+                .await
+                .expect("E6.3 writer upsert commits replacement document");
+        } else {
+            index
+                .index_documents(cx, std::slice::from_ref(original))
+                .await
+                .expect("E6.3 delete/add admits original document");
+            index
+                .commit(cx)
+                .await
+                .expect("E6.3 delete/add commits original document");
+            assert!(
+                index
+                    .delete_document(cx, &original.id)
+                    .await
+                    .expect("E6.3 delete/add deletes original document"),
+                "E6.3 delete/add must delete its known live original document"
+            );
+            index
+                .index_documents(cx, std::slice::from_ref(replacement))
+                .await
+                .expect("E6.3 delete/add admits replacement document");
+            index
+                .commit(cx)
+                .await
+                .expect("E6.3 delete/add commits replacement document");
+        }
+
+        subject
+            .mark_committed()
+            .expect("E6.3 publish writer replacement campaign");
+        subject
+            .observe(cx, case)
+            .await
+            .expect("E6.3 observe writer replacement campaign")
+    }
+
+    /// E6.3 writer lifecycle law: the shipping `LexicalWrite` replacement
+    /// operation is observationally equivalent to explicitly deleting the
+    /// old live ID and then adding the replacement. The scalar inherent ingest
+    /// API is intentionally not used as upsert: it rejects duplicate IDs, and
+    /// that distinct contract is covered by the duplicate-rejection law.
+    ///
+    /// Each seed runs the writer-upsert arm twice to prove replay, compares it
+    /// with the independently sequenced delete/add arm, and uses a planted
+    /// content mutation as a negative fixture. The mutation changes only the
+    /// replacement payload, so a false-green cannot be explained by a changed
+    /// ID, schema, query, or lifecycle route.
+    #[cfg(feature = "perf-harness")]
+    #[test]
+    fn e63_upsert_delete_add_seed_matrix_replays_live_writer_observations() {
+        use frankensearch_core::IndexableDocument;
+
+        const SEEDS: [u64; 3] = [
+            0xe630_0000_0000_0001,
+            0xe630_0000_0000_0002,
+            0xe630_0000_0000_0003,
+        ];
+
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            for seed in SEEDS {
+                let document_id = format!("e63-upsert-delete-add-{seed:016x}");
+                let original = IndexableDocument::new(
+                    document_id.clone(),
+                    format!("e63-original-token seed-{seed:016x}"),
+                );
+                let replacement = IndexableDocument::new(
+                    document_id.clone(),
+                    format!("e63-replacement-token seed-{seed:016x}"),
+                );
+                let invalid_replacement = IndexableDocument::new(
+                    document_id,
+                    format!("e63-invalid-mutation-token seed-{seed:016x}"),
+                );
+                let mut replacement_case = DifferentialCase::new(
+                    format!("e63-upsert-delete-add-{seed:016x}"),
+                    "e63-replacement-token",
+                    16,
+                );
+                replacement_case.snippet_max_chars = None;
+                replacement_case.tie_expansion_limit = 64;
+                replacement_case.metadata.generator_id =
+                    Some("e6.3-upsert-versus-delete-add-v1".to_owned());
+                replacement_case.metadata.generator_seed = Some(seed);
+
+                let upsert = e63_writer_replacement_observation(
+                    &cx,
+                    &original,
+                    &replacement,
+                    &replacement_case,
+                    true,
+                )
+                .await;
+                let replayed_upsert = e63_writer_replacement_observation(
+                    &cx,
+                    &original,
+                    &replacement,
+                    &replacement_case,
+                    true,
+                )
+                .await;
+                let delete_add = e63_writer_replacement_observation(
+                    &cx,
+                    &original,
+                    &replacement,
+                    &replacement_case,
+                    false,
+                )
+                .await;
+                let replay_comparison = compare_observations(
+                    upsert.clone(),
+                    replayed_upsert,
+                    ComparatorConfig::default(),
+                )
+                .unwrap_or_else(|error| {
+                    panic!("E6.3 seed {seed:#x} writer-upsert replay comparison failed: {error}")
+                });
+                assert_eq!(
+                    replay_comparison.status,
+                    ComparisonStatus::Exact,
+                    "E6.3 seed {seed:#x} writer upsert must replay exactly"
+                );
+                let lifecycle_comparison =
+                    compare_observations(upsert, delete_add, ComparatorConfig::default())
+                        .unwrap_or_else(|error| {
+                            panic!(
+                                "E6.3 seed {seed:#x} upsert/delete-add comparison failed: {error}"
+                            )
+                        });
+                assert_eq!(
+                    lifecycle_comparison.status,
+                    ComparisonStatus::Exact,
+                    "E6.3 seed {seed:#x} writer upsert and delete/add diverged: {:?}",
+                    lifecycle_comparison.divergences
+                );
+
+                let invalid = e63_writer_replacement_observation(
+                    &cx,
+                    &original,
+                    &invalid_replacement,
+                    &replacement_case,
+                    true,
+                )
+                .await;
+                let invalid_comparison = compare_observations(
+                    e63_writer_replacement_observation(
+                        &cx,
+                        &original,
+                        &replacement,
+                        &replacement_case,
+                        true,
+                    )
+                    .await,
+                    invalid,
+                    ComparatorConfig::default(),
+                )
+                .unwrap_or_else(|error| {
+                    panic!("E6.3 seed {seed:#x} invalid writer-upsert comparison failed: {error}")
+                });
+                assert_eq!(
+                    invalid_comparison.status,
+                    ComparisonStatus::Failed,
+                    "E6.3 seed {seed:#x} planted replacement-content mutation must not satisfy the lifecycle law"
+                );
+            }
+        });
+    }
+
     #[cfg(feature = "tantivy-oracle")]
     #[test]
     fn e410_controlled_public_search_semantics_match_oracle() {

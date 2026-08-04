@@ -633,17 +633,14 @@ impl MetamorphicLawRegistry {
                 MetamorphicLawDescriptor {
                     id: "e6.3-upsert-versus-delete-add-v1".to_owned(),
                     generator_id: "e6.3-upsert-versus-delete-add-v1".to_owned(),
-                    applicability: MetamorphicLawApplicability::SkipWithReason {
-                        reason: MetamorphicSkipReason::LifecycleCapabilityUnavailable,
-                    },
-                    preconditions: "a declared upsert and delete/add lifecycle operation"
-                        .to_owned(),
-                    observable_projection: "total lexical observation".to_owned(),
-                    equivalence_relation: "declared replacement semantics".to_owned(),
+                    applicability: MetamorphicLawApplicability::Applies,
+                    preconditions: "shipping LexicalWrite replacement contract, one committed live ID, and an independently sequenced delete/add route".to_owned(),
+                    observable_projection: "total lexical observation after the replacement publication".to_owned(),
+                    equivalence_relation: "LexicalWrite upsert replacement is exactly equivalent to deleting the live ID then adding the same replacement".to_owned(),
                     allowed_divergence: "none".to_owned(),
                     positive_fixture_id: "e63-upsert-delete-add-positive".to_owned(),
                     invalid_fixture_id: "e63-upsert-delete-add-content-mutation".to_owned(),
-                    replay_test: "pending runner lifecycle hook".to_owned(),
+                    replay_test: "engine::tests::e63_upsert_delete_add_seed_matrix_replays_live_writer_observations".to_owned(),
                     shrinker_id: "e6.3-total-lexical-ddmin-v1".to_owned(),
                     scopes: vec![MetamorphicLawScope::Quill],
                 },
