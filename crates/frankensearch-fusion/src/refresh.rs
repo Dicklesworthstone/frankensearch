@@ -750,12 +750,11 @@ impl StagedIdentityBoundGeneration {
     /// (bd-core-vector-space-search-guard-ctzo).
     ///
     /// This is the production consumption of
-    /// [`TwoTierIndex::activate_owner_backed_search`]: a staged generation is
-    /// the one object that holds all three inputs the activation requires —
-    /// the retained per-tier owners, and the exact bindings each tier was
-    /// written and admitted under. Callers therefore cannot supply a binding
-    /// of their own choosing here; the bindings are the ones this generation
-    /// was proven with.
+    /// [`TwoTierIndex::activate_owner_backed_search`] on a staged generation.
+    /// The bindings it joins against are the ones `index` retained when each
+    /// staged tier was admitted — the same values this struct exposes as
+    /// [`Self::fast_binding`] / [`Self::quality_binding`] — so no caller can
+    /// substitute an identity of its own choosing.
     ///
     /// Every identity join runs before any vector byte is reachable, and the
     /// returned capability is the only route to a read.
@@ -768,11 +767,7 @@ impl StagedIdentityBoundGeneration {
         &'staged self,
         embeddings: &'query TieredQueryEmbeddings,
     ) -> SearchResult<ActivatedTierSearch<'staged, 'query>> {
-        self.index.activate_owner_backed_search(
-            embeddings,
-            Some(&self.fast_binding),
-            self.quality_binding.as_ref(),
-        )
+        self.index.activate_owner_backed_search(embeddings)
     }
 }
 

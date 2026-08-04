@@ -416,6 +416,19 @@ enum QualityAlignment {
 /// publication state — honoring the owner contract on [`ValidatedFsviBytes`]:
 /// the owner is never converted into a mutable/path-opened [`VectorIndex`];
 /// the tier's index is only ever borrowed from inside the retained owner.
+///
+/// It also retains the exact [`FsviV2IdentityBinding`] the tier was admitted
+/// under (bd-ctzo). That binding is the ONLY materialized
+/// `EmbeddingIdentityBundleV1` describing this artifact — the owner carries
+/// the identity as one-way canonical bytes, and
+/// [`EmbeddingIdentityBundleV1`] has no decoder — so query-side producer
+/// conformance would otherwise have to take an expected bundle from whoever
+/// happens to call `search`. Retaining it here makes owner and binding a
+/// single indivisible admission product: they are installed together by
+/// [`TwoTierIndex::open_admitted_v2_with_paths`] and replaced together by
+/// [`TwoTierIndex::try_replace_admitted_v2`], so a binding that does not
+/// describe this artifact is not a refusal a caller can trigger — it is
+/// unrepresentable.
 // The owner is materially larger than a plain `VectorIndex` (it additionally
 // carries the witness and the byte handle), but exactly one `TierSource`
 // exists per tier per opened index, so the variant-size asymmetry buys
@@ -425,8 +438,20 @@ enum QualityAlignment {
 enum TierSource {
     /// Plain v1 [`VectorIndex::open`] tier (mutable mapping, WAL-bearing).
     PathOpened(VectorIndex),
-    /// Sealed FSVI v2 admission owner, retained in full.
-    AdmittedV2(ValidatedFsviBytes),
+    /// Sealed FSVI v2 admission owner, retained in full together with the
+    /// binding it was admitted under.
+    AdmittedV2 {
+        /// The sealed byte owner, witness and publication state.
+        owner: ValidatedFsviBytes,
+        /// The exact identity this artifact was admitted against.
+        /// [`validate_expected_v2_binding`] proved, before this value
+        /// existed, that the persisted canonical identity bytes, every
+        /// component fingerprint, the storage contract and the full-width
+        /// generation are byte-equal to it.
+        ///
+        /// [`validate_expected_v2_binding`]: crate::VectorIndex::open_admitted_v2
+        binding: FsviV2IdentityBinding,
+    },
 }
 
 impl TierSource {
@@ -439,7 +464,7 @@ impl TierSource {
     const fn index(&self) -> &VectorIndex {
         match self {
             Self::PathOpened(index) => index,
-            Self::AdmittedV2(owner) => &owner.index,
+            Self::AdmittedV2 { owner, .. } => &owner.index,
         }
     }
 
@@ -448,7 +473,29 @@ impl TierSource {
     const fn admitted_owner(&self) -> Option<&ValidatedFsviBytes> {
         match self {
             Self::PathOpened(_) => None,
-            Self::AdmittedV2(owner) => Some(owner),
+            Self::AdmittedV2 { owner, .. } => Some(owner),
+        }
+    }
+
+    /// The identity binding this tier was admitted under, when it came from
+    /// exact FSVI v2 admission.
+    const fn admitted_binding(&self) -> Option<&FsviV2IdentityBinding> {
+        match self {
+            Self::PathOpened(_) => None,
+            Self::AdmittedV2 { binding, .. } => Some(binding),
+        }
+    }
+
+    /// Owner and binding together, as the single admission product they are.
+    ///
+    /// Activation consumes this rather than two independent `Option`s so the
+    /// half-present state — an owner paired with someone else's binding, or a
+    /// binding with no artifact behind it — has no representation to check
+    /// for.
+    const fn admitted_pair(&self) -> Option<(&ValidatedFsviBytes, &FsviV2IdentityBinding)> {
+        match self {
+            Self::PathOpened(_) => None,
+            Self::AdmittedV2 { owner, binding } => Some((owner, binding)),
         }
     }
 }
@@ -629,12 +676,15 @@ impl TwoTierIndex {
     ) -> SearchResult<Self> {
         let paths = paths.clone().into_absolute()?;
         validate_index_paths(&paths)?;
-        let fast_source =
-            TierSource::AdmittedV2(admit_v2_tier(paths.fast_index(), fast_binding, "fast")?);
+        let fast_source = TierSource::AdmittedV2 {
+            owner: admit_v2_tier(paths.fast_index(), fast_binding, "fast")?,
+            binding: fast_binding.clone(),
+        };
         let quality_source = match (paths.quality_index(), quality_binding) {
-            (Some(path), Some(binding)) => Some(TierSource::AdmittedV2(admit_v2_tier(
-                path, binding, "quality",
-            )?)),
+            (Some(path), Some(binding)) => Some(TierSource::AdmittedV2 {
+                owner: admit_v2_tier(path, binding, "quality")?,
+                binding: binding.clone(),
+            }),
             (None, None) => None,
             (Some(path), None) => {
                 return Err(SearchError::InvalidConfig {
@@ -979,7 +1029,7 @@ impl TwoTierIndex {
     fn fast_tier_mut_for_test(&mut self) -> Option<&mut VectorIndex> {
         match &mut self.fast_source {
             TierSource::PathOpened(index) => Some(index),
-            TierSource::AdmittedV2(_) => None,
+            TierSource::AdmittedV2 { .. } => None,
         }
     }
 
@@ -992,9 +1042,61 @@ impl TwoTierIndex {
     /// ([`ValidatedFsviBytes::published_wal_absent`]). Replacing, renaming,
     /// or mutating the source pathname after admission cannot alter what the
     /// retained owner serves. `None` for plain v1 path-opened tiers.
+    ///
+    /// # Drop order
+    ///
+    /// The returned borrow cannot be held across a refresh. bd-3t52d C2 left
+    /// the "borrowed views cannot outlive a `&mut self` install" argument
+    /// asserted but unpinned; this is the pin (bd-r6lwt). Installing a
+    /// successor replaces the `TierSource` the borrow points into, so the
+    /// borrow checker must reject holding one across
+    /// [`Self::try_replace_admitted_v2`]. The error code is pinned too, so a
+    /// snippet that stops compiling for an unrelated reason -- a renamed method
+    /// or a moved re-export -- fails this doctest instead of passing it.
+    ///
+    /// ```compile_fail,E0502
+    /// use frankensearch_index::{FsviV2IdentityBinding, TwoTierIndex, TwoTierIndexPaths};
+    ///
+    /// fn hold_owner_across_install(
+    ///     index: &mut TwoTierIndex,
+    ///     paths: &TwoTierIndexPaths,
+    ///     binding: &FsviV2IdentityBinding,
+    /// ) {
+    ///     let owner = index.fast_admitted_owner();
+    ///     let _ = index.try_replace_admitted_v2(paths, binding, None);
+    ///     let _ = owner;
+    /// }
+    /// ```
+    ///
+    /// The complementary runtime half -- that field drop order *inside* the
+    /// owner is not load-bearing, because the serving index shares the owner's
+    /// allocation rather than borrowing it -- is pinned by
+    /// `owner_drop_order_is_not_load_bearing_because_the_image_is_shared_not_borrowed`.
     #[must_use]
     pub const fn fast_admitted_owner(&self) -> Option<&ValidatedFsviBytes> {
         self.fast_source.admitted_owner()
+    }
+
+    /// The exact identity binding the fast tier was admitted under, when this
+    /// index was opened through exact FSVI v2 admission (bd-ctzo).
+    ///
+    /// This is the artifact's own identity, not a caller's claim about it:
+    /// admission refused the open unless the persisted canonical identity
+    /// bytes, every component fingerprint, the storage contract and the
+    /// full-width generation were byte-equal to it. It is what a query-side
+    /// seam joins against, because the owner retains identity only as
+    /// one-way canonical bytes.
+    #[must_use]
+    pub const fn fast_admitted_binding(&self) -> Option<&FsviV2IdentityBinding> {
+        self.fast_source.admitted_binding()
+    }
+
+    /// Quality-tier counterpart of [`Self::fast_admitted_binding`].
+    #[must_use]
+    pub fn quality_admitted_binding(&self) -> Option<&FsviV2IdentityBinding> {
+        self.quality_source
+            .as_ref()
+            .and_then(TierSource::admitted_binding)
     }
 
     /// Admit a candidate generation and install it only if every tier of it
@@ -1084,30 +1186,31 @@ impl TwoTierIndex {
     /// there is nothing to instrument for "zero work before rejection"
     /// because the work is unreachable, not merely unreached.
     ///
-    /// The expected identity bundle comes from `fast_binding` /
-    /// `quality_binding` rather than from the owner, because
-    /// `EmbeddingIdentityBundleV1` canonical bytes are one-way (there is no
-    /// decoder). That is not a caller-trust hole: the binding's canonical
-    /// bytes are checked here against the artifact's own retained bytes, so
-    /// a caller cannot present an identity the artifact does not carry.
+    /// The expected identity bundle is the one this index RETAINS from its own
+    /// admission ([`Self::fast_admitted_binding`]), never a bundle the caller
+    /// supplies. The r1 revision of this method took the bindings as
+    /// parameters and defended itself by comparing the caller's canonical
+    /// bytes against the artifact's; retaining the binding at admission
+    /// removes the parameter instead of checking it, so "the caller presented
+    /// an identity this artifact does not carry" stops being a refusal and
+    /// becomes unrepresentable. It also removes the plumbing that would
+    /// otherwise force every search caller to carry a binding it has no way
+    /// to obtain.
     ///
     /// # Errors
     ///
     /// Returns [`SearchError::InvalidConfig`] naming the exact tier and
-    /// contract field for a topology, identity, producer, storage,
-    /// dimension or generation mismatch, and for a tier the query requests
-    /// that this index does not retain as an admitted v2 owner.
+    /// contract field for a topology, identity, producer, dimension or
+    /// generation mismatch, and for a tier the query requests that this
+    /// index does not retain as an admitted v2 owner.
     pub fn activate_owner_backed_search<'index, 'query>(
         &'index self,
         embeddings: &'query TieredQueryEmbeddings,
-        fast_binding: Option<&FsviV2IdentityBinding>,
-        quality_binding: Option<&FsviV2IdentityBinding>,
     ) -> SearchResult<ActivatedTierSearch<'index, 'query>> {
         let topology = embeddings.supported_topology();
         let fast = match embeddings.fast() {
             Some(query) => Some(activate_tier(
-                self.fast_admitted_owner(),
-                fast_binding,
+                self.fast_source.admitted_pair(),
                 query,
                 "fast",
             )?),
@@ -1115,8 +1218,9 @@ impl TwoTierIndex {
         };
         let quality = match embeddings.quality() {
             Some(query) => Some(activate_tier(
-                self.quality_admitted_owner(),
-                quality_binding,
+                self.quality_source
+                    .as_ref()
+                    .and_then(TierSource::admitted_pair),
                 query,
                 "quality",
             )?),
@@ -2485,13 +2589,22 @@ impl<'index, 'query> ActivatedTierSearch<'index, 'query> {
 }
 
 /// Perform every identity join for one tier before any vector read (bd-ctzo).
+///
+/// `admitted` is the tier's indivisible admission product — the retained
+/// owner together with the binding it was admitted under. Admission already
+/// proved those two agree byte-for-byte on canonical identity, storage and
+/// generation ([`validate_expected_v2_binding`]), so this function does not
+/// re-derive the artifact's own coherence. What it establishes is the join
+/// that admission could not know about: whether THIS QUERY belongs to that
+/// artifact's space and producer, and whether its width matches.
+///
+/// [`validate_expected_v2_binding`]: crate::VectorIndex::open_admitted_v2
 fn activate_tier<'index, 'query>(
-    owner: Option<&'index ValidatedFsviBytes>,
-    binding: Option<&FsviV2IdentityBinding>,
+    admitted: Option<(&'index ValidatedFsviBytes, &FsviV2IdentityBinding)>,
     query: &'query BoundQueryEmbedding,
     tier: &str,
 ) -> SearchResult<ActivatedTier<'index, 'query>> {
-    let owner = owner.ok_or_else(|| SearchError::InvalidConfig {
+    let (owner, binding) = admitted.ok_or_else(|| SearchError::InvalidConfig {
         field: format!("search_activation.{tier}.owner"),
         value: "<absent>".to_owned(),
         reason: format!(
@@ -2500,28 +2613,6 @@ fn activate_tier<'index, 'query>(
              activation and requires a reindex"
         ),
     })?;
-    let binding = binding.ok_or_else(|| SearchError::InvalidConfig {
-        field: format!("search_activation.{tier}.binding"),
-        value: "<absent>".to_owned(),
-        reason: format!(
-            "typed activation of the {tier} tier requires the admitted identity binding that \
-             opened it"
-        ),
-    })?;
-    // The binding may only speak for THIS artifact: compare the caller's
-    // canonical identity bytes against the ones the owner itself retains.
-    if binding.frozen_identity().canonical_bytes
-        != owner.identity_v2().identity_bundle_canonical_bytes
-    {
-        return Err(SearchError::InvalidConfig {
-            field: format!("search_activation.{tier}.retained_identity"),
-            value: crate::fingerprint_hex(&owner.identity_v2().identity_bundle_fingerprint),
-            reason: format!(
-                "the supplied {tier} binding does not describe the identity the retained owner \
-                 carries; activation is derived from the artifact, never from the caller's claim"
-            ),
-        });
-    }
     // The complete admission law. A certified-foreign producer is
     // comparison-grade telemetry only, so it is refused rather than admitted.
     match query.verify_producer_conformance(&binding.frozen_identity().identity, tier)? {
@@ -2542,6 +2633,15 @@ fn activate_tier<'index, 'query>(
             });
         }
     }
+    // A redundant cross-check, kept deliberately and labelled as redundant:
+    // the space join above already implies this width equality through
+    // `space.dimension == storage.dimension` (bundle validation),
+    // `storage.dimension == metadata.dimension` (admission), and
+    // `vector.len() == space.dimension` (`BoundQueryEmbedding::new`). Unlike
+    // the generation comparison removed below, this one guards the SHAPE OF
+    // THE READ that happens two lines later, so it is worth an O(1) test
+    // immediately before the bytes are touched rather than a proof by
+    // transitivity across three modules.
     if query.vector().len() != owner.dimension() {
         return Err(SearchError::InvalidConfig {
             field: format!("search_activation.{tier}.dimension"),
@@ -2552,17 +2652,18 @@ fn activate_tier<'index, 'query>(
             ),
         });
     }
-    if binding.generation() != owner.witness().generation {
-        return Err(SearchError::InvalidConfig {
-            field: format!("search_activation.{tier}.generation"),
-            value: binding.generation().sequence.to_string(),
-            reason: format!(
-                "the supplied {tier} binding names a different generation than the retained \
-                 owner witnesses ({})",
-                owner.witness().generation.sequence
-            ),
-        });
-    }
+    // No generation join here, deliberately. `binding.generation()` and
+    // `owner.witness().generation` are the same admission fact read twice:
+    // admission refuses an artifact whose persisted generation and generation
+    // fingerprint are not byte-equal to the binding's, and the witness copies
+    // its generation straight out of the artifact's validated header. When the
+    // binding was a caller parameter that comparison could fail and was worth
+    // making; now that owner and binding are installed as one product it can
+    // only ever be true, and an error arm no test can reach is not a guard.
+    // The generation a caller CAN get wrong is the one it asks the index to
+    // install, and `try_replace_admitted_v2` refuses that before any state
+    // change. Coverage still reports the generation from the owner witness
+    // (`ActivatedTier::generation_sequence`), never from a caller.
     Ok(ActivatedTier { owner, query })
 }
 
@@ -6968,7 +7069,7 @@ mod tests {
         // The fast pool at k=1 contains ONLY doc-near.
         let fast_only_embeddings = TieredQueryEmbeddings::fast_only(fast_query.clone());
         let fast_only = index
-            .activate_owner_backed_search(&fast_only_embeddings, Some(&fast_binding), None)
+            .activate_owner_backed_search(&fast_only_embeddings)
             .expect("fast-only activation");
         assert_eq!(fast_only.topology(), RetrievalTopology::FastOnly);
         let fast_pool = fast_only.search_fast(1).expect("fast search");
@@ -6981,7 +7082,7 @@ mod tests {
         // QualityOnly retrieves from the quality owner directly and reaches it.
         let quality_only_embeddings = TieredQueryEmbeddings::quality_only(quality_query.clone());
         let quality_only = index
-            .activate_owner_backed_search(&quality_only_embeddings, None, Some(&quality_binding))
+            .activate_owner_backed_search(&quality_only_embeddings)
             .expect("quality-only activation");
         assert_eq!(quality_only.topology(), RetrievalTopology::QualityOnly);
         assert_eq!(
@@ -6997,11 +7098,7 @@ mod tests {
         // FullProgressive unions independent per-tier retrieval.
         let progressive_embeddings = TieredQueryEmbeddings::progressive(fast_query, quality_query);
         let progressive = index
-            .activate_owner_backed_search(
-                &progressive_embeddings,
-                Some(&fast_binding),
-                Some(&quality_binding),
-            )
+            .activate_owner_backed_search(&progressive_embeddings)
             .expect("progressive activation");
         assert_eq!(progressive.topology(), RetrievalTopology::FullProgressive);
         let union = progressive.search_union(2).expect("union");
@@ -7066,11 +7163,23 @@ mod tests {
         )
         .expect("admit the fast tier");
 
+        // The identity every join below is measured against is the artifact's
+        // own: it is the binding admission proved this file's canonical bytes
+        // equal, retained on the tier. There is no parameter through which a
+        // caller could offer a different one, which is why "a binding foreign
+        // to the artifact" is absent from the cases below -- it stopped being
+        // a refusal and became unrepresentable.
+        assert_eq!(
+            index.fast_admitted_binding(),
+            Some(&binding),
+            "the tier must retain the exact binding it was admitted under"
+        );
+
         // Positive control: the matching query activates and serves.
         let matching =
             TieredQueryEmbeddings::fast_only(bound_query(&identity, &[1.0, 0.0, 0.0, 0.0]));
         let activated = index
-            .activate_owner_backed_search(&matching, Some(&binding), None)
+            .activate_owner_backed_search(&matching)
             .expect("the matching query activates");
         assert_eq!(activated.search_fast(1).expect("search")[0].doc_id, "doc-a");
 
@@ -7080,7 +7189,7 @@ mod tests {
         let foreign =
             TieredQueryEmbeddings::fast_only(bound_query(&foreign_identity, &[1.0, 0.0, 0.0, 0.0]));
         let error = index
-            .activate_owner_backed_search(&foreign, Some(&binding), None)
+            .activate_owner_backed_search(&foreign)
             .expect_err("a same-dimension foreign space must be refused");
         assert!(
             matches!(
@@ -7091,42 +7200,53 @@ mod tests {
             "got {error:?}"
         );
 
-        // (ii) A binding that does not describe the retained artifact.
-        let (other_binding, other_identity) = fsvi_v2_binding("another-model", 4, 81);
-        let other_query =
-            TieredQueryEmbeddings::fast_only(bound_query(&other_identity, &[1.0, 0.0, 0.0, 0.0]));
+        // (ii) THE SAME SPACE, A DIFFERENT PRODUCER, CERTIFIED COMPATIBLE.
+        // This is the case a fingerprint-only join admits and the complete
+        // bd-9xuj law does not: the space fingerprint is byte-identical (only
+        // producer-side fields move, and none of them feed the space), and
+        // both producers carry the same pinned golden-vector certificate, so
+        // `verify_producer_conformance` returns
+        // `ConformanceCompatibleProducer` rather than an error. That verdict
+        // is comparison-grade telemetry, so activation must REFUSE it rather
+        // than admit with a log line.
+        let mut compatible_identity = identity.clone();
+        "a-different-implementation".clone_into(&mut compatible_identity.producer.backend);
+        assert_eq!(
+            compatible_identity.space.fingerprint(),
+            identity.space.fingerprint(),
+            "the fixture is only meaningful while the SPACE is unchanged"
+        );
+        assert_ne!(
+            compatible_identity.producer.fingerprint(),
+            identity.producer.fingerprint(),
+            "the fixture is only meaningful while the PRODUCER differs"
+        );
+        assert_eq!(
+            compatible_identity.producer.golden_vectors, identity.producer.golden_vectors,
+            "the fixture is only meaningful while both producers are certified compatible"
+        );
+        let compatible = TieredQueryEmbeddings::fast_only(bound_query(
+            &compatible_identity,
+            &[1.0, 0.0, 0.0, 0.0],
+        ));
         let error = index
-            .activate_owner_backed_search(&other_query, Some(&other_binding), None)
-            .expect_err("a binding foreign to the artifact must be refused");
+            .activate_owner_backed_search(&compatible)
+            .expect_err("a certified-compatible foreign producer must be refused");
         assert!(
             matches!(
                 error,
                 SearchError::InvalidConfig { ref field, .. }
-                    if field == "search_activation.fast.retained_identity"
+                    if field == "search_activation.fast.producer_conformance"
             ),
             "got {error:?}"
         );
 
-        // (iii) No binding at all: activation cannot proceed on the owner's
-        // word alone, because the expected bundle is not decodable from it.
-        let error = index
-            .activate_owner_backed_search(&matching, None, None)
-            .expect_err("activation requires the admitted binding");
-        assert!(
-            matches!(
-                error,
-                SearchError::InvalidConfig { ref field, .. }
-                    if field == "search_activation.fast.binding"
-            ),
-            "got {error:?}"
-        );
-
-        // (iv) A quality-bound query against an index that retains no quality
+        // (iii) A quality-bound query against an index that retains no quality
         // owner: typed refusal, never a silent fast-tier substitution.
         let quality_bound =
             TieredQueryEmbeddings::quality_only(bound_query(&identity, &[1.0, 0.0, 0.0, 0.0]));
         let error = index
-            .activate_owner_backed_search(&quality_bound, None, Some(&binding))
+            .activate_owner_backed_search(&quality_bound)
             .expect_err("a missing quality owner must be refused");
         assert!(
             matches!(
@@ -7137,7 +7257,7 @@ mod tests {
             "got {error:?}"
         );
 
-        // (v) A legacy v1 index retains no owner at all, so typed activation
+        // (iv) A legacy v1 index retains no owner at all, so typed activation
         // is unreachable rather than degraded.
         let legacy_dir = temp_index_dir("ctzo-legacy");
         fs::create_dir_all(&legacy_dir).expect("create temp dir");
@@ -7146,8 +7266,12 @@ mod tests {
             .expect("write v1 fixture");
         let legacy =
             TwoTierIndex::open(&legacy_dir, TwoTierConfig::default()).expect("open legacy v1");
+        assert!(
+            legacy.fast_admitted_binding().is_none(),
+            "a legacy v1 tier retains no admitted identity to join against"
+        );
         let error = legacy
-            .activate_owner_backed_search(&matching, Some(&binding), None)
+            .activate_owner_backed_search(&matching)
             .expect_err("a legacy tier is not searchable under typed activation");
         assert!(
             matches!(
@@ -7189,7 +7313,7 @@ mod tests {
         let embeddings =
             TieredQueryEmbeddings::fast_only(bound_query(&identity, &[1.0, 0.0, 0.0, 0.0]));
         let activated = index
-            .activate_owner_backed_search(&embeddings, Some(&binding), None)
+            .activate_owner_backed_search(&embeddings)
             .expect("activate");
         let tier = activated.fast().expect("fast tier activated");
         assert_eq!(tier.generation_sequence(), 91);
