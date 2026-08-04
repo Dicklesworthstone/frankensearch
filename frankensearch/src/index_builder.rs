@@ -38,7 +38,15 @@ use frankensearch_index::{
     TwoTierIndex, TwoTierIndexBuilder, VECTOR_INDEX_FALLBACK_FILENAME, VECTOR_INDEX_FAST_FILENAME,
     VECTOR_INDEX_QUALITY_FILENAME,
 };
-#[cfg(feature = "lexical-tantivy")]
+// bd-6281c: this module opens Tantivy in exactly two configurations — the
+// blue-green/direct arms of the `quill` reader, and the standalone
+// `lexical`-without-`quill` reader/writer below. `lexical-tantivy` on its own
+// (the cass-compat lane) only re-exports the namespace for foreign consumers,
+// so gating this import on that feature alone left it unused there.
+#[cfg(any(
+    all(feature = "quill", feature = "lexical-tantivy"),
+    all(feature = "lexical", not(feature = "quill"))
+))]
 use frankensearch_lexical::TantivyIndex;
 #[cfg(feature = "quill")]
 use frankensearch_quill::{
@@ -1093,7 +1101,7 @@ mod tests {
     use std::sync::Arc;
     use std::sync::Mutex;
 
-    #[cfg(feature = "lexical-tantivy")]
+    #[cfg(all(feature = "quill", feature = "lexical-tantivy"))]
     use frankensearch_core::traits::LexicalWrite;
     use frankensearch_core::traits::{MetricsExporter, ModelCategory, SearchFuture};
     use frankensearch_core::types::{EmbeddingMetrics, IndexMetrics, SearchMetrics};
@@ -1101,7 +1109,10 @@ mod tests {
     use frankensearch_durability::FsviProtector;
     #[cfg(all(feature = "durability", feature = "quill"))]
     use frankensearch_durability::{DefaultSymbolCodec, DurabilityConfig, FsviVerifyResult};
-    #[cfg(feature = "lexical-tantivy")]
+    #[cfg(any(
+        all(feature = "quill", feature = "lexical-tantivy"),
+        all(feature = "lexical", not(feature = "quill"))
+    ))]
     use frankensearch_lexical::TantivyIndex;
     #[cfg(feature = "quill")]
     use frankensearch_quill::{

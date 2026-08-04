@@ -382,6 +382,21 @@ jobs:
           cargo check -p frankensearch --all-targets --all-features
           cargo check -p frankensearch-fusion --all-targets --all-features
 
+      - name: cargo clippy (cass-compat lane) (bd-6281c)
+        if: matrix.os == 'ubuntu-latest'
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The workspace clippy step below runs on default features, so nothing
+          # ever linted the cass-compat lane and unused imports accumulated there
+          # unseen (bd-6281c). `cargo check` above proves the lane compiles; only
+          # clippy proves it is clean. Both invocations are needed: the --lib one
+          # covers the lane exactly as CI checks it, and the hash,cass-compat one
+          # matches the feature shape a real CASS consumer resolves and reaches
+          # the lib test target, where two of the three inherited reds lived.
+          cargo clippy -p frankensearch --lib --no-default-features --features cass-compat -- -D warnings
+          cargo clippy -p frankensearch --no-default-features --features hash,cass-compat --all-targets -- -D warnings
+
       - name: cargo clippy
         run: cargo clippy --workspace --all-targets --exclude optimize-params -- -D warnings
 
