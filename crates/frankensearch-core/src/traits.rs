@@ -1063,21 +1063,50 @@ pub trait LexicalRead: Send + Sync {
     ///
     /// Implementations must ignore results without a lexical score (those
     /// did not survive from the lexical candidate pool) and must reject a
-    /// foreign context with a typed error. The default is a no-op for eager
-    /// batches (`context == None`).
+    /// foreign context with a typed error.
+    ///
+    /// # The default fails closed on any context
+    ///
+    /// A backend that does not override this method also does not override
+    /// [`Self::search_candidates`], so it only ever issues *eager* batches,
+    /// whose metadata was attached by the scoring search itself and whose
+    /// context is therefore `None`. Such a backend can never legitimately be
+    /// handed a context — so receiving one means a caller mixed a batch from
+    /// another engine or generation into this reader, which is precisely what
+    /// the hydration capability exists to prevent.
+    ///
+    /// This used to be `let _ = context; Ok(())`, which accepted *any*
+    /// context — including another engine's snapshot pin — and returned
+    /// success. The observable damage was silent: deferred winners came back
+    /// with no metadata restored and no error raised, so a cross-engine mix
+    /// degraded to missing fields rather than failing. Quill already rejected
+    /// a foreign pin with a typed error; every eager-batch backend (Tantivy,
+    /// FTS5, the shadow adapter) inherited the permissive default and did not.
     ///
     /// # Errors
     ///
-    /// Returns `SearchError` if winner metadata cannot be materialized or the
-    /// context does not belong to this backend.
+    /// Returns `SearchError` if winner metadata cannot be materialized, or if
+    /// a context is supplied to a backend that issues only eager batches.
     fn hydrate_candidates<'a>(
         &'a self,
         _cx: &'a Cx,
         context: Option<&'a LexicalHydrationContext>,
         _results: &'a mut [ScoredResult],
     ) -> SearchFuture<'a, ()> {
-        let _ = context;
-        Box::pin(async { Ok(()) })
+        let foreign_backend = context.map(LexicalHydrationContext::backend);
+        Box::pin(async move {
+            foreign_backend.map_or(Ok(()), |backend| {
+                Err(SearchError::SubsystemError {
+                    subsystem: "lexical.hydration",
+                    source: format!(
+                        "hydration context from backend {backend:?} was supplied to a backend \
+                         that issues only eager candidate batches; refusing cross-engine or \
+                         cross-generation hydration"
+                    )
+                    .into(),
+                })
+            })
+        })
     }
 
     /// Number of documents currently searchable.
@@ -1613,5 +1642,112 @@ mod tests {
         assert!(!ModelCategory::HashEmbedder.default_semantic_flag());
         assert!(ModelCategory::StaticEmbedder.default_semantic_flag());
         assert!(ModelCategory::TransformerEmbedder.default_semantic_flag());
+    }
+
+    /// Stand-in for the eager-batch backends — Tantivy, FTS5, the shadow
+    /// adapter — which implement `LexicalRead` without overriding
+    /// `search_candidates` or `hydrate_candidates`.
+    struct EagerOnlyLexical;
+
+    fn lexical_hit(id: &str, metadata: Option<serde_json::Value>) -> ScoredResult {
+        ScoredResult {
+            doc_id: compact_str::CompactString::from(id),
+            score: 1.0,
+            source: crate::types::ScoreSource::Lexical,
+            index: None,
+            fast_score: None,
+            quality_score: None,
+            lexical_score: Some(1.0),
+            rerank_score: None,
+            explanation: None,
+            metadata: metadata.map(std::sync::Arc::new),
+        }
+    }
+
+    impl LexicalRead for EagerOnlyLexical {
+        fn search<'a>(
+            &'a self,
+            _cx: &'a Cx,
+            _query: &'a str,
+            _limit: usize,
+        ) -> SearchFuture<'a, Vec<ScoredResult>> {
+            Box::pin(async {
+                // An eager backend attaches metadata during the scoring search
+                // itself, so there is nothing left to hydrate afterwards.
+                Ok(vec![lexical_hit(
+                    "doc-a",
+                    Some(serde_json::json!({"rev": "v1"})),
+                )])
+            })
+        }
+
+        fn doc_count(&self) -> usize {
+            1
+        }
+    }
+
+    /// An eager batch carries its metadata and needs no context.
+    ///
+    /// This is the positive half: the default hydration path must stay a
+    /// no-op for the shape it actually serves, or making it fail closed would
+    /// break every eager backend.
+    #[test]
+    fn eager_candidates_hydrate_without_a_context() {
+        run_test_with_cx(|cx| async move {
+            let backend = EagerOnlyLexical;
+            let batch = backend
+                .search_candidates(&cx, "alpha", 10)
+                .await
+                .expect("eager candidates");
+            assert!(
+                !batch.is_deferred(),
+                "a backend that does not override search_candidates issues eager batches"
+            );
+            let (mut winners, context) = batch.into_parts();
+            assert!(context.is_none(), "an eager batch carries no snapshot pin");
+            assert!(
+                winners[0].metadata.is_some(),
+                "eager metadata is attached by the scoring search, so it is already \
+                 from the scoring generation"
+            );
+            backend
+                .hydrate_candidates(&cx, context.as_ref(), &mut winners)
+                .await
+                .expect("hydrating an eager batch is a no-op, not an error");
+        });
+    }
+
+    /// A foreign context must fail closed rather than silently succeed.
+    ///
+    /// The negative half, and the one that was broken: the default used to be
+    /// `let _ = context; Ok(())`, so mixing another engine's snapshot pin into
+    /// an eager-batch backend returned success and left deferred winners with
+    /// no metadata restored. `bd-8nqz.1` requires that callers cannot mix a
+    /// hydration capability across engines or generations.
+    #[test]
+    fn a_foreign_hydration_context_is_rejected_with_a_typed_error() {
+        run_test_with_cx(|cx| async move {
+            let backend = EagerOnlyLexical;
+            // A pin minted by some other engine, exactly as a mixing caller
+            // would present it.
+            let foreign = LexicalHydrationContext::new("quill", Box::new(7_u64));
+            let mut winners = vec![lexical_hit("doc-a", None)];
+
+            let error = backend
+                .hydrate_candidates(&cx, Some(&foreign), &mut winners)
+                .await
+                .expect_err("a backend that issues no context must refuse to receive one");
+            match error {
+                SearchError::SubsystemError { subsystem, source } => {
+                    assert_eq!(subsystem, "lexical.hydration");
+                    let message = source.to_string();
+                    assert!(
+                        message.contains("quill"),
+                        "the rejection must name the foreign backend: {message}"
+                    );
+                }
+                other => panic!("expected a typed subsystem error, got {other:?}"),
+            }
+        });
     }
 }
