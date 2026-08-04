@@ -86,10 +86,10 @@ fn admit_tier_space(
     query: &BoundQueryEmbedding,
     tier: &str,
 ) -> SearchResult<()> {
-    match tier_index.space_fingerprint_hex() {
-        Some(expected) => query.verify_space_identity(expected, tier),
-        None => Ok(()),
-    }
+    tier_index.space_fingerprint_hex().map_or_else(
+        || Ok(()),
+        |expected| query.verify_space_identity(expected, tier),
+    )
 }
 
 /// Optional synchronous lexical backend used by [`SyncTwoTierSearcher`].
@@ -1348,7 +1348,7 @@ mod tests {
 
     /// The fixture indexes below build both tiers from vectors of the same
     /// synthetic space, so one bundle legitimately describes both arms. A
-    /// production pair (potion fast + MiniLM quality) would bind two DIFFERENT
+    /// production pair (potion fast + `MiniLM` quality) would bind two DIFFERENT
     /// bundles here, and `admit` would join each against its own tier.
     fn tiered(vector: Vec<f32>) -> TieredQueryEmbeddings {
         TieredQueryEmbeddings::progressive(

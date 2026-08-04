@@ -29,11 +29,11 @@ use frankensearch_index::{InMemoryTwoTierIndex, InMemoryVectorIndex};
 
 /// Bind a synthetic bench vector to an explicitly synthetic identity, for both
 /// tiers (this bench builds both from the same generated space).
-fn tiered_query(vector: Vec<f32>) -> TieredQueryEmbeddings {
+fn tiered_query(vector: &[f32]) -> TieredQueryEmbeddings {
     let dimension = u32::try_from(vector.len()).expect("bench dimension fits u32");
     let bind = || {
         BoundQueryEmbedding::new(
-            vector.clone(),
+            vector.to_vec(),
             EmbeddingIdentityBundleV1::explicit_test_model("bench-fixture", dimension),
         )
         .expect("bench query binds")
@@ -136,7 +136,7 @@ fn bench_progressive_replay(c: &mut Criterion) {
     // is setup, not part of the search being measured.
     let queries: Vec<TieredQueryEmbeddings> = (0..QUERIES)
         .map(|q| {
-            tiered_query(make_vector(
+            tiered_query(&make_vector(
                 &centroids,
                 q % CLUSTERS,
                 0xdead_0000 + q as u64,
