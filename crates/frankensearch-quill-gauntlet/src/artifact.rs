@@ -1276,6 +1276,12 @@ pub struct ArtifactStoreV4SourceBuildSnapshots {
 
 impl ArtifactStoreV4SourceBuildSnapshots {
     /// Construct a fully bound Source-to-Build pair.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GauntletError`] when either snapshot fails its own
+    /// revalidation, or when the build snapshot's recorded source identity
+    /// does not equal the source snapshot's identity.
     pub fn new(
         source: ArtifactStoreV4SourceSnapshot,
         build: ArtifactStoreV4BuildSnapshot,
@@ -1349,6 +1355,12 @@ pub struct ArtifactStoreV4SourceSnapshot {
 
 impl ArtifactStoreV4SourceSnapshot {
     /// Construct and bind a canonical snapshot from descriptor-stable caller inputs.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GauntletError`] when the entries do not canonicalize into a
+    /// valid snapshot, or when the derived domain-separated identity fails the
+    /// same revalidation [`Self::validate`] applies to a decoded snapshot.
     pub fn new(entries: Vec<ArtifactStoreV4SourceEntry>) -> Result<Self, GauntletError> {
         let mut snapshot = Self {
             schema_version: ARTIFACTSTORE_V4_SOURCE_SNAPSHOT_SCHEMA_VERSION,
@@ -1361,6 +1373,12 @@ impl ArtifactStoreV4SourceSnapshot {
     }
 
     /// Revalidate a decoded snapshot and its domain-separated identity.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GauntletError`] when the schema version is not the expected
+    /// one, when the recorded identity is not a lowercase SHA-256, or when
+    /// recomputing the identity over the entries does not reproduce it.
     pub fn validate(&self) -> Result<(), GauntletError> {
         if self.schema_version != ARTIFACTSTORE_V4_SOURCE_SNAPSHOT_SCHEMA_VERSION
             || !is_lower_sha256(&self.identity_sha256)
