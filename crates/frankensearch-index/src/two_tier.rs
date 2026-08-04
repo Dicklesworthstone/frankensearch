@@ -1288,7 +1288,7 @@ impl TwoTierIndex {
         }
 
         let wal_doc_ids: HashSet<&str> = self
-            .fast_index
+            .fast_tier()
             .wal_entries
             .iter()
             .map(|entry| entry.doc_id.as_str())
@@ -3168,7 +3168,10 @@ mod tests {
         // Model the crash-recovery window in which a durable WAL update exists
         // but its best-effort main-slab tombstone did not land. Include a
         // repeated WAL identity to exercise the canonical post-rank dedup rule.
-        index.fast_index.wal_entries.extend([
+        let fast_tier = index
+            .fast_tier_mut_for_test()
+            .expect("path-opened fast tier");
+        fast_tier.wal_entries.extend([
             WalEntry {
                 doc_id: "doc-a".into(),
                 doc_id_hash: crate::fnv1a_hash(b"doc-a"),
@@ -3189,7 +3192,7 @@ mod tests {
         let query = [1.0_f32, 0.0];
         let assert_canonical = |index: &TwoTierIndex, label: &str| {
             let expected = index
-                .fast_index
+                .fast_tier()
                 .search_top_k(&query, 10, None)
                 .expect("canonical main plus WAL search");
             let actual = index.search_fast(&query, 10).expect("ANN plus WAL search");
@@ -3218,7 +3221,7 @@ mod tests {
                 .expect("WAL doc-a remains searchable");
             assert!(
                 usize::try_from(doc_a.index).expect("u32 fits usize")
-                    >= index.fast_index.record_count(),
+                    >= index.fast_tier().record_count(),
                 "{label}: WAL doc-a must supersede the stale main-slab version"
             );
         };
@@ -3231,7 +3234,8 @@ mod tests {
         // then merge the resident WAL exactly once through the same resolver.
         assert!(
             index
-                .fast_index
+                .fast_tier_mut_for_test()
+                .expect("path-opened fast tier")
                 .soft_delete("doc-delete")
                 .expect("post-build tombstone")
         );
@@ -3266,7 +3270,10 @@ mod tests {
             ..TwoTierConfig::default()
         };
         let mut index = TwoTierIndex::open(&dir, config).expect("open ANN index");
-        index.fast_index.wal_entries.push(WalEntry {
+        let fast_tier = index
+            .fast_tier_mut_for_test()
+            .expect("path-opened fast tier");
+        fast_tier.wal_entries.push(WalEntry {
             doc_id: "doc-a".into(),
             doc_id_hash: crate::fnv1a_hash(b"doc-a"),
             embedding: vec![-1.0, 0.0],
@@ -3275,7 +3282,7 @@ mod tests {
         let normal_query = [1.0_f32, 0.0];
         assert!(
             index
-                .fast_index
+                .fast_tier()
                 .search_top_k(&normal_query, 1, None)
                 .expect("canonical normal search")
                 .is_empty(),
@@ -3292,14 +3299,15 @@ mod tests {
 
         assert!(
             index
-                .fast_index
+                .fast_tier_mut_for_test()
+                .expect("path-opened fast tier")
                 .soft_delete("doc-tombstone")
                 .expect("post-build tombstone")
         );
         let fallback_query = [0.0_f32, 1.0];
         assert!(
             index
-                .fast_index
+                .fast_tier()
                 .search_top_k(&fallback_query, 1, None)
                 .expect("canonical fallback search")
                 .is_empty(),
@@ -3338,7 +3346,7 @@ mod tests {
         let index = TwoTierIndex::open(&dir, config).expect("open ANN index");
         let query = [1.0_f32, 0.0];
         let expected = index
-            .fast_index
+            .fast_tier()
             .search_top_k(&query, 2, None)
             .expect("canonical duplicate-ID search");
         let actual = index
@@ -3676,7 +3684,7 @@ mod tests {
         let first = TwoTierIndex::open_with_paths(&paths, config.clone())
             .expect("build custom ANN sidecar");
         assert!(first.has_fast_ann());
-        load_native_ann_sidecar(&fast_ann_path, &first.fast_index);
+        load_native_ann_sidecar(&fast_ann_path, first.fast_tier());
         drop(first);
 
         let lock_path =
@@ -3724,13 +3732,13 @@ mod tests {
         let first = TwoTierIndex::open_with_paths(&paths, config.clone())
             .expect("build ANN below a newly created custom parent");
         assert!(first.has_fast_ann());
-        load_native_ann_sidecar(&fast_ann_path, &first.fast_index);
+        load_native_ann_sidecar(&fast_ann_path, first.fast_tier());
         drop(first);
 
         let reopened =
             TwoTierIndex::open_with_paths(&paths, config).expect("native custom ANN reopen");
         assert!(reopened.has_fast_ann());
-        load_native_ann_sidecar(&fast_ann_path, &reopened.fast_index);
+        load_native_ann_sidecar(&fast_ann_path, reopened.fast_tier());
         assert!(!dir.join(VECTOR_ANN_FAST_FILENAME).exists());
     }
 
@@ -3763,10 +3771,10 @@ mod tests {
             .expect("build both custom ANN tiers");
         assert!(first.has_fast_ann());
         assert!(first.has_quality_ann());
-        load_native_ann_sidecar(&fast_ann_path, &first.fast_index);
+        load_native_ann_sidecar(&fast_ann_path, first.fast_tier());
         load_native_ann_sidecar(
             &quality_ann_path,
-            first.quality_index.as_ref().expect("quality index"),
+            first.quality_tier().expect("quality index"),
         );
         let fast_metadata = fs::read(&fast_ann_path).expect("read fast ANN metadata");
         let quality_metadata = fs::read(&quality_ann_path).expect("read quality ANN metadata");
@@ -3776,10 +3784,10 @@ mod tests {
             TwoTierIndex::open_with_paths(&paths, config).expect("reopen both custom ANN tiers");
         assert!(reopened.has_fast_ann());
         assert!(reopened.has_quality_ann());
-        load_native_ann_sidecar(&fast_ann_path, &reopened.fast_index);
+        load_native_ann_sidecar(&fast_ann_path, reopened.fast_tier());
         load_native_ann_sidecar(
             &quality_ann_path,
-            reopened.quality_index.as_ref().expect("quality index"),
+            reopened.quality_tier().expect("quality index"),
         );
         assert_eq!(
             fs::read(&fast_ann_path).expect("reread fast ANN metadata"),
@@ -3823,7 +3831,7 @@ mod tests {
         assert!(first.has_quality_ann());
         load_native_ann_sidecar(
             &quality_ann_path,
-            first.quality_index.as_ref().expect("quality index"),
+            first.quality_tier().expect("quality index"),
         );
         drop(first);
 
@@ -3833,7 +3841,7 @@ mod tests {
         assert!(reopened.has_quality_ann());
         load_native_ann_sidecar(
             &quality_ann_path,
-            reopened.quality_index.as_ref().expect("quality index"),
+            reopened.quality_tier().expect("quality index"),
         );
         assert!(!dir.join("index-fnv1a-4.hnsw").exists());
         assert!(!dir.join(VECTOR_ANN_FAST_FILENAME).exists());
@@ -4524,7 +4532,7 @@ mod tests {
         assert!(first_open.has_fast_ann());
 
         let ann_path = dir.join(VECTOR_ANN_FAST_FILENAME);
-        let before = load_native_ann_sidecar(&ann_path, &first_open.fast_index);
+        let before = load_native_ann_sidecar(&ann_path, first_open.fast_tier());
         let before_config = before.config();
         assert_eq!(before_config.m, 8);
         assert_eq!(before_config.ef_construction, 64);
@@ -4540,7 +4548,7 @@ mod tests {
         let second_open = TwoTierIndex::open(&dir, updated).expect("open with updated ann config");
         assert!(second_open.has_fast_ann());
 
-        let after = load_native_ann_sidecar(&ann_path, &second_open.fast_index);
+        let after = load_native_ann_sidecar(&ann_path, second_open.fast_tier());
         let after_config = after.config();
         assert_eq!(after_config.m, 24);
         assert_eq!(after_config.ef_construction, 96);
@@ -4582,7 +4590,7 @@ mod tests {
         let reopened = TwoTierIndex::open(&dir, config).expect("reopen");
         assert!(reopened.has_fast_ann());
         let ann_path = dir.join(VECTOR_ANN_FAST_FILENAME);
-        load_native_ann_sidecar(&ann_path, &reopened.fast_index);
+        load_native_ann_sidecar(&ann_path, reopened.fast_tier());
         let after = reopened
             .search_fast(&[1.0, 0.0, 0.0], 1)
             .expect("search after");
@@ -4626,13 +4634,13 @@ mod tests {
         )
         .expect("write legacy metadata");
 
-        let (_, disposition) = HnswIndex::load_with_disposition(&ann_path, &initial.fast_index)
+        let (_, disposition) = HnswIndex::load_with_disposition(&ann_path, initial.fast_tier())
             .expect("legacy fallback rebuild");
         assert_eq!(disposition, HnswLoadDisposition::Rebuilt);
 
         let reopened = TwoTierIndex::open(&dir, config).expect("self-heal legacy ANN sidecar");
         assert!(reopened.has_fast_ann());
-        load_native_ann_sidecar(&ann_path, &reopened.fast_index);
+        load_native_ann_sidecar(&ann_path, reopened.fast_tier());
     }
 
     #[cfg(feature = "ann")]
@@ -4667,13 +4675,13 @@ mod tests {
         )
         .expect("write degraded metadata");
 
-        let (_, disposition) = HnswIndex::load_with_disposition(&ann_path, &initial.fast_index)
+        let (_, disposition) = HnswIndex::load_with_disposition(&ann_path, initial.fast_tier())
             .expect("degraded fallback rebuild");
         assert_eq!(disposition, HnswLoadDisposition::Rebuilt);
 
         let reopened = TwoTierIndex::open(&dir, config).expect("self-heal degraded ANN sidecar");
         assert!(reopened.has_fast_ann());
-        load_native_ann_sidecar(&ann_path, &reopened.fast_index);
+        load_native_ann_sidecar(&ann_path, reopened.fast_tier());
         let repaired: serde_json::Value =
             serde_json::from_slice(&fs::read(&ann_path).expect("read repaired metadata"))
                 .expect("parse repaired metadata");
@@ -4729,7 +4737,7 @@ mod tests {
         .expect("write legacy metadata");
 
         let rebuilt = maybe_load_or_build_ann_with_save(
-            &initial.fast_index,
+            initial.fast_tier(),
             &ann_path,
             1,
             &config,
@@ -4742,7 +4750,7 @@ mod tests {
         // The injected failure left legacy metadata installed, proving the
         // error occurred after a successful rebuild rather than after a native
         // reload. That means the next startup will retry the repair.
-        let (_, disposition) = HnswIndex::load_with_disposition(&ann_path, &initial.fast_index)
+        let (_, disposition) = HnswIndex::load_with_disposition(&ann_path, initial.fast_tier())
             .expect("legacy sidecar still rebuilds after failed persistence");
         assert_eq!(disposition, HnswLoadDisposition::Rebuilt);
 
@@ -4781,6 +4789,10 @@ mod tests {
             .soft_delete("doc-b")
             .expect("soft delete should succeed");
         assert!(deleted);
+        // Release the writable mapping before reopening: since bd-x06p5 the
+        // two-tier open acquires a SHARED READER lock on the same FSVI, which
+        // a live writer handle would block.
+        drop(fast_index);
 
         let config = TwoTierConfig {
             hnsw_threshold: 1,
@@ -4824,6 +4836,9 @@ mod tests {
         // VectorIndex positions = {0:doc-a, 1:doc-b(deleted), 2:doc-c, 3:doc-d}
         let mut fast_index = VectorIndex::open(&fast_path).expect("open for delete");
         assert!(fast_index.soft_delete("doc-b").expect("soft_delete"));
+        // See the note in `ann_search_excludes_tombstoned_docs`: the writable
+        // mapping must be released before the two-tier reader lock is taken.
+        drop(fast_index);
 
         let config = TwoTierConfig {
             hnsw_threshold: 1,
