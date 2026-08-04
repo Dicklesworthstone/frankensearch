@@ -577,3 +577,89 @@ mod capability_tests {
         );
     }
 }
+
+/// Real merge/reopen execution for the maintenance laws (`bd-quill-e6-gauntlet-scale-rm3q.3`).
+///
+/// These laws were registered `SkipWithReason(LifecycleCapabilityUnavailable)`
+/// because the E6.3 observation harness controls ingest batching only — there
+/// was no way to make a real merge happen. The capability turns out to exist
+/// already and simply was not reachable from the laws: `apply_tier_policy` runs
+/// inside `QuillIndex::commit` (quill index.rs:6020) and drives
+/// `plan_tier_merge` + `build_concat_merge`, so a low `tier_fanout` plus a
+/// commit per ingest batch produces GENUINE concat-merges.
+///
+/// Nothing here approximates. A flush is not a merge, so the perturbation is
+/// only accepted when the observed sealed-segment count proves segments were
+/// actually combined — see `merge_actually_occurred`.
+#[cfg(all(test, feature = "perf-harness"))]
+pub(crate) mod maintenance_execution {
+    use frankensearch_core::IndexableDocument;
+    use frankensearch_quill::QuillConfig;
+
+    use crate::engine::QuillSubject;
+
+    /// Outcome of driving one ingest schedule to a committed index.
+    pub(crate) struct MaintenanceOutcome {
+        /// Document ids in ranked order for the probe query.
+        pub(crate) ranked_ids: Vec<String>,
+        /// Live document count of the committed snapshot.
+        pub(crate) doc_count: u64,
+        /// Segment count observed after each commit. A merge shows up as a
+        /// count that does not grow monotonically with commits.
+        pub(crate) sealed_after_each_commit: Vec<usize>,
+    }
+
+    /// Ingest `documents` in `batch_size` chunks, committing after each chunk,
+    /// then run `query`.
+    ///
+    /// Committing per chunk is what makes this a maintenance perturbation
+    /// rather than a batching one: each commit seals a segment, and once the
+    /// sealed count exceeds `tier_fanout` the tier policy performs a real
+    /// concat-merge inside that commit.
+    pub(crate) async fn ingest_and_probe(
+        cx: &asupersync::Cx,
+        config: QuillConfig,
+        documents: &[IndexableDocument],
+        batch_size: usize,
+        query: &str,
+    ) -> MaintenanceOutcome {
+        assert!(batch_size > 0, "ingest batch size must be non-zero");
+        let mut subject = QuillSubject::in_memory(config).expect("in-memory Quill subject");
+        subject
+            .claim_fresh_campaign()
+            .expect("claim maintenance campaign");
+        let mut sealed_after_each_commit = Vec::new();
+        for batch in documents.chunks(batch_size) {
+            let index = subject.index_mut().expect("open maintenance campaign");
+            index
+                .index_documents(cx, batch)
+                .await
+                .expect("index maintenance batch");
+            // Commit per batch is THE SEAM: apply_tier_policy runs inside
+            // commit (quill index.rs:6020) and performs a real concat-merge
+            // once the sealed count exceeds tier_fanout. The returned snapshot
+            // is the merge witness -- proof rather than assumption.
+            let snapshot = index.commit(cx).await.expect("commit maintenance batch");
+            sealed_after_each_commit.push(snapshot.segments().len());
+        }
+        let result = subject
+            .index_mut()
+            .expect("open maintenance campaign")
+            .search_paginated(cx, query, 32, 0, true)
+            .expect("probe the maintained index");
+        let ranked_ids = result
+            .hits
+            .iter()
+            .map(|hit| hit.document_id.clone())
+            .collect::<Vec<_>>();
+        let doc_count = result.doc_count;
+        subject
+            .mark_committed()
+            .expect("publish maintenance campaign");
+        MaintenanceOutcome {
+            ranked_ids,
+            doc_count,
+            sealed_after_each_commit,
+        }
+    }
+}
