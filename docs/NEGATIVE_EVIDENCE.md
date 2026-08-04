@@ -18404,3 +18404,64 @@ worker-census receipts. Do not promote a partial slice, weaken the
 null-center law, or gate on CV.
 
 Verdict: HOLD — classification only (bd-g2pxg, for the bd-z4lqq fail-closed verdict rule); nothing above is altered. The row advances no result in either direction, as its own heading says: widths 2, 4, 16, 32, and 128 fail the corrected null gate because their Tantivy null medians drift outside 2% of 1, and a later receipt-integrity audit invalidated every CPU-derived activity field. The widths that do pass the null gate are recorded above but are not advanced as a claim here, so this row is a quarantined no-claim sweep rather than a verdict on a lever.
+
+### 2026-08-04 — REJECT: Quill STOREDMETA seal-path double-copy is real but not decidable — removing one 7.5 MB memcpy per seal is invisible (`bd-4xr99`, GreenCat)
+
+A stored byte was copied twice per fresh seal: once in
+`StoredFieldColumns::append_document`, where borrowed caller input becomes bytes
+that outlive the caller, and again in the STOREDMETA encoder, which concatenated
+every field blob into a section-sized `Vec<u8>` that the segment writer then
+copied into the durable buffer. Only the first copy is forced (`bd-iic6u`). The
+sibling Delta path never had this shape, so this looked like a sibling-path
+asymmetry worth closing.
+
+It was closed, measured, and reverted. `SectionInput` gained an ordered
+`runs: &[&[u8]]` payload so the seal could hand the writer the accumulator's
+borrowed blobs directly; `encode_canonical_segment` took `Option<&[&[u8]]>`; the
+fresh-seal path passed `BorrowedStoredMetaSection::runs()`, which collects slice
+pointers and copies no payload. That removed the intermediate copy entirely.
+
+MEASURED on the exact operation the change alters — STOREDMETA emission,
+materialize-then-copy versus borrowed runs written straight into the buffer —
+one maximum lease of 65,535 documents carrying 7,536,525 stored blob bytes
+(section 8,888,255 bytes). Shared alternating-round `paired_median_ratio` with a
+same-invocation A/A null control, 81 rounds, `taskset`-pinned, governor
+`performance`, on `thinkstation1`. Ratios are candidate/original, `< 1` favors
+the candidate:
+
+| core | A/A null median [ci95], same invocation | half-width | new/old median [ci95] | verdict |
+|---:|---:|---:|---:|---|
+| 5 | 0.998078 [0.975359, 1.025351] | 2.535% | 1.009055 [0.989676, 1.026897] | INSIDE NULL FLOOR |
+| 19 | 0.998612 [0.981719, 1.012933] | 1.828% | 0.998735 [0.991255, 1.013776] | INSIDE NULL FLOOR |
+
+Both A/A nulls are admissible under the corrected `bd-pjh09` rule. Neither
+candidate median clears its own null floor, and the two pinned cores disagree on
+the sign — 1.0091 on core 5, 0.9987 on core 19. Absolute emission cost was 1.4527
+ms versus 1.4319 ms on core 5 and 1.3246 ms versus 1.3491 ms on core 19, i.e. a
+difference of ±0.02 ms on a ~1.4 ms step. Emission is itself a small share of a
+full lease seal, so the whole-seal effect is smaller still. Removing a 7.5 MB
+memcpy is simply not visible against this path's other costs.
+
+Comparison class: SELF-SPEEDUP, so this is maintenance and never a campaign
+number. The live-incumbent QG-2 run at 200k documents was NOT performed and is
+moot for the decision — a lever that cannot clear its own A/A null in isolation
+cannot support a vs-incumbent claim. For the record it is also blocked on this
+host on two registered preconditions, both checked against
+`scripts/perf-runner.sh` rather than assumed: `k10temp` exposes zero
+`temp*_max`/`temp*_crit` attributes while the promotion producer hard-requires an
+observable thermal limit, and the host is a Threadripper PRO 5975WX with 32
+physical cores where the registered `trj-zen3-5995wx` + `physical-64` profile
+expects 64.
+
+Byte-identity was never in doubt and is recorded so a retry need not redo it: the
+same three-document seal produced the same 1590-byte FSLX file, FNV-1a
+`399eb3e8b79a820d`, `file_xxh3` `85b01e35d4cb9d3b`, at `699e269b` (before any
+work), at `d558b90b`, and with the change applied; `fslx-v1-golden.hex` never
+moved.
+
+Decision: REJECT and revert. `SectionInput::runs`/`from_runs` and the
+`Option<&[&[u8]]>` parameter are gone. `BorrowedStoredMetaSection` predates this
+lever, is byte-identical, and was left in place. Retry only with a fixture whose
+stored-byte volume is a materially larger share of seal cost than 7.5 MB per
+65,535-document lease, or once seal cost elsewhere has dropped far enough for a
+~1 ms step to matter.
