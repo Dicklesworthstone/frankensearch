@@ -24,7 +24,7 @@
 use std::hint::black_box;
 
 use frankensearch_core::bench_support::{PairedRatio, paired_median_ratio};
-use frankensearch_core::traits::LexicalSearch;
+use frankensearch_core::traits::{LexicalRead, LexicalWrite};
 use frankensearch_core::types::{IndexableDocument, ScoredResult};
 use frankensearch_lexical::TantivyIndex;
 use tantivy::collector::TopDocs;
@@ -258,13 +258,16 @@ fn deferred_winners(
     k: usize,
 ) -> Vec<ScoredResult> {
     runtime.block_on(async {
-        let mut results = index
-            .search_fusion_candidates(cx, "search engine", k)
+        let batch = index
+            .search_candidates(cx, "search engine", k)
             .await
             .expect("candidates");
+        let (mut results, pin) = batch.into_parts();
         results.truncate(WINNERS);
+        // Hydrate through the batch's own pin, which is what the deferred arm
+        // now measures: scoring and hydration share one searcher.
         index
-            .hydrate_fusion_metadata(cx, &mut results)
+            .hydrate_candidates(cx, pin.as_ref(), &mut results)
             .await
             .expect("hydrate");
         results
@@ -279,9 +282,11 @@ fn hydration_candidates(
 ) -> Vec<ScoredResult> {
     runtime.block_on(async {
         index
-            .search_fusion_candidates(cx, "search engine", winners)
+            .search_candidates(cx, "search engine", winners)
             .await
             .expect("hydration candidates")
+            .into_parts()
+            .0
     })
 }
 
@@ -355,7 +360,7 @@ fn run_product_gate() {
         let mut unscored = seed.clone();
         runtime.block_on(async {
             index
-                .hydrate_fusion_metadata(&cx, &mut unscored)
+                .hydrate_fusion_metadata_unscored_for_bench(&cx, &mut unscored)
                 .await
                 .expect("unscored hydration parity");
         });
@@ -410,7 +415,7 @@ fn run_product_gate() {
             || {
                 runtime.block_on(async {
                     index
-                        .hydrate_fusion_metadata(&cx, &mut candidate)
+                        .hydrate_fusion_metadata_unscored_for_bench(&cx, &mut candidate)
                         .await
                         .expect("unscored hydration");
                 });

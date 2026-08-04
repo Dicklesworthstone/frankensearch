@@ -55,9 +55,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use asupersync::Cx;
 use asupersync::sync::Mutex;
 use frankensearch_core::error::{SearchError, SearchResult};
-use frankensearch_core::traits::{
-    LexicalCandidateBatch, LexicalHydrationContext, LexicalSearch, SearchFuture,
-};
+use frankensearch_core::traits::{LexicalCandidateBatch, LexicalHydrationContext, SearchFuture};
 use frankensearch_core::types::{DocId, IndexableDocument, ScoreSource, ScoredResult};
 use serde::{Deserialize, Serialize};
 #[cfg(feature = "bench-internals")]
@@ -1501,7 +1499,8 @@ impl TantivyIndex {
 
     /// Delete a document by its ID.
     ///
-    /// The deletion is staged; call [`commit`](LexicalSearch::commit) to persist.
+    /// The deletion is staged; call
+    /// [`commit`](frankensearch_core::traits::LexicalWrite::commit) to persist.
     ///
     /// # Errors
     ///
@@ -2087,16 +2086,6 @@ impl TantivyIndex {
         Ok(results)
     }
 
-    fn hydrate_fusion_metadata_with_collector(
-        &self,
-        results: &mut [ScoredResult],
-        unscored: bool,
-    ) -> SearchResult<()> {
-        // Unpinned: reads whatever generation is current. Retained for the
-        // combined trait; the split path pins its searcher instead.
-        self.hydrate_with_searcher(&self.reader.searcher(), results, unscored)
-    }
-
     /// Hydrate winners from an explicitly supplied searcher.
     ///
     /// A Tantivy `Searcher` holds a fixed segment set, so passing the *same*
@@ -2181,13 +2170,32 @@ impl TantivyIndex {
         _cx: &'a Cx,
         results: &'a mut [ScoredResult],
     ) -> SearchFuture<'a, ()> {
-        Box::pin(async move { self.hydrate_fusion_metadata_with_collector(results, false) })
+        // The scored-collector baseline deliberately reads the CURRENT
+        // generation, matching what the retired combined-trait path did, so the
+        // A/B keeps comparing collectors rather than pinning strategies.
+        Box::pin(async move { self.hydrate_with_searcher(&self.reader.searcher(), results, false) })
+    }
+
+    /// Unscored-collector arm of the same A/B.
+    ///
+    /// The shipping path reaches this through `hydrate_candidates` with a
+    /// pinned searcher; the benchmark needs it without a batch in hand, and on
+    /// the same current-generation footing as the scored baseline above, so
+    /// the measured difference stays the collector and nothing else.
+    #[cfg(feature = "bench-internals")]
+    #[doc(hidden)]
+    pub fn hydrate_fusion_metadata_unscored_for_bench<'a>(
+        &'a self,
+        _cx: &'a Cx,
+        results: &'a mut [ScoredResult],
+    ) -> SearchFuture<'a, ()> {
+        Box::pin(async move { self.hydrate_with_searcher(&self.reader.searcher(), results, true) })
     }
 }
 
 // ─── LexicalSearch implementation ───────────────────────────────────────────
 
-impl LexicalSearch for TantivyIndex {
+impl frankensearch_core::traits::LexicalRead for TantivyIndex {
     #[instrument(skip_all, fields(query = %query, limit = limit))]
     fn search<'a>(
         &'a self,
@@ -2261,46 +2269,100 @@ impl LexicalSearch for TantivyIndex {
         })
     }
 
-    #[instrument(skip_all, fields(query = %query, limit = limit))]
-    fn search_fusion_candidates<'a>(
+    /// Score candidates and pin the searcher that produced them.
+    ///
+    /// Tantivy's deferred-metadata path skips loading stored fields for the
+    /// whole candidate pool and restores them only for the winners. The batch
+    /// carries the exact [`Searcher`] used for scoring: a Tantivy searcher
+    /// holds a fixed segment set, so it *is* the immutable generation handle
+    /// this bead requires, and hydration through it cannot observe a commit
+    /// that landed after scoring.
+    fn search_candidates<'a>(
         &'a self,
         cx: &'a Cx,
         query: &'a str,
         limit: usize,
-    ) -> SearchFuture<'a, Vec<ScoredResult>> {
+    ) -> SearchFuture<'a, LexicalCandidateBatch> {
         Box::pin(async move {
-            self.search_doc_ids(cx, query, limit).map(|hits| {
-                hits.into_iter()
-                    .map(|hit| ScoredResult {
-                        doc_id: hit.doc_id,
-                        score: hit.bm25_score,
-                        source: ScoreSource::Lexical,
-                        index: None,
-                        fast_score: None,
-                        quality_score: None,
-                        lexical_score: Some(hit.bm25_score),
-                        rerank_score: None,
-                        explanation: None,
-                        metadata: None,
-                    })
-                    .collect()
-            })
+            let truncated = Self::truncate_query(query);
+            // One searcher for scoring AND hydration. Taking a second one at
+            // hydration time is exactly the generation race this pins shut.
+            let searcher = self.reader.searcher();
+            // An empty query or a zero limit still returns a *pinned* batch
+            // rather than an eager one. Keeping the shape uniform means a
+            // `None` context always signals caller misuse, so hydration can
+            // reject it without having to guess whether the batch was legitimately
+            // eager.
+            let hits = if truncated.trim().is_empty() || limit == 0 {
+                Vec::new()
+            } else {
+                let parsed = self.parse_query_lenient(truncated);
+                execute_top_k(&searcher, &*parsed, limit, 0)?
+            };
+            let candidates = self
+                .collect_id_hits(&searcher, hits)?
+                .into_iter()
+                .map(|hit| ScoredResult {
+                    doc_id: hit.doc_id,
+                    score: hit.bm25_score,
+                    source: ScoreSource::Lexical,
+                    index: None,
+                    fast_score: None,
+                    quality_score: None,
+                    lexical_score: Some(hit.bm25_score),
+                    rerank_score: None,
+                    explanation: None,
+                    metadata: None,
+                })
+                .collect();
+            let _ = cx;
+            Ok(LexicalCandidateBatch::deferred(
+                candidates,
+                LexicalHydrationContext::new("tantivy", Box::new(searcher)),
+            ))
         })
     }
 
-    fn fusion_metadata_is_deferred(&self) -> bool {
-        true
-    }
-
-    #[instrument(skip_all, fields(results = results.len()))]
-    fn hydrate_fusion_metadata<'a>(
+    /// Restore winner metadata from the pinned scoring searcher.
+    ///
+    /// Rejects a missing or foreign context with a typed error rather than
+    /// silently reading the current generation.
+    fn hydrate_candidates<'a>(
         &'a self,
         _cx: &'a Cx,
+        context: Option<&'a LexicalHydrationContext>,
         results: &'a mut [ScoredResult],
     ) -> SearchFuture<'a, ()> {
-        Box::pin(async move { self.hydrate_fusion_metadata_with_collector(results, true) })
+        Box::pin(async move {
+            let Some(context) = context else {
+                return Err(SearchError::SubsystemError {
+                    subsystem: "tantivy.hydration",
+                    source: "deferred Tantivy candidates require their batch context; \
+                             none was provided"
+                        .into(),
+                });
+            };
+            let Some(searcher) = context.downcast_ref::<Searcher>() else {
+                return Err(SearchError::SubsystemError {
+                    subsystem: "tantivy.hydration",
+                    source: format!(
+                        "hydration context from backend {:?} is not a Tantivy searcher pin; \
+                         refusing cross-engine hydration",
+                        context.backend()
+                    )
+                    .into(),
+                });
+            };
+            self.hydrate_with_searcher(searcher, results, true)
+        })
     }
 
+    fn doc_count(&self) -> usize {
+        self.doc_count.load(Ordering::Relaxed)
+    }
+}
+
+impl frankensearch_core::traits::LexicalWrite for TantivyIndex {
     fn index_document<'a>(
         &'a self,
         cx: &'a Cx,
@@ -2403,139 +2465,6 @@ impl LexicalSearch for TantivyIndex {
             Ok(())
         })
     }
-
-    fn doc_count(&self) -> usize {
-        self.doc_count.load(Ordering::Relaxed)
-    }
-}
-
-// bd-8nqz.1 slice B: split-trait surface. Delegates to the combined-trait
-// impl above; bodies move here when `LexicalSearch` is removed. Tantivy
-// returns full metadata from `search`, so the default eager
-// `search_candidates` and no-op hydration are exact.
-impl frankensearch_core::traits::LexicalRead for TantivyIndex {
-    fn search<'a>(
-        &'a self,
-        cx: &'a Cx,
-        query: &'a str,
-        limit: usize,
-    ) -> SearchFuture<'a, Vec<ScoredResult>> {
-        LexicalSearch::search(self, cx, query, limit)
-    }
-
-    /// Score candidates and pin the searcher that produced them.
-    ///
-    /// Tantivy's deferred-metadata path skips loading stored fields for the
-    /// whole candidate pool and restores them only for the winners. Before
-    /// this override, `TantivyIndex` implemented only `search` and
-    /// `doc_count`, so it inherited the *eager* default and every hybrid
-    /// consumer paid full metadata materialization at scoring time — the
-    /// deferred path existed on the combined trait but no split consumer
-    /// could reach it.
-    ///
-    /// The batch carries the exact [`Searcher`] used for scoring. A Tantivy
-    /// searcher holds a fixed segment set, so it *is* the immutable
-    /// generation handle this bead requires: hydration through it cannot
-    /// observe a commit that landed after scoring.
-    fn search_candidates<'a>(
-        &'a self,
-        cx: &'a Cx,
-        query: &'a str,
-        limit: usize,
-    ) -> SearchFuture<'a, LexicalCandidateBatch> {
-        Box::pin(async move {
-            let truncated = Self::truncate_query(query);
-            if truncated.trim().is_empty() || limit == 0 {
-                return Ok(LexicalCandidateBatch::eager(Vec::new()));
-            }
-            let parsed = self.parse_query_lenient(truncated);
-            // One searcher for scoring AND hydration. Taking a second one at
-            // hydration time is exactly the generation race this pins shut.
-            let searcher = self.reader.searcher();
-            let hits = execute_top_k(&searcher, &*parsed, limit, 0)?;
-            let candidates = self
-                .collect_id_hits(&searcher, hits)?
-                .into_iter()
-                .map(|hit| ScoredResult {
-                    doc_id: hit.doc_id,
-                    score: hit.bm25_score,
-                    source: ScoreSource::Lexical,
-                    index: None,
-                    fast_score: None,
-                    quality_score: None,
-                    lexical_score: Some(hit.bm25_score),
-                    rerank_score: None,
-                    explanation: None,
-                    metadata: None,
-                })
-                .collect();
-            let _ = cx;
-            Ok(LexicalCandidateBatch::deferred(
-                candidates,
-                LexicalHydrationContext::new("tantivy", Box::new(searcher)),
-            ))
-        })
-    }
-
-    /// Restore winner metadata from the pinned scoring searcher.
-    ///
-    /// Rejects a missing or foreign context with a typed error rather than
-    /// silently reading the current generation.
-    fn hydrate_candidates<'a>(
-        &'a self,
-        _cx: &'a Cx,
-        context: Option<&'a LexicalHydrationContext>,
-        results: &'a mut [ScoredResult],
-    ) -> SearchFuture<'a, ()> {
-        Box::pin(async move {
-            let Some(context) = context else {
-                return Err(SearchError::SubsystemError {
-                    subsystem: "tantivy.hydration",
-                    source: "deferred Tantivy candidates require their batch context; \
-                             none was provided"
-                        .into(),
-                });
-            };
-            let Some(searcher) = context.downcast_ref::<Searcher>() else {
-                return Err(SearchError::SubsystemError {
-                    subsystem: "tantivy.hydration",
-                    source: format!(
-                        "hydration context from backend {:?} is not a Tantivy searcher pin; \
-                         refusing cross-engine hydration",
-                        context.backend()
-                    )
-                    .into(),
-                });
-            };
-            self.hydrate_with_searcher(searcher, results, true)
-        })
-    }
-
-    fn doc_count(&self) -> usize {
-        LexicalSearch::doc_count(self)
-    }
-}
-
-impl frankensearch_core::traits::LexicalWrite for TantivyIndex {
-    fn index_document<'a>(
-        &'a self,
-        cx: &'a Cx,
-        doc: &'a IndexableDocument,
-    ) -> SearchFuture<'a, ()> {
-        LexicalSearch::index_document(self, cx, doc)
-    }
-
-    fn index_documents<'a>(
-        &'a self,
-        cx: &'a Cx,
-        docs: &'a [IndexableDocument],
-    ) -> SearchFuture<'a, ()> {
-        LexicalSearch::index_documents(self, cx, docs)
-    }
-
-    fn commit<'a>(&'a self, cx: &'a Cx) -> SearchFuture<'a, ()> {
-        LexicalSearch::commit(self, cx)
-    }
 }
 
 // ─── Tests ──────────────────────────────────────────────────────────────────
@@ -2543,6 +2472,10 @@ impl frankensearch_core::traits::LexicalWrite for TantivyIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
+    // The split capabilities, so `idx.search(..)` / `idx.doc_count()` resolve
+    // now that the combined trait is gone. B1 deliberately kept these out of
+    // module scope to avoid method ambiguity while both surfaces coexisted.
+    use frankensearch_core::traits::{LexicalRead as _, LexicalWrite};
     use frankensearch_core::types::IndexableDocument;
 
     /// Helper: run async test code with a `Cx`.
@@ -2704,10 +2637,11 @@ mod tests {
         let docstore_hits = idx
             .search_doc_ids_via_docstore(cx, query, limit)
             .expect("docstore ID search");
-        let mut candidates = idx
-            .search_fusion_candidates(cx, query, limit)
+        let candidate_batch = idx
+            .search_candidates(cx, query, limit)
             .await
             .expect("fusion candidate search");
+        let (mut candidates, candidate_pin) = candidate_batch.into_parts();
 
         assert_eq!(
             id_hits, docstore_hits,
@@ -2780,7 +2714,7 @@ mod tests {
             );
         }
 
-        idx.hydrate_fusion_metadata(cx, &mut candidates)
+        idx.hydrate_candidates(cx, candidate_pin.as_ref(), &mut candidates)
             .await
             .expect("hydrate fusion metadata");
         for (rank, (candidate, expected)) in candidates.iter().zip(&full).enumerate() {
@@ -3192,12 +3126,15 @@ mod tests {
             idx.commit(&cx).await.expect("commit");
 
             let full = idx.search(&cx, "Rust", 10).await.expect("full search");
-            let mut candidates = idx
-                .search_fusion_candidates(&cx, "Rust", 10)
+            let batch = idx
+                .search_candidates(&cx, "Rust", 10)
                 .await
                 .expect("fusion candidates");
 
-            assert!(idx.fusion_metadata_is_deferred());
+            // `is_deferred` is the split-trait replacement for the retired
+            // `fusion_metadata_is_deferred` capability flag.
+            assert!(batch.is_deferred());
+            let (mut candidates, pin) = batch.into_parts();
             assert_eq!(candidates.len(), full.len());
             assert!(candidates.iter().all(|result| result.metadata.is_none()));
             for (candidate, expected) in candidates.iter().zip(&full) {
@@ -3209,7 +3146,7 @@ mod tests {
                 );
             }
 
-            idx.hydrate_fusion_metadata(&cx, &mut candidates)
+            idx.hydrate_candidates(&cx, pin.as_ref(), &mut candidates)
                 .await
                 .expect("hydrate winners");
             for (candidate, expected) in candidates.iter().zip(&full) {
@@ -3893,9 +3830,11 @@ mod tests {
                 .search_doc_ids(&cx, QUERY, LIMIT)
                 .expect("count-free ID search");
             let candidates = idx
-                .search_fusion_candidates(&cx, QUERY, LIMIT)
+                .search_candidates(&cx, QUERY, LIMIT)
                 .await
-                .expect("fusion candidates");
+                .expect("fusion candidates")
+                .into_parts()
+                .0;
             assert_eq!(
                 collector_invocations(),
                 (0, 2),
@@ -4230,10 +4169,10 @@ mod tests {
 
             let v1 =
                 IndexableDocument::new("doc-a", "alpha pinned content").with_metadata("rev", "v1");
-            LexicalSearch::index_document(&idx, &cx, &v1)
+            LexicalWrite::index_document(&idx, &cx, &v1)
                 .await
                 .expect("index N");
-            LexicalSearch::commit(&idx, &cx).await.expect("publish N");
+            LexicalWrite::commit(&idx, &cx).await.expect("publish N");
 
             // Score on N. Candidates defer metadata and carry the searcher pin.
             let batch = LexicalRead::search_candidates(&idx, &cx, "pinned", 10)
@@ -4252,10 +4191,10 @@ mod tests {
             // Publish N+1 with different metadata for the same document.
             let v2 =
                 IndexableDocument::new("doc-a", "alpha pinned content").with_metadata("rev", "v2");
-            LexicalSearch::index_document(&idx, &cx, &v2)
+            LexicalWrite::index_document(&idx, &cx, &v2)
                 .await
                 .expect("upsert N+1");
-            LexicalSearch::commit(&idx, &cx).await.expect("publish N+1");
+            LexicalWrite::commit(&idx, &cx).await.expect("publish N+1");
 
             let rev_of = |result: &ScoredResult| -> Option<String> {
                 result.metadata.as_ref().and_then(|metadata| {
@@ -4295,10 +4234,10 @@ mod tests {
             let dir = tempfile::tempdir().expect("tempdir");
             let idx = TantivyIndex::create(dir.path()).expect("create");
             let doc = IndexableDocument::new("doc-a", "alpha").with_metadata("rev", "v1");
-            LexicalSearch::index_document(&idx, &cx, &doc)
+            LexicalWrite::index_document(&idx, &cx, &doc)
                 .await
                 .expect("index");
-            LexicalSearch::commit(&idx, &cx).await.expect("commit");
+            LexicalWrite::commit(&idx, &cx).await.expect("commit");
 
             let mut winners = vec![ScoredResult {
                 doc_id: DocId::from("doc-a"),

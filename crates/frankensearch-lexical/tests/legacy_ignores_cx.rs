@@ -16,7 +16,8 @@
 //! control to document the new behavior. Do not "fix" the adapter back.
 
 use asupersync::Cx;
-use frankensearch_core::{IndexableDocument, LexicalSearch};
+use frankensearch_core::IndexableDocument;
+use frankensearch_core::traits::{LexicalRead, LexicalWrite};
 use frankensearch_lexical::TantivyIndex;
 
 const QUERY: &str = "alpha";
@@ -46,7 +47,7 @@ fn tantivy_query_boundaries_ignore_a_cancelled_cx() {
         let index = fixture_index(&cx).await;
 
         // Noncancelled control.
-        let control = LexicalSearch::search(&index, &cx, QUERY, LIMIT)
+        let control = LexicalRead::search(&index, &cx, QUERY, LIMIT)
             .await
             .expect("control search");
         assert_eq!(control.len(), 3, "control must match all three documents");
@@ -62,7 +63,7 @@ fn tantivy_query_boundaries_ignore_a_cancelled_cx() {
         // recorded LegacyIgnoresCx divergence, not an endorsement.
         cx.set_cancel_requested(true);
 
-        let cancelled_search = LexicalSearch::search(&index, &cx, QUERY, LIMIT)
+        let cancelled_search = LexicalRead::search(&index, &cx, QUERY, LIMIT)
             .await
             .expect("legacy adapter ignores cancellation on trait search");
         assert_eq!(cancelled_search.len(), control.len());
@@ -71,12 +72,13 @@ fn tantivy_query_boundaries_ignore_a_cancelled_cx() {
             assert_eq!(cancelled.score.to_bits(), control.score.to_bits());
         }
 
-        let mut candidates = LexicalSearch::search_fusion_candidates(&index, &cx, QUERY, LIMIT)
+        let batch = LexicalRead::search_candidates(&index, &cx, QUERY, LIMIT)
             .await
             .expect("legacy adapter ignores cancellation on fusion candidates");
+        let (mut candidates, pin) = batch.into_parts();
         assert_eq!(candidates.len(), control.len());
 
-        LexicalSearch::hydrate_fusion_metadata(&index, &cx, &mut candidates)
+        LexicalRead::hydrate_candidates(&index, &cx, pin.as_ref(), &mut candidates)
             .await
             .expect("legacy adapter ignores cancellation on hydration");
         let annotated = serde_json::json!({ "lang": "rust" });
