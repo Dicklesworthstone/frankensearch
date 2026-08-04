@@ -690,12 +690,29 @@ mod merge_execution_tests {
         }
     }
 
-    /// e6.3-merge-schedule-v1 EXECUTED AGAINST REAL MERGES.
+    /// e6.3-merge-schedule-v1 against real merges.
     ///
-    /// The unperturbed arm ingests the whole corpus in one batch and commits
-    /// once. The perturbed arm commits per batch under `tier_fanout: 2`, which
-    /// drives `apply_tier_policy` into genuine `concat_merge` calls. Merging is
-    /// a maintenance decision, so the observation must be unchanged.
+    /// IGNORED, and deliberately not deleted or weakened. `tier_fanout: 2` plus
+    /// a commit per batch does NOT by itself produce a merge in this harness:
+    /// the run above observed six commits leaving six segments
+    /// (`[1, 2, 3, 4, 5, 6]`). `plan_tier_merge` (keeper.rs:1459) requires more
+    /// than a segment count — every segment in a `fanout`-wide window must
+    /// classify to the SAME tier width via `classify_width(docid_hi - docid_lo)`,
+    /// and the window must pass a `max_hole_ratio` check. A one-document-per-
+    /// commit corpus does not satisfy that.
+    ///
+    /// The non-degeneracy guard below is what caught this. Without it the test
+    /// would PASS — the two arms agree trivially when nothing is merged — and
+    /// this law would have been reported as executed against real merges while
+    /// exercising none. That is precisely the vacuous-pass the bead's
+    /// "do not label a transform semantics-preserving merely because it is
+    /// convenient" instruction exists to prevent, so the guard stays and the
+    /// test stays ignored until the corpus provably drives a merge.
+    ///
+    /// To un-ignore: build a corpus whose committed segments land in one tier
+    /// width with an acceptable hole ratio, confirm `sealed_after_each_commit`
+    /// is non-monotonic, then remove `#[ignore]`. Do NOT remove the guard.
+    #[ignore = "tier_fanout alone does not trigger a merge; see doc comment (bd-quill-e6-gauntlet-scale-rm3q.3)"]
     #[test]
     fn merge_schedule_law_holds_against_real_concat_merges() {
         let documents = corpus();
