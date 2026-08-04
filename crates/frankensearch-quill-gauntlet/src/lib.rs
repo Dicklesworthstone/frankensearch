@@ -26,9 +26,10 @@ mod machine_class_registry;
 mod metamorphic_maintenance_laws;
 #[cfg(test)]
 mod metamorphic_maintenance_schedules;
-/// bd-8nqz.4.1: the native enriched Quill/Tantivy witness. Layered OVER Core
-/// Lexical V3 (`campaign_contract`) and separately versioned; that contract is
-/// deliberately untouched by this module.
+/// The native enriched Quill/Tantivy witness (bd-8nqz.4.1).
+///
+/// Layered OVER Core Lexical V3 (`campaign_contract`) and separately
+/// versioned; that contract is deliberately untouched by this module.
 pub mod native_enriched_witness;
 mod perf;
 mod perf_assembly;
