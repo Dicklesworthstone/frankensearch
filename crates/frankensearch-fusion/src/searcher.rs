@@ -38,8 +38,8 @@ use frankensearch_core::traits::{
     Embedder, LexicalHydrationContext, LexicalRead, ModelCategory, Reranker,
 };
 use frankensearch_core::types::{
-    EmbeddingMetrics, PhaseMetrics, ScoreSource, ScoredResult, SearchMetrics, SearchMode,
-    SearchPhase, VectorHit,
+    BoundQueryEmbedding, EmbeddingMetrics, PhaseMetrics, ScoreSource, ScoredResult, SearchMetrics,
+    SearchMode, SearchPhase, TieredQueryEmbeddings, VectorHit,
 };
 use frankensearch_core::{
     EmbedderTier, EmbeddingCollectorSample, EmbeddingStage, EmbeddingStatus, LifecycleSeverity,
@@ -52,8 +52,8 @@ use frankensearch_index::{FsviV2IdentityBinding, SearchParams, TwoTierIndex};
 
 use crate::adaptive::{AdaptiveFusion, SignalSource};
 use crate::blend::{
-    blend_two_tier_aligned_vector_index, build_borrowed_rank_map, compute_rank_changes_with_maps,
-    kendall_tau_with_refined_rank,
+    blend_two_tier, blend_two_tier_aligned_vector_index, build_borrowed_rank_map,
+    compute_rank_changes_with_maps, kendall_tau_with_refined_rank,
 };
 use crate::calibration::CalibratorConfig;
 use crate::circuit_breaker::{CircuitBreaker, QualityOutcome};
@@ -271,6 +271,22 @@ struct RefinementPools {
     /// Lexical pool after exclusion filtering. `None` when no lexical
     /// subsystem is configured; `Some` (possibly empty) when one answered.
     lexical: Option<Vec<ScoredResult>>,
+}
+
+/// What the quality tier contributed to a refinement (bd-ctzo C2).
+///
+/// The two variants are not two encodings of one thing — they answer
+/// different questions. `Retrieved` is the quality tier's OWN top-k, which can
+/// name documents the fast tier never selected. `RescoredFastPool` can only
+/// ever re-rank documents the fast tier already chose, so a relevant document
+/// outside the fast pool is invisible to it. The second remains the path for
+/// legacy artifacts, where there is no admitted quality owner to retrieve
+/// from.
+enum QualityPool {
+    /// The quality owner's own top-k for this query.
+    Retrieved(Vec<VectorHit>),
+    /// Quality scores aligned positionally to the fast pool.
+    RescoredFastPool(Vec<Option<f32>>),
 }
 
 /// Phase-1 fused results plus the refinement pools when refinement is
@@ -1093,6 +1109,7 @@ impl TwoTierSearcher {
                 &initial_hits,
                 refinement_pools.as_ref(),
                 &text_fn,
+                admission,
                 &mut metrics,
                 telemetry_root_request_id.as_deref(),
                 telemetry_initial_event_id.clone(),
@@ -1919,6 +1936,7 @@ impl TwoTierSearcher {
         initial_results: &[ScoredResult],
         pools: Option<&RefinementPools>,
         _text_fn: &(dyn Fn(&str) -> Option<String> + Send + Sync),
+        admission: SemanticAdmission,
         metrics: &mut TwoTierMetrics,
         root_request_id: Option<&str>,
         parent_event_id: Option<String>,
@@ -2039,37 +2057,138 @@ impl TwoTierSearcher {
         // power for non-idempotent calibrators (TemperatureScaling, PlattScaling,
         // IsotonicRegression).
 
-        let mut quality_scores = self
-            .index
-            .quality_scores_for_hits(&quality_vec, &fast_hits)?;
+        // bd-ctzo C2: RETRIEVE from the quality tier, do not rescore the fast
+        // pool.
+        //
+        // `quality_scores_for_hits(&quality_vec, &fast_hits)` scores exactly
+        // the documents the FAST tier already selected. Its own comment above
+        // claims quality "can promote candidates that never reached the
+        // Initial top-k", and within the retained pool that is true — but a
+        // document the fast tier ranked below `k * candidate_multiplier`, or
+        // does not contain at all, is unreachable no matter what the quality
+        // tier thinks of it. That is the anti-pattern C2 forbids, and it was
+        // the production path.
+        //
+        // When the quality tier is an admitted owner, the query is instead
+        // embedded, bound, and used to search the quality owner directly; the
+        // two pools are then unioned by canonical doc_id in the blend. The
+        // fast pool is NOT re-retrieved through the activation: phase 1's pool
+        // already went through ANN candidate retrieval, score calibration,
+        // negation filtering and the dense-score corrections, and
+        // `ActivatedTierSearch::search_fast` reproduces none of that. Union
+        // here therefore means "phase 1's real fast pool ∪ the quality owner's
+        // own top-k", which is strictly more than either arm alone.
+        let quality_budget = fast_hits.len().max(k);
+        let quality_pool = match admission {
+            SemanticAdmission::OwnerBacked { quality: true } => {
+                // The PRF-expanded vector stays inside this space by
+                // construction: it is a convex mix of this query and vectors
+                // read out of this very index, so binding it to the quality
+                // embedder's identity states exactly what is true of it.
+                let bound = BoundQueryEmbedding::new(
+                    quality_vec.clone(),
+                    quality_embedder.identity()?.clone(),
+                )?;
+                let embeddings = TieredQueryEmbeddings::quality_only(bound);
+                let activated = self.index.activate_owner_backed_search(&embeddings)?;
+                QualityPool::Retrieved(activated.search_quality(quality_budget)?)
+            }
+            SemanticAdmission::OwnerBacked { quality: false }
+            | SemanticAdmission::LegacyUnidentified => QualityPool::RescoredFastPool(
+                self.index
+                    .quality_scores_for_hits(&quality_vec, &fast_hits)?,
+            ),
+        };
         metrics.quality_search_ms = search_start.elapsed().as_secs_f64() * 1000.0;
 
-        // Calibrate the quality scores in aligned form. The quality tier is a
-        // re-scored subset of `fast_hits` (same doc_ids/index) and calibration is
-        // a pure per-element score transform, so we calibrate the aligned
-        // `Vec<Option<f32>>` directly instead of materializing a `Vec<VectorHit>`
-        // that clones one `String` doc_id per quality hit — those doc_ids are only
-        // ever read as `&str` (by the blend and the `quality_scores_by_doc` map).
-        // Docs with `None` are left out so the blend uses their fast-only score
-        // without penalty. Reuse the owned aligned vector returned by the index:
-        // the previous collect allocated and copied every slot immediately after
-        // receiving ownership. The default no-calibrator path now skips the pass
-        // entirely; configured calibrators still visit each present score in the
-        // same order and apply the identical scalar transform.
+        // Calibration is a pure per-element score transform, so it is applied
+        // in whichever shape the pool arrived in — never by converting between
+        // them.
+        //
+        // On the rescored path that shape is the aligned `Vec<Option<f32>>`
+        // the index returned: the quality tier there IS a re-scored subset of
+        // `fast_hits` (same doc_ids, same indices), so materializing a
+        // `Vec<VectorHit>` would clone one `String` doc_id per hit for values
+        // that are only ever read as `&str`. Docs left `None` blend at their
+        // fast-only score without penalty.
+        //
+        // On the retrieved path the pool is the quality owner's own hits and
+        // carries doc_ids the fast pool may not have at all, so there is
+        // nothing to align to and each hit's score is transformed in place.
+        //
+        // The default no-calibrator path skips both entirely.
+        let mut quality_pool = quality_pool;
         if self.score_calibrator.is_some() {
-            for score in quality_scores.iter_mut().flatten() {
-                *score = self.calibrate_score(*score);
+            match &mut quality_pool {
+                QualityPool::RescoredFastPool(scores) => {
+                    for score in scores.iter_mut().flatten() {
+                        *score = self.calibrate_score(*score);
+                    }
+                }
+                QualityPool::Retrieved(hits) => {
+                    for hit in hits.iter_mut() {
+                        hit.score = self.calibrate_score(hit.score);
+                    }
+                }
             }
         }
-        let quality_count = quality_scores.iter().filter(|s| s.is_some()).count();
-        metrics.incomplete_embeddings = fast_hits.len() - quality_count;
-        metrics.phase2_vectors_searched = quality_count;
+        let quality_pool = quality_pool;
+
+        // Quality evidence, keyed by canonical document identity so the two
+        // pools can disagree about which documents exist at all.
+        let quality_scores_by_doc: AHashMap<&str, f32> = match &quality_pool {
+            QualityPool::RescoredFastPool(scores) => fast_hits
+                .iter()
+                .zip(scores.iter())
+                .filter_map(|(hit, score)| score.map(|s| (hit.doc_id.as_str(), s)))
+                .collect(),
+            QualityPool::Retrieved(hits) => hits
+                .iter()
+                .map(|hit| (hit.doc_id.as_str(), hit.score))
+                .collect(),
+        };
+        // "Incomplete" means a fast candidate the quality tier had nothing to
+        // say about — under retrieval that is a fast document the quality
+        // top-k did not reach, which is a real and different fact from "the
+        // quality tier has no vector for it".
+        metrics.incomplete_embeddings = fast_hits
+            .iter()
+            .filter(|hit| !quality_scores_by_doc.contains_key(hit.doc_id.as_str()))
+            .count();
+        metrics.phase2_vectors_searched = quality_scores_by_doc.len();
 
         // Blend fast + quality scores.
         let blend_start = Instant::now();
         let blend_factor = self.effective_blend_factor(query_class);
-        let blended =
-            blend_two_tier_aligned_vector_index(&fast_hits, &quality_scores, blend_factor);
+        let blended = match &quality_pool {
+            QualityPool::RescoredFastPool(scores) => {
+                blend_two_tier_aligned_vector_index(&fast_hits, scores, blend_factor)
+            }
+            // The union blend: a document in both tiers blends, a fast-only
+            // document keeps its fast score, and a QUALITY-ONLY document keeps
+            // its quality score instead of being dropped. That last case is
+            // the whole behaviour change — it is the document the rescoring
+            // path could never return.
+            QualityPool::Retrieved(hits) => {
+                let mut blended = blend_two_tier(&fast_hits, hits, blend_factor);
+                let fast_indices: AHashMap<&str, u32> = fast_hits
+                    .iter()
+                    .map(|hit| (hit.doc_id.as_str(), hit.index))
+                    .collect();
+                // `VectorHit::index` is a FAST-tier row ordinal everywhere
+                // downstream (the hubness table is indexed by it). A
+                // quality-only document has no fast row, so it carries the
+                // established "no index" sentinel rather than a quality row
+                // ordinal that would silently read as a fast one.
+                for hit in &mut blended {
+                    hit.index = fast_indices
+                        .get(hit.doc_id.as_str())
+                        .copied()
+                        .unwrap_or(u32::MAX);
+                }
+                blended
+            }
+        };
         metrics.blend_ms = blend_start.elapsed().as_secs_f64() * 1000.0;
 
         // Compute rank changes (initial vs refined).
@@ -2098,11 +2217,6 @@ impl TwoTierSearcher {
         let fast_scores_by_doc: AHashMap<&str, f32> = fast_hits
             .iter()
             .map(|hit| (hit.doc_id.as_str(), hit.score))
-            .collect();
-        let quality_scores_by_doc: AHashMap<&str, f32> = fast_hits
-            .iter()
-            .zip(quality_scores.iter())
-            .filter_map(|(hit, score)| score.map(|s| (hit.doc_id.as_str(), s)))
             .collect();
 
         // Convert blended to scored results.
@@ -4481,6 +4595,129 @@ mod tests {
                 !initial.is_empty(),
                 "the legacy lane must still return results"
             );
+        });
+    }
+
+    /// A two-tier index opened through exact FSVI v2 admission where the
+    /// QUALITY tier holds a document the FAST tier does not contain at all.
+    fn owner_backed_two_tier_index(
+        dir: &std::path::Path,
+        fast_binding: &FsviV2IdentityBinding,
+        quality_binding: &FsviV2IdentityBinding,
+    ) -> Arc<TwoTierIndex> {
+        let fast_path = dir.join("vector.fast.idx");
+        let quality_path = dir.join("vector.quality.idx");
+        write_v2_tier(
+            &fast_path,
+            fast_binding,
+            &[
+                ("doc-near", &[1.0, 0.0, 0.0, 0.0]),
+                ("doc-far", &[0.0, 0.0, 1.0, 0.0]),
+            ],
+        );
+        write_v2_tier(
+            &quality_path,
+            quality_binding,
+            &[
+                ("doc-near", &[0.0, 0.0, 1.0, 0.0]),
+                ("doc-far", &[0.0, 0.0, 0.5, 0.0]),
+                ("doc-quality-only", &[0.0, 1.0, 0.0, 0.0]),
+            ],
+        );
+        Arc::new(
+            TwoTierIndex::open_admitted_v2_with_paths(
+                &frankensearch_index::TwoTierIndexPaths::new(&fast_path)
+                    .with_quality_index(&quality_path),
+                TwoTierConfig::default(),
+                fast_binding,
+                Some(quality_binding),
+            )
+            .expect("admit both tiers"),
+        )
+    }
+
+    /// bd-ctzo C2, on the REAL async orchestration: the refined phase must
+    /// RETRIEVE from the quality tier, not rescore the fast pool.
+    ///
+    /// `doc-quality-only` exists in the quality tier and NOWHERE in the fast
+    /// tier, so no ranking, re-ranking, promotion or blend over a
+    /// fast-selected pool can ever produce it. Its presence in the refined
+    /// results is therefore a direct observation of independent retrieval, and
+    /// its absence is the exact failure mode
+    /// `quality_scores_for_hits(&quality_vec, &fast_hits)` had in production.
+    /// The fast-pool assertion below keeps the fixture honest: if a later
+    /// change put the document into the fast tier, this test would start
+    /// passing for the wrong reason, and that assertion fails first.
+    #[test]
+    fn refined_phase_retrieves_from_the_quality_tier_not_the_fast_pool() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let dir = owner_backed_dir("quality-retrieval");
+            let fast_binding = artifact_binding("ctzo-refine-fast", 4, 31);
+            let quality_binding = artifact_binding("ctzo-refine-quality", 4, 31);
+            let index = owner_backed_two_tier_index(&dir, &fast_binding, &quality_binding);
+
+            let fast = Arc::new(IdentityCountingEmbedder::new(
+                "fast",
+                in_memory_identity("ctzo-refine-fast", 4),
+                vec![1.0, 0.0, 0.0, 0.0],
+            ));
+            let quality = Arc::new(IdentityCountingEmbedder::new(
+                "quality",
+                in_memory_identity("ctzo-refine-quality", 4),
+                vec![0.0, 1.0, 0.0, 0.0],
+            ));
+            let searcher =
+                TwoTierSearcher::new(index, fast as Arc<dyn Embedder>, TwoTierConfig::default())
+                    .with_quality_embedder(quality as Arc<dyn Embedder>);
+
+            let mut initial: Vec<String> = Vec::new();
+            let mut refined: Vec<String> = Vec::new();
+            let mut quality_only_index: Option<Option<u32>> = None;
+            searcher
+                .search(
+                    &cx,
+                    "query",
+                    3,
+                    |_| None,
+                    |phase| match phase {
+                        SearchPhase::Initial { results, .. } => {
+                            initial = results.iter().map(|r| r.doc_id.to_string()).collect();
+                        }
+                        SearchPhase::Refined { results, .. }
+                        | SearchPhase::Reranked { results, .. } => {
+                            refined = results.iter().map(|r| r.doc_id.to_string()).collect();
+                            quality_only_index = results
+                                .iter()
+                                .find(|r| r.doc_id == "doc-quality-only")
+                                .map(|r| r.index);
+                        }
+                        SearchPhase::RefinementFailed { error, .. } => {
+                            panic!("refinement must not fail: {error}")
+                        }
+                    },
+                )
+                .await
+                .expect("both tiers are admitted and their embedders join");
+
+            assert!(
+                !initial.contains(&"doc-quality-only".to_owned()),
+                "the fixture is only meaningful while the fast tier cannot reach \
+                 doc-quality-only, got {initial:?}"
+            );
+            assert!(
+                refined.contains(&"doc-quality-only".to_owned()),
+                "the refined phase must reach a document the fast tier does not contain; \
+                 got {refined:?}"
+            );
+            // A document with no fast row must not carry a QUALITY row ordinal
+            // in the field everything downstream reads as a fast-tier index.
+            assert_eq!(
+                quality_only_index,
+                Some(None),
+                "a quality-only document has no fast-tier row and must say so"
+            );
+
+            let _ = std::fs::remove_dir_all(&dir);
         });
     }
 
