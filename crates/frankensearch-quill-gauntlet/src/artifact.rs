@@ -1851,7 +1851,7 @@ fn collect_observable_workspace_inputs_at(
     for child in std::fs::read_dir(root.join(relative_directory))? {
         let child = child?;
         let name = child.file_name();
-        if is_non_compiler_workspace_directory(&name) {
+        if is_non_compiler_workspace_directory(relative_directory, &name) {
             continue;
         }
         let relative_path = relative_directory.join(&name);
@@ -1884,11 +1884,12 @@ fn collect_observable_workspace_inputs_at(
     Ok(())
 }
 
-fn is_non_compiler_workspace_directory(name: &OsStr) -> bool {
+fn is_non_compiler_workspace_directory(relative_directory: &Path, name: &OsStr) -> bool {
     let Some(name) = name.to_str() else {
         return false;
     };
-    name == ".git"
+    (relative_directory.as_os_str().is_empty() && name.starts_with('.') && name != ".cargo")
+        || name == ".git"
         || name == ".beads"
         || name == ".scratch"
         || name == "target"
@@ -4470,6 +4471,8 @@ mod tests {
             .expect("create excluded target directory");
         std::fs::create_dir_all(workspace.path().join(".scratch"))
             .expect("create excluded diagnostic directory");
+        std::fs::create_dir_all(workspace.path().join(".agent-state"))
+            .expect("create excluded control directory");
         std::fs::write(workspace.path().join("Cargo.lock"), "lock").expect("write Cargo lock");
         std::fs::write(workspace.path().join("build.rs"), "fn main() {}")
             .expect("write build script");
@@ -4484,6 +4487,8 @@ mod tests {
             .expect("write generated build output");
         std::fs::write(workspace.path().join(".scratch/receipt.log"), "ignored")
             .expect("write non-compiler diagnostic output");
+        std::fs::write(workspace.path().join(".agent-state/state.json"), "ignored")
+            .expect("write non-compiler control output");
 
         let selected = collect_observable_workspace_inputs(workspace.path())
             .expect("collect Git-less observable workspace inputs");
@@ -4507,6 +4512,10 @@ mod tests {
         assert!(
             !selected.contains_key(".scratch/receipt.log"),
             "diagnostic output directories are not compiler inputs"
+        );
+        assert!(
+            !selected.contains_key(".agent-state/state.json"),
+            "hidden control directories other than .cargo are not compiler inputs"
         );
     }
 
