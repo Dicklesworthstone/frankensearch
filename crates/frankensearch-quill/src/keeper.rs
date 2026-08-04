@@ -9257,16 +9257,15 @@ fn collect_writer_garbage_at_platform(
     ensure_gc_directory_identity(directory, &directory_file)?;
     let snapshot = KeeperSnapshot::open(directory, schema)?;
     ensure_gc_directory_identity(directory, &directory_file)?;
-    let live_segments = live_segment_names_at(&directory_file, directory, &snapshot)?;
+    let mut reachability = live_segment_names_at(&directory_file, directory, &snapshot)?;
     let current_generation = snapshot.loaded_manifest().manifest.generation;
-    let segment_unreachable_since =
+    reachability.unreachable_since =
         segment_unreachability_floor_at(&directory_file, directory, &snapshot, now)?;
     sweep_garbage_directory(
         &directory_file,
         directory,
-        &live_segments,
+        &reachability,
         current_generation,
-        segment_unreachable_since,
         options,
         now,
     )
@@ -9326,15 +9325,14 @@ fn collect_abandoned_genesis_garbage_at_platform(
         }
     }
     ensure_gc_directory_identity(directory, &directory_file)?;
-    sweep_garbage_directory(
-        &directory_file,
-        directory,
-        &HashSet::new(),
-        0,
-        None,
-        options,
-        now,
-    )
+    // Genesis has no slot at all, so no publication ever retired anything and
+    // no receipt can exist: everything present is abandoned in-flight work.
+    let reachability = SegmentReachability {
+        live: HashSet::new(),
+        unreachable_since: None,
+        retirement_provenance_required: false,
+    };
+    sweep_garbage_directory(&directory_file, directory, &reachability, 0, options, now)
 }
 
 #[cfg(unix)]
@@ -9342,15 +9340,18 @@ fn collect_abandoned_genesis_garbage_at_platform(
 fn sweep_garbage_directory(
     directory_file: &File,
     directory: &Path,
-    live_segments: &HashSet<OsString>,
+    reachability: &SegmentReachability,
     current_generation: u64,
-    segment_unreachable_since: Option<SystemTime>,
     options: GarbageCollectionOptions,
     now: SystemTime,
 ) -> Result<GarbageCollectionReport, KeeperError> {
     use rustix::fs::{AtFlags, Dir, FileType, statat, unlinkat};
     use std::os::unix::ffi::OsStringExt;
 
+    let live_segments = &reachability.live;
+    let segment_unreachable_since = reachability.unreachable_since;
+    let mut receipts = BTreeMap::<u64, SegmentRetirementReceipt>::new();
+    let mut present_segments = HashSet::<OsString>::new();
     let mut candidates = Vec::<(OsString, GarbageCandidate, rustix::fs::Stat)>::new();
     let mut entries = Dir::read_from(directory_file)
         .map_err(io::Error::from)
@@ -9404,6 +9405,23 @@ fn sweep_garbage_directory(
             }
         }
         if is_regular {
+            if let GarbageCandidate::RetirementReceipt { segment_id, .. } = &candidate
+                && let Some(receipt) =
+                    read_retirement_receipt_at(directory_file, &name, &candidate_path, &stat)?
+                && receipt.segment_id == *segment_id
+            {
+                receipts.insert(receipt.segment_id, receipt);
+            }
+            if matches!(candidate, GarbageCandidate::Segment) {
+                present_segments
+                    .try_reserve(1)
+                    .map_err(|error| KeeperError::Io {
+                        operation: "allocate present segment inventory",
+                        path: directory.to_path_buf(),
+                        source: io::Error::other(error.to_string()),
+                    })?;
+                present_segments.insert(name.clone());
+            }
             candidates.try_reserve(1).map_err(|error| KeeperError::Io {
                 operation: "allocate garbage candidate inventory",
                 path: directory.to_path_buf(),
@@ -9425,6 +9443,13 @@ fn sweep_garbage_directory(
         if matches!(candidate, GarbageCandidate::Segment)
             && !live_segments.contains(name)
             && segment_old_enough(stat, now, options.grace_period, segment_unreachable_since)
+            && retirement_provenance_admits(
+                reachability,
+                name,
+                &receipts,
+                now,
+                options.grace_period,
+            )
         {
             removable_segments.insert(name.clone());
         }
@@ -9448,11 +9473,26 @@ fn sweep_garbage_directory(
                     && sidecar_is_orphan_at(directory_file, directory, &removable_segments, &base)?
             }
             GarbageCandidate::Claim { .. } => old_enough,
+            // A receipt is reclaimed with the segment it authorized, and
+            // otherwise only once it is proven stale: an aborted publication
+            // can leave one behind for a segment that stayed reachable, and a
+            // partially completed sweep can leave one behind with no segment
+            // at all. A receipt that does not decode is left in place as
+            // corruption evidence; it authorizes nothing either way.
+            GarbageCandidate::RetirementReceipt { base, segment_id } => {
+                removable_segments.contains(&base)
+                    || (old_enough
+                        && receipts.contains_key(&segment_id)
+                        && (live_segments.contains(&base) || !present_segments.contains(&base)))
+            }
         };
         if remove {
             removals.push(name);
         }
     }
+    // Bytewise order removes `seg-<id>.fslx` before `seg-<id>.fslx.retired`,
+    // so an interrupted sweep can only ever lose the receipt after its
+    // segment, never the segment while its authorization survives.
     removals.sort_unstable();
 
     let mut removed = Vec::new();
@@ -9632,19 +9672,47 @@ fn required_gc_witness_time(
     Ok(std::cmp::max(changed, modified))
 }
 
+/// What the durable slot pair proves about segment reachability for one sweep.
+#[cfg(unix)]
+#[allow(dead_code, reason = "wired by the dependent writer-lock milestone")]
+#[derive(Debug)]
+struct SegmentReachability {
+    /// Canonical names referenced by any individually valid slot.
+    live: HashSet<OsString>,
+    /// Conservative manifest-level floor for the recovery window, when the
+    /// selected slot supplies one.
+    unreachable_since: Option<SystemTime>,
+    /// Whether any generation could already have been superseded, and with it
+    /// whether an unreferenced segment may be a *retired* segment rather than
+    /// a never-published crash artifact.
+    ///
+    /// Generations run from 1 and the durable window holds only the distinct
+    /// generations its valid slots name, so a directory whose selected
+    /// generation does not exceed that count has never dropped a published
+    /// manifest: nothing it fails to reference was ever reachable, and no
+    /// first-unreachable receipt can exist to be demanded. Past that point an
+    /// unreferenced segment is indistinguishable from a retired one by
+    /// inspection alone, so deletion requires the durable receipt the
+    /// retiring publication wrote. Counting *distinct* generations matters:
+    /// two slots naming the same generation cover one, not two.
+    retirement_provenance_required: bool,
+}
+
 #[cfg(unix)]
 #[allow(dead_code, reason = "wired by the dependent writer-lock milestone")]
 fn live_segment_names_at(
     directory_file: &File,
     directory: &Path,
     snapshot: &KeeperSnapshot,
-) -> Result<HashSet<OsString>, KeeperError> {
+) -> Result<SegmentReachability, KeeperError> {
     let mut live = HashSet::new();
+    let mut covered_generations = BTreeSet::new();
     for slot_name in ["MANIFEST", "MANIFEST.prev"] {
         let path = directory.join(slot_name);
         if let ManifestSlot::Valid(manifest) =
             read_manifest_slot_at(directory_file, OsStr::new(slot_name), &path)?
         {
+            covered_generations.insert(manifest.generation);
             live.try_reserve(manifest.segments.len())
                 .map_err(|error| KeeperError::Io {
                     operation: "allocate live segment set",
@@ -9678,7 +9746,16 @@ fn live_segment_names_at(
             });
         }
     }
-    Ok(live)
+    let covered = u64::try_from(covered_generations.len()).map_err(|error| KeeperError::Io {
+        operation: "count covered manifest generations",
+        path: directory.to_path_buf(),
+        source: io::Error::other(error.to_string()),
+    })?;
+    Ok(SegmentReachability {
+        live,
+        unreachable_since: None,
+        retirement_provenance_required: snapshot.loaded_manifest().manifest.generation > covered,
+    })
 }
 
 #[allow(dead_code, reason = "wired by the dependent writer-lock milestone")]
@@ -9686,8 +9763,19 @@ fn live_segment_names_at(
 enum GarbageCandidate {
     Temporary,
     Segment,
-    Sidecar { base: OsString },
-    Claim { generation: u64 },
+    Sidecar {
+        base: OsString,
+    },
+    Claim {
+        generation: u64,
+    },
+    /// One segment's first-unreachable receipt. It authorizes deletion of its
+    /// own segment and nothing else, and is itself reclaimed with that
+    /// segment or once it is proven stale.
+    RetirementReceipt {
+        base: OsString,
+        segment_id: u64,
+    },
 }
 
 #[allow(dead_code, reason = "wired by the dependent writer-lock milestone")]
@@ -9709,6 +9797,14 @@ fn classify_garbage_candidate(name: &OsStr) -> Option<GarbageCandidate> {
     {
         return Some(GarbageCandidate::Sidecar {
             base: OsString::from(base),
+        });
+    }
+    if let Some(base) = name.strip_suffix(".retired")
+        && let Some(segment_id) = parse_segment_name(base)
+    {
+        return Some(GarbageCandidate::RetirementReceipt {
+            base: OsString::from(base),
+            segment_id,
         });
     }
     parse_claim_name(OsStr::new(name)).map(|generation| GarbageCandidate::Claim { generation })
@@ -9754,6 +9850,88 @@ fn segment_old_enough(
             now.duration_since(unreachable_since)
                 .is_ok_and(|age| age >= grace_period)
         })
+}
+
+/// Whether first-unreachable provenance permits collecting `name`.
+///
+/// Once any generation may have been superseded, an unreferenced segment is
+/// only collectable through the durable receipt its retiring publication
+/// wrote, aged by the full grace period from the witnessed transition. A
+/// missing, unreadable, or foreign-bound receipt proves nothing, and proving
+/// nothing fails closed -- inferring the transition from the segment's own
+/// mtime is exactly the fail-open this gate exists to remove.
+#[cfg(unix)]
+#[allow(dead_code, reason = "wired by the dependent writer-lock milestone")]
+fn retirement_provenance_admits(
+    reachability: &SegmentReachability,
+    name: &OsStr,
+    receipts: &BTreeMap<u64, SegmentRetirementReceipt>,
+    now: SystemTime,
+    grace_period: Duration,
+) -> bool {
+    if !reachability.retirement_provenance_required {
+        return true;
+    }
+    let Some(segment_id) = name.to_str().and_then(parse_segment_name) else {
+        return false;
+    };
+    receipts.get(&segment_id).is_some_and(|receipt| {
+        receipt.retired_at().is_some_and(|retired_at| {
+            now.duration_since(retired_at)
+                .is_ok_and(|age| age >= grace_period)
+        })
+    })
+}
+
+/// Read one candidate receipt through the sweep's own directory handle.
+///
+/// A receipt of any other length, an unreadable image, or a failed seal is
+/// reported as absent so the segment stays uncollectable. Only a vanished
+/// entry and a genuine I/O fault are distinguished: the latter aborts the
+/// sweep before anything is unlinked.
+#[cfg(unix)]
+#[allow(dead_code, reason = "wired by the dependent writer-lock milestone")]
+fn read_retirement_receipt_at(
+    directory_file: &File,
+    name: &OsStr,
+    path: &Path,
+    stat: &rustix::fs::Stat,
+) -> Result<Option<SegmentRetirementReceipt>, KeeperError> {
+    use rustix::fs::{Mode, OFlags, openat};
+
+    if usize::try_from(stat.st_size).ok() != Some(RETIREMENT_RECEIPT_BYTES) {
+        return Ok(None);
+    }
+    let opened = match openat(
+        directory_file,
+        name,
+        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+        Mode::empty(),
+    ) {
+        Ok(opened) => opened,
+        Err(source) if source == rustix::io::Errno::NOENT => return Ok(None),
+        Err(source) => {
+            return Err(KeeperError::Io {
+                operation: "open retirement receipt",
+                path: path.to_path_buf(),
+                source: io::Error::from(source),
+            });
+        }
+    };
+    let mut file = File::from(opened);
+    let mut bytes = [0_u8; RETIREMENT_RECEIPT_BYTES];
+    match file.read_exact(&mut bytes) {
+        Ok(()) => {}
+        Err(source) if source.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(source) => {
+            return Err(KeeperError::Io {
+                operation: "read retirement receipt",
+                path: path.to_path_buf(),
+                source,
+            });
+        }
+    }
+    Ok(SegmentRetirementReceipt::decode(&bytes))
 }
 
 #[cfg(unix)]
@@ -9869,6 +10047,166 @@ fn safe_direct_child(directory: &Path, relative: &Path) -> Result<PathBuf, Keepe
 
 fn canonical_segment_name(segment_id: u64) -> String {
     format!("seg-{segment_id:016x}.fslx")
+}
+
+/// Four-byte first-unreachable receipt magic, mirroring the MANIFEST style.
+const RETIREMENT_RECEIPT_MAGIC: [u8; 4] = *b"QRTR";
+/// Current durable first-unreachable receipt version.
+const RETIREMENT_RECEIPT_VERSION: u8 = 1;
+/// Exact byte length of a v1 receipt, including its trailing xxh3 seal.
+const RETIREMENT_RECEIPT_BYTES: usize = 40;
+
+/// Canonical name of one segment's first-unreachable receipt.
+fn retirement_receipt_name(segment_id: u64) -> String {
+    format!("{}.retired", canonical_segment_name(segment_id))
+}
+
+/// Durable witness that one segment left the two-slot MANIFEST window.
+///
+/// Garbage collection must not infer a retired segment's unreachability age
+/// from the segment's own mtime: a segment sealed long before it was retired
+/// would then be deletable the instant it fell out of the slot pair, inside
+/// any reader's drain interval. The publisher that performs the retirement is
+/// the only component that observes the transition, so it stamps this receipt
+/// and makes it durable *before* the slot renames make the transition itself
+/// durable. A receipt may therefore exist for a still-reachable segment (an
+/// aborted publish), but a retired segment can never lack one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SegmentRetirementReceipt {
+    /// Segment this receipt is bound to; a mismatch against the file name
+    /// makes the receipt inert, so one cannot be transplanted onto another.
+    segment_id: u64,
+    /// Wall clock at which the retiring publication first witnessed the
+    /// segment leaving the slot pair.
+    retired_unix_s: i64,
+    /// Generation whose publication performed the retirement.
+    retired_generation: u64,
+}
+
+impl SegmentRetirementReceipt {
+    fn encode(&self) -> [u8; RETIREMENT_RECEIPT_BYTES] {
+        let mut bytes = [0_u8; RETIREMENT_RECEIPT_BYTES];
+        bytes[0..4].copy_from_slice(&RETIREMENT_RECEIPT_MAGIC);
+        bytes[4] = RETIREMENT_RECEIPT_VERSION;
+        bytes[8..16].copy_from_slice(&self.segment_id.to_le_bytes());
+        bytes[16..24].copy_from_slice(&self.retired_unix_s.to_le_bytes());
+        bytes[24..32].copy_from_slice(&self.retired_generation.to_le_bytes());
+        let seal = xxhash_rust::xxh3::xxh3_64(&bytes[0..32]);
+        bytes[32..40].copy_from_slice(&seal.to_le_bytes());
+        bytes
+    }
+
+    /// Decode one receipt image, rejecting every malformed or unsealed input.
+    ///
+    /// Returns `None` rather than an error: an unreadable receipt proves
+    /// nothing, and proving nothing must leave the segment uncollectable
+    /// instead of failing the whole sweep.
+    fn decode(bytes: &[u8]) -> Option<Self> {
+        let bytes: &[u8; RETIREMENT_RECEIPT_BYTES] = bytes.try_into().ok()?;
+        if bytes[0..4] != RETIREMENT_RECEIPT_MAGIC[..]
+            || bytes[4] != RETIREMENT_RECEIPT_VERSION
+            || bytes[5..8] != [0_u8; 3][..]
+        {
+            return None;
+        }
+        let seal = u64::from_le_bytes(bytes[32..40].try_into().ok()?);
+        if seal != xxhash_rust::xxh3::xxh3_64(&bytes[0..32]) {
+            return None;
+        }
+        Some(Self {
+            segment_id: u64::from_le_bytes(bytes[8..16].try_into().ok()?),
+            retired_unix_s: i64::from_le_bytes(bytes[16..24].try_into().ok()?),
+            retired_generation: u64::from_le_bytes(bytes[24..32].try_into().ok()?),
+        })
+    }
+
+    /// The witnessed retirement instant, when it is representable here.
+    #[cfg(unix)]
+    fn retired_at(&self) -> Option<SystemTime> {
+        unix_system_time(self.retired_unix_s, 0)
+    }
+}
+
+/// Stamp first-unreachable receipts for every segment this publication
+/// retires, and make them durable before the caller performs the slot renames.
+///
+/// Each receipt is written to a `.tmp-` sibling, fsynced, atomically renamed
+/// into place, and sealed with one directory fsync. Rewriting an existing
+/// receipt is deliberate: an earlier aborted publication left a witness for a
+/// transition that did not happen, and the surviving reader drain must be
+/// measured from the retirement that does.
+fn write_segment_retirement_receipts(
+    directory: &Path,
+    retired: &BTreeSet<u64>,
+    generation: u64,
+) -> Result<(), KeeperError> {
+    if retired.is_empty() {
+        return Ok(());
+    }
+    let retired_unix_s = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .ok()
+        .and_then(|elapsed| i64::try_from(elapsed.as_secs()).ok())
+        .ok_or_else(|| KeeperError::InvalidTransition {
+            detail: "current wall clock is outside the retirement receipt range".to_owned(),
+        })?;
+    for segment_id in retired {
+        let receipt = SegmentRetirementReceipt {
+            segment_id: *segment_id,
+            retired_unix_s,
+            retired_generation: generation,
+        };
+        let name = retirement_receipt_name(*segment_id);
+        let temp_path = directory.join(format!(".tmp-{name}"));
+        let receipt_path = directory.join(&name);
+        let mut temp = File::create(&temp_path).map_err(|source| KeeperError::Io {
+            operation: "create retirement receipt temp",
+            path: temp_path.clone(),
+            source,
+        })?;
+        temp.write_all(&receipt.encode())
+            .and_then(|()| temp.sync_all())
+            .map_err(|source| KeeperError::Io {
+                operation: "persist retirement receipt temp",
+                path: temp_path.clone(),
+                source,
+            })?;
+        drop(temp);
+        std::fs::rename(&temp_path, &receipt_path).map_err(|source| KeeperError::Io {
+            operation: "rename retirement receipt into place",
+            path: receipt_path,
+            source,
+        })?;
+    }
+    sync_directory(directory)
+}
+
+/// Segments the pending publication removes from the durable slot pair.
+///
+/// After the renames the reachable set is the proposed manifest unioned with
+/// the outgoing current slot. Anything the outgoing *previous* slot referenced
+/// and neither of those retains has just become unreachable, and this is the
+/// only moment any component observes that transition.
+fn retired_segment_ids(
+    directory: &Path,
+    outgoing_current: Option<&Manifest>,
+    proposed: &Manifest,
+) -> Result<BTreeSet<u64>, KeeperError> {
+    let previous_path = directory.join("MANIFEST.prev");
+    let ManifestSlot::Valid(outgoing_previous) = read_manifest_slot(&previous_path)? else {
+        return Ok(BTreeSet::new());
+    };
+    let mut retained = BTreeSet::new();
+    retained.extend(proposed.segments.iter().map(|segment| segment.segment_id));
+    if let Some(current) = outgoing_current {
+        retained.extend(current.segments.iter().map(|segment| segment.segment_id));
+    }
+    Ok(outgoing_previous
+        .segments
+        .iter()
+        .map(|segment| segment.segment_id)
+        .filter(|segment_id| !retained.contains(segment_id))
+        .collect())
 }
 
 /// Internal fault-injection points in immutable segment publication.
@@ -10916,6 +11254,15 @@ where
 
     let _claim_guard = claim(&directory, proposed.generation)?;
     observe(PublishCheckpoint::GenerationClaimed, &directory)?;
+    // Only a rotation retires anything: without it the previous slot survives
+    // this publication untouched, so the reachable set never shrinks. The
+    // receipts are made durable here, ahead of the renames, so a crash can
+    // only ever leave a witness for a retirement that did not complete --
+    // never a completed retirement without its witness.
+    if rename_current {
+        let retired = retired_segment_ids(&directory, previous_manifest.as_ref(), &proposed)?;
+        write_segment_retirement_receipts(&directory, &retired, proposed.generation)?;
+    }
     before_slot_renames(&directory, rename_current, proposed.generation)?;
     if rename_current {
         std::fs::rename(&current_path, &previous_path).map_err(|source| KeeperError::Io {
@@ -13864,6 +14211,29 @@ mod tests {
             encoded.as_bytes(),
         )?;
         Ok(manifest_segment(&encoded, seal_seq))
+    }
+
+    /// Stamp the first-unreachable receipt a retiring publication would have
+    /// written for `segment_id`, so hand-built fixtures can model a directory
+    /// that really did retire a segment.
+    fn write_test_retirement_receipt(
+        directory: &Path,
+        segment_id: u64,
+        retired_generation: u64,
+        retired_at: SystemTime,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let receipt = SegmentRetirementReceipt {
+            segment_id,
+            retired_unix_s: i64::try_from(
+                retired_at.duration_since(SystemTime::UNIX_EPOCH)?.as_secs(),
+            )?,
+            retired_generation,
+        };
+        std::fs::write(
+            directory.join(retirement_receipt_name(segment_id)),
+            receipt.encode(),
+        )?;
+        Ok(())
     }
 
     fn manifest_segment(encoded: &EncodedSegment, seal_seq: u64) -> ManifestSegment {
@@ -17234,7 +17604,17 @@ mod tests {
         // The segment was reachable before generation 2 and has only just
         // fallen out of the two-slot union at generation 3. Its ancient file
         // mtime must not consume the grace period that starts at that
-        // unreachability transition.
+        // unreachability transition. Generation 3 can have superseded a
+        // published manifest, so this models a real retirement: the receipt
+        // the generation-3 publication would have stamped is part of the
+        // fixture, and without it the sweep correctly refuses to act (see
+        // gc_refuses_a_backdated_unreferenced_segment_without_a_retirement_receipt).
+        write_test_retirement_receipt(
+            directory.path(),
+            unreachable.segment_id,
+            3,
+            SystemTime::now(),
+        )?;
         write_manifest(
             &directory.path().join("MANIFEST.prev"),
             &durable_test_manifest(2, Vec::new()),
@@ -17273,9 +17653,10 @@ mod tests {
         assert_eq!(
             collect_writer_garbage_at(directory.path(), DEFAULT_SCHEMA, options, after_grace,)?
                 .removed,
-            vec![PathBuf::from(canonical_segment_name(
-                unreachable.segment_id
-            ))]
+            vec![
+                PathBuf::from(canonical_segment_name(unreachable.segment_id)),
+                PathBuf::from(retirement_receipt_name(unreachable.segment_id)),
+            ]
         );
         assert!(!unreachable_path.exists());
         Ok(())
@@ -17641,10 +18022,20 @@ mod tests {
                 reset_grace_deadline,
             )
             .map_err(|error| error.to_string())?;
-            if report.removed != vec![PathBuf::from(canonical_segment_name(segment_id))]
+            // The generation-3 publication stamped the first-unreachable
+            // receipt that authorizes this deletion, so the receipt is
+            // reclaimed with the segment it authorized.
+            if report.removed
+                != vec![
+                    PathBuf::from(canonical_segment_name(segment_id)),
+                    PathBuf::from(retirement_receipt_name(segment_id)),
+                ]
                 || segment_path.exists()
             {
-                return Err("segment was not reclaimed at the reset grace deadline".to_owned());
+                return Err(format!(
+                    "segment was not reclaimed at the reset grace deadline: {:?}",
+                    report.removed
+                ));
             }
             Ok(())
         });
@@ -17681,6 +18072,386 @@ mod tests {
                 .exists(),
             "a missing first-unreachable receipt must fail closed rather than infer age from mtime"
         );
+        Ok(())
+    }
+
+    /// A directory whose generation 3 dropped `0xb` from both slots, with the
+    /// stranded segment's mtime backdated past any grace period. This is the
+    /// exact input a collector that infers unreachability from file age
+    /// deletes, and the only thing that may authorize deleting it is a
+    /// durable first-unreachable receipt.
+    #[cfg(unix)]
+    fn stranded_segment_fixture()
+    -> Result<(tempfile::TempDir, ManifestSegment), Box<dyn std::error::Error>> {
+        let directory = tempdir()?;
+        let live = write_test_segment(directory.path(), 0xa, 1, 0, 2)?;
+        let stranded = write_test_segment(directory.path(), 0xb, 2, 2, 4)?;
+        File::options()
+            .write(true)
+            .open(directory.path().join(canonical_segment_name(0xb)))?
+            .set_times(std::fs::FileTimes::new().set_modified(SystemTime::UNIX_EPOCH))?;
+        let previous = durable_test_manifest(2, vec![live.clone()]);
+        let mut current = durable_test_manifest(3, vec![live]);
+        current.docid_high_watermark = previous.docid_high_watermark;
+        write_manifest(&directory.path().join("MANIFEST.prev"), &previous)?;
+        write_manifest(&directory.path().join("MANIFEST"), &current)?;
+        Ok((directory, stranded))
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gc_refuses_a_backdated_unreferenced_segment_without_a_retirement_receipt() -> TestResult {
+        let (directory, stranded) = stranded_segment_fixture()?;
+        let stranded_path = directory
+            .path()
+            .join(canonical_segment_name(stranded.segment_id));
+        // A year past every timestamp in the fixture: nothing here is young,
+        // so age is the only thing a fail-open collector could be waiting on.
+        let now = SystemTime::now()
+            .checked_add(Duration::from_secs(365 * 24 * 60 * 60))
+            .ok_or_else(|| io::Error::other("test clock remains representable"))?;
+
+        let report = collect_writer_garbage_at(
+            directory.path(),
+            DEFAULT_SCHEMA,
+            GarbageCollectionOptions::default(),
+            now,
+        )?;
+        assert!(report.is_empty());
+        assert!(
+            stranded_path.exists(),
+            "a missing first-unreachable receipt must fail closed however old the segment file is"
+        );
+
+        // Paired positive control: same directory, same clock, same call --
+        // only the durable witness is added. A collector that is merely dead
+        // cannot pass both halves of this test.
+        write_test_retirement_receipt(directory.path(), stranded.segment_id, 3, SystemTime::now())?;
+        let report = collect_writer_garbage_at(
+            directory.path(),
+            DEFAULT_SCHEMA,
+            GarbageCollectionOptions::default(),
+            now,
+        )?;
+        assert_eq!(
+            report.removed,
+            vec![
+                PathBuf::from(canonical_segment_name(stranded.segment_id)),
+                PathBuf::from(retirement_receipt_name(stranded.segment_id)),
+            ],
+            "a witnessed retirement past its grace is still collected exactly once"
+        );
+        assert!(!stranded_path.exists());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gc_counts_distinct_slot_generations_before_trusting_mtime() -> TestResult {
+        // A slot pair covering generations 1 and 2 cannot have dropped a
+        // published manifest, so an unreferenced segment there is provably a
+        // never-published crash artifact and its file age still governs.
+        let adjacent = tempdir()?;
+        let live = write_test_segment(adjacent.path(), 0xa, 1, 0, 2)?;
+        write_test_segment(adjacent.path(), 0xb, 2, 2, 4)?;
+        let previous = durable_test_manifest(1, vec![live.clone()]);
+        let mut current = durable_test_manifest(2, vec![live.clone()]);
+        current.docid_high_watermark = previous.docid_high_watermark;
+        write_manifest(&adjacent.path().join("MANIFEST.prev"), &previous)?;
+        write_manifest(&adjacent.path().join("MANIFEST"), &current)?;
+        let now = SystemTime::now()
+            .checked_add(DEFAULT_GARBAGE_GRACE + Duration::from_secs(1))
+            .ok_or_else(|| io::Error::other("test clock remains representable"))?;
+        assert_eq!(
+            collect_writer_garbage_at(
+                adjacent.path(),
+                DEFAULT_SCHEMA,
+                GarbageCollectionOptions::default(),
+                now,
+            )?
+            .removed,
+            vec![PathBuf::from(canonical_segment_name(0xb))],
+            "generations 1 and 2 leave no room for a retirement to have happened"
+        );
+
+        // Two slots naming the *same* generation cover one generation, not
+        // two, so generation 1 has already been dropped and an unreferenced
+        // segment may be a retired one. Counting slots instead of distinct
+        // generations would reopen mtime inference here.
+        let duplicated = tempdir()?;
+        let live = write_test_segment(duplicated.path(), 0xa, 1, 0, 2)?;
+        let stranded = write_test_segment(duplicated.path(), 0xb, 2, 2, 4)?;
+        let repeated = durable_test_manifest(2, vec![live]);
+        write_manifest(&duplicated.path().join("MANIFEST.prev"), &repeated)?;
+        write_manifest(&duplicated.path().join("MANIFEST"), &repeated)?;
+        assert!(
+            collect_writer_garbage_at(
+                duplicated.path(),
+                DEFAULT_SCHEMA,
+                GarbageCollectionOptions::default(),
+                now,
+            )?
+            .is_empty(),
+            "a repeated slot generation must not be counted twice"
+        );
+        assert!(
+            duplicated
+                .path()
+                .join(canonical_segment_name(stranded.segment_id))
+                .exists()
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gc_rejects_forged_truncated_and_foreign_retirement_receipts() -> TestResult {
+        let valid = SegmentRetirementReceipt {
+            segment_id: 0xb,
+            retired_unix_s: 1_700_000_000,
+            retired_generation: 3,
+        };
+        let mut forged = valid.encode().to_vec();
+        forged[16] ^= 0xff;
+        let mut wrong_magic = valid.encode().to_vec();
+        wrong_magic[0] = b'X';
+        let mut wrong_version = valid.encode().to_vec();
+        wrong_version[4] = 2;
+        let mut dirty_reserved = valid.encode().to_vec();
+        dirty_reserved[5] = 1;
+        let truncated = valid.encode()[..RETIREMENT_RECEIPT_BYTES - 1].to_vec();
+        let mut padded = valid.encode().to_vec();
+        padded.push(0);
+        let foreign = SegmentRetirementReceipt {
+            segment_id: 0xc,
+            ..valid
+        }
+        .encode()
+        .to_vec();
+        let future = SegmentRetirementReceipt {
+            retired_unix_s: i64::MAX,
+            ..valid
+        }
+        .encode()
+        .to_vec();
+
+        for (label, image) in [
+            ("seal broken by a flipped timestamp byte", forged),
+            ("foreign magic", wrong_magic),
+            ("unknown version", wrong_version),
+            ("non-zero reserved bytes", dirty_reserved),
+            ("truncated image", truncated),
+            ("over-long image", padded),
+            ("receipt bound to another segment", foreign),
+            ("retirement stamped beyond the clock", future),
+        ] {
+            let (directory, stranded) = stranded_segment_fixture()?;
+            let stranded_path = directory
+                .path()
+                .join(canonical_segment_name(stranded.segment_id));
+            let receipt_path = directory
+                .path()
+                .join(retirement_receipt_name(stranded.segment_id));
+            std::fs::write(&receipt_path, &image)?;
+            let now = SystemTime::now()
+                .checked_add(Duration::from_secs(365 * 24 * 60 * 60))
+                .ok_or_else(|| io::Error::other("test clock remains representable"))?;
+
+            let report = collect_writer_garbage_at(
+                directory.path(),
+                DEFAULT_SCHEMA,
+                GarbageCollectionOptions::default(),
+                now,
+            )?;
+            assert!(report.is_empty(), "{label}");
+            assert!(stranded_path.exists(), "{label}: segment survives");
+            assert_eq!(
+                std::fs::read(&receipt_path)?,
+                image,
+                "{label}: an unusable receipt is preserved as evidence"
+            );
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gc_refuses_a_receipt_that_has_not_served_its_full_grace() -> TestResult {
+        let (directory, stranded) = stranded_segment_fixture()?;
+        let stranded_path = directory
+            .path()
+            .join(canonical_segment_name(stranded.segment_id));
+        let retired_at = SystemTime::now();
+        write_test_retirement_receipt(directory.path(), stranded.segment_id, 3, retired_at)?;
+        let options = GarbageCollectionOptions {
+            grace_period: Duration::from_secs(600),
+        };
+
+        // The manifest-level floor has long since expired here; only the
+        // receipt's own witness still protects the segment.
+        let before_grace = retired_at
+            .checked_add(Duration::from_secs(599))
+            .ok_or_else(|| io::Error::other("test clock remains representable"))?;
+        assert!(
+            collect_writer_garbage_at(directory.path(), DEFAULT_SCHEMA, options, before_grace)?
+                .is_empty(),
+            "grace is measured from the witnessed transition"
+        );
+        assert!(stranded_path.exists());
+
+        let after_grace = retired_at
+            .checked_add(Duration::from_secs(601))
+            .ok_or_else(|| io::Error::other("test clock remains representable"))?;
+        assert_eq!(
+            collect_writer_garbage_at(directory.path(), DEFAULT_SCHEMA, options, after_grace)?
+                .removed,
+            vec![
+                PathBuf::from(canonical_segment_name(stranded.segment_id)),
+                PathBuf::from(retirement_receipt_name(stranded.segment_id)),
+            ]
+        );
+        assert!(!stranded_path.exists());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn gc_retires_a_receipt_whose_segment_is_live_again_or_already_gone() -> TestResult {
+        let now = SystemTime::now()
+            .checked_add(DEFAULT_GARBAGE_GRACE + Duration::from_secs(1))
+            .ok_or_else(|| io::Error::other("test clock remains representable"))?;
+
+        // An aborted publication can stamp a receipt and never perform the
+        // rotation, leaving a witness for a segment that is still reachable.
+        let directory = tempdir()?;
+        let live = write_test_segment(directory.path(), 0xa, 1, 0, 2)?;
+        let previous = durable_test_manifest(2, vec![live.clone()]);
+        let current = durable_test_manifest(3, vec![live]);
+        write_manifest(&directory.path().join("MANIFEST.prev"), &previous)?;
+        write_manifest(&directory.path().join("MANIFEST"), &current)?;
+        write_test_retirement_receipt(directory.path(), 0xa, 3, SystemTime::now())?;
+        assert_eq!(
+            collect_writer_garbage_at(
+                directory.path(),
+                DEFAULT_SCHEMA,
+                GarbageCollectionOptions::default(),
+                now,
+            )?
+            .removed,
+            vec![PathBuf::from(retirement_receipt_name(0xa))],
+            "a stale receipt is reclaimed and the live segment is untouched"
+        );
+        assert!(directory.path().join(canonical_segment_name(0xa)).exists());
+
+        // An interrupted sweep can unlink the segment and leave its receipt.
+        let orphaned = tempdir()?;
+        let live = write_test_segment(orphaned.path(), 0xa, 1, 0, 2)?;
+        let previous = durable_test_manifest(2, vec![live.clone()]);
+        let current = durable_test_manifest(3, vec![live]);
+        write_manifest(&orphaned.path().join("MANIFEST.prev"), &previous)?;
+        write_manifest(&orphaned.path().join("MANIFEST"), &current)?;
+        write_test_retirement_receipt(orphaned.path(), 0xb, 3, SystemTime::now())?;
+        assert_eq!(
+            collect_writer_garbage_at(
+                orphaned.path(),
+                DEFAULT_SCHEMA,
+                GarbageCollectionOptions::default(),
+                now,
+            )?
+            .removed,
+            vec![PathBuf::from(retirement_receipt_name(0xb))],
+            "a receipt with no segment left to authorize is reclaimed"
+        );
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn publication_stamps_a_first_unreachable_receipt_for_every_segment_it_retires() -> TestResult {
+        let directory = tempdir()?;
+        let retired = write_test_segment(directory.path(), 0xa11, 1, 0, 2)?;
+        let retained = write_test_segment(directory.path(), 0xb22, 2, 2, 4)?;
+        let receipt_path = directory.path().join(retirement_receipt_name(0xa11));
+
+        let generation_one = durable_test_manifest(1, vec![retired.clone()]);
+        publish_manifest_choreography(
+            directory.path().to_path_buf(),
+            &generation_one.to_bytes()?,
+            |_, _| Ok(()),
+            |_, _| Ok(()),
+        )?;
+
+        // Generation 2 drops the segment from the current slot, but the
+        // rotation moves generation 1 into MANIFEST.prev, so it is still
+        // reachable and nothing may be witnessed yet.
+        let generation_two = durable_test_manifest(2, vec![retained.clone()]);
+        publish_manifest_choreography(
+            directory.path().to_path_buf(),
+            &generation_two.to_bytes()?,
+            |_, _| Ok(()),
+            |_, _| Ok(()),
+        )?;
+        assert!(
+            !receipt_path.exists(),
+            "a segment retained by MANIFEST.prev has not been retired"
+        );
+
+        // Generation 3 pushes generation 1 out of the window. This is the
+        // only moment any component observes the transition.
+        let generation_three = durable_test_manifest(3, vec![retained]);
+        publish_manifest_choreography(
+            directory.path().to_path_buf(),
+            &generation_three.to_bytes()?,
+            |_, _| Ok(()),
+            |_, _| Ok(()),
+        )?;
+
+        let receipt = SegmentRetirementReceipt::decode(&std::fs::read(&receipt_path)?)
+            .ok_or_else(|| io::Error::other("publication wrote a decodable receipt"))?;
+        assert_eq!(receipt.segment_id, 0xa11);
+        assert_eq!(receipt.retired_generation, 3);
+        let retired_at = receipt
+            .retired_at()
+            .ok_or_else(|| io::Error::other("receipt timestamp is representable"))?;
+        assert!(retired_at <= SystemTime::now());
+
+        let segment_path = directory.path().join(canonical_segment_name(0xa11));
+        assert!(
+            collect_writer_garbage_at(
+                directory.path(),
+                DEFAULT_SCHEMA,
+                GarbageCollectionOptions::default(),
+                retired_at
+                    .checked_add(
+                        DEFAULT_GARBAGE_GRACE
+                            .checked_sub(Duration::from_secs(1))
+                            .ok_or_else(|| io::Error::other("grace exceeds one second"))?,
+                    )
+                    .ok_or_else(|| io::Error::other("test clock remains representable"))?,
+            )?
+            .is_empty(),
+            "the witnessed retirement still owes its grace period"
+        );
+        assert!(segment_path.exists());
+
+        let after_grace = SystemTime::now()
+            .checked_add(DEFAULT_GARBAGE_GRACE + Duration::from_secs(1))
+            .ok_or_else(|| io::Error::other("test clock remains representable"))?;
+        assert_eq!(
+            collect_writer_garbage_at(
+                directory.path(),
+                DEFAULT_SCHEMA,
+                GarbageCollectionOptions::default(),
+                after_grace,
+            )?
+            .removed,
+            vec![
+                PathBuf::from(canonical_segment_name(0xa11)),
+                PathBuf::from(retirement_receipt_name(0xa11)),
+            ]
+        );
+        assert!(!segment_path.exists());
+        assert!(!receipt_path.exists());
         Ok(())
     }
 
