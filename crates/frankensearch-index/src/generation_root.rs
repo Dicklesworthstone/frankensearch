@@ -6648,15 +6648,32 @@ mod tests {
         fn secure_fixture_base() -> &'static Path {
             FIXTURE_BASE
                 .get_or_init(|| {
-                    let home = std::env::var_os("HOME")
-                        .map(PathBuf::from)
-                        .expect("HOME must identify the process-private fixture ancestor");
-                    assert!(home.is_absolute(), "HOME must be an absolute route");
+                    // bd-54h2l LOW A: this base used to be rooted at $HOME. Its
+                    // name embeds pid + epoch nanos, so every test process minted
+                    // a fresh one and no cleanup path existed — repeated local
+                    // runs accumulated directories in the user's home forever.
+                    // Root it at the platform scratch directory instead
+                    // (`std::env::temp_dir`, which honours TMPDIR): per-run
+                    // isolation is unchanged, but the bases now land where
+                    // scratch space is reclaimed by platform/agent policy rather
+                    // than needing deletion code here.
+                    //
+                    // The security properties are preserved, which matters
+                    // because these fixtures back the route-qualification tests
+                    // themselves: creation below stays O_EXCL-style plus mode
+                    // 0700, so a pre-existing or attacker-planted path is never
+                    // adopted — `create` fails with `AlreadyExists` and the next
+                    // attempt takes a different name.
+                    let scratch = std::env::temp_dir();
+                    assert!(
+                        scratch.is_absolute(),
+                        "the scratch directory must be an absolute route"
+                    );
                     let epoch_nanos = SystemTime::now()
                         .duration_since(UNIX_EPOCH)
                         .map_or(0, |duration| duration.as_nanos());
                     for attempt in 0_u64..64 {
-                        let candidate = home.join(format!(
+                        let candidate = scratch.join(format!(
                             ".frankensearch-generation-root-tests-{}-{epoch_nanos}-{attempt}",
                             std::process::id()
                         ));
@@ -10897,6 +10914,52 @@ if not close_only_contended or not explicit_unlock_released:
             assert_eq!(
                 QualifiedGenerationRoot::admit(&link)
                     .expect_err("root symlink must fail")
+                    .kind(),
+                GenerationRootErrorKind::SymbolicLink
+            );
+        }
+
+        /// Linux half of the cross-platform symlink error-kind parity contract
+        /// (bd-54h2l LOW B).
+        ///
+        /// The macOS arm
+        /// `macos_absolute_root_route_rejects_ancestor_and_final_symlinks`
+        /// asserts [`GenerationRootErrorKind::SymbolicLink`] for an absolute
+        /// route whose ANCESTOR is a symlink and for one whose FINAL component
+        /// is, but it lives in a `cfg(all(target_os = "macos", target_arch =
+        /// "aarch64"))` module that never compiles on a Linux host. Linux
+        /// previously covered only the final component at root admission
+        /// (`root_qualification_rejects_symlink_final_component`) and the
+        /// confined-route case
+        /// (`ancestor_and_final_symlinks_fail_without_touching_decoys`), so the
+        /// ancestor-of-an-absolute-route shape had no Linux twin and the parity
+        /// claim rested on nothing measurable here.
+        ///
+        /// This pins the Linux side of that claim on the identical input shape.
+        /// The macOS side remains an ENCODED EXPECTATION, not a live proof:
+        /// confirming both platforms agree still needs an arm64 macOS run, and
+        /// that residual is named on bd-54h2l.
+        #[test]
+        fn absolute_root_route_rejects_ancestor_and_final_symlinks() {
+            let container = fixture_root("absolute-symlink-container");
+            let target_parent = fixture_root("absolute-symlink-target-parent");
+            let target_root = private_dir(&target_parent, "qualified-root");
+            let ancestor_link = container.join("ancestor-link");
+            let final_link = container.join("final-link");
+            symlink(&target_parent, &ancestor_link)
+                .expect("absolute-route ancestor symlink should be creatable");
+            symlink(&target_root, &final_link)
+                .expect("absolute-route final symlink should be creatable");
+
+            assert_eq!(
+                QualifiedGenerationRoot::admit(&ancestor_link.join("qualified-root"))
+                    .expect_err("an absolute-route ancestor symlink must fail")
+                    .kind(),
+                GenerationRootErrorKind::SymbolicLink
+            );
+            assert_eq!(
+                QualifiedGenerationRoot::admit(&final_link)
+                    .expect_err("an absolute-route final symlink must fail")
                     .kind(),
                 GenerationRootErrorKind::SymbolicLink
             );
