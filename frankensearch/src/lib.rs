@@ -550,7 +550,7 @@ mod feature_matrix_smoke {
         eprintln!(
             "{}",
             serde_json::json!({
-                "schema": "frankensearch-feature-behavior-v1",
+                "schema": "frankensearch-feature-behavior-v2",
                 "lane": lane,
                 "behavior": behavior,
                 "status": "pass",
@@ -799,14 +799,19 @@ mod feature_matrix_smoke {
             emit_evidence(
                 "quill",
                 "real_index_build_search",
-                &serde_json::json!({"documents": documents.len(), "hits": hits.len()}),
+                &serde_json::json!({
+                    "documents": documents.len(),
+                    "hits": hits.len(),
+                    "lexical_backend": "quill",
+                    "selected_backend": "quill",
+                }),
             );
         });
     }
 
     #[cfg(feature = "lexical")]
     #[test]
-    fn lexical_lane_behavior_uses_quill() {
+    fn lexical_lane_behavior() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
             let index = lexical::QuillIndex::in_memory(lexical::QuillConfig::default())
                 .expect("create lexical Quill index");

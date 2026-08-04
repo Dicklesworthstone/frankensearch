@@ -4365,6 +4365,15 @@ mod tests {
     #[test]
     #[ignore = "requires a clean Git-verified producer; run on strict remote Linux"]
     fn artifactstore_v4_current_linux_collector_binds_procfs_image_to_source_build_chain() {
+        let producer = GauntletProducerBuildIdentity::compiled().expect("compiled producer");
+        producer.validate_stored_sealed_v2().unwrap_or_else(|error| {
+            panic!("compiled producer must satisfy the Linux sealed-receipt contract: {producer:?}; {error:?}")
+        });
+        producer
+            .validate_live_source_checkout()
+            .unwrap_or_else(|error| {
+                panic!("compiled producer must bind a clean live checkout: {producer:?}; {error:?}")
+            });
         let snapshots = ArtifactStoreV4SourceBuildSnapshots::collect_current_linux()
             .expect("collect a clean current Linux source/build chain");
         snapshots

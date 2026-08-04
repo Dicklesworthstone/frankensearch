@@ -353,7 +353,7 @@ jobs:
       - name: cargo check (fsfs explicit embedded-models lane)
         run: cargo check -p frankensearch-fsfs --no-default-features --features embedded-models
 
-      - name: Pre-flip lexical feature graph guard (bd-quill-e7.4)
+      - name: QG-10 facade lexical feature graph guard (bd-8nqz.4.2)
         if: matrix.os == 'ubuntu-latest'
         shell: bash
         run: |
@@ -362,6 +362,17 @@ jobs:
           if grep -Eq '^frankensearch-(lexical|quill) v' <<< "${default_tree}"; then
             echo "Default facade graph unexpectedly contains a lexical engine:" >&2
             grep -E '^frankensearch-(lexical|quill) v' <<< "${default_tree}" >&2
+            exit 1
+          fi
+
+          quill_semantic_tantivy_count="$(
+            cargo tree -p frankensearch --no-default-features --features quill,semantic \
+              --edges normal --prefix none | grep -c tantivy || true
+          )"
+          if [[ "${quill_semantic_tantivy_count}" != "0" ]]; then
+            echo "QG-10 failure: Quill+semantic facade graph contains Tantivy:" >&2
+            cargo tree -p frankensearch --no-default-features --features quill,semantic \
+              --edges normal --prefix none | grep tantivy >&2 || true
             exit 1
           fi
 
