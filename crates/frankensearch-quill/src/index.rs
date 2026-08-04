@@ -37,6 +37,8 @@ use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 #[cfg(feature = "conformance-internals")]
 use sha2::{Digest, Sha256};
+#[cfg(test)]
+use std::sync::atomic::AtomicBool;
 use thiserror::Error;
 use tracing::Instrument;
 use xxhash_rust::xxh3::{Xxh3, xxh3_64};
@@ -9468,7 +9470,7 @@ impl RootBoundQuillSearchIndex {
     ) -> Result<RootBoundQuillReaderState, QuillIndexError> {
         check_cancel(cx, "root-bound reader layout inspection")?;
         let root_for_inspection = lexical_root.to_path_buf();
-        let layout = spawn_blocking(move || inspect_lexical_layout(&root_for_inspection)).await??;
+        let layout = spawn_blocking(move || inspect_lexical_layout(&root_for_inspection)).await?;
         check_cancel(cx, "root-bound reader layout inspection")?;
 
         let (active_path, pointer) = match layout {
@@ -9888,7 +9890,7 @@ impl LexicalRead for RootBoundQuillSearchIndex {
     }
 
     fn doc_count(&self) -> usize {
-        self.state.load().reader.doc_count()
+        usize::try_from(self.state.load().reader.doc_count()).unwrap_or(usize::MAX)
     }
 }
 
@@ -12697,7 +12699,7 @@ mod tests {
     use crate::delta::{
         DeltaFieldNorm, DeltaNumericValue, DeltaSegment, DeltaStoredValue, DeltaTermPosting,
     };
-    use crate::keeper::{CompactionError, ConcatMergeError};
+    use crate::keeper::{CompactionError, ConcatMergeError, publish_current};
     #[cfg(feature = "bench-internals")]
     use crate::query::{BooleanClause, QueryField};
     use crate::quiver::{
