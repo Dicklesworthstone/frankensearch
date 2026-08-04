@@ -68,7 +68,7 @@ fn from_fsvi_matches_file_backed_top_k() {
     }
     writer.finish().expect("finish fsvi writer");
 
-    let file_index = VectorIndex::open(&path).expect("open file-backed index");
+    let file_index = VectorIndex::open_read_only(&path).expect("open file-backed index");
     let in_memory = InMemoryVectorIndex::from_fsvi(&path).expect("load in-memory index");
 
     let query = make_vector(dim, 13.7);
