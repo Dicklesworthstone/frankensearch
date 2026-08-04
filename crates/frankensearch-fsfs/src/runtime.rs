@@ -27060,9 +27060,8 @@ mod tests {
 
     #[test]
     fn download_failure_reason_maps_404_to_missing_asset() {
-        let reason = super::download_failure_reason(
-            "curl: (22) The requested URL returned error: 404",
-        );
+        let reason =
+            super::download_failure_reason("curl: (22) The requested URL returned error: 404");
         assert!(reason.contains("HTTP 404"));
         assert!(reason.contains("prebuilt binary"));
     }
