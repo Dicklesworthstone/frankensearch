@@ -284,6 +284,32 @@ validate_lane_coverage() {
   write_matrix_artifact
 }
 
+# bd-8nqz.5: the CASS lexical compatibility lane must resolve Tantivy IN and
+# Quill OUT.
+#
+# This lives here, at the RESOLVED DEPENDENCY GRAPH, and not as a cfg! assertion
+# inside a #[cfg(all(cass-compat, not(quill)))] test: inside that gate the
+# assertion is a compile-time constant and the gate presupposes exactly what it
+# claims to prove. `cargo tree` asks the resolver instead, so a feature edit that
+# started pulling Quill into cass-compat fails here even though every lane would
+# still compile.
+validate_cass_compat_backend_graph() {
+  local tree
+  if ! tree="$(cargo tree -p frankensearch --no-default-features --features cass-compat --prefix none 2>/dev/null)"; then
+    echo "ERROR: cass-compat dependency graph could not be resolved" >&2
+    return 1
+  fi
+  if ! grep -q '^frankensearch-lexical ' <<<"${tree}"; then
+    echo "ERROR: cass-compat must resolve frankensearch-lexical (Tantivy)" >&2
+    return 1
+  fi
+  if grep -q '^frankensearch-quill ' <<<"${tree}"; then
+    echo "ERROR: cass-compat resolved frankensearch-quill; the CASS compatibility lane must exclude Quill unless a consumer requests it independently" >&2
+    return 1
+  fi
+  echo "[feature-matrix][OK] cass-compat resolves Tantivy and excludes Quill"
+}
+
 selected_lanes() {
   if [[ "$LANE" == "all" ]]; then
     printf '%s\n' "${REQUIRED_LANES[@]}"
@@ -307,6 +333,7 @@ run_lane() {
 (
   cd "$ROOT_DIR"
   validate_lane_coverage
+  validate_cass_compat_backend_graph
   if [[ "$MODE" != "validate" ]]; then
     while IFS= read -r lane; do
       [[ -z "$lane" ]] && continue

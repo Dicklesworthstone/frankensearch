@@ -948,17 +948,21 @@ mod feature_matrix_smoke {
     /// consumer.
     #[cfg(all(feature = "cass-compat", not(feature = "quill")))]
     #[test]
-    fn cass_compat_lane_resolves_tantivy_and_excludes_quill() {
-        assert!(
-            cfg!(feature = "lexical-tantivy"),
-            "cass-compat must pull the Tantivy compatibility lane"
-        );
-        assert!(
-            !cfg!(feature = "quill"),
-            "cass-compat alone must not pull Quill into the resolved graph"
-        );
-        // The explicit namespace the contract requires CASS to import through
-        // must still resolve after the d117ce1f flip and the 327d264a trait split.
+    fn cass_compat_lane_namespace_keeps_schema_v8_identity() {
+        // NOTE ON WHERE THE QUILL-ABSENCE PROOF LIVES. It is deliberately NOT
+        // here. Inside `#[cfg(all(cass-compat, not(quill)))]` an assertion on
+        // `cfg!(feature = "quill")` is a compile-time constant, and the gate
+        // presupposes exactly what such an assertion would claim to prove —
+        // circular, and clippy's assertions_on_constants says so. The real
+        // proof asks the resolver instead and lives in
+        // scripts/check_feature_matrix.sh::validate_cass_compat_backend_graph,
+        // which fails if `cargo tree --features cass-compat` ever resolves
+        // frankensearch-quill.
+        //
+        // What this test CAN prove at runtime is the part the flip endangered:
+        // the explicit namespace the contract requires CASS to import through
+        // must still resolve, and must still agree on the schema-v8 identity,
+        // after the d117ce1f flip and the 327d264a trait split.
         assert_eq!(
             lexical_tantivy::CASS_SCHEMA_VERSION,
             cass_compat::CASS_SCHEMA_VERSION,
@@ -966,7 +970,7 @@ mod feature_matrix_smoke {
         );
         emit_evidence(
             "cass-compat",
-            "lane_excludes_quill",
+            "lane_namespace_identity",
             &serde_json::json!({
                 "lexical_tantivy": cfg!(feature = "lexical-tantivy"),
                 "quill": cfg!(feature = "quill"),
@@ -1057,19 +1061,31 @@ mod feature_matrix_smoke {
         // QUERY through the real CASS reader and schema — the same
         // cass_open_search_reader / cass_fields_from_schema surface a CASS
         // consumer uses, not a facade convenience wrapper.
-        let index_dir = cass_compat::cass_index_dir(dir.path()).expect("resolve CASS index dir");
+        // CassTantivyIndex::open_or_create writes the Tantivy directory AT the
+        // path it is given. cass_index_dir is a different convention
+        // (base/index/<schema-version>) that CASS uses when laying out its own
+        // tree, so the reader must be pointed at the same path the writer used.
+        let index_dir = dir.path().to_path_buf();
         let search_one = |needle: &str| -> (usize, usize) {
-            let (reader, fields) =
-                cass_compat::cass_open_search_reader(&index_dir, tantivy::ReloadPolicy::Manual)
-                    .expect("open the CASS search reader");
+            // Tantivy-native types come through the facade's explicit
+            // compatibility namespace, which is exactly the migration this
+            // bead requires of CASS: never through the overloaded `lexical`
+            // name. If lexical_tantivy ever stops re-exporting what a CASS
+            // consumer needs, this test breaks — a direct tantivy dependency
+            // would have hidden that.
+            let (reader, fields) = cass_compat::cass_open_search_reader(
+                &index_dir,
+                lexical_tantivy::ReloadPolicy::Manual,
+            )
+            .expect("open the CASS search reader");
             let searcher = reader.searcher();
             let live = searcher.num_docs();
-            let query = tantivy::query::TermQuery::new(
-                tantivy::Term::from_field_text(fields.content, needle),
-                tantivy::schema::IndexRecordOption::WithFreqs,
+            let query = lexical_tantivy::TermQuery::new(
+                lexical_tantivy::Term::from_field_text(fields.content, needle),
+                lexical_tantivy::IndexRecordOption::WithFreqs,
             );
             let hits = searcher
-                .search(&query, &tantivy::collector::Count)
+                .search(&query, &lexical_tantivy::Count)
                 .expect("run the CASS term query");
             (hits, usize::try_from(live).expect("live docs fit usize"))
         };
