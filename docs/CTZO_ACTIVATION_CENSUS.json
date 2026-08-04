@@ -1,0 +1,89 @@
+{
+  "schema_version": 1,
+  "bead": "bd-core-vector-space-search-guard-ctzo",
+  "description": "Machine-readable census of every PRODUCTION entry point migrated onto typed owner-backed activation (bd-ctzo C5). Validated by crates/frankensearch-fusion/tests/ctzo_activation_census.rs, which fails if a named symbol disappears, if a production call site is added or removed without updating this file, or if the new types stop being consumed outside frankensearch-core.",
+  "definition_crate": "frankensearch-core",
+  "entry_points": [
+    {
+      "crate": "frankensearch-index",
+      "file": "crates/frankensearch-index/src/two_tier.rs",
+      "symbol": "pub fn activate_owner_backed_search",
+      "kind": "activation-constructor",
+      "consumes": ["TieredQueryEmbeddings", "BoundQueryEmbedding", "RetrievalTopology"],
+      "slice": "4a-0 (ad54df83)"
+    },
+    {
+      "crate": "frankensearch-index",
+      "file": "crates/frankensearch-index/src/two_tier.rs",
+      "symbol": "pub fn search_quality",
+      "kind": "direct-quality-retrieval",
+      "consumes": ["ActivatedTierSearch"],
+      "slice": "1 (aa6f9fcb)"
+    },
+    {
+      "crate": "frankensearch-index",
+      "file": "crates/frankensearch-index/src/two_tier.rs",
+      "symbol": "pub fn search_union",
+      "kind": "canonical-doc-union",
+      "consumes": ["ActivatedTierSearch"],
+      "slice": "1 (aa6f9fcb)"
+    },
+    {
+      "crate": "frankensearch-index",
+      "file": "crates/frankensearch-index/src/two_tier.rs",
+      "symbol": "pub fn coverage",
+      "kind": "owner-witness-coverage",
+      "consumes": ["SearchCoverageV1", "TierQueryCoverageV1"],
+      "slice": "5 (C4)"
+    },
+    {
+      "crate": "frankensearch-fusion",
+      "file": "crates/frankensearch-fusion/src/refresh.rs",
+      "symbol": "pub fn activate_search",
+      "kind": "staged-generation-activation",
+      "consumes": ["TieredQueryEmbeddings", "ActivatedTierSearch"],
+      "slice": "2 (018a27cd)"
+    },
+    {
+      "crate": "frankensearch-fusion",
+      "file": "crates/frankensearch-fusion/src/searcher.rs",
+      "symbol": "fn admit_semantic_query",
+      "kind": "pre-embed-identity-admission",
+      "consumes": ["FsviV2IdentityBinding", "EmbeddingIdentityBundleV1"],
+      "slice": "4a (C1 admission guard)"
+    },
+    {
+      "crate": "frankensearch-fusion",
+      "file": "crates/frankensearch-fusion/src/sync_searcher.rs",
+      "symbol": "fn admit_tier_space",
+      "kind": "pre-read-identity-admission",
+      "consumes": ["BoundQueryEmbedding"],
+      "slice": "4c (bd-sync-searcher-tiered-query-embeddings-dbp10)"
+    },
+    {
+      "crate": "frankensearch-fusion",
+      "file": "crates/frankensearch-fusion/src/sync_searcher.rs",
+      "symbol": "fn admit<",
+      "kind": "sync-tiered-admission",
+      "consumes": ["TieredQueryEmbeddings", "BoundQueryEmbedding"],
+      "slice": "4c (bd-sync-searcher-tiered-query-embeddings-dbp10)"
+    }
+  ],
+  "production_call_sites": [
+    {
+      "file": "crates/frankensearch-fusion/src/refresh.rs",
+      "callee": "activate_owner_backed_search",
+      "count": 1
+    },
+    {
+      "file": "crates/frankensearch-fusion/src/searcher.rs",
+      "callee": "activate_owner_backed_search",
+      "count": 1
+    },
+    {
+      "file": "crates/frankensearch-fusion/src/searcher.rs",
+      "callee": ".coverage(",
+      "count": 1
+    }
+  ]
+}

@@ -2091,7 +2091,20 @@ impl TwoTierSearcher {
                 )?;
                 let embeddings = TieredQueryEmbeddings::quality_only(bound);
                 let activated = self.index.activate_owner_backed_search(&embeddings)?;
-                QualityPool::Retrieved(activated.search_quality(quality_budget)?)
+                let hits = activated.search_quality(quality_budget)?;
+                // bd-ctzo C4: the coverage receipt is built from the retained
+                // owner's witness and the candidates this tier ACTUALLY
+                // returned, then carried on the metrics so a caller can read
+                // it. It is assembled after retrieval on purpose — a
+                // contribution count taken before the results exist would be
+                // a prediction, not a measurement.
+                let coverage = activated.coverage(&hits, quality_budget)?;
+                tracing::debug!(
+                    coverage = %coverage.redacted_summary(),
+                    "quality tier served under owner-backed activation"
+                );
+                metrics.coverage = Some(coverage);
+                QualityPool::Retrieved(hits)
             }
             SemanticAdmission::OwnerBacked { quality: false }
             | SemanticAdmission::LegacyUnidentified => QualityPool::RescoredFastPool(
@@ -4673,7 +4686,7 @@ mod tests {
             let mut initial: Vec<String> = Vec::new();
             let mut refined: Vec<String> = Vec::new();
             let mut quality_only_index: Option<Option<u32>> = None;
-            searcher
+            let metrics = searcher
                 .search(
                     &cx,
                     "query",
@@ -4708,6 +4721,35 @@ mod tests {
                 refined.contains(&"doc-quality-only".to_owned()),
                 "the refined phase must reach a document the fast tier does not contain; \
                  got {refined:?}"
+            );
+            // bd-ctzo C4: the coverage receipt reaches the caller, and every
+            // number in it comes from the owner witness or the returned
+            // candidates.
+            let coverage = metrics.coverage.as_ref().expect("owner-backed coverage");
+            match &coverage.quality {
+                frankensearch_core::TierQueryCoverageV1::Witnessed {
+                    generation_sequence,
+                    live_count,
+                    contributed_candidates,
+                } => {
+                    assert_eq!(*generation_sequence, 31, "read from the owner's witness");
+                    assert_eq!(*live_count, 3, "the quality tier holds three live docs");
+                    assert!(
+                        *contributed_candidates > 0,
+                        "the quality tier served candidates, so it must be credited with them"
+                    );
+                }
+                other => panic!("quality tier must be witnessed, got {other:?}"),
+            }
+            assert_eq!(
+                coverage.fast,
+                frankensearch_core::TierQueryCoverageV1::NotRequested,
+                "phase 2 activates the quality arm only; the fast pool came from phase 1"
+            );
+            assert!(
+                !coverage.redacted_summary().contains("doc-"),
+                "a coverage log line must never carry a document id: {}",
+                coverage.redacted_summary()
             );
             // A document with no fast row must not carry a QUALITY row ordinal
             // in the field everything downstream reads as a fast-tier index.

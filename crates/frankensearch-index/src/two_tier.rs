@@ -7,7 +7,7 @@
 
 #[cfg(feature = "ann")]
 use std::collections::HashSet;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs;
 use std::io::{Read as _, Seek as _, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -18,8 +18,8 @@ use std::sync::atomic::{AtomicU8, Ordering as AtomicOrdering};
 use frankensearch_core::config::ZeroSignalReason;
 use frankensearch_core::generation::EmbeddingIdentityBundleV1;
 use frankensearch_core::{
-    BoundQueryEmbedding, RetrievalTopology, SearchError, SearchResult, SpaceIdentityAdmission,
-    TieredQueryEmbeddings, TwoTierConfig, VectorHit,
+    BoundQueryEmbedding, RetrievalTopology, SearchCoverageV1, SearchError, SearchResult,
+    SpaceIdentityAdmission, TierQueryCoverageV1, TieredQueryEmbeddings, TwoTierConfig, VectorHit,
 };
 use tracing::{debug, info, warn};
 
@@ -2545,6 +2545,56 @@ impl<'index, 'query> ActivatedTierSearch<'index, 'query> {
                 reason: "fast retrieval requires an activated fast tier".to_owned(),
             })?
             .search_top_k(k)
+    }
+
+    /// Reconstruct this query's per-tier coverage from the retained owner
+    /// witnesses and the candidates actually returned (bd-ctzo C4).
+    ///
+    /// `returned` is the result set the caller is about to serve. Each tier's
+    /// contribution is COUNTED against it by canonical `doc_id` — not predicted
+    /// from the requested `k`, not taken from a caller-supplied scalar, and
+    /// not inferred from which tiers were activated. A tier that was
+    /// activated but whose documents all lost the blend contributes zero, and
+    /// that zero is a measurement.
+    ///
+    /// A tier the query did not bind reports `NotRequested`; there is no
+    /// variant that reports an absent tier as covering nothing, because
+    /// "not asked" and "asked and found nothing" are different facts.
+    ///
+    /// # Errors
+    ///
+    /// Propagates typed decode failures from re-reading each activated tier's
+    /// own top-`k` doc ids, which is how contribution is attributed.
+    pub fn coverage(&self, returned: &[VectorHit], k: usize) -> SearchResult<SearchCoverageV1> {
+        let fast = Self::tier_coverage(self.fast.as_ref(), returned, k)?;
+        let quality = Self::tier_coverage(self.quality.as_ref(), returned, k)?;
+        Ok(SearchCoverageV1::new(self.topology, fast, quality))
+    }
+
+    /// Coverage for one tier: the owner's own witness plus a counted
+    /// contribution.
+    fn tier_coverage(
+        tier: Option<&ActivatedTier<'index, 'query>>,
+        returned: &[VectorHit],
+        k: usize,
+    ) -> SearchResult<TierQueryCoverageV1> {
+        let Some(tier) = tier else {
+            return Ok(TierQueryCoverageV1::NotRequested);
+        };
+        let served: BTreeSet<String> = tier
+            .search_top_k(k)?
+            .into_iter()
+            .map(|hit| hit.doc_id.to_string())
+            .collect();
+        let contributed = returned
+            .iter()
+            .filter(|hit| served.contains(hit.doc_id.as_str()))
+            .count();
+        Ok(TierQueryCoverageV1::Witnessed {
+            generation_sequence: tier.generation_sequence(),
+            live_count: tier.live_count(),
+            contributed_candidates: contributed as u64,
+        })
     }
 
     /// Independent per-tier retrieval unioned by canonical document identity
@@ -7456,7 +7506,15 @@ mod tests {
         let fast_only = index
             .activate_owner_backed_search(&fast_only_embeddings)
             .expect("fast-only activation");
-        assert_eq!(fast_only.topology(), RetrievalTopology::FastOnly);
+        // HashControl, not FastOnly: `fsvi_v2_binding` builds its identities
+        // from `explicit_test_model`, which is a deterministic control space.
+        // The retrieval SHAPE under test is unchanged -- what changed
+        // (bd-ctzo C4) is that a control-lane query no longer reports one of
+        // the three semantic topology names. Before that guard these
+        // assertions read `FastOnly` / `QualityOnly` / `FullProgressive`,
+        // which was this fixture claiming semantic availability it has never
+        // had.
+        assert_eq!(fast_only.topology(), RetrievalTopology::HashControl);
         let fast_pool = fast_only.search_fast(1).expect("fast search");
         assert_eq!(fast_pool[0].doc_id, "doc-near");
         assert!(
@@ -7469,7 +7527,7 @@ mod tests {
         let quality_only = index
             .activate_owner_backed_search(&quality_only_embeddings)
             .expect("quality-only activation");
-        assert_eq!(quality_only.topology(), RetrievalTopology::QualityOnly);
+        assert_eq!(quality_only.topology(), RetrievalTopology::HashControl);
         assert_eq!(
             quality_only.search_quality(1).expect("quality search")[0].doc_id,
             "doc-quality-only",
@@ -7485,7 +7543,7 @@ mod tests {
         let progressive = index
             .activate_owner_backed_search(&progressive_embeddings)
             .expect("progressive activation");
-        assert_eq!(progressive.topology(), RetrievalTopology::FullProgressive);
+        assert_eq!(progressive.topology(), RetrievalTopology::HashControl);
         let union = progressive.search_union(2).expect("union");
         let union_ids: Vec<&str> = union.iter().map(|hit| hit.doc_id.as_str()).collect();
         // THE DISCRIMINATING ASSERTION: doc-quality-only exists in no fast
@@ -7707,6 +7765,47 @@ mod tests {
             tier.owner().witness().record_count,
             3,
             "coverage is read from the retained witness, not from the caller"
+        );
+
+        // The assembled receipt: every populated field is the owner's witness
+        // or a count taken against the results actually returned.
+        let returned = activated.search_fast(2).expect("fast search");
+        assert_eq!(returned.len(), 2);
+        let coverage = activated.coverage(&returned, 2).expect("coverage");
+        assert_eq!(
+            coverage.fast,
+            TierQueryCoverageV1::Witnessed {
+                generation_sequence: 91,
+                live_count: 3,
+                contributed_candidates: 2,
+            }
+        );
+        assert_eq!(
+            coverage.quality,
+            TierQueryCoverageV1::NotRequested,
+            "a tier the query never bound is NOT REQUESTED -- not a tier that covered nothing"
+        );
+        assert_eq!(coverage.quality.witnessed_live_count(), None);
+        assert!(
+            coverage.is_hash_control(),
+            "the fixture space is a deterministic control, so the receipt must say so"
+        );
+        // CONTRIBUTION IS COUNTED, NOT PREDICTED: hand the same activation a
+        // result set containing a document this tier did not serve, and the
+        // count drops rather than tracking `returned.len()`.
+        let foreign = vec![VectorHit {
+            index: u32::MAX,
+            score: 1.0,
+            doc_id: "doc-from-somewhere-else".into(),
+        }];
+        let diluted = activated.coverage(&foreign, 2).expect("coverage");
+        assert_eq!(
+            diluted.fast,
+            TierQueryCoverageV1::Witnessed {
+                generation_sequence: 91,
+                live_count: 3,
+                contributed_candidates: 0,
+            }
         );
 
         let _ = fs::remove_dir_all(&dir);

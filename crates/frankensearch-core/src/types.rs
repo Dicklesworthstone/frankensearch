@@ -566,7 +566,7 @@ impl TieredQueryEmbeddings {
     /// Whether any bound tier was produced in a non-semantic control space.
     #[must_use]
     pub const fn binds_hash_control(&self) -> bool {
-        const fn is_hash(embedding: &Option<BoundQueryEmbedding>) -> bool {
+        const fn is_hash(embedding: Option<&BoundQueryEmbedding>) -> bool {
             match embedding {
                 Some(bound) => matches!(
                     bound.identity.space.kind,
@@ -575,7 +575,7 @@ impl TieredQueryEmbeddings {
                 None => false,
             }
         }
-        is_hash(&self.fast) || is_hash(&self.quality)
+        is_hash(self.fast.as_ref()) || is_hash(self.quality.as_ref())
     }
 }
 
@@ -4691,9 +4691,11 @@ mod tests {
 
     #[test]
     fn tiered_constructors_report_supported_topology() {
-        let fast = BoundQueryEmbedding::new(vec![0.1; 8], identity("fast-model", 8)).unwrap();
+        let fast =
+            BoundQueryEmbedding::new(vec![0.1; 8], semantic_identity("fast-model", 8)).unwrap();
         let quality =
-            BoundQueryEmbedding::new(vec![0.2; 16], identity("quality-model", 16)).unwrap();
+            BoundQueryEmbedding::new(vec![0.2; 16], semantic_identity("quality-model", 16))
+                .unwrap();
 
         let progressive = TieredQueryEmbeddings::progressive(fast.clone(), quality.clone());
         assert_eq!(
@@ -4709,6 +4711,96 @@ mod tests {
             TieredQueryEmbeddings::quality_only(quality).supported_topology(),
             RetrievalTopology::QualityOnly
         );
+    }
+
+    /// bd-ctzo C4: a hash-control space can never report a semantic topology.
+    ///
+    /// This test previously did not exist, and the one above asserted
+    /// `FullProgressive` for two `explicit_test_model` bundles — which are
+    /// `HashControl` spaces. Every fixture in the tree was therefore claiming
+    /// semantic availability it did not have.
+    #[test]
+    fn a_hash_control_space_can_never_report_a_semantic_topology() {
+        let hash_fast = BoundQueryEmbedding::new(vec![0.1; 8], identity("hash-fast", 8)).unwrap();
+        let hash_quality =
+            BoundQueryEmbedding::new(vec![0.2; 8], identity("hash-quality", 8)).unwrap();
+        let semantic_fast =
+            BoundQueryEmbedding::new(vec![0.1; 8], semantic_identity("real-fast", 8)).unwrap();
+        let semantic_quality =
+            BoundQueryEmbedding::new(vec![0.2; 8], semantic_identity("real-quality", 8)).unwrap();
+
+        for (label, embeddings) in [
+            (
+                "both hash",
+                TieredQueryEmbeddings::progressive(hash_fast.clone(), hash_quality.clone()),
+            ),
+            (
+                "fast hash only",
+                TieredQueryEmbeddings::fast_only(hash_fast.clone()),
+            ),
+            (
+                "quality hash only",
+                TieredQueryEmbeddings::quality_only(hash_quality.clone()),
+            ),
+            // A MIXED pair is still not semantic: a topology describes the
+            // whole retrieval, not its strongest arm.
+            (
+                "semantic fast + hash quality",
+                TieredQueryEmbeddings::progressive(semantic_fast.clone(), hash_quality),
+            ),
+            (
+                "hash fast + semantic quality",
+                TieredQueryEmbeddings::progressive(hash_fast, semantic_quality.clone()),
+            ),
+        ] {
+            assert_eq!(
+                embeddings.supported_topology(),
+                RetrievalTopology::HashControl,
+                "{label} must not claim a semantic topology"
+            );
+            assert!(embeddings.binds_hash_control(), "{label}");
+        }
+
+        // Control: two learned spaces DO report a semantic topology, so the
+        // guard above is not simply answering HashControl for everything.
+        let semantic = TieredQueryEmbeddings::progressive(semantic_fast, semantic_quality);
+        assert_eq!(
+            semantic.supported_topology(),
+            RetrievalTopology::FullProgressive
+        );
+        assert!(!semantic.binds_hash_control());
+    }
+
+    /// bd-ctzo C4: unknown coverage has no number, so it cannot be reported
+    /// as zero.
+    #[test]
+    fn unknown_tier_coverage_cannot_be_read_as_a_zero_count() {
+        let unknown = TierQueryCoverageV1::Unknown {
+            reason: CoverageUnknownReasonV1::LegacyUnidentified,
+        };
+        let empty_but_live = TierQueryCoverageV1::Witnessed {
+            generation_sequence: 7,
+            live_count: 0,
+            contributed_candidates: 0,
+        };
+        assert_eq!(unknown.witnessed_live_count(), None);
+        assert_eq!(empty_but_live.witnessed_live_count(), Some(0));
+        assert_ne!(
+            unknown, empty_but_live,
+            "an unwitnessed tier and a genuinely empty one must not compare equal"
+        );
+
+        let coverage = SearchCoverageV1::new(
+            RetrievalTopology::FastOnly,
+            unknown,
+            TierQueryCoverageV1::NotRequested,
+        );
+        let summary = coverage.redacted_summary();
+        assert!(summary.contains("fast=unknown"), "{summary}");
+        assert!(summary.contains("quality=not_requested"), "{summary}");
+        // The summary is built from closed codes and integers only; there is
+        // no field on the type through which a doc id or vector could reach it.
+        assert!(!summary.contains("doc"), "{summary}");
     }
 
     #[test]

@@ -510,6 +510,17 @@ pub struct TwoTierMetrics {
     /// via `serde(default)`.
     #[serde(default)]
     pub zero_signal: Option<ZeroSignalReason>,
+    /// Per-tier coverage reconstructed from the retained owner witnesses and
+    /// the candidates actually returned (bd-ctzo C4).
+    ///
+    /// `None` means this search had no owner-backed activation to witness —
+    /// a legacy artifact, or a lane that never reached the quality tier. That
+    /// absence is deliberately NOT a zero-coverage receipt: an unwitnessed
+    /// search and a search that covered nothing are different facts, and
+    /// [`crate::TierQueryCoverageV1`] has no variant that conflates them.
+    /// `serde(default)` keeps older payloads readable.
+    #[serde(default)]
+    pub coverage: Option<crate::types::SearchCoverageV1>,
 }
 
 /// Schema version for zero-signal classification payloads.
