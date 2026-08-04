@@ -663,3 +663,72 @@ pub(crate) mod maintenance_execution {
         }
     }
 }
+
+#[cfg(all(test, feature = "perf-harness"))]
+mod merge_execution_tests {
+    use super::maintenance_execution::ingest_and_probe;
+    use frankensearch_core::IndexableDocument;
+    use frankensearch_quill::QuillConfig;
+
+    fn corpus() -> Vec<IndexableDocument> {
+        vec![
+            IndexableDocument::new("doc-1", "alpha beta beta"),
+            IndexableDocument::new("doc-2", "alpha gamma"),
+            IndexableDocument::new("doc-3", "beta gamma gamma"),
+            IndexableDocument::new("doc-4", "alpha beta gamma delta"),
+            IndexableDocument::new("doc-5", "delta epsilon alpha"),
+            IndexableDocument::new("doc-6", "alpha alpha beta"),
+        ]
+    }
+
+    /// `tier_fanout: 2` makes the tier policy merge as soon as a second sealed
+    /// segment appears, so committing per batch produces real concat-merges.
+    fn merging_config() -> QuillConfig {
+        QuillConfig {
+            tier_fanout: 2,
+            ..QuillConfig::default()
+        }
+    }
+
+    /// e6.3-merge-schedule-v1 EXECUTED AGAINST REAL MERGES.
+    ///
+    /// The unperturbed arm ingests the whole corpus in one batch and commits
+    /// once. The perturbed arm commits per batch under `tier_fanout: 2`, which
+    /// drives `apply_tier_policy` into genuine `concat_merge` calls. Merging is
+    /// a maintenance decision, so the observation must be unchanged.
+    #[test]
+    fn merge_schedule_law_holds_against_real_concat_merges() {
+        let documents = corpus();
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let baseline =
+                ingest_and_probe(&cx, merging_config(), &documents, documents.len(), "alpha").await;
+            let merged = ingest_and_probe(&cx, merging_config(), &documents, 1, "alpha").await;
+
+            // NON-DEGENERACY, proven from the commit snapshots rather than
+            // assumed: six commits that never merged would leave six segments.
+            // A segment count below the commit count is a merge that happened.
+            let commits = merged.sealed_after_each_commit.len();
+            let final_segments = *merged
+                .sealed_after_each_commit
+                .last()
+                .expect("at least one commit");
+            assert!(
+                final_segments < commits,
+                "no real merge occurred: {commits} commits left {final_segments} segments \
+                 ({:?}); this law would be vacuously true and a flush would have been \
+                 indistinguishable from a merge",
+                merged.sealed_after_each_commit
+            );
+
+            // THE LAW: merging changes segment geometry, not content.
+            assert_eq!(
+                merged.doc_count, baseline.doc_count,
+                "merging must not change the live document count"
+            );
+            assert_eq!(
+                merged.ranked_ids, baseline.ranked_ids,
+                "merging must not change the ranked result"
+            );
+        });
+    }
+}
