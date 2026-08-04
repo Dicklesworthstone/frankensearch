@@ -1,8 +1,9 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::process::Command;
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -1290,6 +1291,59 @@ impl ArtifactStoreV4SourceBuildSnapshots {
         Ok(Self { source, build })
     }
 
+    /// Collect the current clean Linux producer's complete tracked workspace
+    /// and the build facts sealed into its running `/proc/self/exe` image.
+    ///
+    /// The collector deliberately refuses an unverified/dirty checkout, an
+    /// unsupported platform, and runtime Rust flag or linker overrides that
+    /// the compiled producer identity cannot bind. The resulting Build object
+    /// carries the kernel-held executable digest, not a replaceable path.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GauntletError`] when source selection, descriptor capture,
+    /// compiled producer identity, or Linux running-image binding fails.
+    pub fn collect_current_linux() -> Result<Self, GauntletError> {
+        #[cfg(target_os = "linux")]
+        {
+            let producer = GauntletProducerBuildIdentity::compiled()?;
+            producer.validate_live_source_checkout()?;
+            let snapshots =
+                Self::collect_verified_linux_workspace(&producer_workspace_root(), &producer)?;
+            // The first checkout check fences stale construction. Repeating it
+            // after descriptor capture rejects a tracked file changed between
+            // selection and publication rather than admitting a mixed source
+            // generation against the already-running executable.
+            producer.validate_live_source_checkout()?;
+            Ok(snapshots)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            Err(GauntletError::InvalidPreparedArtifact {
+                reason: "ArtifactStore v4 current-process collection requires Linux /proc/self/exe"
+                    .to_owned(),
+            })
+        }
+    }
+
+    fn collect_verified_linux_workspace(
+        root: &Path,
+        producer: &GauntletProducerBuildIdentity,
+    ) -> Result<Self, GauntletError> {
+        producer.validate_stored_sealed_v2()?;
+        let selected = collect_tracked_compiler_inputs(root)?;
+        let source = ArtifactStoreV4SourceSnapshot::capture_selected(
+            root,
+            selected,
+            MAX_ARTIFACTSTORE_V4_SOURCE_SNAPSHOT_BYTES,
+        )?;
+        let build = ArtifactStoreV4BuildSnapshot::new(
+            source.identity_sha256.clone(),
+            collect_current_linux_build_inputs(root, &source, producer)?,
+        )?;
+        Self::new(source, build)
+    }
+
     #[must_use]
     pub const fn source(&self) -> &ArtifactStoreV4SourceSnapshot {
         &self.source
@@ -1700,6 +1754,274 @@ fn is_canonical_build_input_key(key: &str) -> bool {
         && key.bytes().all(|byte| {
             byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b'/' | b':')
         })
+}
+
+fn collect_tracked_compiler_inputs(
+    root: &Path,
+) -> Result<BTreeMap<String, Vec<ArtifactStoreV4SourceInclusionReason>>, GauntletError> {
+    let mut command = Command::new("git");
+    command.arg("-C").arg(root).args(["ls-files", "-z"]);
+    for (name, _) in std::env::vars_os() {
+        if name.as_encoded_bytes().starts_with(b"GIT_") {
+            command.env_remove(name);
+        }
+    }
+    let output = command
+        .output()
+        .map_err(|error| GauntletError::InvalidPreparedArtifact {
+            reason: format!("ArtifactStore v4 cannot enumerate tracked compiler inputs: {error}"),
+        })?;
+    if !output.status.success() {
+        return Err(GauntletError::InvalidPreparedArtifact {
+            reason: "ArtifactStore v4 cannot enumerate tracked compiler inputs".to_owned(),
+        });
+    }
+
+    let mut selected = BTreeMap::new();
+    for raw_path in output.stdout.split(|byte| *byte == 0) {
+        if raw_path.is_empty() {
+            continue;
+        }
+        let path =
+            std::str::from_utf8(raw_path).map_err(|_| GauntletError::InvalidPreparedArtifact {
+                reason: "ArtifactStore v4 tracked compiler input is not UTF-8".to_owned(),
+            })?;
+        if !is_canonical_source_relative_path(path) {
+            return Err(GauntletError::InvalidPreparedArtifact {
+                reason: "ArtifactStore v4 tracked compiler input path is ambiguous".to_owned(),
+            });
+        }
+        selected.insert(path.to_owned(), compiler_input_reasons(path));
+    }
+    if selected.is_empty() || !selected.contains_key("Cargo.lock") {
+        return Err(GauntletError::InvalidPreparedArtifact {
+            reason: "ArtifactStore v4 tracked compiler input set is missing Cargo.lock".to_owned(),
+        });
+    }
+    Ok(selected)
+}
+
+fn compiler_input_reasons(path: &str) -> Vec<ArtifactStoreV4SourceInclusionReason> {
+    let mut reasons = BTreeSet::from([ArtifactStoreV4SourceInclusionReason::Tracked]);
+    if path == "Cargo.lock" {
+        reasons.insert(ArtifactStoreV4SourceInclusionReason::CargoLock);
+    }
+    if path == "rust-toolchain.toml" || path == "rust-toolchain" {
+        reasons.insert(ArtifactStoreV4SourceInclusionReason::ToolchainConfig);
+    }
+    if path == ".cargo/config" || path == ".cargo/config.toml" {
+        reasons.insert(ArtifactStoreV4SourceInclusionReason::CargoConfig);
+        reasons.insert(ArtifactStoreV4SourceInclusionReason::TargetConfig);
+    }
+    if path == "Cargo.toml" || path.ends_with("/Cargo.toml") {
+        reasons.insert(ArtifactStoreV4SourceInclusionReason::WorkspaceMember);
+        reasons.insert(ArtifactStoreV4SourceInclusionReason::PathDependency);
+    }
+    if path == "build.rs" || path.ends_with("/build.rs") {
+        reasons.insert(ArtifactStoreV4SourceInclusionReason::BuildScriptInput);
+    }
+    reasons.into_iter().collect()
+}
+
+fn collect_current_linux_build_inputs(
+    root: &Path,
+    source: &ArtifactStoreV4SourceSnapshot,
+    producer: &GauntletProducerBuildIdentity,
+) -> Result<Vec<ArtifactStoreV4BuildInput>, GauntletError> {
+    producer.validate_stored_sealed_v2()?;
+    reject_unbound_runtime_build_overrides()?;
+
+    let mut inputs = BTreeMap::new();
+    inputs.insert(
+        "cargo-lock".to_owned(),
+        build_input(
+            ArtifactStoreV4BuildInputKind::CargoLock,
+            read_source_file_bound_to_snapshot(root, source, "Cargo.lock")?,
+        ),
+    );
+    for path in ["rust-toolchain.toml", "rust-toolchain"] {
+        if source
+            .entries
+            .iter()
+            .any(|entry| entry.relative_path == path)
+        {
+            inputs.insert(
+                format!("toolchain/{path}"),
+                build_input(
+                    ArtifactStoreV4BuildInputKind::Toolchain,
+                    read_source_file_bound_to_snapshot(root, source, path)?,
+                ),
+            );
+        }
+    }
+    for path in [".cargo/config", ".cargo/config.toml"] {
+        if source
+            .entries
+            .iter()
+            .any(|entry| entry.relative_path == path)
+        {
+            let bytes = read_source_file_bound_to_snapshot(root, source, path)?;
+            inputs.insert(
+                format!("cargo-config/{path}"),
+                build_input(ArtifactStoreV4BuildInputKind::CargoConfig, bytes.clone()),
+            );
+            inputs.insert(
+                format!("target-config/{path}"),
+                build_input(ArtifactStoreV4BuildInputKind::TargetConfig, bytes),
+            );
+        }
+    }
+    inputs.insert(
+        "compiler/rustc-vv".to_owned(),
+        build_input(
+            ArtifactStoreV4BuildInputKind::Compiler,
+            decode_lower_hex(&producer.rustc_version_verbose_hex).ok_or_else(|| {
+                GauntletError::InvalidPreparedArtifact {
+                    reason: "ArtifactStore v4 producer rustc bytes are malformed".to_owned(),
+                }
+            })?,
+        ),
+    );
+    inputs.insert(
+        "environment/allowlist".to_owned(),
+        build_input(
+            ArtifactStoreV4BuildInputKind::Environment,
+            serde_json::to_vec(&[
+                "RUSTFLAGS=unset",
+                "CARGO_ENCODED_RUSTFLAGS=unset",
+                "RUSTC_LINKER=unset",
+            ])?,
+        ),
+    );
+    inputs.insert(
+        "features/enabled".to_owned(),
+        build_input(
+            ArtifactStoreV4BuildInputKind::FeatureSelection,
+            producer.enabled_features.join("\n").into_bytes(),
+        ),
+    );
+    inputs.insert(
+        "profile/cargo".to_owned(),
+        build_input(
+            ArtifactStoreV4BuildInputKind::Profile,
+            producer.cargo_profile.as_bytes().to_vec(),
+        ),
+    );
+    inputs.insert(
+        "rustflags/absent".to_owned(),
+        build_input(ArtifactStoreV4BuildInputKind::Rustflags, b"absent".to_vec()),
+    );
+    inputs.insert(
+        "target/triple".to_owned(),
+        build_input(
+            ArtifactStoreV4BuildInputKind::TargetConfig,
+            producer.target_triple.as_bytes().to_vec(),
+        ),
+    );
+    inputs.insert(
+        "executable/linux-procfs-running-image".to_owned(),
+        linux_running_image_build_input(producer)?,
+    );
+    inputs.insert(
+        "debug/producer-build-identity".to_owned(),
+        build_input(
+            ArtifactStoreV4BuildInputKind::DebugMetadata,
+            serde_json::to_vec(producer)?,
+        ),
+    );
+
+    Ok(inputs
+        .into_iter()
+        .map(|(key, mut input)| {
+            input.key = key;
+            input
+        })
+        .collect())
+}
+
+fn reject_unbound_runtime_build_overrides() -> Result<(), GauntletError> {
+    for name in ["RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS", "RUSTC_LINKER"] {
+        if std::env::var_os(name).is_some_and(|value| !value.is_empty()) {
+            return Err(GauntletError::InvalidPreparedArtifact {
+                reason: format!(
+                    "ArtifactStore v4 refuses unbound runtime compiler override {name}"
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn read_source_file_bound_to_snapshot(
+    root: &Path,
+    source: &ArtifactStoreV4SourceSnapshot,
+    relative_path: &str,
+) -> Result<Vec<u8>, GauntletError> {
+    let entry = source
+        .entries
+        .iter()
+        .find(|entry| entry.relative_path == relative_path)
+        .ok_or_else(|| GauntletError::InvalidPreparedArtifact {
+            reason: format!(
+                "ArtifactStore v4 source snapshot omits required input {relative_path}"
+            ),
+        })?;
+    if entry.kind != ArtifactStoreV4SourceEntryKind::File {
+        return Err(GauntletError::InvalidPreparedArtifact {
+            reason: format!(
+                "ArtifactStore v4 required input {relative_path} is not a regular file"
+            ),
+        });
+    }
+    let bytes = std::fs::read(root.join(relative_path))?;
+    if u64::try_from(bytes.len()).unwrap_or(u64::MAX) != entry.byte_len
+        || lower_hex(&Sha256::digest(&bytes)) != entry.sha256
+    {
+        return Err(GauntletError::InvalidPreparedArtifact {
+            reason: format!("ArtifactStore v4 source input {relative_path} changed after capture"),
+        });
+    }
+    Ok(bytes)
+}
+
+fn build_input(
+    kind: ArtifactStoreV4BuildInputKind,
+    canonical_bytes: Vec<u8>,
+) -> ArtifactStoreV4BuildInput {
+    ArtifactStoreV4BuildInput {
+        key: String::new(),
+        kind,
+        sha256: lower_hex(&Sha256::digest(&canonical_bytes)),
+        canonical_bytes,
+    }
+}
+
+fn linux_running_image_build_input(
+    producer: &GauntletProducerBuildIdentity,
+) -> Result<ArtifactStoreV4BuildInput, GauntletError> {
+    let (sha256, byte_len, verification) = current_executable_identity()?;
+    if !producer
+        .target_triple
+        .split('-')
+        .any(|component| component == "linux")
+        || verification != GauntletExecutableVerification::ProcfsRunningImage
+        || producer.executable_verification != GauntletExecutableVerification::ProcfsRunningImage
+        || producer.executable_sha256 != sha256
+        || producer.executable_byte_len != byte_len
+    {
+        return Err(GauntletError::InvalidPreparedArtifact {
+            reason: "ArtifactStore v4 Linux executable receipt does not bind the running /proc/self/exe image".to_owned(),
+        });
+    }
+    build_input(
+        ArtifactStoreV4BuildInputKind::Executable,
+        serde_json::to_vec(&serde_json::json!({
+            "path": "/proc/self/exe",
+            "sha256": sha256,
+            "byte_len": byte_len,
+            "verification": verification,
+        }))?,
+    )
 }
 
 /// Mutable run provenance referencing one immutable object hash.
@@ -3943,6 +4265,126 @@ mod tests {
             retargeted.validate(),
             Err(GauntletError::InvalidPreparedArtifact { .. })
         ));
+    }
+
+    #[test]
+    fn artifactstore_v4_collects_every_tracked_input_with_compiler_reasons() {
+        let (repository, _) = clean_fixture_repository();
+        std::fs::create_dir_all(repository.path().join(".cargo"))
+            .expect("create Cargo configuration directory");
+        std::fs::create_dir_all(repository.path().join("crates/example"))
+            .expect("create workspace member directory");
+        std::fs::write(repository.path().join("Cargo.lock"), b"lock\n").expect("write Cargo lock");
+        std::fs::write(
+            repository.path().join("rust-toolchain.toml"),
+            b"[toolchain]\n",
+        )
+        .expect("write toolchain configuration");
+        std::fs::write(repository.path().join(".cargo/config.toml"), b"[build]\n")
+            .expect("write Cargo configuration");
+        std::fs::write(repository.path().join("build.rs"), b"fn main() {}\n")
+            .expect("write build script");
+        std::fs::write(
+            repository.path().join("crates/example/Cargo.toml"),
+            b"[package]\nname = \"example\"\nversion = \"0.1.0\"\n",
+        )
+        .expect("write workspace member manifest");
+        run_fixture_git(repository.path(), &["add", "."]);
+        run_fixture_git(
+            repository.path(),
+            &[
+                "-c",
+                "user.name=Gauntlet Test",
+                "-c",
+                "user.email=gauntlet@example.invalid",
+                "commit",
+                "--quiet",
+                "-m",
+                "compiler inputs",
+            ],
+        );
+
+        let selected = collect_tracked_compiler_inputs(repository.path())
+            .expect("collect tracked compiler inputs");
+        assert!(selected.contains_key("tracked.txt"));
+        assert!(selected["Cargo.lock"].contains(&ArtifactStoreV4SourceInclusionReason::CargoLock));
+        assert!(
+            selected["rust-toolchain.toml"]
+                .contains(&ArtifactStoreV4SourceInclusionReason::ToolchainConfig)
+        );
+        assert!(
+            selected[".cargo/config.toml"]
+                .contains(&ArtifactStoreV4SourceInclusionReason::CargoConfig)
+        );
+        assert!(
+            selected[".cargo/config.toml"]
+                .contains(&ArtifactStoreV4SourceInclusionReason::TargetConfig)
+        );
+        assert!(
+            selected["build.rs"].contains(&ArtifactStoreV4SourceInclusionReason::BuildScriptInput)
+        );
+        assert!(
+            selected["crates/example/Cargo.toml"]
+                .contains(&ArtifactStoreV4SourceInclusionReason::WorkspaceMember)
+        );
+
+        let snapshot =
+            ArtifactStoreV4SourceSnapshot::capture_selected(repository.path(), selected, 1024)
+                .expect("descriptor-stable source snapshot");
+        assert!(
+            snapshot
+                .entries
+                .iter()
+                .any(|entry| entry.relative_path == "Cargo.lock")
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn artifactstore_v4_linux_executable_receipt_binds_running_procfs_image() {
+        let producer = GauntletProducerBuildIdentity::compiled().expect("compiled producer");
+        let input = linux_running_image_build_input(&producer)
+            .expect("bind kernel-held running executable");
+        assert_eq!(input.kind, ArtifactStoreV4BuildInputKind::Executable);
+        let receipt: serde_json::Value =
+            serde_json::from_slice(&input.canonical_bytes).expect("decode executable receipt");
+        assert_eq!(receipt["path"], "/proc/self/exe");
+        assert_eq!(receipt["sha256"], producer.executable_sha256);
+        assert_eq!(receipt["byte_len"], producer.executable_byte_len);
+        assert_eq!(receipt["verification"], "procfs_running_image");
+
+        let mut path_snapshot = producer;
+        path_snapshot.executable_verification = GauntletExecutableVerification::PathSnapshot;
+        assert!(
+            linux_running_image_build_input(&path_snapshot).is_err(),
+            "a replaceable executable path must not satisfy the Linux receipt"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires a clean Git-verified producer; run on strict remote Linux"]
+    fn artifactstore_v4_current_linux_collector_binds_procfs_image_to_source_build_chain() {
+        let snapshots = ArtifactStoreV4SourceBuildSnapshots::collect_current_linux()
+            .expect("collect a clean current Linux source/build chain");
+        snapshots.source().validate().expect("validate source snapshot");
+        snapshots.build().validate().expect("validate build snapshot");
+        let executable = snapshots
+            .build()
+            .inputs
+            .iter()
+            .find(|input| input.kind == ArtifactStoreV4BuildInputKind::Executable)
+            .expect("Build snapshot must retain a Linux executable receipt");
+        let receipt: serde_json::Value =
+            serde_json::from_slice(&executable.canonical_bytes).expect("decode executable receipt");
+        assert_eq!(receipt["path"], "/proc/self/exe");
+        assert_eq!(receipt["verification"], "procfs_running_image");
+        assert_eq!(
+            receipt["sha256"],
+            GauntletProducerBuildIdentity::compiled()
+                .expect("compiled producer")
+                .executable_sha256
+        );
     }
 
     #[test]

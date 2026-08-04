@@ -4677,6 +4677,21 @@ impl DifferentialCampaignRunner {
         Ok(self)
     }
 
+    /// Collect and attach the current Linux producer's sealed v4 Source and
+    /// Build objects. This records the running `/proc/self/exe` digest in the
+    /// Build object before the campaign reservation is created.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the checkout is not clean and Git-verified, a
+    /// compiler-visible input cannot be captured, or the running executable
+    /// cannot be bound through the Linux kernel-held image path.
+    pub fn with_collected_v4_source_build_snapshots(self) -> Result<Self, GauntletError> {
+        self.with_v4_source_build_snapshots(
+            ArtifactStoreV4SourceBuildSnapshots::collect_current_linux()?,
+        )
+    }
+
     /// Attach immutable production provenance (bd-quill-e6-gauntlet-scale-rm3q.9).
     /// Every production campaign run stamps it into the reservation and the
     /// report; regression fixtures deliberately leave it absent.
