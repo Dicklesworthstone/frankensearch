@@ -1981,6 +1981,23 @@ fn collect_current_linux_build_inputs(
             );
         }
     }
+    for entry in &source.entries {
+        if entry.kind == ArtifactStoreV4SourceEntryKind::File
+            && entry
+                .inclusion_reasons
+                .contains(&ArtifactStoreV4SourceInclusionReason::BuildScriptInput)
+        {
+            let path = &entry.relative_path;
+            let key = ["build-script-input/", path].concat();
+            inputs.insert(
+                key,
+                build_input(
+                    ArtifactStoreV4BuildInputKind::BuildScriptInput,
+                    read_source_file_bound_to_snapshot(root, source, path)?,
+                ),
+            );
+        }
+    }
     inputs.insert(
         "compiler/rustc-vv".to_owned(),
         build_input(
@@ -4621,6 +4638,14 @@ mod tests {
         assert_eq!(
             availability["reason"],
             "running producer has no authoritative Cargo build-script output manifest"
+        );
+        assert!(
+            snapshots.build().inputs.iter().any(|input| {
+                input.kind == ArtifactStoreV4BuildInputKind::BuildScriptInput
+                    && input.key.starts_with("build-script-input/")
+                    && input.key.ends_with("build.rs")
+            }),
+            "Build snapshot must bind every source-captured build script as compiler input"
         );
     }
 
