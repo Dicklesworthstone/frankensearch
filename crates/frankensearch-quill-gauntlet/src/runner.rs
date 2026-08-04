@@ -9060,6 +9060,13 @@ mod tests {
         let matrix = registry
             .applicability_matrix()
             .expect("valid E6.3 applicability matrix");
+        assert!(
+            matrix.iter().any(|entry| {
+                entry.law_id == "e6.3-upsert-versus-delete-add-v1"
+                    && entry.applicability == MetamorphicLawApplicability::Applies
+            }),
+            "the shipping LexicalWrite replacement law must remain applicable; reverting it to a capability skip would erase live coverage"
+        );
         assert!(matrix.iter().any(|entry| {
             entry.law_id == "e6.3-tombstone-compaction-v1"
                 && entry.applicability
