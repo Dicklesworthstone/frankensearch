@@ -5,9 +5,9 @@
 //! - optional quality-tier rescoring from `vector.quality.idx`
 //! - doc-id alignment between both tiers
 
-use std::collections::HashMap;
 #[cfg(feature = "ann")]
 use std::collections::HashSet;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io::{Read as _, Seek as _, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -17,7 +17,10 @@ use std::sync::atomic::{AtomicU8, Ordering as AtomicOrdering};
 
 use frankensearch_core::config::ZeroSignalReason;
 use frankensearch_core::generation::EmbeddingIdentityBundleV1;
-use frankensearch_core::{SearchError, SearchResult, TwoTierConfig, VectorHit};
+use frankensearch_core::{
+    BoundQueryEmbedding, RetrievalTopology, SearchError, SearchResult, SpaceIdentityAdmission,
+    TieredQueryEmbeddings, TwoTierConfig, VectorHit,
+};
 use tracing::{debug, info, warn};
 
 #[cfg(all(feature = "ann", test))]
@@ -1064,6 +1067,75 @@ impl TwoTierIndex {
         self.fast_space_fingerprint_hex
             .as_ref()
             .map(|hex| hex.chars().take(16).collect())
+    }
+
+    /// Activate typed owner-backed exact search for one query
+    /// (bd-core-vector-space-search-guard-ctzo).
+    ///
+    /// Every identity join happens HERE, before a single vector byte is
+    /// read: requested topology against the tiers actually retained, the
+    /// artifact's own canonical identity against the caller's admitted
+    /// binding, the complete bd-9xuj admission law (space fingerprints join
+    /// AND the producer is identical — a certified-foreign producer is
+    /// comparison-grade telemetry and is refused here), storage identity,
+    /// dimension, and the generation and live-docset witnesses used for
+    /// coverage. The returned [`ActivatedTierSearch`] is the only route to a
+    /// vector read, so no search method can run ahead of its validation:
+    /// there is nothing to instrument for "zero work before rejection"
+    /// because the work is unreachable, not merely unreached.
+    ///
+    /// The expected identity bundle comes from `fast_binding` /
+    /// `quality_binding` rather than from the owner, because
+    /// `EmbeddingIdentityBundleV1` canonical bytes are one-way (there is no
+    /// decoder). That is not a caller-trust hole: the binding's canonical
+    /// bytes are checked here against the artifact's own retained bytes, so
+    /// a caller cannot present an identity the artifact does not carry.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError::InvalidConfig`] naming the exact tier and
+    /// contract field for a topology, identity, producer, storage,
+    /// dimension or generation mismatch, and for a tier the query requests
+    /// that this index does not retain as an admitted v2 owner.
+    pub fn activate_owner_backed_search<'index, 'query>(
+        &'index self,
+        embeddings: &'query TieredQueryEmbeddings,
+        fast_binding: Option<&FsviV2IdentityBinding>,
+        quality_binding: Option<&FsviV2IdentityBinding>,
+    ) -> SearchResult<ActivatedTierSearch<'index, 'query>> {
+        let topology = embeddings.supported_topology();
+        let fast = match embeddings.fast() {
+            Some(query) => Some(activate_tier(
+                self.fast_admitted_owner(),
+                fast_binding,
+                query,
+                "fast",
+            )?),
+            None => None,
+        };
+        let quality = match embeddings.quality() {
+            Some(query) => Some(activate_tier(
+                self.quality_admitted_owner(),
+                quality_binding,
+                query,
+                "quality",
+            )?),
+            None => None,
+        };
+        if fast.is_none() && quality.is_none() {
+            return Err(SearchError::InvalidConfig {
+                field: "search_activation.topology".to_owned(),
+                value: format!("{topology:?}"),
+                reason: "no tier was requested; vector activation requires at least one \
+                         owner-backed tier"
+                    .to_owned(),
+            });
+        }
+        Ok(ActivatedTierSearch {
+            fast,
+            quality,
+            topology,
+        })
     }
 
     /// Quality-tier counterpart of [`Self::fast_admitted_owner`].
@@ -2262,6 +2334,238 @@ fn ensure_identity_describes_tier(
 /// in [`TierSource::AdmittedV2`] and borrow the validated index from inside
 /// it, so the parsed v2 identity metadata (`identity_v2()` stays `Some`)
 /// still marks the tier ATTESTED on the assembled [`TwoTierIndex`].
+/// One tier that passed every identity join, paired with the query bound to
+/// it (bd-ctzo). Holding this is the proof the join happened.
+#[derive(Debug)]
+pub struct ActivatedTier<'index, 'query> {
+    owner: &'index ValidatedFsviBytes,
+    query: &'query BoundQueryEmbedding,
+}
+
+impl ActivatedTier<'_, '_> {
+    /// Exact top-k over the retained owner's own bytes.
+    ///
+    /// # Errors
+    ///
+    /// Propagates typed row/vector decode failures from the owner.
+    pub fn search_top_k(&self, k: usize) -> SearchResult<Vec<VectorHit>> {
+        self.owner.search_top_k(self.query.vector(), k, None)
+    }
+
+    /// The retained owner this tier serves from.
+    #[must_use]
+    pub const fn owner(&self) -> &ValidatedFsviBytes {
+        self.owner
+    }
+
+    /// Generation sequence witnessed by the retained owner — coverage is
+    /// reconstructed from this, never from a caller-supplied scalar.
+    #[must_use]
+    pub const fn generation_sequence(&self) -> u64 {
+        self.owner.witness().generation.sequence
+    }
+
+    /// Live document count witnessed by the retained owner.
+    #[must_use]
+    pub const fn live_count(&self) -> u64 {
+        self.owner.witness().live_count
+    }
+}
+
+/// A validated activation over one or both tiers (bd-ctzo).
+///
+/// Every method here is reachable only after
+/// [`TwoTierIndex::activate_owner_backed_search`] completed all joins, which
+/// is what makes "no vector read before validation" a structural property
+/// rather than an assertion.
+#[derive(Debug)]
+pub struct ActivatedTierSearch<'index, 'query> {
+    fast: Option<ActivatedTier<'index, 'query>>,
+    quality: Option<ActivatedTier<'index, 'query>>,
+    topology: RetrievalTopology,
+}
+
+impl<'index, 'query> ActivatedTierSearch<'index, 'query> {
+    /// Topology the validated query bindings actually support.
+    #[must_use]
+    pub const fn topology(&self) -> RetrievalTopology {
+        self.topology
+    }
+
+    /// The activated fast tier, when the query bound one.
+    #[must_use]
+    pub const fn fast(&self) -> Option<&ActivatedTier<'index, 'query>> {
+        self.fast.as_ref()
+    }
+
+    /// The activated quality tier, when the query bound one.
+    #[must_use]
+    pub const fn quality(&self) -> Option<&ActivatedTier<'index, 'query>> {
+        self.quality.as_ref()
+    }
+
+    /// Retrieve directly from the QUALITY owner with the quality-bound query.
+    ///
+    /// This is a first-class operation, not a rescoring of a fast-selected
+    /// pool: a document absent from the fast tier's top-k is still reachable
+    /// here, which is the behaviour the fast-pool-rescoring anti-pattern
+    /// silently loses.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError::InvalidConfig`] when no quality tier was
+    /// activated, and propagates typed decode failures.
+    pub fn search_quality(&self, k: usize) -> SearchResult<Vec<VectorHit>> {
+        self.quality
+            .as_ref()
+            .ok_or_else(|| SearchError::InvalidConfig {
+                field: "search_activation.quality".to_owned(),
+                value: format!("{:?}", self.topology),
+                reason: "quality retrieval requires an activated quality tier".to_owned(),
+            })?
+            .search_top_k(k)
+    }
+
+    /// Retrieve directly from the FAST owner with the fast-bound query.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`SearchError::InvalidConfig`] when no fast tier was
+    /// activated, and propagates typed decode failures.
+    pub fn search_fast(&self, k: usize) -> SearchResult<Vec<VectorHit>> {
+        self.fast
+            .as_ref()
+            .ok_or_else(|| SearchError::InvalidConfig {
+                field: "search_activation.fast".to_owned(),
+                value: format!("{:?}", self.topology),
+                reason: "fast retrieval requires an activated fast tier".to_owned(),
+            })?
+            .search_top_k(k)
+    }
+
+    /// Independent per-tier retrieval unioned by canonical document identity
+    /// (bd-ctzo C2 `FullProgressive`).
+    ///
+    /// Each tier is searched with ITS OWN bound query against ITS OWN owner;
+    /// neither pool constrains the other. The union is deterministic:
+    /// documents are keyed by canonical `doc_id`, the better score wins a
+    /// duplicate, and ties break by `doc_id` so the order never depends on
+    /// which tier happened to return first.
+    ///
+    /// # Errors
+    ///
+    /// Propagates typed decode failures from either tier.
+    pub fn search_union(&self, k: usize) -> SearchResult<Vec<VectorHit>> {
+        let mut merged: BTreeMap<String, VectorHit> = BTreeMap::new();
+        for tier in [self.fast.as_ref(), self.quality.as_ref()]
+            .into_iter()
+            .flatten()
+        {
+            for hit in tier.search_top_k(k)? {
+                merged
+                    .entry(hit.doc_id.to_string())
+                    .and_modify(|existing| {
+                        if hit.score > existing.score {
+                            *existing = hit.clone();
+                        }
+                    })
+                    .or_insert(hit);
+            }
+        }
+        let mut union: Vec<VectorHit> = merged.into_values().collect();
+        union.sort_by(|left, right| {
+            right
+                .score
+                .total_cmp(&left.score)
+                .then_with(|| left.doc_id.cmp(&right.doc_id))
+        });
+        union.truncate(k);
+        Ok(union)
+    }
+}
+
+/// Perform every identity join for one tier before any vector read (bd-ctzo).
+fn activate_tier<'index, 'query>(
+    owner: Option<&'index ValidatedFsviBytes>,
+    binding: Option<&FsviV2IdentityBinding>,
+    query: &'query BoundQueryEmbedding,
+    tier: &str,
+) -> SearchResult<ActivatedTier<'index, 'query>> {
+    let owner = owner.ok_or_else(|| SearchError::InvalidConfig {
+        field: format!("search_activation.{tier}.owner"),
+        value: "<absent>".to_owned(),
+        reason: format!(
+            "the query binds a {tier} embedding but this index retains no admitted FSVI v2 \
+             {tier} owner; a legacy or path-opened tier is not searchable under typed \
+             activation and requires a reindex"
+        ),
+    })?;
+    let binding = binding.ok_or_else(|| SearchError::InvalidConfig {
+        field: format!("search_activation.{tier}.binding"),
+        value: "<absent>".to_owned(),
+        reason: format!(
+            "typed activation of the {tier} tier requires the admitted identity binding that \
+             opened it"
+        ),
+    })?;
+    // The binding may only speak for THIS artifact: compare the caller's
+    // canonical identity bytes against the ones the owner itself retains.
+    if binding.frozen_identity().canonical_bytes
+        != owner.identity_v2().identity_bundle_canonical_bytes
+    {
+        return Err(SearchError::InvalidConfig {
+            field: format!("search_activation.{tier}.retained_identity"),
+            value: crate::fingerprint_hex(&owner.identity_v2().identity_bundle_fingerprint),
+            reason: format!(
+                "the supplied {tier} binding does not describe the identity the retained owner \
+                 carries; activation is derived from the artifact, never from the caller's claim"
+            ),
+        });
+    }
+    // The complete admission law. A certified-foreign producer is
+    // comparison-grade telemetry only, so it is refused rather than admitted.
+    match query.verify_producer_conformance(&binding.frozen_identity().identity, tier)? {
+        SpaceIdentityAdmission::SameProducer => {}
+        // Anything that is not the same attested producer -- today only
+        // ConformanceCompatibleProducer -- is comparison-grade telemetry, and
+        // a future variant must default to refusal rather than inherit
+        // admission by being added.
+        other => {
+            return Err(SearchError::InvalidConfig {
+                field: format!("search_activation.{tier}.producer_conformance"),
+                value: format!("{other:?}"),
+                reason: format!(
+                    "the query's producer is not the {tier} index's attested producer; a \
+                     certified-compatible pairing is comparison-grade telemetry and never an \
+                     admission basis"
+                ),
+            });
+        }
+    }
+    if query.vector().len() != owner.dimension() {
+        return Err(SearchError::InvalidConfig {
+            field: format!("search_activation.{tier}.dimension"),
+            value: query.vector().len().to_string(),
+            reason: format!(
+                "query vector width does not match the {tier} index dimension {}",
+                owner.dimension()
+            ),
+        });
+    }
+    if binding.generation() != owner.witness().generation {
+        return Err(SearchError::InvalidConfig {
+            field: format!("search_activation.{tier}.generation"),
+            value: binding.generation().sequence.to_string(),
+            reason: format!(
+                "the supplied {tier} binding names a different generation than the retained \
+                 owner witnesses ({})",
+                owner.witness().generation.sequence
+            ),
+        });
+    }
+    Ok(ActivatedTier { owner, query })
+}
+
 fn admit_v2_tier(
     path: &Path,
     binding: &FsviV2IdentityBinding,
@@ -6573,6 +6877,318 @@ mod tests {
 
         let _ = fs::remove_dir_all(&dir);
         let _ = fs::remove_dir_all(&v2_dir);
+    }
+
+    /// Build a bound query embedding in the same SPACE as an artifact's
+    /// identity, so the admission law joins and only the tested component can
+    /// diverge.
+    ///
+    /// The query's storage identity is deliberately NOT the artifact's: a
+    /// query embedding is an in-process `Vec<f32>` and must carry an f32
+    /// storage identity, while the artifact persists f16. Storage is a
+    /// separate component from the embedding space, so the space fingerprints
+    /// still join — which is exactly why activation verifies space and
+    /// producer, and leaves persisted storage identity to admission, where
+    /// the artifact's own binding is the authority.
+    fn bound_query(identity: &EmbeddingIdentityBundleV1, vector: &[f32]) -> BoundQueryEmbedding {
+        let mut query_identity = identity.clone();
+        query_identity.storage.quantization = QuantizationFormat::F32;
+        "in-memory-f32".clone_into(&mut query_identity.storage.format);
+        "native-f32-values".clone_into(&mut query_identity.storage.endianness);
+        BoundQueryEmbedding::new(vector.to_vec(), query_identity)
+            .expect("bind a query embedding in the fixture's space")
+    }
+
+    /// bd-ctzo C2: the document that matters is ABSENT from the fast tier's
+    /// top-k, so `QualityOnly` must reach it by searching the quality owner
+    /// directly, and `FullProgressive` must reach it through an independent
+    /// per-tier union -- not by rescoring a fast-selected pool.
+    ///
+    /// The fixture is deliberately adversarial: the fast tier's vectors put
+    /// doc-far last, so any implementation that takes the fast top-1 and
+    /// rescores it can never surface doc-far. The final assertion is the
+    /// planted negative for exactly that anti-pattern.
+    #[test]
+    fn quality_only_and_union_reach_a_document_outside_the_fast_pool() {
+        let dir = temp_index_dir("ctzo-out-of-fast-pool");
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let fast_path = dir.join(VECTOR_INDEX_FAST_FILENAME);
+        let quality_path = dir.join(VECTOR_INDEX_QUALITY_FILENAME);
+        let (fast_binding, fast_identity) = fsvi_v2_binding("ctzo-fast-model", 4, 71);
+        let (quality_binding, quality_identity) = fsvi_v2_binding("ctzo-quality-model", 4, 71);
+
+        // doc-far is orthogonal to the fast query and adjacent to it in the
+        // quality space: the tiers genuinely disagree about relevance.
+        write_v2_tier(
+            &fast_path,
+            &fast_binding,
+            &[
+                ("doc-near", &[1.0, 0.0, 0.0, 0.0]),
+                ("doc-far", &[0.0, 0.0, 1.0, 0.0]),
+            ],
+        );
+        // The quality tier additionally holds a document the FAST TIER DOES
+        // NOT CONTAIN AT ALL. No amount of rescoring a fast-selected pool can
+        // ever produce it, which is what makes the union assertion below able
+        // to tell independent retrieval from fast-pool rescoring.
+        write_v2_tier(
+            &quality_path,
+            &quality_binding,
+            &[
+                ("doc-near", &[0.0, 0.0, 1.0, 0.0]),
+                ("doc-far", &[0.0, 0.5, 0.0, 0.0]),
+                ("doc-quality-only", &[0.0, 1.0, 0.0, 0.0]),
+            ],
+        );
+
+        let paths = TwoTierIndexPaths::new(&fast_path).with_quality_index(&quality_path);
+        let index = TwoTierIndex::open_admitted_v2_with_paths(
+            &paths,
+            TwoTierConfig::default(),
+            &fast_binding,
+            Some(&quality_binding),
+        )
+        .expect("admit both tiers");
+
+        let fast_query = bound_query(&fast_identity, &[1.0, 0.0, 0.0, 0.0]);
+        let quality_query = bound_query(&quality_identity, &[0.0, 1.0, 0.0, 0.0]);
+
+        // The fast pool at k=1 contains ONLY doc-near.
+        let fast_only_embeddings = TieredQueryEmbeddings::fast_only(fast_query.clone());
+        let fast_only = index
+            .activate_owner_backed_search(&fast_only_embeddings, Some(&fast_binding), None)
+            .expect("fast-only activation");
+        assert_eq!(fast_only.topology(), RetrievalTopology::FastOnly);
+        let fast_pool = fast_only.search_fast(1).expect("fast search");
+        assert_eq!(fast_pool[0].doc_id, "doc-near");
+        assert!(
+            !fast_pool.iter().any(|hit| hit.doc_id == "doc-far"),
+            "the fixture is only meaningful while doc-far is outside the fast pool"
+        );
+
+        // QualityOnly retrieves from the quality owner directly and reaches it.
+        let quality_only_embeddings = TieredQueryEmbeddings::quality_only(quality_query.clone());
+        let quality_only = index
+            .activate_owner_backed_search(&quality_only_embeddings, None, Some(&quality_binding))
+            .expect("quality-only activation");
+        assert_eq!(quality_only.topology(), RetrievalTopology::QualityOnly);
+        assert_eq!(
+            quality_only.search_quality(1).expect("quality search")[0].doc_id,
+            "doc-quality-only",
+            "QualityOnly must reach a document the fast tier does not even contain"
+        );
+        assert!(
+            quality_only.search_fast(1).is_err(),
+            "a quality-only activation exposes no fast retrieval"
+        );
+
+        // FullProgressive unions independent per-tier retrieval.
+        let progressive_embeddings = TieredQueryEmbeddings::progressive(fast_query, quality_query);
+        let progressive = index
+            .activate_owner_backed_search(
+                &progressive_embeddings,
+                Some(&fast_binding),
+                Some(&quality_binding),
+            )
+            .expect("progressive activation");
+        assert_eq!(progressive.topology(), RetrievalTopology::FullProgressive);
+        let union = progressive.search_union(2).expect("union");
+        let union_ids: Vec<&str> = union.iter().map(|hit| hit.doc_id.as_str()).collect();
+        // THE DISCRIMINATING ASSERTION: doc-quality-only exists in no fast
+        // pool, so a union that quietly degraded to fast-pool retrieval --
+        // or to rescoring one -- cannot satisfy this.
+        assert!(
+            union_ids.contains(&"doc-quality-only"),
+            "the union must carry independent quality retrieval, got {union_ids:?}"
+        );
+        assert!(
+            union_ids.contains(&"doc-near"),
+            "the union must also carry the fast tier's own selection, got {union_ids:?}"
+        );
+        // Deterministic order: scores descending, doc_id breaking ties, so the
+        // result never depends on which tier answered first.
+        for pair in union.windows(2) {
+            assert!(
+                pair[0].score > pair[1].score
+                    || (pair[0].score.to_bits() == pair[1].score.to_bits()
+                        && pair[0].doc_id <= pair[1].doc_id),
+                "union ordering must be deterministic, got {union_ids:?}"
+            );
+        }
+
+        // The same fixture states the anti-pattern directly: the fast pool
+        // this document would have to be rescored from never contained it.
+        assert!(
+            !fast_pool.iter().any(|hit| hit.doc_id == "doc-quality-only"),
+            "rescoring a fast-selected pool can never surface doc-quality-only; that is \
+             precisely why direct quality retrieval and the union are first-class operations"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// bd-ctzo C1/C3: every identity join happens at activation, before any
+    /// vector read is reachable. Each case diverges in exactly one component
+    /// and must be refused by field name; the matching activation in the same
+    /// test is the positive control.
+    #[test]
+    fn activation_refuses_every_identity_divergence_before_any_read() {
+        let dir = temp_index_dir("ctzo-activation-refusals");
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let fast_path = dir.join(VECTOR_INDEX_FAST_FILENAME);
+        let (binding, identity) = fsvi_v2_binding("ctzo-guard-model", 4, 81);
+        write_v2_tier(
+            &fast_path,
+            &binding,
+            &[
+                ("doc-a", &[1.0, 0.0, 0.0, 0.0]),
+                ("doc-b", &[0.0, 1.0, 0.0, 0.0]),
+            ],
+        );
+        let paths = TwoTierIndexPaths::new(&fast_path);
+        let index = TwoTierIndex::open_admitted_v2_with_paths(
+            &paths,
+            TwoTierConfig::default(),
+            &binding,
+            None,
+        )
+        .expect("admit the fast tier");
+
+        // Positive control: the matching query activates and serves.
+        let matching =
+            TieredQueryEmbeddings::fast_only(bound_query(&identity, &[1.0, 0.0, 0.0, 0.0]));
+        let activated = index
+            .activate_owner_backed_search(&matching, Some(&binding), None)
+            .expect("the matching query activates");
+        assert_eq!(activated.search_fast(1).expect("search")[0].doc_id, "doc-a");
+
+        // (i) Same dimension, different embedding space: the case raw vector
+        // APIs silently accept.
+        let (_, foreign_identity) = fsvi_v2_binding("a-foreign-model", 4, 81);
+        let foreign =
+            TieredQueryEmbeddings::fast_only(bound_query(&foreign_identity, &[1.0, 0.0, 0.0, 0.0]));
+        let error = index
+            .activate_owner_backed_search(&foreign, Some(&binding), None)
+            .expect_err("a same-dimension foreign space must be refused");
+        assert!(
+            matches!(
+                error,
+                SearchError::InvalidConfig { ref field, .. }
+                    if field == "query_embedding.fast.space_identity"
+            ),
+            "got {error:?}"
+        );
+
+        // (ii) A binding that does not describe the retained artifact.
+        let (other_binding, other_identity) = fsvi_v2_binding("another-model", 4, 81);
+        let other_query =
+            TieredQueryEmbeddings::fast_only(bound_query(&other_identity, &[1.0, 0.0, 0.0, 0.0]));
+        let error = index
+            .activate_owner_backed_search(&other_query, Some(&other_binding), None)
+            .expect_err("a binding foreign to the artifact must be refused");
+        assert!(
+            matches!(
+                error,
+                SearchError::InvalidConfig { ref field, .. }
+                    if field == "search_activation.fast.retained_identity"
+            ),
+            "got {error:?}"
+        );
+
+        // (iii) No binding at all: activation cannot proceed on the owner's
+        // word alone, because the expected bundle is not decodable from it.
+        let error = index
+            .activate_owner_backed_search(&matching, None, None)
+            .expect_err("activation requires the admitted binding");
+        assert!(
+            matches!(
+                error,
+                SearchError::InvalidConfig { ref field, .. }
+                    if field == "search_activation.fast.binding"
+            ),
+            "got {error:?}"
+        );
+
+        // (iv) A quality-bound query against an index that retains no quality
+        // owner: typed refusal, never a silent fast-tier substitution.
+        let quality_bound =
+            TieredQueryEmbeddings::quality_only(bound_query(&identity, &[1.0, 0.0, 0.0, 0.0]));
+        let error = index
+            .activate_owner_backed_search(&quality_bound, None, Some(&binding))
+            .expect_err("a missing quality owner must be refused");
+        assert!(
+            matches!(
+                error,
+                SearchError::InvalidConfig { ref field, .. }
+                    if field == "search_activation.quality.owner"
+            ),
+            "got {error:?}"
+        );
+
+        // (v) A legacy v1 index retains no owner at all, so typed activation
+        // is unreachable rather than degraded.
+        let legacy_dir = temp_index_dir("ctzo-legacy");
+        fs::create_dir_all(&legacy_dir).expect("create temp dir");
+        let legacy_path = legacy_dir.join(VECTOR_INDEX_FAST_FILENAME);
+        write_index_file(&legacy_path, &[("doc-a", &[1.0, 0.0, 0.0, 0.0])])
+            .expect("write v1 fixture");
+        let legacy =
+            TwoTierIndex::open(&legacy_dir, TwoTierConfig::default()).expect("open legacy v1");
+        let error = legacy
+            .activate_owner_backed_search(&matching, Some(&binding), None)
+            .expect_err("a legacy tier is not searchable under typed activation");
+        assert!(
+            matches!(
+                error,
+                SearchError::InvalidConfig { ref field, .. }
+                    if field == "search_activation.fast.owner"
+            ),
+            "got {error:?}"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&legacy_dir);
+    }
+
+    /// bd-ctzo C4: coverage is reconstructed from the retained owner's own
+    /// witnesses, never from a caller-supplied scalar.
+    #[test]
+    fn activated_coverage_comes_from_the_owner_witness() {
+        let dir = temp_index_dir("ctzo-coverage");
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let fast_path = dir.join(VECTOR_INDEX_FAST_FILENAME);
+        let (binding, identity) = fsvi_v2_binding("ctzo-coverage-model", 4, 91);
+        write_v2_tier(
+            &fast_path,
+            &binding,
+            &[
+                ("doc-a", &[1.0, 0.0, 0.0, 0.0]),
+                ("doc-b", &[0.0, 1.0, 0.0, 0.0]),
+                ("doc-c", &[0.0, 0.0, 1.0, 0.0]),
+            ],
+        );
+        let index = TwoTierIndex::open_admitted_v2_with_paths(
+            &TwoTierIndexPaths::new(&fast_path),
+            TwoTierConfig::default(),
+            &binding,
+            None,
+        )
+        .expect("admit the fast tier");
+        let embeddings =
+            TieredQueryEmbeddings::fast_only(bound_query(&identity, &[1.0, 0.0, 0.0, 0.0]));
+        let activated = index
+            .activate_owner_backed_search(&embeddings, Some(&binding), None)
+            .expect("activate");
+        let tier = activated.fast().expect("fast tier activated");
+        assert_eq!(tier.generation_sequence(), 91);
+        assert_eq!(tier.live_count(), 3);
+        assert_eq!(
+            tier.owner().witness().record_count,
+            3,
+            "coverage is read from the retained witness, not from the caller"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
