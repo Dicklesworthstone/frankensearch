@@ -81,7 +81,7 @@ use frankensearch_core::generation::{
 };
 use frankensearch_core::{SearchError, SearchResult};
 use half::f16;
-use memmap2::MmapMut;
+use memmap2::{Mmap, MmapMut};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tracing::debug;
@@ -723,6 +723,7 @@ pub(crate) struct RecordEntry {
 #[derive(Debug)]
 pub(crate) enum VectorIndexData {
     Mutable(MmapMut),
+    ReadOnly(Mmap),
     Immutable(Arc<[u8]>),
 }
 
@@ -744,10 +745,10 @@ impl VectorIndexData {
                     .flush_range(offset, bytes.len())
                     .map_err(SearchError::Io)
             }
-            Self::Immutable(_) => Err(SearchError::InvalidConfig {
-                field: "fsvi_v2.mutation".to_owned(),
-                value: "immutable-owned-image".to_owned(),
-                reason: "the sealed FSVI v2 owner exposes no writable backing store".to_owned(),
+            Self::ReadOnly(_) | Self::Immutable(_) => Err(SearchError::InvalidConfig {
+                field: "fsvi.writer_lock".to_owned(),
+                value: "read-only mapping".to_owned(),
+                reason: "mutating a published FSVI requires VectorIndex::open_writer and its retained exclusive writer lock".to_owned(),
             }),
         }
     }
@@ -759,8 +760,28 @@ impl Deref for VectorIndexData {
     fn deref(&self) -> &Self::Target {
         match self {
             Self::Mutable(mapping) => mapping,
+            Self::ReadOnly(mapping) => mapping,
             Self::Immutable(bytes) => bytes,
         }
+    }
+}
+
+/// The OS lock retained for the complete lifetime of an FSVI mapping.
+///
+/// A shared lock accompanies every read-only mapping; a mutable mapping is
+/// created only after acquiring and retaining the exclusive counterpart. The
+/// retained descriptor is load-bearing: dropping it while the mapping remains
+/// live would reopen the cross-process mutation race that `memmap2` marks
+/// unsafe.
+#[derive(Debug)]
+enum FsviMapLock {
+    Shared { _file: File },
+    Exclusive { _file: File },
+}
+
+impl FsviMapLock {
+    const fn is_writer(&self) -> bool {
+        matches!(self, Self::Exclusive { .. })
     }
 }
 
@@ -768,6 +789,7 @@ impl Deref for VectorIndexData {
 pub struct VectorIndex {
     pub(crate) path: PathBuf,
     pub(crate) data: VectorIndexData,
+    map_lock: Option<FsviMapLock>,
     pub(crate) metadata: VectorMetadata,
     pub(crate) records_offset: usize,
     pub(crate) strings_offset: usize,
@@ -1562,6 +1584,7 @@ impl ValidatedFsviBytes {
         let index = VectorIndex {
             path: PathBuf::from(OWNED_PATH),
             data: VectorIndexData::Immutable(Arc::clone(&bytes)),
+            map_lock: None,
             metadata,
             records_offset,
             strings_offset,
@@ -1644,26 +1667,80 @@ impl VectorIndex {
         ValidatedFsviBytes::open_published(path, expected)
     }
 
-    /// Open an existing FSVI index from disk.
+    /// Open an existing legacy FSVI index through an exclusive writer lock.
+    ///
+    /// This compatibility entry point retains an exclusive OS lock for as
+    /// long as its writable map can expose bytes. Query-only consumers should
+    /// use [`Self::open_read_only`] so they can coexist under shared locks.
     ///
     /// # Errors
     ///
     /// Returns `SearchError::IndexNotFound` if the file does not exist and
     /// `SearchError::IndexCorrupted` when header/layout validation fails.
-    #[allow(unsafe_code, clippy::too_many_lines)] // MmapMut::map_mut requires unsafe for memory-mapped I/O.
     pub fn open(path: &Path) -> SearchResult<Self> {
+        Self::open_writer(path)
+    }
+
+    /// Open an existing FSVI index through a shared lock and read-only map.
+    ///
+    /// This is the normal published-artifact query path. It retains a shared
+    /// OS lock for as long as its mapping can expose bytes, preventing a
+    /// cooperating writer from creating a writable map until every reader has
+    /// dropped its handle.
+    pub fn open_read_only(path: &Path) -> SearchResult<Self> {
+        Self::open_with_lock(path, false)
+    }
+
+    /// Open an existing legacy FSVI index for mutation.
+    ///
+    /// The returned index retains an exclusive OS lock for its complete
+    /// lifetime before creating its writable map. If any reader or writer
+    /// already holds the artifact lock, this returns a typed configuration
+    /// refusal instead of mapping bytes writable.
+    ///
+    /// # Errors
+    ///
+    /// Returns the same errors as [`Self::open`], plus a typed
+    /// `fsvi.map_lock` refusal when the artifact is already mapped by a
+    /// cooperating reader or writer.
+    pub fn open_writer(path: &Path) -> SearchResult<Self> {
+        Self::open_with_lock(path, true)
+    }
+
+    #[allow(unsafe_code, clippy::too_many_lines)] // memmap constructors require unsafe for memory-mapped I/O.
+    fn open_with_lock(path: &Path, writer: bool) -> SearchResult<Self> {
         if !path.exists() {
             return Err(SearchError::IndexNotFound {
                 path: path.to_path_buf(),
             });
         }
 
-        let file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(path)
-            .map_err(SearchError::Io)?;
-        let data = unsafe { MmapMut::map_mut(&file).map_err(SearchError::Io)? };
+        let file = if writer {
+            OpenOptions::new()
+                .read(true)
+                .write(true)
+                .open(path)
+                .map_err(SearchError::Io)?
+        } else {
+            File::open(path).map_err(SearchError::Io)?
+        };
+        let map_lock = if writer {
+            file.try_lock()
+                .map_err(|error| map_lock_error(path, "exclusive writer", error.into()))?;
+            FsviMapLock::Exclusive { _file: file }
+        } else {
+            file.try_lock_shared()
+                .map_err(|error| map_lock_error(path, "shared reader", error.into()))?;
+            FsviMapLock::Shared { _file: file }
+        };
+        let data = match &map_lock {
+            FsviMapLock::Exclusive { _file } => VectorIndexData::Mutable(unsafe {
+                MmapMut::map_mut(_file).map_err(SearchError::Io)?
+            }),
+            FsviMapLock::Shared { _file } => {
+                VectorIndexData::ReadOnly(unsafe { Mmap::map(_file).map_err(SearchError::Io)? })
+            }
+        };
         let (metadata, header_len) = parse_header(path, &data)?;
 
         let records_bytes = metadata
@@ -1747,13 +1824,13 @@ impl VectorIndex {
                 path = %path.display(),
                 main_gen = metadata.compaction_gen,
                 wal_gen = wal_compaction_gen,
-                "discarding stale/mismatched WAL entries and removing file"
+                "discarding stale/mismatched WAL entries"
             );
             wal_entries.clear();
-            if wal_path.exists() {
+            if writer && wal_path.exists() {
                 let _ = std::fs::remove_file(&wal_path);
             }
-        } else if wal_path.exists() {
+        } else if writer && wal_path.exists() {
             let actual_len = std::fs::metadata(&wal_path).map_err(SearchError::Io)?.len();
             if actual_len > valid_len {
                 tracing::warn!(
@@ -1773,7 +1850,8 @@ impl VectorIndex {
 
         Ok(Self {
             path: path.to_path_buf(),
-            data: VectorIndexData::Mutable(data),
+            data,
+            map_lock: Some(map_lock),
             metadata,
             records_offset,
             strings_offset,
@@ -3405,13 +3483,21 @@ impl VectorIndex {
     }
 
     fn ensure_legacy_mutation_format(&self, operation: &str) -> SearchResult<()> {
-        if self.metadata.fsvi_version != FSVI_V2_VERSION {
+        if self.metadata.fsvi_version == FSVI_V2_VERSION {
+            return Err(SearchError::InvalidConfig {
+                field: "fsvi_v2.mutation".to_owned(),
+                value: operation.to_owned(),
+                reason: "identity-complete FSVI v2 artifacts are immutable in this admission slice; rebuild and publish a separate generation rather than mutating content or attaching a legacy WAL"
+                    .to_owned(),
+            });
+        }
+        if self.map_lock.as_ref().is_some_and(FsviMapLock::is_writer) {
             return Ok(());
         }
         Err(SearchError::InvalidConfig {
-            field: "fsvi_v2.mutation".to_owned(),
+            field: "fsvi.writer_lock".to_owned(),
             value: operation.to_owned(),
-            reason: "identity-complete FSVI v2 artifacts are immutable in this admission slice; rebuild and publish a separate generation rather than mutating content or attaching a legacy WAL"
+            reason: "this handle is a shared read-only mapping; reopen with VectorIndex::open_writer before mutating a published FSVI"
                 .to_owned(),
         })
     }
@@ -5917,6 +6003,16 @@ pub(crate) fn sync_parent_directory(path: &Path) -> SearchResult<()> {
         let _ = path;
     }
     Ok(())
+}
+
+fn map_lock_error(path: &Path, requested_access: &str, error: std::io::Error) -> SearchError {
+    SearchError::InvalidConfig {
+        field: "fsvi.map_lock".to_owned(),
+        value: path.display().to_string(),
+        reason: format!(
+            "cannot acquire {requested_access} lock before mapping this FSVI: {error}; drop live readers/writers before retrying"
+        ),
+    }
 }
 
 fn index_corrupted(path: &Path, detail: impl Into<String>) -> SearchError {
@@ -10564,6 +10660,47 @@ mod tests {
         assert!(!index.soft_delete("doc").unwrap(), "third delete");
 
         std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn published_mapping_refuses_mutation_without_the_writer_lock() {
+        let path = temp_index_path("reader-refuses-published-mutation");
+        let mut writer = VectorIndex::create(&path, "test", 4).expect("create fixture");
+        writer
+            .write_record("doc", &[1.0, 0.0, 0.0, 0.0])
+            .expect("write fixture row");
+        writer.finish().expect("publish fixture");
+
+        let mut reader = VectorIndex::open_read_only(&path).expect("shared reader opens");
+        let error = reader
+            .soft_delete("doc")
+            .expect_err("shared mapping must never mutate a published FSVI");
+        assert!(matches!(
+            error,
+            SearchError::InvalidConfig { field, value, .. }
+                if field == "fsvi.writer_lock" && value == "soft_delete_batch"
+        ));
+        assert!(
+            !reader.is_deleted(0),
+            "the rejected mutation must leave the reader's mapped bytes unchanged"
+        );
+
+        let contended = VectorIndex::open_writer(&path)
+            .expect_err("a live shared mapping must prevent a writable map");
+        assert!(matches!(
+            contended,
+            SearchError::InvalidConfig { field, .. } if field == "fsvi.map_lock"
+        ));
+
+        drop(reader);
+        let mut locked_writer =
+            VectorIndex::open(&path).expect("writer opens after shared reader drops");
+        assert!(
+            locked_writer
+                .soft_delete("doc")
+                .expect("writer lock permits mutation"),
+            "exclusive writer mutates only after acquiring the artifact lock"
+        );
     }
 
     #[test]

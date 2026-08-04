@@ -568,11 +568,11 @@ impl TwoTierIndex {
     ) -> SearchResult<Self> {
         let paths = paths.clone().into_absolute()?;
         validate_index_paths(&paths)?;
-        let fast_index = VectorIndex::open(paths.fast_index())?;
+        let fast_index = VectorIndex::open_read_only(paths.fast_index())?;
         warn_if_wal_rows_replayed("fast", paths.fast_index(), &fast_index);
         let fast_source = TierSource::PathOpened(fast_index);
         let quality_source = match paths.quality_index() {
-            Some(quality_path) => match VectorIndex::open(quality_path) {
+            Some(quality_path) => match VectorIndex::open_read_only(quality_path) {
                 Ok(quality_index) => {
                     warn_if_wal_rows_replayed("quality", quality_path, &quality_index);
                     Some(TierSource::PathOpened(quality_index))
