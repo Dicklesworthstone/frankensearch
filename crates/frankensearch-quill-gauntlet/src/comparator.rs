@@ -6954,8 +6954,11 @@ pub const fn ast_lowering_kind(
         // UNRULED: fires on ordinary public queries and would flood the register
         // on its own; needs an entry bounding which recoveries are semantic.
         QueryDiagnosticKind::SyntaxRecovery => None,
-        // UNRULED: the strongest live-registrable candidate (bd-y8ozo) — Quill
-        // shortens at 10,000 bytes while the oracle receives the whole string.
+        // RULED NOT A DIVERGENCE (bd-y8ozo, measured): the cap is SYMMETRIC.
+        // frankensearch-lexical applies its own identically-valued 10,000-char
+        // truncate_query at every search entry point, so both engines discard
+        // the same tail and agree exactly. Only Quill records the lowering, so
+        // this stays None — there is nothing cross-engine for it to classify.
         QueryDiagnosticKind::Truncated => None,
         // UNRULED: whether an absent field is a divergence depends on the
         // schema contract the campaign declares, not on the parser.

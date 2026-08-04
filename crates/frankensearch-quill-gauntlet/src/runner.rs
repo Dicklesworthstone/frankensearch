@@ -18889,6 +18889,180 @@ mod tests {
         Ok(())
     }
 
+    /// bd-y8ozo: the over-cap truncation is SYMMETRIC, so it is not a
+    /// divergence — and this pins that, because the premise looked obvious and
+    /// was wrong.
+    ///
+    /// The bead was filed expecting Quill to drop every term past
+    /// `MAX_QUERY_LENGTH` while the pinned oracle parsed the whole string. It
+    /// does not: `frankensearch-lexical` applies its own identically-valued
+    /// 10,000-character cap (`truncate_query`, lib.rs:1535) at every search
+    /// entry point, so both engines discard the same tail and agree exactly.
+    ///
+    /// Two cases, because the interesting assertion here is an ABSENCE and an
+    /// absence proves nothing on its own:
+    ///   over-cap  both engines miss the tail term and compare Exact
+    ///   control   the same tail term, queried alone, is matched by both
+    /// Without the control this test would still pass if `zzzuniqueterm` were
+    /// simply unmatchable — the vacuous-agreement shape that hides a broken
+    /// fixture behind a green parity assertion.
+    #[cfg(feature = "tantivy-oracle")]
+    #[test]
+    fn y8ozo_the_over_cap_truncation_is_symmetric_and_therefore_not_a_divergence() {
+        use frankensearch_core::LexicalWrite;
+
+        let document = |id: &str, content: &str| crate::generator::GeneratedDocument {
+            id: id.to_owned(),
+            title: None,
+            content: content.to_owned(),
+            created_at_ms: 0,
+            cass: None,
+            metadata: std::collections::BTreeMap::new(),
+            pathology: None,
+            unicode_lane: crate::generator::UnicodeLane::Ascii,
+        };
+        let documents = vec![
+            document("y8ozo-head", "alphaterm alphaterm alphaterm"),
+            document("y8ozo-tail", "zzzuniqueterm"),
+        ];
+
+        // 13 bytes per clause x 900 = 11,700, so the tail term begins well past
+        // the 10,000-byte cap and inside the region Quill discards.
+        let prefix = "alphaterm OR ".repeat(900);
+        assert!(
+            prefix.len() > frankensearch_quill::query::MAX_QUERY_LENGTH,
+            "the fixture must exceed the cap before the tail term is appended"
+        );
+        let query = format!("{prefix}zzzuniqueterm");
+
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let (mut subject, mut oracle) = live_campaign_engines();
+            subject
+                .claim_fresh_campaign()
+                .expect("claim y8ozo Quill subject");
+            oracle
+                .claim_fresh_campaign()
+                .expect("claim y8ozo Tantivy oracle");
+            let indexable = documents
+                .iter()
+                .cloned()
+                .map(frankensearch_core::IndexableDocument::from)
+                .collect::<Vec<_>>();
+            subject
+                .index_mut()
+                .expect("y8ozo Quill index")
+                .index_documents(&cx, &indexable)
+                .await
+                .expect("index y8ozo Quill corpus");
+            subject
+                .index_mut()
+                .expect("y8ozo Quill index")
+                .commit(&cx)
+                .await
+                .expect("commit y8ozo Quill corpus");
+            oracle
+                .index()
+                .index_documents(&cx, &indexable)
+                .await
+                .expect("index y8ozo Tantivy corpus");
+            oracle
+                .index()
+                .commit(&cx)
+                .await
+                .expect("commit y8ozo Tantivy corpus");
+            subject
+                .mark_committed()
+                .expect("commit y8ozo Quill campaign");
+            oracle
+                .mark_committed()
+                .expect("commit y8ozo Tantivy campaign");
+
+            let harness = crate::engine::DifferentialHarness::new(
+                ComparisonMode::CrossEngine,
+                ComparatorConfig::default(),
+            );
+            let case = |id: &str, text: &str| DifferentialCase {
+                fixture_id: id.to_owned(),
+                query: text.to_owned(),
+                limit: 10,
+                offset: 0,
+                tie_expansion_limit: 256,
+                count_requested: false,
+                snippet_max_chars: None,
+                metadata: DifferentialCaseMetadata {
+                    generator_id: None,
+                    generator_seed: None,
+                    corpus_hash: None,
+                },
+            };
+            let ids = |hits: &[RankedHit]| {
+                hits.iter()
+                    .map(|hit| hit.doc_id.clone())
+                    .collect::<std::collections::BTreeSet<_>>()
+            };
+
+            // CONTROL FIRST: the tail term is matchable by both engines when it
+            // is not buried past the cap. Everything below is an absence, and
+            // this is what makes those absences mean truncation.
+            let control = harness
+                .run(
+                    &cx,
+                    &subject,
+                    &oracle,
+                    &case("y8ozo-control", "zzzuniqueterm"),
+                )
+                .await
+                .expect("run the y8ozo control case");
+            assert!(
+                ids(&control.comparison.subject.hits).contains("y8ozo-tail")
+                    && ids(&control.comparison.oracle.hits).contains("y8ozo-tail"),
+                "the control must match the tail term in BOTH engines, or the over-cap absences \
+                 below prove nothing: subject={:?} oracle={:?}",
+                ids(&control.comparison.subject.hits),
+                ids(&control.comparison.oracle.hits)
+            );
+
+            let run = harness
+                .run(
+                    &cx,
+                    &subject,
+                    &oracle,
+                    &case("y8ozo-over-cap-query", &query),
+                )
+                .await
+                .expect("run the y8ozo over-cap case");
+            let subject_ids = ids(&run.comparison.subject.hits);
+            let oracle_ids = ids(&run.comparison.oracle.hits);
+
+            assert!(
+                !subject_ids.contains("y8ozo-tail") && !oracle_ids.contains("y8ozo-tail"),
+                "BOTH engines cap at 10,000 characters, so neither may reach the tail term: \
+                 subject={subject_ids:?} oracle={oracle_ids:?}"
+            );
+            assert!(
+                subject_ids.contains("y8ozo-head") && oracle_ids.contains("y8ozo-head"),
+                "both engines must still match the head term the truncated prefix carries: \
+                 subject={subject_ids:?} oracle={oracle_ids:?}"
+            );
+            assert_eq!(
+                run.comparison.status,
+                ComparisonStatus::Exact,
+                "symmetric truncation is agreement, not a divergence: {:?}",
+                run.comparison.divergences
+            );
+
+            // QueryDiagnosticKind::Truncated stays unmapped in ast_lowering_kind,
+            // and this is the evidence for WHY: there is no cross-engine
+            // divergence for it to classify. Only Quill records the lowering in
+            // its diagnostics stream; the oracle logs a warning and moves on.
+            assert!(
+                run.comparison.subject.ast_differences.is_empty(),
+                "no lowering may be projected for a symmetric cap: {:?}",
+                run.comparison.subject.ast_differences
+            );
+        });
+    }
+
     // ==== Live oracle campaign activation (bd-quill-e6-gauntlet-scale-rm3q.9) ====
 
     #[cfg(feature = "tantivy-oracle")]
