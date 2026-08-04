@@ -12706,6 +12706,18 @@ pub enum CurrentPointerError {
         /// Engine family the pointer recorded.
         engine: &'static str,
     },
+    /// CURRENT names an entry that is not a real directory beneath its root.
+    #[error(
+        "CURRENT pointer names {dir_name:?} under {root}, but that {engine} engine entry is not a direct directory"
+    )]
+    UnsafeEngineDir {
+        /// Lexical root containing the pointer.
+        root: PathBuf,
+        /// Named engine entry.
+        dir_name: String,
+        /// Engine family the pointer recorded.
+        engine: &'static str,
+    },
     /// No CURRENT and several candidate engine directories: refusing to guess.
     #[error(
         "lexical root {root} has no CURRENT pointer and multiple engine directories {candidates:?}; run fsfs doctor to choose one"
@@ -12866,16 +12878,50 @@ pub fn resolve_current(lexical_root: &Path) -> Result<ResolvedCurrent, CurrentPo
         Some(bytes) => {
             let pointer = CurrentPointer::decode(&bytes)?;
             let engine_dir = pointer.engine_dir(lexical_root);
-            if !engine_dir.is_dir() {
-                return Err(CurrentPointerError::MissingEngineDir {
-                    root: lexical_root.to_path_buf(),
-                    dir_name: pointer.dir_name().to_owned(),
-                    engine: pointer.engine().label(),
-                });
+            match engine_directory_kind(&engine_dir)? {
+                EngineDirectoryKind::Directory => {}
+                EngineDirectoryKind::Missing => {
+                    return Err(CurrentPointerError::MissingEngineDir {
+                        root: lexical_root.to_path_buf(),
+                        dir_name: pointer.dir_name().to_owned(),
+                        engine: pointer.engine().label(),
+                    });
+                }
+                EngineDirectoryKind::Unsafe => {
+                    return Err(CurrentPointerError::UnsafeEngineDir {
+                        root: lexical_root.to_path_buf(),
+                        dir_name: pointer.dir_name().to_owned(),
+                        engine: pointer.engine().label(),
+                    });
+                }
             }
             Ok(ResolvedCurrent::Pointer(pointer))
         }
         None => adopt_or_report_empty(lexical_root),
+    }
+}
+
+/// Classification of a CURRENT-selected child without following symlinks.
+///
+/// A `CURRENT` name is syntactically one component, but that alone is not a
+/// root boundary: `Path::is_dir` would follow a symlinked child outside the
+/// lexical root. Readers must reject that shape before opening an engine.
+enum EngineDirectoryKind {
+    Missing,
+    Directory,
+    Unsafe,
+}
+
+fn engine_directory_kind(path: &Path) -> Result<EngineDirectoryKind, CurrentPointerError> {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_dir() => Ok(EngineDirectoryKind::Directory),
+        Ok(_) => Ok(EngineDirectoryKind::Unsafe),
+        Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(EngineDirectoryKind::Missing),
+        Err(source) => Err(CurrentPointerError::Io {
+            operation: "stat CURRENT engine directory",
+            path: path.to_path_buf(),
+            source,
+        }),
     }
 }
 
@@ -13101,11 +13147,20 @@ pub fn inspect_lexical_layout(lexical_root: &Path) -> Result<LexicalLayout, Curr
             BlueGreenEngine::Quill => LexicalLayout::CorruptQuill { detail },
             BlueGreenEngine::Tantivy => LexicalLayout::CorruptTantivy { detail },
         };
-        if !engine_dir.is_dir() {
-            return Ok(corrupt(format!(
-                "CURRENT names missing engine dir {:?}",
-                pointer.dir_name()
-            )));
+        match engine_directory_kind(&engine_dir)? {
+            EngineDirectoryKind::Directory => {}
+            EngineDirectoryKind::Missing => {
+                return Ok(corrupt(format!(
+                    "CURRENT names missing engine dir {:?}",
+                    pointer.dir_name()
+                )));
+            }
+            EngineDirectoryKind::Unsafe => {
+                return Ok(corrupt(format!(
+                    "CURRENT names non-directory or symlink engine entry {:?}",
+                    pointer.dir_name()
+                )));
+            }
         }
         if !engine_dir.join(marker).is_file() {
             return Ok(corrupt(format!(
@@ -20344,6 +20399,33 @@ mod tests {
             inspect_lexical_layout(root.path()).is_err(),
             "no-follow open must refuse a symlinked CURRENT"
         );
+        Ok(())
+    }
+
+    /// A syntactically safe CURRENT child name must still remain below the
+    /// lexical root. `Path::is_dir` follows symlinks, so this pins the
+    /// no-follow directory classification used by both inspection and the
+    /// mutating resolver.
+    #[cfg(unix)]
+    #[test]
+    fn current_selected_symlink_child_is_corrupt_and_never_resolved() -> TestResult {
+        let root = tempdir()?;
+        let outside = tempdir()?;
+        std::fs::write(outside.path().join("MANIFEST"), b"outside-root")?;
+        std::os::unix::fs::symlink(outside.path(), root.path().join("quill-v1"))?;
+        std::fs::write(
+            root.path().join(CURRENT_FILE_NAME),
+            quill_v1_pointer().encode(),
+        )?;
+
+        assert!(matches!(
+            inspect_lexical_layout(root.path())?,
+            LexicalLayout::CorruptQuill { .. }
+        ));
+        assert!(matches!(
+            resolve_current(root.path()),
+            Err(CurrentPointerError::UnsafeEngineDir { .. })
+        ));
         Ok(())
     }
 

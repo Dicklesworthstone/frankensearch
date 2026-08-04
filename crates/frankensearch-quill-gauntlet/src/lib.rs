@@ -31,7 +31,11 @@ use thiserror::Error;
 
 pub use artifact::{
     ArtifactExecutionRole, ArtifactLexicalContractEvidence, ArtifactObject,
-    ArtifactOracleDependency, ArtifactStore, ArtifactTrustCeiling, CANONICALIZATION_VERSION,
+    ArtifactOracleDependency, ArtifactStore, ArtifactStoreV4BuildInput,
+    ArtifactStoreV4BuildInputKind, ArtifactStoreV4BuildSnapshot, ArtifactStoreV4SourceBuildBinding,
+    ArtifactStoreV4SourceBuildSnapshots, ArtifactStoreV4SourceEntry,
+    ArtifactStoreV4SourceEntryKind, ArtifactStoreV4SourceInclusionReason,
+    ArtifactStoreV4SourceSnapshot, ArtifactTrustCeiling, CANONICALIZATION_VERSION,
     CampaignArtifactContext, GauntletProducerBuildIdentity, GauntletProducerSourceVerification,
     IntegrityCheckedCampaign, OBJECT_SCHEMA_VERSION, PreparedArtifact, RUN_MANIFEST_SCHEMA_VERSION,
     RunManifest, SerializedSchemaDisposition, classify_artifact_object_schema,

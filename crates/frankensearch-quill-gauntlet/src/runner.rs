@@ -20,8 +20,9 @@ use frankensearch_core::LexicalSearch;
 use crate::GauntletError;
 use crate::artifact::{
     ArtifactDivergenceBinding, ArtifactExecutionRole, ArtifactLexicalContractEvidence,
-    ArtifactObject, ArtifactOracleDependency, ArtifactStore, ArtifactTrustCeiling,
-    CampaignArtifactContext, GauntletProducerBuildIdentity, OBJECT_HASH_SCHEME_V7_SHA256,
+    ArtifactObject, ArtifactOracleDependency, ArtifactStore, ArtifactStoreV4SourceBuildBinding,
+    ArtifactStoreV4SourceBuildSnapshots, ArtifactTrustCeiling, CampaignArtifactContext,
+    GauntletProducerBuildIdentity, OBJECT_HASH_SCHEME_V7_SHA256,
 };
 use crate::comparator::{
     ComparatorConfig, ComparisonReport, ComparisonStatus, Divergence, DivergenceClass,
@@ -3163,6 +3164,11 @@ pub struct CampaignReport {
     pub execution_role: ArtifactExecutionRole,
     #[serde(default)]
     pub producer_build_identity: GauntletProducerBuildIdentity,
+    /// Optional reference to the separately persisted ArtifactStore v4
+    /// Source-to-Build chain. This reference does not raise the v7 report's
+    /// integrity-only trust ceiling.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub v4_source_build_binding: Option<ArtifactStoreV4SourceBuildBinding>,
     /// Exact dependency role sealed into the reservation, report, and every
     /// immutable case object, including campaigns with only infrastructure
     /// failures and therefore no case objects.
@@ -3202,6 +3208,8 @@ struct CampaignRunReservation<'a> {
     trust_ceiling: ArtifactTrustCeiling,
     execution_role: ArtifactExecutionRole,
     producer_build_identity: &'a GauntletProducerBuildIdentity,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    v4_source_build_binding: Option<&'a ArtifactStoreV4SourceBuildBinding>,
     oracle_dependency: &'a ArtifactOracleDependency,
     engines: &'a EnginePairIdentity,
     semantic_contract: &'a SemanticContract,
@@ -3789,6 +3797,9 @@ impl CampaignReport {
         self.config.validate_stored_v7()?;
         self.divergence_registry.validate()?;
         self.producer_build_identity.validate_stored_v2()?;
+        if let Some(binding) = &self.v4_source_build_binding {
+            binding.validate()?;
+        }
         self.engines.validate_stored_contract()?;
         if self.engines.semantic_contract.as_ref() != Some(&self.semantic_contract) {
             return Err(campaign_error(
@@ -4009,6 +4020,7 @@ impl CampaignReport {
             trust_ceiling: self.trust_ceiling,
             execution_role: self.execution_role,
             producer_build_identity: &self.producer_build_identity,
+            v4_source_build_binding: self.v4_source_build_binding.as_ref(),
             oracle_dependency: &self.oracle_dependency,
             engines: &self.engines,
             semantic_contract: &self.semantic_contract,
@@ -4598,6 +4610,7 @@ pub struct DifferentialCampaignRunner {
     config: CampaignConfig,
     registry: DivergenceRegistry,
     provenance: Option<CampaignProvenance>,
+    v4_source_build_snapshots: Option<ArtifactStoreV4SourceBuildSnapshots>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -4643,7 +4656,25 @@ impl DifferentialCampaignRunner {
             config,
             registry,
             provenance: None,
+            v4_source_build_snapshots: None,
         })
+    }
+
+    /// Attach a distinct ArtifactStore v4 Source-to-Build chain for this
+    /// campaign. The chain is persisted before run reservation and its two
+    /// immutable identities are bound into both reservation and report.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the supplied Build snapshot is not bound to the
+    /// supplied Source snapshot.
+    pub fn with_v4_source_build_snapshots(
+        mut self,
+        snapshots: ArtifactStoreV4SourceBuildSnapshots,
+    ) -> Result<Self, GauntletError> {
+        snapshots.binding()?;
+        self.v4_source_build_snapshots = Some(snapshots);
+        Ok(self)
     }
 
     /// Attach immutable production provenance (bd-quill-e6-gauntlet-scale-rm3q.9).
@@ -4901,6 +4932,11 @@ impl DifferentialCampaignRunner {
             }
         }
         let producer_build_identity = GauntletProducerBuildIdentity::compiled()?;
+        let v4_source_build_binding = self
+            .v4_source_build_snapshots
+            .as_ref()
+            .map(|snapshots| self.store.persist_v4_source_build_snapshots(snapshots))
+            .transpose()?;
         let mut engines = EnginePairIdentity::new(
             ComparisonMode::CrossEngine,
             subject.descriptor(),
@@ -5005,6 +5041,7 @@ impl DifferentialCampaignRunner {
             trust_ceiling: ArtifactTrustCeiling::IntegrityOnly,
             execution_role: durable_admission,
             producer_build_identity: &producer_build_identity,
+            v4_source_build_binding: v4_source_build_binding.as_ref(),
             oracle_dependency: &oracle_dependency,
             engines: &engines,
             semantic_contract: &self.semantic_contract,
@@ -5227,6 +5264,7 @@ impl DifferentialCampaignRunner {
             trust_ceiling: ArtifactTrustCeiling::IntegrityOnly,
             execution_role: durable_admission,
             producer_build_identity,
+            v4_source_build_binding,
             oracle_dependency,
             engines,
             semantic_contract: self.semantic_contract.clone(),
@@ -14792,6 +14830,98 @@ mod tests {
             let oracle_batches = oracle.indexed_payloads.lock().expect("oracle batches");
             assert_eq!(subject_batches.as_slice(), oracle_batches.as_slice());
             assert_eq!(subject_batches.len(), 2);
+        });
+    }
+
+    #[test]
+    fn runner_persists_v4_source_build_binding_before_campaign_reservation() {
+        let fixture = make_fixture();
+        let source = crate::artifact::ArtifactStoreV4SourceSnapshot::new(vec![
+            crate::artifact::ArtifactStoreV4SourceEntry {
+                relative_path: "Cargo.lock".to_owned(),
+                kind: crate::artifact::ArtifactStoreV4SourceEntryKind::File,
+                inclusion_reasons: vec![
+                    crate::artifact::ArtifactStoreV4SourceInclusionReason::CargoLock,
+                ],
+                mode: 0o100644,
+                byte_len: 5,
+                sha256: sha256_bytes(b"lock\n"),
+                symlink_target: None,
+                resolved_target_path: None,
+            },
+        ])
+        .expect("construct source snapshot");
+        let build = crate::artifact::ArtifactStoreV4BuildSnapshot::new(
+            source.identity_sha256.clone(),
+            vec![crate::artifact::ArtifactStoreV4BuildInput {
+                key: "Cargo.lock".to_owned(),
+                kind: crate::artifact::ArtifactStoreV4BuildInputKind::CargoLock,
+                canonical_bytes: b"lock\n".to_vec(),
+                sha256: sha256_bytes(b"lock\n"),
+            }],
+        )
+        .expect("construct Build snapshot");
+        let snapshots =
+            ArtifactStoreV4SourceBuildSnapshots::new(source, build).expect("bind Source to Build");
+        let expected_snapshots = snapshots.clone();
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().join("gauntlet");
+        let mut subject = ScriptedEngine::new(subject_descriptor(), BTreeMap::new());
+        let mut oracle = ScriptedEngine::new(oracle_descriptor(), BTreeMap::new());
+        let campaign = runner(
+            &root,
+            CampaignSelection::CaseIds {
+                ids: vec!["term".to_owned()],
+            },
+            DivergenceRegistry::default(),
+        )
+        .with_v4_source_build_snapshots(snapshots)
+        .expect("attach v4 Source-to-Build chain");
+
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let _temp = temp;
+            let report = campaign
+                .run(
+                    &cx,
+                    "v4-source-build-binding",
+                    &mut subject,
+                    &mut oracle,
+                    &fixture.documents,
+                    &fixture.corpus_manifest,
+                    &fixture.query_suite,
+                )
+                .await
+                .expect("campaign report");
+            let binding = report
+                .v4_source_build_binding
+                .as_ref()
+                .expect("report must carry the persisted v4 binding");
+            assert_eq!(
+                ArtifactStore::new(&root)
+                    .load_v4_source_build_snapshots(binding)
+                    .expect("reload persisted Source-to-Build chain"),
+                expected_snapshots
+            );
+            let reservation_bytes =
+                std::fs::read(root.join("campaigns/v4-source-build-binding/reservation.json"))
+                    .expect("stored campaign reservation");
+            let reservation: serde_json::Value =
+                serde_json::from_slice(&reservation_bytes).expect("decode reservation");
+            assert_eq!(
+                reservation["v4_source_build_binding"]["source_identity_sha256"],
+                binding.source_identity_sha256
+            );
+            assert_eq!(
+                reservation["v4_source_build_binding"]["build_identity_sha256"],
+                binding.build_identity_sha256
+            );
+            assert_eq!(
+                ArtifactStore::new(&root)
+                    .load_integrity_checked_campaign("v4-source-build-binding")
+                    .expect("integrity replay with v4 binding")
+                    .report(),
+                &report
+            );
         });
     }
 

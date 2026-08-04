@@ -1224,6 +1224,81 @@ const ARTIFACTSTORE_V4_BUILD_SNAPSHOT_HASH_DOMAIN: &[u8] =
     b"frankensearch.artifactstore.v4.build\0";
 const MAX_ARTIFACTSTORE_V4_BUILD_SNAPSHOT_BYTES: u64 = 16 * 1024 * 1024;
 
+/// Immutable Source-to-Build link for an ArtifactStore v4 receipt chain.
+///
+/// This is deliberately separate from the legacy `CampaignReport` identity:
+/// a report may reference the chain, but cannot substitute for either v4
+/// object.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ArtifactStoreV4SourceBuildBinding {
+    pub source_identity_sha256: String,
+    pub build_identity_sha256: String,
+}
+
+impl ArtifactStoreV4SourceBuildBinding {
+    fn new(
+        source: &ArtifactStoreV4SourceSnapshot,
+        build: &ArtifactStoreV4BuildSnapshot,
+    ) -> Result<Self, GauntletError> {
+        source.validate()?;
+        build.validate()?;
+        if build.source_identity_sha256 != source.identity_sha256 {
+            return Err(GauntletError::InvalidPreparedArtifact {
+                reason: "ArtifactStore v4 Build snapshot is not bound to its Source snapshot"
+                    .to_owned(),
+            });
+        }
+        Ok(Self {
+            source_identity_sha256: source.identity_sha256.clone(),
+            build_identity_sha256: build.identity_sha256.clone(),
+        })
+    }
+
+    pub(crate) fn validate(&self) -> Result<(), GauntletError> {
+        if !is_lower_sha256(&self.source_identity_sha256)
+            || !is_lower_sha256(&self.build_identity_sha256)
+        {
+            return Err(GauntletError::InvalidPreparedArtifact {
+                reason: "ArtifactStore v4 Source/Build binding has malformed identities".to_owned(),
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Two immutable snapshots that form the first two ArtifactStore v4 objects.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArtifactStoreV4SourceBuildSnapshots {
+    source: ArtifactStoreV4SourceSnapshot,
+    build: ArtifactStoreV4BuildSnapshot,
+}
+
+impl ArtifactStoreV4SourceBuildSnapshots {
+    /// Construct a fully bound Source-to-Build pair.
+    pub fn new(
+        source: ArtifactStoreV4SourceSnapshot,
+        build: ArtifactStoreV4BuildSnapshot,
+    ) -> Result<Self, GauntletError> {
+        ArtifactStoreV4SourceBuildBinding::new(&source, &build)?;
+        Ok(Self { source, build })
+    }
+
+    #[must_use]
+    pub const fn source(&self) -> &ArtifactStoreV4SourceSnapshot {
+        &self.source
+    }
+
+    #[must_use]
+    pub const fn build(&self) -> &ArtifactStoreV4BuildSnapshot {
+        &self.build
+    }
+
+    pub(crate) fn binding(&self) -> Result<ArtifactStoreV4SourceBuildBinding, GauntletError> {
+        ArtifactStoreV4SourceBuildBinding::new(&self.source, &self.build)
+    }
+}
+
 /// File-kind witness for one compiler-visible source input.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1888,6 +1963,92 @@ impl ArtifactStore {
         ArtifactStoreV4BuildSnapshot::new(source.identity_sha256.clone(), inputs)
     }
 
+    /// Persist the immutable v4 Source and Build objects under their complete
+    /// domain-separated identities. Existing bytes are accepted only when
+    /// exactly equal; neither object is replaceable.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for an invalid chain, a malformed existing object, or
+    /// a content-address collision.
+    pub fn persist_v4_source_build_snapshots(
+        &self,
+        snapshots: &ArtifactStoreV4SourceBuildSnapshots,
+    ) -> Result<ArtifactStoreV4SourceBuildBinding, GauntletError> {
+        let binding = snapshots.binding()?;
+        let source_bytes = serialize_json_bounded(
+            snapshots.source(),
+            MAX_ARTIFACTSTORE_V4_SOURCE_SNAPSHOT_BYTES,
+            "ArtifactStore v4 Source snapshot exceeds its durable byte budget",
+        )?;
+        let build_bytes = serialize_json_bounded(
+            snapshots.build(),
+            MAX_ARTIFACTSTORE_V4_BUILD_SNAPSHOT_BYTES,
+            "ArtifactStore v4 Build snapshot exceeds its durable byte budget",
+        )?;
+        let root = PinnedDirectory::ensure_path(&self.root)?;
+        let v4 = root.ensure_child(OsStr::new("v4"))?;
+        let sources = v4.ensure_child(OsStr::new("sources"))?;
+        let builds = v4.ensure_child(OsStr::new("builds"))?;
+        sources.write_once_or_verify(
+            OsStr::new(&format!("{}.json", binding.source_identity_sha256)),
+            &source_bytes,
+            ExistingFileKind::Object,
+            MAX_ARTIFACTSTORE_V4_SOURCE_SNAPSHOT_BYTES,
+        )?;
+        builds.write_once_or_verify(
+            OsStr::new(&format!("{}.json", binding.build_identity_sha256)),
+            &build_bytes,
+            ExistingFileKind::Object,
+            MAX_ARTIFACTSTORE_V4_BUILD_SNAPSHOT_BYTES,
+        )?;
+        Ok(binding)
+    }
+
+    /// Reload one persisted v4 Source-to-Build chain through pinned directory
+    /// descriptors and revalidate every identity edge.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if either object is missing, noncanonical, malformed,
+    /// or not bound to the requested identities.
+    pub fn load_v4_source_build_snapshots(
+        &self,
+        binding: &ArtifactStoreV4SourceBuildBinding,
+    ) -> Result<ArtifactStoreV4SourceBuildSnapshots, GauntletError> {
+        binding.validate()?;
+        let root = PinnedDirectory::open_path(&self.root)?;
+        let v4 = root.open_child(OsStr::new("v4"))?;
+        let sources = v4.open_child(OsStr::new("sources"))?;
+        let builds = v4.open_child(OsStr::new("builds"))?;
+        let source_bytes = sources.read_regular_bounded(
+            OsStr::new(&format!("{}.json", binding.source_identity_sha256)),
+            MAX_ARTIFACTSTORE_V4_SOURCE_SNAPSHOT_BYTES,
+        )?;
+        let build_bytes = builds.read_regular_bounded(
+            OsStr::new(&format!("{}.json", binding.build_identity_sha256)),
+            MAX_ARTIFACTSTORE_V4_BUILD_SNAPSHOT_BYTES,
+        )?;
+        let source: ArtifactStoreV4SourceSnapshot = serde_json::from_slice(&source_bytes)?;
+        let build: ArtifactStoreV4BuildSnapshot = serde_json::from_slice(&build_bytes)?;
+        if !canonical_json_matches(&source, &source_bytes)?
+            || !canonical_json_matches(&build, &build_bytes)?
+        {
+            return Err(GauntletError::InvalidPreparedArtifact {
+                reason: "persisted ArtifactStore v4 Source or Build object is noncanonical"
+                    .to_owned(),
+            });
+        }
+        let snapshots = ArtifactStoreV4SourceBuildSnapshots::new(source, build)?;
+        if snapshots.binding()? != *binding {
+            return Err(GauntletError::InvalidPreparedArtifact {
+                reason: "persisted ArtifactStore v4 Source/Build chain does not match its binding"
+                    .to_owned(),
+            });
+        }
+        Ok(snapshots)
+    }
+
     #[cfg(test)]
     pub(crate) fn with_test_live_source_bypass(root: impl Into<PathBuf>) -> Self {
         Self {
@@ -2348,6 +2509,9 @@ impl ArtifactStore {
         report: &CampaignReport,
         validation: CampaignEvidenceValidation,
     ) -> Result<(), GauntletError> {
+        if let Some(binding) = &report.v4_source_build_binding {
+            self.load_v4_source_build_snapshots(binding)?;
+        }
         let reservation_bytes = campaign.read_regular_bounded(
             OsStr::new("reservation.json"),
             MAX_CAMPAIGN_RESERVATION_BYTES,
@@ -3972,6 +4136,67 @@ mod tests {
                 Err(GauntletError::InvalidPreparedArtifact { .. })
             ));
         }
+    }
+
+    #[test]
+    fn artifactstore_v4_source_build_chain_persists_and_reloads_exact_bytes() {
+        let source = ArtifactStoreV4SourceSnapshot::new(vec![ArtifactStoreV4SourceEntry {
+            relative_path: "Cargo.lock".to_owned(),
+            kind: ArtifactStoreV4SourceEntryKind::File,
+            inclusion_reasons: vec![ArtifactStoreV4SourceInclusionReason::CargoLock],
+            mode: 0o100644,
+            byte_len: 5,
+            sha256: lower_hex(&Sha256::digest(b"lock\n")),
+            symlink_target: None,
+            resolved_target_path: None,
+        }])
+        .expect("construct source snapshot");
+        let build = ArtifactStoreV4BuildSnapshot::new(
+            source.identity_sha256.clone(),
+            vec![ArtifactStoreV4BuildInput {
+                key: "Cargo.lock".to_owned(),
+                kind: ArtifactStoreV4BuildInputKind::CargoLock,
+                canonical_bytes: b"lock\n".to_vec(),
+                sha256: lower_hex(&Sha256::digest(b"lock\n")),
+            }],
+        )
+        .expect("construct build snapshot");
+        let snapshots =
+            ArtifactStoreV4SourceBuildSnapshots::new(source, build).expect("bind Source to Build");
+        let root = tempfile::tempdir().expect("temporary ArtifactStore root");
+        let store = ArtifactStore::new(root.path());
+
+        let binding = store
+            .persist_v4_source_build_snapshots(&snapshots)
+            .expect("persist immutable v4 chain");
+        let reloaded = store
+            .load_v4_source_build_snapshots(&binding)
+            .expect("reload exact immutable v4 chain");
+
+        assert_eq!(reloaded, snapshots);
+        assert_eq!(
+            store
+                .persist_v4_source_build_snapshots(&snapshots)
+                .expect("idempotent exact re-publish"),
+            binding
+        );
+
+        let unrelated_source =
+            ArtifactStoreV4SourceSnapshot::new(vec![ArtifactStoreV4SourceEntry {
+                relative_path: "Cargo.toml".to_owned(),
+                kind: ArtifactStoreV4SourceEntryKind::File,
+                inclusion_reasons: vec![ArtifactStoreV4SourceInclusionReason::CargoConfig],
+                mode: 0o100644,
+                byte_len: 9,
+                sha256: lower_hex(&Sha256::digest(b"[package]")),
+                symlink_target: None,
+                resolved_target_path: None,
+            }])
+            .expect("construct unrelated source snapshot");
+        assert!(matches!(
+            ArtifactStoreV4SourceBuildSnapshots::new(unrelated_source, reloaded.build().clone()),
+            Err(GauntletError::InvalidPreparedArtifact { .. })
+        ));
     }
 
     #[test]

@@ -1,7 +1,7 @@
-//! Filesystem object identity comparison without the `same-file` crate.
+//! Filesystem object identity comparison.
 //!
-//! frankensearch used `same_file::is_same_file` for one question, asked
-//! six times in `two_tier.rs`: do two paths resolve to the same physical
+//! The one consumer of this module asks one question six times in `two_tier.rs`:
+//! do two paths resolve to the same physical
 //! filesystem object (through symlinks and hardlinks)? That is answered
 //! directly by the platform identity tuple:
 //!
@@ -11,17 +11,10 @@
 //!   (mode-`000`) artifacts still compare correctly where an open-based
 //!   probe would fail with `EACCES`, and no descriptor is spent per
 //!   comparison.
-//! * **Windows** — canonicalized-path equality via [`std::fs::canonicalize`],
-//!   which resolves symlinks and case/`.`/`..` differences on a
-//!   stable-std API. This deliberately does NOT use the by-handle
-//!   `(volume_serial_number, file_index)` identity: those `MetadataExt`
-//!   accessors are still gated behind the unstable `windows_by_handle`
-//!   feature, and this crate must compile without depending on that gate's
-//!   status. The only completeness cost is hardlink aliasing (two hardlinks
-//!   to one file canonicalize to distinct names), which the sole
-//!   consumer — rejecting a config that points two index roles at the same
-//!   artifact — does not need: role aliasing in practice is symlinks and
-//!   case, both of which canonicalization catches.
+//! * **Windows** — [`same_file::is_same_file`], whose stable implementation
+//!   compares the volume serial number and file index obtained from retained
+//!   handles. That detects hardlink aliases without enabling unstable
+//!   `windows_by_handle` accessors or adding unsafe FFI here.
 //!
 //! The Unix path additionally detects hardlinks; both paths follow
 //! symlinks, matching `same_file` semantics at every existing call site.
@@ -32,9 +25,8 @@ use std::path::Path;
 /// Do `left` and `right` refer to the same filesystem object?
 ///
 /// Follows symlinks. On Unix two hardlinks to one inode also compare equal
-/// (identity is `(dev, ino)`); on Windows the comparison is
-/// canonicalized-path equality, which catches symlink/case aliasing but not
-/// hardlinks.
+/// (identity is `(dev, ino)`); on Windows hardlinks and symlinks compare equal
+/// through the stable by-handle identity provider.
 ///
 /// # Errors
 ///
@@ -56,7 +48,17 @@ fn identity_eq(left: &Path, right: &Path) -> io::Result<bool> {
     Ok(identity(left)? == identity(right)?)
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
+fn identity_eq(left: &Path, right: &Path) -> io::Result<bool> {
+    windows_identity_eq(left, right)
+}
+
+#[cfg(any(windows, test))]
+fn windows_identity_eq(left: &Path, right: &Path) -> io::Result<bool> {
+    same_file::is_same_file(left, right)
+}
+
+#[cfg(all(not(unix), not(windows)))]
 fn identity_eq(left: &Path, right: &Path) -> io::Result<bool> {
     Ok(std::fs::canonicalize(left)? == std::fs::canonicalize(right)?)
 }
@@ -113,6 +115,21 @@ mod tests {
         assert!(
             is_same_file(&hardlink, &symlink).expect("cross compare"),
             "all three names resolve to one object"
+        );
+    }
+
+    #[test]
+    fn windows_identity_provider_detects_hardlink_aliases() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let target = dir.path().join("target");
+        File::create(&target).expect("create target");
+
+        let hardlink = dir.path().join("hardlink");
+        std::fs::hard_link(&target, &hardlink).expect("create hardlink");
+
+        assert!(
+            super::windows_identity_eq(&target, &hardlink).expect("hardlink compare"),
+            "the Windows by-handle provider must identify hardlink aliases"
         );
     }
 

@@ -61,12 +61,23 @@ impl PairedRatio {
         (null.p5 / null.median, null.p95 / null.median)
     }
 
-    fn null_contains_one(self) -> bool {
-        self.p5 <= 1.0 && 1.0 <= self.p95
+    /// Largest `|median - 1|` an A/A control may show and still be admissible.
+    /// Mirrors `frankensearch_core::bench_support::NULL_MEDIAN_TOLERANCE`.
+    const NULL_MEDIAN_TOLERANCE: f64 = 0.02;
+
+    /// A/A control admissibility: gate the null's accuracy, never its precision.
+    ///
+    /// Requiring `p5 <= 1.0 <= p95` vetoed a null for being *tight*: the
+    /// narrower its spread, the likelier it excluded 1.0 — however small the
+    /// bias and however large the effect (`bd-pjh09`). The spread still sets
+    /// the effect floor below; only the median says whether the sampler itself
+    /// is trustworthy.
+    fn null_is_unbiased(self) -> bool {
+        (self.median - 1.0).abs() <= Self::NULL_MEDIAN_TOLERANCE
     }
 
     fn verdict_against(self, null: Self) -> &'static str {
-        if !null.null_contains_one() {
+        if !null.null_is_unbiased() {
             "BIASED_NULL_UNDECIDABLE"
         } else if self.median < null.p5 {
             "CANDIDATE_FASTER"
@@ -398,7 +409,7 @@ fn bench_fsvi_int8_two_pass(c: &mut Criterion) {
             null.median,
             null.p5,
             null.p95,
-            null.null_contains_one(),
+            null.null_is_unbiased(),
             null.a_mean_us,
             null.b_mean_us,
             null.a_cv_pct,
@@ -464,7 +475,7 @@ fn bench_fsvi_int8_two_pass(c: &mut Criterion) {
     let mult5_ratio = mult5_lever.calibrated_ratio(mult5_null);
     let (mult3_floor_low, mult3_floor_high) = PairedRatio::calibrated_floor(mult3_null);
     let (_, mult5_floor_high) = PairedRatio::calibrated_floor(mult5_null);
-    let gate = if !mult3_null.null_contains_one() || !mult5_null.null_contains_one() {
+    let gate = if !mult3_null.null_is_unbiased() || !mult5_null.null_is_unbiased() {
         "UNDECIDABLE_NULL_BIAS"
     } else if mult3_ratio > mult3_floor_high || mult5_ratio > mult5_floor_high {
         "REJECT_SIGNAL_PROFILE_REQUIRED"

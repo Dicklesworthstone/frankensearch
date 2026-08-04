@@ -2906,14 +2906,10 @@ fn evaluate_qg4(target: &mut GateTargetEvaluator<'_, '_>) {
 }
 
 fn evaluate_qg5(target: &mut GateTargetEvaluator<'_, '_>) {
-    // Estimator is origin's CI-based gate (bd-yo5by); the fixture label stays
-    // on `medium` because that is the cell `PerfCellSpec` actually emits
-    // (`perf.rs`: `compaction/medium/{density}pct`). An xlarge-pinned label
-    // matches no cell, so the `if let` would bind nothing and QG-5 would score
-    // nothing while still reading as green. Re-pin to xlarge together with
-    // `perf.rs` once the e6.1 generator lands.
+    // The e6.1 generator has landed, so this re-baselined ratchet pin matches
+    // the xlarge QG-5 cell emitted by `PerfMatrixSpec`.
     if let Some((ci_low, ci_high)) = target.median_ci95(
-        "compaction/medium/20pct",
+        "compaction/xlarge/20pct",
         "wall_clock_ms_quill_over_tantivy",
         "paired_ab",
     ) {
@@ -3367,6 +3363,50 @@ mod tests {
             ],
             laws_attested: true,
         }
+    }
+
+    fn qg5_target_artifact(ratio: f64) -> PerfGateArtifact {
+        let mut artifact = qg2_artifact("new", 1.0, 1.0);
+        artifact.gate = PerfGate::Qg5;
+        artifact.applicability_plan = Some(plan_binding(PerfGate::Qg5));
+        artifact.cells = vec![PerfCellResult {
+            fixture: "compaction/xlarge/20pct".to_owned(),
+            metric: "wall_clock_ms_quill_over_tantivy".to_owned(),
+            engine: "paired_ab".to_owned(),
+            unit: "ratio".to_owned(),
+            distribution: distribution(ratio),
+        }];
+        artifact
+    }
+
+    fn qg5_target_decision(ratio: f64) -> DecisionState {
+        let artifact = qg5_target_artifact(ratio);
+        let cells = artifact
+            .cells
+            .iter()
+            .map(|cell| (CellKey::from(cell), cell))
+            .collect::<BTreeMap<_, _>>();
+        let mut state = DecisionState::default();
+        evaluate_gate_targets(&artifact, &cells, None, true, false, &mut state);
+        state
+    }
+
+    #[test]
+    fn qg5_xlarge_rebaseline_rejects_a_fourfold_loss() {
+        let state = qg5_target_decision(0.25);
+
+        assert_eq!(state.decision(), PerfGateDecision::Blocked);
+        assert!(state.reasons.iter().any(|reason| {
+            reason.code == "perf.ratchet.gate_target_missed"
+                && reason.message.contains("QG-5 20% compaction")
+        }));
+    }
+
+    #[test]
+    fn qg5_xlarge_rebaseline_accepts_the_fivefold_threshold() {
+        let state = qg5_target_decision(0.20);
+
+        assert_eq!(state.decision(), PerfGateDecision::Accepted);
     }
 
     fn qg2_current_pair(

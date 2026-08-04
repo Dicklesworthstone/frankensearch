@@ -126,8 +126,19 @@ struct RatioSummary {
 }
 
 impl RatioSummary {
-    fn null_contains_one(self) -> bool {
-        self.p5 <= 1.0 && 1.0 <= self.p95
+    /// Largest `|median - 1|` an A/A control may show and still be admissible.
+    /// Mirrors `frankensearch_core::bench_support::NULL_MEDIAN_TOLERANCE`.
+    const NULL_MEDIAN_TOLERANCE: f64 = 0.02;
+
+    /// A/A control admissibility: gate the null's accuracy, never its precision.
+    ///
+    /// Requiring `p5 <= 1.0 <= p95` vetoed a null for being *tight*: the
+    /// narrower its spread, the likelier it excluded 1.0 — however small the
+    /// bias and however large the effect (`bd-pjh09`). The spread still sets
+    /// the effect floor below; only the median says whether the sampler itself
+    /// is trustworthy.
+    fn null_is_unbiased(self) -> bool {
+        (self.median - 1.0).abs() <= Self::NULL_MEDIAN_TOLERANCE
     }
 }
 
@@ -336,7 +347,7 @@ fn bench_repair_log_rotation_ab(c: &mut Criterion) {
         &candidate,
         base_len,
     );
-    let gate_pass = null.null_contains_one() && candidate_ratio.median < null.p5;
+    let gate_pass = null.null_is_unbiased() && candidate_ratio.median < null.p5;
     eprintln!(
         "[parity] repair_log_append active_and_rotated_bytes=IDENTICAL shapes=999/1000,1000/1000"
     );
@@ -349,10 +360,10 @@ fn bench_repair_log_rotation_ab(c: &mut Criterion) {
         candidate_ratio.median, candidate_ratio.p5, candidate_ratio.p95
     );
     eprintln!(
-        "[gate] decision={} speedup={:.6}x null_contains_one={} candidate_median_below_null_p5={}",
+        "[gate] decision={} speedup={:.6}x null_is_unbiased={} candidate_median_below_null_p5={}",
         if gate_pass { "KEEP" } else { "HOLD" },
         1.0 / candidate_ratio.median,
-        null.null_contains_one(),
+        null.null_is_unbiased(),
         candidate_ratio.median < null.p5
     );
 

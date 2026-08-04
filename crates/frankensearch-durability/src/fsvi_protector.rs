@@ -21,6 +21,26 @@ use crate::file_protector::{FileProtector, FileRepairOutcome};
 use crate::metrics::DurabilityMetrics;
 use crate::repair_trailer::deserialize_repair_trailer;
 
+fn acquire_shared_fsvi_map_lock(file: &fs::File, path: &Path) -> SearchResult<()> {
+    file.try_lock_shared().map_err(|error| SearchError::InvalidConfig {
+        field: "fsvi.map_lock".to_owned(),
+        value: path.display().to_string(),
+        reason: format!(
+            "cannot acquire shared reader lock before mapping this published FSVI: {error}; a writer may be active"
+        ),
+    })
+}
+
+fn acquire_exclusive_fsvi_writer_lock(file: &fs::File, path: &Path) -> SearchResult<()> {
+    file.try_lock().map_err(|error| SearchError::InvalidConfig {
+        field: "fsvi.map_lock".to_owned(),
+        value: path.display().to_string(),
+        reason: format!(
+            "cannot acquire exclusive writer lock before repairing this published FSVI: {error}; drop live readers/writers before retrying"
+        ),
+    })
+}
+
 /// Result of protecting an FSVI file with repair symbols.
 #[derive(Debug, Clone)]
 pub struct FsviProtectionResult {
@@ -102,6 +122,9 @@ impl FsviProtector {
     pub fn protect_atomic(&self, fsvi_path: &Path) -> SearchResult<FsviProtectionResult> {
         let start = Instant::now();
 
+        let _source_lock = fs::File::open(fsvi_path).map_err(SearchError::Io)?;
+        acquire_shared_fsvi_map_lock(&_source_lock, fsvi_path)?;
+
         // Generate repair symbols via the inner protector.
         // FileProtector::protect_file now handles atomic write (temp + rename) internally.
         let protection = self.protector.protect_file(fsvi_path)?;
@@ -181,13 +204,10 @@ impl FsviProtector {
         let actual_hash = if len == 0 {
             xxh3_64(&[])
         } else {
-            // SAFETY: read-only access is not what makes this sound — the
-            // hazard is another process truncating or rewriting the file
-            // while the mapping is live, mutating bytes behind a live
-            // `&[u8]`. Rust cannot express that cross-process invariant, so
-            // no safe wrapper exists. It is upheld by verification: these
-            // bytes are checked against a recorded digest before use, so a
-            // concurrent writer produces a verification failure.
+            acquire_shared_fsvi_map_lock(&file, fsvi_path)?;
+            // SAFETY: the shared lock is retained by `file` for the mapping's
+            // lifetime, and every FSVI writer acquires the exclusive version
+            // before making a writable map.
             let mmap = unsafe { Mmap::map(&file).map_err(SearchError::Io)? };
             xxh3_64(&mmap)
         };
@@ -244,28 +264,32 @@ impl FsviProtector {
         }
 
         // Compute hash before repair (if file exists).
-        let (hash_before, len, had_source) = match fs::File::open(fsvi_path) {
+        let source_lock = match fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(fsvi_path)
+        {
             Ok(file) => {
+                acquire_exclusive_fsvi_writer_lock(&file, fsvi_path)?;
+                Some(file)
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => None,
+            Err(err) => return Err(SearchError::Io(err)),
+        };
+        let (hash_before, len, had_source) = match source_lock.as_ref() {
+            Some(file) => {
                 let len = file.metadata().map_err(SearchError::Io)?.len();
                 let hash_before = if len == 0 {
                     xxh3_64(&[])
                 } else {
-                    // SAFETY: `Mmap::map` is unsafe because another process may
-                    // truncate or rewrite the file while the mapping is live,
-                    // mutating bytes behind a live `&[u8]`. That invariant is an
-                    // OS-level, cross-process property Rust cannot express, which
-                    // is why no crate wraps it safely. It is upheld here by the
-                    // verification contract, not by exclusion: the digest computed
-                    // from these bytes is checked against the recorded witness
-                    // before the artifact is accepted, so a concurrent writer
-                    // yields a verification failure rather than a bad accept.
-                    let mmap = unsafe { Mmap::map(&file).map_err(SearchError::Io)? };
+                    // SAFETY: the exclusive writer lock is retained by
+                    // `source_lock` until repair completes.
+                    let mmap = unsafe { Mmap::map(file).map_err(SearchError::Io)? };
                     xxh3_64(&mmap)
                 };
                 (hash_before, len, true)
             }
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => (0, 0, false),
-            Err(err) => return Err(SearchError::Io(err)),
+            None => (0, 0, false),
         };
 
         let backup_path = if had_source {
@@ -303,21 +327,20 @@ impl FsviProtector {
                 bytes_written,
                 symbols_used,
             } => {
+                // `repair_file` atomically replaces recovered artifacts, so
+                // the exclusive source handle can refer to the old inode.
+                // Drop it before locking the artifact that was published.
+                drop(source_lock);
                 // Verify hash after repair
                 let repaired_file = fs::File::open(fsvi_path).map_err(SearchError::Io)?;
                 let repaired_len = repaired_file.metadata().map_err(SearchError::Io)?.len();
                 let hash_after = if repaired_len == 0 {
                     xxh3_64(&[])
                 } else {
-                    // SAFETY: `Mmap::map` is unsafe because another process may
-                    // truncate or rewrite the file while the mapping is live,
-                    // mutating bytes behind a live `&[u8]`. That invariant is an
-                    // OS-level, cross-process property Rust cannot express, which
-                    // is why no crate wraps it safely. It is upheld here by the
-                    // verification contract, not by exclusion: the digest computed
-                    // from these bytes is checked against the recorded witness
-                    // before the artifact is accepted, so a concurrent writer
-                    // yields a verification failure rather than a bad accept.
+                    acquire_shared_fsvi_map_lock(&repaired_file, fsvi_path)?;
+                    // SAFETY: the shared lock is retained by `repaired_file`
+                    // for the mapping lifetime and protects the inode repair
+                    // actually published.
                     let mmap = unsafe { Mmap::map(&repaired_file).map_err(SearchError::Io)? };
                     xxh3_64(&mmap)
                 };
@@ -403,7 +426,7 @@ mod tests {
     use fsqlite_core::raptorq_integration::{CodecDecodeResult, CodecEncodeResult, SymbolCodec};
     use fsqlite_types::cx::Cx;
 
-    use super::{FsviProtector, FsviVerifyResult};
+    use super::{FsviProtector, FsviVerifyResult, acquire_shared_fsvi_map_lock};
     use crate::config::DurabilityConfig;
 
     /// Mock codec that creates simple repair symbols for testing.
@@ -572,6 +595,31 @@ mod tests {
         let path = PathBuf::from("/tmp/index.fast.fsvi");
         let sidecar = FsviProtector::sidecar_path(&path);
         assert_eq!(sidecar, PathBuf::from("/tmp/index.fast.fsvi.fec"));
+    }
+
+    #[test]
+    fn shared_mapping_refuses_a_published_fsvi_held_by_a_writer() {
+        let path = temp_path("shared-map-writer-contention");
+        std::fs::write(&path, b"published fsvi fixture").expect("write fixture");
+
+        let writer = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .expect("open writer fixture");
+        writer.try_lock().expect("hold exclusive writer lock");
+        let reader = std::fs::File::open(&path).expect("open reader fixture");
+
+        let error = acquire_shared_fsvi_map_lock(&reader, &path)
+            .expect_err("durability verification must not map while a writer owns the artifact");
+        assert!(matches!(
+            error,
+            frankensearch_core::SearchError::InvalidConfig { field, .. } if field == "fsvi.map_lock"
+        ));
+
+        drop(writer);
+        acquire_shared_fsvi_map_lock(&reader, &path)
+            .expect("reader maps only after the writer lock is released");
     }
 
     #[test]

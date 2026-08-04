@@ -54,8 +54,8 @@ pub use index::{
 };
 pub use index::{
     QUILL_LEXICAL_BACKEND, QuillDocumentWitness, QuillHit, QuillIndex, QuillIndexError,
-    QuillSearchIndex, QuillSearchResult, QuillSearchSnapshot, QuillSnippetHit, SnapshotError,
-    SnapshotPublisher, indexable_document_content_hash,
+    QuillSearchIndex, QuillSearchResult, QuillSearchSnapshot, QuillSnippetHit,
+    RootBoundQuillSearchIndex, SnapshotError, SnapshotPublisher, indexable_document_content_hash,
 };
 #[cfg(feature = "profile-internals")]
 #[doc(hidden)]
