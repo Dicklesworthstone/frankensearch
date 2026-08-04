@@ -587,7 +587,7 @@ pub enum ArtifactLexicalContractEvidence {
     LegacyPreV3Missing,
     /// The object intentionally proves only the legacy rich result envelope.
     RankEnvelopeOnly,
-    /// Complete replayable ordinary `LexicalSearch` comparison.
+    /// Complete replayable ordinary lexical-read comparison.
     CoreLexicalV3 {
         comparison: Box<LexicalContractComparison>,
     },

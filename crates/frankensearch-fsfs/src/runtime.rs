@@ -18645,7 +18645,8 @@ mod tests {
     use asupersync::runtime::RuntimeBuilder;
     use asupersync::test_utils::run_test_with_cx;
     use frankensearch_core::{
-        Embedder, IndexableDocument, LexicalSearch, ModelCategory, SearchError, SearchFuture,
+        Embedder, IndexableDocument, LexicalRead as _, LexicalWrite as _, ModelCategory,
+        SearchError, SearchFuture,
     };
     #[cfg(feature = "embedded-models")]
     use frankensearch_embed::verify_dir_cached;

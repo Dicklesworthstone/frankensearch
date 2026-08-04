@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tracing::Instrument as _;
 
-use frankensearch_core::LexicalSearch;
+use frankensearch_core::LexicalRead;
 
 use crate::GauntletError;
 use crate::artifact::{
@@ -245,13 +245,13 @@ pub trait DifferentialCampaignEngine: Send + Sync {
     ///
     /// CASS adapters intentionally retain the default `None`: their richer
     /// retrieval, hydration, post-filter, and CLI projection contract is not
-    /// representable by the ordinary [`LexicalSearch`] boundary.
+    /// representable by the ordinary [`LexicalRead`] boundary.
     ///
     /// # Errors
     ///
     /// Implementations may return a typed adapter error when their ordinary
     /// lexical facade cannot be exposed safely for the current lifecycle.
-    fn core_lexical_search(&self) -> Result<Option<&dyn LexicalSearch>, GauntletError> {
+    fn core_lexical_search(&self) -> Result<Option<&dyn LexicalRead>, GauntletError> {
         Ok(None)
     }
 
@@ -6400,7 +6400,7 @@ async fn observe_core_lexical_bundle(
     )?;
     let lexical = engine.core_lexical_search()?.ok_or_else(|| {
         campaign_error(format!(
-            "engine {} does not expose the required ordinary LexicalSearch contract",
+            "engine {} does not expose the required ordinary LexicalRead contract",
             descriptor.implementation
         ))
     })?;
@@ -6737,7 +6737,7 @@ impl DifferentialCampaignEngine for crate::engine::QuillSubject {
         SemanticContract::scalar_g1a()
     }
 
-    fn core_lexical_search(&self) -> Result<Option<&dyn LexicalSearch>, GauntletError> {
+    fn core_lexical_search(&self) -> Result<Option<&dyn LexicalRead>, GauntletError> {
         self.require_committed()?;
         Ok(Some(self.index()?))
     }
@@ -6853,7 +6853,7 @@ impl DifferentialCampaignEngine for crate::engine::TantivyOracle {
         self.campaign_semantic_contract().clone()
     }
 
-    fn core_lexical_search(&self) -> Result<Option<&dyn LexicalSearch>, GauntletError> {
+    fn core_lexical_search(&self) -> Result<Option<&dyn LexicalRead>, GauntletError> {
         self.require_committed()?;
         Ok(Some(self.index()))
     }
@@ -6865,7 +6865,7 @@ impl DifferentialCampaignEngine for crate::engine::TantivyOracle {
         _semantic_contract: &'a SemanticContract,
     ) -> CampaignFuture<'a, ()> {
         Box::pin(async move {
-            use frankensearch_core::LexicalSearch;
+            use frankensearch_core::LexicalRead;
 
             if self.index().doc_count() != 0 {
                 return Err(campaign_error(
@@ -6883,7 +6883,7 @@ impl DifferentialCampaignEngine for crate::engine::TantivyOracle {
         documents: &'a [GeneratedDocument],
     ) -> CampaignFuture<'a, ()> {
         Box::pin(async move {
-            use frankensearch_core::LexicalSearch;
+            use frankensearch_core::LexicalWrite;
 
             self.require_ingesting()?;
             let indexable = documents
@@ -6903,7 +6903,7 @@ impl DifferentialCampaignEngine for crate::engine::TantivyOracle {
         semantic_contract: &'a SemanticContract,
     ) -> CampaignFuture<'a, EngineIndexReceipt> {
         Box::pin(async move {
-            use frankensearch_core::LexicalSearch;
+            use frankensearch_core::{LexicalRead, LexicalWrite};
 
             self.require_ingesting()?;
             self.index().commit(cx).await?;
@@ -17419,7 +17419,7 @@ mod tests {
     #[cfg(feature = "tantivy-oracle")]
     #[test]
     fn tantivy_campaign_adapter_rejects_wrapped_delete_to_zero_history() {
-        use frankensearch_core::LexicalSearch;
+        use frankensearch_core::{LexicalRead, LexicalWrite};
 
         let fixture = make_fixture();
         let lexical_revision = oracle_version_contract()
@@ -18329,6 +18329,8 @@ mod tests {
         }
 
         asupersync::test_utils::run_test_with_cx(|cx| async move {
+            use frankensearch_core::LexicalWrite;
+
             let fixture = make_scalar_g1a_regression_fixture();
             let (mut subject, mut oracle) = live_campaign_engines();
             subject
@@ -18796,6 +18798,8 @@ mod tests {
     #[test]
     fn mixed_chain_duplicates_and_fielded_literals_match_oracle_exactly() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
+            use frankensearch_core::LexicalWrite;
+
             let fixture = make_scalar_g1a_regression_fixture();
             let (mut subject, mut oracle) = live_campaign_engines();
             subject.claim_fresh_campaign().expect("claim subject");

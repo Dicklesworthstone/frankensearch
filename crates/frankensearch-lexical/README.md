@@ -4,7 +4,7 @@ Tantivy BM25 full-text search integration for frankensearch.
 
 ## Overview
 
-This crate provides the `TantivyIndex` implementation of the `LexicalSearch` trait, wrapping Tantivy for BM25 keyword search. It handles schema creation, document indexing, query parsing, snippet generation, and result ranking. Title matches receive a 2x BM25 boost for improved relevance.
+This crate provides the `TantivyIndex` implementation of the split `LexicalRead` / `LexicalWrite` traits, wrapping Tantivy for BM25 keyword search. It handles schema creation, document indexing, query parsing, snippet generation, and result ranking. Title matches receive a 2x BM25 boost for improved relevance.
 
 It also includes the CASS (Content-Addressable Search Schema) compatibility layer for advanced schema management, boolean query parsing, edge-ngram tokenization, and regex query caching.
 
@@ -19,7 +19,7 @@ It also includes the CASS (Content-Addressable Search Schema) compatibility laye
 
 ## Key Types
 
-- `TantivyIndex` - main lexical search backend implementing the `LexicalSearch` trait
+- `TantivyIndex` - main lexical search backend implementing `LexicalRead` + `LexicalWrite`
 - `LexicalHit` - enriched search result with BM25 score, snippet, and query explanation
 - `LexicalDocHit` - raw hit with BM25 score and Tantivy doc address for custom field extraction
 - `LexicalIdHit` - lightweight hit with just doc ID and score for hot paths

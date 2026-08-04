@@ -416,7 +416,7 @@ fn semantic_queries_do_not_leak_the_answer_vocabulary() {
 #[cfg(feature = "quill")]
 mod lexical {
     use super::{LEXICAL_QUERIES, Passage, chapters_of, corpus};
-    use frankensearch::{IndexableDocument, LexicalSearch, QuillConfig, QuillIndex};
+    use frankensearch::{IndexableDocument, LexicalRead, LexicalWrite, QuillConfig, QuillIndex};
     #[cfg(feature = "lexical-tantivy")]
     use frankensearch::{ScoredResult, TantivyIndex};
 
@@ -476,10 +476,10 @@ mod lexical {
         let index = QuillIndex::create(cx, dir, QuillConfig::default())
             .await
             .expect("create quill index");
-        LexicalSearch::index_documents(&index, cx, docs)
+        LexicalWrite::index_documents(&index, cx, docs)
             .await
             .expect("index passages");
-        LexicalSearch::commit(&index, cx).await.expect("commit");
+        LexicalWrite::commit(&index, cx).await.expect("commit");
         index
     }
 
@@ -490,10 +490,10 @@ mod lexical {
         docs: &[IndexableDocument],
     ) -> TantivyIndex {
         let index = TantivyIndex::create(dir).expect("create Tantivy index");
-        LexicalSearch::index_documents(&index, cx, docs)
+        LexicalWrite::index_documents(&index, cx, docs)
             .await
             .expect("index passages");
-        LexicalSearch::commit(&index, cx).await.expect("commit");
+        LexicalWrite::commit(&index, cx).await.expect("commit");
         index
     }
 
@@ -600,13 +600,13 @@ mod lexical {
     }
 
     #[cfg(feature = "lexical-tantivy")]
-    async fn public_observation<I: LexicalSearch>(
+    async fn public_observation<I: LexicalRead>(
         index: &I,
         cx: &frankensearch::Cx,
         query: &str,
         limit: usize,
     ) -> RankedObservation {
-        LexicalSearch::search(index, cx, query, limit)
+        LexicalRead::search(index, cx, query, limit)
             .await
             .expect("public lexical search")
             .into_iter()
@@ -684,7 +684,7 @@ mod lexical {
     }
 
     #[cfg(feature = "lexical-tantivy")]
-    async fn assert_adapter_consistency<I: LexicalSearch>(
+    async fn assert_adapter_consistency<I: LexicalRead>(
         label: &str,
         index: &I,
         cx: &frankensearch::Cx,
@@ -834,8 +834,8 @@ mod lexical {
             // No backend-specific fixture transform can drift between arms.
             let quill = build_quill_index(&cx, &quill_dir, &docs).await;
             let tantivy = build_tantivy_index(&cx, &tantivy_dir, &docs).await;
-            assert_eq!(LexicalSearch::doc_count(&quill), docs.len());
-            assert_eq!(LexicalSearch::doc_count(&tantivy), docs.len());
+            assert_eq!(LexicalRead::doc_count(&quill), docs.len());
+            assert_eq!(LexicalRead::doc_count(&tantivy), docs.len());
 
             assert_qrels("Quill before reopen", &passages, &spec, |query, limit| {
                 quill_sync_observation(&quill, &cx, query, limit)
@@ -868,8 +868,8 @@ mod lexical {
                 .await
                 .expect("reopen Quill index");
             let tantivy = TantivyIndex::open(&tantivy_dir).expect("reopen Tantivy index");
-            assert_eq!(LexicalSearch::doc_count(&quill), docs.len());
-            assert_eq!(LexicalSearch::doc_count(&tantivy), docs.len());
+            assert_eq!(LexicalRead::doc_count(&quill), docs.len());
+            assert_eq!(LexicalRead::doc_count(&tantivy), docs.len());
 
             assert_qrels("Quill after reopen", &passages, &spec, |query, limit| {
                 quill_sync_observation(&quill, &cx, query, limit)

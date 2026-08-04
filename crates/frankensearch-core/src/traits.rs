@@ -2,7 +2,8 @@
 //!
 //! - [`Embedder`]: Text embedding model interface (hash, model2vec, fastembed).
 //! - [`Reranker`]: Cross-encoder reranking model interface.
-//! - [`LexicalSearch`]: Full-text search backend interface (Tantivy, FTS5).
+//! - [`LexicalRead`] / [`LexicalWrite`]: Split full-text backend interface
+//!   (Tantivy, FTS5, Quill).
 //!
 //! Async operations are represented as boxed futures so the traits remain
 //! dyn-compatible for runtime polymorphism (`Box<dyn Embedder>`, etc.).
@@ -802,118 +803,22 @@ impl<T: SyncRerank + 'static> Reranker for SyncRerankerAdapter<T> {
     }
 }
 
-// ─── Lexical Search Trait ───────────────────────────────────────────────────
-
-/// Trait for full-text lexical search backends.
-///
-/// Two implementations are planned:
-/// - `TantivyIndex` in `frankensearch-lexical` (default, via `lexical` feature)
-/// - FTS5 adapter in `frankensearch-storage` (alternative, via `fts5` feature)
-///
-/// Both produce `ScoredResult` with `source = ScoreSource::Lexical`.
-pub trait LexicalSearch: Send + Sync {
-    /// Search for documents matching the query, returning up to `limit` results
-    /// sorted by BM25 relevance.
-    ///
-    /// # Errors
-    ///
-    /// Returns `SearchError` if the query cannot be parsed or the search backend fails.
-    fn search<'a>(
-        &'a self,
-        cx: &'a Cx,
-        query: &'a str,
-        limit: usize,
-    ) -> SearchFuture<'a, Vec<ScoredResult>>;
-
-    /// Search for lexical candidates that will be consumed by hybrid fusion.
-    ///
-    /// The default preserves the full [`Self::search`] result. Backends with a
-    /// cheaper identifier-only path may override this and defer stored metadata
-    /// materialization until [`Self::hydrate_fusion_metadata`] knows which
-    /// candidates survived fusion.
-    ///
-    /// # Errors
-    ///
-    /// Returns `SearchError` under the same conditions as [`Self::search`].
-    fn search_fusion_candidates<'a>(
-        &'a self,
-        cx: &'a Cx,
-        query: &'a str,
-        limit: usize,
-    ) -> SearchFuture<'a, Vec<ScoredResult>> {
-        self.search(cx, query, limit)
-    }
-
-    /// Whether [`Self::search_fusion_candidates`] omits metadata that must be
-    /// restored for the final fused winners.
-    fn fusion_metadata_is_deferred(&self) -> bool {
-        false
-    }
-
-    /// Restore metadata for final hybrid results produced from deferred fusion
-    /// candidates.
-    ///
-    /// Implementations should ignore results without a lexical score: those
-    /// results did not survive from the lexical candidate pool. The default is
-    /// a no-op because the default candidate path already returns full results.
-    ///
-    /// # Errors
-    ///
-    /// Returns `SearchError` if winner metadata cannot be materialized.
-    fn hydrate_fusion_metadata<'a>(
-        &'a self,
-        _cx: &'a Cx,
-        _results: &'a mut [ScoredResult],
-    ) -> SearchFuture<'a, ()> {
-        Box::pin(async { Ok(()) })
-    }
-
-    /// Index a single document for full-text search.
-    ///
-    /// # Errors
-    ///
-    /// Returns `SearchError` if the document cannot be indexed.
-    fn index_document<'a>(&'a self, cx: &'a Cx, doc: &'a IndexableDocument)
-    -> SearchFuture<'a, ()>;
-
-    /// Index a batch of documents.
-    ///
-    /// # Errors
-    ///
-    /// Returns `SearchError` if any document cannot be indexed.
-    fn index_documents<'a>(
-        &'a self,
-        cx: &'a Cx,
-        docs: &'a [IndexableDocument],
-    ) -> SearchFuture<'a, ()> {
-        Box::pin(async move {
-            for doc in docs {
-                self.index_document(cx, doc).await?;
-            }
-            Ok(())
-        })
-    }
-
-    /// Commit any pending writes to the index.
-    ///
-    /// # Errors
-    ///
-    /// Returns `SearchError` if the commit fails (e.g., I/O error).
-    fn commit<'a>(&'a self, cx: &'a Cx) -> SearchFuture<'a, ()>;
-
-    /// Number of documents currently indexed.
-    fn doc_count(&self) -> usize;
-}
+// ─── Lexical Search Trait (REMOVED — bd-8nqz.1) ─────────────────────────────
+//
+// `LexicalSearch` combined search, metadata hydration, indexing and commit in
+// one trait. That forced read-only consumers and `TwoTierSearcher` to hold a
+// writer-capable backend, and it let hydration read a newer snapshot than the
+// one that scored a candidate batch. It is replaced by `LexicalRead` and
+// `LexicalWrite` below; every backend implements them directly, with no
+// compatibility shim.
 
 // ─── Split lexical traits (bd-8nqz.1) ───────────────────────────────────────
 //
-// [`LexicalSearch`] combines read and write concerns, which forces read-only
-// consumers to hold writer-capable backends and lets hydration read a newer
-// snapshot than the one that scored a candidate batch. The split below is the
-// replacement contract: [`LexicalRead`] for search + generation-pinned
-// hydration, [`LexicalWrite`] for mutation. Consumers migrate off
-// [`LexicalSearch`] in the coordinated flip (fusion/facade/gauntlet), after
-// which the combined trait is removed.
+// The retired combined trait mixed read and write concerns, which forced
+// read-only consumers to hold writer-capable backends and let hydration read a
+// newer snapshot than the one that scored a candidate batch. This is the
+// replacement contract: [`LexicalRead`] for search plus generation-pinned
+// hydration, [`LexicalWrite`] for mutation.
 
 /// Opaque, backend-owned pin of the immutable snapshot that scored a
 /// candidate batch (bd-8nqz.1).
@@ -1486,8 +1391,12 @@ mod tests {
     }
 
     #[test]
-    fn lexical_search_trait_is_object_safe() {
-        fn _takes_dyn_lexical(_: &dyn LexicalSearch) {}
+    fn split_lexical_traits_are_object_safe() {
+        // Both halves must stay object-safe: `ShadowLexical` holds them as
+        // `Arc<dyn _>`, and a read-only consumer must be able to take
+        // `&dyn LexicalRead` without dragging in a mutation surface.
+        fn _takes_dyn_read(_: &dyn LexicalRead) {}
+        fn _takes_dyn_write(_: &dyn LexicalWrite) {}
     }
 
     #[test]
