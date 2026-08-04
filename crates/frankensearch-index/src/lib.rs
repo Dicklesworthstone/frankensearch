@@ -1807,8 +1807,17 @@ impl VectorIndex {
 
         // Load WAL entries if a sidecar file exists.
         let wal_path = wal::wal_path_for(path);
-        let (wal_entries_raw, wal_compaction_gen, valid_len) =
-            wal::read_wal(&wal_path, metadata.dimension, metadata.quantization)?;
+        // Only a write-capable open may quarantine a torn header; a read-only
+        // open stays side-effect-free like every other `writer &&` guard here.
+        let (wal_entries_raw, wal_compaction_gen, valid_len) = if writer {
+            wal::read_wal_recovering_torn_header(
+                &wal_path,
+                metadata.dimension,
+                metadata.quantization,
+            )?
+        } else {
+            wal::read_wal(&wal_path, metadata.dimension, metadata.quantization)?
+        };
 
         let mut deduped_wal = Vec::with_capacity(wal_entries_raw.len());
         let mut seen_ids = std::collections::HashSet::new();
