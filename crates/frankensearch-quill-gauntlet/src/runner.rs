@@ -744,6 +744,18 @@ impl MetamorphicLawRegistry {
                     ],
                 ),
                 law(
+                    "e6.3-three-term-or-associativity-v1",
+                    "e6.3-three-term-or-associativity-v1",
+                    "three distinct unboosted optional scalar OR operands, regrouped only",
+                    "ranked document sequence, doc count, match count, and snippets; score bits EXCLUDED and separately witnessed (measured one ULP)",
+                    "same ranked documents under re-association, WITHIN each engine only; the cross-engine scope is excluded because the un-transformed baseline (alpha OR gamma) OR delta already diverges by one ULP, registered on bd-quill-e6-gauntlet-scale-rm3q.8.1",
+                    "tie_order",
+                    "e63-three-term-or-associativity-positive",
+                    "e63-three-term-or-associativity-mixed-operator",
+                    "engine::tests::e63_three_term_or_associates_within_each_engine_while_cross_engine_stays_registered",
+                    vec![MetamorphicLawScope::Quill, MetamorphicLawScope::Tantivy],
+                ),
+                law(
                     "e6.3-single-term-quote-v1",
                     "e6.3-single-term-quote-v1",
                     "one quoted term on a position-capable scalar field",
@@ -9195,6 +9207,7 @@ mod tests {
             "e6.3-two-term-and-commutativity-v1",
             "e6.3-two-term-or-commutativity-v1",
             "e6.3-three-term-and-associativity-v1",
+            "e6.3-three-term-or-associativity-v1",
             "e6.3-single-term-quote-v1",
             "e6.3-tight-segment-geometry-v1",
             "e6.3-bulk-publication-cadence-v1",
@@ -19834,6 +19847,10 @@ mod tests {
     const E68_RECORDED_AT: &str = "2026-08-04T19:00:00Z";
     #[cfg(feature = "tantivy-oracle")]
     const E68_RECORDED_BY: &str = "Claude-pane12";
+    #[cfg(feature = "tantivy-oracle")]
+    const E68_LIVE_LEDGER_FIXTURE: &str = "fixtures/divergence-register-v2-live.json";
+    #[cfg(feature = "tantivy-oracle")]
+    const E68_LIVE_WITNESS_FIXTURE: &str = "fixtures/artifact-object-v7-div007-live.json";
     /// Domain separation for the minimized-fixture digest recorded with the
     /// observation. Re-derivable from the committed inputs, so the digest is a
     /// checkable claim rather than an opaque constant.
@@ -20161,6 +20178,86 @@ mod tests {
                 );
             }
         });
+    }
+
+    /// bd-quill-e6-gauntlet-scale-rm3q.8: the COMMITTED production register and
+    /// its committed witness must remain valid, mutually bound, and free of
+    /// plaintext — on any checkout, clean or dirty, since a stored seal is
+    /// evidence about the producer that minted it, not about the reader.
+    ///
+    /// This is the register selfcheck that outlives the mint: the mint proves a
+    /// live mismatch CAN be ingested, this proves the ingested record still
+    /// says what it said, still joins to its witness, and still redacts.
+    #[cfg(feature = "tantivy-oracle")]
+    #[test]
+    fn committed_live_divergence_register_joins_its_witness_and_stays_redacted() {
+        let crate_root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+        let ledger = DivergenceRegisterLedger::decode_json(
+            &std::fs::read(crate_root.join(E68_LIVE_LEDGER_FIXTURE))
+                .expect("committed live divergence register"),
+        )
+        .expect("committed live register must decode and validate");
+        ledger
+            .validate()
+            .expect("committed live register must satisfy the current v2 contract");
+
+        let object: ArtifactObject = serde_json::from_slice(
+            &std::fs::read(crate_root.join(E68_LIVE_WITNESS_FIXTURE))
+                .expect("committed live witness object"),
+        )
+        .expect("committed witness object must decode");
+        ledger
+            .validate_relational_integrity_against_artifact_objects(std::slice::from_ref(&object))
+            .expect("committed register must join to its committed witness");
+
+        // The recorded minimized-fixture digest is re-derived, not trusted.
+        let fixture = make_e68_witness_fixture();
+        let expected_fixture_sha256 = e68_minimized_fixture_sha256(&fixture, E68_WITNESS_CASE_ID);
+        let observation = ledger
+            .events
+            .iter()
+            .find_map(|event| match event {
+                DivergenceRegisterEvent::Observation(observation) => Some(observation),
+                DivergenceRegisterEvent::Disposition(_)
+                | DivergenceRegisterEvent::Prediction(_) => None,
+            })
+            .expect("committed register holds an observation");
+        assert_eq!(observation.divergence_id, E68_WITNESS_DIVERGENCE_ID);
+        assert_eq!(observation.class, DivergenceClass::RankMismatch);
+        assert_eq!(
+            observation.fixture.fixture_sha256, expected_fixture_sha256,
+            "the recorded minimized fixture no longer hashes to the committed case"
+        );
+
+        // A raw failure class may only block or be fixed, never be accepted.
+        let disposition = ledger
+            .events
+            .iter()
+            .find_map(|event| match event {
+                DivergenceRegisterEvent::Disposition(disposition) => Some(disposition),
+                DivergenceRegisterEvent::Observation(_)
+                | DivergenceRegisterEvent::Prediction(_) => None,
+            })
+            .expect("committed register holds a disposition");
+        match &disposition.disposition {
+            DivergenceDisposition::Blocking { bead_id, .. } => {
+                assert_eq!(bead_id, E68_WITNESS_BLOCKING_BEAD);
+            }
+            DivergenceDisposition::Accepted { .. } | DivergenceDisposition::Fixed { .. } => {
+                panic!("DIV-008 is neither accepted nor fixed; the committed record says otherwise")
+            }
+        }
+
+        // Redaction: neither the witness query nor any corpus document content
+        // may appear in the committed ledger bytes.
+        let corpus_canary = fixture
+            .documents
+            .first()
+            .map(|document| document.content.clone())
+            .expect("Core100 corpus is non-empty");
+        ledger
+            .validate_redaction_canaries(&[E68_WITNESS_QUERY, corpus_canary.as_str()])
+            .expect("committed register must not leak query or corpus plaintext");
     }
 
     /// bd-htcun: a trailing operand that duplicates an explicit-OR-run member
