@@ -607,6 +607,9 @@ pub(crate) mod maintenance_execution {
         /// Segment count observed after each commit. A merge shows up as a
         /// count that does not grow monotonically with commits.
         pub(crate) sealed_after_each_commit: Vec<usize>,
+        /// Direct concat-merge witness, when this route explicitly requested
+        /// one. The pair is `(segments_before, segments_after)`.
+        pub(crate) explicit_merge_segment_counts: Option<(usize, usize)>,
     }
 
     /// Ingest `documents` in `batch_size` chunks, committing after each chunk,
@@ -660,13 +663,98 @@ pub(crate) mod maintenance_execution {
             ranked_ids,
             doc_count,
             sealed_after_each_commit,
+            explicit_merge_segment_counts: None,
+        }
+    }
+
+    /// Ingest one sealed segment per batch, then execute an exact public
+    /// [`QuillIndex::concat_merge`] over the complete current manifest run.
+    ///
+    /// This is deliberately separate from [`ingest_and_probe`]. The latter
+    /// tests a policy-derived schedule and its non-degeneracy guard correctly
+    /// caught that the chosen corpus did not make the policy merge. This route
+    /// instead names the exact source segment IDs and verifies that their
+    /// replacement reduced the sealed segment count, so it cannot confuse a
+    /// sequence of flushes with a merge.
+    pub(crate) async fn ingest_explicit_concat_merge_and_probe(
+        cx: &asupersync::Cx,
+        config: QuillConfig,
+        documents: &[IndexableDocument],
+        batch_size: usize,
+        query: &str,
+    ) -> MaintenanceOutcome {
+        assert!(batch_size > 0, "ingest batch size must be non-zero");
+        let mut subject = QuillSubject::in_memory(config).expect("in-memory Quill subject");
+        subject
+            .claim_fresh_campaign()
+            .expect("claim explicit concat-merge campaign");
+        let mut sealed_after_each_commit = Vec::new();
+        for batch in documents.chunks(batch_size) {
+            let index = subject.index_mut().expect("open explicit merge campaign");
+            index
+                .index_documents(cx, batch)
+                .await
+                .expect("index explicit merge batch");
+            let snapshot = index.commit(cx).await.expect("commit explicit merge batch");
+            sealed_after_each_commit.push(snapshot.segments().len());
+        }
+
+        let index = subject.index_mut().expect("open explicit merge campaign");
+        let source_segment_ids = index
+            .snapshot()
+            .segments()
+            .iter()
+            .map(|segment| segment.manifest().segment_id)
+            .collect::<Vec<_>>();
+        let segments_before = source_segment_ids.len();
+        assert!(
+            segments_before >= 2,
+            "an explicit concat merge needs at least two committed source segments"
+        );
+        let output_segment_id = source_segment_ids
+            .iter()
+            .copied()
+            .max()
+            .and_then(|segment_id| segment_id.checked_add(1))
+            .expect("explicit merge fixture needs a collision-free successor segment id");
+        let merged_snapshot = index
+            .concat_merge(cx, &source_segment_ids, output_segment_id, 0)
+            .await
+            .expect("execute explicit concat merge over the full manifest run");
+        let segments_after = merged_snapshot.segments().len();
+        assert!(
+            segments_after < segments_before,
+            "explicit concat merge published without reducing segment count: before={segments_before}, after={segments_after}"
+        );
+        assert_eq!(
+            segments_after, 1,
+            "merging the full manifest run must leave exactly its replacement segment"
+        );
+
+        let result = index
+            .search_paginated(cx, query, 32, 0, true)
+            .expect("probe explicitly merged index");
+        let ranked_ids = result
+            .hits
+            .iter()
+            .map(|hit| hit.document_id.clone())
+            .collect::<Vec<_>>();
+        let doc_count = result.doc_count;
+        subject
+            .mark_committed()
+            .expect("publish explicit concat-merge campaign");
+        MaintenanceOutcome {
+            ranked_ids,
+            doc_count,
+            sealed_after_each_commit,
+            explicit_merge_segment_counts: Some((segments_before, segments_after)),
         }
     }
 }
 
 #[cfg(all(test, feature = "perf-harness"))]
 mod merge_execution_tests {
-    use super::maintenance_execution::ingest_and_probe;
+    use super::maintenance_execution::{ingest_and_probe, ingest_explicit_concat_merge_and_probe};
     use frankensearch_core::IndexableDocument;
     use frankensearch_quill::QuillConfig;
 
@@ -745,6 +833,43 @@ mod merge_execution_tests {
             assert_eq!(
                 merged.ranked_ids, baseline.ranked_ids,
                 "merging must not change the ranked result"
+            );
+        });
+    }
+
+    /// The direct execution seam used by the E6.3 merge family. Unlike the
+    /// policy-attempt test above, this names every current manifest segment as
+    /// a source and observes the successor snapshot, which proves the
+    /// transform happened before comparing query output.
+    #[test]
+    fn direct_concat_merge_changes_geometry_but_not_the_observable_corpus() {
+        let documents = corpus();
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let baseline =
+                ingest_and_probe(&cx, merging_config(), &documents, documents.len(), "alpha").await;
+            let merged = ingest_explicit_concat_merge_and_probe(
+                &cx,
+                merging_config(),
+                &documents,
+                1,
+                "alpha",
+            )
+            .await;
+
+            let (segments_before, segments_after) = merged
+                .explicit_merge_segment_counts
+                .expect("direct concat-merge route must return a geometry witness");
+            assert!(
+                segments_after < segments_before,
+                "the direct merge witness must prove a real geometry transform"
+            );
+            assert_eq!(
+                merged.doc_count, baseline.doc_count,
+                "direct concat merge must not change the live document count"
+            );
+            assert_eq!(
+                merged.ranked_ids, baseline.ranked_ids,
+                "direct concat merge must not change the ranked result"
             );
         });
     }
