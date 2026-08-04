@@ -16088,7 +16088,20 @@ mod tests {
     fn profiled_fragmented_snapshot_records_fanout_eligibility_and_rayon() {
         run_with_cx(|cx| async move {
             let directory = tempfile::tempdir().expect("fragmented profile directory");
-            let writer = QuillIndex::create(&cx, directory.path(), deterministic_config())
+            // The fixture needs SEGMENT_COUNT_FANOUT_THRESHOLD segments to stay
+            // LIVE so the search actually fans out. `deterministic_config()`
+            // leaves tier_fanout at DEFAULT_TIER_FANOUT, which is the same 8, so
+            // the eighth commit tripped the same-tier merge and the receipt
+            // truthfully reported one segment. Give the tier policy headroom,
+            // exactly as segment_fanout_fixture_index does for the non-profiled
+            // fan-out tests.
+            let fragmented_config = QuillConfig {
+                tier_fanout: SEGMENT_COUNT_FANOUT_THRESHOLD
+                    .checked_add(1)
+                    .expect("fan-out threshold leaves room for its tier policy"),
+                ..deterministic_config()
+            };
+            let writer = QuillIndex::create(&cx, directory.path(), fragmented_config.clone())
                 .await
                 .expect("create fragmented profile writer");
             for ordinal in 0..SEGMENT_COUNT_FANOUT_THRESHOLD {
@@ -16103,7 +16116,7 @@ mod tests {
                     .await
                     .expect("publish fragmented profile segment");
             }
-            let reader = QuillSearchIndex::open(&cx, directory.path(), deterministic_config())
+            let reader = QuillSearchIndex::open(&cx, directory.path(), fragmented_config)
                 .await
                 .expect("open fragmented profile reader");
             let outcome = reader
