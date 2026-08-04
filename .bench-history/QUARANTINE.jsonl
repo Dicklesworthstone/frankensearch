@@ -1,0 +1,21 @@
+# Append-only quarantine register for structurally invalid measured revisions.
+#
+# ONE JSON RECORD PER LINE. This file is APPEND-ONLY: records are never edited
+# and never removed. Retracting a quarantine means appending a later record
+# through the ledger's supersession process, not rewriting a line here. Raw
+# history under .bench-history/attempts/ is likewise never deleted or altered --
+# a quarantined sweep stays readable forever, it simply stops being admissible
+# as evidence.
+#
+# Enforced by frankensearch-quill-gauntlet::perf_evidence: an artifact whose
+# provenance.build.git_revision starts with a registered prefix is refused by
+# PerfEvidenceArtifact::load_admissible_evidence with
+# EvidenceArtifactError::QuarantinedRevision. PerfEvidenceArtifact::load_verified
+# still reads it, because reading history for diagnosis must keep working.
+#
+# Lines beginning with '#' and blank lines are ignored. Every other line must be
+# a complete record whose schema_version is quill-perf-quarantine-v1 and whose
+# git_revision_prefix is at least 7 lowercase hex characters.
+{"schema_version":"quill-perf-quarantine-v1","git_revision_prefix":"193d2e3f","reason":"QG-1 sweep is STRUCTURALLY INVALID / DIAGNOSTIC ONLY: corpus generation occurred between timed calls, so Tantivy background work fell outside the measured interval while Quill remained synchronous; configured pool width was substituted for observed work; coverage, nulls, machine-class proof, work/byte counts, terminal quiescence, fastest-incumbent screening, and provenance were incomplete. Magnitude, breakpoint, scaling, target-distance, and activation claims are retracted. QG-1.v7.unmeasured.latest.json remains authoritative.","recorded_by":"bd-qg1-invalid-sweep-quarantine-h4sqj"}
+{"schema_version":"quill-perf-quarantine-v1","git_revision_prefix":"544ffeb0","reason":"Clean-source reference for the 193d2e3f QG-1 sweep. Retained as raw history and non-admissible as evidence for the same structural defects: timing asymmetry across corpus generation, configured-versus-observed work substitution, and incomplete coverage, nulls, quiescence, and provenance.","recorded_by":"bd-qg1-invalid-sweep-quarantine-h4sqj"}
+{"schema_version":"quill-perf-quarantine-v1","git_revision_prefix":"e0dc6ba3","reason":"Unresolved historical digest associated with the 193d2e3f QG-1 sweep; it is not current provenance and cannot be treated as one. Non-admissible as evidence, preserved as raw history.","recorded_by":"bd-qg1-invalid-sweep-quarantine-h4sqj"}
