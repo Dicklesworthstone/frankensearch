@@ -813,16 +813,33 @@ mod feature_matrix_smoke {
     #[test]
     fn lexical_lane_behavior() {
         asupersync::test_utils::run_test_with_cx(|cx| async move {
-            let index = lexical::QuillIndex::in_memory(lexical::QuillConfig::default())
-                .expect("create lexical Quill index");
+            let dir = tempfile::tempdir().expect("lexical Quill feature tempdir");
+            let index = lexical::QuillIndex::create(
+                &cx,
+                dir.path(),
+                lexical::QuillConfig {
+                    bulk_load_mode: true,
+                    deterministic_ingest: true,
+                    max_ingest_shards: 1,
+                    ..lexical::QuillConfig::default()
+                },
+            )
+            .await
+            .expect("create lexical Quill index");
             index
-                .index_document(
+                .index_documents(
                     &cx,
-                    &IndexableDocument::new("doc-lexical", "lexical feature uses quill"),
+                    &[IndexableDocument::new(
+                        "doc-lexical",
+                        "lexical feature uses quill",
+                    )],
                 )
                 .await
                 .expect("index lexical Quill document");
-            index.commit(&cx).await.expect("commit lexical Quill index");
+            index
+                .finish_bulk_load(&cx)
+                .await
+                .expect("finalize lexical Quill index");
             let hits = index
                 .search_results(&cx, "lexical", 5)
                 .expect("search lexical Quill index");
