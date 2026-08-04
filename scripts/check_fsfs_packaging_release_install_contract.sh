@@ -274,6 +274,301 @@ PY
   fi
 }
 
+# Contract "Install UX Expectations": preflight MUST cover platform support,
+# disk floor, destination permissions, endpoint reachability (unless --offline),
+# and existing-install detection; flags MUST include --force.
+check_installer_preflight() {
+  local installer="$ROOT_DIR/install.sh"
+  local installer_shell="${FSFS_INSTALL_TEST_BASH:-bash}"
+  local work parsed status output
+
+  echo "[installer] exercising preflight, argument, and stream contracts"
+  work=$(mktemp -d)
+
+  # --- argument parsing -----------------------------------------------------
+  if parsed=$(FSFS_INSTALL_CONTRACT_TEST=1 "$installer_shell" "$installer" args \
+      --version v1.2.3 --dest "$work/bin" --force --offline --verify 2>/dev/null) \
+    && [[ "$parsed" == *"version=v1.2.3"* ]] \
+    && [[ "$parsed" == *"force=1"* ]] \
+    && [[ "$parsed" == *"offline=1"* ]] \
+    && [[ "$parsed" == *"verify=1"* ]]; then
+    echo "[installer][OK]   --force and --offline are recognized installer flags"
+  else
+    echo "[installer][FAIL] contract-required flags not parsed: ${parsed:-<error>}"
+    FAILURES=$((FAILURES + 1))
+  fi
+
+  if parsed=$(FSFS_INSTALL_CONTRACT_TEST=1 "$installer_shell" "$installer" args --lite 2>/dev/null) \
+    && [[ "$parsed" == *"lite=1"* ]] && [[ "$parsed" == *"from_source=1"* ]]; then
+    echo "[installer][OK]   --lite still implies the explicit model-free source route"
+  else
+    echo "[installer][FAIL] --lite no longer implies from-source: ${parsed:-<error>}"
+    FAILURES=$((FAILURES + 1))
+  fi
+
+  status=0
+  output=$(FSFS_INSTALL_CONTRACT_TEST=1 "$installer_shell" "$installer" args --liet 2>&1) || status=$?
+  if [[ "$status" -eq 2 && "$output" == *"Unknown installer argument: --liet"* ]]; then
+    echo "[installer][OK]   an unrecognized flag is rejected instead of silently ignored"
+  else
+    echo "[installer][FAIL] unknown flag not rejected status=$status output=${output:-<empty>}"
+    FAILURES=$((FAILURES + 1))
+  fi
+
+  status=0
+  output=$(FSFS_INSTALL_CONTRACT_TEST=1 "$installer_shell" "$installer" args --version 2>&1) || status=$?
+  if [[ "$status" -eq 2 && "$output" == *"--version requires a value"* ]]; then
+    echo "[installer][OK]   a flag missing its value is rejected"
+  else
+    echo "[installer][FAIL] valueless flag not rejected status=$status output=${output:-<empty>}"
+    FAILURES=$((FAILURES + 1))
+  fi
+
+  # --- disk-space floor -----------------------------------------------------
+  if FSFS_INSTALL_CONTRACT_TEST=1 NO_COLOR=1 "$installer_shell" "$installer" \
+      disk-floor "$work" 0 "test area" >/dev/null 2>&1; then
+    echo "[installer][OK]   a satisfied disk floor admits the install"
+  else
+    echo "[installer][FAIL] satisfied disk floor rejected"
+    FAILURES=$((FAILURES + 1))
+  fi
+
+  status=0
+  output=$(FSFS_INSTALL_CONTRACT_TEST=1 NO_COLOR=1 "$installer_shell" "$installer" \
+    disk-floor "$work" 999999999 "test area" 2>&1) || status=$?
+  if [[ "$status" -ne 0 && "$output" == *"install.preflight.disk_space_low"* ]]; then
+    echo "[installer][OK]   an unmet disk floor emits install.preflight.disk_space_low"
+  else
+    echo "[installer][FAIL] disk floor reason code missing status=$status output=${output:-<empty>}"
+    FAILURES=$((FAILURES + 1))
+  fi
+
+  # --- destination writability ---------------------------------------------
+  if FSFS_INSTALL_CONTRACT_TEST=1 NO_COLOR=1 "$installer_shell" "$installer" \
+      dest-writable "$work/new/nested" >/dev/null 2>&1; then
+    echo "[installer][OK]   a creatable destination under a writable ancestor is admitted"
+  else
+    echo "[installer][FAIL] creatable destination rejected"
+    FAILURES=$((FAILURES + 1))
+  fi
+
+  mkdir -p "$work/readonly"
+  chmod 500 "$work/readonly"
+  if [ -w "$work/readonly" ]; then
+    echo "[installer][SKIP] running as a user that ignores directory write bits"
+  else
+    status=0
+    output=$(FSFS_INSTALL_CONTRACT_TEST=1 NO_COLOR=1 "$installer_shell" "$installer" \
+      dest-writable "$work/readonly/bin" 2>&1) || status=$?
+    if [[ "$status" -ne 0 && "$output" == *"install.preflight.dest_unwritable"* ]]; then
+      echo "[installer][OK]   an unwritable destination fails preflight before any replacement"
+    else
+      echo "[installer][FAIL] unwritable destination admitted status=$status output=${output:-<empty>}"
+      FAILURES=$((FAILURES + 1))
+    fi
+  fi
+  chmod 700 "$work/readonly"
+
+  # --- existing-install detection -------------------------------------------
+  local incumbent="$work/incumbent/fsfs"
+  mkdir -p "$work/incumbent"
+  installer_write_stub "$incumbent" "1.0.0"
+
+  local detected probe probe_path probe_version probe_expected
+  for probe in \
+    "$work/incumbent/absent v1.0.0 fresh" \
+    "$incumbent v1.0.0 same-version" \
+    "$incumbent v2.0.0 different-version"; do
+    read -r probe_path probe_version probe_expected <<<"$probe"
+    detected=$(FSFS_INSTALL_CONTRACT_TEST=1 "$installer_shell" "$installer" \
+      existing-install "$probe_path" "$probe_version" 2>/dev/null || true)
+    if [[ "$detected" == "$probe_expected" ]]; then
+      echo "[installer][OK]   existing-install detection: $probe_expected"
+    else
+      echo "[installer][FAIL] existing-install expected=$probe_expected actual=${detected:-<error>}"
+      FAILURES=$((FAILURES + 1))
+    fi
+  done
+
+  # --- offline preconditions ------------------------------------------------
+  local offline_case offline_expect o_off o_ver o_src o_url o_sum
+  for offline_case in \
+    "1|||||offline_version_required" \
+    "1|v1.0.0|1|/tmp/a.tar.gz|abc|offline_source_unavailable" \
+    "1|v1.0.0|0|https://example.invalid/a.tar.gz|abc|offline_artifact_required" \
+    "1|v1.0.0|0|/tmp/a.tar.gz||offline_checksum_required"; do
+    IFS='|' read -r o_off o_ver o_src o_url o_sum offline_expect <<<"$offline_case"
+    status=0
+    output=$(FSFS_INSTALL_CONTRACT_TEST=1 NO_COLOR=1 "$installer_shell" "$installer" \
+      offline-preconditions "$o_off" "$o_ver" "$o_src" "$o_url" "$o_sum" 2>&1) || status=$?
+    if [[ "$status" -ne 0 && "$output" == *"install.preflight.$offline_expect"* ]]; then
+      echo "[installer][OK]   offline gate: $offline_expect"
+    else
+      echo "[installer][FAIL] offline gate $offline_expect status=$status output=${output:-<empty>}"
+      FAILURES=$((FAILURES + 1))
+    fi
+  done
+
+  if FSFS_INSTALL_CONTRACT_TEST=1 NO_COLOR=1 "$installer_shell" "$installer" \
+      offline-preconditions 1 v1.0.0 0 /tmp/a.tar.gz "$(printf 'a%.0s' {1..64})" >/dev/null 2>&1; then
+    echo "[installer][OK]   complete offline inputs are admitted"
+  else
+    echo "[installer][FAIL] complete offline inputs rejected"
+    FAILURES=$((FAILURES + 1))
+  fi
+
+  # --- error stream ---------------------------------------------------------
+  local err_stdout err_stderr
+  err_stdout=$(FSFS_INSTALL_CONTRACT_TEST=1 "$installer_shell" "$installer" output-mode 0 2>"$work/stderr.log")
+  err_stderr=$(cat "$work/stderr.log")
+  if [[ "$err_stdout" != *"error-output"* ]] \
+    && [[ "$err_stderr" == *"error-output"* ]] \
+    && [[ "$err_stdout" == *"info-output"* ]]; then
+    echo "[installer][OK]   errors go to stderr while routine output stays on stdout"
+  else
+    echo "[installer][FAIL] error stream contract violated stdout=${err_stdout:-<empty>} stderr=${err_stderr:-<empty>}"
+    FAILURES=$((FAILURES + 1))
+  fi
+
+  rm -rf "$work"
+}
+
+# Writes a dependency-free stand-in for the fsfs binary. The stub honors the
+# same subcommands the installer drives and lets each case script the outcome
+# of model provisioning without a network or a real model cache.
+installer_file_digest() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    sha256sum -- "$1" | awk '{print $1}'
+  else
+    shasum -a 256 -- "$1" | awk '{print $1}'
+  fi
+}
+
+installer_write_stub() {
+  local path="$1" version="$2"
+  cat >"$path" <<STUB
+#!/bin/sh
+case "\${1:-}" in
+  version|--version) printf 'fsfs $version\n' ;;
+  download-models)
+    if [ "\${2:-}" = "--verify" ]; then exit "\${FSFS_STUB_VERIFY_STATUS:-0}"; fi
+    exit "\${FSFS_STUB_DOWNLOAD_STATUS:-0}"
+    ;;
+  *) exit 0 ;;
+esac
+STUB
+  chmod 0755 "$path"
+}
+
+# Drives the real top-level installer end to end with no network: a local
+# artifact plus an explicit checksum. This exercises checksum verification,
+# staged model provisioning, and destination replacement on the production path.
+check_installer_offline_e2e() {
+  local installer="$ROOT_DIR/install.sh"
+  local installer_shell="${FSFS_INSTALL_TEST_BASH:-bash}"
+  local work archive dest status output digest
+
+  echo "[installer] exercising the offline end-to-end install lifecycle"
+  work=$(mktemp -d)
+  dest="$work/bin"
+  mkdir -p "$work/stage" "$dest"
+
+  installer_write_stub "$work/stage/fsfs" "9.9.9"
+  archive="$work/fsfs-9.9.9-local.tar.gz"
+  tar -czf "$archive" -C "$work/stage" fsfs
+
+  digest=$(installer_file_digest "$archive")
+  local staged_digest
+  staged_digest=$(installer_file_digest "$work/stage/fsfs")
+
+  local -a base_cmd=(
+    env NO_COLOR=1 "FSFS_INSTALL_LOCK_FILE=$work/install.lock"
+    "$installer_shell" "$installer"
+    --offline --version v9.9.9 --artifact-url "$archive" --checksum "$digest" --dest "$dest"
+  )
+
+  # 1. Fresh offline install replaces nothing and lands a working binary.
+  status=0
+  output=$("${base_cmd[@]}" 2>&1) || status=$?
+  if [[ "$status" -eq 0 && -x "$dest/fsfs" ]] && "$dest/fsfs" version | grep -q '9\.9\.9'; then
+    echo "[installer][OK]   offline artifact install completes without network access"
+  else
+    echo "[installer][FAIL] offline install status=$status output=${output:-<empty>}"
+    FAILURES=$((FAILURES + 1))
+  fi
+
+  # 2. Re-running without --force preserves the incumbent instead of reinstalling.
+  # The incumbent is marked so a silent no-op is distinguishable from a
+  # byte-identical reinstall: only a real replacement can drop the marker.
+  local before_digest after_digest
+  printf '# installed-marker\n' >>"$dest/fsfs"
+  before_digest=$(installer_file_digest "$dest/fsfs")
+  status=0
+  output=$("${base_cmd[@]}" 2>&1) || status=$?
+  after_digest=$(installer_file_digest "$dest/fsfs")
+  if [[ "$status" -eq 0 && "$output" == *"already installed"* && "$before_digest" == "$after_digest" ]]; then
+    echo "[installer][OK]   an already-installed version is detected and left untouched"
+  else
+    echo "[installer][FAIL] existing-install short circuit failed status=$status output=${output:-<empty>}"
+    FAILURES=$((FAILURES + 1))
+  fi
+
+  # 3. --force reinstalls the same version, restoring the archive's bytes.
+  status=0
+  output=$("${base_cmd[@]}" --force 2>&1) || status=$?
+  after_digest=$(installer_file_digest "$dest/fsfs")
+  if [[ "$status" -eq 0 && "$after_digest" == "$staged_digest" && "$after_digest" != "$before_digest" ]]; then
+    echo "[installer][OK]   --force reinstalls an already-present version"
+  else
+    echo "[installer][FAIL] --force did not reinstall status=$status output=${output:-<empty>}"
+    FAILURES=$((FAILURES + 1))
+  fi
+
+  # 4. A corrupt checksum must abort without replacing the incumbent.
+  installer_write_stub "$dest/fsfs" "1.0.0"
+  before_digest=$(installer_file_digest "$dest/fsfs")
+  status=0
+  output=$(env NO_COLOR=1 "FSFS_INSTALL_LOCK_FILE=$work/install.lock" \
+    "$installer_shell" "$installer" --offline --version v9.9.9 \
+    --artifact-url "$archive" --checksum "$(printf '0%.0s' {1..64})" --dest "$dest" 2>&1) || status=$?
+  after_digest=$(installer_file_digest "$dest/fsfs")
+  if [[ "$status" -ne 0 && "$output" == *"Checksum mismatch"* && "$before_digest" == "$after_digest" ]] \
+    && "$dest/fsfs" version | grep -q '1\.0\.0'; then
+    echo "[installer][OK]   a checksum mismatch preserves the previous installation"
+  else
+    echo "[installer][FAIL] checksum mismatch damaged the incumbent status=$status output=${output:-<empty>}"
+    FAILURES=$((FAILURES + 1))
+  fi
+
+  # 5. Failed model verification must abort without replacing the incumbent.
+  status=0
+  output=$(env NO_COLOR=1 FSFS_STUB_VERIFY_STATUS=1 "FSFS_INSTALL_LOCK_FILE=$work/install.lock" \
+    "${base_cmd[@]:1}" 2>&1) || status=$?
+  after_digest=$(installer_file_digest "$dest/fsfs")
+  if [[ "$status" -ne 0 && "$output" == *"Semantic model verification failed"* \
+    && "$before_digest" == "$after_digest" ]] && "$dest/fsfs" version | grep -q '1\.0\.0'; then
+    echo "[installer][OK]   failed semantic model verification preserves the previous installation"
+  else
+    echo "[installer][FAIL] model verification failure damaged the incumbent status=$status output=${output:-<empty>}"
+    FAILURES=$((FAILURES + 1))
+  fi
+
+  # 6. Offline without an explicit checksum is refused before any staging.
+  status=0
+  output=$(env NO_COLOR=1 "FSFS_INSTALL_LOCK_FILE=$work/install.lock" \
+    "$installer_shell" "$installer" --offline --version v9.9.9 \
+    --artifact-url "$archive" --dest "$dest" 2>&1) || status=$?
+  if [[ "$status" -ne 0 && "$output" == *"install.preflight.offline_checksum_required"* ]] \
+    && "$dest/fsfs" version | grep -q '1\.0\.0'; then
+    echo "[installer][OK]   offline install without a checksum fails closed"
+  else
+    echo "[installer][FAIL] offline checksum gate status=$status output=${output:-<empty>}"
+    FAILURES=$((FAILURES + 1))
+  fi
+
+  rm -rf "$work"
+}
+
 check_model_features() {
   echo "[model-features] validating loader-capable defaults, explicit lite, and embedded release lanes"
   if ! command -v python3 >/dev/null 2>&1; then
@@ -797,6 +1092,8 @@ if [[ "$MODE" == "installer" || "$MODE" == "all" || "$MODE" == "model-features" 
 fi
 if [[ "$MODE" == "installer" || "$MODE" == "all" ]]; then
   check_installer_behavior
+  check_installer_preflight
+  check_installer_offline_e2e
 fi
 if [[ "$MODE" == "model-features" || "$MODE" == "all" ]]; then
   check_model_features

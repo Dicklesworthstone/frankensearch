@@ -14,6 +14,9 @@
 #   --system           Install to /usr/local/bin (requires sudo)
 #   --easy-mode        Auto-update PATH in shell rc files
 #   --verify           Run self-test after install
+#   --force            Reinstall even when the resolved version is already present
+#   --offline          Never touch the network; requires --version and a local
+#                      --artifact-url plus --checksum
 #   --from-source      Build from source instead of downloading binary
 #   --lite             Force the model-free source profile (~15MB binary)
 #   --quiet            Suppress non-error output
@@ -42,16 +45,25 @@ QUIET=0
 VERIFY=0
 FROM_SOURCE=0
 LITE=0
+FORCE=0
+OFFLINE=0
 CHECKSUM="${CHECKSUM:-}"
 CHECKSUM_URL="${CHECKSUM_URL:-}"
 ARTIFACT_URL="${ARTIFACT_URL:-}"
-LOCK_FILE="/tmp/fsfs-install.lock"
+LOCK_FILE="${FSFS_INSTALL_LOCK_FILE:-/tmp/fsfs-install.lock}"
 SYSTEM=0
 NO_GUM=0
 NO_COLOR_MODE=0
 if [ -n "${NO_COLOR:-}" ]; then
   NO_COLOR_MODE=1
 fi
+
+# Preflight free-space floors (MB). The destination only holds the binary; the
+# staging area holds the downloaded archive plus its extraction, or the whole
+# source checkout and its Cargo target directory.
+MIN_DEST_MB="${FSFS_INSTALL_MIN_DEST_MB:-128}"
+MIN_STAGE_ARTIFACT_MB="${FSFS_INSTALL_MIN_STAGE_ARTIFACT_MB:-512}"
+MIN_STAGE_SOURCE_MB="${FSFS_INSTALL_MIN_STAGE_SOURCE_MB:-2048}"
 
 # Detect gum for fancy output (https://github.com/charmbracelet/gum)
 HAS_GUM=0
@@ -94,13 +106,15 @@ warn() {
   fi
 }
 
+# Errors always go to stderr regardless of renderer: --quiet suppresses routine
+# output but a caller piping stdout must never receive a failure message as data.
 err() {
   if [ "$NO_COLOR_MODE" -eq 1 ]; then
     printf '%s\n' "✗ $*" >&2
   elif [ "$HAS_GUM" -eq 1 ] && [ "$NO_GUM" -eq 0 ]; then
-    gum style --foreground 196 "✗ $*"
+    gum style --foreground 196 "✗ $*" >&2
   else
-    echo -e "\033[0;31m✗\033[0m $*"
+    echo -e "\033[0;31m✗\033[0m $*" >&2
   fi
 }
 
@@ -197,6 +211,144 @@ fail_unsupported_semantic_platform() {
   return 78
 }
 
+# --- Preflight ---------------------------------------------------------------
+# Every check below runs before the destination is touched, so a rejected
+# preflight always leaves the incumbent installation in place.
+
+# Free megabytes on the filesystem that would hold $1, resolved through the
+# nearest existing ancestor because the destination may not exist yet.
+available_mb() {
+  local path="$1" parent="" avail_kb=""
+  [ -n "$path" ] || return 1
+  while [ ! -e "$path" ]; do
+    parent=$(dirname "$path")
+    [ "$parent" = "$path" ] && break
+    path="$parent"
+  done
+  [ -e "$path" ] || return 1
+  # -P -k is the POSIX portable form; GNU and BSD df agree on field 4 = available.
+  avail_kb=$(df -P -k "$path" 2>/dev/null | awk 'NR==2 {print $4}') || return 1
+  case "$avail_kb" in
+    ''|*[!0-9]*) return 1 ;;
+  esac
+  printf '%s\n' "$((avail_kb / 1024))"
+}
+
+check_disk_floor() {
+  local path="$1" floor_mb="$2" label="$3" avail_mb=""
+  if ! avail_mb=$(available_mb "$path"); then
+    warn "Free space for $label ($path) is not measurable on this system; continuing without a floor check"
+    return 0
+  fi
+  if [ "$avail_mb" -lt "$floor_mb" ]; then
+    err "install.preflight.disk_space_low: $label ($path) has ${avail_mb}MB free but needs at least ${floor_mb}MB"
+    err "Free space or select a larger volume, then rerun. The existing fsfs installation was not replaced."
+    return 1
+  fi
+  info "Preflight: $label has ${avail_mb}MB free (floor ${floor_mb}MB)"
+}
+
+check_dest_writable() {
+  local dest="$1"
+  local probe="$dest"
+  if [ "$SYSTEM" -eq 1 ]; then
+    info "Preflight: --system install writes through sudo; skipping unprivileged write check"
+    return 0
+  fi
+  local parent
+  while [ ! -e "$probe" ]; do
+    parent=$(dirname "$probe")
+    [ "$parent" = "$probe" ] && break
+    probe="$parent"
+  done
+  if [ ! -e "$probe" ]; then
+    err "install.preflight.dest_unwritable: no existing ancestor of $dest could be resolved"
+    return 1
+  fi
+  if [ ! -d "$probe" ]; then
+    err "install.preflight.dest_unwritable: $probe exists but is not a directory"
+    return 1
+  fi
+  if [ ! -w "$probe" ]; then
+    err "install.preflight.dest_unwritable: $probe is not writable by the current user"
+    err "Choose another --dest, fix the permissions, or rerun with --system to install through sudo."
+    return 1
+  fi
+  info "Preflight: destination $dest is writable"
+}
+
+# Classifies whatever already occupies the destination path. Purely
+# observational: it never writes and never removes the incumbent.
+detect_existing_install() {
+  local dest_binary="$1" resolved_version="$2" existing_version=""
+  if [ ! -e "$dest_binary" ]; then
+    printf '%s\n' "fresh"
+    return 0
+  fi
+  if [ ! -x "$dest_binary" ]; then
+    printf '%s\n' "unreadable"
+    return 0
+  fi
+  if ! existing_version=$("$dest_binary" version 2>/dev/null | head -n 1); then
+    printf '%s\n' "unreadable"
+    return 0
+  fi
+  if [ -z "$existing_version" ]; then
+    printf '%s\n' "unreadable"
+    return 0
+  fi
+  case "$existing_version" in
+    *"${resolved_version#v}"*) printf '%s\n' "same-version" ;;
+    *) printf '%s\n' "different-version" ;;
+  esac
+}
+
+# --offline forbids every network access, so the inputs that would otherwise be
+# fetched must have been supplied explicitly.
+check_offline_preconditions() {
+  local offline="$1" version="$2" from_source="$3" artifact_url="$4" checksum="$5"
+  [ "$offline" -eq 1 ] || return 0
+  if [ -z "$version" ]; then
+    err "install.preflight.offline_version_required: --offline needs an explicit --version vX.Y.Z because latest-release resolution queries GitHub"
+    return 1
+  fi
+  if [ "$from_source" -eq 1 ]; then
+    err "install.preflight.offline_source_unavailable: --offline cannot build from source; the source route clones the repository and fetches crates"
+    return 1
+  fi
+  case "$artifact_url" in
+    '')
+      err "install.preflight.offline_artifact_required: --offline needs --artifact-url pointing at a locally available archive"
+      return 1
+      ;;
+    http://*|https://*|ftp://*)
+      err "install.preflight.offline_artifact_required: --artifact-url $artifact_url is a network URL; --offline needs a local path or file:// URL"
+      return 1
+      ;;
+  esac
+  if [ -z "$checksum" ]; then
+    err "install.preflight.offline_checksum_required: --offline needs an explicit --checksum because the release checksum manifest cannot be fetched"
+    return 1
+  fi
+  info "Preflight: offline inputs are complete"
+}
+
+# Reachability is reported, not enforced: an unreachable release endpoint is
+# recoverable through the documented source-build fallback.
+check_release_endpoint_reachable() {
+  local url="$1"
+  if [ "$OFFLINE" -eq 1 ]; then
+    info "Preflight: --offline set; skipping release endpoint reachability probe"
+    return 0
+  fi
+  if curl -fsS --connect-timeout 10 --max-time 20 -o /dev/null -I "$url" >/dev/null 2>&1; then
+    info "Preflight: release endpoint is reachable"
+    return 0
+  fi
+  warn "install.preflight.release_endpoint_unreachable: $url did not respond; the installer will fall back to the loader-capable source build if the download fails"
+  return 0
+}
+
 install_binary() {
   local source_binary="$1" destination_binary="$2"
   if [ "$SYSTEM" -eq 1 ]; then
@@ -238,6 +390,61 @@ verify_staged_binary() {
 
   err "Staged binary failed version checks. The existing fsfs installation was not replaced."
   return 1
+}
+
+usage() {
+  cat <<EOFU
+Usage: install.sh [--version vX.Y.Z] [--dest DIR] [--system] [--easy-mode] [--verify] \\
+                  [--artifact-url URL] [--checksum HEX] [--checksum-url URL] \\
+                  [--force] [--offline] [--from-source] [--lite] [--quiet] [--no-gum]
+
+Options:
+  --version vX.Y.Z   Install specific version (default: latest)
+  --dest DIR         Install to DIR (default: ~/.local/bin)
+  --system           Install to /usr/local/bin (requires sudo)
+  --easy-mode        Auto-update PATH in shell rc files
+  --verify           Run self-test after install
+  --artifact-url URL Install from an explicit archive URL or local path
+  --checksum HEX     Expected SHA-256 of the archive (64 hex characters)
+  --checksum-url URL Fetch the expected SHA-256 from URL instead of the release
+  --force            Reinstall even when the resolved version is already present
+  --offline          Never touch the network; requires --version plus a local
+                     --artifact-url and --checksum
+  --from-source      Build from source instead of downloading binary
+  --lite             Force the model-free source profile (~15MB).
+                     Implies --from-source; the Cargo default is loader-capable.
+  --quiet            Suppress non-error output
+  --no-gum           Disable gum formatting even if available
+EOFU
+}
+
+# An unrecognized flag is rejected rather than ignored: silently dropping a
+# mistyped --lite would install a different profile than the operator asked for.
+parse_args() {
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --version) [ "$#" -ge 2 ] || { err "--version requires a value"; return 2; }; VERSION="$2"; shift 2;;
+      --dest) [ "$#" -ge 2 ] || { err "--dest requires a value"; return 2; }; DEST="$2"; shift 2;;
+      --system) SYSTEM=1; DEST="/usr/local/bin"; shift;;
+      --easy-mode) EASY=1; shift;;
+      --verify) VERIFY=1; shift;;
+      --artifact-url) [ "$#" -ge 2 ] || { err "--artifact-url requires a value"; return 2; }; ARTIFACT_URL="$2"; shift 2;;
+      --checksum) [ "$#" -ge 2 ] || { err "--checksum requires a value"; return 2; }; CHECKSUM="$2"; shift 2;;
+      --checksum-url) [ "$#" -ge 2 ] || { err "--checksum-url requires a value"; return 2; }; CHECKSUM_URL="$2"; shift 2;;
+      --force) FORCE=1; shift;;
+      --offline) OFFLINE=1; shift;;
+      --from-source) FROM_SOURCE=1; shift;;
+      --lite) LITE=1; FROM_SOURCE=1; shift;;
+      --quiet|-q) QUIET=1; shift;;
+      --no-gum) NO_GUM=1; shift;;
+      -h|--help) usage; return 10;;
+      *)
+        err "Unknown installer argument: $1"
+        err "Run install.sh --help for the supported flags. Nothing was installed or replaced."
+        return 2
+        ;;
+    esac
+  done
 }
 
 run_installer_contract_test() {
@@ -300,6 +507,33 @@ run_installer_contract_test() {
       [ "$#" -eq 3 ] || { err "contract install-built requires SOURCE DESTINATION"; return 2; }
       SYSTEM=0
       install_binary "$2" "$3"
+      ;;
+    args)
+      shift
+      parse_args "$@" || return $?
+      printf 'version=%s dest=%s system=%s easy=%s verify=%s force=%s offline=%s from_source=%s lite=%s quiet=%s no_gum=%s artifact_url=%s checksum=%s\n' \
+        "$VERSION" "$DEST" "$SYSTEM" "$EASY" "$VERIFY" "$FORCE" "$OFFLINE" \
+        "$FROM_SOURCE" "$LITE" "$QUIET" "$NO_GUM" "$ARTIFACT_URL" "$CHECKSUM"
+      ;;
+    disk-floor)
+      [ "$#" -eq 4 ] || { err "contract disk-floor requires PATH FLOOR_MB LABEL"; return 2; }
+      check_disk_floor "$2" "$3" "$4"
+      ;;
+    dest-writable)
+      [ "$#" -eq 2 ] || [ "$#" -eq 3 ] || { err "contract dest-writable requires DEST [SYSTEM]"; return 2; }
+      SYSTEM="${3:-0}"
+      check_dest_writable "$2"
+      ;;
+    existing-install)
+      [ "$#" -eq 3 ] || { err "contract existing-install requires DEST_BINARY VERSION"; return 2; }
+      detect_existing_install "$2" "$3"
+      ;;
+    offline-preconditions)
+      [ "$#" -eq 6 ] || {
+        err "contract offline-preconditions requires OFFLINE VERSION FROM_SOURCE ARTIFACT_URL CHECKSUM"
+        return 2
+      }
+      check_offline_preconditions "$2" "$3" "$4" "$5" "$6"
       ;;
     *)
       err "Unknown installer contract test: $action"
@@ -401,44 +635,13 @@ ensure_rust() {
   rustup component add rustfmt clippy || true
 }
 
-usage() {
-  cat <<EOFU
-Usage: install.sh [--version vX.Y.Z] [--dest DIR] [--system] [--easy-mode] [--verify] \\
-                  [--artifact-url URL] [--checksum HEX] [--checksum-url URL] \\
-                  [--from-source] [--lite] [--quiet] [--no-gum]
-
-Options:
-  --version vX.Y.Z   Install specific version (default: latest)
-  --dest DIR         Install to DIR (default: ~/.local/bin)
-  --system           Install to /usr/local/bin (requires sudo)
-  --easy-mode        Auto-update PATH in shell rc files
-  --verify           Run self-test after install
-  --from-source      Build from source instead of downloading binary
-  --lite             Force the model-free source profile (~15MB).
-                     Implies --from-source; the Cargo default is loader-capable.
-  --quiet            Suppress non-error output
-  --no-gum           Disable gum formatting even if available
-EOFU
-}
-
-while [ $# -gt 0 ]; do
-  case "$1" in
-    --version) VERSION="$2"; shift 2;;
-    --dest) DEST="$2"; shift 2;;
-    --system) SYSTEM=1; DEST="/usr/local/bin"; shift;;
-    --easy-mode) EASY=1; shift;;
-    --verify) VERIFY=1; shift;;
-    --artifact-url) ARTIFACT_URL="$2"; shift 2;;
-    --checksum) CHECKSUM="$2"; shift 2;;
-    --checksum-url) CHECKSUM_URL="$2"; shift 2;;
-    --from-source) FROM_SOURCE=1; shift;;
-    --lite) LITE=1; FROM_SOURCE=1; shift;;
-    --quiet|-q) QUIET=1; shift;;
-    --no-gum) NO_GUM=1; shift;;
-    -h|--help) usage; exit 0;;
-    *) shift;;
-  esac
-done
+PARSE_STATUS=0
+parse_args "$@" || PARSE_STATUS=$?
+case "$PARSE_STATUS" in
+  0) ;;
+  10) exit 0;;             # --help
+  *) exit "$PARSE_STATUS";;
+esac
 
 # Show header
 if [ "$QUIET" -eq 0 ]; then
@@ -485,10 +688,54 @@ if [ "$LITE" -eq 0 ] && [ "$TARGET" = "x86_64-apple-darwin" ]; then
   exit $?
 fi
 
+# Offline inputs are validated before anything reaches for the network.
+check_offline_preconditions "$OFFLINE" "$VERSION" "$FROM_SOURCE" "$ARTIFACT_URL" "$CHECKSUM" || exit 1
+
 # Version lookup may use the network. Unsupported ordinary profiles are
 # rejected above before any release lookup, artifact probe, or filesystem
 # installation mutation. Intel macOS remains available only through --lite.
 resolve_version
+
+# Remaining preflight. Every check below is observational, so a rejection here
+# leaves any existing installation exactly as it was.
+check_dest_writable "$DEST" || exit 1
+check_disk_floor "$DEST" "$MIN_DEST_MB" "install destination" || exit 1
+
+STAGE_ROOT="${TMPDIR:-/tmp}"
+if [ "$FROM_SOURCE" -eq 1 ] || [ -z "$TARGET" ]; then
+  check_disk_floor "$STAGE_ROOT" "$MIN_STAGE_SOURCE_MB" "source build staging area" || exit 1
+else
+  check_disk_floor "$STAGE_ROOT" "$MIN_STAGE_ARTIFACT_MB" "artifact staging area" || exit 1
+fi
+
+EXISTING_STATE=$(detect_existing_install "$DEST/${BINARY_NAME}" "$VERSION")
+case "$EXISTING_STATE" in
+  fresh)
+    info "Preflight: no existing ${BINARY_NAME} at $DEST"
+    ;;
+  same-version)
+    if [ "$FORCE" -eq 0 ]; then
+      ok "${BINARY_NAME} ${VERSION} is already installed at $DEST/${BINARY_NAME}; pass --force to reinstall"
+      exit 0
+    fi
+    info "Preflight: ${VERSION} already installed; --force requested, reinstalling"
+    ;;
+  different-version)
+    info "Preflight: upgrading the existing ${BINARY_NAME} at $DEST to ${VERSION}"
+    ;;
+  *)
+    warn "An existing $DEST/${BINARY_NAME} did not report a version; it will be replaced only after the new binary verifies"
+    ;;
+esac
+
+if [ "$FROM_SOURCE" -eq 0 ]; then
+  case "$ARTIFACT_URL" in
+    http://*|https://*) check_release_endpoint_reachable "$ARTIFACT_URL" ;;
+    '') check_release_endpoint_reachable "https://github.com/${OWNER}/${REPO}/releases" ;;
+    *) info "Preflight: installing from the local artifact $ARTIFACT_URL" ;;
+  esac
+fi
+
 mkdir -p "$DEST"
 
 # Build artifact filename and download URL.
@@ -544,6 +791,31 @@ download_with_progress() {
   local url="$1" dest="$2" label="${3:-Downloading}"
   local size_bytes="" size_human=""
 
+  # A local path or file:// URL is copied rather than fetched, which is what
+  # makes --offline installs possible from a pre-staged archive.
+  case "$url" in
+    file://*)
+      local local_path="${url#file://}"
+      if [ ! -f "$local_path" ]; then
+        err "Local artifact not found: $local_path"
+        return 1
+      fi
+      info "$label (local artifact)"
+      cp -- "$local_path" "$dest"
+      return 0
+      ;;
+    *://*) : ;;
+    *)
+      if [ ! -f "$url" ]; then
+        err "Local artifact not found: $url"
+        return 1
+      fi
+      info "$label (local artifact)"
+      cp -- "$url" "$dest"
+      return 0
+      ;;
+  esac
+
   # Probe content-length for a helpful pre-download message
   if size_bytes=$(curl -fsSL --connect-timeout 10 --max-time 15 -I "$url" 2>/dev/null \
         | grep -i '^content-length:' | awk '{print $2}' | tr -d '\r'); then
@@ -593,6 +865,11 @@ download_with_progress() {
 
 if [ "$FROM_SOURCE" -eq 0 ]; then
   if ! download_with_progress "$URL" "$TMP/$TAR" "Downloading ${BINARY_NAME} ${VERSION}"; then
+    if [ "$OFFLINE" -eq 1 ]; then
+      err "The offline artifact could not be staged and --offline forbids the source-build fallback."
+      err "The existing fsfs installation was not replaced."
+      exit 1
+    fi
     ROUTE=$(install_route "$LITE" 0 "$TARGET")
     case "$ROUTE" in
       source-default)
