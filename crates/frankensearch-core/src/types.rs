@@ -530,8 +530,30 @@ impl TieredQueryEmbeddings {
     /// is [`TierCoveragePairV1::derive_topology`], which additionally
     /// validates bindings, per-tier coverage, and intent. Use this to answer
     /// "what could these embeddings ask for", never "what did the search do".
+    ///
+    /// # A hash-control space can never ask for a semantic topology
+    ///
+    /// If ANY bound tier was produced in an
+    /// [`EmbeddingSpaceKindV1::HashControl`] space, the answer is
+    /// [`RetrievalTopology::HashControl`] — never `FastOnly`, `QualityOnly`
+    /// or `FullProgressive` (bd-ctzo C4). Those three names assert semantic
+    /// retrieval; a deterministic control lane produces vectors whose
+    /// neighbourhoods carry no learned meaning, so reporting one of them for
+    /// a hash query is the "hash-as-semantic" claim this bead forbids. The
+    /// r1 revision of this method looked only at which tiers were `Some`,
+    /// which meant every hash-control fixture in the tree reported
+    /// `FullProgressive` and looked like semantic availability.
+    ///
+    /// A MIXED pair — one semantic tier, one hash tier — also answers
+    /// `HashControl`. It is the weaker of the two claims, and a topology is a
+    /// statement about the whole retrieval, not about its best arm.
+    ///
+    /// [`EmbeddingSpaceKindV1::HashControl`]: crate::generation::EmbeddingSpaceKindV1::HashControl
     #[must_use]
     pub const fn supported_topology(&self) -> RetrievalTopology {
+        if self.binds_hash_control() {
+            return RetrievalTopology::HashControl;
+        }
         match (&self.fast, &self.quality) {
             (Some(_), Some(_)) => RetrievalTopology::FullProgressive,
             (Some(_), None) => RetrievalTopology::FastOnly,
@@ -539,6 +561,165 @@ impl TieredQueryEmbeddings {
             // Unreachable by construction; lexical-only is the honest floor.
             (None, None) => RetrievalTopology::LexicalOnly,
         }
+    }
+
+    /// Whether any bound tier was produced in a non-semantic control space.
+    #[must_use]
+    pub const fn binds_hash_control(&self) -> bool {
+        const fn is_hash(embedding: &Option<BoundQueryEmbedding>) -> bool {
+            match embedding {
+                Some(bound) => matches!(
+                    bound.identity.space.kind,
+                    crate::generation::EmbeddingSpaceKindV1::HashControl
+                ),
+                None => false,
+            }
+        }
+        is_hash(&self.fast) || is_hash(&self.quality)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Per-query coverage reconstructed from retained owner witnesses (bd-ctzo C4)
+// ---------------------------------------------------------------------------
+
+/// What one tier contributed to ONE query.
+///
+/// Every populated field is read from the retained owner's own witness or
+/// counted off the candidates the search actually returned. There is no
+/// constructor that accepts a coverage scalar, because a caller's claim about
+/// how much of the corpus it searched is not evidence of anything.
+///
+/// # Unknown is not zero
+///
+/// The `Unknown` variant carries NO counts. That is the point: a legacy
+/// artifact retains no witness, and reporting its coverage as `0` would be
+/// indistinguishable from a live tier that genuinely matched nothing — the
+/// exact conflation bd-ctzo C4 forbids. A consumer that wants a number must
+/// first destructure `Witnessed`, which means it cannot accidentally average
+/// an unknown into a total.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
+pub enum TierQueryCoverageV1 {
+    /// The query bound no embedding for this tier, so it was never consulted.
+    NotRequested,
+    /// The query bound this tier, but no owner-backed witness exists for it.
+    Unknown {
+        /// Closed reason no witness was available.
+        reason: CoverageUnknownReasonV1,
+    },
+    /// The tier was served by a retained admitted owner.
+    Witnessed {
+        /// Generation sequence the owner witnesses. Not a caller's claim.
+        generation_sequence: u64,
+        /// Live document count the owner witnesses.
+        live_count: u64,
+        /// How many of the returned candidates this tier actually produced,
+        /// counted against the results, not predicted from the request.
+        contributed_candidates: u64,
+    },
+}
+
+impl TierQueryCoverageV1 {
+    /// Stable `snake_case` state code for logs and machine payloads.
+    #[must_use]
+    pub const fn code(&self) -> &'static str {
+        match self {
+            Self::NotRequested => "not_requested",
+            Self::Unknown { .. } => "unknown",
+            Self::Witnessed { .. } => "witnessed",
+        }
+    }
+
+    /// The witnessed live count, or `None` when this tier has no witness.
+    ///
+    /// Deliberately `Option<u64>` rather than `u64`: see the type-level note
+    /// on why unknown must not collapse to zero.
+    #[must_use]
+    pub const fn witnessed_live_count(&self) -> Option<u64> {
+        match self {
+            Self::Witnessed { live_count, .. } => Some(*live_count),
+            Self::NotRequested | Self::Unknown { .. } => None,
+        }
+    }
+}
+
+/// Coverage and contribution for one complete tiered query (bd-ctzo C4).
+///
+/// Built by the index layer from an activated search plus the candidates it
+/// returned. Serialized form is stable and bounded: it carries counts,
+/// generation sequences and closed enum codes only — never vectors, query
+/// text, document ids, tokens, secrets or paths.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SearchCoverageV1 {
+    /// Schema version of this receipt.
+    pub schema_version: u16,
+    /// Topology the bound embeddings could support — already hash-aware, so
+    /// a control-lane query cannot be recorded here as semantic.
+    pub topology: RetrievalTopology,
+    /// Fast-tier coverage.
+    pub fast: TierQueryCoverageV1,
+    /// Quality-tier coverage.
+    pub quality: TierQueryCoverageV1,
+}
+
+impl SearchCoverageV1 {
+    /// Assemble a per-query coverage receipt.
+    ///
+    /// Intentionally has no `coverage_ratio`, `percent` or `total` parameter:
+    /// everything here is either the topology the bindings support or a fact
+    /// one of the two tier witnesses already established.
+    #[must_use]
+    pub const fn new(
+        topology: RetrievalTopology,
+        fast: TierQueryCoverageV1,
+        quality: TierQueryCoverageV1,
+    ) -> Self {
+        Self {
+            schema_version: TIER_COVERAGE_SCHEMA_VERSION_V1,
+            topology,
+            fast,
+            quality,
+        }
+    }
+
+    /// Whether this query ran on a non-semantic control lane.
+    #[must_use]
+    pub const fn is_hash_control(&self) -> bool {
+        matches!(self.topology, RetrievalTopology::HashControl)
+    }
+
+    /// A bounded one-line summary safe to put in a log.
+    ///
+    /// Contains only closed state codes, generation sequences and counts. No
+    /// vector, query, document id, token, secret or path can reach it: the
+    /// type holds none of those to begin with, which is a stronger guarantee
+    /// than remembering to redact at each call site.
+    #[must_use]
+    pub fn redacted_summary(&self) -> String {
+        fn tier(label: &str, coverage: &TierQueryCoverageV1) -> String {
+            match coverage {
+                TierQueryCoverageV1::Witnessed {
+                    generation_sequence,
+                    live_count,
+                    contributed_candidates,
+                } => format!(
+                    "{label}=witnessed(gen={generation_sequence},live={live_count},\
+                     contributed={contributed_candidates})"
+                ),
+                TierQueryCoverageV1::Unknown { reason } => {
+                    format!("{label}=unknown({reason:?})")
+                }
+                TierQueryCoverageV1::NotRequested => format!("{label}=not_requested"),
+            }
+        }
+        format!(
+            "topology={:?} {} {}",
+            self.topology,
+            tier("fast", &self.fast),
+            tier("quality", &self.quality)
+        )
     }
 }
 
