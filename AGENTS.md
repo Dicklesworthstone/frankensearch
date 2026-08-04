@@ -324,20 +324,45 @@ default = ['hash']
 hash = ['frankensearch-embed/hash']                              # FNV-1a hash embedder (zero deps)
 model2vec = ['frankensearch-embed/model2vec']                    # potion-128M fast embedder
 fastembed = ['frankensearch-embed/fastembed']                    # MiniLM-L6-v2 quality embedder
-lexical = ['dep:frankensearch-lexical', 'frankensearch-fusion/lexical']  # Tantivy BM25
+lexical = ['quill']                                              # Default lexical backend is QUILL, not Tantivy
+lexical-tantivy = ['dep:frankensearch-lexical']                  # Tantivy BM25 (pinned oracle / cass-compat)
+cass-compat = ['lexical-tantivy']                                # cass on-disk compatibility lane
+quill = ['dep:frankensearch-quill', 'frankensearch-fusion/quill']
+graph = ['frankensearch-fusion/graph']
 storage = ['dep:frankensearch-storage']                          # FrankenSQLite persistence
-durability = ['dep:frankensearch-durability']                    # Repair/protection layer
+durability = ['dep:frankensearch-durability', 'frankensearch-quill?/durability']
 fts5 = ['storage', 'frankensearch-storage/fts5']                 # FTS5 storage backend
-rerank = ['dep:frankensearch-rerank']                            # FlashRank cross-encoder
+rerank = ['dep:frankensearch-rerank', 'frankensearch-rerank/native', 'frankensearch-fusion/rerank']
+native = ['dep:frankensearch-rerank', 'frankensearch-rerank/native', 'frankensearch-fusion/rerank']
+fastembed-reranker = ['rerank', 'frankensearch-rerank/fastembed-reranker']
 ann = ['frankensearch-index/ann']                                # HNSW approximate nearest neighbors
 download = ['frankensearch-embed/download']                      # Model download via asupersync HTTP
+api = ['frankensearch-embed/api']
 semantic = ['hash', 'model2vec', 'fastembed']                    # All embedding models
 hybrid = ['semantic', 'lexical']                                 # Semantic + lexical + RRF
 persistent = ['hybrid', 'storage']                               # Hybrid + durable metadata/index queues
 durable = ['persistent', 'durability']                           # Persistent + repair/protection
-full = ['durable', 'rerank', 'ann', 'download']                  # Everything except FTS5
+full = ['durable', 'rerank', 'ann', 'download', 'graph', 'api']  # Everything except FTS5
 full-fts5 = ['full', 'fts5']                                     # Full stack + FTS5
 ```
+
+**Packaging boundary (bd-8nqz-6-ft-registry-4hca).** Two features pull dependencies that
+come from **git, not crates.io**, and they are the only two that do:
+
+| Feature | Git-sourced closure | Why it is not registry-resolvable |
+|---------|--------------------|-----------------------------------|
+| `rerank` / `native` / `fastembed-reranker` | `ft-api`, `ft-autograd`, `ft-core`, `ft-dispatch`, `ft-kernel-cpu`, `ft-runtime` (frankentorch) | None of the six are published. `ft-api` on crates.io is an unrelated FifthTry crate whose only version (`0.1.0`) collides with ours. |
+| `ann` | `hnsw_rs` (Dicklesworthstone/hnswlib-rs fork) | Registry `hnsw_rs` 0.3.4 exists, but the fork diverges from it by 12 owner commits including an HNSW search-correctness fix — switching to the registry crate silently loses that fix. |
+
+`full` and `full-fts5` include both, so **every feature at or above `rerank` or `ann` is
+unpublishable to crates.io today**. `default`, `hash`, `semantic`, `hybrid`, `persistent`,
+and `durable` are git-free and registry-clean. Note that `rerank` and `native` are exact
+aliases — there is no ONNX-only rerank lane, and `fastembed-reranker` also enables `native`.
+
+Do **not** try to make packaging pass by adding a `version` to a git dependency: `cargo
+package` strips the git source and rebinds the name to whatever crate owns it on crates.io.
+`scripts/check_crates_publish_contract.sh` fails closed on this via
+`DEPENDENCY_GIT_REGISTRY_NAME_UNPROVEN`.
 
 ### Core Types Quick Reference
 

@@ -328,6 +328,14 @@ run_self_test() {
           kind: null,
           optional: true,
           path: null
+        },
+        {
+          name: "git-versioned-engine",
+          source: "git+https://example.invalid/versioned?rev=def",
+          req: "^0.1.0",
+          kind: null,
+          optional: true,
+          path: null
         }
       ]
     | (.packages[] | select(.name == "frankensearch-core") | .dependencies) += [
@@ -369,6 +377,8 @@ run_self_test() {
   jq -e '
     ([.blockers[].code] | index("PACKAGE_README_MISSING")) != null
     and ([.blockers[].code] | index("DEPENDENCY_GIT_VERSION_REQUIRED")) != null
+    and ([.blockers[].code] | index("DEPENDENCY_GIT_REGISTRY_NAME_UNPROVEN")) != null
+    and ([.blockers[] | select(.code == "DEPENDENCY_GIT_REGISTRY_NAME_UNPROVEN") | .dependency] | index("git-versioned-engine")) != null
     and ([.blockers[].code] | index("INTERNAL_DEPENDENCY_CYCLE")) != null
     and ([.blockers[].code] | index("INTERNAL_DEPENDENCY_VERSION_MISMATCH")) != null
     and ([.blockers[].code] | index("INTERNAL_DEPENDENCY_VERSION_REQUIRED")) != null
@@ -726,8 +736,8 @@ for package_name in "${SEQUENCE[@]}"; do
           "Publish the dependency or remove it from the registry-facing graph."
       fi
     elif [[ "$dependency_source" == git+* ]]; then
+      bead_id="$(dependency_bead "$dependency_name")"
       if [[ -z "$dependency_req" || "$dependency_req" == "*" ]]; then
-        bead_id="$(dependency_bead "$dependency_name")"
         add_blocker \
           "DEPENDENCY_GIT_VERSION_REQUIRED" \
           "$package_name" \
@@ -735,6 +745,24 @@ for package_name in "${SEQUENCE[@]}"; do
           "$bead_id" \
           "Git dependency '$dependency_name' in '$package_name' has no registry version requirement." \
           "Publish a registry-equivalent crate and add its concrete version, or remove the dependency."
+      else
+        # A version requirement does NOT make a git dependency registry-resolvable.
+        # `cargo package` strips the git source and rewrites the dependency to the
+        # crates.io crate that owns the same NAME -- which may be an entirely
+        # different project. Observed instance (bd-8nqz-6-ft-registry-4hca): the
+        # workspace pins `ft-api` at a frankentorch git rev reporting v0.1.0, while
+        # crates.io `ft-api` is FifthTry's HTTP client whose ONLY published version
+        # is also 0.1.0. Adding `version = "0.1.0"` would therefore satisfy cargo and
+        # the no-version arm above while silently binding the published crate to the
+        # wrong project. Name identity must be proven by publishing under a name this
+        # project owns, not asserted by a version requirement.
+        add_blocker \
+          "DEPENDENCY_GIT_REGISTRY_NAME_UNPROVEN" \
+          "$package_name" \
+          "$dependency_name" \
+          "$bead_id" \
+          "Git dependency '$dependency_name' in '$package_name' carries version requirement '$dependency_req', but a version requirement does not prove the crates.io crate named '$dependency_name' is this project." \
+          "Publish under a name this project owns and depend on it via a Cargo package alias (e.g. ft-core = { package = \"frankentorch-core\", version = \"...\" }); do not satisfy packaging by adding a version to a git dependency."
       fi
     fi
   done < <(

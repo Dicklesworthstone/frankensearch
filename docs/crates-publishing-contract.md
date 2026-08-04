@@ -105,6 +105,7 @@ route work without parsing prose.
 | `INTERNAL_DEPENDENCY_VERSION_MISMATCH` | A dependent does not require the exact candidate internal version. |
 | `INTERNAL_DEPENDENCY_NOT_PUBLISHABLE` | A registry package depends on a workspace package marked non-publishable. |
 | `DEPENDENCY_GIT_VERSION_REQUIRED` | Cargo cannot rewrite a git-only dependency to an existing registry version. |
+| `DEPENDENCY_GIT_REGISTRY_NAME_UNPROVEN` | A git dependency carries a version requirement, but that does not prove the crates.io crate of the same name is this project. Packaging strips the git source and rebinds the name to whoever owns it on the registry — so a version requirement is manifest laundering, not a fix. |
 | `PACKAGE_*_MISSING` | Required crates.io package metadata is absent. |
 | `REGISTRY_CENSUS_*` | Registry identity is missing, malformed, or unverifiable. |
 | `PUBLISHED_VERSION_SOURCE_MISMATCH` | The version is occupied by different source bytes. |
