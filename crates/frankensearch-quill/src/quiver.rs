@@ -10046,6 +10046,25 @@ impl BorrowedStoredMetaSection<'_> {
         debug_assert_eq!(output.len() - start, self.total_len);
     }
 
+    /// Ordered payload runs whose concatenation is the durable section.
+    ///
+    /// Directory first, then per field its prefix followed by that field's
+    /// borrowed blob — the order [`Self::write_into`] emits. Only slice
+    /// pointers are collected; no payload byte is copied, so this is what the
+    /// segment writer should be handed instead of a materialized section.
+    #[must_use]
+    pub fn runs(&self) -> Vec<&[u8]> {
+        let mut runs: Vec<&[u8]> = Vec::with_capacity(self.prefixes.len() + self.blobs.len());
+        if let Some(directory) = self.prefixes.first() {
+            runs.push(directory.as_slice());
+        }
+        for (prefix, blob) in self.prefixes.iter().skip(1).zip(&self.blobs) {
+            runs.push(prefix.as_slice());
+            runs.push(blob);
+        }
+        runs
+    }
+
     /// Materialize the section into owned bytes.
     ///
     /// This reintroduces the copy the borrowed form exists to avoid, so it is
@@ -10522,12 +10541,12 @@ impl<'a> BorrowedStoredMetaSection<'a> {
                 bytes: (stored_fields.len() + 1) * std::mem::size_of::<Vec<u8>>(),
             })?;
         let mut blobs: Vec<&'a [u8]> = Vec::new();
-        blobs
-            .try_reserve_exact(stored_fields.len())
-            .map_err(|_| StoredMetaCodecError::Allocation {
+        blobs.try_reserve_exact(stored_fields.len()).map_err(|_| {
+            StoredMetaCodecError::Allocation {
                 resource: "section blob views",
                 bytes: stored_fields.len() * std::mem::size_of::<&[u8]>(),
-            })?;
+            }
+        })?;
 
         let mut bytes = Vec::new();
         bytes
@@ -10632,7 +10651,6 @@ impl<'a> BorrowedStoredMetaSection<'a> {
 }
 
 impl EncodedStoredMetaSection {
-
     /// Concatenate ordered non-overlapping STOREDMETA sections.
     ///
     /// Inter-segment docid gaps become holes. Source values remain opaque; the

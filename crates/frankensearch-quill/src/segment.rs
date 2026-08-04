@@ -91,6 +91,18 @@ pub struct SectionInput<'a> {
     pub flags: u16,
     /// Exact payload bytes, excluding alignment padding.
     pub bytes: &'a [u8],
+    /// Further payload runs emitted after [`Self::bytes`], in order.
+    ///
+    /// The durable section is the concatenation of `bytes` then every run, so
+    /// a caller whose payload is already contiguous *in pieces* can hand those
+    /// pieces over instead of joining them first. STOREDMETA is the motivating
+    /// case (`bd-4xr99`): its field blobs live in the Scribe accumulator and
+    /// were previously copied into a section-sized buffer only to be copied
+    /// again into the segment buffer here.
+    ///
+    /// Empty for every ordinary single-buffer section, which keeps their
+    /// length, hash, and emission paths bit-for-bit what they were.
+    pub runs: &'a [&'a [u8]],
 }
 
 impl<'a> SectionInput<'a> {
@@ -101,6 +113,53 @@ impl<'a> SectionInput<'a> {
             kind,
             flags: 0,
             bytes,
+            runs: &[],
+        }
+    }
+
+    /// Construct a known section whose payload is an ordered list of runs.
+    ///
+    /// The durable bytes are the runs concatenated in order — identical to
+    /// passing that concatenation to [`Self::new`], without building it.
+    #[must_use]
+    pub const fn from_runs(kind: SectionKind, runs: &'a [&'a [u8]]) -> Self {
+        Self {
+            kind,
+            flags: 0,
+            bytes: &[],
+            runs,
+        }
+    }
+
+    /// Total durable payload length, or `None` on overflow.
+    fn payload_len(&self) -> Option<usize> {
+        self.runs
+            .iter()
+            .try_fold(self.bytes.len(), |total, run| total.checked_add(run.len()))
+    }
+
+    /// xxh3 of the durable payload.
+    ///
+    /// Single-buffer sections keep the exact one-shot call they always used;
+    /// only a run list takes the streaming path, which digests the same byte
+    /// sequence.
+    fn payload_xxh3(&self) -> u64 {
+        if self.runs.is_empty() {
+            return xxh3_64(self.bytes);
+        }
+        let mut hasher = Xxh3::new();
+        hasher.update(self.bytes);
+        for run in self.runs {
+            hasher.update(run);
+        }
+        hasher.digest()
+    }
+
+    /// Append the durable payload to `output`.
+    fn extend_into(&self, output: &mut Vec<u8>) {
+        output.extend_from_slice(self.bytes);
+        for run in self.runs {
+            output.extend_from_slice(run);
         }
     }
 }
@@ -574,17 +633,20 @@ impl EncodedSegment {
                 .ok_or_else(|| invalid_segment("section alignment overflow"))?;
             let offset = u64::try_from(cursor)
                 .map_err(|_| invalid_segment("section offset does not fit u64"))?;
-            let len = u64::try_from(section.bytes.len())
+            let payload_len = section
+                .payload_len()
+                .ok_or_else(|| invalid_segment("section payload length overflow"))?;
+            let len = u64::try_from(payload_len)
                 .map_err(|_| invalid_segment("section length does not fit u64"))?;
             table.push(SectionEntry {
                 kind: section.kind,
                 flags: section.flags,
                 offset,
                 len,
-                xxh3: xxh3_64(section.bytes),
+                xxh3: section.payload_xxh3(),
             });
             cursor = cursor
-                .checked_add(section.bytes.len())
+                .checked_add(payload_len)
                 .ok_or_else(|| invalid_segment("section end overflow"))?;
         }
         let file_len = cursor
@@ -636,7 +698,7 @@ impl EncodedSegment {
             let offset = usize::try_from(entry.offset)
                 .map_err(|_| invalid_segment("section offset does not fit usize"))?;
             bytes.resize(offset, 0);
-            bytes.extend_from_slice(section.bytes);
+            section.extend_into(&mut bytes);
         }
         debug_assert_eq!(bytes.len(), file_len - TRAILER_LEN);
         let mut source_hasher = Xxh3::new();
@@ -1906,6 +1968,7 @@ mod tests {
                 kind: section.kind,
                 flags: section.flags,
                 bytes: &section.bytes,
+                runs: &[],
             })
             .collect();
         EncodedSegment::encode(header, &borrowed)
@@ -1936,6 +1999,7 @@ mod tests {
                 kind: section.kind,
                 flags: section.flags,
                 bytes: &section.bytes,
+                runs: &[],
             })
             .collect();
         EncodedSegment::encode_with_limits_impl(header, &borrowed, SegmentLimits::default(), true)
