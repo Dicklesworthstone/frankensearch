@@ -10522,12 +10522,12 @@ impl<'a> BorrowedStoredMetaSection<'a> {
                 bytes: (stored_fields.len() + 1) * std::mem::size_of::<Vec<u8>>(),
             })?;
         let mut blobs: Vec<&'a [u8]> = Vec::new();
-        blobs
-            .try_reserve_exact(stored_fields.len())
-            .map_err(|_| StoredMetaCodecError::Allocation {
+        blobs.try_reserve_exact(stored_fields.len()).map_err(|_| {
+            StoredMetaCodecError::Allocation {
                 resource: "section blob views",
                 bytes: stored_fields.len() * std::mem::size_of::<&[u8]>(),
-            })?;
+            }
+        })?;
 
         let mut bytes = Vec::new();
         bytes
@@ -10632,7 +10632,6 @@ impl<'a> BorrowedStoredMetaSection<'a> {
 }
 
 impl EncodedStoredMetaSection {
-
     /// Concatenate ordered non-overlapping STOREDMETA sections.
     ///
     /// Inter-segment docid gaps become holes. Source values remain opaque; the

@@ -23,6 +23,8 @@ mod machine_class_registry;
 // with an allow — under `--lib` there is genuinely no production consumer yet,
 // because the executors that will call these schedules are still blocked.
 #[cfg(test)]
+mod metamorphic_maintenance_laws;
+#[cfg(test)]
 mod metamorphic_maintenance_schedules;
 mod perf;
 mod perf_assembly;
