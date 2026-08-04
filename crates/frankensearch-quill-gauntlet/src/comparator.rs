@@ -7765,6 +7765,116 @@ const fn ordered_f32_bits(bits: u32) -> u32 {
     }
 }
 
+/// Whether ONE total-lexical-contract mismatch is the same score difference the
+/// rank comparator already classified under `reason`.
+///
+/// The rank projection and the total lexical contract observe the same two
+/// engines through different lenses. When a lane opts into a reviewed
+/// `ScoreEpsilonReason`, `classify_rank` admits a bounded score difference on
+/// the rank axis — but `compare_score_bits` compares `normalized_score_bits`
+/// with plain `u32` equality and has no envelope at all, so the SAME difference
+/// still lands as a raw lexical mismatch and the case fails closed on an axis
+/// the lane already reviewed.
+///
+/// This predicate is deliberately narrow, because it is the thing standing
+/// between a reviewed class and a false pass. It admits a mismatch only when
+/// ALL of the following hold:
+///
+///   - the mismatch class is `Score` — an ordering, identity, metadata,
+///     snippet, or explanation difference is never a score envelope question;
+///   - the path names a LEXICAL score-bits field. `normalized_score_bits` and
+///     `raw_lexical_score_bits` are the two the fused lexical scorer produces
+///     and therefore the only two this mechanism can move.
+///     `fast_score_bits`, `quality_score_bits` and `rerank_score_bits` come
+///     from other subsystems and are deliberately NOT admitted, so a semantic
+///     or reranker drift can never ride in under a lexical summation class;
+///   - both diagnostics parse as exact f32 bit patterns, so a truncated or
+///     redacted diagnostic fails closed rather than being interpreted. Two
+///     renderings occur in practice: a bare `0x...` from `compare_score_bits`
+///     and a `Some("0x...")` from `compare_debug_field`'s `Option` formatting.
+///     A `None` on either side never parses, so a field PRESENT on one engine
+///     and absent on the other stays a mismatch; and
+///   - the two bit patterns are inside `reason`'s own envelope — for
+///     `SummationAssociation` that is [`SUMMATION_ASSOCIATION_MAX_ULPS`], NOT
+///     the generic relative epsilon.
+///
+/// Anything else — a wider score drift, a different field, an unparseable
+/// diagnostic — returns false and the contract mismatch stands.
+/// Whether the total lexical contract is refusing the SAME score difference the
+/// rank comparator already classified under a reviewed envelope.
+///
+/// THE DEFECT THIS CLOSES (bd-gx7n4, register witness DIV-008).
+/// `classify_case_with_lexical` short-circuits on ANY lexical mismatch BEFORE
+/// `classify_case` runs, so a case whose only contract mismatches are the
+/// reviewed one-ULP summation-association difference fails closed as
+/// `Unclassified` even when the rank axis has already classified it as
+/// `ScoreEpsilon`/`SummationAssociation`. Opting a lane into the typed reason
+/// fixes the rank axis and then appears to have done nothing, because the
+/// lexical axis refuses first and its reason is the one recorded.
+///
+/// The gate is deliberately conjunctive, and every term is load-bearing:
+///
+///   1. the rank comparator must ALREADY have classified this case as
+///      `ScoreEpsilon`. A lane that did not opt in produces `RankMismatch`,
+///      this returns false, and behaviour is byte-identical to before.
+///   2. it must carry the typed reason, so the class is the reviewed one
+///      rather than an untyped tolerance.
+///   3. EVERY mismatch must be that same score difference, inside the reason's
+///      own envelope. One ordering, membership, metadata, snippet or
+///      wider-score mismatch anywhere in the contract and the case still fails
+///      closed — a reviewed score class must never launder an unreviewed
+///      difference that happens to travel beside it.
+///   4. there must BE mismatches. An empty set cannot be "explained".
+///
+/// What this does NOT do: it does not hide the difference. The contract still
+/// reports `status == Mismatch` with every mismatch listed and
+/// `first_mismatch` populated, and the artifact retains all of it. Only the
+/// campaign DISPOSITION changes, from "unclassified, nobody has reviewed this"
+/// to the auto-class the rank axis already carries.
+pub fn lexical_mismatches_are_the_classified_rank_divergence(
+    mismatches: &[LexicalFieldMismatch],
+    comparison: &ComparisonReport,
+) -> bool {
+    if comparison.rank_class != RankClass::ScoreEpsilon {
+        return false;
+    }
+    let Some(reason) = comparison.score_epsilon_reason else {
+        return false;
+    };
+    !mismatches.is_empty()
+        && mismatches
+            .iter()
+            .all(|mismatch| lexical_mismatch_is_reviewed_score_epsilon(mismatch, reason))
+}
+
+pub fn lexical_mismatch_is_reviewed_score_epsilon(
+    mismatch: &LexicalFieldMismatch,
+    reason: ScoreEpsilonReason,
+) -> bool {
+    if mismatch.class != LexicalMismatchClass::Score {
+        return false;
+    }
+    if !(mismatch.path.ends_with("/normalized_score_bits")
+        || mismatch.path.ends_with("/raw_lexical_score_bits"))
+    {
+        return false;
+    }
+    let parse = |value: &str| {
+        value
+            .strip_prefix("Some(\"")
+            .and_then(|rest| rest.strip_suffix("\")"))
+            .unwrap_or(value)
+            .strip_prefix("0x")
+            .and_then(|hex| u32::from_str_radix(hex, 16).ok())
+    };
+    let (Some(oracle_bits), Some(subject_bits)) =
+        (parse(&mismatch.oracle), parse(&mismatch.subject))
+    else {
+        return false;
+    };
+    scores_within_epsilon(oracle_bits, subject_bits, SCORE_EPSILON, reason)
+}
+
 fn score_map(hits: &[RankedHit]) -> Option<BTreeMap<&str, u32>> {
     let map = hits
         .iter()
@@ -9895,6 +10005,193 @@ mod tests {
 
         assert_eq!(report.rank_class, RankClass::RankMismatch);
         assert_eq!(report.status, ComparisonStatus::Failed);
+    }
+
+    /// bd-gx7n4 PLANTED NEGATIVES for the lexical score-envelope predicate.
+    ///
+    /// The positive case is easy and is proven live on production evidence by
+    /// the campaign lane. What has to be pinned here is every way this
+    /// predicate must REFUSE, because it is the gate between a reviewed class
+    /// and a false pass, and each refusal below is a distinct laundering route
+    /// somebody could otherwise drive a real divergence through.
+    #[test]
+    fn the_reviewed_score_envelope_refuses_everything_it_should() {
+        let mismatch = |class: LexicalMismatchClass, path: &str, oracle: &str, subject: &str| {
+            LexicalFieldMismatch {
+                class,
+                path: path.to_owned(),
+                oracle: oracle.to_owned(),
+                subject: subject.to_owned(),
+            }
+        };
+        let reason = ScoreEpsilonReason::SummationAssociation;
+        // The real DIV-008 witness pair, read out of the committed v7 object.
+        let witness = mismatch(
+            LexicalMismatchClass::Score,
+            "/full_search/outcome/hits/0/normalized_score_bits",
+            "0x4113fe32",
+            "0x4113fe33",
+        );
+        assert!(
+            lexical_mismatch_is_reviewed_score_epsilon(&witness, reason),
+            "the reviewed one-ULP witness must be admitted or the fix does nothing"
+        );
+        // Same pair through compare_debug_field's Option rendering.
+        assert!(lexical_mismatch_is_reviewed_score_epsilon(
+            &mismatch(
+                LexicalMismatchClass::Score,
+                "/full_search/outcome/hits/0/raw_lexical_score_bits",
+                "Some(\"0x4113fe32\")",
+                "Some(\"0x4113fe33\")",
+            ),
+            reason
+        ));
+
+        // 1. A WIDER score drift. Three ULPs is outside the reviewed bound, and
+        //    the bound is the whole content of the class.
+        assert!(!lexical_mismatch_is_reviewed_score_epsilon(
+            &mismatch(
+                LexicalMismatchClass::Score,
+                "/full_search/outcome/hits/0/normalized_score_bits",
+                "0x4113fe32",
+                "0x4113fe35",
+            ),
+            reason
+        ));
+        // 2. A NON-SCORE class at a score-looking path. Ordering is not a score
+        //    question no matter what the payload looks like.
+        assert!(!lexical_mismatch_is_reviewed_score_epsilon(
+            &mismatch(
+                LexicalMismatchClass::Ordering,
+                "/full_search/outcome/hits/0/normalized_score_bits",
+                "0x4113fe32",
+                "0x4113fe33",
+            ),
+            reason
+        ));
+        // 3. A DIFFERENT SUBSYSTEM's score. The lexical summation mechanism
+        //    cannot move a reranker score, so a reranker drift must never ride
+        //    in under a lexical class.
+        for path in [
+            "/full_search/outcome/hits/0/rerank_score_bits",
+            "/full_search/outcome/hits/0/quality_score_bits",
+            "/full_search/outcome/hits/0/fast_score_bits",
+        ] {
+            assert!(
+                !lexical_mismatch_is_reviewed_score_epsilon(
+                    &mismatch(
+                        LexicalMismatchClass::Score,
+                        path,
+                        "Some(\"0x4113fe32\")",
+                        "Some(\"0x4113fe33\")",
+                    ),
+                    reason
+                ),
+                "{path} is not produced by the lexical scorer and must not be admitted"
+            );
+        }
+        // 4. PRESENCE asymmetry. A field one engine emits and the other does
+        //    not is a real contract difference, not a rounding difference.
+        assert!(!lexical_mismatch_is_reviewed_score_epsilon(
+            &mismatch(
+                LexicalMismatchClass::Score,
+                "/full_search/outcome/hits/0/raw_lexical_score_bits",
+                "None",
+                "Some(\"0x4113fe33\")",
+            ),
+            reason
+        ));
+        // 5. AN UNPARSEABLE diagnostic fails closed rather than being guessed.
+        assert!(!lexical_mismatch_is_reviewed_score_epsilon(
+            &mismatch(
+                LexicalMismatchClass::Score,
+                "/full_search/outcome/hits/0/normalized_score_bits",
+                "<redacted>",
+                "0x4113fe33",
+            ),
+            reason
+        ));
+        // 6. A DIFFERENT REVIEWED REASON has a different envelope. The same
+        //    one-ULP pair is admitted under PlatformLibm's relative form too,
+        //    but the caller only ever passes the reason its own lane declared,
+        //    so this pins that the reason is CONSULTED rather than ignored: a
+        //    pair far outside the relative epsilon is refused under PlatformLibm
+        //    while the ULP-bounded class would still be asked about separately.
+        assert!(!lexical_mismatch_is_reviewed_score_epsilon(
+            &mismatch(
+                LexicalMismatchClass::Score,
+                "/full_search/outcome/hits/0/normalized_score_bits",
+                "0x40000000",
+                "0x41000000",
+            ),
+            ScoreEpsilonReason::PlatformLibm
+        ));
+    }
+
+    /// bd-gx7n4: the composed gate, with the rank axis built by the real
+    /// comparator rather than hand-set, so the two axes agree the way they do
+    /// in a campaign.
+    #[test]
+    fn the_lexical_axis_defers_only_to_a_rank_axis_that_actually_classified() {
+        // One ULP apart on the same document: 0x4113fe32 / 0x4113fe33, the
+        // committed DIV-008 witness pair.
+        let subject = observation(vec![quill_hit("a", f32::from_bits(0x4113_fe33), 1)]);
+        let oracle = observation(vec![tantivy_hit("a", f32::from_bits(0x4113_fe32), 1)]);
+        let score_mismatch = LexicalFieldMismatch {
+            class: LexicalMismatchClass::Score,
+            path: "/full_search/outcome/hits/0/normalized_score_bits".to_owned(),
+            oracle: "0x4113fe32".to_owned(),
+            subject: "0x4113fe33".to_owned(),
+        };
+        let ordering_mismatch = LexicalFieldMismatch {
+            class: LexicalMismatchClass::Ordering,
+            path: "/full_search/outcome/hits/0/doc_id".to_owned(),
+            oracle: "a".to_owned(),
+            subject: "b".to_owned(),
+        };
+
+        // The lane did NOT opt in: rank is a raw mismatch, so the lexical axis
+        // must keep refusing. This is the byte-identical-default arm.
+        let raw =
+            compare_observations(subject.clone(), oracle.clone(), ComparatorConfig::default())
+                .expect("zero-tolerance comparison");
+        assert_eq!(raw.rank_class, RankClass::RankMismatch);
+        assert!(!lexical_mismatches_are_the_classified_rank_divergence(
+            std::slice::from_ref(&score_mismatch),
+            &raw
+        ));
+
+        // The lane opted in: rank classifies, and the lexical axis defers.
+        let classified = compare_observations(
+            subject,
+            oracle,
+            ComparatorConfig::default()
+                .with_score_epsilon_reason(ScoreEpsilonReason::SummationAssociation),
+        )
+        .expect("enveloped comparison");
+        assert_eq!(classified.rank_class, RankClass::ScoreEpsilon);
+        assert_eq!(
+            classified.score_epsilon_reason,
+            Some(ScoreEpsilonReason::SummationAssociation)
+        );
+        assert!(lexical_mismatches_are_the_classified_rank_divergence(
+            std::slice::from_ref(&score_mismatch),
+            &classified
+        ));
+
+        // ONE unreviewed mismatch travelling beside the reviewed one and the
+        // whole case still fails closed. This is the property that keeps the
+        // envelope from becoming a laundering channel.
+        assert!(!lexical_mismatches_are_the_classified_rank_divergence(
+            &[score_mismatch.clone(), ordering_mismatch],
+            &classified
+        ));
+
+        // An empty mismatch set is never "explained".
+        assert!(!lexical_mismatches_are_the_classified_rank_divergence(
+            &[],
+            &classified
+        ));
     }
 
     #[test]

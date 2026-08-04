@@ -29,7 +29,8 @@ use crate::comparator::{
     EngineObservation, LexicalBackendIdentity, LexicalComparisonStatus,
     LexicalContractBuildContext, LexicalEngineRole, LexicalFieldMismatch, LexicalMismatchClass,
     LexicalProbeCoverage, LexicalSideCoverage, RankClass, compare_lexical_contracts,
-    compare_observations, observe_live_lexical_contract,
+    compare_observations, lexical_mismatches_are_the_classified_rank_divergence,
+    observe_live_lexical_contract,
 };
 #[cfg(any(test, feature = "tantivy-oracle"))]
 use crate::engine::BuiltInEngineProfile;
@@ -5855,6 +5856,7 @@ fn classify_case_with_lexical(
         comparison: lexical,
     } = lexical_contract
         && lexical.status == LexicalComparisonStatus::Mismatch
+        && !lexical_mismatches_are_the_classified_rank_divergence(&lexical.mismatches, comparison)
     {
         return (
             CampaignDisposition::Unclassified,
@@ -20043,19 +20045,31 @@ mod tests {
     /// divergence, and drives its retained artifact through the typed ingestion
     /// contract into an append-only register ledger.
     ///
-    /// Two properties the acceptance names are proven here on PRODUCTION
-    /// evidence rather than on a synthetic fixture:
+    /// Properties proven here on PRODUCTION evidence rather than on a
+    /// synthetic fixture:
     ///
-    ///   1. an emitted mismatch carrying no classification FAILS CLOSED — the
-    ///      witness case lands as `Unclassified` on TWO independent axes (the
-    ///      total lexical contract mismatches, and the rank comparison carries
-    ///      an unregistered divergence), while its sibling control in the same
-    ///      suite stays `Exact`, so the fail-closed verdict is specific to the
-    ///      divergence and not a blanket refusal;
+    ///   1. the reviewed DIV-007 mechanism is CLASSIFIED in this lane rather
+    ///      than failing closed — bd-gx7n4. The witness case carries the
+    ///      one-ULP summation-association difference on BOTH axes, the lane
+    ///      declares the typed reason, and the case comes out classified while
+    ///      its sibling control in the same suite stays `Exact`, so the verdict
+    ///      is specific to the reviewed mechanism and not a blanket tolerance.
+    ///      The total lexical contract still reports its mismatch — the fix
+    ///      changes the disposition, never the evidence;
     ///   2. that mismatch can be INGESTED with immutable first-seen evidence —
     ///      the witness address, producer identity, oracle dependency identity,
     ///      lexical-contract audit revision, and corpus/query manifests are all
     ///      read out of the artifact, never typed in.
+    ///
+    /// HISTORY, because the test's name still says `unclassified`: before
+    /// bd-gx7n4 this case proved the opposite — that an unregistered mismatch
+    /// fails closed on two independent axes. The name is left alone because the
+    /// committed register fixtures, the divergence id, and the mint procedure
+    /// all reference it; renaming it would break the join this file's other
+    /// test asserts. What the name means now is "the case that WAS
+    /// unclassified", and the fail-closed property it used to carry lives in
+    /// `comparator::tests::the_reviewed_score_envelope_refuses_everything_it_should`
+    /// and `the_lexical_axis_defers_only_to_a_rank_axis_that_actually_classified`.
     ///
     /// SEAL: object creation requires a clean Git-verified producer, so this
     /// test passes only in a clean checkout, exactly like the existing
@@ -20086,23 +20100,39 @@ mod tests {
                 .iter()
                 .find(|case| case.case_id == E68_WITNESS_CASE_ID)
                 .expect("witness case is selected by the campaign");
-            assert_eq!(
+            // bd-gx7n4 CHANGED WHAT THIS CASE PROVES, and the change is stated
+            // rather than absorbed. Before the fix this witness landed
+            // Unclassified/LexicalContractMismatch — the lane did not opt into
+            // the reviewed reason, so the rank axis raised a raw RankMismatch
+            // and the lexical axis refused first. The lane now opts in and the
+            // register records three-clause disjunctions as DIV-007 members, so
+            // the SAME production evidence must now come out CLASSIFIED.
+            //
+            // What this case no longer proves is fail-closed-on-an-unregistered
+            // mismatch, because its mismatch is now registered. That property
+            // did not evaporate: it is pinned at the gate by
+            // `comparator::tests::the_reviewed_score_envelope_refuses_everything_it_should`
+            // and `the_lexical_axis_defers_only_to_a_rank_axis_that_actually_classified`,
+            // including the case that matters most — one unreviewed mismatch
+            // travelling beside a reviewed one still fails the whole case. That
+            // is a unit-level proof where this was a production-evidence proof,
+            // and restoring production evidence needs a second live case
+            // carrying a genuinely non-DIV-007 divergence, which cannot be
+            // minted from a dirty checkout.
+            assert_ne!(
                 witness.disposition,
                 CampaignDisposition::Unclassified,
-                "an unregistered production mismatch must fail closed: {:?}",
+                "the reviewed DIV-007 mechanism must no longer fail closed in this lane: {:?}",
                 witness.reason
             );
-            // The total lexical contract sees the same one-ULP difference and
-            // `classify_case_with_lexical` reports it first, so the recorded
-            // reason is the lexical one. The rank axis refuses independently:
-            // the case carries an unregistered raw divergence, which is what
-            // `MissingDivergenceRegistration` would name on its own. Both
-            // axes are asserted rather than one assumed from the other.
             assert_eq!(
-                witness.reason,
-                Some(CampaignCaseReason::LexicalContractMismatch),
-                "the total lexical contract must refuse this case first"
+                witness.reason, None,
+                "a classified case must not also carry a refusal reason"
             );
+            // NOTHING WAS HIDDEN. The total lexical contract still reports the
+            // mismatch and still names where; only the campaign disposition
+            // changed. If a future edit made the contract go quiet instead,
+            // this is the assertion that catches it.
             match witness.lexical_contract {
                 CampaignLexicalCaseSummary::CoreLexicalV3 {
                     status,
@@ -20122,10 +20152,15 @@ mod tests {
                     panic!("the default-profile lane must produce Core Lexical V3 evidence")
                 }
             }
-            assert_eq!(witness.rank_class, Some(RankClass::RankMismatch));
+            assert_eq!(
+                witness.rank_class,
+                Some(RankClass::ScoreEpsilon),
+                "the lane's typed reason must classify the rank axis"
+            );
             assert!(
                 witness.registered_divergence.is_none(),
-                "the rank axis must hold an UNREGISTERED divergence, or nothing failed closed"
+                "an AUTO-class needs no register entry; a register-classified divergence here \
+                 would mean the auto-class path stopped working"
             );
 
             let control = report
@@ -20411,6 +20446,14 @@ mod tests {
                 require_provenance: true,
                 index_batch_size: 5,
                 snippet_max_chars: None,
+                // bd-gx7n4 / DIV-008: this lane covers three-clause and wider
+                // pure disjunctions, which the register now records as members
+                // of the DIV-007 summation-association class. The bd-55mvg
+                // ruling keeps the comparator's DEFAULT config zero-tolerance
+                // and has covering lanes opt in with the typed reason, so the
+                // opt-in lives here rather than in ComparatorConfig::default.
+                comparator_config: ComparatorConfig::default()
+                    .with_score_epsilon_reason(ScoreEpsilonReason::SummationAssociation),
                 ..CampaignConfig::default()
             },
             DivergenceRegistry::default(),
