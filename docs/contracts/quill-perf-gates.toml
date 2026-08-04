@@ -82,7 +82,7 @@ activated = false
 
 [gate.QG-5]
 name = "full compaction"
-fixture = "50k docs (medium) at tombstone densities {5, 20, 50}% — NEVER 0% (bd-6m8p lesson). Scored on medium, not xlarge, because perf.rs emits `compaction/medium/{density}pct` and perf_ratchet pins that same label: an xlarge-pinned ratchet cell would match no emitted cell, bind nothing, and leave QG-5 scoring nothing while still reading green. The corpus.xlarge e6.1 generator has since LANDED (see [corpus.xlarge].status), so re-pinning is now unblocked; it must be done as one change across perf.rs, perf_ratchet.rs and this fixture line, with a re-baseline. Tracked as the 2026-08-02 harmonization follow-up."
+fixture = "1M docs (xlarge) at tombstone densities {5, 20, 50}% — NEVER 0% (bd-6m8p lesson). The LANDED corpus.xlarge e6.1 generator re-baselines QG-5 on xlarge: perf.rs emits `compaction/xlarge/{density}pct` and perf_ratchet pins that same label, so the ratchet cannot bind no emitted cell and read green."
 target = "wall-clock >= 5x faster than oracle force-merge at 20%; report all densities"
 activated = false
 

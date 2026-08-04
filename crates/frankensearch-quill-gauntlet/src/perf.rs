@@ -1125,23 +1125,18 @@ impl PerfMatrixSpec {
         commit.writer_heap_bytes = Some(perf_writer_heap_bytes(1));
         cells.push(commit);
 
-        // QG-5 scores on `medium`, not `xlarge`. The xlarge corpus is still
-        // `PENDING generator (quill-e6.1)` in `quill-perf-gates.toml`, so an
-        // xlarge-pinned cell can never produce a decision — it can only ever
-        // report NoDecision, which is indistinguishable from "not run" in the
-        // artifact and reads as coverage we do not have. Medium (50k docs) is
-        // a committed fixture, so the cell actually completes and the gate can
-        // be scored today. The tombstone densities and the >=5x force-merge
-        // target are unchanged; only the corpus the ratio is measured on moves.
-        // Re-pin to xlarge once the e6.1 generator lands and re-baseline.
+        // QG-5 re-baselines on `xlarge` now that the deterministic e6.1
+        // generator has landed. Its fixture must remain synchronized with the
+        // ratchet pin: a pin with no emitted cell can otherwise score nothing.
+        // The tombstone densities and the >=5x force-merge target are unchanged.
         for density in [5, 20, 50] {
             let mut cell = PerfCellSpec::new(
                 PerfGate::Qg5,
-                format!("compaction/medium/{density}pct"),
+                format!("compaction/xlarge/{density}pct"),
                 "wall_clock_ms",
             );
-            cell.corpus = Some(PerfCorpus::Medium);
-            cell.document_count = Some(PerfCorpus::Medium.document_count());
+            cell.corpus = Some(PerfCorpus::Xlarge);
+            cell.document_count = Some(PerfCorpus::Xlarge.document_count());
             cell.positions = Some(PositionMode::On);
             cell.threads = Some(1);
             cell.writer_heap_bytes = Some(perf_writer_heap_bytes(1));
@@ -4630,6 +4625,21 @@ mod tests {
         let qg10 = matrix.for_gate(PerfGate::Qg10);
         assert_eq!(qg10.len(), 1);
         assert_eq!(qg10[0].threads, Some(1));
+    }
+
+    #[test]
+    fn qg5_matrix_is_repinned_to_xlarge_after_generator_landing() {
+        let qg5 = PerfMatrixSpec::complete().for_gate(PerfGate::Qg5);
+        assert_eq!(qg5.len(), 3);
+
+        for (cell, density) in qg5.into_iter().zip([5, 20, 50]) {
+            assert_eq!(cell.fixture, format!("compaction/xlarge/{density}pct"));
+            assert_eq!(cell.corpus, Some(PerfCorpus::Xlarge));
+            assert_eq!(
+                cell.document_count,
+                Some(PerfCorpus::Xlarge.document_count())
+            );
+        }
     }
 
     #[test]
