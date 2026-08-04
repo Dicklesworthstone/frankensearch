@@ -16,6 +16,14 @@ mod engine;
 mod generator;
 mod local_perf_runner;
 mod machine_class_registry;
+// E6.3 metamorphic-law infrastructure is test-only, exactly like the law
+// executors it feeds in `engine.rs`, which all live inside that file's
+// `#[cfg(test)] mod tests`. Declaring it `#[cfg(test)]` states that honestly
+// instead of exporting unstable internals as crate API or silencing dead-code
+// with an allow — under `--lib` there is genuinely no production consumer yet,
+// because the executors that will call these schedules are still blocked.
+#[cfg(test)]
+mod metamorphic_maintenance_schedules;
 mod perf;
 mod perf_assembly;
 mod perf_evidence;
