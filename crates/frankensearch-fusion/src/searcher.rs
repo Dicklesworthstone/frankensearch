@@ -3504,6 +3504,9 @@ mod tests {
     use std::sync::Arc;
     use std::sync::Mutex;
 
+    use frankensearch_core::generation::{
+        ArtifactGenerationIdentityV1, EmbeddingIdentityBundleV1, QuantizationFormat,
+    };
     use frankensearch_core::traits::{MetricsExporter, ModelCategory, SearchFuture};
     use frankensearch_core::types::{EmbeddingMetrics, IndexMetrics, SearchMetrics};
     use frankensearch_core::{
@@ -4160,6 +4163,305 @@ mod tests {
                 .expect("add quality record");
         }
         Arc::new(builder.finish().expect("finish index"))
+    }
+
+    // ─── Owner-backed activation fixtures (bd-ctzo) ─────────────────────
+
+    /// An embedder that declares a complete immutable identity AND counts
+    /// every inference it is asked for.
+    ///
+    /// The count is the instrument: the whole claim of C1 is that a query in
+    /// the wrong space is refused BEFORE any work, and "before" is only
+    /// observable if the work is countable. A refusal that still embedded
+    /// would leave this at 1.
+    struct IdentityCountingEmbedder {
+        id: &'static str,
+        identity: EmbeddingIdentityBundleV1,
+        vector: Vec<f32>,
+        embeds: Arc<AtomicU64>,
+    }
+
+    impl IdentityCountingEmbedder {
+        fn new(id: &'static str, identity: EmbeddingIdentityBundleV1, vector: Vec<f32>) -> Self {
+            Self {
+                id,
+                identity,
+                vector,
+                embeds: Arc::new(AtomicU64::new(0)),
+            }
+        }
+
+        fn embed_count(&self) -> u64 {
+            self.embeds.load(Ordering::Relaxed)
+        }
+    }
+
+    impl Embedder for IdentityCountingEmbedder {
+        fn embed<'a>(&'a self, _cx: &'a Cx, _text: &'a str) -> SearchFuture<'a, Vec<f32>> {
+            self.embeds.fetch_add(1, Ordering::Relaxed);
+            let vector = self.vector.clone();
+            Box::pin(async move { Ok(vector) })
+        }
+
+        fn identity(&self) -> SearchResult<&EmbeddingIdentityBundleV1> {
+            Ok(&self.identity)
+        }
+
+        fn dimension(&self) -> usize {
+            self.vector.len()
+        }
+
+        fn id(&self) -> &str {
+            self.id
+        }
+
+        fn model_name(&self) -> &str {
+            self.id
+        }
+
+        fn is_semantic(&self) -> bool {
+            true
+        }
+
+        fn category(&self) -> ModelCategory {
+            ModelCategory::StaticEmbedder
+        }
+    }
+
+    /// The in-process f32 storage variant an embedder must declare.
+    fn in_memory_identity(model_id: &str, dimension: u32) -> EmbeddingIdentityBundleV1 {
+        let mut identity = EmbeddingIdentityBundleV1::explicit_test_model(model_id, dimension);
+        "in-memory-f32".clone_into(&mut identity.storage.format);
+        identity.storage.quantization = QuantizationFormat::F32;
+        "native-f32-values".clone_into(&mut identity.storage.endianness);
+        identity
+    }
+
+    /// The persisted fsvi-v2 variant of the SAME mathematical space. Query and
+    /// artifact bundles can never be byte-equal — one is in-process f32, the
+    /// other little-endian f16 on disk — which is exactly why the join is on
+    /// the space and the producer, not on the whole bundle.
+    fn artifact_binding(model_id: &str, dimension: u32, sequence: u64) -> FsviV2IdentityBinding {
+        let mut artifact = EmbeddingIdentityBundleV1::explicit_test_model(model_id, dimension);
+        "fsvi-v2".clone_into(&mut artifact.storage.format);
+        artifact.storage.quantization = QuantizationFormat::F16;
+        "little-endian".clone_into(&mut artifact.storage.endianness);
+        FsviV2IdentityBinding::new(
+            ArtifactGenerationIdentityV1::new(sequence, [0x5c; 16]).expect("test generation"),
+            artifact.freeze().expect("freeze artifact identity"),
+        )
+        .expect("valid FSVI v2 binding")
+    }
+
+    fn owner_backed_dir(label: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "frankensearch-ctzo-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        dir
+    }
+
+    fn write_v2_tier(path: &std::path::Path, binding: &FsviV2IdentityBinding, rows: &[(&str, &[f32])]) {
+        let mut writer = frankensearch_index::VectorIndex::create_v2(path, binding.clone())
+            .expect("create_v2 fixture");
+        for (doc_id, vector) in rows {
+            writer.write_record(doc_id, vector).expect("write v2 row");
+        }
+        writer.finish().expect("finish v2 fixture");
+    }
+
+    /// A fast-only index opened through exact FSVI v2 admission, so it retains
+    /// both the sealed owner and the binding it was admitted under.
+    fn owner_backed_index(dir: &std::path::Path, binding: &FsviV2IdentityBinding) -> Arc<TwoTierIndex> {
+        let fast_path = dir.join("vector.fast.idx");
+        write_v2_tier(
+            &fast_path,
+            binding,
+            &[
+                ("doc-a", &[1.0, 0.0, 0.0, 0.0]),
+                ("doc-b", &[0.0, 1.0, 0.0, 0.0]),
+            ],
+        );
+        Arc::new(
+            TwoTierIndex::open_admitted_v2_with_paths(
+                &frankensearch_index::TwoTierIndexPaths::new(&fast_path),
+                TwoTierConfig::default(),
+                binding,
+                None,
+            )
+            .expect("admit the fast tier"),
+        )
+    }
+
+    /// bd-ctzo C1: an owner-backed index refuses a query from a different
+    /// embedding space BEFORE the embedder runs, and admits and serves the
+    /// query from the space it was actually written in.
+    ///
+    /// The positive control and the refusal share one fixture and differ in
+    /// exactly one thing: which model produced the query embedder. Without
+    /// this guard the refused case is the dangerous one — same dimension, so
+    /// every vector API accepts it, and the search returns confident
+    /// nonsense.
+    #[test]
+    fn owner_backed_index_refuses_a_foreign_space_before_embedding() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let dir = owner_backed_dir("foreign-space");
+            let binding = artifact_binding("ctzo-searcher-model", 4, 17);
+            let index = owner_backed_index(&dir, &binding);
+
+            // Positive control: the embedder that produced this index.
+            let matching = Arc::new(IdentityCountingEmbedder::new(
+                "matching",
+                in_memory_identity("ctzo-searcher-model", 4),
+                vec![1.0, 0.0, 0.0, 0.0],
+            ));
+            let searcher = TwoTierSearcher::new(
+                Arc::clone(&index),
+                Arc::clone(&matching) as Arc<dyn Embedder>,
+                TwoTierConfig::default(),
+            );
+            let mut results = Vec::new();
+            searcher
+                .search(&cx, "query", 2, |_| None, |phase| {
+                    if let SearchPhase::Initial { results: hits, .. } = phase {
+                        results = hits;
+                    }
+                })
+                .await
+                .expect("the producing embedder is admitted");
+            assert_eq!(results.first().map(|r| r.doc_id.as_str()), Some("doc-a"));
+            assert_eq!(
+                matching.embed_count(),
+                1,
+                "an admitted query must actually embed"
+            );
+
+            // Same dimension, different space: refused, and NOTHING ran.
+            let foreign = Arc::new(IdentityCountingEmbedder::new(
+                "foreign",
+                in_memory_identity("a-different-model", 4),
+                vec![1.0, 0.0, 0.0, 0.0],
+            ));
+            let searcher = TwoTierSearcher::new(
+                index,
+                Arc::clone(&foreign) as Arc<dyn Embedder>,
+                TwoTierConfig::default(),
+            );
+            let error = searcher
+                .search(&cx, "query", 2, |_| None, |_| {})
+                .await
+                .expect_err("a foreign embedding space must be refused");
+            assert!(
+                matches!(
+                    error,
+                    SearchError::InvalidConfig { ref field, .. }
+                        if field == "query_embedding.fast.space_identity"
+                ),
+                "got {error:?}"
+            );
+            assert_eq!(
+                foreign.embed_count(),
+                0,
+                "the refusal must precede the embedder, not follow it"
+            );
+
+            let _ = std::fs::remove_dir_all(&dir);
+        });
+    }
+
+    /// bd-ctzo C1: a certified-compatible foreign producer is comparison-grade
+    /// telemetry and never an admission basis, so it is refused here too —
+    /// again before any inference.
+    #[test]
+    fn owner_backed_index_refuses_a_certified_compatible_producer_before_embedding() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let dir = owner_backed_dir("compatible-producer");
+            let binding = artifact_binding("ctzo-producer-model", 4, 23);
+            let index = owner_backed_index(&dir, &binding);
+
+            let mut compatible = in_memory_identity("ctzo-producer-model", 4);
+            "a-different-implementation".clone_into(&mut compatible.producer.backend);
+            let reference = in_memory_identity("ctzo-producer-model", 4);
+            assert_eq!(
+                compatible.space.fingerprint(),
+                reference.space.fingerprint(),
+                "the fixture is only meaningful while the SPACE is unchanged"
+            );
+            assert_ne!(
+                compatible.producer.fingerprint(),
+                reference.producer.fingerprint(),
+                "the fixture is only meaningful while the PRODUCER differs"
+            );
+            assert_eq!(
+                compatible.producer.golden_vectors, reference.producer.golden_vectors,
+                "the fixture is only meaningful while both producers are certified compatible"
+            );
+
+            let embedder = Arc::new(IdentityCountingEmbedder::new(
+                "compatible",
+                compatible,
+                vec![1.0, 0.0, 0.0, 0.0],
+            ));
+            let searcher = TwoTierSearcher::new(
+                index,
+                Arc::clone(&embedder) as Arc<dyn Embedder>,
+                TwoTierConfig::default(),
+            );
+            let error = searcher
+                .search(&cx, "query", 2, |_| None, |_| {})
+                .await
+                .expect_err("a certified-compatible producer must be refused");
+            assert!(
+                matches!(
+                    error,
+                    SearchError::InvalidConfig { ref field, .. }
+                        if field == "search_activation.fast.producer_conformance"
+                ),
+                "got {error:?}"
+            );
+            assert_eq!(embedder.embed_count(), 0, "refused before any inference");
+
+            let _ = std::fs::remove_dir_all(&dir);
+        });
+    }
+
+    /// bd-ctzo C1: the legacy path must survive. Every canonical production
+    /// index on disk today is a v1 artifact that retains no owner and carries
+    /// no space identity, and an embedder that declares no identity bundle is
+    /// still a legal `Embedder`. Neither may be turned into a refusal by this
+    /// guard — the guard binds only where there is an admitted identity to
+    /// bind to.
+    #[test]
+    fn legacy_unidentified_index_stays_searchable_without_any_identity() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let index = build_test_index(4);
+            assert!(
+                index.fast_admitted_binding().is_none(),
+                "the fixture is only meaningful while the index is legacy-unidentified"
+            );
+            // StubEmbedder deliberately does not implement `identity()`.
+            let embedder = Arc::new(StubEmbedder::new("stub-fast", 4));
+            let searcher =
+                TwoTierSearcher::new(index, embedder, TwoTierConfig::default());
+            let mut initial = Vec::new();
+            searcher
+                .search(&cx, "query", 3, |_| None, |phase| {
+                    if let SearchPhase::Initial { results, .. } = phase {
+                        initial = results;
+                    }
+                })
+                .await
+                .expect("a legacy index stays searchable");
+            assert!(
+                !initial.is_empty(),
+                "the legacy lane must still return results"
+            );
+        });
     }
 
     // ─── Tests ──────────────────────────────────────────────────────────
