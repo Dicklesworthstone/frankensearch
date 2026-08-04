@@ -55,12 +55,11 @@ use crate::grimoire::{
     TermSectionLengths,
 };
 use crate::quiver::{
-    BlockMaxError, BorrowedStoredMetaSection, DocLenCodecError, DocLenFieldInput,
-    EncodedDocLenSection, EncodedIdHashSection, EncodedIdMapSection, EncodedNumericSection,
-    EncodedPositionList, EncodedPostingList, EncodedStatsSection, EncodedStoredMetaSection,
-    FieldStats, IdHashCodecError, IdMapCodecError, IdMapEntryInput, NumericCodecError,
-    NumericEntry, NumericFieldInput, NumericValue, PositionCodecError, Posting, StatsCodecError,
-    StoredMetaCodecError, StoredMetaFieldInput,
+    BlockMaxError, DocLenCodecError, DocLenFieldInput, EncodedDocLenSection, EncodedIdHashSection,
+    EncodedIdMapSection, EncodedNumericSection, EncodedPositionList, EncodedPostingList,
+    EncodedStatsSection, EncodedStoredMetaSection, FieldStats, IdHashCodecError, IdMapCodecError,
+    IdMapEntryInput, NumericCodecError, NumericEntry, NumericFieldInput, NumericValue,
+    PositionCodecError, Posting, StatsCodecError, StoredMetaCodecError, StoredMetaFieldInput,
 };
 use crate::schema::{Analyzer as AnalyzerKind, FieldKind, SchemaDescriptor};
 use crate::segment::{EncodedSegment, SectionInput, SectionKind, SegmentHeaderInput};
@@ -3490,20 +3489,16 @@ pub fn flush_accumulator_with_mode<A: TokenAnalyzer>(
         )?)
     };
 
-    // Borrowed, not materialized: the field blobs stay in the accumulator and
-    // are emitted straight into the segment buffer below (`bd-4xr99`).
     let stored_meta = if accumulator.stored_fields().is_empty() {
         None
     } else {
-        Some(BorrowedStoredMetaSection::encode_accumulator(
+        Some(EncodedStoredMetaSection::encode_accumulator(
             docid_lo,
             docid_hi,
             input.lease_docid_base,
             accumulator,
         )?)
     };
-    // Slice pointers only; no payload byte is copied here.
-    let stored_meta_runs = stored_meta.as_ref().map(BorrowedStoredMetaSection::runs);
     let stats_rows = accumulator
         .fields()
         .iter()
@@ -3525,7 +3520,7 @@ pub fn flush_accumulator_with_mode<A: TokenAnalyzer>(
         &id_map,
         &id_hash,
         numeric.as_ref(),
-        stored_meta_runs.as_deref(),
+        stored_meta.as_ref(),
         &stats,
     )?;
     flush_span.record("result_count", u64::from(doc_count));
@@ -3603,9 +3598,6 @@ pub fn flush_delta_snapshot(
         encode_delta_stored_meta(snapshot, &live_documents, docid_lo, docid_hi, span)?;
     let stats = EncodedStatsSection::encode(&expected_field_ords, &stats_rows, doc_count)?;
 
-    // The Delta path already owns one contiguous section; hand it over as a
-    // single run so the writer has one payload shape.
-    let stored_meta_runs = stored_meta.as_ref().map(|section| [section.as_bytes()]);
     encode_canonical_segment(
         input,
         schema,
@@ -3617,7 +3609,7 @@ pub fn flush_delta_snapshot(
         &id_map,
         &id_hash,
         numeric.as_ref(),
-        stored_meta_runs.as_ref().map(<[&[u8]; 1]>::as_slice),
+        stored_meta.as_ref(),
         &stats,
     )
     .map(Some)
@@ -3863,11 +3855,7 @@ fn encode_canonical_segment(
     id_map: &EncodedIdMapSection,
     id_hash: &EncodedIdHashSection,
     numeric: Option<&EncodedNumericSection>,
-    // Ordered STOREDMETA payload runs rather than one contiguous section, so
-    // the fresh-seal path can hand over the accumulator's borrowed field blobs
-    // instead of materializing a section-sized copy first (`bd-4xr99`). The
-    // Delta path passes a single run and is unchanged on the wire.
-    stored_meta_runs: Option<&[&[u8]]>,
+    stored_meta: Option<&EncodedStoredMetaSection>,
     stats: &EncodedStatsSection,
 ) -> Result<EncodedSegment, FlushError> {
     let (postings_bytes, positions_bytes, blockmax_bytes, term_inputs) = term_streams;
@@ -3902,10 +3890,10 @@ fn encode_canonical_segment(
     if let Some(numeric) = numeric {
         sections.push(SectionInput::new(SectionKind::NUMERIC, numeric.as_bytes()));
     }
-    if let Some(stored_meta_runs) = stored_meta_runs {
-        sections.push(SectionInput::from_runs(
+    if let Some(stored_meta) = stored_meta {
+        sections.push(SectionInput::new(
             SectionKind::STOREDMETA,
-            stored_meta_runs,
+            stored_meta.as_bytes(),
         ));
     }
     sections.push(SectionInput::new(SectionKind::STATS, stats.as_bytes()));
