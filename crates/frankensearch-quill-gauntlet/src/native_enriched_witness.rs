@@ -97,11 +97,15 @@ pub const FIXTURE_CORPUS: &[(&str, &str)] = &[
     // correct engine excludes, or "total" would be indistinguishable from
     // "doc_count".
     ("doc-delta", "unrelated prose about weather"),
+    // Carries markup in its BODY. Deliberately shares no term with the
+    // "quill"/"lexical" probes so the pagination expectations above are
+    // untouched; its own probe term is "escaping".
+    (MARKUP_DOC_ID, MARKUP_DOC_BODY),
 ];
 
 /// Exact live document count of [`FIXTURE_CORPUS`], asserted rather than
 /// derived from `.len()` so a fixture edit has to be deliberate.
-pub const FIXTURE_DOC_COUNT: usize = 4;
+pub const FIXTURE_DOC_COUNT: usize = 5;
 
 /// One hand-derived expectation. Every field is a claim about what any correct
 /// BM25 engine must produce for [`FIXTURE_CORPUS`]; none of it is copied from
@@ -318,8 +322,9 @@ pub const FIXTURE_METADATA: &[(&str, &[(&str, &str)])] =
 /// UNTRUSTED document text, which is a different thing entirely from the
 /// TRUSTED highlight tags the caller configured.
 pub const MARKUP_DOC_ID: &str = "doc-markup";
-/// The markup-bearing document body.
-pub const MARKUP_DOC_BODY: &str = "quill <script>alert(1)</script> payload";
+/// The markup-bearing document body. Its probe term is "escaping", chosen so
+/// this document does not disturb the "quill"/"lexical" pagination rows.
+pub const MARKUP_DOC_BODY: &str = "escaping <script>alert(1)</script> payload";
 
 /// The committed enrichment expectation table.
 pub const FIXTURE_ENRICHMENT_EXPECTATIONS: &[EnrichmentExpectationV1] = &[
@@ -356,6 +361,20 @@ pub const FIXTURE_ENRICHMENT_EXPECTATIONS: &[EnrichmentExpectationV1] = &[
         expected_query_type_code: "boolean",
         subject_doc: "doc-beta",
         highlighted_term: "lexical",
+        expected_metadata_pairs: &[],
+    },
+    // ESCAPING: the subject document's BODY contains markup. The configured
+    // tags are trusted and must render; the document's own <script> must not
+    // survive as live markup. Both halves are adjudicated, because a check
+    // for the tags alone would pass an engine that echoed the body verbatim.
+    EnrichmentExpectationV1 {
+        query: "escaping",
+        limit: 10,
+        highlight_prefix: "<b>",
+        highlight_postfix: "</b>",
+        expected_query_type_code: "simple",
+        subject_doc: MARKUP_DOC_ID,
+        highlighted_term: "escaping",
         expected_metadata_pairs: &[],
     },
 ];
@@ -432,7 +451,9 @@ pub fn adjudicate_enrichment(
     if let Some(snippet) = subject.snippet.as_deref() {
         let highlighted = format!(
             "{}{}{}",
-            observation.highlight_prefix, expectation.highlighted_term, observation.highlight_postfix
+            observation.highlight_prefix,
+            expectation.highlighted_term,
+            observation.highlight_postfix
         );
         if !snippet.contains(&highlighted) {
             failures.push(format!(
@@ -443,9 +464,14 @@ pub fn adjudicate_enrichment(
         // asserted separately from the tag check above precisely because a
         // single "contains <b>" assertion would pass an engine that echoed
         // untrusted document markup verbatim.
+        // The assertion is SEMANTIC — untrusted markup must not survive as
+        // live markup — rather than a claim about how that is achieved.
+        // Escaping and stripping are both safe, and pinning one would assert
+        // an engine's rendering choice as a contract. Observed today: Quill
+        // escapes, emitting `&lt;script&gt;`, beside live `<b>` tags.
         if snippet.contains("<script>") {
             failures.push(
-                "snippet echoed untrusted document markup (<script>) unescaped".to_owned(),
+                "snippet echoed untrusted document markup (<script>) as live markup".to_owned(),
             );
         }
     }
@@ -1077,6 +1103,176 @@ mod tests {
             "got {:?}",
             verdict.oracle_failures
         );
+    }
+
+    fn enrichment_row(query: &str, prefix: &str) -> &'static EnrichmentExpectationV1 {
+        FIXTURE_ENRICHMENT_EXPECTATIONS
+            .iter()
+            .find(|row| row.query == query && row.highlight_prefix == prefix)
+            .expect("enrichment fixture row")
+    }
+
+    fn enriched(
+        engine: NativeEngineV1,
+        expectation: &EnrichmentExpectationV1,
+        snippet: Option<&str>,
+        query_type_code: &str,
+        metadata: MetadataStateV1,
+    ) -> NativeEnrichedObservationV1 {
+        NativeEnrichedObservationV1 {
+            engine,
+            query: expectation.query.to_owned(),
+            highlight_prefix: expectation.highlight_prefix.to_owned(),
+            highlight_postfix: expectation.highlight_postfix.to_owned(),
+            hits: vec![NativeEnrichedHitV1 {
+                doc_id: expectation.subject_doc.to_owned(),
+                rank: 0,
+                snippet: snippet.map(str::to_owned),
+                query_type_code: query_type_code.to_owned(),
+                metadata,
+            }],
+        }
+    }
+
+    /// THE ENRICHMENT COMMON-MODE PROOF. Both engines misclassify the same
+    /// query the same way. `enriched_engines_agree` reports success; the
+    /// independent oracle still fails both.
+    ///
+    /// This is the case the two-`QueryExplanation`-types finding makes real:
+    /// the enums are defined independently in each crate, so they can drift
+    /// together — a shared misreading of "two bare words" — and a receipt
+    /// whose oracle was cross-engine code equality would bless it.
+    #[test]
+    fn a_common_mode_query_type_drift_passes_agreement_and_still_fails_the_oracle() {
+        let row = enrichment_row("lexical backend", "<b>");
+        let snippet = "<b>lexical</b> lexical quill backend";
+        let quill = enriched(
+            NativeEngineV1::Quill,
+            row,
+            Some(snippet),
+            "simple",
+            MetadataStateV1::Absent,
+        );
+        let tantivy = enriched(
+            NativeEngineV1::Tantivy,
+            row,
+            Some(snippet),
+            "simple",
+            MetadataStateV1::Absent,
+        );
+
+        assert!(
+            enriched_engines_agree(&quill, &tantivy),
+            "the drift must be COMMON-MODE, or this proves nothing"
+        );
+        for observed in [&quill, &tantivy] {
+            let verdict = adjudicate_enrichment(row, observed);
+            assert!(!verdict.passed(), "{observed:?}");
+            assert!(
+                verdict
+                    .oracle_failures
+                    .iter()
+                    .any(|failure| failure.contains("query_type simple != expected boolean")),
+                "got {:?}",
+                verdict.oracle_failures
+            );
+        }
+    }
+
+    /// Untrusted document markup surviving as live markup fails, even though
+    /// the configured tags are present — which is why the two halves are
+    /// asserted separately.
+    #[test]
+    fn echoed_document_markup_fails_even_when_the_configured_tags_render() {
+        let row = enrichment_row("escaping", "<b>");
+        let leaked = enriched(
+            NativeEngineV1::Quill,
+            row,
+            Some("<b>escaping</b> <script>alert(1)</script> payload"),
+            "simple",
+            MetadataStateV1::Absent,
+        );
+        let verdict = adjudicate_enrichment(row, &leaked);
+        assert!(!verdict.passed());
+        assert!(
+            verdict
+                .oracle_failures
+                .iter()
+                .any(|failure| failure.contains("untrusted document markup")),
+            "got {:?}",
+            verdict.oracle_failures
+        );
+
+        // The safe rendering passes.
+        let escaped = enriched(
+            NativeEngineV1::Quill,
+            row,
+            Some("<b>escaping</b> &lt;script&gt;alert(1)&lt;/script&gt; payload"),
+            "simple",
+            MetadataStateV1::Absent,
+        );
+        assert!(adjudicate_enrichment(row, &escaped).passed());
+    }
+
+    /// A hard-coded `<b>` that ignores the caller's configured tags fails.
+    #[test]
+    fn ignoring_the_configured_highlight_tags_fails() {
+        let row = enrichment_row("quill", "[[");
+        let hard_coded = enriched(
+            NativeEngineV1::Quill,
+            row,
+            Some("<b>quill</b> indexes text"),
+            "simple",
+            MetadataStateV1::Entries {
+                pairs: vec!["kind=primary".to_owned(), "lang=en".to_owned()],
+            },
+        );
+        let verdict = adjudicate_enrichment(row, &hard_coded);
+        assert!(!verdict.passed());
+        assert!(
+            verdict
+                .oracle_failures
+                .iter()
+                .any(|failure| failure.contains("[[quill]]")),
+            "got {:?}",
+            verdict.oracle_failures
+        );
+    }
+
+    /// Absent and empty-object are both legal for a document indexed without
+    /// metadata; fabricated entries are not.
+    #[test]
+    fn metadata_states_stay_distinguishable() {
+        let row = enrichment_row("lexical backend", "<b>");
+        let snippet = Some("<b>lexical</b> <b>backend</b>");
+        for state in [MetadataStateV1::Absent, MetadataStateV1::EmptyObject] {
+            let observed = enriched(NativeEngineV1::Quill, row, snippet, "boolean", state);
+            assert!(
+                adjudicate_enrichment(row, &observed).passed(),
+                "both representations of 'no metadata' are legal"
+            );
+        }
+        let fabricated = enriched(
+            NativeEngineV1::Quill,
+            row,
+            snippet,
+            "boolean",
+            MetadataStateV1::Entries {
+                pairs: vec!["kind=invented".to_owned()],
+            },
+        );
+        let verdict = adjudicate_enrichment(row, &fabricated);
+        assert!(!verdict.passed());
+        assert!(
+            verdict
+                .oracle_failures
+                .iter()
+                .any(|failure| failure.contains("present for a document indexed without any")),
+            "got {:?}",
+            verdict.oracle_failures
+        );
+        assert!(!MetadataStateV1::Absent.is_present());
+        assert!(!MetadataStateV1::EmptyObject.is_present());
     }
 
     #[test]

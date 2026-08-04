@@ -141,18 +141,46 @@ fn the_committed_enrichment_expectations_hold_against_real_quill() {
 fn the_committed_expectations_hold_against_real_tantivy() {
     use frankensearch_core::traits::LexicalWrite;
     use frankensearch_lexical::TantivyIndex;
-    use frankensearch_quill_gauntlet::native_enriched_witness::observe_tantivy;
+    use frankensearch_quill_gauntlet::native_enriched_witness::{
+        observe_tantivy, observe_tantivy_enrichment,
+    };
 
     asupersync::test_utils::run_test_with_cx(|cx| async move {
         let dir = tempfile::tempdir().expect("witness tempdir");
         let index = TantivyIndex::create(dir.path()).expect("create the witness Tantivy index");
-        for (doc_id, body) in FIXTURE_CORPUS {
+        for document in fixture_documents() {
             index
-                .index_document(&cx, &IndexableDocument::new(*doc_id, *body))
+                .index_document(&cx, &document)
                 .await
                 .expect("index a witness fixture document");
         }
         index.commit(&cx).await.expect("commit the Tantivy index");
+
+        // The ENRICHED arm runs against the same index and the same committed
+        // expectations, so a divergence between the engines shows up as one
+        // of them failing the SHARED oracle rather than as a diff.
+        let mut enrichment_failures = Vec::new();
+        for expectation in FIXTURE_ENRICHMENT_EXPECTATIONS {
+            let observed = observe_tantivy_enrichment(&cx, &index, expectation)
+                .expect("observe native Tantivy enrichment");
+            let verdict = adjudicate_enrichment(expectation, &observed);
+            if !verdict.passed() {
+                enrichment_failures.push(format!(
+                    "query={:?} tags={}{} -> {:?} (hits {:?})",
+                    expectation.query,
+                    expectation.highlight_prefix,
+                    expectation.highlight_postfix,
+                    verdict.oracle_failures,
+                    observed.hits,
+                ));
+            }
+        }
+        assert!(
+            enrichment_failures.is_empty(),
+            "the committed enrichment expectations do not describe the shipping Tantivy \
+             engine:\n{}",
+            enrichment_failures.join("\n")
+        );
 
         let mut failures = Vec::new();
         for expectation in FIXTURE_EXPECTATIONS {
