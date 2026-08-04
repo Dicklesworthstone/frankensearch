@@ -4,6 +4,7 @@
 use std::env;
 use std::error::Error;
 use std::ffi::{OsStr, OsString};
+use std::fmt;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -102,6 +103,53 @@ struct LoadedBaseline {
     evidence_path: Option<PathBuf>,
     pointer: Option<(PathBuf, Vec<u8>)>,
 }
+
+const REBASELINE_RETRY_PREDICATE: &str = "rerun the paired candidate and same-window reproduction with the current interleaved-runner schema, then promote the resulting current-schema history pointer";
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+struct BaselineSchemaIncompatibility {
+    code: &'static str,
+    baseline_path: PathBuf,
+    found_schema: String,
+    expected_schema: &'static str,
+    retry_predicate: &'static str,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BaselineLoadError {
+    incompatibility: BaselineSchemaIncompatibility,
+}
+
+impl BaselineLoadError {
+    fn stale_threshold_schema(path: &Path, found_schema: &str) -> Self {
+        Self {
+            incompatibility: BaselineSchemaIncompatibility {
+                code: "baseline_schema_incompatible",
+                baseline_path: path.to_path_buf(),
+                found_schema: found_schema.to_owned(),
+                expected_schema: PERF_ARTIFACT_SCHEMA_VERSION,
+                retry_predicate: REBASELINE_RETRY_PREDICATE,
+            },
+        }
+    }
+}
+
+impl fmt::Display for BaselineLoadError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let incompatibility = &self.incompatibility;
+        write!(
+            formatter,
+            "{}: baseline={} found_schema={:?} expected_schema={:?} retry_predicate={:?}",
+            incompatibility.code,
+            incompatibility.baseline_path.display(),
+            incompatibility.found_schema,
+            incompatibility.expected_schema,
+            incompatibility.retry_predicate,
+        )
+    }
+}
+
+impl Error for BaselineLoadError {}
 
 #[derive(Debug)]
 struct HistoryPublicationPlan {
@@ -815,11 +863,7 @@ fn read_baseline(
         });
     }
     if schema_version.starts_with("quill-perf-artifact-v") {
-        return Err(format!(
-            "threshold artifact {} has stale schema {schema_version:?}; expected {PERF_ARTIFACT_SCHEMA_VERSION:?}",
-            path.display()
-        )
-        .into());
+        return Err(BaselineLoadError::stale_threshold_schema(path, schema_version).into());
     }
     if explicit_evidence_path.is_some() {
         return Err(
@@ -898,6 +942,15 @@ fn read_baseline(
 
 fn read_artifact(path: &Path) -> Result<(PerfGateArtifact, Vec<u8>), Box<dyn Error>> {
     let bytes = fs::read(path)?;
+    let probe = serde_json::from_slice::<serde_json::Value>(&bytes)?;
+    if let Some(schema_version) = probe
+        .get("schema_version")
+        .and_then(serde_json::Value::as_str)
+        && schema_version.starts_with("quill-perf-artifact-v")
+        && schema_version != PERF_ARTIFACT_SCHEMA_VERSION
+    {
+        return Err(BaselineLoadError::stale_threshold_schema(path, schema_version).into());
+    }
     let artifact = serde_json::from_slice::<PerfGateArtifact>(&bytes)?;
     let canonical = serde_json::to_vec_pretty(&artifact)?;
     let mut canonical_bootstrap = canonical.clone();
@@ -1597,7 +1650,7 @@ mod tests {
     }
 
     #[test]
-    fn direct_historical_thresholds_fail_with_precise_stale_schema_error() {
+    fn direct_historical_thresholds_return_typed_rebaseline_incompatibility() {
         let directory = tempfile::tempdir().expect("baseline directory");
         for schema in [
             "quill-perf-artifact-v4",
@@ -1615,14 +1668,84 @@ mod tests {
             .expect("write historical threshold probe");
             let error = read_baseline(&path, None)
                 .expect_err("historical direct threshold must fail closed")
-                .to_string();
+                .downcast::<BaselineLoadError>()
+                .expect("historical threshold denial must be typed");
             assert!(
-                error.contains("stale schema")
-                    && error.contains(schema)
-                    && error.contains(PERF_ARTIFACT_SCHEMA_VERSION),
-                "unexpected stale-schema diagnostic: {error}"
+                error.incompatibility.code == "baseline_schema_incompatible"
+                    && error.incompatibility.baseline_path == path
+                    && error.incompatibility.found_schema == schema
+                    && error.incompatibility.expected_schema == PERF_ARTIFACT_SCHEMA_VERSION
+                    && error.incompatibility.retry_predicate == REBASELINE_RETRY_PREDICATE,
+                "unexpected typed stale-schema diagnostic: {error}"
             );
         }
+    }
+
+    #[test]
+    fn historical_threshold_through_current_history_pointer_is_typed() {
+        let directory = tempfile::tempdir().expect("baseline directory");
+        let profile = test_profile();
+        let threshold_file = "historical-threshold.json";
+        let threshold_path = directory.path().join(threshold_file);
+        fs::write(
+            &threshold_path,
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "schema_version": "quill-perf-artifact-v6",
+            }))
+            .expect("historical threshold probe"),
+        )
+        .expect("write historical threshold probe");
+
+        let pointer_path = directory.path().join(
+            profile
+                .latest_basename(PerfGate::Qg2.label())
+                .expect("latest basename"),
+        );
+        let pointer = HistoryPointer {
+            schema_version: PERF_HISTORY_POINTER_SCHEMA_VERSION.to_owned(),
+            gate: PerfGate::Qg2,
+            profile,
+            run_id: "typed-history-pointer".to_owned(),
+            threshold_file: threshold_file.to_owned(),
+            threshold_sha256: "0".repeat(64),
+            evidence_file: "unreached-evidence.json".to_owned(),
+            evidence_sha256: "0".repeat(64),
+        };
+        fs::write(
+            &pointer_path,
+            serde_json::to_vec_pretty(&pointer).expect("canonical history pointer"),
+        )
+        .expect("write history pointer");
+
+        let error = read_baseline(&pointer_path, None)
+            .expect_err("a pointer to historical schema must fail closed")
+            .downcast::<BaselineLoadError>()
+            .expect("pointer-resolved historical threshold denial must be typed");
+        assert_eq!(error.incompatibility.code, "baseline_schema_incompatible");
+        assert_eq!(error.incompatibility.baseline_path, threshold_path);
+        assert_eq!(error.incompatibility.found_schema, "quill-perf-artifact-v6");
+        assert_eq!(
+            error.incompatibility.retry_predicate,
+            REBASELINE_RETRY_PREDICATE
+        );
+    }
+
+    #[test]
+    fn current_versioned_bootstrap_loads_without_rebaseline_incompatibility() {
+        let directory = tempfile::tempdir().expect("baseline directory");
+        let path = directory
+            .path()
+            .join(current_bootstrap_basename(PerfGate::Qg2));
+        fs::write(
+            &path,
+            include_bytes!("../../../../.bench-history/QG-2.v7.unmeasured.latest.json"),
+        )
+        .expect("write current bootstrap");
+
+        let loaded = read_baseline(&path, None)
+            .expect("current versioned bootstrap must load without a rebaseline incompatibility");
+        assert_eq!(loaded.artifact.schema_version, PERF_ARTIFACT_SCHEMA_VERSION);
+        assert!(loaded.evidence.is_none());
     }
 
     #[test]

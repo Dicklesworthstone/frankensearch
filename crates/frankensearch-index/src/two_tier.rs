@@ -3162,16 +3162,13 @@ mod tests {
             hnsw_ef_search: 32,
             ..TwoTierConfig::default()
         };
-        let mut index = TwoTierIndex::open(&dir, config).expect("open ANN index");
+        let mut index = TwoTierIndex::open(&dir, config.clone()).expect("open ANN index");
         assert!(index.has_fast_ann());
 
         // Model the crash-recovery window in which a durable WAL update exists
         // but its best-effort main-slab tombstone did not land. Include a
         // repeated WAL identity to exercise the canonical post-rank dedup rule.
-        let fast_tier = index
-            .fast_tier_mut_for_test()
-            .expect("path-opened fast tier");
-        fast_tier.wal_entries.extend([
+        let wal_entries = vec![
             WalEntry {
                 doc_id: "doc-a".into(),
                 doc_id_hash: crate::fnv1a_hash(b"doc-a"),
@@ -3187,7 +3184,11 @@ mod tests {
                 doc_id_hash: crate::fnv1a_hash(b"doc-new"),
                 embedding: vec![0.95, 0.312_249_9],
             },
-        ]);
+        ];
+        let fast_tier = index
+            .fast_tier_mut_for_test()
+            .expect("path-opened fast tier");
+        fast_tier.wal_entries.extend(wal_entries.clone());
 
         let query = [1.0_f32, 0.0];
         let assert_canonical = |index: &TwoTierIndex, label: &str| {
@@ -3229,16 +3230,25 @@ mod tests {
         assert_canonical(&index, "normal ANN");
         assert_eq!(index.ann_fallback_count(), 0);
 
-        // A post-build tombstone removes one native candidate. Fetching the
-        // entire four-point graph must therefore exact-repair the main tier,
-        // then merge the resident WAL exactly once through the same resolver.
+        // A post-build tombstone must happen through the writer role between
+        // reader-tier opens. Fetching the entire four-point graph must then
+        // exact-repair the main tier and merge the resident WAL once through
+        // the same resolver.
+        drop(index);
+        let mut writer =
+            VectorIndex::open_writer(&fast_path).expect("writer opens after reader drops");
         assert!(
-            index
-                .fast_tier_mut_for_test()
-                .expect("path-opened fast tier")
+            writer
                 .soft_delete("doc-delete")
                 .expect("post-build tombstone")
         );
+        drop(writer);
+        let mut index = TwoTierIndex::open(&dir, config).expect("reopen ANN index after tombstone");
+        index
+            .fast_tier_mut_for_test()
+            .expect("reopened path-opened fast tier")
+            .wal_entries
+            .extend(wal_entries);
         assert_canonical(&index, "exact-underfill fallback");
         assert_eq!(
             index.ann_fallback_count(),
@@ -3269,15 +3279,16 @@ mod tests {
             hnsw_ef_search: 32,
             ..TwoTierConfig::default()
         };
-        let mut index = TwoTierIndex::open(&dir, config).expect("open ANN index");
-        let fast_tier = index
-            .fast_tier_mut_for_test()
-            .expect("path-opened fast tier");
-        fast_tier.wal_entries.push(WalEntry {
+        let mut index = TwoTierIndex::open(&dir, config.clone()).expect("open ANN index");
+        let wal_entry = WalEntry {
             doc_id: "doc-a".into(),
             doc_id_hash: crate::fnv1a_hash(b"doc-a"),
             embedding: vec![-1.0, 0.0],
-        });
+        };
+        let fast_tier = index
+            .fast_tier_mut_for_test()
+            .expect("path-opened fast tier");
+        fast_tier.wal_entries.push(wal_entry.clone());
 
         let normal_query = [1.0_f32, 0.0];
         assert!(
@@ -3297,13 +3308,21 @@ mod tests {
         );
         assert_eq!(index.ann_fallback_count(), 0);
 
+        drop(index);
+        let mut writer =
+            VectorIndex::open_writer(&fast_path).expect("writer opens after reader drops");
         assert!(
-            index
-                .fast_tier_mut_for_test()
-                .expect("path-opened fast tier")
+            writer
                 .soft_delete("doc-tombstone")
                 .expect("post-build tombstone")
         );
+        drop(writer);
+        let mut index = TwoTierIndex::open(&dir, config).expect("reopen ANN index after tombstone");
+        index
+            .fast_tier_mut_for_test()
+            .expect("reopened path-opened fast tier")
+            .wal_entries
+            .push(wal_entry);
         let fallback_query = [0.0_f32, 1.0];
         assert!(
             index
