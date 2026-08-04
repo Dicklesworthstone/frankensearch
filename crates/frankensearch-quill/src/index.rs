@@ -11107,11 +11107,18 @@ fn lower_boolean<'a>(
         QueryLoweringMode::Scored if topdocs_root => {
             #[cfg(feature = "pruning-conformance")]
             if let Some(checkpoint) = checkpoint {
-                return ReferenceScorer::boolean_topdocs_with_checkpoint(
-                    clauses,
-                    Arc::clone(checkpoint),
-                )
-                .map_err(QuillIndexError::from);
+                // `QueryCheckpointHandle` is the concrete `Arc<QueryCheckpoint>`
+                // under `profile-internals` and already `Arc<dyn ..>` otherwise.
+                // The clone must infer its type parameter from the ARGUMENT, so
+                // it is bound unannotated first; annotating it directly makes
+                // `Arc::clone` unify against `Arc<dyn ..>` and reject the
+                // concrete handle before any unsize coercion can apply. The
+                // second binding is the coercion site, and is an identity when
+                // the alias is already the trait object.
+                let handle = Arc::clone(checkpoint);
+                let checkpoint: Arc<dyn QueryWorkCheckpoint + 'a> = handle;
+                return ReferenceScorer::boolean_topdocs_with_checkpoint(clauses, checkpoint)
+                    .map_err(QuillIndexError::from);
             }
             ReferenceScorer::boolean_topdocs(clauses)
         }
