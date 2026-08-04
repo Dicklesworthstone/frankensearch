@@ -564,12 +564,29 @@ jobs:
         timeout-minutes: 30
         run: cargo test --profile release -p frankensearch-quill-gauntlet engine::tests::e55_seeded_mixed_residency_conformance_is_exact -- --ignored --exact
 
-      - name: Nightly full validation (all features)
+      # frankensearch-quill declares a deliberate feature-exclusivity invariant:
+      # `profile-internals` is a diagnostic sidecar that must never be linked
+      # into a `bench-internals` timing build, because profile instrumentation
+      # corrupts the timings this repo treats as evidence. It is enforced by a
+      # compile_error! in crates/frankensearch-quill/src/lib.rs. `--all-features`
+      # unions both, so a workspace-wide --all-features build CANNOT compile by
+      # design -- this lane failed before it ran a single test, and had done so
+      # unnoticed long enough for a genuinely broken feature to hide behind the
+      # noise (bd-rg18d). A feature graph with a declared exclusivity invariant
+      # simply has no single all-features build.
+      #
+      # Quill is therefore deselected here. It is still COMPILED as a dependency,
+      # with bench-internals, via frankensearch-quill-gauntlet, so no coverage is
+      # lost from that direction. Quill's own feature matrix needs two explicit
+      # arms (one per side of the exclusion); they are blocked on the crate's
+      # pre-existing feature-combination errors and tracked in bd-57cyv. Do NOT
+      # "fix" this lane by deleting the compile_error! or by unioning the pair.
+      - name: Nightly full validation (all features except the quill exclusivity pair)
         if: matrix.os == 'ubuntu-latest' && steps.validation_profile.outputs.profile == 'nightly'
         env:
           QUILL_E3_9_RANDOM_SEEDS: "32"
           QUILL_E6_5_RANDOM_SEEDS: "16"
-        run: cargo test --workspace --all-features -- --nocapture
+        run: cargo test --workspace --all-features --exclude frankensearch-quill -- --nocapture
 
       - name: E2E contract smoke (fsfs)
         if: matrix.os == 'ubuntu-latest'
@@ -701,7 +718,7 @@ jobs:
               },
               "nightly": {
                 "description": "Full validation sweep",
-                "required_lanes": ["premerge","cargo test --workspace --all-features -- --nocapture"]
+                "required_lanes": ["premerge","cargo test --workspace --all-features --exclude frankensearch-quill -- --nocapture"]
               }
             }
           }
@@ -774,7 +791,7 @@ jobs:
             "gate_active": false,
             "enforcement": "artifact_contract_only",
             "details": "baseline/current artifacts present but evaluation lane not yet fully wired in this workflow",
-            "replay_command": "cargo test --workspace --all-features -- --nocapture"
+            "replay_command": "cargo test --workspace --all-features --exclude frankensearch-quill -- --nocapture"
           }
           EOF
           else
@@ -786,7 +803,7 @@ jobs:
             "gate_active": false,
             "enforcement": "artifact_contract_only",
             "details": "benchmark metric artifacts not yet present in ci_artifacts/",
-            "replay_command": "cargo test --workspace --all-features -- --nocapture"
+            "replay_command": "cargo test --workspace --all-features --exclude frankensearch-quill -- --nocapture"
           }
           EOF
           fi
