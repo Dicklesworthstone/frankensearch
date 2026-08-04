@@ -2812,6 +2812,10 @@ mod tests {
     // `perf-harness` block, so the import carries the same gate.
     #[cfg(feature = "perf-harness")]
     use crate::comparator::DivergenceClass;
+    // The Boolean associativity laws compare under the reviewed DIV-007
+    // two-ULP envelope, so they need its reason enum; same `perf-harness` gate.
+    #[cfg(feature = "perf-harness")]
+    use crate::comparator::ScoreEpsilonReason;
 
     const E55_ID_FIELD: u16 = 0;
     const E55_CONTENT_FIELD: u16 = 1;
@@ -3073,6 +3077,39 @@ mod tests {
         generator_id: &str,
     ) -> Vec<(String, EngineObservation, EngineObservation)> {
         e63_observations_with_config(cx, documents, cases, seed, generator_id, e55_config()).await
+    }
+
+    /// E6.3 executable precondition for the Boolean associativity laws.
+    ///
+    /// A re-association fixture is only meaningful when the two spellings
+    /// differ *solely* in grouping: same operands, same order, same operator,
+    /// different parenthesisation. Asserting that here keeps a fixture that
+    /// silently stopped exercising re-association -- or that mutated a term
+    /// while nobody was looking -- from passing vacuously.
+    #[cfg(feature = "perf-harness")]
+    fn e63_assert_regrouping_precondition(left: &str, right: &str, operands: &[&str]) {
+        assert_ne!(
+            left, right,
+            "E6.3 associativity fixture must exercise a real re-association"
+        );
+        let distinct = operands.iter().collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            distinct.len(),
+            operands.len(),
+            "E6.3 associativity operands must be distinct: {operands:?}"
+        );
+        let strip = |query: &str| query.replace(['(', ')'], "");
+        assert_eq!(
+            strip(left),
+            strip(right),
+            "E6.3 associativity spellings must differ only in grouping"
+        );
+        for operand in operands {
+            assert!(
+                left.contains(operand) && right.contains(operand),
+                "E6.3 associativity operand {operand} missing from a spelling"
+            );
+        }
     }
 
     #[cfg(feature = "perf-harness")]
@@ -7466,6 +7503,231 @@ mod tests {
                             .iter()
                             .all(|divergence| divergence.class == DivergenceClass::TieOrder),
                         "E6.3 {engine} seed {seed:#x} produced a non-tie OR commutation divergence: {:?}",
+                        comparison.divergences,
+                    );
+                }
+            }
+        });
+    }
+
+    /// E6.3 law: three distinct, unboosted positive scalar `AND` operands
+    /// re-associate. `(A AND B) AND C` and `A AND (B AND C)` select the same
+    /// conjunction, so the total lexical observation must agree exactly or by
+    /// tie order only.
+    ///
+    /// This is the law the two-term commutativity pair explicitly excluded
+    /// ("excludes association ... because those shapes can expose parser or
+    /// score-accumulation behavior"). The exclusion was a deferral, not a
+    /// proof, so the relation here was measured before it was declared: on the
+    /// scalar G1A fixture both Quill and Tantivy report `RankExact` with zero
+    /// divergences under re-association. The relation is still written as
+    /// `RankExact | TieOrder` so a legitimate tie reshuffle on another seed is
+    /// admitted rather than reported as a violation.
+    ///
+    /// Preconditions are executable, not decorative: the operands must be
+    /// three distinct analyzed terms and both spellings must differ only in
+    /// grouping, so a fixture that accidentally stopped exercising
+    /// re-association fails loudly instead of passing vacuously.
+    ///
+    /// The intentionally invalid control re-groups across MIXED operators
+    /// (`(A AND B) OR C` versus `A AND (B OR C)`), which is genuinely not an
+    /// associativity transform and must be rejected.
+    #[cfg(feature = "perf-harness")]
+    #[test]
+    fn e63_three_term_and_associates_but_mixed_operator_regrouping_is_not_equivalent() {
+        use frankensearch_core::IndexableDocument;
+
+        const SEED: u64 = 0xe63_a55d_c0aa_5eed;
+        let documents = vec![
+            IndexableDocument::new("doc-1", "alpha beta beta").with_title("guide"),
+            IndexableDocument::new("doc-2", "alpha gamma").with_title("alpha overview"),
+            IndexableDocument::new("doc-3", "beta gamma gamma gamma").with_title("alpha"),
+            IndexableDocument::new("doc-4", "alpha beta gamma delta").with_title("reference"),
+            IndexableDocument::new("doc-5", "delta epsilon").with_title("quiet"),
+        ];
+
+        let left_grouped = "(alpha AND beta) AND gamma";
+        let right_grouped = "alpha AND (beta AND gamma)";
+        e63_assert_regrouping_precondition(
+            left_grouped,
+            right_grouped,
+            &["alpha", "beta", "gamma"],
+        );
+
+        let canonical = [("three-term-and-assoc", left_grouped)];
+        let regrouped = [("three-term-and-assoc", right_grouped)];
+        let operator_mutated = [("three-term-and-assoc", "alpha AND (beta OR gamma)")];
+
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let baseline = e63_observations(
+                &cx,
+                &documents,
+                &canonical,
+                SEED,
+                "e6.3-three-term-and-associativity-v1",
+            )
+            .await;
+            let transformed = e63_observations(
+                &cx,
+                &documents,
+                &regrouped,
+                SEED,
+                "e6.3-three-term-and-associativity-v1",
+            )
+            .await;
+            let invalid = e63_observations(
+                &cx,
+                &documents,
+                &operator_mutated,
+                SEED,
+                "e6.3-three-term-and-associativity-v1",
+            )
+            .await;
+
+            let baseline_case = baseline.first().expect("E6.3 baseline AND-assoc fixture");
+            let regrouped_case = transformed
+                .first()
+                .expect("E6.3 regrouped AND-assoc fixture");
+            assert_eq!(
+                baseline_case.0, regrouped_case.0,
+                "E6.3 three-term AND associativity case identity drifted"
+            );
+            for (engine, before, after) in [
+                ("Quill", &baseline_case.1, &regrouped_case.1),
+                ("Tantivy", &baseline_case.2, &regrouped_case.2),
+            ] {
+                let comparison = compare_observations(
+                    before.clone(),
+                    after.clone(),
+                    ComparatorConfig::default()
+                        .with_score_epsilon_reason(ScoreEpsilonReason::SummationAssociation),
+                )
+                .unwrap_or_else(|error| {
+                    panic!("E6.3 {engine} three-term AND associativity comparison failed: {error}")
+                });
+                assert!(
+                    matches!(
+                        comparison.rank_class,
+                        RankClass::RankExact | RankClass::TieOrder | RankClass::ScoreEpsilon
+                    ),
+                    "E6.3 {engine} produced a divergence outside the DIV-007 envelope under three-term AND association: {:?} / {:?}",
+                    comparison.rank_class,
+                    comparison.divergences,
+                );
+            }
+
+            let invalid_case = invalid
+                .first()
+                .expect("E6.3 invalid mixed-operator AND-assoc fixture");
+            for (engine, before, after) in [
+                ("Quill", &baseline_case.1, &invalid_case.1),
+                ("Tantivy", &baseline_case.2, &invalid_case.2),
+            ] {
+                let comparison = compare_observations(
+                    before.clone(),
+                    after.clone(),
+                    ComparatorConfig::default(),
+                )
+                .unwrap_or_else(|error| {
+                    panic!("E6.3 {engine} invalid mixed-operator comparison failed: {error}")
+                });
+                assert_eq!(
+                    comparison.status,
+                    ComparisonStatus::Failed,
+                    "E6.3 {engine} incorrectly accepted a mixed-operator regrouping as association",
+                );
+            }
+        });
+    }
+
+    /// E6.3 bounded replay campaign for three-term `AND` associativity. The
+    /// seed matrix varies which three of the fixture's analyzed terms are
+    /// associated, so a law that only held for one operand triple cannot pass.
+    #[cfg(feature = "perf-harness")]
+    #[test]
+    fn e63_three_term_and_associativity_seed_matrix_replays_live_observations() {
+        use frankensearch_core::IndexableDocument;
+
+        const SEEDS: [u64; 3] = [
+            0xe63_a55d_c0aa_5eed,
+            0xe63_a55d_c0aa_5eee,
+            0xe63_a55d_c0aa_5eef,
+        ];
+        let documents = vec![
+            IndexableDocument::new("doc-1", "alpha beta beta").with_title("guide"),
+            IndexableDocument::new("doc-2", "alpha gamma").with_title("alpha overview"),
+            IndexableDocument::new("doc-3", "beta gamma gamma gamma").with_title("alpha"),
+            IndexableDocument::new("doc-4", "alpha beta gamma delta").with_title("reference"),
+            IndexableDocument::new("doc-5", "delta epsilon").with_title("quiet"),
+        ];
+
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            for ((first, second, third), seed) in [
+                (("alpha", "beta", "gamma"), SEEDS[0]),
+                (("alpha", "gamma", "delta"), SEEDS[1]),
+                (("beta", "gamma", "delta"), SEEDS[2]),
+            ] {
+                let left_grouped = format!("({first} AND {second}) AND {third}");
+                let right_grouped = format!("{first} AND ({second} AND {third})");
+                e63_assert_regrouping_precondition(
+                    &left_grouped,
+                    &right_grouped,
+                    &[first, second, third],
+                );
+                assert_eq!(
+                    right_grouped,
+                    format!("{first} AND ({second} AND {third})"),
+                    "E6.3 seed {seed:#x} must replay its association transform byte-identically",
+                );
+
+                let canonical_cases = [("three-term-and-assoc", left_grouped.as_str())];
+                let regrouped_cases = [("three-term-and-assoc", right_grouped.as_str())];
+                let baseline = e63_observations(
+                    &cx,
+                    &documents,
+                    &canonical_cases,
+                    seed,
+                    "e6.3-three-term-and-associativity-v1",
+                )
+                .await;
+                let transformed = e63_observations(
+                    &cx,
+                    &documents,
+                    &regrouped_cases,
+                    seed,
+                    "e6.3-three-term-and-associativity-v1",
+                )
+                .await;
+                let baseline_case = baseline
+                    .first()
+                    .expect("E6.3 seed baseline AND-assoc fixture");
+                let regrouped_case = transformed
+                    .first()
+                    .expect("E6.3 seed regrouped AND-assoc fixture");
+                assert_eq!(
+                    baseline_case.0, regrouped_case.0,
+                    "E6.3 seed {seed:#x} AND-assoc case identity drifted"
+                );
+                for (engine, before, after) in [
+                    ("Quill", &baseline_case.1, &regrouped_case.1),
+                    ("Tantivy", &baseline_case.2, &regrouped_case.2),
+                ] {
+                    let comparison = compare_observations(
+                        before.clone(),
+                        after.clone(),
+                        ComparatorConfig::default()
+                            .with_score_epsilon_reason(ScoreEpsilonReason::SummationAssociation),
+                    )
+                    .unwrap_or_else(|error| {
+                        panic!("E6.3 {engine} seed {seed:#x} AND-assoc comparison failed: {error}")
+                    });
+                    assert!(
+                        matches!(
+                            comparison.rank_class,
+                            RankClass::RankExact | RankClass::TieOrder | RankClass::ScoreEpsilon
+                        ),
+                        "E6.3 {engine} seed {seed:#x} produced a divergence outside the DIV-007 envelope under AND association: {:?} / {:?}",
+                        comparison.rank_class,
                         comparison.divergences,
                     );
                 }
