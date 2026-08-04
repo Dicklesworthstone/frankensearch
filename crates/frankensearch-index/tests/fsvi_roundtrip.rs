@@ -284,9 +284,13 @@ fn wal_append_and_compact() {
     assert_eq!(index.wal_record_count(), 0);
 
     // Re-open and verify all 4 records are in the main index.
-    let reopened = VectorIndex::open(&path).unwrap();
+    // `open` retains the exclusive writer lock for its entire lifetime. Release
+    // the compaction writer before acquiring a shared query mapping.
+    drop(index);
+    let reopened = VectorIndex::open_read_only(&path).unwrap();
     assert_eq!(reopened.record_count(), 4);
     assert_eq!(reopened.wal_record_count(), 0);
+    drop(reopened);
 
     cleanup(&path);
 }
