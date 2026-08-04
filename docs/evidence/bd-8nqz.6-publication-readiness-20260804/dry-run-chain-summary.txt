@@ -1,0 +1,14 @@
+frankensearch-core           exit=0     26s  
+frankensearch-durability     exit=0    127s  
+frankensearch-embed          exit=101    1s  error: failed to prepare local package for uploading
+frankensearch-index          exit=101    1s  error: failed to verify manifest at `/data/projects/frankensearch/crates/frankensearch-index/Cargo.toml`
+frankensearch-lexical        exit=101    1s  error: failed to prepare local package for uploading
+frankensearch-quill          exit=101    0s  error: failed to prepare local package for uploading
+frankensearch-rerank         exit=101    1s  error: failed to verify manifest at `/data/projects/frankensearch/crates/frankensearch-rerank/Cargo.toml`
+frankensearch-fusion         exit=101    1s  error: failed to prepare local package for uploading
+frankensearch-storage        exit=101    1s  error: failed to prepare local package for uploading
+frankensearch                exit=101    0s  error: failed to prepare local package for uploading
+frankensearch-tui            exit=0    155s  
+frankensearch-fsfs           exit=101    2s  error: failed to prepare local package for uploading
+frankensearch-ops            exit=101    1s  error: failed to prepare local package for uploading
+CHAIN_COMPLETE

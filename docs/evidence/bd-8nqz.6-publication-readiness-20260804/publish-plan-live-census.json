@@ -1,0 +1,387 @@
+{
+  "schema": "frankensearch-crates-publish-plan-v1",
+  "mode": "audit",
+  "scope": "workspace",
+  "status": "blocked",
+  "root_package": {
+    "name": "frankensearch",
+    "version": "0.3.2"
+  },
+  "release": {
+    "tag": null,
+    "tag_namespace": "crates-v<facade-version>",
+    "heterogeneous_package_versions": true
+  },
+  "source": {
+    "git_sha": "bae865c03848abddbfd26aa39130c4092ff2cc5f",
+    "tracked_worktree_dirty": true,
+    "non_ignored_untracked_files": [
+      "..."
+    ],
+    "cargo_lock_sha256": "09f199f0031c7ef33ab3a43bc76fd32042132907ffb942e653153b60cc0808db",
+    "rustc": "rustc 1.99.0-nightly (9f36de775 2026-07-19)",
+    "cargo": "cargo 1.99.0-nightly (3efb1f477 2026-07-17)"
+  },
+  "generated_at": "2026-08-04T17:42:01Z",
+  "packages": [
+    {
+      "position": 0,
+      "name": "frankensearch-core",
+      "version": "0.2.1",
+      "manifest": "crates/frankensearch-core/Cargo.toml",
+      "internal_dependencies": [],
+      "registry": {
+        "status": "published",
+        "checksum": "649311eb17406963d8c1eba7056d3d4f940d30a3632f4337a9f038edf5248151",
+        "source_sha": "2cad158f4468ece7076e3fe529c8e5c20b2e020e",
+        "source_dirty": false
+      },
+      "action": "blocked_version_reuse"
+    },
+    {
+      "position": 1,
+      "name": "frankensearch-durability",
+      "version": "0.2.0",
+      "manifest": "crates/frankensearch-durability/Cargo.toml",
+      "internal_dependencies": [
+        "frankensearch-core"
+      ],
+      "registry": {
+        "status": "published",
+        "checksum": "10e100cbc6cb37283f74ce8ad578dbac4d2ee5264454a01b0967883232fd6e35",
+        "source_sha": "72fad4d9d596fb7501f07e21ca76d21d6d2b71f2",
+        "source_dirty": false
+      },
+      "action": "blocked_version_reuse"
+    },
+    {
+      "position": 2,
+      "name": "frankensearch-embed",
+      "version": "0.2.1",
+      "manifest": "crates/frankensearch-embed/Cargo.toml",
+      "internal_dependencies": [
+        "frankensearch-core"
+      ],
+      "registry": {
+        "status": "published",
+        "checksum": "51c5469ac2ef558c069e1396971e5cfbd67fd46c1613bf5109e5443f6f25e271",
+        "source_sha": "2cad158f4468ece7076e3fe529c8e5c20b2e020e",
+        "source_dirty": false
+      },
+      "action": "blocked_version_reuse"
+    },
+    {
+      "position": 3,
+      "name": "frankensearch-index",
+      "version": "0.2.1",
+      "manifest": "crates/frankensearch-index/Cargo.toml",
+      "internal_dependencies": [
+        "frankensearch-core"
+      ],
+      "registry": {
+        "status": "published",
+        "checksum": "cafea894f186445b67383d015ffbae4a2a945a5072025f8f992a1033876c3cb6",
+        "source_sha": "2cad158f4468ece7076e3fe529c8e5c20b2e020e",
+        "source_dirty": false
+      },
+      "action": "blocked_version_reuse"
+    },
+    {
+      "position": 4,
+      "name": "frankensearch-lexical",
+      "version": "0.2.1",
+      "manifest": "crates/frankensearch-lexical/Cargo.toml",
+      "internal_dependencies": [
+        "frankensearch-core"
+      ],
+      "registry": {
+        "status": "published",
+        "checksum": "ec99e727d05bbdb7f426d205984bb374f8e5e4cd73ee8c4af7bf7e58f2439805",
+        "source_sha": "2cad158f4468ece7076e3fe529c8e5c20b2e020e",
+        "source_dirty": false
+      },
+      "action": "blocked_version_reuse"
+    },
+    {
+      "position": 5,
+      "name": "frankensearch-quill",
+      "version": "0.2.1",
+      "manifest": "crates/frankensearch-quill/Cargo.toml",
+      "internal_dependencies": [
+        "frankensearch-core",
+        "frankensearch-durability",
+        "frankensearch-index",
+        "frankensearch-lexical"
+      ],
+      "registry": {
+        "status": "unpublished",
+        "checksum": null,
+        "source_sha": null,
+        "source_dirty": false
+      },
+      "action": "publish"
+    },
+    {
+      "position": 6,
+      "name": "frankensearch-rerank",
+      "version": "0.2.2",
+      "manifest": "crates/frankensearch-rerank/Cargo.toml",
+      "internal_dependencies": [
+        "frankensearch-core",
+        "frankensearch-embed"
+      ],
+      "registry": {
+        "status": "published",
+        "checksum": "0aba2030939f8535d4855c0f5b5a3c164283f532f60aac912217dad4cbfa4ea8",
+        "source_sha": "2cad158f4468ece7076e3fe529c8e5c20b2e020e",
+        "source_dirty": false
+      },
+      "action": "blocked_version_reuse"
+    },
+    {
+      "position": 7,
+      "name": "frankensearch-fusion",
+      "version": "0.2.1",
+      "manifest": "crates/frankensearch-fusion/Cargo.toml",
+      "internal_dependencies": [
+        "frankensearch-core",
+        "frankensearch-embed",
+        "frankensearch-index",
+        "frankensearch-lexical",
+        "frankensearch-quill",
+        "frankensearch-rerank"
+      ],
+      "registry": {
+        "status": "published",
+        "checksum": "5e9ebbab5d9bce15564dcd1444275bac41d4288336914fb15a06212ab159b39d",
+        "source_sha": "2cad158f4468ece7076e3fe529c8e5c20b2e020e",
+        "source_dirty": false
+      },
+      "action": "blocked_version_reuse"
+    },
+    {
+      "position": 8,
+      "name": "frankensearch-storage",
+      "version": "0.2.0",
+      "manifest": "crates/frankensearch-storage/Cargo.toml",
+      "internal_dependencies": [
+        "frankensearch-core"
+      ],
+      "registry": {
+        "status": "published",
+        "checksum": "1eb475291a954bd31dc12b1467aa4c160c62b52801575643fd9dd964efe089bd",
+        "source_sha": "72fad4d9d596fb7501f07e21ca76d21d6d2b71f2",
+        "source_dirty": false
+      },
+      "action": "blocked_version_reuse"
+    },
+    {
+      "position": 9,
+      "name": "frankensearch",
+      "version": "0.3.2",
+      "manifest": "frankensearch/Cargo.toml",
+      "internal_dependencies": [
+        "frankensearch-core",
+        "frankensearch-durability",
+        "frankensearch-embed",
+        "frankensearch-fusion",
+        "frankensearch-index",
+        "frankensearch-lexical",
+        "frankensearch-quill",
+        "frankensearch-rerank",
+        "frankensearch-storage"
+      ],
+      "registry": {
+        "status": "published",
+        "checksum": "aebc2e59465ed0d1c580fcdb285840feae85a6e9b8d2b4f8edc3370d2ec89cd3",
+        "source_sha": "2cad158f4468ece7076e3fe529c8e5c20b2e020e",
+        "source_dirty": false
+      },
+      "action": "blocked_version_reuse"
+    },
+    {
+      "position": 10,
+      "name": "frankensearch-tui",
+      "version": "0.2.0",
+      "manifest": "crates/frankensearch-tui/Cargo.toml",
+      "internal_dependencies": [
+        "frankensearch-core"
+      ],
+      "registry": {
+        "status": "unpublished",
+        "checksum": null,
+        "source_sha": null,
+        "source_dirty": false
+      },
+      "action": "publish"
+    },
+    {
+      "position": 11,
+      "name": "frankensearch-fsfs",
+      "version": "1.4.3",
+      "manifest": "crates/frankensearch-fsfs/Cargo.toml",
+      "internal_dependencies": [
+        "frankensearch-core",
+        "frankensearch-durability",
+        "frankensearch-embed",
+        "frankensearch-index",
+        "frankensearch-lexical",
+        "frankensearch-quill",
+        "frankensearch-storage",
+        "frankensearch-tui"
+      ],
+      "registry": {
+        "status": "unpublished",
+        "checksum": null,
+        "source_sha": null,
+        "source_dirty": false
+      },
+      "action": "publish"
+    },
+    {
+      "position": 12,
+      "name": "frankensearch-ops",
+      "version": "0.2.0",
+      "manifest": "crates/frankensearch-ops/Cargo.toml",
+      "internal_dependencies": [
+        "frankensearch-core",
+        "frankensearch-tui"
+      ],
+      "registry": {
+        "status": "unpublished",
+        "checksum": null,
+        "source_sha": null,
+        "source_dirty": false
+      },
+      "action": "publish"
+    }
+  ],
+  "blockers": [
+    {
+      "code": "DIRTY_TRACKED_WORKTREE",
+      "package": null,
+      "dependency": null,
+      "bead": "bd-8nqz.6",
+      "message": "Tracked files differ from candidate source SHA bae865c03848abddbfd26aa39130c4092ff2cc5f.",
+      "remediation": "Run the gate from a clean checkout at the exact release commit."
+    },
+    {
+      "code": "PUBLISHED_VERSION_SOURCE_MISMATCH",
+      "package": "frankensearch",
+      "dependency": null,
+      "bead": "bd-8nqz.6",
+      "message": "Version frankensearch 0.3.2 is already published from source 2cad158f4468ece7076e3fe529c8e5c20b2e020e, not candidate bae865c03848abddbfd26aa39130c4092ff2cc5f.",
+      "remediation": "Bump the crate version and every dependent internal requirement."
+    },
+    {
+      "code": "PUBLISHED_VERSION_SOURCE_MISMATCH",
+      "package": "frankensearch-core",
+      "dependency": null,
+      "bead": "bd-8nqz.6",
+      "message": "Version frankensearch-core 0.2.1 is already published from source 2cad158f4468ece7076e3fe529c8e5c20b2e020e, not candidate bae865c03848abddbfd26aa39130c4092ff2cc5f.",
+      "remediation": "Bump the crate version and every dependent internal requirement."
+    },
+    {
+      "code": "PUBLISHED_VERSION_SOURCE_MISMATCH",
+      "package": "frankensearch-durability",
+      "dependency": null,
+      "bead": "bd-8nqz.6",
+      "message": "Version frankensearch-durability 0.2.0 is already published from source 72fad4d9d596fb7501f07e21ca76d21d6d2b71f2, not candidate bae865c03848abddbfd26aa39130c4092ff2cc5f.",
+      "remediation": "Bump the crate version and every dependent internal requirement."
+    },
+    {
+      "code": "PUBLISHED_VERSION_SOURCE_MISMATCH",
+      "package": "frankensearch-embed",
+      "dependency": null,
+      "bead": "bd-8nqz.6",
+      "message": "Version frankensearch-embed 0.2.1 is already published from source 2cad158f4468ece7076e3fe529c8e5c20b2e020e, not candidate bae865c03848abddbfd26aa39130c4092ff2cc5f.",
+      "remediation": "Bump the crate version and every dependent internal requirement."
+    },
+    {
+      "code": "PUBLISHED_VERSION_SOURCE_MISMATCH",
+      "package": "frankensearch-fusion",
+      "dependency": null,
+      "bead": "bd-8nqz.6",
+      "message": "Version frankensearch-fusion 0.2.1 is already published from source 2cad158f4468ece7076e3fe529c8e5c20b2e020e, not candidate bae865c03848abddbfd26aa39130c4092ff2cc5f.",
+      "remediation": "Bump the crate version and every dependent internal requirement."
+    },
+    {
+      "code": "PUBLISHED_VERSION_SOURCE_MISMATCH",
+      "package": "frankensearch-index",
+      "dependency": null,
+      "bead": "bd-8nqz.6",
+      "message": "Version frankensearch-index 0.2.1 is already published from source 2cad158f4468ece7076e3fe529c8e5c20b2e020e, not candidate bae865c03848abddbfd26aa39130c4092ff2cc5f.",
+      "remediation": "Bump the crate version and every dependent internal requirement."
+    },
+    {
+      "code": "PUBLISHED_VERSION_SOURCE_MISMATCH",
+      "package": "frankensearch-lexical",
+      "dependency": null,
+      "bead": "bd-8nqz.6",
+      "message": "Version frankensearch-lexical 0.2.1 is already published from source 2cad158f4468ece7076e3fe529c8e5c20b2e020e, not candidate bae865c03848abddbfd26aa39130c4092ff2cc5f.",
+      "remediation": "Bump the crate version and every dependent internal requirement."
+    },
+    {
+      "code": "PUBLISHED_VERSION_SOURCE_MISMATCH",
+      "package": "frankensearch-rerank",
+      "dependency": null,
+      "bead": "bd-8nqz.6",
+      "message": "Version frankensearch-rerank 0.2.2 is already published from source 2cad158f4468ece7076e3fe529c8e5c20b2e020e, not candidate bae865c03848abddbfd26aa39130c4092ff2cc5f.",
+      "remediation": "Bump the crate version and every dependent internal requirement."
+    },
+    {
+      "code": "PUBLISHED_VERSION_SOURCE_MISMATCH",
+      "package": "frankensearch-storage",
+      "dependency": null,
+      "bead": "bd-8nqz.6",
+      "message": "Version frankensearch-storage 0.2.0 is already published from source 72fad4d9d596fb7501f07e21ca76d21d6d2b71f2, not candidate bae865c03848abddbfd26aa39130c4092ff2cc5f.",
+      "remediation": "Bump the crate version and every dependent internal requirement."
+    },
+    {
+      "code": "UNTRACKED_PACKAGE_FILES",
+      "package": null,
+      "dependency": null,
+      "bead": "bd-8nqz.6",
+      "message": "The candidate contains 1 non-ignored untracked file(s) that may enter Cargo package selection.",
+      "remediation": "Commit intended package inputs or ignore non-package artifacts, then rerun from a clean checkout; never bypass a release gate with --allow-dirty."
+    },
+    {
+      "code": "DEPENDENCY_GIT_VERSION_REQUIRED",
+      "package": "frankensearch-rerank",
+      "dependency": "ft-api",
+      "bead": "bd-8nqz.6-ft-registry",
+      "message": "Git dependency 'ft-api' in 'frankensearch-rerank' has no registry version requirement.",
+      "remediation": "Publish a registry-equivalent crate and add its concrete version, or remove the dependency."
+    },
+    {
+      "code": "DEPENDENCY_GIT_VERSION_REQUIRED",
+      "package": "frankensearch-rerank",
+      "dependency": "ft-autograd",
+      "bead": "bd-8nqz.6-ft-registry",
+      "message": "Git dependency 'ft-autograd' in 'frankensearch-rerank' has no registry version requirement.",
+      "remediation": "Publish a registry-equivalent crate and add its concrete version, or remove the dependency."
+    },
+    {
+      "code": "DEPENDENCY_GIT_VERSION_REQUIRED",
+      "package": "frankensearch-rerank",
+      "dependency": "ft-core",
+      "bead": "bd-8nqz.6-ft-registry",
+      "message": "Git dependency 'ft-core' in 'frankensearch-rerank' has no registry version requirement.",
+      "remediation": "Publish a registry-equivalent crate and add its concrete version, or remove the dependency."
+    },
+    {
+      "code": "DEPENDENCY_GIT_VERSION_REQUIRED",
+      "package": "frankensearch-index",
+      "dependency": "hnsw_rs",
+      "bead": "bd-mczj",
+      "message": "Git dependency 'hnsw_rs' in 'frankensearch-index' has no registry version requirement.",
+      "remediation": "Publish a registry-equivalent crate and add its concrete version, or remove the dependency."
+    }
+  ],
+  "blocker_codes": [
+    "DEPENDENCY_GIT_VERSION_REQUIRED",
+    "DIRTY_TRACKED_WORKTREE",
+    "PUBLISHED_VERSION_SOURCE_MISMATCH",
+    "UNTRACKED_PACKAGE_FILES"
+  ]
+}
