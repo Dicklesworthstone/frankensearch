@@ -90,6 +90,14 @@ use frankensearch_index::{
 use crate::cache::IndexCache;
 use crate::queue::{EmbeddingJob, EmbeddingQueue, JobOutcome};
 
+/// The fast and quality vectors joined for one document during a staged merge.
+///
+/// Either tier may be absent: a row carrying only a fast vector has no quality
+/// sibling yet, and a quality-only row belongs to a reachable
+/// `AttestedV2 { fast: None, quality: Some(_) }` generation that must land in
+/// the staged quality tier without fabricating a fast row.
+type MergedTierVectors = (Option<Vec<f32>>, Option<Vec<f32>>);
+
 // ---------------------------------------------------------------------------
 // Configuration
 // ---------------------------------------------------------------------------
@@ -1613,7 +1621,7 @@ impl RefreshWorker {
         //    generation (`AttestedV2 { fast: None, quality: Some(_) }`):
         //    such rows land in the staged quality tier and never fabricate a
         //    fast row.
-        let mut merged: HashMap<String, (Option<Vec<f32>>, Option<Vec<f32>>)> = HashMap::new();
+        let mut merged: HashMap<String, MergedTierVectors> = HashMap::new();
         let mut quality_lookup: HashMap<String, Vec<f32>> = HashMap::new();
         if let Some(AdmittedCanonicalTier {
             owner: quality_owner,
@@ -1761,7 +1769,7 @@ impl RefreshWorker {
         debug_assert!(index.fast_identity_is_attested());
         // The staged pair shares one nonce by construction, so admission must
         // never have silently degraded the quality tier (round-2 hardening).
-        debug_assert!(quality_binding.is_some() == index.has_quality_index());
+        debug_assert_eq!(quality_binding.is_some(), index.has_quality_index());
 
         info!(
             target: "frankensearch.refresh",

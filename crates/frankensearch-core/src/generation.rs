@@ -4933,12 +4933,18 @@ mod tests {
         let genesis = authority_reference(1, None);
         let floor = AuthorityFloorV1::new([0x5a; 16], genesis).expect("valid floor");
         let results = std::thread::scope(|scope| {
-            let handles = (1..=8)
-                .map(|key_byte| {
-                    let store = std::sync::Arc::clone(&store);
-                    scope.spawn(move || store.compare_and_advance(None, floor, [key_byte; 16]))
-                })
-                .collect::<Vec<_>>();
+            // Every publisher must be spawned BEFORE the first join, otherwise
+            // the eight threads run one at a time and "exactly one winner"
+            // holds trivially without ever racing a same-base CAS. The spawn
+            // loop is deliberately eager for that reason; a lazy
+            // `.map(spawn).map(join)` chain would serialize them.
+            let mut handles = Vec::with_capacity(8);
+            for key_byte in 1..=8_u8 {
+                let store = std::sync::Arc::clone(&store);
+                handles.push(
+                    scope.spawn(move || store.compare_and_advance(None, floor, [key_byte; 16])),
+                );
+            }
             handles
                 .into_iter()
                 .map(|handle| handle.join().expect("publisher thread must not panic"))

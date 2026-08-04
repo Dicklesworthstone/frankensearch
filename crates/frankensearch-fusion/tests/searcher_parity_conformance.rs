@@ -22,6 +22,15 @@ use frankensearch_core::{
 use frankensearch_fusion::{SyncLexicalSearch, SyncTwoTierSearcher, TwoTierSearcher};
 use frankensearch_index::{InMemoryTwoTierIndex, InMemoryVectorIndex, TwoTierIndex};
 
+/// One seeded corpus document: its id plus its fast and quality vectors.
+type SeededDoc = (String, Vec<f32>, Vec<f32>);
+
+/// Phase snapshots captured from one searcher, labelled by phase name.
+type PhaseSnapshots = Vec<(&'static str, Vec<ScoredResult>)>;
+
+/// The sync and async snapshot pair a parity assertion compares.
+type ParitySnapshots = (PhaseSnapshots, PhaseSnapshots);
+
 /// Known, documented divergences between the two searchers (bd-k3089).
 /// Each entry pins WHERE the divergence lives so accidental convergence or a
 /// new divergence both surface as test failures worth reading.
@@ -35,7 +44,7 @@ enum KnownDivergence {
     KendallTau,
     /// The synchronous in-memory fixture and serialized FSVI fixture can use
     /// different physical row positions for the same document. Result order
-    /// and doc_id are the portable rank identity; index is covered by the
+    /// and `doc_id` are the portable rank identity; index is covered by the
     /// shared four-document fixture where both layouts are intentionally equal.
     IndexIdentity,
 }
@@ -278,7 +287,7 @@ fn seeded_unit_vector(state: &mut u64) -> Vec<f32> {
     normalize(values)
 }
 
-fn seeded_corpus() -> (Vec<(String, Vec<f32>, Vec<f32>)>, Vec<f32>) {
+fn seeded_corpus() -> (Vec<SeededDoc>, Vec<f32>) {
     let mut state = 0x4d59_5df4_d0f3_3173_u64;
     let docs = (0..32)
         .map(|index| {
@@ -445,10 +454,7 @@ fn phase_snapshots(
     query_vec: &[f32],
     with_quality: bool,
     config: TwoTierConfig,
-) -> (
-    Vec<(&'static str, Vec<ScoredResult>)>,
-    Vec<(&'static str, Vec<ScoredResult>)>,
-) {
+) -> ParitySnapshots {
     let sync = SyncTwoTierSearcher::new(sync_index(with_quality), config.clone())
         .search_iter(query_vec, 4)
         .map(|phase| (phase_label(&phase), phase_results(&phase).to_vec()))
@@ -482,13 +488,7 @@ fn phase_snapshots(
     (sync, async_phases)
 }
 
-fn lexical_phase_snapshots(
-    query_vec: &[f32],
-    config: TwoTierConfig,
-) -> (
-    Vec<(&'static str, Vec<ScoredResult>)>,
-    Vec<(&'static str, Vec<ScoredResult>)>,
-) {
+fn lexical_phase_snapshots(query_vec: &[f32], config: TwoTierConfig) -> ParitySnapshots {
     let sync = SyncTwoTierSearcher::new(sync_index(true), config.clone())
         .with_lexical(Arc::new(StaticLexical {
             hits: lexical_hits(),

@@ -9409,9 +9409,9 @@ mod tests {
 
     /// bd-cnby1: a v1 rebuild via bare create+finish over an existing index
     /// must be REFUSED while that index's WAL sidecar is present. Before the
-    /// fix, finish() published the fresh generation beside the old sidecar;
-    /// the fresh compaction_gen restarts at 1, next_generation(1) matches the
-    /// old sidecar's binding, and the next open() adopted every stale WAL
+    /// fix, `finish()` published the fresh generation beside the old sidecar;
+    /// the fresh `compaction_gen` restarts at 1, `next_generation(1)` matches
+    /// the old sidecar's binding, and the next `open()` adopted every stale WAL
     /// entry: deleted documents resurrected and the WAL shadow suppressed the
     /// freshly rebuilt main-slab vectors.
     #[test]
