@@ -11,11 +11,17 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ops::{Bound, Deref};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+#[cfg(any(feature = "conformance-internals", feature = "profile-internals"))]
+use std::sync::Mutex as StdMutex;
+// `AtomicBool` is needed by the profile/conformance sessions above AND by the
+// `#[cfg(test)]` RootRefreshPause below; one import covering both avoids the
+// duplicate definition that used to break `--all-targets` whenever tests ran
+// with either feature enabled.
+#[cfg(any(test, feature = "conformance-internals", feature = "profile-internals"))]
+use std::sync::atomic::AtomicBool;
 #[cfg(feature = "conformance-internals")]
 use std::sync::atomic::AtomicU8;
 use std::sync::atomic::{AtomicU64, Ordering};
-#[cfg(any(feature = "conformance-internals", feature = "profile-internals"))]
-use std::sync::{Mutex as StdMutex, atomic::AtomicBool};
 #[cfg(feature = "pruning-conformance")]
 use std::thread::ThreadId;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -37,8 +43,6 @@ use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 #[cfg(feature = "conformance-internals")]
 use sha2::{Digest, Sha256};
-#[cfg(test)]
-use std::sync::atomic::AtomicBool;
 use thiserror::Error;
 use tracing::Instrument;
 use xxhash_rust::xxh3::{Xxh3, xxh3_64};
@@ -13414,7 +13418,7 @@ mod tests {
 
         let cancel_context = Arc::clone(&refresh_cx);
         let cancel_pause = Arc::clone(&pause);
-        let (canceller, _) = lab
+        let (cancel_task, _) = lab
             .state
             .create_task(region, Budget::INFINITE, async move {
                 while !cancel_pause.arrived.load(Ordering::Acquire) {
@@ -13426,7 +13430,7 @@ mod tests {
             .expect("create root-bound cancellation task");
 
         lab.scheduler.lock().schedule(refresh, 0);
-        lab.scheduler.lock().schedule(canceller, 0);
+        lab.scheduler.lock().schedule(cancel_task, 0);
         let report = lab.run_until_quiescent_with_report();
         assert!(cancelled.load(Ordering::SeqCst));
         assert!(report.quiescent, "root-bound refresh schedule must quiesce");
