@@ -1,0 +1,71 @@
+{
+  "schema_version": "fsfs.migration.snapshot.v1",
+  "source_version": "1.4.2",
+  "source_tag": "v1.4.2",
+  "corpus_seed": "0x5eed4a2",
+  "corpus_docs": 40,
+  "corpus_digest": "27aac27d73b027d5d70d96b51bbbf5263fd1c95bb7ab6124418677626b624399",
+  "replay_command": "git worktree add --detach <dir> v1.4.2 && cargo build -p frankensearch-fsfs --bin fsfs && FRANKENSEARCH_MODEL_DIR=$HOME/.local/share/frankensearch/models ./fsfs index <corpus> --offline --config <toml with [storage] index_dir>",
+  "artifacts": [
+    {
+      "normalized_path": "fsfs.publication.lock",
+      "kind": "bytes",
+      "size_bytes": 0,
+      "digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "normalized_path": "index_sentinel.json",
+      "kind": "json-volatile-elided",
+      "digest": "34268bb832d07407ddf7f2c718d95a02a96fde33382cdf1bcc94ac277852ecf1"
+    },
+    {
+      "normalized_path": "lexical/CURRENT",
+      "kind": "bytes",
+      "size_bytes": 31,
+      "digest": "370845df10d2944ab7e1c0fce153495a98af9ad7a8326fe94cf0089f26c2ecf8"
+    },
+    {
+      "normalized_path": "lexical/index_manifest.json",
+      "kind": "json-volatile-elided",
+      "digest": "c4bebd52535e4c0a163ba239f4cc1a3fe6873a1bbf4433825c5fa7c341b8934a"
+    },
+    {
+      "normalized_path": "lexical/quill-v1/LOCK",
+      "kind": "bytes",
+      "size_bytes": 0,
+      "digest": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+    },
+    {
+      "normalized_path": "lexical/quill-v1/MANIFEST",
+      "kind": "quill-manifest",
+      "digest": "e5794036e25d9def2b9e39446616e02223a9137c3c58f17fc6df709cc764d068"
+    },
+    {
+      "normalized_path": "lexical/quill-v1/MANIFEST.prev",
+      "kind": "quill-manifest",
+      "digest": "d95f5a6383fef3eb04772c1cfa5f264d04f4436a7d63b5efb122b117b5e6e9f8"
+    },
+    {
+      "normalized_path": "lexical/quill-v1/seg-<ID>.fslx",
+      "kind": "fslx-section-table",
+      "digest": "5f59cf8330cd161fc11bf68cf06738a03958474cd713b51d3f02ee9976552efa"
+    },
+    {
+      "normalized_path": "vector/index.fsvi",
+      "kind": "bytes",
+      "size_bytes": 21696,
+      "digest": "eeb19d7df7e47be965b895e694c1031891bc7ae95a679268f2482916c6c9c7e2"
+    },
+    {
+      "normalized_path": "vector/index_manifest.json",
+      "kind": "json-volatile-elided",
+      "digest": "c4bebd52535e4c0a163ba239f4cc1a3fe6873a1bbf4433825c5fa7c341b8934a"
+    }
+  ],
+  "subsystem_digests": {
+    "config": "f493fa95ceb4a849d060604dec24ef756338cc92d0363b74951642b7d17629c6",
+    "frankensqlite": "9ad03a328d344b88ced62b88b6cab0f6adae219143cd60b7db22eb1751e86c0e",
+    "fsvi": "9bc8d57151d461a5229020278e92104c18a6d1592d43887cfcb6adea342da0ad",
+    "tantivy": "da791ef38b5e6ecbc1ca3924f09fe51f42e281f8dbecad02aefe5c7133868c56"
+  }
+}

@@ -1,0 +1,66 @@
+name: Migration Compatibility
+
+# Runs the `upgrade.migration.*` compatibility matrix against every committed
+# prior-version snapshot and blocks merge when any required lane fails, per the
+# packaging-release-install contract's CI gate requirements
+# (docs/fsfs-packaging-release-install-contract.md:664-671).
+#
+# Scoped to format-sensitive surfaces. A change to the on-disk artifacts, to the
+# evaluation module, or to the snapshot corpus itself must not reach main
+# without this matrix going green.
+#
+# The snapshots are APPEND-ONLY, version-stamped goldens produced from real
+# released binaries. If this job goes red because a snapshot no longer matches,
+# the fix is a GOLDEN-CHANGE note plus a semantic diff review of what moved in
+# the format — never regenerating the snapshot to match. Note in particular that
+# the repo-wide `UPDATE_GOLDENS` switch rewrites every fsfs golden at once and
+# must never be pointed at this corpus; snapshots are added one version at a
+# time through the ignored `produce_snapshot` probe.
+
+on:
+  pull_request:
+    paths:
+      - "crates/frankensearch-fsfs/src/migration_compat.rs"
+      - "crates/frankensearch-fsfs/tests/migration_compat_corpus.rs"
+      - "crates/frankensearch-fsfs/tests/fixtures/migration-snapshots/**"
+      - "crates/frankensearch-fsfs/src/runtime.rs"
+      - "crates/frankensearch-quill/src/segment.rs"
+      - "crates/frankensearch-quill/src/keeper.rs"
+      - "crates/frankensearch-quill/src/scribe.rs"
+      - "crates/frankensearch-index/src/**"
+      - "docs/fsfs-packaging-release-install-contract.md"
+      - ".github/workflows/migration-compat.yml"
+  push:
+    branches:
+      - main
+
+jobs:
+  migration-compat:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      # The matrix summary, per-path reason-code report, and replay handles the
+      # contract requires are produced by `render_artifacts`, which the lane
+      # exercises. A failure prints the evaluator's own reason codes, so a red
+      # build names the contract clause that broke rather than just failing.
+      - name: Run the migration compatibility matrix
+        run: |
+          set -euo pipefail
+          cargo test -p frankensearch-fsfs --test migration_compat_corpus -- --nocapture
+
+      # A lane that only ever sees clean input proves nothing. This is the
+      # planted negative: it must report a violation when a replayed migration
+      # moves the artifacts, and the job fails if it does not.
+      - name: Prove the lane fails closed
+        run: |
+          set -euo pipefail
+          cargo test -p frankensearch-fsfs --test migration_compat_corpus \
+            lane_fails_closed_on_a_drifted_snapshot -- --exact --nocapture
