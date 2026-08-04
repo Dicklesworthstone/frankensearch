@@ -3674,6 +3674,53 @@ mod tests {
         );
     }
 
+    /// ONE-BIT SCORE AND SNIPPET STATE: the classes no independent oracle can
+    /// adjudicate, and therefore the classes the ADDRESS exists for.
+    ///
+    /// A BM25 score float is an engine implementation detail — the committed
+    /// expectations deliberately do not predict it (see the module header), so
+    /// no recomputation can catch a changed score bit. The same is true of
+    /// whether an engine rendered a snippet at all: `None` is a legal answer.
+    /// What binds them is the content address, which is why the receipt
+    /// records score bits and snippet state at all and why the aggregator must
+    /// hold the address out of band. This test is the proof that the binding
+    /// actually works for both.
+    #[test]
+    fn a_one_bit_score_change_and_a_dropped_snippet_fail_against_the_bound_address() {
+        let receipt = loadable_receipt();
+        let bound_address = receipt.receipt_hash().expect("address");
+
+        let mut one_bit = receipt.clone();
+        let original = one_bit.observations[0].page_score_bits[0];
+        one_bit.observations[0].page_score_bits[0] = original ^ 1;
+        assert_eq!(
+            one_bit.observations[0].page_score_bits[0].count_ones() as i32
+                - original.count_ones() as i32,
+            1,
+            "the mutation must really be a single bit"
+        );
+        // The independent oracle cannot see it — proving the address is what
+        // does the work here, not a recomputation.
+        assert_eq!(
+            recompute_verdicts(&one_bit.run()).expect("recompute"),
+            receipt.verdicts,
+            "a score bit is invisible to the fixture oracle by design"
+        );
+        let bytes = serde_json::to_vec(&one_bit).expect("body");
+        let error = NativeEnrichedReceiptV1::load_canonical(&bytes, &bound_address)
+            .expect_err("a one-bit score change must fail against the bound address");
+        assert!(error.to_string().contains("does not match the expected"));
+
+        // Snippet state: Some -> None is a legal ENGINE answer, so only the
+        // address can bind which one was actually observed.
+        let mut dropped = receipt;
+        dropped.enriched_observations[0].hits[0].snippet = None;
+        let bytes = serde_json::to_vec(&dropped).expect("body");
+        let error = NativeEnrichedReceiptV1::load_canonical(&bytes, &bound_address)
+            .expect_err("a dropped snippet must fail against the bound address");
+        assert!(error.to_string().contains("does not match the expected"));
+    }
+
     /// A receipt cannot quietly drop the rows that failed.
     #[test]
     fn a_receipt_that_omits_committed_rows_is_rejected() {
