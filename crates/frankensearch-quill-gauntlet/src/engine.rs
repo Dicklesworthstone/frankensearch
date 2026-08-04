@@ -7780,6 +7780,144 @@ mod tests {
         });
     }
 
+    /// E6.3 lifecycle law: a duplicate-ID batch is rejected before either row
+    /// publishes. Deleting that ID afterwards must therefore be the same
+    /// lifecycle as deleting an ID that was never added: it returns `false`
+    /// and leaves the total lexical observation empty. The paired invalid
+    /// fixture admits one unique row first; its delete must return `true` so
+    /// equal empty terminal search results cannot mask an incorrect relation.
+    #[cfg(feature = "perf-harness")]
+    #[test]
+    fn e63_duplicate_then_delete_seed_matrix_replays_never_added_lifecycle() {
+        use frankensearch_core::IndexableDocument;
+        use frankensearch_quill::index::QuillIndexError;
+
+        const SEEDS: [u64; 3] = [
+            0xe63_ded1_0000_0001,
+            0xe63_ded1_0000_0002,
+            0xe63_ded1_0000_0003,
+        ];
+
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            for seed in SEEDS {
+                let document_id = format!("e63-duplicate-then-delete-{seed:016x}");
+                let original = IndexableDocument::new(
+                    document_id.clone(),
+                    format!("alpha original {seed:016x}"),
+                );
+                let duplicate = IndexableDocument::new(
+                    document_id.clone(),
+                    format!("beta replacement {seed:016x}"),
+                );
+                let mut case = DifferentialCase::new(
+                    format!("e63-duplicate-then-delete-{seed:016x}"),
+                    "alpha",
+                    16,
+                );
+                case.snippet_max_chars = None;
+                case.tie_expansion_limit = 64;
+                case.metadata.generator_id = Some("e6.3-duplicate-then-delete-v1".to_owned());
+                case.metadata.generator_seed = Some(seed);
+
+                let mut rejected = qg_position_mode_subject(true);
+                rejected
+                    .claim_fresh_campaign()
+                    .expect("E6.3 claim rejected duplicate lifecycle campaign");
+                let duplicate_error = rejected
+                    .index_mut()
+                    .expect("E6.3 open rejected duplicate lifecycle campaign")
+                    .index_documents(&cx, &[original, duplicate])
+                    .await
+                    .expect_err("E6.3 duplicate batch must reject atomically");
+                assert!(matches!(
+                    duplicate_error,
+                    QuillIndexError::InvalidState { ref detail }
+                        if detail.contains("duplicate live document id")
+                ));
+                let rejected_delete = rejected
+                    .index_mut()
+                    .expect("E6.3 rejected duplicate campaign remains open")
+                    .delete_document(&cx, &document_id)
+                    .await
+                    .expect("E6.3 delete after rejected duplicate batch");
+                assert!(
+                    !rejected_delete,
+                    "E6.3 seed {seed:#x} rejected duplicate ID must remain never-added"
+                );
+                rejected
+                    .mark_committed()
+                    .expect("E6.3 publish rejected duplicate lifecycle campaign");
+                let rejected_observation = rejected
+                    .observe(&cx, &case)
+                    .await
+                    .expect("E6.3 observe rejected duplicate lifecycle campaign");
+
+                let mut never_added = qg_position_mode_subject(true);
+                never_added
+                    .claim_fresh_campaign()
+                    .expect("E6.3 claim never-added lifecycle campaign");
+                let never_added_delete = never_added
+                    .index_mut()
+                    .expect("E6.3 open never-added lifecycle campaign")
+                    .delete_document(&cx, &document_id)
+                    .await
+                    .expect("E6.3 delete never-added ID");
+                assert!(
+                    !never_added_delete,
+                    "E6.3 seed {seed:#x} never-added ID must report absent"
+                );
+                never_added
+                    .mark_committed()
+                    .expect("E6.3 publish never-added lifecycle campaign");
+                let never_added_observation = never_added
+                    .observe(&cx, &case)
+                    .await
+                    .expect("E6.3 observe never-added lifecycle campaign");
+                let comparison = compare_observations(
+                    rejected_observation,
+                    never_added_observation,
+                    ComparatorConfig::default(),
+                )
+                .unwrap_or_else(|error| {
+                    panic!("E6.3 seed {seed:#x} lifecycle comparison failed: {error}")
+                });
+                assert_eq!(comparison.status, ComparisonStatus::Exact);
+                assert_eq!(comparison.rank_class, RankClass::RankExact);
+
+                let unique = IndexableDocument::new(
+                    document_id.clone(),
+                    format!("alpha uniquely-admitted {seed:016x}"),
+                );
+                let mut invalid = qg_position_mode_subject(true);
+                invalid
+                    .claim_fresh_campaign()
+                    .expect("E6.3 claim invalid unique-admission lifecycle campaign");
+                invalid
+                    .index_mut()
+                    .expect("E6.3 open invalid unique-admission lifecycle campaign")
+                    .index_documents(&cx, std::slice::from_ref(&unique))
+                    .await
+                    .expect("E6.3 admit invalid unique fixture");
+                invalid
+                    .index_mut()
+                    .expect("E6.3 commit invalid unique-admission lifecycle campaign")
+                    .commit(&cx)
+                    .await
+                    .expect("E6.3 publish invalid unique fixture");
+                let invalid_delete = invalid
+                    .index_mut()
+                    .expect("E6.3 reopen invalid unique-admission lifecycle campaign")
+                    .delete_document(&cx, &document_id)
+                    .await
+                    .expect("E6.3 delete invalid unique fixture");
+                assert!(
+                    invalid_delete,
+                    "E6.3 seed {seed:#x} planted unique admission must not satisfy never-added relation"
+                );
+            }
+        });
+    }
+
     #[cfg(feature = "tantivy-oracle")]
     #[test]
     fn e410_controlled_public_search_semantics_match_oracle() {
