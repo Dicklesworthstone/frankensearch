@@ -994,6 +994,78 @@ impl TwoTierIndex {
         self.fast_source.admitted_owner()
     }
 
+    /// Admit a candidate generation and install it only if every tier of it
+    /// is admitted (bd-typed-fsvi-owner-retention C5).
+    ///
+    /// The candidate is opened in full — path validation, per-tier exact
+    /// admission against its own binding, alignment planning and ANN
+    /// planning — BEFORE anything of `self` is disturbed. Any failure
+    /// returns the typed error with the previously retained owners still
+    /// installed and still serving byte-identically: there is no window in
+    /// which this index is neither the old generation nor the new one, and a
+    /// rejected candidate can neither modify nor evict the incumbent.
+    ///
+    /// A reader that opened its own [`TwoTierIndex`] over the same artifacts
+    /// is unaffected either way — each index retains its own admitted byte
+    /// image, so an installed successor never invalidates a live predecessor.
+    ///
+    /// # Errors
+    ///
+    /// Returns exactly the errors of [`Self::open_admitted_v2_with_paths`],
+    /// and returns them before any state change.
+    pub fn try_replace_admitted_v2(
+        &mut self,
+        paths: &TwoTierIndexPaths,
+        fast_binding: &FsviV2IdentityBinding,
+        quality_binding: Option<&FsviV2IdentityBinding>,
+    ) -> SearchResult<()> {
+        let candidate = match Self::open_admitted_v2_with_paths(
+            paths,
+            self.config.clone(),
+            fast_binding,
+            quality_binding,
+        ) {
+            Ok(candidate) => candidate,
+            Err(error) => {
+                // Bounded digests only: generation sequence and truncated
+                // fingerprint prefixes of the RETAINED owner, plus the typed
+                // reason. Never vectors, queries, document text, or paths.
+                warn!(
+                    incumbent_generation = self.admitted_generation_sequence(),
+                    incumbent_space = self.bounded_fast_space_digest(),
+                    reason = %error,
+                    "candidate generation was refused; the retained owner keeps serving"
+                );
+                return Err(error);
+            }
+        };
+        info!(
+            previous_generation = self.admitted_generation_sequence(),
+            installed_generation = candidate.admitted_generation_sequence(),
+            installed_space = candidate.bounded_fast_space_digest(),
+            installed_records = candidate.doc_count(),
+            "installed an admitted successor generation"
+        );
+        *self = candidate;
+        Ok(())
+    }
+
+    /// Generation sequence of the retained fast owner, or `None` for a tier
+    /// that was not admitted as FSVI v2.
+    fn admitted_generation_sequence(&self) -> Option<u64> {
+        self.fast_admitted_owner()
+            .map(|owner| owner.witness().generation.sequence)
+    }
+
+    /// First 16 hex characters of the fast tier's space fingerprint — enough
+    /// to correlate an event, bounded so a log line can never carry a full
+    /// identity image.
+    fn bounded_fast_space_digest(&self) -> Option<String> {
+        self.fast_space_fingerprint_hex
+            .as_ref()
+            .map(|hex| hex.chars().take(16).collect())
+    }
+
     /// Quality-tier counterpart of [`Self::fast_admitted_owner`].
     ///
     /// `None` both when no quality tier is loaded and when the loaded one is
@@ -6072,6 +6144,435 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// C5 + C2 refresh: a refused candidate leaves the retained owner
+    /// serving byte-identically, an accepted one installs, and a reader that
+    /// opened its own index over the same artifacts is unaffected by either
+    /// outcome. The failed and successful halves run against the SAME index
+    /// in the same test, so neither can pass by the seam being inert.
+    #[test]
+    fn refused_candidate_leaves_the_retained_owner_serving_and_accepted_one_installs() {
+        let dir = temp_index_dir("admitted-v2-candidate-refresh");
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let fast_path = dir.join(VECTOR_INDEX_FAST_FILENAME);
+        let (generation_one, _) = fsvi_v2_binding("refresh-model", 4, 31);
+        let incumbent_rows: [(&str, &[f32]); 2] = [
+            ("doc-a", &[1.0, 0.0, 0.0, 0.0]),
+            ("doc-b", &[0.0, 1.0, 0.0, 0.0]),
+        ];
+        write_v2_tier(&fast_path, &generation_one, &incumbent_rows);
+
+        let paths = TwoTierIndexPaths::new(&fast_path);
+        let mut index = TwoTierIndex::open_admitted_v2_with_paths(
+            &paths,
+            TwoTierConfig::default(),
+            &generation_one,
+            None,
+        )
+        .expect("admit generation one");
+        // An independent reader over the same artifact, held across both
+        // refresh attempts.
+        let reader = TwoTierIndex::open_admitted_v2_with_paths(
+            &paths,
+            TwoTierConfig::default(),
+            &generation_one,
+            None,
+        )
+        .expect("second reader admits generation one");
+
+        let incumbent_witness = index
+            .fast_admitted_owner()
+            .expect("retained owner")
+            .witness()
+            .clone();
+        let reader_witness = reader
+            .fast_admitted_owner()
+            .expect("reader owner")
+            .witness()
+            .clone();
+
+        // (i) REFUSED: the artifact on disk is still generation one, but the
+        // caller presents generation two's binding. Admission must reject it.
+        let (generation_two, _) = fsvi_v2_binding("refresh-model", 4, 32);
+        let refusal = index
+            .try_replace_admitted_v2(&paths, &generation_two, None)
+            .expect_err("a candidate whose identity does not match the artifact is refused");
+        assert!(
+            matches!(
+                refusal,
+                SearchError::InvalidConfig { ref field, .. } if field == "two_tier.fast_v2_admission"
+            ),
+            "got {refusal:?}"
+        );
+        assert_eq!(
+            index
+                .fast_admitted_owner()
+                .expect("incumbent still retained")
+                .witness(),
+            &incumbent_witness,
+            "a refused candidate must not modify or evict the retained owner"
+        );
+        assert_eq!(
+            index
+                .search_fast(&[0.0, 1.0, 0.0, 0.0], 1)
+                .expect("incumbent still serves")[0]
+                .doc_id,
+            "doc-b"
+        );
+        assert_eq!(index.doc_count(), 2);
+
+        // (ii) ACCEPTED: publish a real generation two and refresh into it.
+        let successor_rows: [(&str, &[f32]); 3] = [
+            ("doc-a", &[1.0, 0.0, 0.0, 0.0]),
+            ("doc-b", &[0.0, 1.0, 0.0, 0.0]),
+            ("doc-c", &[0.0, 0.0, 1.0, 0.0]),
+        ];
+        write_v2_tier(&fast_path, &generation_two, &successor_rows);
+        index
+            .try_replace_admitted_v2(&paths, &generation_two, None)
+            .expect("a matching candidate installs");
+        let installed = index.fast_admitted_owner().expect("successor retained");
+        assert_eq!(installed.witness().generation.sequence, 32);
+        assert_ne!(
+            installed.witness(),
+            &incumbent_witness,
+            "the successor is a different admission"
+        );
+        assert_eq!(index.doc_count(), 3);
+        assert_eq!(
+            index
+                .search_fast(&[0.0, 0.0, 1.0, 0.0], 1)
+                .expect("successor serves")[0]
+                .doc_id,
+            "doc-c"
+        );
+
+        // (iii) The independent reader is untouched by either outcome: it
+        // still serves generation one from its own retained bytes, even
+        // though the pathname now holds generation two.
+        assert_eq!(
+            reader
+                .fast_admitted_owner()
+                .expect("reader owner")
+                .witness(),
+            &reader_witness,
+            "installing a successor must not disturb a live predecessor reader"
+        );
+        assert_eq!(reader.doc_count(), 2);
+        assert_eq!(
+            reader
+                .search_fast(&[0.0, 1.0, 0.0, 0.0], 1)
+                .expect("reader still serves generation one")[0]
+                .doc_id,
+            "doc-b"
+        );
+        assert!(
+            !reader
+                .search_fast(&[0.0, 0.0, 1.0, 0.0], 3)
+                .expect("reader exhaustive search")
+                .iter()
+                .any(|hit| hit.doc_id == "doc-c"),
+            "generation one has no doc-c; the reader must not observe the successor"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// C5, the partial-install case: a refresh whose FAST tier admits but
+    /// whose QUALITY tier is refused must leave BOTH incumbent tiers exactly
+    /// as they were. This is the shape a half-installed generation would
+    /// take, and it is the only shape that distinguishes "admit everything,
+    /// then install" from "install each tier as it admits".
+    #[test]
+    fn a_refused_quality_tier_leaves_both_incumbent_tiers_installed() {
+        let dir = temp_index_dir("admitted-v2-partial-install");
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let fast_path = dir.join(VECTOR_INDEX_FAST_FILENAME);
+        let quality_path = dir.join(VECTOR_INDEX_QUALITY_FILENAME);
+        let (generation_one, _) = fsvi_v2_binding("partial-install-model", 4, 61);
+        let rows: [(&str, &[f32]); 2] = [
+            ("doc-a", &[1.0, 0.0, 0.0, 0.0]),
+            ("doc-b", &[0.0, 1.0, 0.0, 0.0]),
+        ];
+        write_v2_tier(&fast_path, &generation_one, &rows);
+        write_v2_tier(&quality_path, &generation_one, &rows);
+
+        let paths = TwoTierIndexPaths::new(&fast_path).with_quality_index(&quality_path);
+        let mut index = TwoTierIndex::open_admitted_v2_with_paths(
+            &paths,
+            TwoTierConfig::default(),
+            &generation_one,
+            Some(&generation_one),
+        )
+        .expect("admit generation one on both tiers");
+        let fast_witness = index
+            .fast_admitted_owner()
+            .expect("fast owner")
+            .witness()
+            .clone();
+        let quality_witness = index
+            .quality_admitted_owner()
+            .expect("quality owner")
+            .witness()
+            .clone();
+
+        // Publish a real generation two for the FAST tier only, and leave the
+        // quality artifact at generation one. The candidate's fast binding
+        // therefore admits and its quality binding cannot.
+        let (generation_two, _) = fsvi_v2_binding("partial-install-model", 4, 62);
+        let successor_rows: [(&str, &[f32]); 3] = [
+            ("doc-a", &[1.0, 0.0, 0.0, 0.0]),
+            ("doc-b", &[0.0, 1.0, 0.0, 0.0]),
+            ("doc-c", &[0.0, 0.0, 1.0, 0.0]),
+        ];
+        write_v2_tier(&fast_path, &generation_two, &successor_rows);
+        let refusal = index
+            .try_replace_admitted_v2(&paths, &generation_two, Some(&generation_two))
+            .expect_err("a candidate whose quality tier cannot be admitted is refused whole");
+        assert!(
+            matches!(
+                refusal,
+                SearchError::InvalidConfig { ref field, .. }
+                    if field == "two_tier.quality_v2_admission"
+            ),
+            "the refusal must name the quality tier: got {refusal:?}"
+        );
+
+        assert_eq!(
+            index.fast_admitted_owner().expect("fast owner").witness(),
+            &fast_witness,
+            "the incumbent FAST owner must survive a quality-tier refusal"
+        );
+        assert_eq!(
+            index
+                .quality_admitted_owner()
+                .expect("quality owner")
+                .witness(),
+            &quality_witness,
+            "the incumbent QUALITY owner must survive too"
+        );
+        assert_eq!(index.doc_count(), 2, "no half-installed successor");
+        assert!(
+            !index
+                .search_fast(&[0.0, 0.0, 1.0, 0.0], 3)
+                .expect("incumbent still serves")
+                .iter()
+                .any(|hit| hit.doc_id == "doc-c"),
+            "the successor's doc-c must not be observable after a refused refresh"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// C3, the enumerated mismatch classes, driven through the two-tier open
+    /// rather than only through the admission layer. Each candidate differs
+    /// from the artifact in exactly ONE identity component, and every one
+    /// must be refused; the unmodified binding is the positive control in the
+    /// same test, so a seam that rejected everything could not pass.
+    #[test]
+    fn each_single_component_identity_mismatch_is_refused_at_two_tier_open() {
+        let dir = temp_index_dir("admitted-v2-mismatch-table");
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let fast_path = dir.join(VECTOR_INDEX_FAST_FILENAME);
+        let (binding, identity) = fsvi_v2_binding("mismatch-table-model", 4, 41);
+        let rows: [(&str, &[f32]); 2] = [
+            ("doc-a", &[1.0, 0.0, 0.0, 0.0]),
+            ("doc-b", &[0.0, 1.0, 0.0, 0.0]),
+        ];
+        write_v2_tier(&fast_path, &binding, &rows);
+        let paths = TwoTierIndexPaths::new(&fast_path);
+
+        // Positive control first: the exact binding admits.
+        let index = TwoTierIndex::open_admitted_v2_with_paths(
+            &paths,
+            TwoTierConfig::default(),
+            &binding,
+            None,
+        )
+        .expect("the exact binding admits");
+        assert_eq!(index.doc_count(), 2);
+        drop(index);
+
+        let generation =
+            ArtifactGenerationIdentityV1::new(41, [0x4d; 16]).expect("valid test generation");
+        // The defence is TWO layers, and this test measures both rather than
+        // assuming one. The bundle is SELF-BINDING: producer.space_fingerprint
+        // must bind the bundled space identity and space.input_contract_
+        // fingerprint must bind the bundled input contract, so a candidate
+        // whose model, tokenizer, dimension or input contract disagrees with
+        // the rest of its own bundle cannot even be FROZEN -- it is refused
+        // before an admission call is reachable. Components that are legally
+        // independent freeze fine and must then be refused by admission.
+        for (label, mutation) in [
+            (
+                "tokenizer",
+                Box::new(|bundle: &mut EmbeddingIdentityBundleV1| {
+                    "a-different-tokenizer".clone_into(&mut bundle.space.tokenizer_fingerprint);
+                }) as Box<dyn Fn(&mut EmbeddingIdentityBundleV1)>,
+            ),
+            (
+                "input contract",
+                Box::new(|bundle: &mut EmbeddingIdentityBundleV1| {
+                    "a-different-canonicalization".clone_into(&mut bundle.input.canonicalization);
+                }),
+            ),
+            (
+                "storage endianness",
+                Box::new(|bundle: &mut EmbeddingIdentityBundleV1| {
+                    "big-endian".clone_into(&mut bundle.storage.endianness);
+                }),
+            ),
+        ] {
+            let mut mutated = identity.clone();
+            mutation(&mut mutated);
+            assert!(
+                mutated.freeze().is_err(),
+                "{label}: an identity the format cannot represent must not be constructible"
+            );
+        }
+
+        let mutate = |mutation: &dyn Fn(&mut EmbeddingIdentityBundleV1)| {
+            let mut mutated = identity.clone();
+            mutation(&mut mutated);
+            FsviV2IdentityBinding::new(
+                generation,
+                mutated.freeze().expect("freeze mutated identity"),
+            )
+            .expect("valid binding over a mutated identity")
+        };
+
+        type IdentityMutation = Box<dyn Fn(&mut EmbeddingIdentityBundleV1)>;
+        let cases: [(&str, IdentityMutation); 2] = [
+            (
+                "producer attestation",
+                Box::new(|bundle: &mut EmbeddingIdentityBundleV1| {
+                    "a-different-backend".clone_into(&mut bundle.producer.backend);
+                }),
+            ),
+            (
+                "quantization",
+                Box::new(|bundle: &mut EmbeddingIdentityBundleV1| {
+                    bundle.storage.quantization = QuantizationFormat::F32;
+                }),
+            ),
+        ];
+
+        // Space-level classes, as coherent bundles: a different model and a
+        // different output dimension each produce a valid but different
+        // embedding space, which is what a caller would actually present
+        // after a re-embed.
+        for (label, candidate) in [
+            ("model", fsvi_v2_binding("a-different-model", 4, 41).0),
+            (
+                "dimension",
+                fsvi_v2_binding("mismatch-table-model", 8, 41).0,
+            ),
+        ] {
+            let error = TwoTierIndex::open_admitted_v2_with_paths(
+                &paths,
+                TwoTierConfig::default(),
+                &candidate,
+                None,
+            )
+            .err()
+            .unwrap_or_else(|| panic!("{label} mismatch must be refused"));
+            assert!(
+                matches!(
+                    error,
+                    SearchError::InvalidConfig { ref field, .. }
+                        if field == "two_tier.fast_v2_admission"
+                ),
+                "{label}: got {error:?}"
+            );
+        }
+
+        for (label, mutation) in &cases {
+            let candidate = mutate(mutation.as_ref());
+            let error = TwoTierIndex::open_admitted_v2_with_paths(
+                &paths,
+                TwoTierConfig::default(),
+                &candidate,
+                None,
+            )
+            .expect_err(&format!("{label} mismatch must be refused"));
+            assert!(
+                matches!(
+                    error,
+                    SearchError::InvalidConfig { ref field, .. }
+                        if field == "two_tier.fast_v2_admission"
+                ),
+                "{label}: got {error:?}"
+            );
+        }
+
+        // A wrong GENERATION over an otherwise identical identity is refused
+        // too, so "same space, newer generation" cannot be laundered in.
+        let wrong_generation = FsviV2IdentityBinding::new(
+            ArtifactGenerationIdentityV1::new(42, [0x4d; 16]).expect("valid generation"),
+            identity.clone().freeze().expect("freeze identity"),
+        )
+        .expect("valid binding");
+        assert!(
+            TwoTierIndex::open_admitted_v2_with_paths(
+                &paths,
+                TwoTierConfig::default(),
+                &wrong_generation,
+                None,
+            )
+            .is_err(),
+            "generation mismatch must be refused"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// C6, discharged structurally rather than with a compile-fail harness
+    /// (adding one would mean a new dev-dependency, which this bead is not
+    /// the place to decide). The property is that a retained owner is only
+    /// reachable through admission: `TierSource` is private, `TwoTierIndex`
+    /// exposes owners by reference only, and the only public constructors of
+    /// an owner-backed index are the admitting ones. A v1 open — the sole
+    /// public path that takes no binding — yields no owner at all, so no
+    /// public API returns an owner that was not admitted.
+    #[test]
+    fn owners_are_reachable_only_through_admission() {
+        let dir = temp_index_dir("owner-reachability");
+        fs::create_dir_all(&dir).expect("create temp dir");
+        let fast_path = dir.join(VECTOR_INDEX_FAST_FILENAME);
+        write_index_file(&fast_path, &[("doc-a", &[1.0, 0.0, 0.0, 0.0])])
+            .expect("write v1 fixture");
+
+        // Every non-admitting public constructor: no owner, and no fabricated
+        // identity to stand in for one.
+        let opened = TwoTierIndex::open(&dir, TwoTierConfig::default()).expect("v1 open");
+        assert!(opened.fast_admitted_owner().is_none());
+        assert!(opened.quality_admitted_owner().is_none());
+        assert!(!opened.fast_identity_is_attested());
+        assert!(opened.fast_space_fingerprint_hex().is_none());
+
+        let by_paths = TwoTierIndex::open_with_paths(
+            &TwoTierIndexPaths::new(&fast_path),
+            TwoTierConfig::default(),
+        )
+        .expect("v1 open_with_paths");
+        assert!(by_paths.fast_admitted_owner().is_none());
+        assert!(!by_paths.fast_identity_is_attested());
+
+        // And v2 bytes cannot reach either of them: the v1 opener rejects the
+        // image outright, so there is no non-admitting route to an owner.
+        let v2_dir = temp_index_dir("owner-reachability-v2");
+        fs::create_dir_all(&v2_dir).expect("create temp dir");
+        let v2_path = v2_dir.join(VECTOR_INDEX_FAST_FILENAME);
+        let (binding, _) = fsvi_v2_binding("reachability-model", 4, 51);
+        write_v2_tier(&v2_path, &binding, &[("doc-a", &[1.0, 0.0, 0.0, 0.0])]);
+        assert!(
+            TwoTierIndex::open(&v2_dir, TwoTierConfig::default()).is_err(),
+            "a v2 artifact must not be reachable through the v1 opener"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+        let _ = fs::remove_dir_all(&v2_dir);
     }
 
     #[test]
