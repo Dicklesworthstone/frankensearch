@@ -2777,9 +2777,23 @@ fn is_trusted_release_url(url: &str) -> bool {
     )
 }
 
-/// Fetch the latest release tag from GitHub Releases via `curl`.
-/// Returns `(tag_name, html_url)` on success.
-fn fetch_latest_release_tag() -> SearchResult<Option<(String, String)>> {
+/// Latest-release metadata fetched from the GitHub Releases API.
+#[derive(Debug, Clone)]
+struct LatestRelease {
+    /// Release tag, e.g. `v1.4.3`.
+    tag: String,
+    /// Human-facing release page URL.
+    html_url: String,
+    /// Names of every asset attached to the release, as enumerated by the
+    /// API response itself. Used to detect a release that ships no build for
+    /// the current target before constructing a download URL that can only
+    /// 404 (issue #31: every non-linux-x86_64 asset has been absent since
+    /// v1.2.5, so the updater advertised v1.4.3 and then failed applying it).
+    asset_names: Vec<String>,
+}
+
+/// Fetch the latest release metadata from GitHub Releases via `curl`.
+fn fetch_latest_release() -> SearchResult<Option<LatestRelease>> {
     let url = format!("https://api.github.com/repos/{GITHUB_OWNER}/{GITHUB_REPO}/releases/latest");
 
     let output = std::process::Command::new("curl")
@@ -2851,12 +2865,28 @@ fn fetch_latest_release_tag() -> SearchResult<Option<(String, String)>> {
         });
     }
 
-    Ok(Some((tag, html_url)))
+    let asset_names = json
+        .get("assets")
+        .and_then(|v| v.as_array())
+        .map(|assets| {
+            assets
+                .iter()
+                .filter_map(|asset| asset.get("name").and_then(|n| n.as_str()))
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default();
+
+    Ok(Some(LatestRelease {
+        tag,
+        html_url,
+        asset_names,
+    }))
 }
 
 /// Download a release asset to a local path using `curl`.
 fn download_release_asset(url: &str, dest: &Path) -> SearchResult<()> {
-    let status = std::process::Command::new("curl")
+    let output = std::process::Command::new("curl")
         .args([
             "-sSfL",
             "-o",
@@ -2865,20 +2895,39 @@ fn download_release_asset(url: &str, dest: &Path) -> SearchResult<()> {
             "120",
             url,
         ])
-        .status()
+        .output()
         .map_err(|e| SearchError::SubsystemError {
             subsystem: "fsfs.update.download",
             source: Box::new(e),
         })?;
 
-    if !status.success() {
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
         return Err(SearchError::InvalidConfig {
             field: "update.download".into(),
             value: url.to_owned(),
-            reason: "asset download failed".into(),
+            reason: download_failure_reason(stderr.trim()),
         });
     }
     Ok(())
+}
+
+/// Translate a curl failure into an actionable reason string.
+///
+/// A 404 on a release-asset URL almost always means the release simply does
+/// not ship a build for this file (the pre-download asset-list check should
+/// catch that first; this is defense in depth for races and cached listings),
+/// so say that instead of a bare "download failed".
+fn download_failure_reason(curl_stderr: &str) -> String {
+    if curl_stderr.contains("404") {
+        "asset not found (HTTP 404): the release does not ship this file; \
+         it may not include a prebuilt binary for this platform"
+            .to_owned()
+    } else if curl_stderr.is_empty() {
+        "asset download failed".to_owned()
+    } else {
+        format!("asset download failed: {curl_stderr}")
+    }
 }
 
 /// Compute SHA-256 hex digest of a file.
@@ -3048,6 +3097,35 @@ fn release_asset_filename(tag: &str, triple: &str) -> String {
     format!("{family}-{version}-{triple}.{ext}")
 }
 
+/// Returns true when the release's asset list contains `asset_filename`.
+///
+/// GitHub asset names are matched exactly: the release pipeline controls both
+/// sides of the comparison, so no case folding or prefix/suffix leniency is
+/// applied (leniency here is how a `-lite` archive could masquerade as a full
+/// build, or vice versa).
+fn release_has_asset(asset_names: &[String], asset_filename: &str) -> bool {
+    asset_names.iter().any(|name| name == asset_filename)
+}
+
+/// Human-actionable reason for a release that ships no asset for this target.
+///
+/// Used both as a note on `fsfs update --check` and as the error reason when
+/// applying an update whose release lacks a build for the current platform
+/// (issue #31: constructing the URL anyway produced a raw curl 404).
+fn missing_asset_reason(tag: &str, triple: &str, asset_names: &[String]) -> String {
+    let available = if asset_names.is_empty() {
+        "none".to_owned()
+    } else {
+        asset_names.join(", ")
+    };
+    format!(
+        "release {tag} has no prebuilt binary for {triple}; build from source \
+         (git clone https://github.com/{GITHUB_OWNER}/{GITHUB_REPO} && \
+         cargo build --release -p frankensearch-fsfs) or wait for a release \
+         that ships this target (assets on this release: {available})"
+    )
+}
+
 /// Extract the expected SHA-256 hash for a given asset filename from a
 /// SHA256SUMS-format file (each line: `<hash>  <filename>`).
 ///
@@ -3193,8 +3271,8 @@ pub fn is_cache_valid(cache: &VersionCheckCache) -> bool {
 /// Returns `SearchError` if the GitHub API call or cache write fails.
 pub fn refresh_version_cache() -> SearchResult<VersionCheckCache> {
     let current_version = env!("CARGO_PKG_VERSION").to_owned();
-    let (latest_version, release_url) = match fetch_latest_release_tag()? {
-        Some((tag, html_url)) => (tag, html_url),
+    let (latest_version, release_url) = match fetch_latest_release()? {
+        Some(release) => (release.tag, release.html_url),
         None => (current_version.clone(), String::new()),
     };
     let cache = VersionCheckCache {
@@ -4218,7 +4296,12 @@ impl FsfsRuntime {
         })?;
 
         // Query GitHub for the latest release.
-        let Some((tag, html_url)) = fetch_latest_release_tag()? else {
+        let Some(LatestRelease {
+            tag,
+            html_url,
+            asset_names,
+        }) = fetch_latest_release()?
+        else {
             notes.push("no published GitHub releases found for this channel".to_owned());
             return Ok(FsfsUpdatePayload {
                 current_version: current_str.to_owned(),
@@ -4253,10 +4336,23 @@ impl FsfsRuntime {
             });
         }
 
+        // Resolve the current platform's asset name and confirm the release
+        // actually ships it before promising (or attempting) an update. The
+        // API response above already enumerates the release's assets, so a
+        // release whose target matrix shrank (issue #31: only linux-x86_64
+        // musl since v1.2.5) is detected here instead of via a curl 404 on a
+        // constructed URL.
+        let triple = detect_target_triple();
+        let asset_filename = release_asset_filename(&tag, &triple);
+        let target_asset_available = release_has_asset(&asset_names, &asset_filename);
+
         if check_only {
             notes.push(format!(
                 "update available: v{current} -> v{latest} (run `fsfs update` to apply)"
             ));
+            if !target_asset_available {
+                notes.push(missing_asset_reason(&tag, &triple, &asset_names));
+            }
             return Ok(FsfsUpdatePayload {
                 current_version: current_str.to_owned(),
                 latest_version: latest.to_string(),
@@ -4270,10 +4366,15 @@ impl FsfsRuntime {
         }
 
         // Full update: download, verify, replace.
-        let triple = detect_target_triple();
+        if !target_asset_available {
+            return Err(SearchError::InvalidConfig {
+                field: "update.asset".into(),
+                value: asset_filename,
+                reason: missing_asset_reason(&tag, &triple, &asset_names),
+            });
+        }
         let asset_url = release_asset_url(&tag, &triple);
         let checksum_url = release_checksum_url(&tag);
-        let asset_filename = release_asset_filename(&tag, &triple);
         let is_zip = triple.contains("windows");
 
         let temp_dir = create_secure_update_temp_dir()?;
@@ -26861,6 +26962,117 @@ mod tests {
     fn release_checksum_url_format() {
         let url = super::release_checksum_url("v0.2.0");
         assert!(url.ends_with("/SHA256SUMS"));
+    }
+
+    #[test]
+    fn release_has_asset_matches_exact_name_only() {
+        let assets = vec![
+            "fsfs-1.4.3-aarch64-apple-darwin.tar.xz".to_owned(),
+            "fsfs-lite-1.4.3-x86_64-unknown-linux-musl.tar.xz".to_owned(),
+        ];
+        assert!(super::release_has_asset(
+            &assets,
+            "fsfs-1.4.3-aarch64-apple-darwin.tar.xz"
+        ));
+        // A lite archive must not satisfy a full-build request (or vice
+        // versa), and neither prefix nor suffix fragments may match.
+        assert!(!super::release_has_asset(
+            &assets,
+            "fsfs-lite-1.4.3-aarch64-apple-darwin.tar.xz"
+        ));
+        assert!(!super::release_has_asset(
+            &assets,
+            "fsfs-1.4.3-x86_64-unknown-linux-musl.tar.xz"
+        ));
+        assert!(!super::release_has_asset(&assets, "fsfs-1.4.3"));
+        assert!(!super::release_has_asset(
+            &assets,
+            "FSFS-1.4.3-AARCH64-APPLE-DARWIN.TAR.XZ"
+        ));
+    }
+
+    #[test]
+    fn release_has_asset_empty_list_matches_nothing() {
+        // v1.4.0 published with zero assets of any kind; the updater must
+        // treat that as "no build for any target", not panic or 404.
+        assert!(!super::release_has_asset(
+            &[],
+            "fsfs-1.4.0-aarch64-apple-darwin.tar.xz"
+        ));
+    }
+
+    #[test]
+    fn v1_4_3_asset_inventory_lacks_all_non_linux_x86_64_targets() {
+        // Regression for issue #31: exact asset inventory of the v1.4.3
+        // release (linux x86_64 musl only). Every other target the updater
+        // can request must be detected as absent BEFORE constructing a
+        // download URL that can only 404.
+        let assets: Vec<String> = [
+            "fsfs-1.4.3-x86_64-unknown-linux-musl.tar.xz",
+            "fsfs-1.4.3-x86_64-unknown-linux-musl.tar.xz.sha256",
+            "fsfs-lite-1.4.3-x86_64-unknown-linux-musl.tar.xz",
+            "fsfs-lite-1.4.3-x86_64-unknown-linux-musl.tar.xz.sha256",
+            "SHA256SUMS",
+        ]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+
+        // The one shipped target resolves.
+        let linux = super::release_asset_filename("v1.4.3", "x86_64-unknown-linux-musl");
+        assert!(super::release_has_asset(&assets, &linux));
+
+        // Every other matrix target is missing.
+        for triple in [
+            "aarch64-apple-darwin",
+            "x86_64-apple-darwin",
+            "aarch64-unknown-linux-musl",
+            "x86_64-pc-windows-msvc",
+            "aarch64-pc-windows-msvc",
+        ] {
+            let name = super::release_asset_filename("v1.4.3", triple);
+            assert!(
+                !super::release_has_asset(&assets, &name),
+                "expected {name} to be reported missing on v1.4.3"
+            );
+        }
+    }
+
+    #[test]
+    fn missing_asset_reason_is_actionable() {
+        let assets = vec!["fsfs-lite-1.4.3-x86_64-unknown-linux-musl.tar.xz".to_owned()];
+        let reason = super::missing_asset_reason("v1.4.3", "aarch64-apple-darwin", &assets);
+        assert!(reason.contains("v1.4.3"));
+        assert!(reason.contains("aarch64-apple-darwin"));
+        assert!(reason.contains("build from source"));
+        assert!(reason.contains("fsfs-lite-1.4.3-x86_64-unknown-linux-musl.tar.xz"));
+    }
+
+    #[test]
+    fn missing_asset_reason_handles_empty_release() {
+        let reason = super::missing_asset_reason("v1.4.0", "aarch64-apple-darwin", &[]);
+        assert!(reason.contains("assets on this release: none"));
+    }
+
+    #[test]
+    fn download_failure_reason_maps_404_to_missing_asset() {
+        let reason = super::download_failure_reason(
+            "curl: (22) The requested URL returned error: 404",
+        );
+        assert!(reason.contains("HTTP 404"));
+        assert!(reason.contains("prebuilt binary"));
+    }
+
+    #[test]
+    fn download_failure_reason_preserves_other_curl_errors() {
+        let reason =
+            super::download_failure_reason("curl: (28) Operation timed out after 120000 ms");
+        assert!(reason.contains("asset download failed"));
+        assert!(reason.contains("timed out"));
+        assert_eq!(
+            super::download_failure_reason(""),
+            "asset download failed".to_owned()
+        );
     }
 
     #[test]
