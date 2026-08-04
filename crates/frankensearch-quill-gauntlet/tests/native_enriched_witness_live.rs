@@ -395,7 +395,32 @@ fn a_both_engines_receipt_assembles_and_replays_against_real_engines() {
         // Admissibility is a SEPARATE question, and in a shared working tree
         // the honest answer is no. Asserting the reason rather than the
         // outcome keeps this from silently becoming a green "it passed".
-        match verified.require_release_admissible() {
+        //
+        // The verdict is EMITTED either way (visible under --nocapture), because
+        // a clean-tree run whose whole purpose is to produce an admissible
+        // receipt must leave the address behind. Proving admissibility and
+        // recording nothing would make the run unharvestable, and re-running it
+        // later on a different tree would answer a different question.
+        let admissibility = verified.require_release_admissible();
+        println!("NATIVE_ENRICHED_RECEIPT_ADDRESS={address}");
+        println!(
+            "NATIVE_ENRICHED_RECEIPT_PRODUCER_REVISION={}",
+            receipt.producer.source_git_revision
+        );
+        println!(
+            "NATIVE_ENRICHED_RECEIPT_PRODUCER_DIRTY={}",
+            receipt.producer.source_git_dirty
+        );
+        println!(
+            "NATIVE_ENRICHED_RECEIPT_SOURCE_VERIFICATION={:?}",
+            receipt.producer.source_verification
+        );
+        match &admissibility {
+            Ok(()) => println!("NATIVE_ENRICHED_RECEIPT_ADMISSIBLE=yes"),
+            Err(error) => println!("NATIVE_ENRICHED_RECEIPT_ADMISSIBLE=no reason={error}"),
+        }
+
+        match admissibility {
             Ok(()) => assert!(
                 !receipt.producer.source_git_dirty,
                 "a dirty producer must never be admissible"
