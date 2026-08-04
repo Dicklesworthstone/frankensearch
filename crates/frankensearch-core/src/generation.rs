@@ -4590,23 +4590,76 @@ pub const GENERATION_SOURCE_CHECKPOINT_DOMAIN_V1: &[u8] =
 /// The shared source checkpoint every component of one generation carries.
 ///
 /// [`ExactComponentReceiptV1::source_checkpoint`] is contractually "the same 32
-/// bytes every role shares", but the keystone left the derivation open. It is
-/// derived here from the commit range that produced the generation, because
-/// that is the source state a checkpoint names, and because deriving it makes
-/// the value RECOMPUTABLE rather than an opaque blob a caller asserts. That is
-/// what lets [`ExactComponentReceiptV1::for_metadata_manifest`] refuse a
-/// receipt whose checkpoint its own manifest does not support.
+/// bytes every role shares", but the keystone left the derivation open, and the
+/// four producers then diverged: the metadata receipt derived its value while
+/// the vector, ANN, and lexical producers accepted any `[u8; 32]` a caller
+/// handed them (bd-z4zr3).
 ///
-/// The other roles are unaffected: they still carry the 32 bytes without
-/// needing to know a commit range.
+/// That was not merely untidy. `ExactGenerationComponentsV1::admit` compares
+/// every role against the VECTOR anchor, so a caller passing an arbitrary
+/// checkpoint to the three accepting producers made the one role that computed
+/// its checkpoint correctly — metadata — the role reported as drifting. The
+/// component that was right got the blame.
+///
+/// This type removes the failure at its source. It can only be constructed by
+/// derivation from the commit range that produced the generation, so "an
+/// arbitrary 32 bytes" is not a value any producer can be given. The wrong
+/// checkpoint is unrepresentable rather than merely discouraged, which is the
+/// difference between a contract and a comment.
+///
+/// # The guarantee is compile-time, so it is pinned at compile time
+///
+/// No runtime test can observe this property: a test can only exercise
+/// constructors that exist, and the guarantee here is the ABSENCE of one. I
+/// verified that directly — adding a `from_bytes` escape hatch to this type
+/// reddens no test in the workspace, because nothing calls it; it merely makes
+/// the hole available again for the next caller. The doctest below is therefore
+/// the actual enforcement, and the error code is pinned so a snippet that stops
+/// compiling for an unrelated reason fails it instead of passing.
+///
+/// ```compile_fail,E0423
+/// use frankensearch_core::generation::SourceCheckpointV1;
+///
+/// // The field is private: bytes cannot become a checkpoint by assertion.
+/// let forged = SourceCheckpointV1([0x5c; 32]);
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SourceCheckpointV1([u8; 32]);
+
+impl SourceCheckpointV1 {
+    /// Derive the checkpoint from the commit range that produced the generation.
+    ///
+    /// This is the ONLY constructor. There is deliberately no
+    /// `from_bytes`/`from_raw`: every such escape hatch reintroduces exactly the
+    /// split this type exists to close.
+    #[must_use]
+    pub fn derive(commit_range: &CommitRange) -> Self {
+        let mut encoder = CanonicalEncoder::new(GENERATION_SOURCE_CHECKPOINT_DOMAIN_V1);
+        encoder.u64(commit_range.low);
+        encoder.u64(commit_range.high);
+        let mut hasher = Sha256::new();
+        hasher.update(&encoder.bytes);
+        Self(hasher.finalize().into())
+    }
+
+    /// The 32 bytes a receipt carries on the wire.
+    ///
+    /// One-way on purpose: a receipt's field stays `[u8; 32]` so the serialized
+    /// schema is unchanged, but bytes cannot travel back into a checkpoint.
+    #[must_use]
+    pub const fn to_bytes(self) -> [u8; 32] {
+        self.0
+    }
+}
+
+/// Derive the shared source checkpoint from a generation's commit range.
+///
+/// Prefer [`SourceCheckpointV1::derive`], which is the same derivation in a form
+/// that cannot be confused with an arbitrary array. This returns raw bytes and
+/// remains for callers comparing against a receipt's stored field.
 #[must_use]
 pub fn generation_source_checkpoint_v1(commit_range: &CommitRange) -> [u8; 32] {
-    let mut encoder = CanonicalEncoder::new(GENERATION_SOURCE_CHECKPOINT_DOMAIN_V1);
-    encoder.u64(commit_range.low);
-    encoder.u64(commit_range.high);
-    let mut hasher = Sha256::new();
-    hasher.update(&encoder.bytes);
-    hasher.finalize().into()
+    SourceCheckpointV1::derive(commit_range).to_bytes()
 }
 
 impl ExactComponentReceiptV1 {

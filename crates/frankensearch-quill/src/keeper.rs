@@ -25,7 +25,7 @@ use asupersync::runtime::spawn_blocking;
 use asupersync::sync::{LockError, Mutex, OwnedMutexGuard};
 use frankensearch_core::generation::{
     CanonicalDocsetV1, ExactComponentReceiptV1, GenerationComponentReceiptV1,
-    GenerationComponentRole,
+    GenerationComponentRole, SourceCheckpointV1,
 };
 use frankensearch_core::{DocId, SearchError};
 #[cfg(feature = "durability")]
@@ -2786,7 +2786,10 @@ pub struct KeeperSnapshot {
 pub struct ExactLexicalSnapshotDescriptor {
     directory: PathBuf,
     schema: SchemaDescriptor,
-    source_checkpoint: [u8; 32],
+    /// Held as the derived type, not raw bytes (bd-z4zr3), so a reopen
+    /// re-derives against the same generation rather than re-presenting an
+    /// array whose provenance the descriptor can no longer vouch for.
+    source_checkpoint: SourceCheckpointV1,
     receipt: ExactComponentReceiptV1,
 }
 
@@ -2895,8 +2898,13 @@ impl KeeperSnapshot {
     /// identity, or arithmetic overflow while framing the exact byte receipt.
     pub fn exact_lexical_component_receipt(
         &self,
-        source_checkpoint: [u8; 32],
+        source_checkpoint: SourceCheckpointV1,
     ) -> Result<ExactComponentReceiptV1, KeeperError> {
+        let source_checkpoint = source_checkpoint.to_bytes();
+        // Retained despite the newtype (bd-z4zr3): a derived checkpoint cannot
+        // be all-zero for any commit range, so this is now unreachable through
+        // the public path. It stays as the fail-closed floor for the wire form,
+        // which is still a bare [u8; 32] in the receipt.
         if source_checkpoint == [0; 32] {
             return Err(KeeperError::ExactSnapshotReceipt {
                 detail: "source checkpoint must not be all zeroes".to_owned(),
@@ -2976,7 +2984,7 @@ impl KeeperSnapshot {
     /// revalidates rather than following a newer publication.
     pub fn exact_lexical_snapshot_descriptor(
         &self,
-        source_checkpoint: [u8; 32],
+        source_checkpoint: SourceCheckpointV1,
     ) -> Result<ExactLexicalSnapshotDescriptor, KeeperError> {
         let directory =
             self.directory
@@ -14234,6 +14242,7 @@ mod tests {
     use asupersync::runtime::yield_now;
     use asupersync::types::Budget;
     use asupersync::{LabConfig, LabRuntime};
+    use frankensearch_core::generation::CommitRange;
     #[cfg(feature = "durability")]
     use frankensearch_durability::{DefaultSymbolCodec, DurabilityConfig, FileHealth};
     use tempfile::tempdir;
@@ -14618,11 +14627,16 @@ mod tests {
         .map_err(io::Error::other)?;
 
         let snapshot = KeeperSnapshot::open(&directory, DEFAULT_SCHEMA)?;
-        let descriptor = snapshot.exact_lexical_snapshot_descriptor([7; 32])?;
+        let descriptor = snapshot.exact_lexical_snapshot_descriptor(SourceCheckpointV1::derive(
+            &CommitRange { low: 1, high: 7 },
+        ))?;
         let receipt = descriptor.receipt();
         assert_eq!(receipt.role, GenerationComponentRole::Lexical);
         assert_eq!(receipt.live_document_count, 2);
-        assert_eq!(receipt.source_checkpoint, [7; 32]);
+        assert_eq!(
+            receipt.source_checkpoint,
+            SourceCheckpointV1::derive(&CommitRange { low: 1, high: 7 }).to_bytes()
+        );
         let expected_docset =
             CanonicalDocsetV1::from_ordered_live_documents(["receipt-a", "receipt-b"])?;
         assert_eq!(receipt.docset_digest, expected_docset.digest());
@@ -14630,11 +14644,18 @@ mod tests {
 
         let reopened = descriptor.reopen()?;
         assert_eq!(
-            reopened.exact_lexical_component_receipt([7; 32])?,
+            reopened.exact_lexical_component_receipt(SourceCheckpointV1::derive(&CommitRange {
+                low: 1,
+                high: 7
+            }))?,
             *receipt,
             "paired control: descriptor-backed reopen must reproduce every receipt field"
         );
-        let other_checkpoint = snapshot.exact_lexical_component_receipt([8; 32])?;
+        let other_checkpoint =
+            snapshot.exact_lexical_component_receipt(SourceCheckpointV1::derive(&CommitRange {
+                low: 1,
+                high: 8,
+            }))?;
         assert_eq!(other_checkpoint.docset_digest, receipt.docset_digest);
         assert_eq!(other_checkpoint.bytes, receipt.bytes);
         assert_ne!(

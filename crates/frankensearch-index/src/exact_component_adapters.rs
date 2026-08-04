@@ -37,7 +37,7 @@
 
 use frankensearch_core::generation::{
     CanonicalDocsetV1, ExactComponentReceiptV1, GenerationAuthorityErrorV1,
-    GenerationComponentReceiptV1, GenerationComponentRole,
+    GenerationComponentReceiptV1, GenerationComponentRole, SourceCheckpointV1,
 };
 
 use crate::FsviV2Witness;
@@ -101,7 +101,7 @@ where
 pub fn vector_component_receipt<I, S>(
     witness: &FsviV2Witness,
     ordered_live_documents: I,
-    source_checkpoint: [u8; 32],
+    source_checkpoint: SourceCheckpointV1,
 ) -> Result<ExactComponentReceiptV1, GenerationAuthorityErrorV1>
 where
     I: IntoIterator<Item = S>,
@@ -115,7 +115,7 @@ where
         },
         docset_digest: canonical_docset_digest(ordered_live_documents)?,
         live_document_count: witness.live_count,
-        source_checkpoint,
+        source_checkpoint: source_checkpoint.to_bytes(),
     };
     receipt.validate()?;
     Ok(receipt)
@@ -137,7 +137,7 @@ where
 pub fn ann_component_receipt<I, S>(
     receipt: &NativeHnswGenerationReceiptV2,
     ordered_live_documents: I,
-    source_checkpoint: [u8; 32],
+    source_checkpoint: SourceCheckpointV1,
 ) -> Result<ExactComponentReceiptV1, GenerationAuthorityErrorV1>
 where
     I: IntoIterator<Item = S>,
@@ -151,7 +151,7 @@ where
         },
         docset_digest: canonical_docset_digest(ordered_live_documents)?,
         live_document_count: receipt.point_count,
-        source_checkpoint,
+        source_checkpoint: source_checkpoint.to_bytes(),
     };
     component.validate()?;
     Ok(component)
@@ -160,7 +160,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::canonical_docset_digest;
-    use frankensearch_core::generation::CanonicalDocsetV1;
+    use frankensearch_core::generation::{CanonicalDocsetV1, CommitRange, SourceCheckpointV1};
     use sha2::{Digest, Sha256};
 
     /// Mirror of the FSVI v2 ordered-live-docset digest, byte for byte with the
@@ -263,7 +263,16 @@ mod tests {
     use frankensearch_core::generation::ArtifactGenerationIdentityV1;
 
     const DOCS: [&str; 3] = ["doc-a", "doc-b", "doc-c"];
-    const CHECKPOINT: [u8; 32] = [0x5c; 32];
+    /// The generation's commit range, and the checkpoint every role derives
+    /// from it. Since bd-z4zr3 a checkpoint cannot be an arbitrary array, so
+    /// the fixture names the RANGE and lets the type produce the bytes — the
+    /// same discipline production callers now have no way to avoid.
+    const RANGE: CommitRange = CommitRange { low: 1, high: 100 };
+    const OTHER_RANGE: CommitRange = CommitRange { low: 1, high: 101 };
+
+    fn checkpoint() -> SourceCheckpointV1 {
+        SourceCheckpointV1::derive(&RANGE)
+    }
 
     /// Distinct byte markers per field, so a mis-mapped adapter produces a
     /// visibly wrong value rather than a coincidentally right one.
@@ -350,7 +359,7 @@ mod tests {
     #[test]
     fn the_vector_adapter_maps_every_field_from_the_witness() {
         let witness = witness_fixture();
-        let receipt = vector_component_receipt(&witness, DOCS, CHECKPOINT)
+        let receipt = vector_component_receipt(&witness, DOCS, checkpoint())
             .expect("a valid witness produces a vector receipt");
 
         assert_eq!(receipt.role, GenerationComponentRole::Vector);
@@ -365,7 +374,7 @@ mod tests {
             "live count, not record_count"
         );
         assert_ne!(receipt.live_document_count, witness.record_count);
-        assert_eq!(receipt.source_checkpoint, CHECKPOINT);
+        assert_eq!(receipt.source_checkpoint, checkpoint().to_bytes());
 
         // The load-bearing mapping, restated against a real witness: the
         // adapter must recompute, never re-label.
@@ -387,7 +396,7 @@ mod tests {
     #[test]
     fn the_ann_adapter_binds_the_graph_not_the_fsvi_image() {
         let ann = ann_receipt_fixture();
-        let receipt = ann_component_receipt(&ann, DOCS, CHECKPOINT)
+        let receipt = ann_component_receipt(&ann, DOCS, checkpoint())
             .expect("a valid ANN receipt produces an ANN component");
 
         assert_eq!(receipt.role, GenerationComponentRole::Ann);
@@ -411,7 +420,7 @@ mod tests {
         );
 
         assert_eq!(receipt.live_document_count, ann.point_count);
-        assert_eq!(receipt.source_checkpoint, CHECKPOINT);
+        assert_eq!(receipt.source_checkpoint, checkpoint().to_bytes());
         assert_ne!(
             receipt.docset_digest,
             sha256_from_hex("docset", &ann.ordered_live_docset_digest).expect("fixture hex"),
@@ -421,7 +430,7 @@ mod tests {
 
     fn metadata_component(
         docset_digest: [u8; 32],
-        checkpoint: [u8; 32],
+        checkpoint: SourceCheckpointV1,
     ) -> ExactComponentReceiptV1 {
         ExactComponentReceiptV1 {
             role: GenerationComponentRole::Metadata,
@@ -431,11 +440,14 @@ mod tests {
             },
             docset_digest,
             live_document_count: DOCS.len() as u64,
-            source_checkpoint: checkpoint,
+            source_checkpoint: checkpoint.to_bytes(),
         }
     }
 
-    fn lexical_component(docset_digest: [u8; 32], checkpoint: [u8; 32]) -> ExactComponentReceiptV1 {
+    fn lexical_component(
+        docset_digest: [u8; 32],
+        checkpoint: SourceCheckpointV1,
+    ) -> ExactComponentReceiptV1 {
         ExactComponentReceiptV1 {
             role: GenerationComponentRole::Lexical,
             bytes: GenerationComponentReceiptV1 {
@@ -444,7 +456,7 @@ mod tests {
             },
             docset_digest,
             live_document_count: DOCS.len() as u64,
-            source_checkpoint: checkpoint,
+            source_checkpoint: checkpoint.to_bytes(),
         }
     }
 
@@ -455,17 +467,17 @@ mod tests {
     /// types.
     #[test]
     fn adapter_produced_receipts_admit_as_one_generation() {
-        let vector =
-            vector_component_receipt(&witness_fixture(), DOCS, CHECKPOINT).expect("vector receipt");
+        let vector = vector_component_receipt(&witness_fixture(), DOCS, checkpoint())
+            .expect("vector receipt");
         let ann =
-            ann_component_receipt(&ann_receipt_fixture(), DOCS, CHECKPOINT).expect("ann receipt");
+            ann_component_receipt(&ann_receipt_fixture(), DOCS, checkpoint()).expect("ann receipt");
         let canonical = vector.docset_digest;
 
         let admitted = ExactGenerationComponentsV1::admit(
             vector.clone(),
-            lexical_component(canonical, CHECKPOINT),
+            lexical_component(canonical, checkpoint()),
             Some(ann.clone()),
-            metadata_component(canonical, CHECKPOINT),
+            metadata_component(canonical, checkpoint()),
         )
         .expect("adapter-produced receipts describe one generation");
 
@@ -477,9 +489,9 @@ mod tests {
         // ANN is optional: dropping it still leaves an exact generation.
         ExactGenerationComponentsV1::admit(
             vector,
-            lexical_component(canonical, CHECKPOINT),
+            lexical_component(canonical, checkpoint()),
             None,
-            metadata_component(canonical, CHECKPOINT),
+            metadata_component(canonical, checkpoint()),
         )
         .expect("a generation without an ANN sidecar is still exact");
     }
@@ -489,7 +501,7 @@ mod tests {
     /// to pass itself off as agreeing with the anchor.
     #[test]
     fn an_adapter_fed_a_different_docset_rejects_on_its_own_role() {
-        let anchor = vector_component_receipt(&witness_fixture(), DOCS, CHECKPOINT)
+        let anchor = vector_component_receipt(&witness_fixture(), DOCS, checkpoint())
             .expect("anchor vector receipt");
         let canonical = anchor.docset_digest;
 
@@ -497,15 +509,15 @@ mod tests {
         let drifted_ann = ann_component_receipt(
             &ann_receipt_fixture(),
             ["doc-a", "doc-c", "doc-b"],
-            CHECKPOINT,
+            checkpoint(),
         )
         .expect("ann receipt over a reordered set");
         assert_ne!(drifted_ann.docset_digest, canonical);
         let observed = ExactGenerationComponentsV1::admit(
             anchor.clone(),
-            lexical_component(canonical, CHECKPOINT),
+            lexical_component(canonical, checkpoint()),
             Some(drifted_ann),
-            metadata_component(canonical, CHECKPOINT),
+            metadata_component(canonical, checkpoint()),
         );
         assert!(
             matches!(
@@ -519,14 +531,14 @@ mod tests {
         // so the OTHERS drift against it -- the first mandatory role checked
         // after the anchor is lexical.
         let drifted_anchor =
-            vector_component_receipt(&witness_fixture(), ["doc-a", "doc-b"], CHECKPOINT)
+            vector_component_receipt(&witness_fixture(), ["doc-a", "doc-b"], checkpoint())
                 .expect("vector receipt over a shorter set");
         assert_ne!(drifted_anchor.docset_digest, canonical);
         let observed = ExactGenerationComponentsV1::admit(
             drifted_anchor,
-            lexical_component(canonical, CHECKPOINT),
+            lexical_component(canonical, checkpoint()),
             None,
-            metadata_component(canonical, CHECKPOINT),
+            metadata_component(canonical, checkpoint()),
         );
         assert!(
             matches!(
@@ -541,10 +553,13 @@ mod tests {
     /// document set held fixed so the checkpoint is the only variable.
     #[test]
     fn an_adapter_given_a_different_checkpoint_rejects_on_its_own_role() {
-        let vector =
-            vector_component_receipt(&witness_fixture(), DOCS, CHECKPOINT).expect("vector receipt");
+        let vector = vector_component_receipt(&witness_fixture(), DOCS, checkpoint())
+            .expect("vector receipt");
         let canonical = vector.docset_digest;
-        let other_checkpoint = [0x5d; 32];
+        // A genuinely different generation, expressed the only way the type
+        // permits: a different commit range.
+        let other_checkpoint = SourceCheckpointV1::derive(&OTHER_RANGE);
+        assert_ne!(other_checkpoint, checkpoint());
 
         let ann = ann_component_receipt(&ann_receipt_fixture(), DOCS, other_checkpoint)
             .expect("ann receipt at another checkpoint");
@@ -555,9 +570,9 @@ mod tests {
 
         let observed = ExactGenerationComponentsV1::admit(
             vector,
-            lexical_component(canonical, CHECKPOINT),
+            lexical_component(canonical, checkpoint()),
             Some(ann),
-            metadata_component(canonical, CHECKPOINT),
+            metadata_component(canonical, checkpoint()),
         );
         assert!(
             matches!(
@@ -608,7 +623,7 @@ mod tests {
         let mut ann = ann_receipt_fixture();
         ann.graph_sha256 = zeros;
         assert!(
-            ann_component_receipt(&ann, DOCS, CHECKPOINT).is_err(),
+            ann_component_receipt(&ann, DOCS, checkpoint()).is_err(),
             "an all-zero graph digest cannot identify real bytes"
         );
     }
@@ -620,23 +635,180 @@ mod tests {
         let witness = witness_fixture();
         let ann = ann_receipt_fixture();
 
-        assert!(vector_component_receipt(&witness, ["doc-a", "doc-a"], CHECKPOINT).is_err());
-        assert!(ann_component_receipt(&ann, ["doc-a", "doc-a"], CHECKPOINT).is_err());
-        assert!(vector_component_receipt(&witness, ["doc-a", ""], CHECKPOINT).is_err());
-        assert!(ann_component_receipt(&ann, ["", "doc-b"], CHECKPOINT).is_err());
+        assert!(vector_component_receipt(&witness, ["doc-a", "doc-a"], checkpoint()).is_err());
+        assert!(ann_component_receipt(&ann, ["doc-a", "doc-a"], checkpoint()).is_err());
+        assert!(vector_component_receipt(&witness, ["doc-a", ""], checkpoint()).is_err());
+        assert!(ann_component_receipt(&ann, ["", "doc-b"], checkpoint()).is_err());
 
         // Control: the same adapters accept the valid set, so the refusals are
         // attributable to the docset and not to the fixtures.
-        vector_component_receipt(&witness, DOCS, CHECKPOINT).expect("valid docset");
-        ann_component_receipt(&ann, DOCS, CHECKPOINT).expect("valid docset");
+        vector_component_receipt(&witness, DOCS, checkpoint()).expect("valid docset");
+        ann_component_receipt(&ann, DOCS, checkpoint()).expect("valid docset");
     }
 
     /// A zero-placeholder checkpoint is refused at construction. Without this
     /// an adapter could emit a receipt that only fails later, inside `admit()`,
     /// as an anonymous `InvalidComponent`.
+    /// PER-PRODUCER PLANTED NEGATIVE (bd-z4zr3): a drifted checkpoint is
+    /// attributed to the role that actually drifted, for every non-anchor role.
+    ///
+    /// This is the bug this bead was filed for. Before the unification the
+    /// metadata producer derived its checkpoint while vector, ANN and lexical
+    /// accepted any array, so a caller passing a non-derived value made METADATA
+    /// — the only role that computed correctly — the role `admit` reported as
+    /// drifting. Each case below drifts exactly one role and asserts the error
+    /// names that same role.
+    ///
+    /// The vector role is absent from the loop on purpose: it is the anchor, so
+    /// drifting it makes every OTHER role disagree. That case is covered
+    /// separately below, because "the anchor drifted" is a different failure
+    /// than "a component drifted" and conflating them is what produced the
+    /// original misattribution.
     #[test]
-    fn a_zero_placeholder_checkpoint_never_leaves_an_adapter() {
-        assert!(vector_component_receipt(&witness_fixture(), DOCS, [0; 32]).is_err());
-        assert!(ann_component_receipt(&ann_receipt_fixture(), DOCS, [0; 32]).is_err());
+    fn every_non_anchor_role_is_blamed_for_its_own_checkpoint_drift() {
+        let anchor = vector_component_receipt(&witness_fixture(), DOCS, checkpoint())
+            .expect("anchor vector receipt");
+        let canonical = anchor.docset_digest;
+        let other = SourceCheckpointV1::derive(&OTHER_RANGE);
+        assert_ne!(other, checkpoint(), "the fixture must move the checkpoint");
+
+        // ANN drifts alone.
+        let observed = ExactGenerationComponentsV1::admit(
+            anchor.clone(),
+            lexical_component(canonical, checkpoint()),
+            Some(
+                ann_component_receipt(&ann_receipt_fixture(), DOCS, other)
+                    .expect("ann receipt at another checkpoint"),
+            ),
+            metadata_component(canonical, checkpoint()),
+        );
+        assert!(
+            matches!(
+                observed,
+                Err(ComponentJoinErrorV1::CheckpointDrift { role: "ann" })
+            ),
+            "ann drift must name ann: {observed:?}"
+        );
+
+        // Lexical drifts alone.
+        let observed = ExactGenerationComponentsV1::admit(
+            anchor.clone(),
+            lexical_component(canonical, other),
+            None,
+            metadata_component(canonical, checkpoint()),
+        );
+        assert!(
+            matches!(
+                observed,
+                Err(ComponentJoinErrorV1::CheckpointDrift { role: "lexical" })
+            ),
+            "lexical drift must name lexical: {observed:?}"
+        );
+
+        // Metadata drifts alone. This is the case that used to be reported for
+        // everyone else's mistake.
+        let observed = ExactGenerationComponentsV1::admit(
+            anchor.clone(),
+            lexical_component(canonical, checkpoint()),
+            None,
+            metadata_component(canonical, other),
+        );
+        assert!(
+            matches!(
+                observed,
+                Err(ComponentJoinErrorV1::CheckpointDrift { role: "metadata" })
+            ),
+            "metadata drift must name metadata: {observed:?}"
+        );
+
+        // Control: all four agreeing admits, so each rejection above is
+        // attributable to the single role it moved.
+        ExactGenerationComponentsV1::admit(
+            anchor,
+            lexical_component(canonical, checkpoint()),
+            Some(
+                ann_component_receipt(&ann_receipt_fixture(), DOCS, checkpoint())
+                    .expect("ann receipt"),
+            ),
+            metadata_component(canonical, checkpoint()),
+        )
+        .expect("one derived checkpoint across all four roles admits");
+    }
+
+    /// The anchor case, stated separately so it cannot be mistaken for the
+    /// per-role attribution above.
+    ///
+    /// The vector receipt defines truth, so a drifted anchor does not report
+    /// "vector" — it reports the first mandatory role that now disagrees with
+    /// it. That is correct behaviour and worth pinning, because someone reading
+    /// a `lexical` drift error needs to know it can mean "the anchor moved"
+    /// rather than "the lexical component is wrong".
+    #[test]
+    fn a_drifted_anchor_is_reported_against_the_roles_that_disagree_with_it() {
+        let drifted_anchor = vector_component_receipt(
+            &witness_fixture(),
+            DOCS,
+            SourceCheckpointV1::derive(&OTHER_RANGE),
+        )
+        .expect("vector receipt at another checkpoint");
+        let canonical = drifted_anchor.docset_digest;
+
+        let observed = ExactGenerationComponentsV1::admit(
+            drifted_anchor,
+            lexical_component(canonical, checkpoint()),
+            None,
+            metadata_component(canonical, checkpoint()),
+        );
+        assert!(
+            matches!(
+                observed,
+                Err(ComponentJoinErrorV1::CheckpointDrift { role: "lexical" })
+            ),
+            "a drifted anchor surfaces as disagreement from the first checked \
+             mandatory role, not as a vector error: {observed:?}"
+        );
+    }
+
+    /// The zero-placeholder checkpoint is now UNREPRESENTABLE rather than
+    /// rejected (bd-z4zr3).
+    ///
+    /// This test previously passed `[0; 32]` to both adapters and asserted an
+    /// error. That call no longer compiles: `SourceCheckpointV1` has exactly one
+    /// constructor and it is a derivation, so there is no way to hand an adapter
+    /// an arbitrary array at all. The assertion therefore moves down a level —
+    /// no commit range derives to the all-zero placeholder, so the state the old
+    /// test guarded against cannot be reached from any input.
+    ///
+    /// Kept rather than deleted because the property still matters: the receipt
+    /// field is a bare `[u8; 32]` on the wire, and `validate()` still rejects a
+    /// zero there for anything deserialized rather than constructed.
+    #[test]
+    fn no_commit_range_derives_the_zero_placeholder_checkpoint() {
+        for range in [
+            CommitRange { low: 0, high: 0 },
+            CommitRange { low: 0, high: 1 },
+            CommitRange { low: 1, high: 1 },
+            CommitRange { low: 1, high: 100 },
+            CommitRange {
+                low: u64::MAX,
+                high: u64::MAX,
+            },
+            // An empty/invalid range (high < low) still derives a real digest
+            // rather than degenerating to the placeholder.
+            CommitRange { low: 5, high: 1 },
+        ] {
+            assert_ne!(
+                SourceCheckpointV1::derive(&range).to_bytes(),
+                [0; 32],
+                "{range:?} derived the all-zero placeholder"
+            );
+        }
+
+        // And the derivation is injective enough to distinguish adjacent
+        // ranges, so two different generations cannot share a checkpoint.
+        assert_ne!(
+            SourceCheckpointV1::derive(&CommitRange { low: 0, high: 1 }),
+            SourceCheckpointV1::derive(&CommitRange { low: 1, high: 0 })
+        );
     }
 }
