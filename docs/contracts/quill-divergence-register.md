@@ -259,6 +259,55 @@ These are the classes the plan *predicts*; each becomes a numbered DIV entry whe
 - Decision: accept (owner ruling; bounded)
 - Reviewer: SandyGrove (author of record for the ruling) · second-agent sign-off requested from LilacSquirrel (campaign author) via mail thread `bd-55mvg`
 
+### DIV-008: the DIV-007 mechanism reaches the zero-tolerance default-profile lane as a raw rank mismatch
+
+**This is the register's first WITNESSED entry.** DIV-001 through DIV-007 are documented — their
+evidence was transcribed into the prose above by a human reading a campaign result. DIV-008 was
+ingested by machine from the artifact that observed it, through
+`DivergenceRegisterLedger::observation_from_artifact`, and the authoritative record is the ledger,
+not this row. This row is the human projection of it.
+
+- Class: `RankMismatch` (raw failure class — it may be fixed or blocked, never accepted)
+- Machine record: `crates/frankensearch-quill-gauntlet/fixtures/divergence-register-v2-live.json`
+  (register `quill-e6-divergence-register-live`, ledger SHA-256
+  `6dfd9d1c7d9d07bbc261e1703c2bc1bc61b536adea5d17fd5daf9bd9b0ba276d`)
+- First seen: 2026-08-04 · live default-profile oracle-differential campaign, run `e68-live-ingestion`,
+  minted from a clean checkout at `4efe400cc80f55e85079400a7c54674116ab6f98`. Retained v7 witness object
+  `65b1e4e89a3d1a2cc2202634fa448c397a48376fab90afb9a89390dfd823e763`, committed at
+  `crates/frankensearch-quill-gauntlet/fixtures/artifact-object-v7-div007-live.json`; case
+  `e68-div007-witness`; mismatch signature `15c251dd6671f6766082fc47e653cda26b72cb7b6e1b642ba4b795fb906133ec`
+- Root cause: the DIV-007 mechanism observed OUTSIDE its documented qualifiers. A plain three-clause
+  disjunction over the shared Core100 campaign corpus — three leaves, no boost, no mixed-occur
+  nesting, where DIV-007 documents eight leaves — scores one document exactly one ULP away from the
+  pinned oracle. A 52-query sweep over the same corpus produced 9 such hits, and the witness pair
+  moves the ULP in OPPOSITE directions on the same document, which is what distinguishes summation
+  association from a scoring bias in either engine. A two-clause control stays bit-exact.
+- Consumer impact: result sets and rank positions are unchanged; only the order of two ULP-adjacent
+  scores can flip. The load-bearing impact is on the campaign: the default-profile lane does not opt
+  into the typed `SummationAssociation` reason, so this reaches it as a raw `RankMismatch` and the
+  case fails closed as `Unclassified` on two independent axes — the total lexical contract mismatches,
+  and the rank comparison carries an unregistered divergence.
+- Fixture: campaign case `e68-div007-witness` (minimized-inputs SHA-256
+  `210e480537e2cc6750df1699989cc1c818c8dab14ca71251772ddfe205136cb0`, re-derived by the selfcheck
+  rather than trusted); executable regression
+  `runner::tests::three_clause_or_diverges_at_one_ulp_without_the_div007_envelope`, which pins both
+  halves of the bd-55mvg ruling: raw `RankMismatch` under the default comparator,
+  `ScoreEpsilon`/`SummationAssociation` once a lane opts in.
+- Decision: **blocking** (bead `bd-gx7n4`). DIV-007's acceptance is expressed through the typed
+  reason, and a raw failure class can never be accepted, so blocking is the only admissible machine
+  record while the lane's envelope scope is undecided. Resolving it means one of: opt the
+  default-profile lane into `with_score_epsilon_reason(SummationAssociation)`; widen DIV-007's
+  documented envelope to cover three-clause disjunctions and then opt in; or re-associate Quill's
+  fused multi-field summation, which bd-55mvg declined on QG-6 latency grounds.
+- Reviewer: recorded and blocked by `Claude-pane12`. No independent review is claimed, and none is
+  required to block: `DivergenceDisposition::validate` enforces an independent reviewer only for
+  acceptance, which is exactly the decision that needs one.
+- Note for the terminal census (bead e6.8.1): the mismatch signature above is identical to DIV-006's,
+  because a signature commits to the mismatch SHAPE (rank class, divergence class, normalized pointer,
+  cause shape) rather than to the instance. DIV-006 and DIV-008 are mechanically unrelated, so a single
+  ledger holding both active would trip the "one active mismatch signature cannot belong to multiple
+  divergences" rule. That is a census-design constraint, not a defect in either entry.
+
 ---
 
 *Cross-references: comparator classes implemented in the gauntlet kernel (bead e0.5); auto-triage feeding this ledger (bd-quill-duel-shrinker); statistical gates consuming per-class pass rates (bead e6.6); G2 exit requires this register complete over two consecutive nightly runs (bead e6.8).*
