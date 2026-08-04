@@ -2812,10 +2812,6 @@ mod tests {
     // `perf-harness` block, so the import carries the same gate.
     #[cfg(feature = "perf-harness")]
     use crate::comparator::DivergenceClass;
-    // The Boolean associativity laws compare under the reviewed DIV-007
-    // two-ULP envelope, so they need its reason enum; same `perf-harness` gate.
-    #[cfg(feature = "perf-harness")]
-    use crate::comparator::ScoreEpsilonReason;
 
     const E55_ID_FIELD: u16 = 0;
     const E55_CONTENT_FIELD: u16 = 1;
@@ -3110,6 +3106,55 @@ mod tests {
                 "E6.3 associativity operand {operand} missing from a spelling"
             );
         }
+    }
+
+    /// The declared projection for WITHIN-ENGINE Boolean re-association.
+    ///
+    /// Re-association reorders finite additions, so one engine can return the
+    /// same document at the same rank with a score one ULP apart — measured on
+    /// Quill at operands `(alpha, gamma, delta)`, `doc-4@3fdc09b7` versus
+    /// `doc-4@3fdc09b6`. That is a real effect and the law must not pretend
+    /// otherwise.
+    ///
+    /// It also must not be classified as `DIV-007`. That register entry is
+    /// recorded as CROSS-ENGINE (Quill's fused scorer against the pinned
+    /// oracle) and scoped to composite shapes, and re-association within a
+    /// single engine at three conjunctive leaves is outside it on both axes.
+    /// Citing it here would be proof-class inflation, so this law declares a
+    /// narrowed projection instead of borrowing a tolerance class:
+    ///
+    ///   PROJECTED:  ranked document-ID sequence, live doc count, match count,
+    ///               and snippets — the full observation minus score bits.
+    ///   EXCLUDED:   score bits.
+    ///
+    /// The exclusion is bounded rather than open: the maximum score-bit
+    /// distance is returned so the caller can witness it, and a caller that
+    /// finds it growing beyond the measured one ULP is looking at a different
+    /// effect than the one this projection was declared for.
+    #[cfg(feature = "perf-harness")]
+    fn e63_reassociation_projection(
+        before: &EngineObservation,
+        after: &EngineObservation,
+    ) -> (bool, u32) {
+        let ranked_ids = |observation: &EngineObservation| {
+            observation
+                .hits
+                .iter()
+                .map(|hit| hit.doc_id.clone())
+                .collect::<Vec<_>>()
+        };
+        let equivalent = ranked_ids(before) == ranked_ids(after)
+            && before.doc_count == after.doc_count
+            && before.match_count == after.match_count
+            && before.snippets == after.snippets;
+        let max_score_bit_distance = before
+            .hits
+            .iter()
+            .zip(after.hits.iter())
+            .map(|(before_hit, after_hit)| before_hit.score_bits.abs_diff(after_hit.score_bits))
+            .max()
+            .unwrap_or(0);
+        (equivalent, max_score_bit_distance)
     }
 
     #[cfg(feature = "perf-harness")]
@@ -7512,17 +7557,30 @@ mod tests {
 
     /// E6.3 law: three distinct, unboosted positive scalar `AND` operands
     /// re-associate. `(A AND B) AND C` and `A AND (B AND C)` select the same
-    /// conjunction, so the total lexical observation must agree exactly or by
-    /// tie order only.
+    /// conjunction, so the ranked document sequence must agree — under the
+    /// declared score-insensitive projection of
+    /// [`e63_reassociation_projection`], never under a borrowed tolerance
+    /// class.
     ///
     /// This is the law the two-term commutativity pair explicitly excluded
     /// ("excludes association ... because those shapes can expose parser or
     /// score-accumulation behavior"). The exclusion was a deferral, not a
-    /// proof, so the relation here was measured before it was declared: on the
-    /// scalar G1A fixture both Quill and Tantivy report `RankExact` with zero
-    /// divergences under re-association. The relation is still written as
-    /// `RankExact | TieOrder` so a legitimate tie reshuffle on another seed is
-    /// admitted rather than reported as a violation.
+    /// proof, and the measurement vindicated the warning: at operands
+    /// `(alpha, gamma, delta)` Quill returns the same document at the same
+    /// rank with a score one ULP apart, because re-association reorders finite
+    /// additions.
+    ///
+    /// The law originally bound that shift to `DIV-007`
+    /// (`ScoreEpsilonReason::SummationAssociation`). That classification is
+    /// RETRACTED: the register records DIV-007 as cross-engine and scoped to
+    /// composite shapes, while this shift is within one engine at three
+    /// conjunctive leaves — outside the reviewed envelope on both axes.
+    /// Widening an owner-ruled tolerance class to cover a shape it was not
+    /// reviewed for is proof-class inflation, so the law declares its own
+    /// narrowed projection and reports the excluded distance instead. The
+    /// measurement itself stands and is routed to the Divergence Register
+    /// (`bd-quill-e6-gauntlet-scale-rm3q.8.1`) beside the cross-engine
+    /// three-clause OR case.
     ///
     /// Preconditions are executable, not decorative: the operands must be
     /// three distinct analyzed terms and both spellings must differ only in
@@ -7596,29 +7654,38 @@ mod tests {
                 ("Quill", &baseline_case.1, &regrouped_case.1),
                 ("Tantivy", &baseline_case.2, &regrouped_case.2),
             ] {
-                let comparison = compare_observations(
-                    before.clone(),
-                    after.clone(),
-                    ComparatorConfig::default()
-                        .with_score_epsilon_reason(ScoreEpsilonReason::SummationAssociation),
-                )
-                .unwrap_or_else(|error| {
-                    panic!("E6.3 {engine} three-term AND associativity comparison failed: {error}")
-                });
+                let (equivalent, score_bit_distance) = e63_reassociation_projection(before, after);
                 assert!(
-                    matches!(
-                        comparison.rank_class,
-                        RankClass::RankExact | RankClass::TieOrder | RankClass::ScoreEpsilon
-                    ),
-                    "E6.3 {engine} produced a divergence outside the DIV-007 envelope under three-term AND association: {:?} / {:?}",
-                    comparison.rank_class,
-                    comparison.divergences,
+                    equivalent,
+                    "E6.3 {engine} three-term AND association changed the projected observation"
+                );
+                assert!(
+                    score_bit_distance <= 1,
+                    "E6.3 {engine} excluded a {score_bit_distance}-ULP score shift under AND \
+                     association; the projection was declared for the measured one-ULP \
+                     re-association effect, so re-measure before widening it"
                 );
             }
 
             let invalid_case = invalid
                 .first()
                 .expect("E6.3 invalid mixed-operator AND-assoc fixture");
+            // The narrowed projection must still REJECT the planted invalid.
+            // Excluding scores is only defensible if the remaining projection
+            // is what carries the law, so prove it rejects a real
+            // non-associativity rather than trusting the zero-tolerance
+            // comparison below to do all the work.
+            for (engine, before, after) in [
+                ("Quill", &baseline_case.1, &invalid_case.1),
+                ("Tantivy", &baseline_case.2, &invalid_case.2),
+            ] {
+                let (equivalent, _) = e63_reassociation_projection(before, after);
+                assert!(
+                    !equivalent,
+                    "E6.3 {engine} score-insensitive projection accepted a mixed-operator \
+                     regrouping, so it is too weak to carry this law"
+                );
+            }
             for (engine, before, after) in [
                 ("Quill", &baseline_case.1, &invalid_case.1),
                 ("Tantivy", &baseline_case.2, &invalid_case.2),
@@ -7712,23 +7779,16 @@ mod tests {
                     ("Quill", &baseline_case.1, &regrouped_case.1),
                     ("Tantivy", &baseline_case.2, &regrouped_case.2),
                 ] {
-                    let comparison = compare_observations(
-                        before.clone(),
-                        after.clone(),
-                        ComparatorConfig::default()
-                            .with_score_epsilon_reason(ScoreEpsilonReason::SummationAssociation),
-                    )
-                    .unwrap_or_else(|error| {
-                        panic!("E6.3 {engine} seed {seed:#x} AND-assoc comparison failed: {error}")
-                    });
+                    let (equivalent, score_bit_distance) =
+                        e63_reassociation_projection(before, after);
                     assert!(
-                        matches!(
-                            comparison.rank_class,
-                            RankClass::RankExact | RankClass::TieOrder | RankClass::ScoreEpsilon
-                        ),
-                        "E6.3 {engine} seed {seed:#x} produced a divergence outside the DIV-007 envelope under AND association: {:?} / {:?}",
-                        comparison.rank_class,
-                        comparison.divergences,
+                        equivalent,
+                        "E6.3 {engine} seed {seed:#x} AND association changed the projected observation"
+                    );
+                    assert!(
+                        score_bit_distance <= 1,
+                        "E6.3 {engine} seed {seed:#x} excluded a {score_bit_distance}-ULP score \
+                         shift under AND association; re-measure before widening the projection"
                     );
                 }
             }
