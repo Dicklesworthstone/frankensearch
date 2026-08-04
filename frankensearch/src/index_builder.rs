@@ -856,9 +856,7 @@ async fn open_lexical_reader(cx: &Cx, dir: &Path) -> SearchResult<Option<Arc<dyn
     })?;
     match layout {
         LexicalLayout::Empty => return Ok(None),
-        LexicalLayout::DirectQuill
-        |
-        LexicalLayout::BlueGreen { ref pointer, .. }
+        LexicalLayout::DirectQuill | LexicalLayout::BlueGreen { ref pointer, .. }
             if pointer.engine() == BlueGreenEngine::Quill =>
         {
             let index = RootBoundQuillSearchIndex::open(cx, dir, QuillConfig::default()).await?;
@@ -876,16 +874,14 @@ async fn open_lexical_reader(cx: &Cx, dir: &Path) -> SearchResult<Option<Arc<dyn
             let index = TantivyIndex::open(pointer.engine_dir(dir))?;
             Ok(Some(Arc::new(index)))
         }
-        ref layout => {
-            Err(SearchError::InvalidConfig {
-                field: "data_dir/lexical".to_owned(),
-                value: dir.display().to_string(),
-                reason: format!(
-                    "lexical layout is {}, which this build cannot open",
-                    layout.label()
-                ),
-            })
-        }
+        ref layout => Err(SearchError::InvalidConfig {
+            field: "data_dir/lexical".to_owned(),
+            value: dir.display().to_string(),
+            reason: format!(
+                "lexical layout is {}, which this build cannot open",
+                layout.label()
+            ),
+        }),
     }
 }
 
@@ -1088,6 +1084,8 @@ mod tests {
     use std::sync::Arc;
     use std::sync::Mutex;
 
+    #[cfg(feature = "lexical-tantivy")]
+    use frankensearch_core::traits::LexicalWrite;
     use frankensearch_core::traits::{MetricsExporter, ModelCategory, SearchFuture};
     use frankensearch_core::types::{EmbeddingMetrics, IndexMetrics, SearchMetrics};
     #[cfg(feature = "durability")]
@@ -1096,14 +1094,13 @@ mod tests {
     use frankensearch_durability::{DefaultSymbolCodec, DurabilityConfig, FsviVerifyResult};
     #[cfg(feature = "lexical-tantivy")]
     use frankensearch_lexical::TantivyIndex;
-    #[cfg(feature = "lexical-tantivy")]
-    use frankensearch_core::traits::LexicalWrite;
     #[cfg(feature = "quill")]
     use frankensearch_quill::{
-        BlueGreenEngine, CurrentPointer, DEFAULT_SCHEMA, EncodedSegment, FSLX_FORMAT_VERSION,
-        SectionInput, SectionKind, SegmentHeaderInput, SegmentReader, load_manifest_pair,
-        publish_current,
+        BlueGreenEngine, DEFAULT_SCHEMA, EncodedSegment, SectionInput, SectionKind,
+        SegmentHeaderInput, SegmentReader, load_manifest_pair,
     };
+    #[cfg(all(feature = "quill", feature = "lexical-tantivy"))]
+    use frankensearch_quill::{CurrentPointer, publish_current};
 
     use super::*;
 
@@ -2274,6 +2271,43 @@ mod tests {
                 error.to_string().contains("mixed"),
                 "error must carry the typed layout label: {error}"
             );
+        });
+    }
+
+    /// bd-8nqz.2: when both backends are compiled, a published Tantivy
+    /// generation is a supported rollback target. The root inspector decides
+    /// the engine; no Quill open is attempted against Tantivy's `meta.json`.
+    #[cfg(all(feature = "quill", feature = "lexical-tantivy"))]
+    #[test]
+    fn open_lexical_reader_opens_current_tantivy_generation() {
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let root = tempfile::tempdir().unwrap();
+            let lexical_root = root.path().join("lexical");
+            let tantivy_dir = lexical_root.join("tantivy-v1");
+            std::fs::create_dir_all(&tantivy_dir).unwrap();
+
+            let tantivy = TantivyIndex::create(&tantivy_dir).unwrap();
+            LexicalWrite::index_document(
+                &tantivy,
+                &cx,
+                &IndexableDocument::new("tantivy-doc", "rollback sentinel"),
+            )
+            .await
+            .unwrap();
+            LexicalWrite::commit(&tantivy, &cx).await.unwrap();
+            publish_current(
+                &lexical_root,
+                &CurrentPointer::new(BlueGreenEngine::Tantivy, "tantivy-v1", 0).unwrap(),
+            )
+            .unwrap();
+
+            let lexical = open_lexical_reader(&cx, &lexical_root)
+                .await
+                .unwrap()
+                .expect("published Tantivy generation must open");
+            let hits = lexical.search(&cx, "rollback", 5).await.unwrap();
+            assert_eq!(hits.len(), 1);
+            assert_eq!(hits[0].doc_id, "tantivy-doc");
         });
     }
 
