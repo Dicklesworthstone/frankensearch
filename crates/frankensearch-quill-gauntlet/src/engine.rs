@@ -3181,6 +3181,11 @@ mod tests {
     /// E6.3 observation runner variant that fixes the ingest batch schedule.
     /// A non-zero batch size lets lifecycle laws exercise publication
     /// boundaries without changing the corpus or query projection.
+    ///
+    /// Cross-engine exactness stays asserted here, byte for byte, for every
+    /// existing caller. A law that needs to MEASURE a cross-engine divergence
+    /// rather than die on it calls [`e63_runs_with_config_and_batch_size`]
+    /// directly and states in its own descriptor why.
     #[cfg(feature = "perf-harness")]
     async fn e63_observations_with_config_and_batch_size(
         cx: &Cx,
@@ -3191,6 +3196,62 @@ mod tests {
         subject_config: QuillConfig,
         batch_size: usize,
     ) -> Vec<(String, EngineObservation, EngineObservation)> {
+        let runs = e63_runs_with_config_and_batch_size(
+            cx,
+            documents,
+            cases,
+            seed,
+            generator_id,
+            subject_config,
+            batch_size,
+        )
+        .await;
+        runs.into_iter()
+            .map(|(case_id, comparison)| {
+                assert_eq!(
+                    comparison.status,
+                    ComparisonStatus::Exact,
+                    "E6.3 cross-engine case {case_id}: {:?}",
+                    comparison.divergences,
+                );
+                assert_eq!(
+                    comparison.rank_class,
+                    RankClass::RankExact,
+                    "E6.3 cross-engine case {case_id}: {:?}",
+                    comparison.divergences,
+                );
+                (case_id, comparison.subject, comparison.oracle)
+            })
+            .collect()
+    }
+
+    /// The same E6.3 campaign WITHOUT the shared cross-engine exactness
+    /// assertion, returning each case's full comparison report.
+    ///
+    /// The assertion in [`e63_observations_with_config_and_batch_size`] is
+    /// strictly stronger than the divergence envelope this project has already
+    /// reviewed, so any law whose fixture happens to reach a legitimate
+    /// cross-engine difference dies inside the shared harness before its own
+    /// equivalence relation is ever evaluated. That is the correct default —
+    /// twelve laws depend on it and it is unchanged — but it makes one class
+    /// of finding impossible to record: a divergence the law exists to
+    /// measure.
+    ///
+    /// This seam is per-case opt-in, which is what the DIV-007 ruling
+    /// prescribes ("the comparator's default config REMAINS zero-tolerance;
+    /// campaign lanes ... opt in"). A caller taking it MUST state the
+    /// exclusion in its registry descriptor; silently routing a law here to
+    /// dodge a red comparison would be gate self-weakening.
+    #[cfg(feature = "perf-harness")]
+    async fn e63_runs_with_config_and_batch_size(
+        cx: &Cx,
+        documents: &[frankensearch_core::IndexableDocument],
+        cases: &[(&str, &str)],
+        seed: u64,
+        generator_id: &str,
+        subject_config: QuillConfig,
+        batch_size: usize,
+    ) -> Vec<(String, ComparisonReport)> {
         assert!(batch_size > 0, "E6.3 ingest batch size must be non-zero");
         let mut subject = qg_position_mode_subject_with_config(true, subject_config);
         let mut oracle = qg_position_mode_oracle(true);
@@ -3238,23 +3299,7 @@ mod tests {
                 .run(cx, &subject, &oracle, &case)
                 .await
                 .unwrap_or_else(|error| panic!("E6.3 case {case_id} failed: {error}"));
-            assert_eq!(
-                run.comparison.status,
-                ComparisonStatus::Exact,
-                "E6.3 cross-engine case {case_id}: {:?}",
-                run.comparison.divergences,
-            );
-            assert_eq!(
-                run.comparison.rank_class,
-                RankClass::RankExact,
-                "E6.3 cross-engine case {case_id}: {:?}",
-                run.comparison.divergences,
-            );
-            observations.push((
-                case_id.to_owned(),
-                run.comparison.subject,
-                run.comparison.oracle,
-            ));
+            observations.push((case_id.to_owned(), run.comparison));
         }
         observations
     }
@@ -7793,6 +7838,207 @@ mod tests {
                 }
             }
         });
+    }
+
+    /// E6.3 law `e6.3-three-term-or-associativity-v1`: three distinct
+    /// unboosted optional scalar `OR` operands re-associate WITHIN each
+    /// engine, under the same score-insensitive projection the `AND` law
+    /// declares. Its cross-engine scope is deliberately excluded, and this
+    /// test measures the reason rather than asserting it.
+    ///
+    /// WHY THE LAW IS NOT CROSS-ENGINE. LavenderElk found that the BASELINE
+    /// spelling `(alpha OR gamma) OR delta` — no transform applied — already
+    /// diverges between Quill and the pinned oracle: same document, same rank,
+    /// `doc-4@3fdc09b7` versus `3fdc09b6`. The divergence is a property of
+    /// that operand triple, not of re-association, and `(alpha OR beta) OR
+    /// gamma` compares cleanly. It is registered on
+    /// `bd-quill-e6-gauntlet-scale-rm3q.8.1` and is NOT classified here: by
+    /// the register's own text a 3-leaf pure-disjunctive shape is supposed to
+    /// be bit-exact and outside DIV-007, so this fixture is evidence that
+    /// either the shape is not spliceable in the sense the entry means or the
+    /// entry's boundary is too strong. Answering that is the register owner's
+    /// call, not this lane's.
+    ///
+    /// So the law declares `[Quill, Tantivy]` and the cross-engine cell is
+    /// omitted rather than claimed. The exclusion is EARNED, not asserted:
+    /// this test measures the cross-engine comparison through the opt-in seam
+    /// and requires the divergence to still be there and still be one ULP. If
+    /// it ever becomes exact, this test fails and the scope must be widened;
+    /// if it ever grows, this test fails and it is a different finding.
+    #[cfg(feature = "perf-harness")]
+    #[test]
+    fn e63_three_term_or_associates_within_each_engine_while_cross_engine_stays_registered() {
+        use frankensearch_core::IndexableDocument;
+
+        const SEEDS: [u64; 3] = [
+            0xe63_055d_c0aa_5eed,
+            0xe63_055d_c0aa_5eee,
+            0xe63_055d_c0aa_5eef,
+        ];
+        let documents = vec![
+            IndexableDocument::new("doc-1", "alpha beta beta").with_title("guide"),
+            IndexableDocument::new("doc-2", "alpha gamma").with_title("alpha overview"),
+            IndexableDocument::new("doc-3", "beta gamma gamma gamma").with_title("alpha"),
+            IndexableDocument::new("doc-4", "alpha beta gamma delta").with_title("reference"),
+            IndexableDocument::new("doc-5", "delta epsilon").with_title("quiet"),
+        ];
+
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let mut cross_engine_divergences = 0_u32;
+            for ((first, second, third), seed) in [
+                (("alpha", "beta", "gamma"), SEEDS[0]),
+                (("alpha", "gamma", "delta"), SEEDS[1]),
+                (("beta", "gamma", "delta"), SEEDS[2]),
+            ] {
+                let left_grouped = format!("({first} OR {second}) OR {third}");
+                let right_grouped = format!("{first} OR ({second} OR {third})");
+                e63_assert_regrouping_precondition(
+                    &left_grouped,
+                    &right_grouped,
+                    &[first, second, third],
+                );
+
+                let baseline = e63_or_associativity_runs(
+                    &cx,
+                    &documents,
+                    &[("three-term-or-assoc", left_grouped.as_str())],
+                    seed,
+                )
+                .await;
+                let regrouped = e63_or_associativity_runs(
+                    &cx,
+                    &documents,
+                    &[("three-term-or-assoc", right_grouped.as_str())],
+                    seed,
+                )
+                .await;
+                let baseline_case = baseline.first().expect("E6.3 baseline OR-assoc fixture");
+                let regrouped_case = regrouped.first().expect("E6.3 regrouped OR-assoc fixture");
+                assert_eq!(
+                    baseline_case.0, regrouped_case.0,
+                    "E6.3 seed {seed:#x} OR-assoc case identity drifted"
+                );
+
+                // THE LAW, per engine, under the declared projection.
+                for (engine, before, after) in [
+                    (
+                        "Quill",
+                        &baseline_case.1.subject,
+                        &regrouped_case.1.subject,
+                    ),
+                    ("Tantivy", &baseline_case.1.oracle, &regrouped_case.1.oracle),
+                ] {
+                    let (equivalent, score_bit_distance) =
+                        e63_reassociation_projection(before, after);
+                    assert!(
+                        equivalent,
+                        "E6.3 {engine} seed {seed:#x} OR association changed the projected observation"
+                    );
+                    assert!(
+                        score_bit_distance <= 1,
+                        "E6.3 {engine} seed {seed:#x} excluded a {score_bit_distance}-ULP score \
+                         shift under OR association; re-measure before widening the projection"
+                    );
+                }
+
+                // THE EXCLUSION, measured on the UN-transformed spelling so it
+                // cannot be blamed on re-association.
+                let (cross_equivalent, cross_distance) = e63_reassociation_projection(
+                    &baseline_case.1.oracle,
+                    &baseline_case.1.subject,
+                );
+                assert!(
+                    cross_equivalent,
+                    "E6.3 seed {seed:#x} cross-engine OR baseline diverged in RANKED DOCUMENTS, \
+                     not just scores; that is outside the registered finding and must be \
+                     investigated rather than excluded"
+                );
+                assert!(
+                    cross_distance <= 1,
+                    "E6.3 seed {seed:#x} cross-engine OR baseline score distance grew to \
+                     {cross_distance} ULP; the registered rm3q.8.1 finding is one ULP"
+                );
+                if cross_distance == 1 {
+                    cross_engine_divergences += 1;
+                }
+            }
+            assert!(
+                cross_engine_divergences >= 1,
+                "E6.3 no cross-engine OR divergence reproduced; the registered rm3q.8.1 finding \
+                 has gone away, so the cross-engine scope must be re-analysed rather than left \
+                 excluded"
+            );
+        });
+    }
+
+    /// E6.3 planted invalid for OR associativity: re-grouping across MIXED
+    /// operators is not an associativity transform, and the declared
+    /// projection must reject it. Without this the law's projection could be
+    /// weakened to something that accepts anything and still look green.
+    #[cfg(feature = "perf-harness")]
+    #[test]
+    fn e63_three_term_or_mixed_operator_regrouping_is_rejected_by_the_projection() {
+        use frankensearch_core::IndexableDocument;
+
+        const SEED: u64 = 0xe63_055d_c0aa_5eed;
+        let documents = vec![
+            IndexableDocument::new("doc-1", "alpha beta beta").with_title("guide"),
+            IndexableDocument::new("doc-2", "alpha gamma").with_title("alpha overview"),
+            IndexableDocument::new("doc-3", "beta gamma gamma gamma").with_title("alpha"),
+            IndexableDocument::new("doc-4", "alpha beta gamma delta").with_title("reference"),
+            IndexableDocument::new("doc-5", "delta epsilon").with_title("quiet"),
+        ];
+
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let baseline = e63_or_associativity_runs(
+                &cx,
+                &documents,
+                &[("three-term-or-assoc", "(alpha OR beta) OR gamma")],
+                SEED,
+            )
+            .await;
+            let mutated = e63_or_associativity_runs(
+                &cx,
+                &documents,
+                &[("three-term-or-assoc", "alpha OR (beta AND gamma)")],
+                SEED,
+            )
+            .await;
+            let baseline_case = baseline.first().expect("E6.3 baseline OR-assoc fixture");
+            let mutated_case = mutated.first().expect("E6.3 mutated OR-assoc fixture");
+            for (engine, before, after) in [
+                ("Quill", &baseline_case.1.subject, &mutated_case.1.subject),
+                ("Tantivy", &baseline_case.1.oracle, &mutated_case.1.oracle),
+            ] {
+                let (equivalent, _) = e63_reassociation_projection(before, after);
+                assert!(
+                    !equivalent,
+                    "E6.3 {engine} projection accepted a mixed-operator regrouping as OR \
+                     association, so it is too weak to carry this law"
+                );
+            }
+        });
+    }
+
+    /// The OR-associativity law's opt-in into the non-asserting seam, in ONE
+    /// place so the exclusion is auditable rather than scattered.
+    #[cfg(feature = "perf-harness")]
+    async fn e63_or_associativity_runs(
+        cx: &Cx,
+        documents: &[frankensearch_core::IndexableDocument],
+        cases: &[(&str, &str)],
+        seed: u64,
+    ) -> Vec<(String, ComparisonReport)> {
+        e63_runs_with_config_and_batch_size(
+            cx,
+            documents,
+            cases,
+            seed,
+            "e6.3-three-term-or-associativity-v1",
+            e55_config(),
+            documents.len(),
+        )
+        .await
     }
 
     /// E6.3 law: on the position-capable scalar fixture, a quoted single term
