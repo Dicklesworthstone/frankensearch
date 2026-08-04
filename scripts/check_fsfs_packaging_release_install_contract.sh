@@ -1031,6 +1031,22 @@ require(
     "release-publish must require both build jobs and verify the exact six artifact/checksum pairs",
 )
 
+# bd-0zrer: the contract's Required Reason Codes list declares
+# release.build.missing_target and release.publish.asset_upload_failed, but the
+# release lanes emitted only their own release.inventory.* vocabulary, so both
+# declared codes had no emitter anywhere in the repo. Gate them here, or a later
+# edit silently drops them again and no test notices.
+require(
+    "release.build.missing_target:" in release
+    and "release.build.missing_target:" in lite,
+    "both release build jobs must emit release.build.missing_target when a target artifact is absent",
+)
+require(
+    "release.publish.asset_upload_failed:" in release_publish
+    and "steps.publish_release.outcome == 'failure'" in release_publish,
+    "release-publish must emit release.publish.asset_upload_failed when asset upload fails",
+)
+
 for forbidden in ("--models-only", "embedded-models", "FRANKENSEARCH_BUNDLED_MODELS_SOURCE_DIR"):
     require(
         forbidden not in crates_publish,
