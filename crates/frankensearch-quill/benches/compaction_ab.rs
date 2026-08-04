@@ -305,7 +305,7 @@ fn main() {
     let document_count = scale.document_count();
     let rounds = scale.rounds();
     eprintln!(
-        "[gate] scale={} documents={} densities={:?} zero_density=FORBIDDEN max_compaction_to_rebuild_ratio={MAX_COMPACTION_TO_REBUILD_RATIO:.2} null_must_bracket_one=true decidable=true",
+        "[gate] scale={} documents={} densities={:?} zero_density=FORBIDDEN max_compaction_to_rebuild_ratio={MAX_COMPACTION_TO_REBUILD_RATIO:.2} null_must_be_unbiased=true decidable=true",
         scale.label(),
         document_count,
         DENSITY_PERCENTAGES,
@@ -338,10 +338,14 @@ fn main() {
         );
         print_ratio("null", &case, null);
         print_ratio("lever", &case, lever);
-        let null_brackets_one = null.p5 <= 1.0 && null.p95 >= 1.0;
+        // `decidable_against` already requires an admissible control; this is
+        // reported separately so a HOLD names which half failed. It used to be
+        // an independent `p5 <= 1.0 <= p95` straddle test, which vetoed a null
+        // for being tight rather than for being wrong (`bd-pjh09`).
+        let null_admissible = null.is_admissible_null();
         let decidable = lever.decidable_against(&null);
         let throughput_keep = decidable && lever.median <= MAX_COMPACTION_TO_REBUILD_RATIO;
-        evidence_admissible &= null_brackets_one;
+        evidence_admissible &= null_admissible;
         all_throughput_keep &= throughput_keep;
         let decision = if throughput_keep {
             "KEEP"

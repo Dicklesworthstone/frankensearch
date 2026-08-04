@@ -110,11 +110,22 @@ struct RatioDistribution {
     round_pairs: usize,
 }
 impl RatioDistribution {
-    fn null_contains_one(self) -> bool {
-        self.p5 <= 1.0 && 1.0 <= self.p95
+    /// Largest `|median - 1|` an A/A control may show and still be admissible.
+    /// Mirrors `frankensearch_core::bench_support::NULL_MEDIAN_TOLERANCE`.
+    const NULL_MEDIAN_TOLERANCE: f64 = 0.02;
+
+    /// A/A control admissibility: gate the null's accuracy, never its precision.
+    ///
+    /// Requiring `p5 <= 1.0 <= p95` vetoed a null for being *tight*: the
+    /// narrower its spread, the likelier it excluded 1.0 — however small the
+    /// bias and however large the effect (`bd-pjh09`). The spread still sets
+    /// the effect floor below; only the median says whether the sampler itself
+    /// is trustworthy.
+    fn null_is_unbiased(self) -> bool {
+        (self.median - 1.0).abs() <= Self::NULL_MEDIAN_TOLERANCE
     }
     fn verdict_against(self, null: Self) -> &'static str {
-        if !null.null_contains_one() {
+        if !null.null_is_unbiased() {
             "BIASED_NULL_UNDECIDABLE"
         } else if self.median < null.p5 {
             "COLUMNAR_FASTER"
@@ -255,7 +266,7 @@ fn main() {
             "[paired] n={n} dim={dim} columnar_vs_row median={:.4} p5={:.4} p95={:.4}",
             lever.median, lever.p5, lever.p95
         );
-        let faster = null.null_contains_one() && lever.median < null.p5;
+        let faster = null.null_is_unbiased() && lever.median < null.p5;
         all_faster &= faster;
         eprintln!(
             "[gate] n={n} dim={dim} verdict={} columnar_speedup={:.4}x faster={faster}",

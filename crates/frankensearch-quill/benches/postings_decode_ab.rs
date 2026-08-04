@@ -130,8 +130,14 @@ fn configured_inner() -> u32 {
     }
 }
 
+/// Classify a lever against its A/A control.
+///
+/// Admissibility of the control is delegated to the shared helper, which gates
+/// the null's accuracy. This used to re-derive it as `p5 <= 1.0 <= p95`, a
+/// clause that vetoed a null for being *tight* rather than for being wrong
+/// (`bd-pjh09`). The null's raw spread is still the effect floor below.
 fn classify(null: &PairedRatio, lever: &PairedRatio) -> GateVerdict {
-    if !(null.p5 <= 1.0 && 1.0 <= null.p95) {
+    if !null.is_admissible_null() {
         GateVerdict::InvalidNull
     } else if lever.median < 1.0 && lever.median < null.p5 {
         GateVerdict::Win
