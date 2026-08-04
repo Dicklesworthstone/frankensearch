@@ -9999,7 +9999,7 @@ pub struct BorrowedStoredMetaSection<'a> {
     total_len: usize,
 }
 
-impl<'a> BorrowedStoredMetaSection<'a> {
+impl BorrowedStoredMetaSection<'_> {
     /// Exact durable length of the section this will emit.
     #[must_use]
     pub const fn len(&self) -> usize {
