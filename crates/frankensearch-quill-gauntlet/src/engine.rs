@@ -1616,7 +1616,15 @@ fn quill_observation_from_validated_results(
         snippets: BTreeMap::new(),
         match_count,
         doc_count: observed.doc_count,
-        ast_differences: Vec::new(),
+        // Subject-side only. The oracle builders below keep an empty vector
+        // because the pinned Tantivy parser emits no structured diagnostics to
+        // project; that asymmetry is stated verbatim inside each emitted
+        // difference rather than inferred from an empty oracle vector.
+        // `observed` and `evidence` were already required to agree on
+        // diagnostics above, so either source is the same value.
+        ast_differences: crate::comparator::ast_differences_from_quill_diagnostics(
+            &observed.diagnostics,
+        ),
     })
 }
 

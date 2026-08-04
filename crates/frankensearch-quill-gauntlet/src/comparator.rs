@@ -6917,6 +6917,92 @@ pub struct AstDifference {
     pub subject: String,
 }
 
+/// Recorded verbatim in every `AstDifference::oracle` this producer emits.
+///
+/// The pinned oracle's compatibility parser emits no structured recovery
+/// diagnostics at all, so the oracle side of a lowering comparison is
+/// UNOBSERVABLE, not empty. Saying so verbatim is the binding condition of the
+/// D1(c) ruling: an empty string would let silence read as agreement, and a
+/// reader six months from now cannot tell those apart from the artifact alone.
+///
+/// The register's symmetry claims (DIV-004) continue to rest on their own named
+/// fixtures — argus scorer proofs and parser pins — never on this field.
+pub const ORACLE_LOWERING_UNOBSERVABLE: &str =
+    "oracle lowering unobservable: the pinned Tantivy compatibility parser emits no structured recovery diagnostics";
+
+/// Map one Quill parser diagnostic to its reviewed register lowering class.
+///
+/// EXHAUSTIVE BY CONSTRUCTION, with no wildcard arm, which is the point: adding
+/// a kind to `QueryDiagnosticKind` breaks THIS BUILD until someone rules where
+/// it belongs. That fails closed at the point of change — where it costs one
+/// compile error — instead of at the point of observation, where the same
+/// caution would flip every currently-green campaign lane red (D1(b)).
+///
+/// `None` here means UNRULED, never "benign". A kind returning `None` produces
+/// no divergence today only because no reviewed register entry describes it
+/// yet; each arm names what would have to be decided.
+pub const fn ast_lowering_kind(
+    kind: frankensearch_quill::query::QueryDiagnosticKind,
+) -> Option<AstLoweringKind> {
+    use frankensearch_quill::query::QueryDiagnosticKind;
+    match kind {
+        // RULED: register DIV-004 states this lowering, its consumer impact and
+        // its acceptance. Currently INERT in campaigns — the public parser caps
+        // queries at MAX_QUERY_LENGTH (10,000) before a term can reach
+        // MAX_TERM_BYTES (65,530) — and landed anyway for the tripwire above.
+        QueryDiagnosticKind::TermLengthLimit => Some(AstLoweringKind::OversizedQueryToken),
+        // UNRULED: fires on ordinary public queries and would flood the register
+        // on its own; needs an entry bounding which recoveries are semantic.
+        QueryDiagnosticKind::SyntaxRecovery => None,
+        // UNRULED: the strongest live-registrable candidate (bd-y8ozo) — Quill
+        // shortens at 10,000 bytes while the oracle receives the whole string.
+        QueryDiagnosticKind::Truncated => None,
+        // UNRULED: whether an absent field is a divergence depends on the
+        // schema contract the campaign declares, not on the parser.
+        QueryDiagnosticKind::UnknownField => None,
+        // UNRULED: the analyzer mismatch is a harness configuration fault more
+        // often than an engine divergence.
+        QueryDiagnosticKind::UnsupportedField => None,
+        // UNRULED: dropping a fragment changes matching, but the reviewed shapes
+        // are not yet separated from the benign ones.
+        QueryDiagnosticKind::DroppedFragment => None,
+        // UNRULED: currently indistinguishable from an unparseable literal, so a
+        // register entry could not state its cause. See the second silent site
+        // noted on bd-quill-e6-gauntlet-scale-rm3q.8 (query.rs lower_typed_value).
+        QueryDiagnosticKind::InvalidTypedValue => None,
+        // UNRULED: register DIV-005 covers non-finite boosts, but on parser pins
+        // rather than on this diagnostic; binding them needs that entry revised.
+        QueryDiagnosticKind::InvalidBoost => None,
+        // UNRULED: the repair is Quill's deliberate, reviewed complement
+        // semantics (DIV-001, fixed) — a divergence only if the oracle differs.
+        QueryDiagnosticKind::AllNegativeRepair => None,
+        // UNRULED: a depth cap reached is a bound, not yet a reviewed class.
+        QueryDiagnosticKind::DepthLimit => None,
+    }
+}
+
+/// Project Quill's parser diagnostics into recorded lowering differences.
+///
+/// Subject-only by construction: the oracle cannot report, so every emitted
+/// difference states that verbatim rather than implying agreement. The
+/// diagnostic's `fragment` is deliberately NOT carried — it is the only field
+/// that can hold caller query text, and this value travels into artifacts that
+/// the redaction policy governs.
+pub fn ast_differences_from_quill_diagnostics(
+    diagnostics: &[frankensearch_quill::query::QueryDiagnostic],
+) -> Vec<AstDifference> {
+    diagnostics
+        .iter()
+        .filter_map(|diagnostic| {
+            ast_lowering_kind(diagnostic.kind).map(|kind| AstDifference {
+                kind,
+                oracle: ORACLE_LOWERING_UNOBSERVABLE.to_owned(),
+                subject: format!("quill parser diagnostic: {}", diagnostic.message),
+            })
+        })
+        .collect()
+}
+
 /// Query-count observation. Missing evidence is never treated as zero.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -10104,6 +10190,111 @@ mod tests {
         // The classified pointer resolves in the serialized artifact.
         let projection = serde_json::json!({ "comparison": &report });
         assert!(projection.pointer(&report.divergences[0].pointer).is_some());
+    }
+
+    /// The D1(b) mapping, pinned kind by kind.
+    ///
+    /// Exhaustiveness is enforced by the compiler — `ast_lowering_kind` has no
+    /// wildcard arm, so a new `QueryDiagnosticKind` breaks the build. What a
+    /// test can add is the RULING itself: exactly one kind maps today, and the
+    /// rest are unruled rather than benign. If someone quietly maps another
+    /// kind, this fails and they have to come back to the bead.
+    #[test]
+    fn only_the_ruled_diagnostic_kind_maps_to_a_register_lowering() {
+        use frankensearch_quill::query::QueryDiagnosticKind;
+
+        assert_eq!(
+            ast_lowering_kind(QueryDiagnosticKind::TermLengthLimit),
+            Some(AstLoweringKind::OversizedQueryToken),
+            "the DIV-004 lowering is the one ruled mapping"
+        );
+        for unruled in [
+            QueryDiagnosticKind::Truncated,
+            QueryDiagnosticKind::SyntaxRecovery,
+            QueryDiagnosticKind::UnknownField,
+            QueryDiagnosticKind::UnsupportedField,
+            QueryDiagnosticKind::DroppedFragment,
+            QueryDiagnosticKind::InvalidTypedValue,
+            QueryDiagnosticKind::InvalidBoost,
+            QueryDiagnosticKind::AllNegativeRepair,
+            QueryDiagnosticKind::DepthLimit,
+        ] {
+            assert_eq!(
+                ast_lowering_kind(unruled),
+                None,
+                "{unruled:?} is UNRULED; mapping it needs a reviewed register entry first"
+            );
+        }
+    }
+
+    /// D1(c) option (i): the oracle's silence is recorded, never implied.
+    ///
+    /// The projection must also stay payload-free — the diagnostic's `fragment`
+    /// is the one field that can carry caller query text, and it must not reach
+    /// an artifact through this path.
+    #[test]
+    fn a_projected_lowering_states_the_oracle_is_unobservable_and_carries_no_payload() {
+        use frankensearch_quill::query::{QueryDiagnostic, QueryDiagnosticKind};
+
+        let secret = "sensitive-caller-fragment";
+        let differences = ast_differences_from_quill_diagnostics(&[
+            QueryDiagnostic {
+                kind: QueryDiagnosticKind::TermLengthLimit,
+                message: "analyzed term exceeds the admitted term-length bound; branch lowered to match-nothing"
+                    .to_owned(),
+                byte_offset: Some(7),
+                fragment: Some(secret.to_owned()),
+            },
+            // Control: an unruled kind in the same batch contributes nothing, so
+            // the count below is attributable to the ruling, not to the loop.
+            QueryDiagnostic {
+                kind: QueryDiagnosticKind::SyntaxRecovery,
+                message: "recovered".to_owned(),
+                byte_offset: None,
+                fragment: None,
+            },
+        ]);
+
+        assert_eq!(differences.len(), 1, "only the ruled kind projects");
+        assert_eq!(differences[0].kind, AstLoweringKind::OversizedQueryToken);
+        assert_eq!(
+            differences[0].oracle, ORACLE_LOWERING_UNOBSERVABLE,
+            "the oracle field must carry the unobservability statement verbatim"
+        );
+        assert!(
+            !differences[0].oracle.is_empty() && differences[0].oracle.contains("unobservable"),
+            "an empty or vague oracle field would let silence read as agreement"
+        );
+        assert!(
+            !differences[0].subject.contains(secret) && !differences[0].oracle.contains(secret),
+            "the diagnostic fragment must never travel into an artifact projection"
+        );
+    }
+
+    /// A subject with no mapped diagnostics stays exactly as it was.
+    ///
+    /// This is the inertness control the D1(b) ruling relies on: wiring the
+    /// projection into the live subject builder must not, on its own, turn a
+    /// green campaign lane into a classified divergence.
+    #[test]
+    fn unruled_diagnostics_leave_the_comparison_untouched() {
+        use frankensearch_quill::query::{QueryDiagnostic, QueryDiagnosticKind};
+
+        let mut subject = observation(vec![quill_hit("a", 5.0, 1)]);
+        subject.ast_differences = ast_differences_from_quill_diagnostics(&[QueryDiagnostic {
+            kind: QueryDiagnosticKind::SyntaxRecovery,
+            message: "recovered a stray operator".to_owned(),
+            byte_offset: Some(3),
+            fragment: None,
+        }]);
+        assert!(subject.ast_differences.is_empty());
+
+        let oracle = observation(vec![tantivy_hit("a", 5.0, 1)]);
+        let report = compare_observations(subject, oracle, ComparatorConfig::default())
+            .expect("unruled-diagnostic comparison");
+
+        assert_eq!(report.status, ComparisonStatus::Exact);
+        assert!(report.divergences.is_empty());
     }
 
     #[test]
