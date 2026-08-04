@@ -3007,6 +3007,21 @@ impl PerfQuarantineRegister {
         }
     }
 
+    /// Load the register that belongs to a `.bench-history`-style directory.
+    ///
+    /// Callers own the history directory, not the register's file name, so this
+    /// is the call the promotion path wants: it keeps
+    /// [`PERF_QUARANTINE_FILE_NAME`] an implementation detail of this module
+    /// instead of a string every call site has to repeat and keep in sync.
+    ///
+    /// # Errors
+    ///
+    /// Same contract as [`Self::load`]: an absent register is empty, a present
+    /// but unreadable or malformed one is an error.
+    pub fn load_from_history_dir(history_dir: &Path) -> Result<Self, EvidenceArtifactError> {
+        Self::load(&history_dir.join(PERF_QUARANTINE_FILE_NAME))
+    }
+
     /// The record quarantining `git_revision`, when one exists.
     #[must_use]
     pub fn quarantine_of(&self, git_revision: &str) -> Option<&PerfQuarantineRecord> {
@@ -4429,9 +4444,8 @@ mod tests {
         ));
 
         let directory = tempfile::tempdir().expect("absent register directory");
-        let absent =
-            PerfQuarantineRegister::load(&directory.path().join(PERF_QUARANTINE_FILE_NAME))
-                .expect("an absent register is an empty register");
+        let absent = PerfQuarantineRegister::load_from_history_dir(directory.path())
+            .expect("an absent register is an empty register");
         assert!(absent.records().is_empty());
     }
 
