@@ -8101,15 +8101,40 @@ mod tests {
         });
     }
 
-    /// E6.3 lifecycle law: a duplicate-ID batch is rejected before either row
-    /// publishes. Deleting that ID afterwards must therefore be the same
-    /// lifecycle as deleting an ID that was never added: it returns `false`
-    /// and leaves the total lexical observation empty. The paired invalid
-    /// fixture admits one unique row first; its delete must return `true` so
-    /// equal empty terminal search results cannot mask an incorrect relation.
+    /// E6.3 `e6.3-duplicate-then-delete-v1`: the law's precondition is
+    /// UNSATISFIABLE on the live scalar writer, and this test is the
+    /// measurement that earns its `SkipWithReason`.
+    ///
+    /// The law wants the bead's contractual sequence: a duplicate-ID batch is
+    /// rejected before either row publishes, so deleting that ID afterwards is
+    /// the same lifecycle as deleting an ID that was never added. Measured on
+    /// the shipping writer, every step of that sentence fails:
+    ///
+    ///   1. the rejection leaves `has_uncommitted_changes()` true — the serial
+    ///      route accumulates each row and only then detects the duplicate, so
+    ///      the batch's EARLIER rows stay staged;
+    ///   2. `delete_document` is therefore refused with an exact typed error,
+    ///      so the transform cannot even be executed at that point;
+    ///   3. the next `commit()` succeeds and PUBLISHES the staged first row —
+    ///      `doc_count` becomes 1. The rejected ID is live, not never-added;
+    ///   4. so its delete then reports `true`, while the never-added control
+    ///      reports `false`. The two lifecycles diverge at the delete itself.
+    ///
+    /// Step 3 is an engine finding, not a fixture problem: an ingest that
+    /// returned `Err` still publishes part of its batch on the next commit.
+    /// It is filed as its own blocker —
+    /// `bd-quill-rejected-ingest-publishes-partial-batch-aihri` — rather than
+    /// absorbed here, and this law stays a skip until that blocker is ruled
+    /// on. Weakening the law to
+    /// "membership only" or committing before the delete would both hide the
+    /// partial publication instead of reporting it.
+    ///
+    /// The registry assertion at the end binds this measurement to the
+    /// descriptor, so the skip cannot be flipped back to `Applies` without
+    /// re-running the measurement that justifies it.
     #[cfg(feature = "perf-harness")]
     #[test]
-    fn e63_duplicate_then_delete_seed_matrix_replays_never_added_lifecycle() {
+    fn e63_duplicate_then_delete_precondition_fails_because_a_rejected_batch_publishes() {
         use frankensearch_core::IndexableDocument;
         use frankensearch_quill::index::QuillIndexError;
 
@@ -8149,22 +8174,62 @@ mod tests {
                     .expect("E6.3 open rejected duplicate lifecycle campaign")
                     .index_documents(&cx, &[original, duplicate])
                     .await
-                    .expect_err("E6.3 duplicate batch must reject atomically");
+                    .expect_err("E6.3 duplicate batch must be rejected");
                 assert!(matches!(
                     duplicate_error,
                     QuillIndexError::InvalidState { ref detail }
                         if detail.contains("duplicate live document id")
                 ));
+                // 1. The rejected batch left its earlier row staged.
+                assert!(
+                    rejected
+                        .index()
+                        .expect("E6.3 read rejected duplicate lifecycle campaign")
+                        .has_uncommitted_changes(),
+                    "E6.3 seed {seed:#x} rejected batch must be measured, not assumed, to leave staged rows"
+                );
+
+                // 2. So the transform's own operation is refused, exactly.
+                let refusal = rejected
+                    .index_mut()
+                    .expect("E6.3 rejected duplicate campaign remains open")
+                    .delete_document(&cx, &document_id)
+                    .await
+                    .expect_err("E6.3 delete after a rejected duplicate batch must be refused");
+                assert!(
+                    matches!(
+                        refusal,
+                        QuillIndexError::InvalidState { ref detail }
+                            if detail == "delete_document requires a fully committed scalar index"
+                    ),
+                    "E6.3 seed {seed:#x} unexpected refusal: {refusal:?}"
+                );
+
+                // 3. THE BLOCKER: committing after the rejection publishes the
+                //    staged first row. The batch is atomic against automatic
+                //    publication only, never against the caller's next commit.
+                rejected
+                    .index_mut()
+                    .expect("E6.3 rejected duplicate campaign remains open")
+                    .commit(&cx)
+                    .await
+                    .expect("E6.3 commit after a rejected duplicate batch");
+                assert_eq!(
+                    rejected
+                        .index()
+                        .expect("E6.3 read rejected duplicate lifecycle campaign")
+                        .doc_count(),
+                    1,
+                    "E6.3 seed {seed:#x} a rejected ingest must not publish part of its batch"
+                );
+
+                // 4. And so the two lifecycles diverge at the delete itself.
                 let rejected_delete = rejected
                     .index_mut()
                     .expect("E6.3 rejected duplicate campaign remains open")
                     .delete_document(&cx, &document_id)
                     .await
-                    .expect("E6.3 delete after rejected duplicate batch");
-                assert!(
-                    !rejected_delete,
-                    "E6.3 seed {seed:#x} rejected duplicate ID must remain never-added"
-                );
+                    .expect("E6.3 delete the published row of the rejected batch");
                 rejected
                     .mark_committed()
                     .expect("E6.3 publish rejected duplicate lifecycle campaign");
@@ -8194,7 +8259,20 @@ mod tests {
                     .observe(&cx, &case)
                     .await
                     .expect("E6.3 observe never-added lifecycle campaign");
-                let comparison = compare_observations(
+
+                assert_ne!(
+                    rejected_delete, never_added_delete,
+                    "E6.3 seed {seed:#x} the two lifecycles are measured as DIFFERENT; if they \
+                     ever agree, re-measure the blocker and revisit the registry skip"
+                );
+
+                // WHY THE PROJECTION MATTERS. Both terminal corpora are empty,
+                // so a law projected on the searchable corpus alone compares
+                // Exact here and would report this transform as holding. It is
+                // the typed delete outcome above that shows it does not. This
+                // is the "equal empty terminal results mask an incorrect
+                // relation" trap the original law warned about, measured.
+                let masked = compare_observations(
                     rejected_observation,
                     never_added_observation,
                     ComparatorConfig::default(),
@@ -8202,8 +8280,8 @@ mod tests {
                 .unwrap_or_else(|error| {
                     panic!("E6.3 seed {seed:#x} lifecycle comparison failed: {error}")
                 });
-                assert_eq!(comparison.status, ComparisonStatus::Exact);
-                assert_eq!(comparison.rank_class, RankClass::RankExact);
+                assert_eq!(masked.status, ComparisonStatus::Exact);
+                assert_eq!(masked.rank_class, RankClass::RankExact);
 
                 let unique = IndexableDocument::new(
                     document_id.clone(),
@@ -8236,6 +8314,23 @@ mod tests {
                     "E6.3 seed {seed:#x} planted unique admission must not satisfy never-added relation"
                 );
             }
+
+            // Bind the measurement to the declaration. A future change that
+            // makes the rejected batch leave nothing staged must come here,
+            // re-run this test, and flip the descriptor deliberately.
+            let descriptor = crate::runner::MetamorphicLawRegistry::scalar_g1a_v1()
+                .laws
+                .into_iter()
+                .find(|law| law.id == "e6.3-duplicate-then-delete-v1")
+                .expect("E6.3 registry declares the duplicate-then-delete law");
+            assert_eq!(
+                descriptor.applicability,
+                crate::runner::MetamorphicLawApplicability::SkipWithReason {
+                    reason:
+                        crate::runner::MetamorphicSkipReason::RejectedIngestPublishesPartialBatch,
+                },
+                "the measurement above is the only thing that justifies this law's skip"
+            );
         });
     }
 

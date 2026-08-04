@@ -339,10 +339,12 @@ mod tests {
 /// Runner lifecycle capabilities the maintenance laws depend on.
 ///
 /// Declared as data so a law's precondition is an EXECUTABLE GATE rather than a
-/// sentence in a descriptor. The registry currently records each maintenance law
-/// as `SkipWithReason`, and a prose precondition cannot be checked — which means
-/// nothing detects the day the capability arrives, and nothing detects the day
-/// it silently regresses either.
+/// sentence in a descriptor. A prose precondition cannot be checked — which
+/// means nothing detects the day the capability arrives, and nothing detects
+/// the day it silently regresses either. The registry recorded all three laws
+/// as `SkipWithReason` until the in-tree executors witnessed the operations;
+/// `the_registry_matches_the_capabilities_the_in_tree_executors_witness` now
+/// keeps the shipped declaration and this gate from drifting apart.
 ///
 /// Every field defaults to `false`: a runner must positively declare a
 /// capability to gain it. A default of `true` would make a runner that forgot to
@@ -376,6 +378,41 @@ impl MaintenanceRunnerCapabilities {
             deterministic_merge_scheduling: false,
             durable_reopen_lifecycle: false,
             compaction_statistics_parity: false,
+        }
+    }
+
+    /// What the in-tree gauntlet executors actually witness.
+    ///
+    /// This is the set [`crate::runner::MetamorphicLawRegistry::scalar_g1a_v1`]
+    /// declares, and every flag here is earned by a live witness asserted in
+    /// the SAME invocation that performs the operation — never by a runner
+    /// asserting its own competence:
+    ///
+    /// - `deterministic_merge_scheduling` <-
+    ///   `merge_schedule_law_tests::the_merge_capability_flip_is_earned_by_a_witnessed_merge`
+    ///   (`merges_executed >= 1`), with
+    ///   `merge_execution_tests::direct_concat_merge_changes_geometry_but_not_the_observable_corpus`
+    ///   proving the merge is a real `QuillIndex::concat_merge` whose sealed
+    ///   segment count falls to one.
+    /// - `durable_reopen_lifecycle` <-
+    ///   `reopen_recovery_law_tests::the_reopen_capability_flip_is_earned_by_a_witnessed_recovery`
+    ///   (`reopens_executed >= 1`, read from the FRESH instance off disk).
+    /// - `compaction_statistics_parity` <-
+    ///   `tombstone_compaction_law_tests::the_tombstone_capability_flip_is_earned_by_a_witnessed_compaction`
+    ///   (`compactions_with_work >= 1`), with
+    ///   `compaction_restores_never_added_statistics` and its control
+    ///   `without_the_compaction_step_the_total_projection_diverges` showing
+    ///   compaction — not a narrowed projection — is what discharges the
+    ///   score sensitivity the skip reason named.
+    ///
+    /// A runner that does not execute those operations must keep using
+    /// [`Self::none`]: the flags describe measured behaviour, not intent.
+    #[must_use]
+    pub const fn in_tree_live_executors() -> Self {
+        Self {
+            deterministic_merge_scheduling: true,
+            durable_reopen_lifecycle: true,
+            compaction_statistics_parity: true,
         }
     }
 
@@ -589,6 +626,44 @@ mod capability_tests {
                 .iter()
                 .all(|entry| entry.applicability == MetamorphicLawApplicability::Applies),
             "a fully capable runner must make every maintenance law applicable"
+        );
+    }
+
+    /// The shipped registry and the declared capabilities are ONE decision.
+    ///
+    /// `MetamorphicLawRegistry::scalar_g1a_v1` writes the three maintenance
+    /// cells as literals because it is production code and this capability
+    /// type is test-only. That split is exactly how a registry drifts into
+    /// claiming coverage a runner no longer has, so the two are pinned
+    /// together here: if a capability is withdrawn, this test fails until the
+    /// registry admits the corresponding skip, and if someone flips a registry
+    /// cell by hand it fails until a capability is honestly declared.
+    ///
+    /// The capabilities themselves are not taken on trust either — each is
+    /// earned by a witnessed operation in `the_*_capability_flip_is_earned_by_*`.
+    #[test]
+    fn the_registry_matches_the_capabilities_the_in_tree_executors_witness() {
+        let declared = MaintenanceRunnerCapabilities::in_tree_live_executors()
+            .applicability_matrix()
+            .into_iter()
+            .map(|entry| (entry.law_id, entry.applicability))
+            .collect::<Vec<_>>();
+        let registry = crate::runner::MetamorphicLawRegistry::scalar_g1a_v1();
+        let registered = declared
+            .iter()
+            .map(|(law_id, _)| {
+                let law = registry
+                    .laws
+                    .iter()
+                    .find(|law| &law.id == law_id)
+                    .unwrap_or_else(|| panic!("the registry must still declare {law_id}"));
+                (law.id.clone(), law.applicability)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            registered, declared,
+            "the shipped registry and the witnessed capabilities disagree about the \
+             index-maintenance laws"
         );
     }
 }

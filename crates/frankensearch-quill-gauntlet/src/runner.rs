@@ -476,6 +476,15 @@ pub enum MetamorphicSkipReason {
     PositionsUnavailable,
     /// The scalar-G1A preconditions do not hold for the selected profile.
     ProfileOutsideScalarG1a,
+    /// A scalar ingest that returned `Err` still leaves its earlier rows
+    /// staged, so the next `commit()` publishes part of the rejected batch.
+    ///
+    /// This blocks any law whose transform requires a rejected ID to remain
+    /// never-added: the delete is refused while the rows are staged, and once
+    /// committed the ID is live. Measured in
+    /// `engine::tests::e63_duplicate_then_delete_precondition_fails_because_a_rejected_batch_publishes`
+    /// and filed as `bd-quill-rejected-ingest-publishes-partial-batch-aihri`.
+    RejectedIngestPublishesPartialBatch,
 }
 
 /// Applicability result for one law/scope pair before execution.
@@ -557,9 +566,17 @@ pub struct MetamorphicLawSummary {
 impl MetamorphicLawRegistry {
     /// Returns the current qualified scalar-G1A E6.3 declaration.
     ///
-    /// Lifecycle and corpus-statistics-sensitive transforms remain registered
-    /// as explicit skips until a runner can execute their declared projection;
-    /// they are deliberately not omitted or treated as passing.
+    /// A transform whose declared projection cannot be executed is registered
+    /// as an explicit skip — never omitted, never treated as passing.
+    ///
+    /// The three index-maintenance laws are applicable because the in-tree
+    /// executors witness the operations their preconditions name. That is not
+    /// asserted here: `metamorphic_maintenance_laws::capability_tests::
+    /// the_registry_matches_the_capabilities_the_in_tree_executors_witness`
+    /// pins these three cells against
+    /// `MaintenanceRunnerCapabilities::in_tree_live_executors()`, and each
+    /// capability in that set is earned by a live witness in the same
+    /// invocation that performs the merge, the recovery, or the compaction.
     #[must_use]
     pub fn scalar_g1a_v1() -> Self {
         let law = |id: &str,
@@ -607,9 +624,9 @@ impl MetamorphicLawRegistry {
                 law(
                     "e6.3-duplicate-live-id-rejection-v1",
                     "e6.3-duplicate-live-id-rejection-v1",
-                    "scalar Quill live-ID uniqueness contract",
+                    "scalar Quill live-ID uniqueness contract, observed with NO commit between the rejection and the observation",
                     "typed lifecycle error plus published corpus observation",
-                    "duplicate input is rejected without partial publication",
+                    "duplicate input is rejected without partial publication into the observed snapshot; a later commit does publish the staged row, which is e6.3-duplicate-then-delete-v1's blocker",
                     "none",
                     "e63-duplicate-live-id-positive",
                     "e63-duplicate-live-id-partial-publication",
@@ -619,14 +636,16 @@ impl MetamorphicLawRegistry {
                 MetamorphicLawDescriptor {
                     id: "e6.3-duplicate-then-delete-v1".to_owned(),
                     generator_id: "e6.3-duplicate-then-delete-v1".to_owned(),
-                    applicability: MetamorphicLawApplicability::Applies,
-                    preconditions: "an atomically rejected duplicate-ID batch followed by deletion of that never-published ID".to_owned(),
+                    applicability: MetamorphicLawApplicability::SkipWithReason {
+                        reason: MetamorphicSkipReason::RejectedIngestPublishesPartialBatch,
+                    },
+                    preconditions: "a rejected duplicate-ID batch that leaves no staged row behind, so the rejected ID can still be deleted as a never-added ID".to_owned(),
                     observable_projection: "typed delete outcome plus total lexical observation".to_owned(),
-                    equivalence_relation: "rejected duplicate then delete is equivalent to a never-added ID only when delete reports absent".to_owned(),
+                    equivalence_relation: "rejected duplicate then delete would equal a never-added ID; unreachable while a rejected batch stages its earlier rows".to_owned(),
                     allowed_divergence: "none".to_owned(),
                     positive_fixture_id: "e63-duplicate-then-delete-positive".to_owned(),
                     invalid_fixture_id: "e63-duplicate-then-delete-unique-admission".to_owned(),
-                    replay_test: "engine::tests::e63_duplicate_then_delete_seed_matrix_replays_never_added_lifecycle".to_owned(),
+                    replay_test: "engine::tests::e63_duplicate_then_delete_precondition_fails_because_a_rejected_batch_publishes".to_owned(),
                     shrinker_id: "e6.3-total-lexical-ddmin-v1".to_owned(),
                     scopes: vec![MetamorphicLawScope::Quill],
                 },
@@ -775,51 +794,56 @@ impl MetamorphicLawRegistry {
                 MetamorphicLawDescriptor {
                     id: "e6.3-merge-schedule-v1".to_owned(),
                     generator_id: "e6.3-merge-schedule-v1".to_owned(),
-                    applicability: MetamorphicLawApplicability::SkipWithReason {
-                        reason: MetamorphicSkipReason::LifecycleCapabilityUnavailable,
-                    },
-                    preconditions: "runner-exposed deterministic merge scheduling".to_owned(),
+                    applicability: MetamorphicLawApplicability::Applies,
+                    preconditions:
+                        "a witnessed concat-merge (sealed segment count provably falls) at a chosen point in a seeded schedule"
+                            .to_owned(),
                     observable_projection: "total lexical observation".to_owned(),
                     equivalence_relation: "same committed corpus under a different merge schedule"
                         .to_owned(),
-                    allowed_divergence: "none".to_owned(),
+                    allowed_divergence: "tie_order".to_owned(),
                     positive_fixture_id: "e63-merge-schedule-positive".to_owned(),
                     invalid_fixture_id: "e63-merge-schedule-content-mutation".to_owned(),
-                    replay_test: "pending runner lifecycle hook".to_owned(),
+                    replay_test:
+                        "metamorphic_maintenance_laws::live_shrink_replay_tests::a_failing_merge_fixture_shrinks_and_still_reproduces_live"
+                            .to_owned(),
                     shrinker_id: "e6.3-total-lexical-ddmin-v1".to_owned(),
                     scopes: vec![MetamorphicLawScope::Quill],
                 },
                 MetamorphicLawDescriptor {
                     id: "e6.3-reopen-recovery-v1".to_owned(),
                     generator_id: "e6.3-reopen-recovery-v1".to_owned(),
-                    applicability: MetamorphicLawApplicability::SkipWithReason {
-                        reason: MetamorphicSkipReason::LifecycleCapabilityUnavailable,
-                    },
-                    preconditions: "runner-exposed durable reopen/recovery lifecycle".to_owned(),
+                    applicability: MetamorphicLawApplicability::Applies,
+                    preconditions:
+                        "a witnessed durable recovery: a fresh instance opened on the same directory reports the corpus off disk"
+                            .to_owned(),
                     observable_projection: "total lexical observation".to_owned(),
                     equivalence_relation: "same committed corpus before and after reopen"
                         .to_owned(),
-                    allowed_divergence: "none".to_owned(),
+                    allowed_divergence: "tie_order".to_owned(),
                     positive_fixture_id: "e63-reopen-recovery-positive".to_owned(),
                     invalid_fixture_id: "e63-reopen-recovery-corrupt-state".to_owned(),
-                    replay_test: "pending runner lifecycle hook".to_owned(),
+                    replay_test:
+                        "metamorphic_maintenance_laws::live_shrink_replay_tests::a_failing_reopen_fixture_shrinks_and_still_reproduces_live"
+                            .to_owned(),
                     shrinker_id: "e6.3-total-lexical-ddmin-v1".to_owned(),
                     scopes: vec![MetamorphicLawScope::Quill],
                 },
                 MetamorphicLawDescriptor {
                     id: "e6.3-tombstone-compaction-v1".to_owned(),
                     generator_id: "e6.3-tombstone-compaction-v1".to_owned(),
-                    applicability: MetamorphicLawApplicability::SkipWithReason {
-                        reason: MetamorphicSkipReason::ScoreSensitiveCorpusStatistics,
-                    },
-                    preconditions: "a score-insensitive projection approved by the runner"
-                        .to_owned(),
+                    applicability: MetamorphicLawApplicability::Applies,
+                    preconditions:
+                        "a witnessed compaction (CompactionReport drops rows), which restores never-added corpus statistics instead of projecting around them"
+                            .to_owned(),
                     observable_projection: "total lexical observation".to_owned(),
                     equivalence_relation: "same live corpus before and after compaction".to_owned(),
-                    allowed_divergence: "none".to_owned(),
+                    allowed_divergence: "tie_order".to_owned(),
                     positive_fixture_id: "e63-tombstone-compaction-positive".to_owned(),
                     invalid_fixture_id: "e63-tombstone-compaction-extra-delete".to_owned(),
-                    replay_test: "pending score-insensitive runner projection".to_owned(),
+                    replay_test:
+                        "metamorphic_maintenance_laws::live_shrink_replay_tests::a_failing_tombstone_fixture_shrinks_and_still_reproduces_live"
+                            .to_owned(),
                     shrinker_id: "e6.3-total-lexical-ddmin-v1".to_owned(),
                     scopes: vec![MetamorphicLawScope::Quill],
                 },
@@ -9225,11 +9249,22 @@ mod tests {
             }),
             "the shipping LexicalWrite replacement law must remain applicable; reverting it to a capability skip would erase live coverage"
         );
+        // The tombstone law is applicable because the in-tree executor
+        // COMPACTS, which is what discharges the score sensitivity its old
+        // skip reason named; a runner declaring nothing still skips it, which
+        // `metamorphic_maintenance_laws::capability_tests` pins separately.
         assert!(matrix.iter().any(|entry| {
             entry.law_id == "e6.3-tombstone-compaction-v1"
+                && entry.applicability == MetamorphicLawApplicability::Applies
+        }));
+        // The registry must still declare at least one honest skip, or the
+        // "a skip is never a pass" plant below would have nothing to plant on
+        // and would silently stop testing anything.
+        assert!(matrix.iter().any(|entry| {
+            entry.law_id == "e6.3-duplicate-then-delete-v1"
                 && entry.applicability
                     == MetamorphicLawApplicability::SkipWithReason {
-                        reason: MetamorphicSkipReason::ScoreSensitiveCorpusStatistics,
+                        reason: MetamorphicSkipReason::RejectedIngestPublishesPartialBatch,
                     }
         }));
         let results = matrix
