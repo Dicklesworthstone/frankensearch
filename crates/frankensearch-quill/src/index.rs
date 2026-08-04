@@ -23,6 +23,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use arc_swap::{ArcSwap, ArcSwapOption};
 use asupersync::Cx;
 use asupersync::runtime::spawn_blocking;
+#[cfg(test)]
+use asupersync::runtime::yield_now;
 use asupersync::sync::{LockError, Mutex, OwnedMutexGuard, TryLockError};
 use frankensearch_core::{
     DocId, IndexableDocument, LexicalCandidateBatch, LexicalHydrationContext, LexicalRead,
@@ -61,9 +63,10 @@ use crate::grimoire::{
 #[cfg(feature = "durability")]
 use crate::keeper::UnrepairableSegmentPolicy;
 use crate::keeper::{
-    CURRENT_ENGINE_VERSION, CompactionPolicy, CompactionReport, KeeperError, KeeperSnapshot,
-    KeeperWriter, MANIFEST_FLAG_BULK_MODE_IN_PROGRESS, Manifest, ManifestFieldStats,
-    ManifestSegment, RecoveredSegment, TierMergePolicy, TierPolicyError, TombstoneSet,
+    BlueGreenEngine, CURRENT_ENGINE_VERSION, CompactionPolicy, CompactionReport, CurrentPointer,
+    CurrentPointerError, KeeperError, KeeperSnapshot, KeeperWriter, LexicalLayout,
+    MANIFEST_FLAG_BULK_MODE_IN_PROGRESS, Manifest, ManifestFieldStats, ManifestSegment,
+    RecoveredSegment, TierMergePolicy, TierPolicyError, TombstoneSet, inspect_lexical_layout,
     plan_tier_merge, validate_manifest_successor,
 };
 use crate::query::{
@@ -111,6 +114,9 @@ pub enum QuillIndexError {
     /// Keeper admission, recovery, or publication failed.
     #[error(transparent)]
     Keeper(#[from] KeeperError),
+    /// A lexical-root CURRENT pointer or layout could not be validated.
+    #[error(transparent)]
+    CurrentPointer(#[from] CurrentPointerError),
     /// FSLX framing or section access failed.
     #[error(transparent)]
     Quill(#[from] QuillError),
@@ -3862,6 +3868,51 @@ pub struct QuillIndex {
 pub struct QuillSearchIndex {
     reader: QuillReader,
     directory: PathBuf,
+}
+
+/// Read-only Quill handle bound to a lexical root rather than one engine
+/// directory.
+///
+/// A blue-green publication changes `<root>/CURRENT`, not the MANIFEST inside
+/// a fixed child. This facade resolves and validates that pointer afresh on
+/// every refresh, then atomically replaces the entire reader state. Searches
+/// clone the active [`Arc`] before beginning, so a search already in flight
+/// remains pinned to its prior engine generation.
+#[derive(Clone)]
+pub struct RootBoundQuillSearchIndex {
+    lexical_root: PathBuf,
+    config: QuillConfig,
+    state: Arc<ArcSwap<RootBoundQuillReaderState>>,
+    #[cfg(test)]
+    refresh_pause: Arc<RootRefreshPause>,
+}
+
+struct RootBoundQuillReaderState {
+    reader: Arc<QuillSearchIndex>,
+    active_path: PathBuf,
+    pointer: Option<CurrentPointer>,
+    generation: u64,
+}
+
+#[cfg(test)]
+#[derive(Default)]
+struct RootRefreshPause {
+    enabled: AtomicBool,
+    arrived: AtomicBool,
+    release: AtomicBool,
+}
+
+#[cfg(test)]
+impl RootRefreshPause {
+    async fn wait_before_swap(&self) {
+        if !self.enabled.load(Ordering::Acquire) {
+            return;
+        }
+        self.arrived.store(true, Ordering::Release);
+        while !self.release.load(Ordering::Acquire) {
+            yield_now().await;
+        }
+    }
 }
 
 /// Read-only in-memory handle for conformance schemas with their own parser.
@@ -9310,6 +9361,165 @@ impl QuillIndex {
     }
 }
 
+impl RootBoundQuillSearchIndex {
+    /// Open a read-only Quill reader from a lexical root.
+    ///
+    /// Direct Quill roots remain readable for migration compatibility. A
+    /// blue-green root must carry a published, Quill-backed `CURRENT`; an
+    /// unadopted child is deliberately rejected because this read-only API
+    /// never writes `CURRENT` on a caller's behalf.
+    ///
+    /// # Errors
+    ///
+    /// Returns typed layout, cancellation, recovery, schema, or parser
+    /// failures. No writer lease is acquired and the lexical root is never
+    /// mutated.
+    pub async fn open(
+        cx: &Cx,
+        lexical_root: impl Into<PathBuf>,
+        config: QuillConfig,
+    ) -> Result<Self, QuillIndexError> {
+        let lexical_root = lexical_root.into();
+        let state = Self::open_state(cx, &lexical_root, &config).await?;
+        Ok(Self {
+            lexical_root,
+            config,
+            state: Arc::new(ArcSwap::from_pointee(state)),
+            #[cfg(test)]
+            refresh_pause: Arc::default(),
+        })
+    }
+
+    /// Lexical root whose `CURRENT` pointer is followed on refresh.
+    #[must_use]
+    pub fn lexical_root(&self) -> &Path {
+        &self.lexical_root
+    }
+
+    /// Active Quill engine directory currently pinned by this reader.
+    #[must_use]
+    pub fn active_path(&self) -> PathBuf {
+        self.state.load().active_path.clone()
+    }
+
+    /// Durable MANIFEST generation currently pinned by this reader.
+    #[must_use]
+    pub fn keeper_generation(&self) -> u64 {
+        self.state.load().generation
+    }
+
+    /// Refresh this reader from the lexical root's current layout.
+    ///
+    /// The replacement is fully inspected and opened before the final
+    /// cancellation check and one atomic state swap. Therefore cancellation,
+    /// a malformed `CURRENT`, a missing engine directory, or an invalid Quill
+    /// snapshot always leave the previous reader live for in-flight and later
+    /// searches.
+    ///
+    /// # Errors
+    ///
+    /// Returns typed cancellation, layout, recovery, schema, or
+    /// snapshot-transition failures. A generation regression within the same
+    /// active engine directory is rejected.
+    pub async fn refresh(&self, cx: &Cx) -> Result<bool, QuillIndexError> {
+        check_cancel(cx, "root-bound reader refresh")?;
+        let replacement = Self::open_state(cx, &self.lexical_root, &self.config).await?;
+        self.install_validated_replacement(cx, replacement).await
+    }
+
+    /// Install one replacement that has already passed root-layout and Quill
+    /// snapshot validation. Keeping this visibility boundary separate makes
+    /// cancellation linearizable: no mutable reader state is touched before
+    /// the final check immediately preceding the `ArcSwap` store.
+    async fn install_validated_replacement(
+        &self,
+        cx: &Cx,
+        replacement: RootBoundQuillReaderState,
+    ) -> Result<bool, QuillIndexError> {
+        #[cfg(test)]
+        self.refresh_pause.wait_before_swap().await;
+
+        check_cancel(cx, "root-bound reader refresh swap")?;
+        let current = self.state.load_full();
+        if replacement.active_path == current.active_path {
+            if replacement.generation < current.generation {
+                return Err(invalid_state(format!(
+                    "root-bound refresh regressed Quill generation from {} to {} at {}",
+                    current.generation,
+                    replacement.generation,
+                    current.active_path.display()
+                )));
+            }
+            if replacement.generation == current.generation
+                && replacement.pointer == current.pointer
+            {
+                return Ok(false);
+            }
+        }
+
+        self.state.store(Arc::new(replacement));
+        Ok(true)
+    }
+
+    async fn open_state(
+        cx: &Cx,
+        lexical_root: &Path,
+        config: &QuillConfig,
+    ) -> Result<RootBoundQuillReaderState, QuillIndexError> {
+        check_cancel(cx, "root-bound reader layout inspection")?;
+        let root_for_inspection = lexical_root.to_path_buf();
+        let layout = spawn_blocking(move || inspect_lexical_layout(&root_for_inspection)).await??;
+        check_cancel(cx, "root-bound reader layout inspection")?;
+
+        let (active_path, pointer) = match layout {
+            LexicalLayout::DirectQuill => (lexical_root.to_path_buf(), None),
+            LexicalLayout::BlueGreen {
+                pointer,
+                pointer_on_disk: true,
+            } if pointer.engine() == BlueGreenEngine::Quill => {
+                let active_path = pointer.engine_dir(lexical_root);
+                (active_path, Some(pointer))
+            }
+            LexicalLayout::BlueGreen {
+                pointer,
+                pointer_on_disk: false,
+            } => {
+                return Err(invalid_state(format!(
+                    "lexical root {} has an unadopted {} child {:?}; read-only open refuses to publish CURRENT",
+                    lexical_root.display(),
+                    pointer.engine().label(),
+                    pointer.dir_name()
+                )));
+            }
+            LexicalLayout::BlueGreen { pointer, .. } => {
+                return Err(invalid_state(format!(
+                    "lexical root {} CURRENT selects {}, but this reader only supports Quill",
+                    lexical_root.display(),
+                    pointer.engine().label()
+                )));
+            }
+            layout => {
+                return Err(invalid_state(format!(
+                    "lexical root {} has {} layout; refusing to select an engine",
+                    lexical_root.display(),
+                    layout.label()
+                )));
+            }
+        };
+
+        let reader =
+            Arc::new(QuillSearchIndex::open(cx, active_path.clone(), config.clone()).await?);
+        check_cancel(cx, "root-bound reader validation")?;
+        let generation = reader.keeper_generation();
+        Ok(RootBoundQuillReaderState {
+            reader,
+            active_path,
+            pointer,
+            generation,
+        })
+    }
+}
+
 impl SegmentStatsProvider for QuillIndex {
     fn segment_stats(&self) -> SegmentStats {
         self.reader.segment_stats()
@@ -9319,6 +9529,12 @@ impl SegmentStatsProvider for QuillIndex {
 impl SegmentStatsProvider for QuillSearchIndex {
     fn segment_stats(&self) -> SegmentStats {
         self.reader.segment_stats()
+    }
+}
+
+impl SegmentStatsProvider for RootBoundQuillSearchIndex {
+    fn segment_stats(&self) -> SegmentStats {
+        self.state.load().reader.segment_stats()
     }
 }
 
@@ -9630,6 +9846,49 @@ impl LexicalRead for QuillSearchIndex {
 
     fn doc_count(&self) -> usize {
         usize::try_from(Self::doc_count(self)).unwrap_or(usize::MAX)
+    }
+}
+
+/// The root-bound reader pins the complete active reader in each returned
+/// future. A blue-green refresh may replace `CURRENT` concurrently, but that
+/// cannot redirect an already-admitted search to a different engine.
+impl LexicalRead for RootBoundQuillSearchIndex {
+    fn search<'a>(
+        &'a self,
+        cx: &'a Cx,
+        query: &'a str,
+        limit: usize,
+    ) -> SearchFuture<'a, Vec<ScoredResult>> {
+        let reader = Arc::clone(&self.state.load_full().reader);
+        Box::pin(async move { LexicalRead::search(reader.as_ref(), cx, query, limit).await })
+    }
+
+    fn search_candidates<'a>(
+        &'a self,
+        cx: &'a Cx,
+        query: &'a str,
+        limit: usize,
+    ) -> SearchFuture<'a, LexicalCandidateBatch> {
+        let reader = Arc::clone(&self.state.load_full().reader);
+        Box::pin(
+            async move { LexicalRead::search_candidates(reader.as_ref(), cx, query, limit).await },
+        )
+    }
+
+    fn hydrate_candidates<'a>(
+        &'a self,
+        cx: &'a Cx,
+        context: Option<&'a LexicalHydrationContext>,
+        results: &'a mut [ScoredResult],
+    ) -> SearchFuture<'a, ()> {
+        let reader = Arc::clone(&self.state.load_full().reader);
+        Box::pin(async move {
+            LexicalRead::hydrate_candidates(reader.as_ref(), cx, context, results).await
+        })
+    }
+
+    fn doc_count(&self) -> usize {
+        self.state.load().reader.doc_count()
     }
 }
 
@@ -13013,6 +13272,183 @@ mod tests {
             deterministic_ingest: true,
             ..QuillConfig::default()
         }
+    }
+
+    async fn create_root_generation(
+        cx: &Cx,
+        lexical_root: &Path,
+        name: &str,
+        document_id: &str,
+        content: &str,
+    ) -> PathBuf {
+        let path = lexical_root.join(name);
+        let index = QuillIndex::create(cx, &path, deterministic_config())
+            .await
+            .expect("create root-bound generation");
+        LexicalWrite::index_document(&index, cx, &IndexableDocument::new(document_id, content))
+            .await
+            .expect("index root-bound fixture document");
+        LexicalWrite::commit(&index, cx)
+            .await
+            .expect("commit root-bound fixture document");
+        path
+    }
+
+    fn root_pointer(name: &str) -> CurrentPointer {
+        CurrentPointer::new(
+            BlueGreenEngine::Quill,
+            name,
+            crate::segment::FSLX_FORMAT_VERSION,
+        )
+        .expect("valid root-bound Quill pointer")
+    }
+
+    #[test]
+    fn root_bound_reader_refreshes_to_the_current_blue_green_generation() {
+        let root = tempfile::tempdir().expect("root-bound reader directory");
+        let lexical_root = root.path().to_path_buf();
+        let cx = Cx::for_testing();
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .blocking_threads(1, 4)
+            .build()
+            .expect("build root-bound reader runtime");
+
+        runtime.block_on(async {
+            let v1 =
+                create_root_generation(&cx, &lexical_root, "quill-v1", "old", "old token").await;
+            publish_current(&lexical_root, &root_pointer("quill-v1"))
+                .expect("publish first root generation");
+            let reader =
+                RootBoundQuillSearchIndex::open(&cx, &lexical_root, deterministic_config())
+                    .await
+                    .expect("open root-bound reader");
+            assert_eq!(reader.active_path(), v1);
+            assert_eq!(
+                LexicalRead::search(&reader, &cx, "old", 10)
+                    .await
+                    .expect("search first generation")[0]
+                    .doc_id,
+                "old"
+            );
+
+            let v2 =
+                create_root_generation(&cx, &lexical_root, "quill-v2", "new", "new token").await;
+            publish_current(&lexical_root, &root_pointer("quill-v2"))
+                .expect("publish replacement root generation");
+            assert!(reader.refresh(&cx).await.expect("refresh root reader"));
+            assert_eq!(reader.active_path(), v2);
+            assert_eq!(
+                LexicalRead::search(&reader, &cx, "new", 10)
+                    .await
+                    .expect("search replacement generation")[0]
+                    .doc_id,
+                "new"
+            );
+            assert!(
+                LexicalRead::search(&reader, &cx, "old", 10)
+                    .await
+                    .expect("search replacement generation")
+                    .is_empty(),
+                "refresh must switch the root reader rather than reopening the original child"
+            );
+        });
+    }
+
+    #[test]
+    fn labruntime_cancel_before_root_bound_swap_retains_the_old_reader() {
+        let root = tempfile::tempdir().expect("root-bound cancellation directory");
+        let lexical_root = root.path().to_path_buf();
+        let setup_cx = Cx::for_testing();
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .blocking_threads(1, 4)
+            .build()
+            .expect("build root-bound cancellation runtime");
+
+        let (reader, replacement) = runtime.block_on(async {
+            create_root_generation(&setup_cx, &lexical_root, "quill-v1", "old", "old token").await;
+            publish_current(&lexical_root, &root_pointer("quill-v1"))
+                .expect("publish first root generation");
+            let reader =
+                RootBoundQuillSearchIndex::open(&setup_cx, &lexical_root, deterministic_config())
+                    .await
+                    .expect("open root-bound reader");
+            create_root_generation(&setup_cx, &lexical_root, "quill-v2", "new", "new token").await;
+            publish_current(&lexical_root, &root_pointer("quill-v2"))
+                .expect("publish replacement root generation");
+            let replacement = RootBoundQuillSearchIndex::open_state(
+                &setup_cx,
+                &lexical_root,
+                &deterministic_config(),
+            )
+            .await
+            .expect("open and validate replacement before Lab cancellation");
+            (reader, replacement)
+        });
+        let pause = Arc::clone(&reader.refresh_pause);
+        pause.enabled.store(true, Ordering::Release);
+        let refresh_cx = Arc::new(Cx::for_testing());
+        let cancelled = Arc::new(AtomicBool::new(false));
+
+        let mut lab = LabRuntime::new(LabConfig::new(0x8a02_0002).max_steps(100_000));
+        let region = lab.state.create_root_region(Budget::INFINITE);
+        let refresh_reader = reader.clone();
+        let refresh_context = Arc::clone(&refresh_cx);
+        let refresh_cancelled = Arc::clone(&cancelled);
+        let (refresh, _) = lab
+            .state
+            .create_task(region, Budget::INFINITE, async move {
+                assert!(matches!(
+                    refresh_reader
+                        .install_validated_replacement(refresh_context.as_ref(), replacement)
+                        .await,
+                    Err(QuillIndexError::Cancelled {
+                        phase: "root-bound reader refresh swap"
+                    })
+                ));
+                refresh_cancelled.store(true, Ordering::SeqCst);
+            })
+            .expect("create root-bound refresh task");
+
+        let cancel_context = Arc::clone(&refresh_cx);
+        let cancel_pause = Arc::clone(&pause);
+        let (canceller, _) = lab
+            .state
+            .create_task(region, Budget::INFINITE, async move {
+                while !cancel_pause.arrived.load(Ordering::Acquire) {
+                    yield_now().await;
+                }
+                cancel_context.set_cancel_requested(true);
+                cancel_pause.release.store(true, Ordering::Release);
+            })
+            .expect("create root-bound cancellation task");
+
+        lab.scheduler.lock().schedule(refresh, 0);
+        lab.scheduler.lock().schedule(canceller, 0);
+        let report = lab.run_until_quiescent_with_report();
+        assert!(cancelled.load(Ordering::SeqCst));
+        assert!(report.quiescent, "root-bound refresh schedule must quiesce");
+        assert!(
+            report.oracle_report.all_passed(),
+            "root-bound refresh oracles must pass"
+        );
+        assert!(report.invariant_violations.is_empty());
+
+        runtime.block_on(async {
+            assert_eq!(reader.active_path(), lexical_root.join("quill-v1"));
+            assert_eq!(
+                LexicalRead::search(&reader, &setup_cx, "old", 10)
+                    .await
+                    .expect("old reader remains usable after cancellation")[0]
+                    .doc_id,
+                "old"
+            );
+            assert!(
+                LexicalRead::search(&reader, &setup_cx, "new", 10)
+                    .await
+                    .expect("cancelled refresh leaves old generation active")
+                    .is_empty()
+            );
+        });
     }
 
     #[cfg(all(feature = "bench-internals", feature = "conformance-internals"))]
