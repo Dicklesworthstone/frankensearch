@@ -3131,6 +3131,11 @@ mod tests {
     /// distance is returned so the caller can witness it, and a caller that
     /// finds it growing beyond the measured one ULP is looking at a different
     /// effect than the one this projection was declared for.
+    ///
+    /// `e6.3-three-term-or-associativity-v1` also uses it in a second role —
+    /// to MEASURE the cross-engine cell it excludes, rather than to apply a
+    /// law across engines. Measuring an excluded cell keeps the exclusion
+    /// earned; it does not make the projection a cross-engine relation.
     #[cfg(feature = "perf-harness")]
     fn e63_reassociation_projection(
         before: &EngineObservation,
