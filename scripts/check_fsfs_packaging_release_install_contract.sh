@@ -449,7 +449,16 @@ installer_write_stub() {
   cat >"$path" <<STUB
 #!/bin/sh
 case "\${1:-}" in
-  version|--version) printf 'fsfs $version\n' ;;
+  version|--version)
+    # Lets a case fail post-install validation only: the staged copy still
+    # verifies, the copy running from the destination does not.
+    if [ -n "\${FSFS_STUB_FAIL_FROM_DEST:-}" ]; then
+      case "\$0" in
+        *"\${FSFS_STUB_FAIL_FROM_DEST}"*) exit 1 ;;
+      esac
+    fi
+    printf 'fsfs $version\n'
+    ;;
   download-models)
     if [ "\${2:-}" = "--verify" ]; then exit "\${FSFS_STUB_VERIFY_STATUS:-0}"; fi
     exit "\${FSFS_STUB_DOWNLOAD_STATUS:-0}"
@@ -563,6 +572,204 @@ check_installer_offline_e2e() {
     echo "[installer][OK]   offline install without a checksum fails closed"
   else
     echo "[installer][FAIL] offline checksum gate status=$status output=${output:-<empty>}"
+    FAILURES=$((FAILURES + 1))
+  fi
+
+  rm -rf "$work"
+}
+
+# Contract "Integrity and Signature Policy" + "Upgrade UX Expectations": every
+# required reason code that the installer owns must have a real emitter.
+check_installer_release_policy() {
+  local installer="$ROOT_DIR/install.sh"
+  local installer_shell="${FSFS_INSTALL_TEST_BASH:-bash}"
+  local work status output archive
+
+  echo "[installer] exercising signature policy, upgrade paths, and rollback"
+  work=$(mktemp -d)
+  archive="$work/fsfs-1.0.0-local.tar.gz"
+  printf 'archive-bytes\n' >"$archive"
+
+  # --- release.package.checksum_failed ---------------------------------------
+  status=0
+  output=$(FSFS_INSTALL_CONTRACT_TEST=1 NO_COLOR=1 "$installer_shell" "$installer" \
+    checksum "$archive" "$(printf '0%.0s' {1..64})" 2>&1) || status=$?
+  if [[ "$status" -ne 0 && "$output" == *"release.package.checksum_failed"* ]]; then
+    echo "[installer][OK]   a checksum mismatch emits release.package.checksum_failed"
+  else
+    echo "[installer][FAIL] checksum reason code missing status=$status output=${output:-<empty>}"
+    FAILURES=$((FAILURES + 1))
+  fi
+
+  # --- install.verify.signature_missing --------------------------------------
+  status=0
+  output=$(FSFS_INSTALL_CONTRACT_TEST=1 NO_COLOR=1 "$installer_shell" "$installer" \
+    signature "$archive" 2>&1) || status=$?
+  if [[ "$status" -eq 0 && "$output" == *"install.verify.signature_missing"* ]]; then
+    echo "[installer][OK]   an unsigned archive warns install.verify.signature_missing, not silent success"
+  else
+    echo "[installer][FAIL] missing signature not reported status=$status output=${output:-<empty>}"
+    FAILURES=$((FAILURES + 1))
+  fi
+
+  printf 'signature\n' >"$archive.sig"
+  printf 'certificate\n' >"$archive.pem"
+
+  # A signed archive with no verifier present must say so rather than claim success.
+  status=0
+  output=$(env FSFS_INSTALL_COSIGN=fsfs-verifier-that-does-not-exist NO_COLOR=1 \
+    FSFS_INSTALL_CONTRACT_TEST=1 "$installer_shell" "$installer" signature "$archive" 2>&1) || status=$?
+  if [[ "$status" -eq 0 && "$output" == *"install.verify.signature_unverifiable"* ]]; then
+    echo "[installer][OK]   a signed archive without cosign reports that it went unverified"
+  else
+    echo "[installer][FAIL] absent verifier not reported status=$status output=${output:-<empty>}"
+    FAILURES=$((FAILURES + 1))
+  fi
+
+  # --- signature verification failure MUST abort -----------------------------
+  local fake_bin="$work/fakebin"
+  mkdir -p "$fake_bin"
+  printf '#!/bin/sh\nexit 1\n' >"$fake_bin/cosign"
+  chmod 0755 "$fake_bin/cosign"
+  status=0
+  output=$(env "FSFS_INSTALL_COSIGN=$fake_bin/cosign" NO_COLOR=1 FSFS_INSTALL_CONTRACT_TEST=1 \
+    "$installer_shell" "$installer" signature "$archive" 2>&1) || status=$?
+  if [[ "$status" -ne 0 && "$output" == *"install.verify.signature_invalid"* ]]; then
+    echo "[installer][OK]   a failing signature aborts before the destination is replaced"
+  else
+    echo "[installer][FAIL] invalid signature admitted status=$status output=${output:-<empty>}"
+    FAILURES=$((FAILURES + 1))
+  fi
+
+  printf '#!/bin/sh\nexit 0\n' >"$fake_bin/cosign"
+  status=0
+  output=$(env "FSFS_INSTALL_COSIGN=$fake_bin/cosign" NO_COLOR=1 FSFS_INSTALL_CONTRACT_TEST=1 \
+    "$installer_shell" "$installer" signature "$archive" 2>&1) || status=$?
+  if [[ "$status" -eq 0 && "$output" == *"Signature verified"* ]]; then
+    echo "[installer][OK]   a valid signature is admitted"
+  else
+    echo "[installer][FAIL] valid signature rejected status=$status output=${output:-<empty>}"
+    FAILURES=$((FAILURES + 1))
+  fi
+
+  # --- upgrade path classification -------------------------------------------
+  local path_case installed target expected actual
+  while IFS='|' read -r installed target expected; do
+    [ -n "$expected" ] || continue
+    actual=$(FSFS_INSTALL_CONTRACT_TEST=1 "$installer_shell" "$installer" \
+      upgrade-path "$installed" "$target" 2>/dev/null || true)
+    if [[ "$actual" == "$expected" ]]; then
+      echo "[installer][OK]   upgrade path '${installed:-<none>}' -> $target = $expected"
+    else
+      echo "[installer][FAIL] upgrade path '${installed:-<none>}' -> $target expected=$expected actual=${actual:-<error>}"
+      FAILURES=$((FAILURES + 1))
+    fi
+  done <<'PATHS'
+|v1.4.0|fresh
+fsfs 1.4.0|v1.4.0|same
+fsfs 1.3.0|v1.4.0|upgrade
+fsfs 1.2.0|v1.4.0|upgrade
+fsfs 2.0.0|v1.4.0|downgrade
+fsfs 1.4.1|v1.4.0|downgrade
+fsfs dev|v1.4.0|unknown
+PATHS
+
+  # --- rollback --------------------------------------------------------------
+  local backup="$work/backup-bin" live="$work/live-bin"
+  printf 'previous\n' >"$backup"
+  printf 'broken\n' >"$live"
+  chmod 0755 "$backup" "$live"
+  status=0
+  output=$(FSFS_INSTALL_CONTRACT_TEST=1 NO_COLOR=1 "$installer_shell" "$installer" \
+    rollback "$backup" "$live" "post-install validation failed" 2>&1) || status=$?
+  if [[ "$status" -eq 0 && "$output" == *"upgrade.apply.rollback_triggered"* ]] \
+    && [[ "$(cat "$live")" == "previous" ]]; then
+    echo "[installer][OK]   rollback restores the previous binary and emits upgrade.apply.rollback_triggered"
+  else
+    echo "[installer][FAIL] rollback did not restore status=$status output=${output:-<empty>}"
+    FAILURES=$((FAILURES + 1))
+  fi
+
+  status=0
+  output=$(FSFS_INSTALL_CONTRACT_TEST=1 NO_COLOR=1 "$installer_shell" "$installer" \
+    rollback "$work/absent-backup" "$live" "post-install validation failed" 2>&1) || status=$?
+  if [[ "$status" -ne 0 && "$output" == *"upgrade.apply.rollback_triggered"* \
+    && "$output" == *"no previous"* ]]; then
+    echo "[installer][OK]   a fresh install with nothing to restore still reports the rollback outcome"
+  else
+    echo "[installer][FAIL] absent-backup rollback status=$status output=${output:-<empty>}"
+    FAILURES=$((FAILURES + 1))
+  fi
+
+  rm -rf "$work"
+}
+
+# End-to-end proof on the production path that a failed post-install check and a
+# rejected downgrade both leave the operator with a working incumbent.
+check_installer_rollback_e2e() {
+  local installer="$ROOT_DIR/install.sh"
+  local installer_shell="${FSFS_INSTALL_TEST_BASH:-bash}"
+  local work dest archive digest status output incumbent_digest
+
+  echo "[installer] exercising post-install rollback and downgrade refusal"
+  work=$(mktemp -d)
+  dest="$work/bin"
+  mkdir -p "$work/stage" "$dest"
+
+  installer_write_stub "$work/stage/fsfs" "9.9.9"
+  archive="$work/fsfs-9.9.9-local.tar.gz"
+  tar -czf "$archive" -C "$work/stage" fsfs
+  digest=$(installer_file_digest "$archive")
+
+  # An incumbent that works, reporting an older version.
+  installer_write_stub "$dest/fsfs" "1.0.0"
+  incumbent_digest=$(installer_file_digest "$dest/fsfs")
+
+  # 1. Post-install validation fails only once the binary runs from the
+  #    destination; the incumbent must come back.
+  status=0
+  output=$(env NO_COLOR=1 "FSFS_INSTALL_LOCK_FILE=$work/install.lock" \
+    "FSFS_STUB_FAIL_FROM_DEST=$dest" \
+    "$installer_shell" "$installer" --offline --version v9.9.9 \
+    --artifact-url "$archive" --checksum "$digest" --dest "$dest" --verify 2>&1) || status=$?
+  if [[ "$status" -ne 0 && "$output" == *"upgrade.apply.rollback_triggered"* ]] \
+    && [[ "$(installer_file_digest "$dest/fsfs")" == "$incumbent_digest" ]] \
+    && "$dest/fsfs" version | grep -q '1\.0\.0'; then
+    echo "[installer][OK]   a failed post-install check rolls the incumbent back into place"
+  else
+    echo "[installer][FAIL] post-install rollback status=$status output=${output:-<empty>}"
+    FAILURES=$((FAILURES + 1))
+  fi
+
+  # 2. A downgrade is refused before anything is staged.
+  local old_archive old_digest
+  mkdir -p "$work/oldstage"
+  installer_write_stub "$work/oldstage/fsfs" "0.5.0"
+  old_archive="$work/fsfs-0.5.0-local.tar.gz"
+  tar -czf "$old_archive" -C "$work/oldstage" fsfs
+  old_digest=$(installer_file_digest "$old_archive")
+
+  status=0
+  output=$(env NO_COLOR=1 "FSFS_INSTALL_LOCK_FILE=$work/install.lock" \
+    "$installer_shell" "$installer" --offline --version v0.5.0 \
+    --artifact-url "$old_archive" --checksum "$old_digest" --dest "$dest" 2>&1) || status=$?
+  if [[ "$status" -ne 0 && "$output" == *"upgrade.apply.unsupported_path"* ]] \
+    && [[ "$(installer_file_digest "$dest/fsfs")" == "$incumbent_digest" ]]; then
+    echo "[installer][OK]   a downgrade is refused with upgrade.apply.unsupported_path"
+  else
+    echo "[installer][FAIL] downgrade refusal status=$status output=${output:-<empty>}"
+    FAILURES=$((FAILURES + 1))
+  fi
+
+  # 3. --force overrides the downgrade refusal.
+  status=0
+  output=$(env NO_COLOR=1 "FSFS_INSTALL_LOCK_FILE=$work/install.lock" \
+    "$installer_shell" "$installer" --offline --version v0.5.0 \
+    --artifact-url "$old_archive" --checksum "$old_digest" --dest "$dest" --force 2>&1) || status=$?
+  if [[ "$status" -eq 0 ]] && "$dest/fsfs" version | grep -q '0\.5\.0'; then
+    echo "[installer][OK]   --force permits an explicit downgrade"
+  else
+    echo "[installer][FAIL] forced downgrade status=$status output=${output:-<empty>}"
     FAILURES=$((FAILURES + 1))
   fi
 
@@ -1094,6 +1301,8 @@ if [[ "$MODE" == "installer" || "$MODE" == "all" ]]; then
   check_installer_behavior
   check_installer_preflight
   check_installer_offline_e2e
+  check_installer_release_policy
+  check_installer_rollback_e2e
 fi
 if [[ "$MODE" == "model-features" || "$MODE" == "all" ]]; then
   check_model_features

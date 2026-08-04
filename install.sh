@@ -185,9 +185,124 @@ verify_archive_checksum() {
   actual_normalized=$(printf '%s' "$actual" | tr '[:upper:]' '[:lower:]')
   expected_normalized=$(printf '%s' "$expected" | tr '[:upper:]' '[:lower:]')
   if ! validate_sha256 "$actual" || [ "$actual_normalized" != "$expected_normalized" ]; then
-    err "Checksum mismatch for $(basename "$archive")"
+    err "release.package.checksum_failed: Checksum mismatch for $(basename "$archive")"
     return 1
   fi
+}
+
+# --- Signature policy --------------------------------------------------------
+# Signing is optional, so an absent sidecar is a deterministic warning rather
+# than a hard failure. A signature that is present and does not verify is a
+# verification failure and MUST abort before the destination is replaced.
+verify_archive_signature() {
+  local archive="$1"
+  local signature="${archive}.sig"
+  local certificate="${archive}.pem"
+  local cosign_bin="${FSFS_INSTALL_COSIGN:-cosign}"
+
+  if [ ! -f "$signature" ] || [ ! -f "$certificate" ]; then
+    warn "install.verify.signature_missing: no .sig/.pem sidecar accompanies $(basename "$archive"); the archive is checksum-verified but unsigned"
+    return 0
+  fi
+
+  if ! command -v "$cosign_bin" >/dev/null 2>&1; then
+    warn "install.verify.signature_unverifiable: $(basename "$archive") is signed but ${cosign_bin} is not installed; the signature was not checked"
+    return 0
+  fi
+
+  if "$cosign_bin" verify-blob \
+    --signature "$signature" \
+    --certificate "$certificate" \
+    "$archive" >/dev/null 2>&1; then
+    ok "Signature verified for $(basename "$archive")"
+    return 0
+  fi
+
+  err "install.verify.signature_invalid: signature verification failed for $(basename "$archive")"
+  err "The existing fsfs installation was not replaced."
+  return 1
+}
+
+# --- Upgrade path ------------------------------------------------------------
+extract_semver() {
+  local text="${1:-}"
+  if [[ "$text" =~ ([0-9]+)\.([0-9]+)\.([0-9]+) ]]; then
+    printf '%s.%s.%s\n' "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" "${BASH_REMATCH[3]}"
+  fi
+}
+
+# Prints older | same | newer describing $1 relative to $2.
+compare_semver() {
+  local left right l1 l2 l3 r1 r2 r3
+  left=$(extract_semver "$1")
+  right=$(extract_semver "$2")
+  if [ -z "$left" ] || [ -z "$right" ]; then
+    printf '%s\n' "unknown"
+    return 0
+  fi
+  IFS=. read -r l1 l2 l3 <<<"$left"
+  IFS=. read -r r1 r2 r3 <<<"$right"
+  local index
+  for index in 1 2 3; do
+    local lv rv
+    case "$index" in
+      1) lv="$l1"; rv="$r1" ;;
+      2) lv="$l2"; rv="$r2" ;;
+      *) lv="$l3"; rv="$r3" ;;
+    esac
+    if [ "$lv" -lt "$rv" ]; then
+      printf '%s\n' "older"
+      return 0
+    fi
+    if [ "$lv" -gt "$rv" ]; then
+      printf '%s\n' "newer"
+      return 0
+    fi
+  done
+  printf '%s\n' "same"
+}
+
+# Classifies the transition from an installed version string to the resolved
+# target: fresh | same | upgrade | downgrade | unknown.
+classify_upgrade_path() {
+  local installed_text="${1:-}" target_version="${2:-}"
+  if [ -z "$installed_text" ]; then
+    printf '%s\n' "fresh"
+    return 0
+  fi
+  case "$(compare_semver "$installed_text" "$target_version")" in
+    older) printf '%s\n' "upgrade" ;;
+    newer) printf '%s\n' "downgrade" ;;
+    same) printf '%s\n' "same" ;;
+    *) printf '%s\n' "unknown" ;;
+  esac
+}
+
+# --- Rollback ----------------------------------------------------------------
+# Post-install validation runs against the replaced destination, so the
+# incumbent is copied aside first and restored if that validation fails.
+back_up_incumbent() {
+  local destination_binary="$1" backup_path="$2"
+  [ -f "$destination_binary" ] || return 0
+  cp -p "$destination_binary" "$backup_path" 2>/dev/null || {
+    warn "Could not stage a rollback copy of $destination_binary; a failed post-install check will not be able to restore it"
+    return 0
+  }
+  info "Staged a rollback copy of the previous ${BINARY_NAME}"
+}
+
+roll_back_incumbent() {
+  local backup_path="$1" destination_binary="$2" reason="$3"
+  if [ ! -f "$backup_path" ]; then
+    err "upgrade.apply.rollback_triggered: $reason; no previous ${BINARY_NAME} was available to restore"
+    return 1
+  fi
+  if install_binary "$backup_path" "$destination_binary"; then
+    err "upgrade.apply.rollback_triggered: $reason; the previous ${BINARY_NAME} has been restored"
+    return 0
+  fi
+  err "upgrade.apply.rollback_triggered: $reason; restoring the previous ${BINARY_NAME} also failed"
+  return 1
 }
 
 install_route() {
@@ -528,6 +643,19 @@ run_installer_contract_test() {
       [ "$#" -eq 3 ] || { err "contract existing-install requires DEST_BINARY VERSION"; return 2; }
       detect_existing_install "$2" "$3"
       ;;
+    signature)
+      [ "$#" -eq 2 ] || { err "contract signature requires ARCHIVE"; return 2; }
+      verify_archive_signature "$2"
+      ;;
+    upgrade-path)
+      [ "$#" -eq 3 ] || { err "contract upgrade-path requires INSTALLED_TEXT TARGET_VERSION"; return 2; }
+      classify_upgrade_path "$2" "$3"
+      ;;
+    rollback)
+      [ "$#" -eq 4 ] || { err "contract rollback requires BACKUP DESTINATION REASON"; return 2; }
+      SYSTEM=0
+      roll_back_incumbent "$2" "$3" "$4"
+      ;;
     offline-preconditions)
       [ "$#" -eq 6 ] || {
         err "contract offline-preconditions requires OFFLINE VERSION FROM_SOURCE ARTIFACT_URL CHECKSUM"
@@ -721,7 +849,24 @@ case "$EXISTING_STATE" in
     info "Preflight: ${VERSION} already installed; --force requested, reinstalling"
     ;;
   different-version)
-    info "Preflight: upgrading the existing ${BINARY_NAME} at $DEST to ${VERSION}"
+    INSTALLED_VERSION_TEXT=$("$DEST/${BINARY_NAME}" version 2>/dev/null | head -n 1 || true)
+    case "$(classify_upgrade_path "$INSTALLED_VERSION_TEXT" "$VERSION")" in
+      downgrade)
+        if [ "$FORCE" -eq 0 ]; then
+          err "upgrade.apply.unsupported_path: $DEST/${BINARY_NAME} reports '${INSTALLED_VERSION_TEXT}', which is newer than the requested ${VERSION}"
+          err "Downgrades are outside the supported N-1/N-2 upgrade window. Pass --force to install ${VERSION} anyway."
+          err "The existing fsfs installation was not replaced."
+          exit 1
+        fi
+        warn "Preflight: installing ${VERSION} over the newer '${INSTALLED_VERSION_TEXT}' because --force was requested"
+        ;;
+      unknown)
+        warn "Preflight: could not compare '${INSTALLED_VERSION_TEXT}' with ${VERSION}; proceeding as a replacement"
+        ;;
+      *)
+        info "Preflight: upgrading the existing ${BINARY_NAME} at $DEST to ${VERSION}"
+        ;;
+    esac
     ;;
   *)
     warn "An existing $DEST/${BINARY_NAME} did not report a version; it will be replaced only after the new binary verifies"
@@ -939,12 +1084,15 @@ if [ "$FROM_SOURCE" -eq 1 ]; then
     fi
   fi
 
+  ROLLBACK_BACKUP="$TMP/${BINARY_NAME}.incumbent"
+  back_up_incumbent "$DEST/${BINARY_NAME}" "$ROLLBACK_BACKUP"
   install_binary "$BIN" "$DEST/${BINARY_NAME}"
   ok "Installed to $DEST/${BINARY_NAME} (source build)"
   maybe_add_path
   if [ "$VERIFY" -eq 1 ]; then
     if ! SELF_TEST_OUTPUT=$("$DEST/${BINARY_NAME}" version 2>&1); then
       err "Self-test failed: $SELF_TEST_OUTPUT"
+      roll_back_incumbent "$ROLLBACK_BACKUP" "$DEST/${BINARY_NAME}" "post-install validation failed" || true
       exit 1
     fi
     ok "Self-test complete: $SELF_TEST_OUTPUT"
@@ -993,6 +1141,22 @@ fi
 verify_archive_checksum "$TMP/$TAR" "$CHECKSUM" || exit 1
 ok "Checksum verified"
 
+# Signing is optional, so the sidecars are staged best-effort next to the
+# archive; verify_archive_signature decides what their absence means.
+if [ "$VERIFY" -eq 1 ]; then
+  for SIGNATURE_EXT in sig pem; do
+    case "$URL" in
+      file://*) cp -- "${URL#file://}.${SIGNATURE_EXT}" "$TMP/$TAR.${SIGNATURE_EXT}" 2>/dev/null || true ;;
+      *://*)
+        curl -fsSL --connect-timeout 15 --max-time 60 "${URL}.${SIGNATURE_EXT}" \
+          -o "$TMP/$TAR.${SIGNATURE_EXT}" 2>/dev/null || true
+        ;;
+      *) cp -- "${URL}.${SIGNATURE_EXT}" "$TMP/$TAR.${SIGNATURE_EXT}" 2>/dev/null || true ;;
+    esac
+  done
+  verify_archive_signature "$TMP/$TAR" || exit 1
+fi
+
 # Extract
 info "Extracting"
 case "$TAR" in
@@ -1021,6 +1185,8 @@ if [ "$VERIFY" -eq 1 ]; then
   fi
 fi
 
+ROLLBACK_BACKUP="$TMP/${BINARY_NAME}.incumbent"
+back_up_incumbent "$DEST/${BINARY_NAME}" "$ROLLBACK_BACKUP"
 install_binary "$BIN" "$DEST/${BINARY_NAME}"
 ok "Installed to $DEST/${BINARY_NAME}"
 maybe_add_path
@@ -1028,6 +1194,7 @@ maybe_add_path
 if [ "$VERIFY" -eq 1 ]; then
   if ! SELF_TEST_OUTPUT=$("$DEST/${BINARY_NAME}" version 2>&1); then
     err "Self-test failed: $SELF_TEST_OUTPUT"
+    roll_back_incumbent "$ROLLBACK_BACKUP" "$DEST/${BINARY_NAME}" "post-install validation failed" || true
     exit 1
   fi
   ok "Self-test complete: $SELF_TEST_OUTPUT"
