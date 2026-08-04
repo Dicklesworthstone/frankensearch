@@ -5114,6 +5114,7 @@ pub enum CassProfileDiagnosticKind {
     InvalidBoost,
     AllNegativeRepair,
     DepthLimit,
+    TermLengthLimit,
 }
 
 impl From<frankensearch_quill::query::QueryDiagnosticKind> for CassProfileDiagnosticKind {
@@ -5129,6 +5130,7 @@ impl From<frankensearch_quill::query::QueryDiagnosticKind> for CassProfileDiagno
             QueryDiagnosticKind::InvalidBoost => Self::InvalidBoost,
             QueryDiagnosticKind::AllNegativeRepair => Self::AllNegativeRepair,
             QueryDiagnosticKind::DepthLimit => Self::DepthLimit,
+            QueryDiagnosticKind::TermLengthLimit => Self::TermLengthLimit,
         }
     }
 }

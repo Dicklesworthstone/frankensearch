@@ -496,6 +496,19 @@ pub enum QueryDiagnosticKind {
     AllNegativeRepair,
     /// The nesting cap was reached.
     DepthLimit,
+    /// An analyzed term exceeded [`MAX_TERM_BYTES`], so the branch that
+    /// required it was lowered to match-nothing.
+    ///
+    /// The analyzer drops the oversized term and the branch cannot be
+    /// satisfied without it, so the lowering is a silent change in meaning
+    /// rather than a repair: the query still parses, and it can no longer
+    /// match. Every other lowering of that severity announces itself here, and
+    /// until this variant existed this one did not — a consumer reading the
+    /// diagnostics stream could not distinguish "matched nothing" from
+    /// "lowered to match nothing".
+    ///
+    /// [`MAX_TERM_BYTES`]: crate::grimoire::MAX_TERM_BYTES
+    TermLengthLimit,
 }
 
 /// One best-effort parse diagnostic.
@@ -2814,6 +2827,19 @@ impl Grammar {
                     return None;
                 };
                 if report.oversized_tokens != 0 {
+                    // The fragment is deliberately omitted: it WOULD be the
+                    // oversized term itself, which by definition exceeds the
+                    // bound the fragment field is documented to respect, so
+                    // carrying it would push a >MAX_TERM_BYTES payload into the
+                    // diagnostics stream. The byte offset still locates it.
+                    self.push_diagnostic(QueryDiagnostic {
+                        kind: QueryDiagnosticKind::TermLengthLimit,
+                        message:
+                            "analyzed term exceeds the admitted term-length bound; branch lowered to match-nothing"
+                                .to_owned(),
+                        byte_offset: Some(atom.byte_offset),
+                        fragment: None,
+                    });
                     return Some(Query::Empty);
                 }
                 match terms.len() {
@@ -7071,6 +7097,66 @@ mod tests {
             phrase.query.is_empty(),
             "phrase containing an oversized term must lower to Query::Empty, got {:?}",
             phrase.query
+        );
+    }
+
+    /// The match-nothing lowering announces itself in the diagnostics stream.
+    ///
+    /// Until `TermLengthLimit` existed, this branch returned `Query::Empty`
+    /// silently, so no consumer could tell a query that MATCHED nothing from
+    /// one that was LOWERED to match nothing. The control parses an admissible
+    /// term through the same path and asserts the diagnostic is absent, so a
+    /// version of this test that passed by finding a diagnostic on every query
+    /// would fail.
+    #[test]
+    fn an_oversized_term_lowering_announces_itself() {
+        let parser = parser();
+        let leak_probe = "x".repeat(64);
+
+        for (label, query) in [
+            ("standalone", oversized_atom()),
+            ("phrase member", format!("\"cache {}\"", oversized_atom())),
+        ] {
+            let parsed = parse_untruncated(&parser, &query);
+            assert!(
+                parsed.query.is_empty(),
+                "{label} must still lower to match-nothing"
+            );
+            let diagnostic = parsed
+                .diagnostics
+                .iter()
+                .find(|diagnostic| diagnostic.kind == QueryDiagnosticKind::TermLengthLimit)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{label} lowering must announce itself, got {:?}",
+                        parsed
+                            .diagnostics
+                            .iter()
+                            .map(|diagnostic| diagnostic.kind)
+                            .collect::<Vec<_>>()
+                    )
+                });
+            assert!(
+                diagnostic.byte_offset.is_some(),
+                "{label} diagnostic must locate the atom it lowered"
+            );
+            assert!(
+                diagnostic.fragment.is_none() && !diagnostic.message.contains(&leak_probe),
+                "{label} diagnostic must not carry the oversized term as a payload"
+            );
+        }
+
+        // Control: an admissible term takes the same analyze_field path and
+        // emits no length diagnostic, so the assertions above are attributable
+        // to the oversized term rather than to the path being noisy.
+        let ordinary = parse_untruncated(&parser, "cache");
+        assert!(!ordinary.query.is_empty(), "the control must still match");
+        assert!(
+            ordinary
+                .diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic.kind != QueryDiagnosticKind::TermLengthLimit),
+            "an admissible term must not report a length limit"
         );
     }
 
