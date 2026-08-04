@@ -2013,7 +2013,7 @@ fn linux_running_image_build_input(
             reason: "ArtifactStore v4 Linux executable receipt does not bind the running /proc/self/exe image".to_owned(),
         });
     }
-    build_input(
+    Ok(build_input(
         ArtifactStoreV4BuildInputKind::Executable,
         serde_json::to_vec(&serde_json::json!({
             "path": "/proc/self/exe",
@@ -2021,7 +2021,7 @@ fn linux_running_image_build_input(
             "byte_len": byte_len,
             "verification": verification,
         }))?,
-    )
+    ))
 }
 
 /// Mutable run provenance referencing one immutable object hash.
@@ -4367,8 +4367,14 @@ mod tests {
     fn artifactstore_v4_current_linux_collector_binds_procfs_image_to_source_build_chain() {
         let snapshots = ArtifactStoreV4SourceBuildSnapshots::collect_current_linux()
             .expect("collect a clean current Linux source/build chain");
-        snapshots.source().validate().expect("validate source snapshot");
-        snapshots.build().validate().expect("validate build snapshot");
+        snapshots
+            .source()
+            .validate()
+            .expect("validate source snapshot");
+        snapshots
+            .build()
+            .validate()
+            .expect("validate build snapshot");
         let executable = snapshots
             .build()
             .inputs
