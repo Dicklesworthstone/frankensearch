@@ -11651,6 +11651,16 @@ relevance claim). On worker `vmi1227854`, the isolated handoff cleared its null 
 **0.853127** [0.735856, 0.969935] was inside the A/A floor of 0.937580 [0.825111, 1.170674]. Faster direction is
 not enough; the full operation is the shipping gate.
 
+**Re-adjudicated 2026-08-04 (`bd-npdmj`), verdict REJECT — unchanged, narrower support.** Under
+`bd-pjh09`'s corrected A/A admissibility (a control is admissible when its median sits within 2% of
+1.0; CI width is telemetry, not a veto), the two isolated-handoff cells cited above lose their
+controls: their same-invocation A/A null medians are 0.971933 [0.765276, 1.140919] and 1.030091
+[0.805651, 1.229080], drifting 2.81% and 3.01% from 1.0. So "cleared its null floor twice" is
+withdrawn — that speedup is unmeasured on this evidence rather than merely diluted. The final
+full-path rerun's control (0.937580 [0.825111, 1.170674], same invocation) drifts 6.24% and is also
+inadmissible. This entry's REJECT stands on the restored-production decision, not on those cells.
+Corresponding correction in `docs/PERF_LEDGER.md` under the same bead.
+
 **Decision/boundary.** Production source was restored to HEAD; only the feature-gated comparator, benchmark,
 parity test, and this evidence remain. Do not retry this second-copy handoff without a quieter full-write fixture
 whose A/A floor can resolve a roughly 9–14% effect. This does not reopen direct postings compression or the
@@ -14399,6 +14409,15 @@ Candidate/original ratios below 1 favor prefetch:
 | 256 | 1.011 [0.612, 2.840] | **0.791** [0.631, 1.098] | inside null floor |
 | 512 | 1.032 [0.846, 1.337] | **0.809** [0.692, 1.097] | clears null floor |
 
+**Re-adjudicated 2026-08-04 (`bd-npdmj`), verdict REJECT/HOLD — unchanged, narrower support.** Under
+`bd-pjh09`'s corrected A/A admissibility (admissible when the null median sits within 2% of 1.0; CI
+width is telemetry, not a veto), the 512-token row loses its control: same-invocation A/A null
+median 1.032 [0.846, 1.337], drifting 3.20% from 1.0. "The 512-token result confirms the mechanism"
+is therefore withdrawn on this evidence. The 128- and 256-token rows are unaffected (nulls 0.988 and
+1.011, drifts 1.20% and 1.10%), so the 256-token REJECT/HOLD below is unchanged. The separate
+`bd-vxki` entry re-measured the 512+ threshold and is what any 512 claim should cite. Corresponding
+correction in `docs/PERF_LEDGER.md` under the same bead.
+
 **Decision. REJECT/HOLD.** The chosen 256-token shipping onset does not clear the same-binary null floor, so the
 production path was restored byte-for-byte. The exact oracle and boundary reproducer remain feature-gated behind
 `bench-internals`; normal builds retain no prefetch code. The 512-token result confirms the mechanism but does not
@@ -15937,6 +15956,18 @@ On the primary worker radix measured `0.7266` at one thread and `0.6165` at
 eight, but an independent nine-round `ovh-a` run put the one-thread lever at
 `0.9714` inside its `0.9488..1.0241` null spread. Only its 8-thread result was
 decisive (`0.7489`, null `0.9625..1.0594`).
+
+**Re-adjudicated 2026-08-04 (`bd-npdmj`), verdict REJECT — unchanged, narrower support.** Under
+`bd-pjh09`'s corrected A/A admissibility (admissible when the null median sits within 2% of 1.0; CI
+width is telemetry, not a veto), the two one-thread cells cited above lose their controls:
+golden-medium 1-thread `0.7763` rests on a same-invocation A/A null median 0.9721 [0.8726, 1.0726]
+drifting 2.79%, and golden-small 1-thread `0.7266` on 1.0310 [0.9951, 1.0892] drifting 3.10%. The
+claim "every lever median cleared its cell's null p5" therefore no longer holds for those two; both
+are withdrawn as unmeasured. Conversely golden-small 8-thread `0.6165` gains an admissible control
+(null 0.9827 [0.9110, 0.9883], drift 1.73%) whose spread sits entirely below 1.0 — the retired
+straddle clause would have vetoed it. The 8-thread and xlarge cells (`0.6858`, `0.8736`, `0.6697`)
+are unaffected, so the decision below is unchanged. Corresponding correction in
+`docs/PERF_LEDGER.md` under the same bead.
 
 **Decision: REJECT hash/arena chains as the bulk seal above the small-batch
 crossover.** Retry that topology only below roughly 10,000 live terms or for a
