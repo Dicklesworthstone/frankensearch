@@ -856,7 +856,16 @@ async fn open_lexical_reader(cx: &Cx, dir: &Path) -> SearchResult<Option<Arc<dyn
     })?;
     match layout {
         LexicalLayout::Empty => return Ok(None),
-        LexicalLayout::DirectQuill | LexicalLayout::BlueGreen { ref pointer, .. }
+        // NOTE: deliberately two arms, not an or-pattern — `pointer` is only
+        // bound in the BlueGreen variant, so `DirectQuill | BlueGreen {..} if
+        // pointer.engine() == ...` is E0408 (pointer not bound in all
+        // patterns) whenever this fn is compiled (feature "quill" enabled by
+        // downstream workspaces such as mcp_agent_mail_rust).
+        LexicalLayout::DirectQuill => {
+            let index = RootBoundQuillSearchIndex::open(cx, dir, QuillConfig::default()).await?;
+            Ok(Some(Arc::new(index)))
+        }
+        LexicalLayout::BlueGreen { ref pointer, .. }
             if pointer.engine() == BlueGreenEngine::Quill =>
         {
             let index = RootBoundQuillSearchIndex::open(cx, dir, QuillConfig::default()).await?;
@@ -871,7 +880,7 @@ async fn open_lexical_reader(cx: &Cx, dir: &Path) -> SearchResult<Option<Arc<dyn
         LexicalLayout::BlueGreen { ref pointer, .. }
             if pointer.engine() == BlueGreenEngine::Tantivy =>
         {
-            let index = TantivyIndex::open(pointer.engine_dir(dir))?;
+            let index = TantivyIndex::open(&pointer.engine_dir(dir))?;
             Ok(Some(Arc::new(index)))
         }
         ref layout => Err(SearchError::InvalidConfig {
