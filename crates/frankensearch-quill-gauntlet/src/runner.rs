@@ -19991,10 +19991,11 @@ mod tests {
     /// evidence rather than on a synthetic fixture:
     ///
     ///   1. an emitted mismatch carrying no classification FAILS CLOSED — the
-    ///      witness case lands as `Unclassified` /
-    ///      `MissingDivergenceRegistration`, while its sibling control in the
-    ///      same suite stays `Exact`, so the fail-closed verdict is specific to
-    ///      the divergence and not a blanket refusal;
+    ///      witness case lands as `Unclassified` on TWO independent axes (the
+    ///      total lexical contract mismatches, and the rank comparison carries
+    ///      an unregistered divergence), while its sibling control in the same
+    ///      suite stays `Exact`, so the fail-closed verdict is specific to the
+    ///      divergence and not a blanket refusal;
     ///   2. that mismatch can be INGESTED with immutable first-seen evidence —
     ///      the witness address, producer identity, oracle dependency identity,
     ///      lexical-contract audit revision, and corpus/query manifests are all
@@ -20035,12 +20036,41 @@ mod tests {
                 "an unregistered production mismatch must fail closed: {:?}",
                 witness.reason
             );
+            // The total lexical contract sees the same one-ULP difference and
+            // `classify_case_with_lexical` reports it first, so the recorded
+            // reason is the lexical one. The rank axis refuses independently:
+            // the case carries an unregistered raw divergence, which is what
+            // `MissingDivergenceRegistration` would name on its own. Both
+            // axes are asserted rather than one assumed from the other.
             assert_eq!(
                 witness.reason,
-                Some(CampaignCaseReason::MissingDivergenceRegistration),
-                "the fail-closed reason must name the missing registration"
+                Some(CampaignCaseReason::LexicalContractMismatch),
+                "the total lexical contract must refuse this case first"
             );
+            match witness.lexical_contract {
+                CampaignLexicalCaseSummary::CoreLexicalV3 {
+                    status,
+                    ref first_mismatch,
+                    mismatch_count,
+                    ..
+                } => {
+                    assert_eq!(status, LexicalComparisonStatus::Mismatch);
+                    assert!(
+                        mismatch_count > 0 && first_mismatch.is_some(),
+                        "a lexical mismatch verdict must name where it mismatched"
+                    );
+                }
+                CampaignLexicalCaseSummary::LegacyMissing
+                | CampaignLexicalCaseSummary::RankEnvelopeOnly
+                | CampaignLexicalCaseSummary::CoreLexicalV3Unavailable => {
+                    panic!("the default-profile lane must produce Core Lexical V3 evidence")
+                }
+            }
             assert_eq!(witness.rank_class, Some(RankClass::RankMismatch));
+            assert!(
+                witness.registered_divergence.is_none(),
+                "the rank axis must hold an UNREGISTERED divergence, or nothing failed closed"
+            );
 
             let control = report
                 .cases
