@@ -1682,6 +1682,23 @@ jobs:
           EOF
           rm -f "dist/${binary_name}"
 
+          # bd-0zrer: the packaging contract declares release.build.missing_target
+          # as a Required Reason Code, but nothing emitted it — a target whose
+          # archive, checksum, or metadata never materialized would fail with a
+          # bare shell error carrying no contract-declared code. Assert this
+          # target's three artifacts exist before the job reports success.
+          for required in \
+            "${archive_path}" \
+            "${archive_path}.sha256" \
+            "dist/${archive_base}.metadata.json" \
+            "${installer_archive_path}" \
+            "${installer_archive_path}.sha256"; do
+            if [[ ! -f "${required}" ]]; then
+              echo "release.build.missing_target: target=${TARGET_TRIPLE} missing=${required}" >&2
+              exit 1
+            fi
+          done
+
       - name: Install cosign (optional signing)
         uses: sigstore/cosign-installer@v3.8.1
 
@@ -1852,6 +1869,23 @@ jobs:
           EOF
           rm -f "dist/${binary_name}"
 
+          # bd-0zrer: the packaging contract declares release.build.missing_target
+          # as a Required Reason Code, but nothing emitted it — a target whose
+          # archive, checksum, or metadata never materialized would fail with a
+          # bare shell error carrying no contract-declared code. Assert this
+          # target's three artifacts exist before the job reports success.
+          for required in \
+            "${archive_path}" \
+            "${archive_path}.sha256" \
+            "dist/${archive_base}.metadata.json" \
+            "${installer_archive_path}" \
+            "${installer_archive_path}.sha256"; do
+            if [[ ! -f "${required}" ]]; then
+              echo "release.build.missing_target: target=${TARGET_TRIPLE} missing=${required}" >&2
+              exit 1
+            fi
+          done
+
       - name: Upload lite release artifacts
         uses: actions/upload-artifact@v4
         with:
@@ -1969,9 +2003,21 @@ jobs:
           PY
 
       - name: Publish release
+        id: publish_release
         uses: softprops/action-gh-release@v2
         with:
           files: dist/**/*
+
+      # bd-0zrer: release.publish.asset_upload_failed is a Required Reason Code
+      # with no emitter — an upload failure surfaced only as the action's own
+      # error. Report the contract code when the upload step fails, and keep the
+      # job red.
+      - name: Report release asset upload failure
+        if: failure() && steps.publish_release.outcome == 'failure'
+        shell: bash
+        run: |
+          echo "release.publish.asset_upload_failed: tag=${GITHUB_REF_NAME} assets=dist/**/*" >&2
+          exit 1
 
   publish-crates:
     name: Publish crates.io packages
