@@ -181,6 +181,304 @@ pub const FIXTURE_EXPECTATIONS: &[EnrichedExpectationV1] = &[
 ];
 
 // ---------------------------------------------------------------------------
+// Enrichment: snippets, query classification, metadata (slice 2)
+// ---------------------------------------------------------------------------
+
+/// Semantic state of a hit's stored metadata.
+///
+/// The bead requires `None`, empty and value to stay distinguishable. They are
+/// three variants here rather than an `Option<Value>` because the two engines
+/// legitimately REPRESENT "no metadata" differently — one may answer `None`,
+/// the other `Some({})` — and collapsing that into a single `Option` would
+/// either force a false expectation or hide a real divergence. The oracle
+/// adjudicates the SEMANTIC state; the raw representation is recorded beside
+/// it for the divergence census.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case", deny_unknown_fields)]
+pub enum MetadataStateV1 {
+    /// The engine returned no metadata object at all.
+    Absent,
+    /// The engine returned a metadata object with no entries.
+    EmptyObject,
+    /// The engine returned metadata, rendered as canonical sorted `k=v` pairs
+    /// so two engines' map orderings cannot masquerade as a difference.
+    Entries {
+        /// Sorted `key=value` pairs.
+        pairs: Vec<String>,
+    },
+}
+
+impl MetadataStateV1 {
+    /// Classify a raw metadata payload into its semantic state.
+    #[must_use]
+    pub fn classify(raw: Option<&serde_json::Value>) -> Self {
+        match raw {
+            None | Some(serde_json::Value::Null) => Self::Absent,
+            Some(serde_json::Value::Object(map)) if map.is_empty() => Self::EmptyObject,
+            Some(serde_json::Value::Object(map)) => {
+                let mut pairs: Vec<String> = map
+                    .iter()
+                    .map(|(key, value)| match value {
+                        serde_json::Value::String(text) => format!("{key}={text}"),
+                        other => format!("{key}={other}"),
+                    })
+                    .collect();
+                pairs.sort_unstable();
+                Self::Entries { pairs }
+            }
+            Some(other) => Self::Entries {
+                pairs: vec![format!("<non-object>={other}")],
+            },
+        }
+    }
+
+    /// Whether any metadata content is present.
+    #[must_use]
+    pub const fn is_present(&self) -> bool {
+        matches!(self, Self::Entries { .. })
+    }
+}
+
+/// One enriched hit, normalized across the two engines.
+///
+/// `query_type_code` is a STRING, deliberately. `QueryExplanation` is defined
+/// independently in `frankensearch-lexical` and `frankensearch-quill`: two
+/// distinct types that happen to share a name and, today, a variant set. They
+/// cannot be compared by type, and comparing the two engines' codes to EACH
+/// OTHER would be the cross-engine-agreement oracle this bead rejects — if
+/// both crates drift the same way, agreement passes. Each engine's code is
+/// therefore normalized here and adjudicated against a hand-derived expected
+/// classification instead.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeEnrichedHitV1 {
+    /// Stable external document identifier.
+    pub doc_id: String,
+    /// Zero-based rank in the returned page.
+    pub rank: usize,
+    /// Rendered snippet. `None` stays distinct from `Some("")`.
+    pub snippet: Option<String>,
+    /// Engine's own query classification, normalized to its `Display` code.
+    pub query_type_code: String,
+    /// Semantic metadata state.
+    pub metadata: MetadataStateV1,
+}
+
+/// One engine's enriched answer to one enrichment expectation.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeEnrichedObservationV1 {
+    /// Engine that produced this observation.
+    pub engine: NativeEngineV1,
+    /// Query, echoed so a serialized receipt is self-describing.
+    pub query: String,
+    /// Highlight markup the caller configured, echoed so a receipt records
+    /// which tag contract was exercised.
+    pub highlight_prefix: String,
+    /// Closing highlight markup.
+    pub highlight_postfix: String,
+    /// Page-ordered enriched hits.
+    pub hits: Vec<NativeEnrichedHitV1>,
+}
+
+/// A hand-derived expectation about the ENRICHED surface.
+#[derive(Debug, Clone, Copy)]
+pub struct EnrichmentExpectationV1 {
+    /// Query handed to both engines verbatim.
+    pub query: &'static str,
+    /// Page size.
+    pub limit: usize,
+    /// Highlight markup to configure. Trusted caller-supplied tags.
+    pub highlight_prefix: &'static str,
+    /// Closing highlight markup.
+    pub highlight_postfix: &'static str,
+    /// Classification any reader derives from the query TEXT — a quoted
+    /// string is a phrase, one bare word is simple, several are boolean.
+    /// Derived from the query, never copied from an engine.
+    pub expected_query_type_code: &'static str,
+    /// Document whose enriched hit the remaining fields describe.
+    pub subject_doc: &'static str,
+    /// Substring the snippet must contain, wrapped in the configured tags,
+    /// when the engine renders a snippet at all.
+    pub highlighted_term: &'static str,
+    /// Metadata content the subject document was indexed with, as sorted
+    /// `k=v` pairs. Empty means the document carries no metadata.
+    pub expected_metadata_pairs: &'static [&'static str],
+}
+
+/// Documents carrying metadata, keyed by document id. Absent ids are indexed
+/// with no metadata at all, which is how the `Absent`/`EmptyObject` states are
+/// reached without a second corpus.
+pub const FIXTURE_METADATA: &[(&str, &[(&str, &str)])] =
+    &[("doc-alpha", &[("kind", "primary"), ("lang", "en")])];
+
+/// Content deliberately containing markup, so escaping can be adjudicated.
+///
+/// A snippet engine that echoed this verbatim would emit live markup from
+/// UNTRUSTED document text, which is a different thing entirely from the
+/// TRUSTED highlight tags the caller configured.
+pub const MARKUP_DOC_ID: &str = "doc-markup";
+/// The markup-bearing document body.
+pub const MARKUP_DOC_BODY: &str = "quill <script>alert(1)</script> payload";
+
+/// The committed enrichment expectation table.
+pub const FIXTURE_ENRICHMENT_EXPECTATIONS: &[EnrichmentExpectationV1] = &[
+    // Default tags, single bare term -> "simple".
+    EnrichmentExpectationV1 {
+        query: "quill",
+        limit: 10,
+        highlight_prefix: "<b>",
+        highlight_postfix: "</b>",
+        expected_query_type_code: "simple",
+        subject_doc: "doc-alpha",
+        highlighted_term: "quill",
+        expected_metadata_pairs: &["kind=primary", "lang=en"],
+    },
+    // CUSTOM tags: the receipt must prove the configured markup is what gets
+    // rendered, not a hard-coded <b>.
+    EnrichmentExpectationV1 {
+        query: "quill",
+        limit: 10,
+        highlight_prefix: "[[",
+        highlight_postfix: "]]",
+        expected_query_type_code: "simple",
+        subject_doc: "doc-alpha",
+        highlighted_term: "quill",
+        expected_metadata_pairs: &["kind=primary", "lang=en"],
+    },
+    // Two bare terms -> "boolean". doc-beta carries NO metadata, which is how
+    // the absent/empty state gets exercised.
+    EnrichmentExpectationV1 {
+        query: "lexical backend",
+        limit: 10,
+        highlight_prefix: "<b>",
+        highlight_postfix: "</b>",
+        expected_query_type_code: "boolean",
+        subject_doc: "doc-beta",
+        highlighted_term: "lexical",
+        expected_metadata_pairs: &[],
+    },
+];
+
+/// Adjudicate one ENRICHED observation against its committed expectation.
+///
+/// Like [`adjudicate`], this never consults the other engine.
+#[must_use]
+pub fn adjudicate_enrichment(
+    expectation: &EnrichmentExpectationV1,
+    observation: &NativeEnrichedObservationV1,
+) -> NativeVerdictV1 {
+    let mut failures = Vec::new();
+
+    let subject = observation
+        .hits
+        .iter()
+        .find(|hit| hit.doc_id == expectation.subject_doc);
+    let Some(subject) = subject else {
+        failures.push(format!(
+            "subject document {} absent from the enriched page",
+            expectation.subject_doc
+        ));
+        return NativeVerdictV1 {
+            engine: observation.engine,
+            query: observation.query.clone(),
+            offset: 0,
+            oracle_failures: failures,
+        };
+    };
+
+    // Query classification, against the hand-derived expectation.
+    if subject.query_type_code != expectation.expected_query_type_code {
+        failures.push(format!(
+            "query_type {} != expected {}",
+            subject.query_type_code, expectation.expected_query_type_code
+        ));
+    }
+
+    // Metadata semantics.
+    let expected_metadata_present = !expectation.expected_metadata_pairs.is_empty();
+    match (&subject.metadata, expected_metadata_present) {
+        (MetadataStateV1::Entries { pairs }, true) => {
+            let expected: Vec<String> = expectation
+                .expected_metadata_pairs
+                .iter()
+                .map(|pair| (*pair).to_owned())
+                .collect();
+            if *pairs != expected {
+                failures.push(format!("metadata {pairs:?} != expected {expected:?}"));
+            }
+        }
+        (MetadataStateV1::Entries { pairs }, false) => {
+            failures.push(format!(
+                "metadata {pairs:?} present for a document indexed without any"
+            ));
+        }
+        // Absent and EmptyObject are both legal representations of "indexed
+        // without metadata"; the receipt records WHICH, and the census reads
+        // it. Claiming one is correct would assert an engine's internal
+        // choice as a contract.
+        (MetadataStateV1::Absent | MetadataStateV1::EmptyObject, false) => {}
+        (state, true) => {
+            failures.push(format!(
+                "metadata {state:?} for a document indexed with {:?}",
+                expectation.expected_metadata_pairs
+            ));
+        }
+    }
+
+    // Snippet contract. `None` is a legal answer (a schema may not store
+    // source text) and is recorded; when a snippet IS rendered, it must use
+    // the configured markup and must not leak document markup.
+    if let Some(snippet) = subject.snippet.as_deref() {
+        let highlighted = format!(
+            "{}{}{}",
+            observation.highlight_prefix, expectation.highlighted_term, observation.highlight_postfix
+        );
+        if !snippet.contains(&highlighted) {
+            failures.push(format!(
+                "snippet does not render {highlighted:?} with the configured tags"
+            ));
+        }
+        // The document's own markup must not survive as live markup. This is
+        // asserted separately from the tag check above precisely because a
+        // single "contains <b>" assertion would pass an engine that echoed
+        // untrusted document markup verbatim.
+        if snippet.contains("<script>") {
+            failures.push(
+                "snippet echoed untrusted document markup (<script>) unescaped".to_owned(),
+            );
+        }
+    }
+
+    NativeVerdictV1 {
+        engine: observation.engine,
+        query: observation.query.clone(),
+        offset: 0,
+        oracle_failures: failures,
+    }
+}
+
+/// Whether two engines agree on the enriched facts.
+///
+/// Telemetry only, exactly like [`engines_agree`]: snippets and metadata
+/// representations legitimately differ, so this compares only the fields both
+/// engines are contractually obliged to share.
+#[must_use]
+pub fn enriched_engines_agree(
+    left: &NativeEnrichedObservationV1,
+    right: &NativeEnrichedObservationV1,
+) -> bool {
+    let key = |observation: &NativeEnrichedObservationV1| {
+        observation
+            .hits
+            .iter()
+            .map(|hit| (hit.doc_id.clone(), hit.query_type_code.clone()))
+            .collect::<Vec<_>>()
+    };
+    key(left) == key(right)
+}
+
+// ---------------------------------------------------------------------------
 // Observations
 // ---------------------------------------------------------------------------
 
@@ -483,6 +781,91 @@ pub fn observe_quill(
         total,
         doc_count,
         page_score_bits: result.hits.iter().map(|hit| hit.score.to_bits()).collect(),
+    })
+}
+
+/// Observe one ENRICHED expectation through the REAL native Quill
+/// `search_with_snippets` API.
+///
+/// # Errors
+///
+/// Propagates typed Quill snippet/query failures.
+pub fn observe_quill_enrichment(
+    cx: &Cx,
+    index: &frankensearch_quill::QuillIndex,
+    expectation: &EnrichmentExpectationV1,
+) -> Result<NativeEnrichedObservationV1, GauntletError> {
+    let config = frankensearch_quill::SnippetConfig {
+        max_chars: frankensearch_quill::DEFAULT_SNIPPET_MAX_CHARS,
+        highlight_prefix: expectation.highlight_prefix.to_owned(),
+        highlight_postfix: expectation.highlight_postfix.to_owned(),
+    };
+    let hits = index
+        .search_with_snippets(cx, expectation.query, expectation.limit, &config)
+        .map_err(|error| GauntletError::InvalidContract {
+            reason: format!("native Quill enriched search failed: {error}"),
+        })?;
+    Ok(NativeEnrichedObservationV1 {
+        engine: NativeEngineV1::Quill,
+        query: expectation.query.to_owned(),
+        highlight_prefix: expectation.highlight_prefix.to_owned(),
+        highlight_postfix: expectation.highlight_postfix.to_owned(),
+        hits: hits
+            .into_iter()
+            .map(|hit| NativeEnrichedHitV1 {
+                doc_id: hit.document_id,
+                rank: hit.rank,
+                snippet: hit.snippet,
+                // Normalized through Display: the two crates' enums are
+                // DIFFERENT types and cannot be compared any other way.
+                query_type_code: hit.query_type.to_string(),
+                metadata: MetadataStateV1::classify(hit.metadata.as_deref()),
+            })
+            .collect(),
+    })
+}
+
+/// Observe one ENRICHED expectation through the REAL native Tantivy
+/// `search_with_snippets` API.
+///
+/// # Errors
+///
+/// Propagates typed Tantivy snippet/query failures.
+#[cfg(feature = "tantivy-oracle")]
+pub fn observe_tantivy_enrichment(
+    cx: &Cx,
+    index: &frankensearch_lexical::TantivyIndex,
+    expectation: &EnrichmentExpectationV1,
+) -> Result<NativeEnrichedObservationV1, GauntletError> {
+    // Tantivy keeps its default window private, so the shared default is taken
+    // from `SnippetConfig::default()` and only the tag fields are overridden.
+    // Both crates default to the same 200-byte window, which is why the two
+    // arms remain comparable.
+    let config = frankensearch_lexical::SnippetConfig {
+        highlight_prefix: expectation.highlight_prefix.to_owned(),
+        highlight_postfix: expectation.highlight_postfix.to_owned(),
+        ..frankensearch_lexical::SnippetConfig::default()
+    };
+    let hits = index
+        .search_with_snippets(cx, expectation.query, expectation.limit, &config)
+        .map_err(|error| GauntletError::InvalidContract {
+            reason: format!("native Tantivy enriched search failed: {error}"),
+        })?;
+    Ok(NativeEnrichedObservationV1 {
+        engine: NativeEngineV1::Tantivy,
+        query: expectation.query.to_owned(),
+        highlight_prefix: expectation.highlight_prefix.to_owned(),
+        highlight_postfix: expectation.highlight_postfix.to_owned(),
+        hits: hits
+            .into_iter()
+            .map(|hit| NativeEnrichedHitV1 {
+                doc_id: hit.doc_id,
+                rank: hit.rank,
+                snippet: hit.snippet,
+                query_type_code: hit.query_type.to_string(),
+                metadata: MetadataStateV1::classify(hit.metadata.as_ref()),
+            })
+            .collect(),
     })
 }
 

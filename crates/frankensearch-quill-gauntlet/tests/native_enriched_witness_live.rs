@@ -14,7 +14,8 @@
 use frankensearch_core::IndexableDocument;
 use frankensearch_quill::{QuillConfig, QuillIndex};
 use frankensearch_quill_gauntlet::native_enriched_witness::{
-    FIXTURE_CORPUS, FIXTURE_EXPECTATIONS, adjudicate, observe_quill,
+    FIXTURE_CORPUS, FIXTURE_ENRICHMENT_EXPECTATIONS, FIXTURE_EXPECTATIONS, FIXTURE_METADATA,
+    adjudicate, adjudicate_enrichment, observe_quill, observe_quill_enrichment,
 };
 
 /// Build the committed corpus in a real Quill index.
@@ -31,9 +32,9 @@ async fn build_quill(cx: &asupersync::Cx, dir: &std::path::Path) -> QuillIndex {
     )
     .await
     .expect("create the witness Quill index");
-    for (doc_id, body) in FIXTURE_CORPUS {
+    for document in fixture_documents() {
         index
-            .index_document(cx, &IndexableDocument::new(*doc_id, *body))
+            .index_document(cx, &document)
             .await
             .expect("index a witness fixture document");
     }
@@ -42,6 +43,28 @@ async fn build_quill(cx: &asupersync::Cx, dir: &std::path::Path) -> QuillIndex {
         .await
         .expect("finalize the witness Quill index");
     index
+}
+
+/// The committed corpus as indexable documents, with the metadata the
+/// enrichment expectations describe.
+///
+/// Both engines are fed EXACTLY this list, so a metadata or snippet
+/// divergence is a divergence in the engines, not in how they were loaded.
+fn fixture_documents() -> Vec<IndexableDocument> {
+    FIXTURE_CORPUS
+        .iter()
+        .map(|(doc_id, body)| {
+            let mut document = IndexableDocument::new(*doc_id, *body);
+            if let Some((_, pairs)) = FIXTURE_METADATA.iter().find(|(id, _)| id == doc_id) {
+                for (key, value) in *pairs {
+                    document
+                        .metadata
+                        .insert((*key).to_owned(), (*value).to_owned());
+                }
+            }
+            document
+        })
+        .collect()
 }
 
 /// Every committed expectation must hold against the REAL native Quill
@@ -72,6 +95,39 @@ fn the_committed_expectations_hold_against_real_quill() {
         assert!(
             failures.is_empty(),
             "the committed expectations do not describe the shipping Quill engine:\n{}",
+            failures.join("\n")
+        );
+    });
+}
+
+/// Every committed ENRICHMENT expectation must hold against real Quill:
+/// configured highlight tags, hand-derived query classification, and metadata
+/// semantics.
+#[test]
+fn the_committed_enrichment_expectations_hold_against_real_quill() {
+    asupersync::test_utils::run_test_with_cx(|cx| async move {
+        let dir = tempfile::tempdir().expect("witness tempdir");
+        let index = build_quill(&cx, dir.path()).await;
+
+        let mut failures = Vec::new();
+        for expectation in FIXTURE_ENRICHMENT_EXPECTATIONS {
+            let observed = observe_quill_enrichment(&cx, &index, expectation)
+                .expect("observe native Quill enrichment");
+            let verdict = adjudicate_enrichment(expectation, &observed);
+            if !verdict.passed() {
+                failures.push(format!(
+                    "query={:?} tags={}{} -> {:?} (hits {:?})",
+                    expectation.query,
+                    expectation.highlight_prefix,
+                    expectation.highlight_postfix,
+                    verdict.oracle_failures,
+                    observed.hits,
+                ));
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "the committed enrichment expectations do not describe the shipping Quill engine:\n{}",
             failures.join("\n")
         );
     });
