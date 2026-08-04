@@ -1717,14 +1717,173 @@ pub struct NativeEnrichedReceiptV1 {
     pub corpus_manifest_sha256: String,
     /// Digest of the committed expectation table.
     pub query_manifest_sha256: String,
-    /// Every observation, in table order.
+    /// Digest of the committed capability table.
+    pub capability_manifest_sha256: String,
+    /// Schema/analyzer axis, bound as the harness's existing semantic
+    /// contract rather than as a witness-local restatement of it.
+    pub semantic_contract: crate::runner::SemanticContract,
+    /// Independently derived identity of every engine arm observed.
+    pub engine_identities: Vec<NativeEngineIdentityV1>,
+    /// The exact accepted candidate this receipt is evidence about.
+    pub candidate: AcceptedCandidateBindingV1,
+    /// Every paginated observation, in table order.
     pub observations: Vec<NativeObservationV1>,
-    /// Every verdict, in table order.
+    /// Every enriched observation, in table order.
+    pub enriched_observations: Vec<NativeEnrichedObservationV1>,
+    /// Every capability probe, in table order.
+    pub capability_outcomes: Vec<CapabilityProbeRecordV1>,
+    /// Every verdict, recomputed at assembly and again at load. A verdict is
+    /// a DERIVED field: it is never taken from a caller and never trusted
+    /// from a stored body.
     pub verdicts: Vec<NativeVerdictV1>,
     /// Whether both engines were observed. A single-engine receipt is legal
     /// and honest — the Tantivy arm needs the `tantivy-oracle` feature — but
     /// it must say so rather than imply cross-engine coverage.
     pub both_engines_observed: bool,
+}
+
+/// One capability probe, labelled by its committed row.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CapabilityProbeRecordV1 {
+    /// Committed row label.
+    pub label: String,
+    /// What the engine actually did.
+    pub outcome: CapabilityProbeOutcomeV1,
+}
+
+/// Everything one witness run observed, before it becomes a receipt.
+///
+/// Deliberately carries NO verdicts: the adjudication is the receipt's job, so
+/// a caller cannot hand in observations together with the conclusion it would
+/// like drawn from them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeEnrichedRunV1 {
+    /// Paginated observations.
+    pub observations: Vec<NativeObservationV1>,
+    /// Enriched observations.
+    pub enriched_observations: Vec<NativeEnrichedObservationV1>,
+    /// Capability probes.
+    pub capability_outcomes: Vec<CapabilityProbeRecordV1>,
+    /// Whether both engines were driven.
+    pub both_engines_observed: bool,
+}
+
+/// Independently derive the identity of every engine arm this build can drive.
+///
+/// # Errors
+///
+/// Propagates a Quill schema-identity failure.
+pub fn derive_engine_identities() -> Result<Vec<NativeEngineIdentityV1>, GauntletError> {
+    #[allow(unused_mut)]
+    let mut identities = vec![derive_quill_engine_identity()?];
+    #[cfg(feature = "tantivy-oracle")]
+    identities.push(derive_tantivy_engine_identity());
+    Ok(identities)
+}
+
+/// Recompute every verdict from the committed tables.
+///
+/// This is the function that makes a stored verdict worthless as a claim: a
+/// receipt's verdicts are compared against what THIS binary derives from the
+/// same observations, so an edited verdict is a mismatch rather than a fact.
+///
+/// Coverage is required, not optional. Every committed row must be observed
+/// once by every engine the receipt claims to have driven, because a receipt
+/// that could omit rows could hide exactly the rows that failed.
+///
+/// # Errors
+///
+/// Returns [`GauntletError::InvalidContract`] when an observation names a
+/// query outside the committed tables, when a row is observed twice, or when
+/// a claimed engine did not observe every row.
+pub fn recompute_verdicts(
+    run: &NativeEnrichedRunV1,
+) -> Result<Vec<NativeVerdictV1>, GauntletError> {
+    let invalid = |reason: String| GauntletError::InvalidContract { reason };
+    let engines: Vec<NativeEngineV1> = if run.both_engines_observed {
+        vec![NativeEngineV1::Quill, NativeEngineV1::Tantivy]
+    } else {
+        vec![NativeEngineV1::Quill]
+    };
+
+    let mut verdicts = Vec::new();
+
+    // Paginated rows.
+    for observation in &run.observations {
+        let expectation = FIXTURE_EXPECTATIONS
+            .iter()
+            .find(|row| {
+                row.query == observation.query
+                    && row.limit == observation.limit
+                    && row.offset == observation.offset
+            })
+            .ok_or_else(|| {
+                invalid(format!(
+                    "observation of {:?} (limit {}, offset {}) has no committed expectation",
+                    observation.query, observation.limit, observation.offset
+                ))
+            })?;
+        verdicts.push(adjudicate(expectation, observation));
+    }
+    let expected_pages = FIXTURE_EXPECTATIONS.len() * engines.len();
+    if run.observations.len() != expected_pages {
+        return Err(invalid(format!(
+            "receipt carries {} paginated observations, but {} engines x {} committed rows \
+             require {expected_pages}",
+            run.observations.len(),
+            engines.len(),
+            FIXTURE_EXPECTATIONS.len()
+        )));
+    }
+
+    // Enriched rows.
+    for observation in &run.enriched_observations {
+        let expectation = FIXTURE_ENRICHMENT_EXPECTATIONS
+            .iter()
+            .find(|row| {
+                row.query == observation.query
+                    && row.highlight_prefix == observation.highlight_prefix
+            })
+            .ok_or_else(|| {
+                invalid(format!(
+                    "enriched observation of {:?} with prefix {:?} has no committed expectation",
+                    observation.query, observation.highlight_prefix
+                ))
+            })?;
+        verdicts.push(adjudicate_enrichment(expectation, observation));
+    }
+    let expected_enriched = FIXTURE_ENRICHMENT_EXPECTATIONS.len() * engines.len();
+    if run.enriched_observations.len() != expected_enriched {
+        return Err(invalid(format!(
+            "receipt carries {} enriched observations but {expected_enriched} are required",
+            run.enriched_observations.len()
+        )));
+    }
+
+    // Capability rows. Quill-only: Tantivy has no typed capability surface,
+    // which the witness records as a divergence rather than a gap.
+    for record in &run.capability_outcomes {
+        let expectation = FIXTURE_CAPABILITY_EXPECTATIONS
+            .iter()
+            .find(|row| row.label == record.label)
+            .ok_or_else(|| {
+                invalid(format!(
+                    "capability probe {:?} has no committed expectation",
+                    record.label
+                ))
+            })?;
+        verdicts.push(adjudicate_capability_probe(expectation, &record.outcome));
+    }
+    if run.capability_outcomes.len() != FIXTURE_CAPABILITY_EXPECTATIONS.len() {
+        return Err(invalid(format!(
+            "receipt carries {} capability probes but {} committed rows require all of them",
+            run.capability_outcomes.len(),
+            FIXTURE_CAPABILITY_EXPECTATIONS.len()
+        )));
+    }
+
+    Ok(verdicts)
 }
 
 impl NativeEnrichedReceiptV1 {
@@ -1744,6 +1903,248 @@ impl NativeEnrichedReceiptV1 {
         self.verdicts.iter().all(NativeVerdictV1::passed)
     }
 
+    /// Assemble a receipt from one run, sealing it to THIS binary.
+    ///
+    /// The verdicts are computed here from the committed tables; the producer
+    /// identity, manifests and engine identities are derived, never supplied.
+    ///
+    /// # Errors
+    ///
+    /// Propagates producer-identity, coverage and adjudication failures, and
+    /// rejects a candidate binding that this binary did not produce.
+    pub fn assemble(
+        run: &NativeEnrichedRunV1,
+        candidate: AcceptedCandidateBindingV1,
+    ) -> Result<Self, GauntletError> {
+        Self::assemble_with_producer(run, candidate, GauntletProducerBuildIdentity::compiled()?)
+    }
+
+    /// Assemble against an explicitly supplied producer identity.
+    ///
+    /// Crate-visible on purpose. An injected producer is exactly the synthetic
+    /// construction the bead rejects as release evidence, and
+    /// [`NativeEnrichedReceiptV1::load_canonical`] re-derives the producer from
+    /// the running binary, so a receipt built this way cannot survive a load
+    /// anywhere but the machine that would have produced it anyway.
+    pub(crate) fn assemble_with_producer(
+        run: &NativeEnrichedRunV1,
+        candidate: AcceptedCandidateBindingV1,
+        producer: GauntletProducerBuildIdentity,
+    ) -> Result<Self, GauntletError> {
+        let identities = derive_engine_identities()?;
+        if run.both_engines_observed && identities.len() < 2 {
+            return Err(GauntletError::InvalidContract {
+                reason: "receipt claims both engines but this build can drive only one".to_owned(),
+            });
+        }
+        let semantic_contract = crate::runner::SemanticContract::shipping_default();
+        require_shipping_semantic_contract(&semantic_contract)?;
+        for identity in &identities {
+            identity.reject_cass_identity(&semantic_contract)?;
+        }
+        if candidate.candidate_source_revision != producer.source_git_revision {
+            return Err(GauntletError::ManifestMismatch {
+                reason: format!(
+                    "receipt binds candidate {} but was produced by {}",
+                    candidate.candidate_source_revision, producer.source_git_revision
+                ),
+            });
+        }
+        Ok(Self {
+            schema_version: NATIVE_ENRICHED_RECEIPT_SCHEMA_VERSION,
+            producer,
+            corpus_manifest_sha256: corpus_manifest_sha256(),
+            query_manifest_sha256: query_manifest_sha256(),
+            capability_manifest_sha256: capability_manifest_sha256(),
+            semantic_contract,
+            engine_identities: identities,
+            candidate,
+            verdicts: recompute_verdicts(run)?,
+            observations: run.observations.clone(),
+            enriched_observations: run.enriched_observations.clone(),
+            capability_outcomes: run.capability_outcomes.clone(),
+            both_engines_observed: run.both_engines_observed,
+        })
+    }
+
+    /// The run this receipt records, for re-adjudication.
+    fn run(&self) -> NativeEnrichedRunV1 {
+        NativeEnrichedRunV1 {
+            observations: self.observations.clone(),
+            enriched_observations: self.enriched_observations.clone(),
+            capability_outcomes: self.capability_outcomes.clone(),
+            both_engines_observed: self.both_engines_observed,
+        }
+    }
+
+    /// Load a stored receipt, recomputing everything it claims.
+    ///
+    /// # Why the address alone is not verification
+    ///
+    /// The address IS the hash of the body, so any edit changes it — but an
+    /// editor can simply recompute the address, and then the object is
+    /// internally consistent and still false. What an editor CANNOT do is make
+    /// the stored manifests agree with this build's committed fixtures, the
+    /// stored producer agree with this binary's sealed identity, the stored
+    /// engine identities agree with the engine crates' own exports, or the
+    /// stored verdicts agree with a fresh adjudication of the stored
+    /// observations. Those recomputations, not the address, are what makes a
+    /// stored body evidence.
+    ///
+    /// A [`VerifiedNativeEnrichedReceiptV1`] can be produced ONLY here. There
+    /// is no constructor that takes a body, which is what makes synthetic
+    /// from-body construction unusable as release evidence.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GauntletError::Json`] for a body that is not canonical (an
+    /// unknown field is a parse failure), [`GauntletError::ManifestMismatch`]
+    /// for an address or provenance that does not replay, and
+    /// [`GauntletError::InvalidContract`] for a contract violation.
+    pub fn load_canonical(
+        bytes: &[u8],
+        expected_address: &str,
+    ) -> Result<VerifiedNativeEnrichedReceiptV1, GauntletError> {
+        let receipt: Self = serde_json::from_slice(bytes)?;
+        let mismatch = |reason: String| GauntletError::ManifestMismatch { reason };
+
+        if receipt.schema_version != NATIVE_ENRICHED_RECEIPT_SCHEMA_VERSION {
+            return Err(GauntletError::InvalidContract {
+                reason: format!(
+                    "receipt schema version {} is not {NATIVE_ENRICHED_RECEIPT_SCHEMA_VERSION}",
+                    receipt.schema_version
+                ),
+            });
+        }
+
+        // 1. Object address.
+        let address = receipt.receipt_hash()?;
+        if address != expected_address {
+            return Err(mismatch(format!(
+                "receipt address {address} does not match the expected {expected_address}"
+            )));
+        }
+
+        // 2. Fixture manifests, recomputed from the committed tables.
+        for (label, stored, recomputed) in [
+            (
+                "corpus manifest",
+                &receipt.corpus_manifest_sha256,
+                corpus_manifest_sha256(),
+            ),
+            (
+                "query manifest",
+                &receipt.query_manifest_sha256,
+                query_manifest_sha256(),
+            ),
+            (
+                "capability manifest",
+                &receipt.capability_manifest_sha256,
+                capability_manifest_sha256(),
+            ),
+        ] {
+            if *stored != recomputed {
+                return Err(mismatch(format!(
+                    "{label} {stored} does not match this build's {recomputed}"
+                )));
+            }
+        }
+
+        // 3. Schema/analyzer axis, and the CASS refusal.
+        require_shipping_semantic_contract(&receipt.semantic_contract)?;
+        for identity in &receipt.engine_identities {
+            identity.reject_cass_identity(&receipt.semantic_contract)?;
+        }
+
+        // 4. Engine identities, re-derived from the engine crates.
+        let derived = derive_engine_identities()?;
+        if receipt.engine_identities != derived {
+            return Err(mismatch(
+                "receipt engine identities do not match the engines this build links".to_owned(),
+            ));
+        }
+
+        // 5. Producer provenance, axis by axis so a failure names what moved.
+        let compiled = GauntletProducerBuildIdentity::compiled()?;
+        for (label, stored, current) in [
+            (
+                "source revision",
+                &receipt.producer.source_git_revision,
+                &compiled.source_git_revision,
+            ),
+            (
+                "Cargo.lock digest",
+                &receipt.producer.cargo_lock_sha256,
+                &compiled.cargo_lock_sha256,
+            ),
+            (
+                "toolchain",
+                &receipt.producer.rustc_version_verbose_hex,
+                &compiled.rustc_version_verbose_hex,
+            ),
+            (
+                "target triple",
+                &receipt.producer.target_triple,
+                &compiled.target_triple,
+            ),
+            (
+                "cargo profile",
+                &receipt.producer.cargo_profile,
+                &compiled.cargo_profile,
+            ),
+            (
+                "feature selection",
+                &receipt.producer.enabled_features_sha256,
+                &compiled.enabled_features_sha256,
+            ),
+            (
+                "executable digest",
+                &receipt.producer.executable_sha256,
+                &compiled.executable_sha256,
+            ),
+        ] {
+            if stored != current {
+                return Err(mismatch(format!(
+                    "receipt {label} {stored} was not produced by this binary ({current})"
+                )));
+            }
+        }
+        if receipt.producer != compiled {
+            return Err(mismatch(
+                "receipt producer identity differs from this binary's sealed identity".to_owned(),
+            ));
+        }
+
+        // 6. The candidate this receipt claims to be evidence about.
+        if receipt.candidate.contract_mode
+            != crate::campaign_contract::CampaignContractModeV1::CoreLexicalV3
+        {
+            return Err(GauntletError::InvalidContract {
+                reason: format!(
+                    "receipt candidate exercises {:?}, not the full core-v3 surface",
+                    receipt.candidate.contract_mode
+                ),
+            });
+        }
+        if receipt.candidate.candidate_source_revision != receipt.producer.source_git_revision {
+            return Err(mismatch(format!(
+                "receipt binds candidate {} but was produced by {}",
+                receipt.candidate.candidate_source_revision, receipt.producer.source_git_revision
+            )));
+        }
+
+        // 7. The derived fields: verdicts are recomputed, never read.
+        let recomputed = recompute_verdicts(&receipt.run())?;
+        if receipt.verdicts != recomputed {
+            return Err(mismatch(
+                "receipt verdicts do not match a fresh adjudication of its own observations"
+                    .to_owned(),
+            ));
+        }
+
+        Ok(VerifiedNativeEnrichedReceiptV1 { receipt, address })
+    }
+
     /// Content address over the domain-separated canonical body.
     ///
     /// # Errors
@@ -1759,6 +2160,74 @@ impl NativeEnrichedReceiptV1 {
         hasher.update([0u8]);
         hasher.update(&body);
         Ok(hex_lower(&hasher.finalize()))
+    }
+}
+
+/// A receipt whose every claim was recomputed at load.
+///
+/// The inner receipt is PRIVATE and there is no public constructor: the only
+/// way to hold one of these is to have passed
+/// [`NativeEnrichedReceiptV1::load_canonical`]. A body deserialized by hand is
+/// a `NativeEnrichedReceiptV1` and can never become this type, which is what
+/// "rejects synthetic from-body-only construction as release evidence" means
+/// in the type system rather than in a comment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifiedNativeEnrichedReceiptV1 {
+    receipt: NativeEnrichedReceiptV1,
+    address: String,
+}
+
+impl VerifiedNativeEnrichedReceiptV1 {
+    /// The verified receipt body.
+    #[must_use]
+    pub const fn receipt(&self) -> &NativeEnrichedReceiptV1 {
+        &self.receipt
+    }
+
+    /// The verified content address.
+    #[must_use]
+    pub fn address(&self) -> &str {
+        &self.address
+    }
+
+    /// Even a VERIFIED receipt cannot authorize a replacement.
+    ///
+    /// Verification establishes that the receipt describes what it claims. It
+    /// says nothing about whether the enriched surface is complete enough to
+    /// replace an engine, which only the terminal release-gate aggregator may
+    /// decide.
+    #[must_use]
+    pub const fn authorizes_replacement(&self) -> bool {
+        false
+    }
+
+    /// Whether this receipt is admissible as release evidence.
+    ///
+    /// Separate from loading on purpose. Loading answers "does this object
+    /// describe what it claims"; admissibility answers "may it be cited". A
+    /// dirty-tree receipt is perfectly loadable and perfectly inadmissible,
+    /// and collapsing the two would make the harness unable to record an
+    /// honest development run at all.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GauntletError::InvalidContract`] naming the first
+    /// admissibility requirement the receipt fails.
+    pub fn require_release_admissible(&self) -> Result<(), GauntletError> {
+        self.receipt
+            .candidate
+            .require_produced_by_the_candidate(&self.receipt.producer)?;
+        if !self.receipt.both_engines_observed {
+            return Err(GauntletError::InvalidContract {
+                reason: "a single-engine receipt is not release evidence".to_owned(),
+            });
+        }
+        if !self.receipt.all_verdicts_passed() {
+            return Err(GauntletError::InvalidContract {
+                reason: "receipt carries failing verdicts".to_owned(),
+            });
+        }
+        Ok(())
     }
 }
 
@@ -2947,6 +3416,321 @@ mod tests {
         assert!(!is_canonical_git_revision(&"A".repeat(40)));
         assert!(!is_canonical_git_revision("unavailable"));
         assert!(!is_canonical_git_revision(&"g".repeat(40)));
+    }
+
+    // -----------------------------------------------------------------
+    // Canonical load/replay and the provenance mutation battery (slice 6)
+    // -----------------------------------------------------------------
+
+    /// A run that satisfies every committed table, built synthetically.
+    ///
+    /// Synthetic on purpose: these tests exercise the LOADER, whose job is to
+    /// recompute, not to re-run engines. The engines are exercised against
+    /// these same tables by the live suite, so the tables are not merely
+    /// self-consistent.
+    fn passing_run() -> NativeEnrichedRunV1 {
+        let observations = FIXTURE_EXPECTATIONS
+            .iter()
+            .map(|row| {
+                let page: Vec<&str> = row
+                    .matching_docs
+                    .iter()
+                    .skip(row.offset)
+                    .take(row.limit)
+                    .copied()
+                    .collect();
+                observation(NativeEngineV1::Quill, row, &page, row.total)
+            })
+            .collect();
+        let enriched_observations = FIXTURE_ENRICHMENT_EXPECTATIONS
+            .iter()
+            .map(|row| {
+                let metadata = if row.expected_metadata_pairs.is_empty() {
+                    MetadataStateV1::Absent
+                } else {
+                    MetadataStateV1::Entries {
+                        pairs: row
+                            .expected_metadata_pairs
+                            .iter()
+                            .map(|pair| (*pair).to_owned())
+                            .collect(),
+                    }
+                };
+                let snippet = format!(
+                    "{}{}{} {UTF8_INTACT_TOKEN}",
+                    row.highlight_prefix, row.highlighted_term, row.highlight_postfix
+                );
+                enriched(
+                    NativeEngineV1::Quill,
+                    row,
+                    Some(&snippet),
+                    row.expected_query_type_code,
+                    metadata,
+                )
+            })
+            .collect();
+        let capability_outcomes = FIXTURE_CAPABILITY_EXPECTATIONS
+            .iter()
+            .map(|row| CapabilityProbeRecordV1 {
+                label: row.label.to_owned(),
+                outcome: match row.outcome {
+                    CapabilityOutcomeExpectationV1::Refused { .. } => {
+                        CapabilityProbeOutcomeV1::Refused(refusal())
+                    }
+                    CapabilityOutcomeExpectationV1::Served { docs, total } => {
+                        CapabilityProbeOutcomeV1::Served {
+                            doc_ids: docs.iter().map(|doc| (*doc).to_owned()).collect(),
+                            total: Some(total),
+                        }
+                    }
+                },
+            })
+            .collect();
+        NativeEnrichedRunV1 {
+            observations,
+            enriched_observations,
+            capability_outcomes,
+            both_engines_observed: false,
+        }
+    }
+
+    /// A receipt sealed to THIS binary, so every loader gate except the one
+    /// under test is satisfied.
+    fn loadable_receipt() -> NativeEnrichedReceiptV1 {
+        let producer =
+            GauntletProducerBuildIdentity::compiled().expect("this binary has a sealed identity");
+        let candidate = AcceptedCandidateBindingV1 {
+            candidate_source_revision: producer.source_git_revision.clone(),
+            contract_mode: crate::campaign_contract::CampaignContractModeV1::CoreLexicalV3,
+        };
+        NativeEnrichedReceiptV1::assemble_with_producer(&passing_run(), candidate, producer)
+            .expect("assemble a receipt for this binary")
+    }
+
+    fn load(
+        receipt: &NativeEnrichedReceiptV1,
+    ) -> Result<VerifiedNativeEnrichedReceiptV1, GauntletError> {
+        let address = receipt.receipt_hash().expect("address");
+        let bytes = serde_json::to_vec(receipt).expect("canonical body");
+        NativeEnrichedReceiptV1::load_canonical(&bytes, &address)
+    }
+
+    #[test]
+    fn a_receipt_sealed_to_this_binary_loads_and_replays() {
+        let receipt = loadable_receipt();
+        let verified = load(&receipt).expect("the sealed receipt must load");
+        assert_eq!(verified.receipt(), &receipt);
+        assert_eq!(verified.address(), receipt.receipt_hash().expect("address"));
+        // The non-authorization property survives verification itself.
+        assert!(!verified.authorizes_replacement());
+        assert!(!receipt.authorizes_replacement());
+    }
+
+    /// The address is checked, but the address is the WEAK half: an editor can
+    /// recompute it. Both halves are proved here — a stale address is caught,
+    /// and so is an edit whose address was recomputed.
+    #[test]
+    fn a_recomputed_address_does_not_launder_an_edited_body() {
+        let receipt = loadable_receipt();
+        let honest_address = receipt.receipt_hash().expect("address");
+
+        // Stale address: body edited, address left alone.
+        let mut edited = receipt.clone();
+        edited.corpus_manifest_sha256 = "0".repeat(64);
+        let bytes = serde_json::to_vec(&edited).expect("body");
+        let error = NativeEnrichedReceiptV1::load_canonical(&bytes, &honest_address)
+            .expect_err("an edited body must not match the old address");
+        assert!(error.to_string().contains("does not match the expected"));
+
+        // Recomputed address: internally consistent, still false.
+        let error = load(&edited).expect_err("a recomputed address must not launder the edit");
+        assert!(
+            error.to_string().contains("corpus manifest"),
+            "the recomputation, not the address, must catch it: {error}"
+        );
+    }
+
+    /// One named mutation of a stored receipt: its label, the edit, and the
+    /// substring the resulting rejection must contain.
+    type ReceiptMutation = (&'static str, fn(&mut NativeEnrichedReceiptV1), &'static str);
+
+    /// THE PROVENANCE MUTATION BATTERY. Each axis the acceptance names is
+    /// mutated alone, with the address recomputed every time — the hostile
+    /// case, not the careless one.
+    #[test]
+    fn every_provenance_axis_is_independently_replayed() {
+        let baseline = loadable_receipt();
+        load(&baseline).expect("the baseline must load, or the mutations prove nothing");
+
+        let mutations: [ReceiptMutation; 12] = [
+            (
+                "corpus manifest",
+                |receipt| receipt.corpus_manifest_sha256 = "0".repeat(64),
+                "corpus manifest",
+            ),
+            (
+                "query manifest",
+                |receipt| receipt.query_manifest_sha256 = "0".repeat(64),
+                "query manifest",
+            ),
+            (
+                "capability manifest",
+                |receipt| receipt.capability_manifest_sha256 = "0".repeat(64),
+                "capability manifest",
+            ),
+            (
+                "candidate SHA",
+                |receipt| receipt.producer.source_git_revision = "c".repeat(40),
+                "source revision",
+            ),
+            (
+                "lockfile",
+                |receipt| receipt.producer.cargo_lock_sha256 = "0".repeat(64),
+                "Cargo.lock digest",
+            ),
+            (
+                "toolchain",
+                |receipt| receipt.producer.rustc_version_verbose_hex = "00".to_owned(),
+                "toolchain",
+            ),
+            (
+                "target triple",
+                |receipt| receipt.producer.target_triple = "wasm32-unknown-unknown".to_owned(),
+                "target triple",
+            ),
+            (
+                "profile",
+                |receipt| receipt.producer.cargo_profile = "release".to_owned(),
+                "cargo profile",
+            ),
+            (
+                "features",
+                |receipt| receipt.producer.enabled_features_sha256 = "0".repeat(64),
+                "feature selection",
+            ),
+            (
+                "engine identity",
+                |receipt| {
+                    if let Some(identity) = receipt.engine_identities.first_mut() {
+                        identity.backend_code = "not-quill".to_owned();
+                    }
+                },
+                "engine identities do not match",
+            ),
+            (
+                "stale candidate",
+                |receipt| receipt.candidate.candidate_source_revision = "d".repeat(40),
+                "binds candidate",
+            ),
+            (
+                "schema version",
+                |receipt| receipt.schema_version = 99,
+                "schema version",
+            ),
+        ];
+        for (name, mutate, expected) in mutations {
+            let mut mutated = baseline.clone();
+            mutate(&mut mutated);
+            let error = load(&mutated).expect_err(name).to_string();
+            assert!(
+                error.contains(expected),
+                "the {name} mutation must be rejected for its own reason, got {error}"
+            );
+        }
+    }
+
+    /// A DERIVED field is not a claim. Editing a verdict to say "passed", or
+    /// editing an observation without editing its verdict, are both caught by
+    /// the same fresh adjudication.
+    #[test]
+    fn edited_derived_fields_do_not_survive_replay() {
+        let baseline = loadable_receipt();
+
+        // Claim a pass that the observations do not support.
+        let mut broken_observation = baseline.clone();
+        broken_observation.observations[0].total += 1;
+        let error = load(&broken_observation)
+            .expect_err("an edited observation must not keep its old verdict");
+        assert!(
+            error.to_string().contains("fresh adjudication"),
+            "got {error}"
+        );
+
+        // Silence a failing verdict without touching the observation.
+        let mut silenced = broken_observation.clone();
+        silenced.verdicts = recompute_verdicts(&silenced.run()).expect("recompute");
+        assert!(
+            !silenced.all_verdicts_passed(),
+            "the edited observation really must fail its oracle"
+        );
+        for verdict in &mut silenced.verdicts {
+            verdict.oracle_failures.clear();
+        }
+        let error =
+            load(&silenced).expect_err("a hand-cleared verdict must not survive recomputation");
+        assert!(
+            error.to_string().contains("fresh adjudication"),
+            "got {error}"
+        );
+    }
+
+    /// A receipt cannot quietly drop the rows that failed.
+    #[test]
+    fn a_receipt_that_omits_committed_rows_is_rejected() {
+        let mut truncated = loadable_receipt();
+        truncated.observations.pop();
+        truncated.verdicts = Vec::new();
+        let error = load(&truncated).expect_err("dropping a committed row must be rejected");
+        assert!(
+            error.to_string().contains("paginated observations"),
+            "got {error}"
+        );
+
+        let mut padded = loadable_receipt();
+        let mut extra = padded.observations[0].clone();
+        extra.query = "a query nobody committed".to_owned();
+        padded.observations.push(extra);
+        let error = load(&padded).expect_err("an unaudited row must be rejected");
+        assert!(
+            error.to_string().contains("no committed expectation"),
+            "got {error}"
+        );
+    }
+
+    /// An unknown field is a parse failure, not a silently ignored extension.
+    #[test]
+    fn an_unknown_field_is_not_silently_accepted() {
+        let receipt = loadable_receipt();
+        let mut body: serde_json::Value =
+            serde_json::to_value(&receipt).expect("receipt serializes");
+        body.as_object_mut()
+            .expect("receipt is a JSON object")
+            .insert("authorizes_replacement".to_owned(), serde_json::json!(true));
+        let bytes = serde_json::to_vec(&body).expect("body");
+        let error = NativeEnrichedReceiptV1::load_canonical(&bytes, "unused")
+            .expect_err("an unknown field must fail the parse");
+        assert!(matches!(error, GauntletError::Json(_)), "got {error}");
+    }
+
+    /// Loading proves the object describes what it claims; admissibility
+    /// decides whether it may be cited. This tree is dirty while peers work in
+    /// it, so the dirty arm is the one exercised here — and it is the arm that
+    /// matters, because a dirty receipt that loaded AND was admissible would
+    /// be the failure.
+    #[test]
+    fn loading_is_not_admissibility() {
+        let receipt = loadable_receipt();
+        let verified = load(&receipt).expect("integrity holds regardless of admissibility");
+        let admissible = verified.require_release_admissible();
+        if receipt.producer.source_git_dirty {
+            let error = admissible.expect_err("a dirty-tree receipt is not release evidence");
+            assert!(error.to_string().contains("dirty"), "got {error}");
+        } else {
+            // A clean tree still fails on single-engine coverage, which this
+            // synthetic run declares honestly.
+            let error = admissible.expect_err("a single-engine receipt is not release evidence");
+            assert!(error.to_string().contains("single-engine"), "got {error}");
+        }
     }
 
     #[test]

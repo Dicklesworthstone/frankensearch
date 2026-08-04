@@ -133,6 +133,27 @@ impl MaintenanceSchedule {
             .count()
     }
 
+    /// Build an explicit schedule for a control fixture.
+    ///
+    /// The seeded generators deliberately refuse to emit some sequences — a
+    /// reopen at an uncommitted boundary, for one. Measuring what those
+    /// sequences actually do is how their exclusion stays evidenced instead of
+    /// assumed, so a control needs to name its steps directly. Test-only, and
+    /// never a path a campaign takes.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn from_steps_for_test(
+        seed: u64,
+        corpus_len: usize,
+        steps: Vec<MaintenanceStep>,
+    ) -> Self {
+        Self {
+            seed,
+            corpus_len,
+            steps,
+        }
+    }
+
     /// A compact, redaction-safe rendering for replay artifacts.
     ///
     /// Only structural facts appear — step kinds, counts, and corpus indices —
@@ -222,6 +243,30 @@ pub fn merge_schedule(seed: u64, corpus_len: usize) -> MaintenanceSchedule {
 /// this against an uninterrupted ingest: recovery must restore exactly the
 /// durable state, so the observation must be unchanged.
 ///
+/// # Every reopen is preceded by a flush, and that is a SCOPE decision
+///
+/// The first version of this generator let the seed decide whether to flush
+/// before a reopen, on the reasoning that "a reopen without a preceding flush
+/// exercises recovery of buffered state". That was wrong about what the engine
+/// contracts, and it would have made this law fail for a reason the law does
+/// not name.
+///
+/// Uncommitted ingest is not durable: closing an index discards it, and a
+/// reopen therefore returns an index missing those documents. Comparing that
+/// arm against a control containing the whole corpus produces a document-count
+/// difference — a real one, correctly reported — but it is a difference in WHAT
+/// was durably indexed, not in whether recovery restored what it should. The
+/// resulting failure would name reopen-recovery while actually exercising the
+/// durability of uncommitted buffers.
+///
+/// So the transform is now qualified: reopen at a committed boundary. What that
+/// LOSES is the uncommitted-reopen case, which this law never had standing to
+/// judge; what it KEEPS is every reopen this law is actually about. The
+/// excluded case is not assumed — it is measured, in
+/// `an_uncommitted_reopen_loses_the_buffered_documents`
+/// (`super::metamorphic_maintenance_laws`), so the exclusion rests on a
+/// witnessed engine boundary rather than on convenience.
+///
 /// # Panics
 ///
 /// Panics when `corpus_len` is below two.
@@ -232,13 +277,11 @@ pub fn reopen_recovery_schedule(seed: u64, corpus_len: usize) -> MaintenanceSche
     let mut steps = Vec::with_capacity(batches.len() * 3);
     for (index, count) in batches.iter().enumerate() {
         steps.push(MaintenanceStep::Ingest { count: *count });
-        // A reopen without a preceding flush exercises recovery of buffered
-        // state; with one, it exercises reopen of durable state. Both are in
-        // contract, so the seed picks between them.
-        if mix(&mut state) % 2 == 0 {
+        // The seed picks WHERE the reopens land, never whether the boundary is
+        // committed first. Index 0 always reopens so no seed degenerates into a
+        // schedule with no recovery at all.
+        if index == 0 || mix(&mut state) % 2 == 0 {
             steps.push(MaintenanceStep::Flush);
-        }
-        if index + 1 < batches.len() || index == 0 {
             steps.push(MaintenanceStep::Reopen);
         }
     }
@@ -293,14 +336,85 @@ pub fn tombstone_compaction_schedule(seed: u64, corpus_len: usize) -> Maintenanc
     }
 }
 
+/// Step-wise driver for the shrink search.
+///
+/// The reduction algorithm lives here ONCE, and both callers turn its crank:
+/// [`shrink_schedule`] for a synchronous predicate, and the live law campaigns
+/// for an asynchronous one that must actually run the transform against an
+/// index. A second, async copy of the algorithm would be free to drift, and a
+/// shrinker that behaves differently in the campaign than in its own tests is a
+/// shrinker whose tests prove nothing about the fixtures it emits.
+pub struct ShrinkDriver {
+    current: MaintenanceSchedule,
+    index: usize,
+    pending: Option<MaintenanceSchedule>,
+}
+
+impl ShrinkDriver {
+    /// Begin reducing `schedule`.
+    #[must_use]
+    pub fn new(schedule: &MaintenanceSchedule) -> Self {
+        Self {
+            current: schedule.clone(),
+            index: 0,
+            pending: None,
+        }
+    }
+
+    /// The next candidate to test, or `None` when the search is complete.
+    ///
+    /// Ingest steps are never dropped, because removing one changes the corpus
+    /// rather than the maintenance sequence, and the last perturbing step is
+    /// never dropped, because a schedule with none no longer exercises the law
+    /// it came from.
+    pub fn next_candidate(&mut self) -> Option<MaintenanceSchedule> {
+        while self.index < self.current.steps.len() {
+            if matches!(
+                self.current.steps[self.index],
+                MaintenanceStep::Ingest { .. }
+            ) || self.current.perturbing_steps() <= 1
+            {
+                self.index += 1;
+                continue;
+            }
+            let mut candidate = self.current.clone();
+            candidate.steps.remove(self.index);
+            self.pending = Some(candidate.clone());
+            return Some(candidate);
+        }
+        None
+    }
+
+    /// Record whether the candidate still reproduced the failure.
+    ///
+    /// # Panics
+    ///
+    /// Panics when called without an outstanding candidate, which would mean a
+    /// verdict was recorded against a schedule the driver never proposed.
+    pub fn accept(&mut self, still_fails: bool) {
+        let candidate = self
+            .pending
+            .take()
+            .expect("a shrink verdict requires an outstanding candidate");
+        if still_fails {
+            self.current = candidate;
+        } else {
+            self.index += 1;
+        }
+    }
+
+    /// The reduced schedule.
+    #[must_use]
+    pub fn finish(self) -> MaintenanceSchedule {
+        self.current
+    }
+}
+
 /// Reduce a failing schedule toward a bounded fixture.
 ///
-/// Greedy single-pass delta debugging: drop one perturbing step at a time,
-/// keeping the reduction only while `still_fails` reports the schedule still
-/// reproduces the failure. Ingest steps are never dropped, because removing
-/// them changes the corpus rather than the maintenance sequence, and the last
-/// perturbing step is never dropped, because a schedule with none no longer
-/// exercises the law it came from.
+/// Greedy single-pass delta debugging over [`ShrinkDriver`]: drop one
+/// perturbing step at a time, keeping the reduction only while `still_fails`
+/// reports the schedule still reproduces the failure.
 ///
 /// The result is a schedule that still fails, is no longer than the input, and
 /// retains at least one perturbing step.
@@ -308,24 +422,12 @@ pub fn shrink_schedule<F>(schedule: &MaintenanceSchedule, mut still_fails: F) ->
 where
     F: FnMut(&MaintenanceSchedule) -> bool,
 {
-    let mut current = schedule.clone();
-    let mut index = 0;
-    while index < current.steps.len() {
-        if matches!(current.steps[index], MaintenanceStep::Ingest { .. })
-            || current.perturbing_steps() <= 1
-        {
-            index += 1;
-            continue;
-        }
-        let mut candidate = current.clone();
-        candidate.steps.remove(index);
-        if still_fails(&candidate) {
-            current = candidate;
-        } else {
-            index += 1;
-        }
+    let mut driver = ShrinkDriver::new(schedule);
+    while let Some(candidate) = driver.next_candidate() {
+        let verdict = still_fails(&candidate);
+        driver.accept(verdict);
     }
-    current
+    driver.finish()
 }
 
 #[cfg(test)]
@@ -436,6 +538,41 @@ mod tests {
                 signatures.len() > 1,
                 "{name} collapsed every seed in the matrix onto one schedule"
             );
+        }
+    }
+
+    /// Reopen schedules must only reopen at a committed boundary.
+    ///
+    /// This is the executable form of the scope qualification documented on
+    /// [`reopen_recovery_schedule`]: an unflushed reopen discards uncommitted
+    /// ingest, so a schedule containing one would fail this law for a
+    /// durability reason the law does not name. Asserting it here means the
+    /// qualification cannot be lost by a later edit to the generator.
+    #[test]
+    fn every_reopen_follows_a_flush_of_the_batch_before_it() {
+        for seed in MAINTENANCE_SEED_MATRIX {
+            let schedule = reopen_recovery_schedule(seed, CORPUS_LEN);
+            let steps = schedule.steps();
+            let reopens = steps
+                .iter()
+                .filter(|step| matches!(step, MaintenanceStep::Reopen))
+                .count();
+            assert!(
+                reopens >= 1,
+                "seed {seed:#018x} reopens nothing, so its law would be vacuous: {}",
+                schedule.replay_signature()
+            );
+            for (position, step) in steps.iter().enumerate() {
+                if !matches!(step, MaintenanceStep::Reopen) {
+                    continue;
+                }
+                assert!(
+                    position > 0 && matches!(steps[position - 1], MaintenanceStep::Flush),
+                    "seed {seed:#018x} reopens at an uncommitted boundary, which tests the \
+                     durability of buffered ingest rather than recovery: {}",
+                    schedule.replay_signature()
+                );
+            }
         }
     }
 

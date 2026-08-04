@@ -1252,6 +1252,61 @@ impl QuillSubject {
         })
     }
 
+    /// Wrap an index this crate already opened, instead of creating one.
+    ///
+    /// The E6.3 index-maintenance laws (`bd-quill-e6-gauntlet-scale-rm3q.3`)
+    /// need this for exactly one reason: a durable close/reopen cycle. Every
+    /// other construction path here is in-memory, and an in-memory index cannot
+    /// express recovery — so without this seam the reopen-recovery law could
+    /// only be "tested" by approximating a reopen with a fresh open, which
+    /// tests something other than what it claims.
+    ///
+    /// The subject starts `Fresh`, so the caller still walks the normal
+    /// claim/commit/publish campaign states; this changes where the index came
+    /// from and nothing else. Test-only, and only under `perf-harness`.
+    #[cfg(all(test, feature = "perf-harness"))]
+    pub(crate) fn from_open_index(
+        index: QuillIndex,
+        config: QuillConfig,
+    ) -> Result<Self, GauntletError> {
+        let producer = GauntletProducerBuildIdentity::compiled()?;
+        let descriptor = EngineDescriptor {
+            family: EngineFamily::Quill,
+            implementation: "frankensearch-quill/scalar-index".to_owned(),
+            crate_version: frankensearch_quill::FRANKENSEARCH_QUILL_CRATE_VERSION.to_owned(),
+            source_revision: producer.source_git_revision,
+            source_dirty: producer.source_git_dirty,
+            config_hash: quill_config_hash(&config),
+        };
+        descriptor.validate()?;
+        Ok(Self {
+            index: Some(index),
+            config,
+            descriptor,
+            state: QuillCampaignState::Fresh,
+        })
+    }
+
+    /// Take the open index out of this subject, leaving it unusable.
+    ///
+    /// Used by the reopen-recovery law to CLOSE an index for real: the returned
+    /// value is dropped by the caller before the directory is reopened, so the
+    /// reopen observes durable state rather than a still-live writer.
+    #[cfg(all(test, feature = "perf-harness"))]
+    pub(crate) fn take_index(&mut self) -> Result<QuillIndex, GauntletError> {
+        self.index
+            .take()
+            .ok_or_else(|| GauntletError::SubjectUnavailable {
+                reason: "Quill campaign subject has no open index to close".to_owned(),
+            })
+    }
+
+    /// Reinstall an index after a close/reopen cycle, preserving campaign state.
+    #[cfg(all(test, feature = "perf-harness"))]
+    pub(crate) fn restore_index(&mut self, index: QuillIndex) {
+        self.index = Some(index);
+    }
+
     #[must_use]
     pub const fn config(&self) -> &QuillConfig {
         &self.config

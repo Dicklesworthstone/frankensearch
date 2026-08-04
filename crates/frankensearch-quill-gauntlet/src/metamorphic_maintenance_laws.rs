@@ -105,28 +105,34 @@ pub const REOPEN_RECOVERY_ALLOWED: &[DivergenceClass] = &[DivergenceClass::TieOr
 /// law exists to catch — so it is NOT admitted, despite counts being the most
 /// tempting thing to excuse when a compaction reclaims space.
 ///
-/// # This relation is CONTINGENT on a precondition that is not yet met
+/// # The score-sensitivity blocker was real, and COMPACTION discharges it
 ///
-/// Admitting only [`DivergenceClass::TieOrder`] is correct **only under the
-/// score-insensitive projection this law's preconditions demand**. The registry
-/// records `e6.3-tombstone-compaction-v1` as
-/// `SkipWithReason(ScoreSensitiveCorpusStatistics)` with the precondition "a
-/// score-insensitive projection approved by the runner", and that precondition
-/// is currently unmet.
+/// The registry records this law as
+/// `SkipWithReason(ScoreSensitiveCorpusStatistics)`, precondition "a
+/// score-insensitive projection approved by the runner". That skip was
+/// well-founded: an earlier probe on this bead compared *delete* against
+/// *never-added* and found a survivor's score bits moving (`402a35ec` ->
+/// `40082c9c`), because a tombstoned document still occupies the corpus
+/// statistics. Under that comparison this TieOrder-only relation would have
+/// been wrong rather than strict, and would have manufactured false failures.
 ///
-/// Under the CURRENT score-sensitive total lexical observation this relation
-/// would be wrong, not merely strict: deleting documents changes corpus
-/// statistics, so surviving documents legitimately shift in score and rank, and
-/// those shifts would surface as [`DivergenceClass::ScoreEpsilon`] or
-/// [`DivergenceClass::RankMismatch`] and be reported as violations of a law
-/// they do not actually violate.
+/// Measurement changed the answer. The transform this law actually names is
+/// tombstone **and compaction**, and a real compaction folds the tombstones
+/// away — statistics included. Measured across the whole seed matrix in
+/// `compaction_restores_never_added_statistics`, a compacted index is
+/// observationally identical to a corpus that never contained the deleted
+/// documents, under the TOTAL lexical observation, with zero divergences.
+/// `without_the_compaction_step_the_total_projection_diverges` is the control
+/// that keeps that from being a property of the fixture: drop the `Compact`
+/// step and the divergences come back.
 ///
-/// So whoever builds the executor must bind this relation to a score-insensitive
-/// projection, exactly as the precondition says. Binding it to the score-
-/// sensitive observation would manufacture false failures — the mirror image of
-/// the vacuous-pass trap the rest of this module guards against, and just as
-/// misleading. The relation is inert until then, because the law is skipped and
-/// nothing calls it.
+/// So this relation is bound to the total projection, exactly like merge and
+/// reopen, and admits only tie order. The score-insensitive membership
+/// projection built for the fallback case remains in
+/// [`super::metamorphic_maintenance_laws::maintenance_law_execution`] as
+/// diagnostic evidence — it separates "membership broke" from "scores drifted"
+/// when a failure does occur — but the law does not need it, and narrowing to
+/// it would give up coverage this engine has earned.
 pub const TOMBSTONE_COMPACTION_ALLOWED: &[DivergenceClass] = &[DivergenceClass::TieOrder];
 
 /// Equivalence relation for `e6.3-merge-schedule-v1`.
@@ -348,9 +354,18 @@ pub struct MaintenanceRunnerCapabilities {
     pub deterministic_merge_scheduling: bool,
     /// The runner can close and reopen an index, exercising durable recovery.
     pub durable_reopen_lifecycle: bool,
-    /// The runner can project observations that do not vary with corpus
-    /// statistics, so deleting documents cannot move a survivor's score.
-    pub score_insensitive_projection: bool,
+    /// The runner can execute a real compaction, whose corpus statistics are
+    /// then those of a corpus that never contained the deleted documents.
+    ///
+    /// The registry states this law's precondition as "a score-insensitive
+    /// projection approved by the runner", because a bare delete leaves a
+    /// tombstoned document in the statistics and moves survivors' scores. A
+    /// real compaction removes that difference instead of projecting around it
+    /// -- measured in `compaction_restores_never_added_statistics`, with
+    /// `without_the_compaction_step_the_total_projection_diverges` as the
+    /// control -- so what a runner must actually declare is that it COMPACTS,
+    /// and the resulting comparison needs no narrowed projection at all.
+    pub compaction_statistics_parity: bool,
 }
 
 impl MaintenanceRunnerCapabilities {
@@ -360,7 +375,7 @@ impl MaintenanceRunnerCapabilities {
         Self {
             deterministic_merge_scheduling: false,
             durable_reopen_lifecycle: false,
-            score_insensitive_projection: false,
+            compaction_statistics_parity: false,
         }
     }
 
@@ -390,14 +405,14 @@ impl MaintenanceRunnerCapabilities {
 
     /// Applicability of `e6.3-tombstone-compaction-v1` under these capabilities.
     ///
-    /// Gated on the score-insensitive projection rather than on a lifecycle
-    /// operation: the runner can already delete and compact, but under a
-    /// score-sensitive projection the comparison is meaningless, because
-    /// removing documents legitimately moves every survivor's score. See
+    /// Gated on compaction rather than on a narrowed projection. A runner that
+    /// deletes without compacting still faces the score-sensitivity the
+    /// registry's skip reason names, so the skip reason is unchanged and
+    /// correct for that runner; one that compacts has discharged it. See
     /// [`TOMBSTONE_COMPACTION_ALLOWED`].
     #[must_use]
     pub const fn tombstone_compaction(self) -> MetamorphicLawApplicability {
-        if self.score_insensitive_projection {
+        if self.compaction_statistics_parity {
             MetamorphicLawApplicability::Applies
         } else {
             MetamorphicLawApplicability::SkipWithReason {
@@ -520,7 +535,7 @@ mod capability_tests {
         );
 
         let projection_only = MaintenanceRunnerCapabilities {
-            score_insensitive_projection: true,
+            compaction_statistics_parity: true,
             ..MaintenanceRunnerCapabilities::none()
         };
         assert_eq!(
@@ -566,7 +581,7 @@ mod capability_tests {
         let all = MaintenanceRunnerCapabilities {
             deterministic_merge_scheduling: true,
             durable_reopen_lifecycle: true,
-            score_insensitive_projection: true,
+            compaction_statistics_parity: true,
         };
         let matrix: Vec<MetamorphicLawApplicabilityEntry> = all.applicability_matrix();
         assert!(
@@ -592,24 +607,402 @@ mod capability_tests {
 /// only accepted when the observed sealed-segment count proves segments were
 /// actually combined — see `merge_actually_occurred`.
 #[cfg(all(test, feature = "perf-harness"))]
-pub(crate) mod maintenance_execution {
+pub mod maintenance_execution {
     use frankensearch_core::IndexableDocument;
-    use frankensearch_quill::QuillConfig;
+    use frankensearch_quill::{CompactionPolicy, CompactionReport, QuillConfig, QuillIndex};
 
     use crate::engine::QuillSubject;
+    use crate::metamorphic_maintenance_schedules::{MaintenanceSchedule, MaintenanceStep};
+
+    /// The 6-document maintenance fixture.
+    ///
+    /// Shared by every route here so a law and its geometry witness never
+    /// disagree about what was indexed. `alpha` matches five of the six
+    /// documents with repeated terms, so a merge that dropped or duplicated a
+    /// posting shows up as a rank or count change rather than as nothing.
+    pub fn maintenance_corpus() -> Vec<IndexableDocument> {
+        vec![
+            IndexableDocument::new("doc-1", "alpha beta beta"),
+            IndexableDocument::new("doc-2", "alpha gamma"),
+            IndexableDocument::new("doc-3", "beta gamma gamma"),
+            IndexableDocument::new("doc-4", "alpha beta gamma delta"),
+            IndexableDocument::new("doc-5", "delta epsilon alpha"),
+            IndexableDocument::new("doc-6", "alpha alpha beta"),
+        ]
+    }
+
+    /// `tier_fanout: 2` makes the tier policy merge as soon as a second sealed
+    /// segment appears, so committing per batch produces real concat-merges.
+    pub fn merging_config() -> QuillConfig {
+        QuillConfig {
+            tier_fanout: 2,
+            ..QuillConfig::default()
+        }
+    }
+
+    /// Config for the durable reopen-recovery arms.
+    ///
+    /// `deterministic_ingest` so a replayed seed produces the same durable
+    /// state, which is what makes a recovery comparison reproducible rather
+    /// than merely repeated.
+    pub fn recovery_config() -> QuillConfig {
+        QuillConfig {
+            deterministic_ingest: true,
+            ..QuillConfig::default()
+        }
+    }
+
+    /// The compaction policy every maintenance schedule uses.
+    ///
+    /// Well below any density a tombstoned fixture segment can produce, so a
+    /// scheduled `Compact` step always has eligible work. The default policy
+    /// would legitimately no-op on a six-document fixture, and a law whose
+    /// transform silently did nothing is the vacuous pass this module exists to
+    /// refuse. The witness in [`MaintainedIndex::compactions_with_work`] is
+    /// still what decides whether work happened -- the policy makes it likely,
+    /// the report makes it PROVEN.
+    pub const MAINTENANCE_COMPACTION_POLICY: CompactionPolicy = CompactionPolicy::new(0.01);
+
+    /// Commit only when there is something to seal.
+    ///
+    /// Returns the resulting sealed-segment count, or `None` when the index was
+    /// already clean. Committing a clean index would push a segment count that
+    /// witnesses no work, which is exactly the kind of bookkeeping that makes a
+    /// vacuous run look busy.
+    async fn commit_if_dirty(cx: &asupersync::Cx, index: &QuillIndex) -> Option<usize> {
+        if !index.has_uncommitted_changes() {
+            return None;
+        }
+        let snapshot = index.commit(cx).await.expect("commit maintenance step");
+        Some(snapshot.segments().len())
+    }
+
+    /// Execute one REAL concat-merge over the complete current manifest run.
+    ///
+    /// Returns `(segments_before, segments_after)`, or `None` when fewer than
+    /// two segments exist so there is nothing to merge. The `None` case is
+    /// deliberately not an error: the caller counts witnesses, and a schedule
+    /// whose merges all degenerate to `None` must fail its non-degeneracy check
+    /// rather than silently pass as "merged".
+    async fn merge_full_manifest_run(
+        cx: &asupersync::Cx,
+        index: &QuillIndex,
+    ) -> Option<(usize, usize)> {
+        let source_segment_ids = index
+            .snapshot()
+            .segments()
+            .iter()
+            .map(|segment| segment.manifest().segment_id)
+            .collect::<Vec<_>>();
+        let segments_before = source_segment_ids.len();
+        if segments_before < 2 {
+            return None;
+        }
+        let output_segment_id = source_segment_ids
+            .iter()
+            .copied()
+            .max()
+            .and_then(|segment_id| segment_id.checked_add(1))
+            .expect("merge fixture needs a collision-free successor segment id");
+        let merged = index
+            .concat_merge(cx, &source_segment_ids, output_segment_id, 0)
+            .await
+            .expect("execute concat merge over the full manifest run");
+        let segments_after = merged.segments().len();
+        assert!(
+            segments_after < segments_before,
+            "concat merge published without reducing segment count: \
+             before={segments_before}, after={segments_after}"
+        );
+        Some((segments_before, segments_after))
+    }
+
+    /// A live index driven to a committed state, retained rather than probed.
+    ///
+    /// The subject is kept alive so a law can project it through the SAME
+    /// [`crate::engine::GauntletEngine::observe`] path the differential harness
+    /// uses. Returning a hand-rolled result summary instead would compare an
+    /// invented side channel, and a law proven against a side channel says
+    /// nothing about the shipping observation.
+    pub struct MaintainedIndex {
+        /// The committed subject, ready to observe.
+        pub subject: QuillSubject,
+        /// Sealed-segment count after each commit this run performed.
+        pub sealed_after_each_commit: Vec<usize>,
+        /// One `(before, after)` pair per executed concat-merge.
+        pub merge_witnesses: Vec<(usize, usize)>,
+        /// Live document count reported by each FRESH index instance opened by
+        /// a `Reopen` step. Read from the reopened instance itself, so a
+        /// non-zero entry proves the state came off disk rather than from the
+        /// writer that was just dropped.
+        pub reopen_witnesses: Vec<u64>,
+        /// The engine's own report from each executed compaction pass.
+        pub compaction_witnesses: Vec<CompactionReport>,
+    }
+
+    impl MaintainedIndex {
+        /// Merges that provably reduced the sealed-segment count.
+        ///
+        /// This is the non-degeneracy measure for every merge-family law: a run
+        /// reporting zero here executed no merge, so any agreement between its
+        /// arms is agreement about nothing.
+        pub fn real_merges(&self) -> usize {
+            self.merge_witnesses
+                .iter()
+                .filter(|(before, after)| after < before)
+                .count()
+        }
+
+        /// Reopens that provably recovered documents from durable state.
+        ///
+        /// A reopen that returned an empty index recovered nothing, so a law
+        /// comparing its arms would be comparing an accident. Counting only
+        /// non-empty recoveries is what stops "the reopen ran" from standing in
+        /// for "the reopen restored the index".
+        pub fn real_reopens(&self) -> usize {
+            self.reopen_witnesses
+                .iter()
+                .filter(|doc_count| **doc_count > 0)
+                .count()
+        }
+
+        /// Compaction passes that provably folded tombstoned rows away.
+        ///
+        /// `CompactionPolicy` no-ops below its density threshold, and a no-op
+        /// pass leaves the law comparing an uncompacted index. Counting only
+        /// passes that dropped documents is what makes "compaction ran" mean
+        /// "compaction did something".
+        pub fn compactions_with_work(&self) -> usize {
+            self.compaction_witnesses
+                .iter()
+                .filter(|report| report.dropped_documents > 0)
+                .count()
+        }
+    }
+
+    /// Where a maintained index lives.
+    ///
+    /// This is not a convenience knob. A `Reopen` step is only executable
+    /// against a directory: an in-memory index has no durable state to recover,
+    /// so "reopening" one could only mean constructing a fresh empty index —
+    /// the approximation this law family exists to avoid. The backing therefore
+    /// decides which steps are executable at all, and an inexecutable step
+    /// panics rather than degrading into something adjacent.
+    #[derive(Clone, Copy)]
+    pub enum MaintenanceBacking<'a> {
+        /// Owned-buffer index. `Reopen` is NOT executable.
+        InMemory,
+        /// Durable index rooted at this directory. Every step is executable.
+        Durable(&'a std::path::Path),
+    }
+
+    impl MaintenanceBacking<'_> {
+        /// Open the index this backing describes.
+        async fn open(self, cx: &asupersync::Cx, config: QuillConfig) -> QuillSubject {
+            match self {
+                Self::InMemory => QuillSubject::in_memory(config).expect("in-memory Quill subject"),
+                Self::Durable(directory) => {
+                    let index = QuillIndex::create(cx, directory, config.clone())
+                        .await
+                        .expect("create durable Quill index");
+                    QuillSubject::from_open_index(index, config).expect("durable Quill subject")
+                }
+            }
+        }
+    }
+
+    /// Execute a seeded [`MaintenanceSchedule`] against a live index.
+    ///
+    /// Every step is performed for real. `Flush` commits; `Merge` seals and
+    /// calls [`QuillIndex::concat_merge`] over the whole manifest run;
+    /// `Reopen` DROPS the writer and opens the directory again, so what comes
+    /// back was reconstructed from durable state; `Tombstone` deletes through
+    /// the shipping `LexicalWrite` path; `Compact` runs real compaction.
+    ///
+    /// A step this backing cannot perform PANICS by name. Silently ignoring one
+    /// would leave the schedule's replay signature describing a run that never
+    /// happened, which is the most expensive kind of green.
+    pub async fn execute_schedule(
+        cx: &asupersync::Cx,
+        config: QuillConfig,
+        backing: MaintenanceBacking<'_>,
+        documents: &[IndexableDocument],
+        schedule: &MaintenanceSchedule,
+    ) -> MaintainedIndex {
+        assert_eq!(
+            schedule.corpus_len(),
+            documents.len(),
+            "schedule was generated for a different corpus length"
+        );
+        assert_eq!(
+            schedule.ingested(),
+            documents.len(),
+            "a maintenance schedule must ingest the whole corpus exactly once"
+        );
+        let mut subject = backing.open(cx, config.clone()).await;
+        subject
+            .claim_fresh_campaign()
+            .expect("claim maintenance campaign");
+        let mut cursor = 0usize;
+        let mut sealed_after_each_commit = Vec::new();
+        let mut merge_witnesses = Vec::new();
+        let mut reopen_witnesses = Vec::new();
+        let mut compaction_witnesses = Vec::new();
+        for step in schedule.steps() {
+            match *step {
+                MaintenanceStep::Ingest { count } => {
+                    let end = cursor
+                        .checked_add(count)
+                        .expect("ingest cursor overflowed the corpus");
+                    assert!(
+                        end <= documents.len(),
+                        "schedule ingests past the end of the corpus"
+                    );
+                    subject
+                        .index_mut()
+                        .expect("open maintenance campaign")
+                        .index_documents(cx, &documents[cursor..end])
+                        .await
+                        .expect("index maintenance batch");
+                    cursor = end;
+                }
+                MaintenanceStep::Flush => {
+                    let index = subject.index_mut().expect("open maintenance campaign");
+                    if let Some(sealed) = commit_if_dirty(cx, index).await {
+                        sealed_after_each_commit.push(sealed);
+                    }
+                }
+                MaintenanceStep::Merge => {
+                    let index = subject.index_mut().expect("open maintenance campaign");
+                    if let Some(sealed) = commit_if_dirty(cx, index).await {
+                        sealed_after_each_commit.push(sealed);
+                    }
+                    if let Some(witness) = merge_full_manifest_run(cx, index).await {
+                        merge_witnesses.push(witness);
+                    }
+                }
+                MaintenanceStep::Reopen => {
+                    let MaintenanceBacking::Durable(directory) = backing else {
+                        panic!(
+                            "a Reopen step requires a durable backing; an in-memory index has no \
+                             durable state to recover, and constructing a fresh index instead \
+                             would approximate the transform rather than execute it"
+                        );
+                    };
+                    // CLOSE for real: the writer is dropped before the
+                    // directory is opened again, so nothing in-process can
+                    // carry state across the boundary.
+                    let closed = subject.take_index().expect("close maintenance index");
+                    drop(closed);
+                    let reopened = QuillIndex::open(cx, directory, config.clone())
+                        .await
+                        .expect("reopen the maintenance index from durable state");
+                    // Read the count from the FRESH instance: a non-zero value
+                    // proves recovery happened rather than a new empty index.
+                    reopen_witnesses.push(reopened.doc_count());
+                    subject.restore_index(reopened);
+                }
+                MaintenanceStep::Tombstone { corpus_index } => {
+                    let document = documents
+                        .get(corpus_index)
+                        .expect("tombstone step names a document outside the corpus");
+                    let index = subject.index_mut().expect("open maintenance campaign");
+                    // Deletion needs a committed target, exactly as the engine
+                    // contracts; committing here is part of executing the
+                    // tombstone, not a substitute for it.
+                    if let Some(sealed) = commit_if_dirty(cx, index).await {
+                        sealed_after_each_commit.push(sealed);
+                    }
+                    let deleted = index
+                        .delete_document(cx, &document.id)
+                        .await
+                        .expect("delete the tombstoned document");
+                    assert!(
+                        deleted,
+                        "tombstone step deleted nothing for {}; a no-op deletion would leave the \
+                         law comparing two identical corpora",
+                        document.id
+                    );
+                }
+                MaintenanceStep::Compact => {
+                    let index = subject.index_mut().expect("open maintenance campaign");
+                    if let Some(sealed) = commit_if_dirty(cx, index).await {
+                        sealed_after_each_commit.push(sealed);
+                    }
+                    let report = index
+                        .compact(cx, MAINTENANCE_COMPACTION_POLICY)
+                        .await
+                        .expect("compact the maintained index");
+                    compaction_witnesses.push(report);
+                }
+            }
+        }
+        assert_eq!(
+            cursor,
+            documents.len(),
+            "schedule finished without ingesting the whole corpus"
+        );
+        let index = subject.index_mut().expect("open maintenance campaign");
+        if let Some(sealed) = commit_if_dirty(cx, index).await {
+            sealed_after_each_commit.push(sealed);
+        }
+        subject
+            .mark_committed()
+            .expect("publish maintenance campaign");
+        MaintainedIndex {
+            subject,
+            sealed_after_each_commit,
+            merge_witnesses,
+            reopen_witnesses,
+            compaction_witnesses,
+        }
+    }
+
+    /// The unperturbed control arm: ingest everything once, commit once, and
+    /// perform no maintenance at all. This is what a maintenance law compares
+    /// against, and it uses the same backing as the perturbed arm so the only
+    /// difference between them is the schedule.
+    pub async fn ingest_baseline(
+        cx: &asupersync::Cx,
+        config: QuillConfig,
+        backing: MaintenanceBacking<'_>,
+        documents: &[IndexableDocument],
+    ) -> MaintainedIndex {
+        let mut subject = backing.open(cx, config).await;
+        subject
+            .claim_fresh_campaign()
+            .expect("claim baseline campaign");
+        let index = subject.index_mut().expect("open baseline campaign");
+        index
+            .index_documents(cx, documents)
+            .await
+            .expect("index baseline corpus");
+        let mut sealed_after_each_commit = Vec::new();
+        if let Some(sealed) = commit_if_dirty(cx, index).await {
+            sealed_after_each_commit.push(sealed);
+        }
+        subject.mark_committed().expect("publish baseline campaign");
+        MaintainedIndex {
+            subject,
+            sealed_after_each_commit,
+            merge_witnesses: Vec::new(),
+            reopen_witnesses: Vec::new(),
+            compaction_witnesses: Vec::new(),
+        }
+    }
 
     /// Outcome of driving one ingest schedule to a committed index.
-    pub(crate) struct MaintenanceOutcome {
+    pub struct MaintenanceOutcome {
         /// Document ids in ranked order for the probe query.
-        pub(crate) ranked_ids: Vec<String>,
+        pub ranked_ids: Vec<String>,
         /// Live document count of the committed snapshot.
-        pub(crate) doc_count: u64,
+        pub doc_count: u64,
         /// Segment count observed after each commit. A merge shows up as a
         /// count that does not grow monotonically with commits.
-        pub(crate) sealed_after_each_commit: Vec<usize>,
+        pub sealed_after_each_commit: Vec<usize>,
         /// Direct concat-merge witness, when this route explicitly requested
         /// one. The pair is `(segments_before, segments_after)`.
-        pub(crate) explicit_merge_segment_counts: Option<(usize, usize)>,
+        pub explicit_merge_segment_counts: Option<(usize, usize)>,
     }
 
     /// Ingest `documents` in `batch_size` chunks, committing after each chunk,
@@ -619,7 +1012,7 @@ pub(crate) mod maintenance_execution {
     /// rather than a batching one: each commit seals a segment, and once the
     /// sealed count exceeds `tier_fanout` the tier policy performs a real
     /// concat-merge inside that commit.
-    pub(crate) async fn ingest_and_probe(
+    pub async fn ingest_and_probe(
         cx: &asupersync::Cx,
         config: QuillConfig,
         documents: &[IndexableDocument],
@@ -676,7 +1069,7 @@ pub(crate) mod maintenance_execution {
     /// instead names the exact source segment IDs and verifies that their
     /// replacement reduced the sealed segment count, so it cannot confuse a
     /// sequence of flushes with a merge.
-    pub(crate) async fn ingest_explicit_concat_merge_and_probe(
+    pub async fn ingest_explicit_concat_merge_and_probe(
         cx: &asupersync::Cx,
         config: QuillConfig,
         documents: &[IndexableDocument],
@@ -752,30 +1145,407 @@ pub(crate) mod maintenance_execution {
     }
 }
 
+/// Live execution of the E6.3 maintenance laws.
+///
+/// This is the seam the three law families were blocked on: it drives a seeded
+/// [`MaintenanceSchedule`] against a real index, projects BOTH arms through the
+/// shipping [`GauntletEngine::observe`] path, compares them with the same
+/// [`compare_observations`] the differential harness calls, and decides the
+/// result with the equivalence relation proven at the top of this module.
+///
+/// Two properties are load-bearing and neither is optional:
+///
+/// * The projection is the total lexical observation, not a summary invented
+///   here. A law proven against a side channel proves nothing about what ships.
+/// * Every outcome carries the number of merges that PROVABLY happened, so a
+///   caller can refuse to count agreement produced by a run that merged
+///   nothing.
+#[cfg(all(test, feature = "perf-harness"))]
+pub mod maintenance_law_execution {
+    use frankensearch_core::IndexableDocument;
+    use frankensearch_quill::QuillConfig;
+
+    use super::maintenance_execution::{MaintenanceBacking, execute_schedule, ingest_baseline};
+    use super::{
+        LawVerdict, merge_schedule_verdict, reopen_recovery_verdict, tombstone_compaction_verdict,
+    };
+    use crate::comparator::{
+        ComparatorConfig, ComparisonReport, CountState, Divergence, DivergenceClass,
+        EngineObservation, compare_observations,
+    };
+    use crate::engine::{DifferentialCase, GauntletEngine};
+    use crate::metamorphic_maintenance_schedules::{MaintenanceSchedule, MaintenanceStep};
+
+    /// One live execution of a maintenance law.
+    pub struct MaintenanceLawOutcome {
+        /// The equivalence relation's decision over the live divergence set.
+        pub verdict: LawVerdict,
+        /// The full comparator report both arms produced.
+        pub report: ComparisonReport,
+        /// Commits the perturbed arm actually performed. A schedule whose
+        /// flushes all no-opped never sealed anything, and nothing downstream
+        /// of a seal -- a merge above all -- could have happened.
+        pub commits_executed: usize,
+        /// Merges that provably reduced segment count in the perturbed arm.
+        pub merges_executed: usize,
+        /// Reopens that provably recovered a non-empty index from disk.
+        pub reopens_executed: usize,
+        /// Redaction-safe replay identity of the executed schedule.
+        pub replay_signature: String,
+    }
+
+    /// The observation projection every maintenance law is compared through.
+    ///
+    /// Snippets are disabled because the scalar Quill adapter refuses them; the
+    /// remaining projection — ranked hits with score bits, both tie groups,
+    /// exact count, live document count, and recorded AST differences — is the
+    /// complete one, deliberately NOT narrowed to the fields a merge is
+    /// expected to preserve.
+    fn law_case(law_id: &str, schedule: &MaintenanceSchedule, query: &str) -> DifferentialCase {
+        let mut case = DifferentialCase::new(
+            format!("{law_id}-seed-{:#018x}", schedule.seed()),
+            query,
+            16,
+        );
+        case.snippet_max_chars = None;
+        case.tie_expansion_limit = 64;
+        case.metadata.generator_id = Some(law_id.to_owned());
+        case.metadata.generator_seed = Some(schedule.seed());
+        case
+    }
+
+    /// Execute `e6.3-merge-schedule-v1` against real concat-merges.
+    ///
+    /// `maintained_documents` is a separate slice from `baseline_documents`
+    /// solely so a planted-invalid fixture can mutate one arm. A positive run
+    /// passes the same corpus twice; anything else is a negative control and
+    /// must be labelled as one.
+    pub async fn run_merge_schedule_law(
+        cx: &asupersync::Cx,
+        config: QuillConfig,
+        baseline_documents: &[IndexableDocument],
+        maintained_documents: &[IndexableDocument],
+        schedule: &MaintenanceSchedule,
+        query: &str,
+    ) -> MaintenanceLawOutcome {
+        run_total_projection_law(
+            cx,
+            config,
+            MaintenanceBacking::InMemory,
+            MaintenanceBacking::InMemory,
+            baseline_documents,
+            maintained_documents,
+            schedule,
+            query,
+            "e6.3-merge-schedule-v1",
+            merge_schedule_verdict,
+        )
+        .await
+    }
+
+    /// Execute `e6.3-reopen-recovery-v1` against real close/reopen cycles.
+    ///
+    /// Both arms are DURABLE and use the same config; the only difference is
+    /// that the maintained arm closes and reopens its directory at the points
+    /// the schedule names. An in-memory control would differ from the perturbed
+    /// arm in storage backend as well as in maintenance, and any divergence
+    /// would then be unattributable.
+    pub async fn run_reopen_recovery_law(
+        cx: &asupersync::Cx,
+        config: QuillConfig,
+        baseline_directory: &std::path::Path,
+        maintained_directory: &std::path::Path,
+        baseline_documents: &[IndexableDocument],
+        maintained_documents: &[IndexableDocument],
+        schedule: &MaintenanceSchedule,
+        query: &str,
+    ) -> MaintenanceLawOutcome {
+        run_total_projection_law(
+            cx,
+            config,
+            MaintenanceBacking::Durable(baseline_directory),
+            MaintenanceBacking::Durable(maintained_directory),
+            baseline_documents,
+            maintained_documents,
+            schedule,
+            query,
+            "e6.3-reopen-recovery-v1",
+            reopen_recovery_verdict,
+        )
+        .await
+    }
+
+    /// Shared body for the laws whose projection is the TOTAL observation.
+    ///
+    /// Merge and reopen both claim exactness up to tie order, so both compare
+    /// through the complete `EngineObservation`. Tombstone/compaction does not
+    /// and must not use this path — see
+    /// [`run_tombstone_compaction_law`].
+    #[allow(clippy::too_many_arguments)] // every argument is an arm, a fixture, or a law identity
+    async fn run_total_projection_law(
+        cx: &asupersync::Cx,
+        config: QuillConfig,
+        baseline_backing: MaintenanceBacking<'_>,
+        maintained_backing: MaintenanceBacking<'_>,
+        baseline_documents: &[IndexableDocument],
+        maintained_documents: &[IndexableDocument],
+        schedule: &MaintenanceSchedule,
+        query: &str,
+        law_id: &str,
+        verdict_of: fn(&[Divergence]) -> LawVerdict,
+    ) -> MaintenanceLawOutcome {
+        let maintained = execute_schedule(
+            cx,
+            config.clone(),
+            maintained_backing,
+            maintained_documents,
+            schedule,
+        )
+        .await;
+        let baseline = ingest_baseline(cx, config, baseline_backing, baseline_documents).await;
+        let case = law_case(law_id, schedule, query);
+        let maintained_observation = maintained
+            .subject
+            .observe(cx, &case)
+            .await
+            .expect("observe the maintained index");
+        let baseline_observation = baseline
+            .subject
+            .observe(cx, &case)
+            .await
+            .expect("observe the unperturbed index");
+        let report = compare_observations(
+            maintained_observation,
+            baseline_observation,
+            ComparatorConfig::default(),
+        )
+        .expect("compare maintenance observations");
+        let verdict = verdict_of(&report.divergences);
+        MaintenanceLawOutcome {
+            verdict,
+            commits_executed: maintained.sealed_after_each_commit.len(),
+            merges_executed: maintained.real_merges(),
+            reopens_executed: maintained.real_reopens(),
+            replay_signature: schedule.replay_signature(),
+            report,
+        }
+    }
+
+    /// The score-insensitive projection `e6.3-tombstone-compaction-v1` requires.
+    ///
+    /// # What it keeps, and why that is the whole law
+    ///
+    /// Membership of the returned set, the live document count, and the exact
+    /// count state. Those are precisely the two failures this law exists to
+    /// catch: a compaction that RESURRECTS a tombstoned document, and one that
+    /// LOSES a survivor.
+    ///
+    /// # What it drops, named rather than implied
+    ///
+    /// Score bits and rank order. This is a real blind spot and it is
+    /// deliberate: deleting documents changes corpus statistics, so a survivor
+    /// legitimately moves in score and rank relative to a corpus that never
+    /// contained the deleted documents. Comparing those under the total
+    /// projection manufactures failures for a law that was never violated —
+    /// the mirror image of a vacuous pass. The evidence for that claim is not
+    /// an argument: `the_total_projection_would_report_a_false_tombstone_failure`
+    /// measures it.
+    ///
+    /// # Why this is not a weakened gate
+    ///
+    /// A weakened gate admits the failure it was built to catch. This drops a
+    /// dimension in which the two arms are NOT expected to agree, and keeps
+    /// every dimension in which they are. Ordering regressions are still owned
+    /// by the merge and reopen laws, which compare through the total
+    /// projection with no such allowance.
+    #[derive(Debug, PartialEq, Eq)]
+    pub struct MembershipProjection {
+        /// Returned document ids as a set: sorted and deduplicated.
+        doc_ids: Vec<String>,
+        /// Live document count of the snapshot.
+        doc_count: u64,
+        /// Exact-count evidence state.
+        match_count: CountState,
+    }
+
+    impl MembershipProjection {
+        /// Project one observation down to membership evidence.
+        fn of(observation: &EngineObservation) -> Self {
+            let mut doc_ids = observation
+                .hits
+                .iter()
+                .map(|hit| hit.doc_id.clone())
+                .collect::<Vec<_>>();
+            doc_ids.sort_unstable();
+            doc_ids.dedup();
+            Self {
+                doc_ids,
+                doc_count: observation.doc_count,
+                match_count: observation.match_count,
+            }
+        }
+
+        /// Differences between two projections, expressed in the comparator's
+        /// own taxonomy so the SAME equivalence relation decides them.
+        ///
+        /// Membership differences are reported as `RankMismatch` and count
+        /// differences as `CountMismatch`/`DocumentCountMismatch` — the classes
+        /// the real comparator would raise for the same facts, and all three
+        /// are outside every maintenance law's allow-list.
+        fn divergences_against(&self, other: &Self) -> Vec<Divergence> {
+            let mut divergences = Vec::new();
+            if self.doc_ids != other.doc_ids {
+                divergences.push(Divergence {
+                    class: DivergenceClass::RankMismatch,
+                    pointer: "/hits/membership".to_owned(),
+                    oracle: other.doc_ids.join(","),
+                    subject: self.doc_ids.join(","),
+                });
+            }
+            if self.doc_count != other.doc_count {
+                divergences.push(Divergence {
+                    class: DivergenceClass::DocumentCountMismatch,
+                    pointer: "/doc_count".to_owned(),
+                    oracle: other.doc_count.to_string(),
+                    subject: self.doc_count.to_string(),
+                });
+            }
+            if self.match_count != other.match_count {
+                divergences.push(Divergence {
+                    class: DivergenceClass::CountMismatch,
+                    pointer: "/match_count".to_owned(),
+                    oracle: format!("{:?}", other.match_count),
+                    subject: format!("{:?}", self.match_count),
+                });
+            }
+            divergences
+        }
+    }
+
+    /// One live execution of the tombstone/compaction law.
+    pub struct TombstoneLawOutcome {
+        /// Verdict under the TOTAL lexical projection: the law.
+        pub verdict: LawVerdict,
+        /// Divergences the score-insensitive membership projection observed.
+        /// Diagnostic only: it separates a membership failure (resurrection or
+        /// loss) from score drift when the total projection reports something.
+        pub membership_divergences: Vec<Divergence>,
+        /// Divergences the total projection observed, which decide the verdict.
+        pub total_divergences: Vec<Divergence>,
+        /// Commits the perturbed arm actually performed.
+        pub commits_executed: usize,
+        /// Compaction passes that provably dropped tombstoned rows.
+        pub compactions_with_work: usize,
+        /// Redaction-safe replay identity of the executed schedule.
+        pub replay_signature: String,
+    }
+
+    /// Execute `e6.3-tombstone-compaction-v1` against real deletes and a real
+    /// compaction, comparing against a corpus that NEVER contained the deleted
+    /// documents.
+    ///
+    /// `surviving_documents` is supplied by the caller rather than derived here
+    /// so a negative control can plant a wrong survivor set; positive callers
+    /// derive it from the schedule with [`survivors_of`].
+    pub async fn run_tombstone_compaction_law(
+        cx: &asupersync::Cx,
+        config: QuillConfig,
+        full_documents: &[IndexableDocument],
+        surviving_documents: &[IndexableDocument],
+        schedule: &MaintenanceSchedule,
+        query: &str,
+    ) -> TombstoneLawOutcome {
+        let maintained = execute_schedule(
+            cx,
+            config.clone(),
+            MaintenanceBacking::InMemory,
+            full_documents,
+            schedule,
+        )
+        .await;
+        let baseline = ingest_baseline(
+            cx,
+            config,
+            MaintenanceBacking::InMemory,
+            surviving_documents,
+        )
+        .await;
+        let case = law_case("e6.3-tombstone-compaction-v1", schedule, query);
+        let maintained_observation = maintained
+            .subject
+            .observe(cx, &case)
+            .await
+            .expect("observe the compacted index");
+        let baseline_observation = baseline
+            .subject
+            .observe(cx, &case)
+            .await
+            .expect("observe the never-added corpus");
+        let membership_divergences = MembershipProjection::of(&maintained_observation)
+            .divergences_against(&MembershipProjection::of(&baseline_observation));
+        let total_divergences = compare_observations(
+            maintained_observation,
+            baseline_observation,
+            ComparatorConfig::default(),
+        )
+        .expect("compare tombstone observations")
+        .divergences;
+        // THE LAW IS DECIDED ON THE TOTAL PROJECTION, the same instrument merge
+        // and reopen use. The membership projection travels alongside as
+        // evidence, not as the verdict: see TOMBSTONE_COMPACTION_ALLOWED for
+        // why the narrower instrument turned out to be unnecessary, and
+        // `without_the_compaction_step_the_total_projection_diverges` for the
+        // control that proves compaction is what earned it.
+        TombstoneLawOutcome {
+            verdict: tombstone_compaction_verdict(&total_divergences),
+            membership_divergences,
+            total_divergences,
+            commits_executed: maintained.sealed_after_each_commit.len(),
+            compactions_with_work: maintained.compactions_with_work(),
+            replay_signature: schedule.replay_signature(),
+        }
+    }
+
+    /// The corpus a tombstone schedule leaves alive, in corpus order.
+    ///
+    /// This is the never-added control the law compares against: not "the same
+    /// corpus with deletions applied", but a corpus that never contained the
+    /// deleted documents at all.
+    pub fn survivors_of(
+        documents: &[IndexableDocument],
+        schedule: &MaintenanceSchedule,
+    ) -> Vec<IndexableDocument> {
+        let tombstoned = schedule
+            .steps()
+            .iter()
+            .filter_map(|step| match step {
+                MaintenanceStep::Tombstone { corpus_index } => Some(*corpus_index),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        documents
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| !tombstoned.contains(index))
+            .map(|(_, document)| document.clone())
+            .collect()
+    }
+}
+
 #[cfg(all(test, feature = "perf-harness"))]
 mod merge_execution_tests {
-    use super::maintenance_execution::{ingest_and_probe, ingest_explicit_concat_merge_and_probe};
+    use super::maintenance_execution::{
+        ingest_and_probe, ingest_explicit_concat_merge_and_probe, maintenance_corpus,
+    };
     use frankensearch_core::IndexableDocument;
     use frankensearch_quill::QuillConfig;
 
     fn corpus() -> Vec<IndexableDocument> {
-        vec![
-            IndexableDocument::new("doc-1", "alpha beta beta"),
-            IndexableDocument::new("doc-2", "alpha gamma"),
-            IndexableDocument::new("doc-3", "beta gamma gamma"),
-            IndexableDocument::new("doc-4", "alpha beta gamma delta"),
-            IndexableDocument::new("doc-5", "delta epsilon alpha"),
-            IndexableDocument::new("doc-6", "alpha alpha beta"),
-        ]
+        maintenance_corpus()
     }
 
-    /// `tier_fanout: 2` makes the tier policy merge as soon as a second sealed
-    /// segment appears, so committing per batch produces real concat-merges.
     fn merging_config() -> QuillConfig {
-        QuillConfig {
-            tier_fanout: 2,
-            ..QuillConfig::default()
-        }
+        super::maintenance_execution::merging_config()
     }
 
     /// e6.3-merge-schedule-v1 against real merges.
@@ -870,6 +1640,965 @@ mod merge_execution_tests {
             assert_eq!(
                 merged.ranked_ids, baseline.ranked_ids,
                 "direct concat merge must not change the ranked result"
+            );
+        });
+    }
+}
+
+/// `e6.3-merge-schedule-v1` executed end to end: seeded schedule, real merges,
+/// shipping projection, proven equivalence relation.
+///
+/// These are the four acceptance components the law was missing — an executable
+/// precondition, a live observable projection, a positive fixture measured
+/// rather than asserted, and the applicability flip the precondition earns.
+#[cfg(all(test, feature = "perf-harness"))]
+mod merge_schedule_law_tests {
+    use super::maintenance_execution::{maintenance_corpus, merging_config};
+    use super::maintenance_law_execution::run_merge_schedule_law;
+    use super::{LawVerdict, MaintenanceRunnerCapabilities};
+    use crate::metamorphic_maintenance_schedules::{MAINTENANCE_SEED_MATRIX, merge_schedule};
+    use crate::runner::{MetamorphicLawApplicability, MetamorphicSkipReason};
+    use frankensearch_core::IndexableDocument;
+
+    /// The probe query. `alpha` matches five of the six documents, so a merge
+    /// that lost, duplicated, or reordered a posting cannot hide inside an
+    /// empty or single-hit result.
+    const PROBE: &str = "alpha";
+
+    /// POSITIVE FIXTURE, measured live for every seed in the fixed matrix.
+    ///
+    /// Each seed's schedule is executed against a real index — real commits,
+    /// real [`QuillIndex::concat_merge`] — and both arms are projected through
+    /// the shipping observation path before the equivalence relation decides.
+    ///
+    /// The non-degeneracy assertion is not decoration. Merging is the whole
+    /// transform: a seed whose schedule merged nothing would make this law
+    /// vacuously true, and the run would report "law holds against real merges"
+    /// having executed none.
+    #[test]
+    fn the_merge_schedule_law_holds_across_the_seed_matrix() {
+        let documents = maintenance_corpus();
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            for seed in MAINTENANCE_SEED_MATRIX {
+                let schedule = merge_schedule(seed, documents.len());
+                let outcome = run_merge_schedule_law(
+                    &cx,
+                    merging_config(),
+                    &documents,
+                    &documents,
+                    &schedule,
+                    PROBE,
+                )
+                .await;
+                assert!(
+                    outcome.commits_executed >= 2,
+                    "a merge needs at least two seals to combine: {}",
+                    outcome.replay_signature
+                );
+                assert!(
+                    outcome.merges_executed >= 1,
+                    "seed executed no real merge, so the law would be vacuously true: {}",
+                    outcome.replay_signature
+                );
+                assert!(
+                    outcome.verdict.is_equivalent(),
+                    "merge-schedule law violated for {}: {:?} (divergences {:?})",
+                    outcome.replay_signature,
+                    outcome.verdict,
+                    outcome.report.divergences
+                );
+                // The comparison must have had something to compare. An empty
+                // result on both sides agrees perfectly and proves nothing.
+                assert!(
+                    !outcome.report.subject.hits.is_empty(),
+                    "the probe returned no hits, so the observation is empty: {}",
+                    outcome.replay_signature
+                );
+            }
+        });
+    }
+
+    /// PLANTED-INVALID NEGATIVE against the SAME live path.
+    ///
+    /// One document's content differs in the merged arm. Nothing about the
+    /// schedule, the projection, or the relation changes — only the corpus — so
+    /// a violation here proves the executor can actually fail. Without this the
+    /// positive test above would be indistinguishable from a comparison that
+    /// silently compares an index against itself.
+    /// The mutation has to be visible to the PROBE, not merely to the corpus.
+    ///
+    /// Replacing `delta` with `saffron` in doc-4 was the first attempt and it
+    /// produced zero divergences — correctly, since the probe is `alpha`, both
+    /// documents keep one `alpha` in four tokens, and the corpus statistics for
+    /// `alpha` are untouched. A negative control that mutates something the
+    /// observation cannot see does not fail, and would have been mistaken for a
+    /// comparator that cannot fail at all. So this mutation removes `alpha`
+    /// from doc-4 and thereby changes what the probe returns.
+    #[test]
+    fn a_planted_corpus_mutation_makes_the_merge_schedule_law_fail() {
+        let baseline = maintenance_corpus();
+        let mut mutated = maintenance_corpus();
+        mutated[3] = IndexableDocument::new("doc-4", "beta gamma delta saffron");
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let schedule = merge_schedule(MAINTENANCE_SEED_MATRIX[0], baseline.len());
+            let outcome = run_merge_schedule_law(
+                &cx,
+                merging_config(),
+                &baseline,
+                &mutated,
+                &schedule,
+                PROBE,
+            )
+            .await;
+            assert!(
+                outcome.merges_executed >= 1,
+                "the negative control must exercise the same real merge: {}",
+                outcome.replay_signature
+            );
+            let LawVerdict::Violated { offending } = &outcome.verdict else {
+                panic!(
+                    "a mutated corpus must violate the merge-schedule law, got {:?} with \
+                     divergences {:?}",
+                    outcome.verdict, outcome.report.divergences
+                );
+            };
+            assert!(
+                !offending.is_empty(),
+                "a violation must name the classes it rejected"
+            );
+        });
+    }
+
+    /// EXECUTABLE PRECONDITION, earned in the same invocation that proves it.
+    ///
+    /// The registry's precondition for this law is "runner-exposed deterministic
+    /// merge scheduling". This test does not assert that sentence — it executes
+    /// a schedule, requires a witnessed merge, and only then asserts that a
+    /// runner declaring the capability flips the law to `Applies` while one
+    /// declaring nothing still skips.
+    ///
+    /// The pairing is the point: a capability flag that can be set without a
+    /// live merge behind it is exactly how a skip becomes a false pass.
+    #[test]
+    fn the_merge_capability_flip_is_earned_by_a_witnessed_merge() {
+        let documents = maintenance_corpus();
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let schedule = merge_schedule(MAINTENANCE_SEED_MATRIX[0], documents.len());
+            let outcome = run_merge_schedule_law(
+                &cx,
+                merging_config(),
+                &documents,
+                &documents,
+                &schedule,
+                PROBE,
+            )
+            .await;
+            assert!(
+                outcome.merges_executed >= 1,
+                "no witnessed merge, so no capability may be declared: {}",
+                outcome.replay_signature
+            );
+
+            let declared = MaintenanceRunnerCapabilities {
+                deterministic_merge_scheduling: true,
+                ..MaintenanceRunnerCapabilities::none()
+            };
+            assert_eq!(
+                declared.merge_schedule(),
+                MetamorphicLawApplicability::Applies,
+                "a runner with a witnessed merge must apply the law"
+            );
+            assert_eq!(
+                MaintenanceRunnerCapabilities::none().merge_schedule(),
+                MetamorphicLawApplicability::SkipWithReason {
+                    reason: MetamorphicSkipReason::LifecycleCapabilityUnavailable,
+                },
+                "a runner without the capability must still skip, witness or not"
+            );
+            // The other two laws are NOT unlocked by a merge witness. Declaring
+            // one capability must never leak into another law's gate.
+            assert_eq!(
+                declared.reopen_recovery(),
+                MetamorphicLawApplicability::SkipWithReason {
+                    reason: MetamorphicSkipReason::LifecycleCapabilityUnavailable,
+                },
+            );
+            assert_eq!(
+                declared.tombstone_compaction(),
+                MetamorphicLawApplicability::SkipWithReason {
+                    reason: MetamorphicSkipReason::ScoreSensitiveCorpusStatistics,
+                },
+            );
+        });
+    }
+}
+
+/// `e6.3-reopen-recovery-v1` executed end to end against real close/reopen
+/// cycles on durable indexes.
+#[cfg(all(test, feature = "perf-harness"))]
+mod reopen_recovery_law_tests {
+    use super::maintenance_execution::{
+        MaintenanceBacking, execute_schedule, maintenance_corpus, recovery_config,
+    };
+    use super::maintenance_law_execution::run_reopen_recovery_law;
+    use super::{LawVerdict, MaintenanceRunnerCapabilities};
+    use crate::metamorphic_maintenance_schedules::{
+        MAINTENANCE_SEED_MATRIX, MaintenanceSchedule, MaintenanceStep, reopen_recovery_schedule,
+    };
+    use crate::runner::{MetamorphicLawApplicability, MetamorphicSkipReason};
+    use frankensearch_core::IndexableDocument;
+
+    const PROBE: &str = "alpha";
+
+    /// POSITIVE FIXTURE, measured live for every seed in the fixed matrix.
+    ///
+    /// Both arms are durable; the maintained one closes its writer and opens
+    /// the directory again wherever the schedule says. The recovery witness is
+    /// read from the FRESH instance, so a run that never recovered anything
+    /// cannot be counted as a run that did.
+    #[test]
+    fn the_reopen_recovery_law_holds_across_the_seed_matrix() {
+        let documents = maintenance_corpus();
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            for seed in MAINTENANCE_SEED_MATRIX {
+                let baseline_root = tempfile::tempdir().expect("baseline index directory");
+                let maintained_root = tempfile::tempdir().expect("maintained index directory");
+                let schedule = reopen_recovery_schedule(seed, documents.len());
+                let outcome = run_reopen_recovery_law(
+                    &cx,
+                    recovery_config(),
+                    baseline_root.path(),
+                    maintained_root.path(),
+                    &documents,
+                    &documents,
+                    &schedule,
+                    PROBE,
+                )
+                .await;
+                assert!(
+                    outcome.commits_executed >= 1,
+                    "a recovery needs durable state, which needs a seal: {}",
+                    outcome.replay_signature
+                );
+                assert!(
+                    outcome.reopens_executed >= 1,
+                    "no reopen recovered a non-empty index, so the law would be vacuously \
+                     true: {}",
+                    outcome.replay_signature
+                );
+                assert!(
+                    outcome.verdict.is_equivalent(),
+                    "reopen-recovery law violated for {}: {:?} (divergences {:?})",
+                    outcome.replay_signature,
+                    outcome.verdict,
+                    outcome.report.divergences
+                );
+                assert!(
+                    !outcome.report.subject.hits.is_empty(),
+                    "the probe returned no hits, so the observation is empty: {}",
+                    outcome.replay_signature
+                );
+            }
+        });
+    }
+
+    /// PLANTED-INVALID NEGATIVE against the same live durable path.
+    #[test]
+    fn a_planted_corpus_mutation_makes_the_reopen_recovery_law_fail() {
+        let baseline = maintenance_corpus();
+        let mut mutated = maintenance_corpus();
+        // Removes `alpha` from doc-4, so the probe's result set changes. A
+        // mutation the probe cannot see would not fail, and would prove
+        // nothing about the executor's ability to fail.
+        mutated[3] = IndexableDocument::new("doc-4", "beta gamma delta saffron");
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let baseline_root = tempfile::tempdir().expect("baseline index directory");
+            let maintained_root = tempfile::tempdir().expect("maintained index directory");
+            let schedule = reopen_recovery_schedule(MAINTENANCE_SEED_MATRIX[0], baseline.len());
+            let outcome = run_reopen_recovery_law(
+                &cx,
+                recovery_config(),
+                baseline_root.path(),
+                maintained_root.path(),
+                &baseline,
+                &mutated,
+                &schedule,
+                PROBE,
+            )
+            .await;
+            assert!(
+                outcome.reopens_executed >= 1,
+                "the negative control must exercise the same real recovery: {}",
+                outcome.replay_signature
+            );
+            let LawVerdict::Violated { offending } = &outcome.verdict else {
+                panic!(
+                    "a mutated corpus must violate the reopen-recovery law, got {:?} with \
+                     divergences {:?}",
+                    outcome.verdict, outcome.report.divergences
+                );
+            };
+            assert!(
+                !offending.is_empty(),
+                "a violation must name the classes it rejected"
+            );
+        });
+    }
+
+    /// THE MEASURED BOUNDARY the schedule generator's scope rests on.
+    ///
+    /// `reopen_recovery_schedule` flushes before every reopen, and its doc
+    /// comment justifies that by asserting uncommitted ingest does not survive
+    /// a close. This measures it rather than assuming it: the same schedule
+    /// with the flush removed loses the buffered batch.
+    ///
+    /// If this ever stops holding — if uncommitted ingest becomes durable —
+    /// this test fails and the generator's qualification must be revisited
+    /// rather than silently keeping a restriction it no longer needs.
+    #[test]
+    fn an_uncommitted_reopen_loses_the_buffered_documents() {
+        let documents = maintenance_corpus();
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let root = tempfile::tempdir().expect("index directory");
+            // Ingest everything, reopen WITHOUT flushing, then commit whatever
+            // the reopened index still holds.
+            let unflushed = MaintenanceSchedule::from_steps_for_test(
+                MAINTENANCE_SEED_MATRIX[0],
+                documents.len(),
+                vec![
+                    MaintenanceStep::Ingest {
+                        count: documents.len(),
+                    },
+                    MaintenanceStep::Reopen,
+                ],
+            );
+            let outcome = execute_schedule(
+                &cx,
+                recovery_config(),
+                MaintenanceBacking::Durable(root.path()),
+                &documents,
+                &unflushed,
+            )
+            .await;
+            assert_eq!(
+                outcome.reopen_witnesses,
+                vec![0],
+                "uncommitted ingest survived a close/reopen; the reopen-recovery generator's \
+                 flush-before-reopen qualification is based on this boundary and must be \
+                 revisited if it moves"
+            );
+            assert_eq!(
+                outcome.real_reopens(),
+                0,
+                "a reopen that recovered nothing must not count as a recovery"
+            );
+        });
+    }
+
+    /// EXECUTABLE PRECONDITION, earned by a witnessed recovery.
+    #[test]
+    fn the_reopen_capability_flip_is_earned_by_a_witnessed_recovery() {
+        let documents = maintenance_corpus();
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let baseline_root = tempfile::tempdir().expect("baseline index directory");
+            let maintained_root = tempfile::tempdir().expect("maintained index directory");
+            let schedule = reopen_recovery_schedule(MAINTENANCE_SEED_MATRIX[0], documents.len());
+            let outcome = run_reopen_recovery_law(
+                &cx,
+                recovery_config(),
+                baseline_root.path(),
+                maintained_root.path(),
+                &documents,
+                &documents,
+                &schedule,
+                PROBE,
+            )
+            .await;
+            assert!(
+                outcome.reopens_executed >= 1,
+                "no witnessed recovery, so no capability may be declared: {}",
+                outcome.replay_signature
+            );
+
+            let declared = MaintenanceRunnerCapabilities {
+                durable_reopen_lifecycle: true,
+                ..MaintenanceRunnerCapabilities::none()
+            };
+            assert_eq!(
+                declared.reopen_recovery(),
+                MetamorphicLawApplicability::Applies,
+                "a runner with a witnessed recovery must apply the law"
+            );
+            assert_eq!(
+                MaintenanceRunnerCapabilities::none().reopen_recovery(),
+                MetamorphicLawApplicability::SkipWithReason {
+                    reason: MetamorphicSkipReason::LifecycleCapabilityUnavailable,
+                },
+                "a runner without the capability must still skip, witness or not"
+            );
+            assert_eq!(
+                declared.merge_schedule(),
+                MetamorphicLawApplicability::SkipWithReason {
+                    reason: MetamorphicSkipReason::LifecycleCapabilityUnavailable,
+                },
+                "a reopen witness must not unlock the merge law"
+            );
+        });
+    }
+}
+
+/// `e6.3-tombstone-compaction-v1` executed end to end against real deletes and
+/// a real compaction, under the score-insensitive projection its precondition
+/// demands.
+#[cfg(all(test, feature = "perf-harness"))]
+mod tombstone_compaction_law_tests {
+    use super::maintenance_execution::{maintenance_corpus, merging_config};
+    use super::maintenance_law_execution::{run_tombstone_compaction_law, survivors_of};
+    use super::{LawVerdict, MaintenanceRunnerCapabilities};
+    use crate::metamorphic_maintenance_schedules::{
+        MAINTENANCE_SEED_MATRIX, MaintenanceSchedule, MaintenanceStep,
+        tombstone_compaction_schedule,
+    };
+    use crate::runner::{MetamorphicLawApplicability, MetamorphicSkipReason};
+
+    const PROBE: &str = "alpha";
+
+    /// POSITIVE FIXTURE, measured live for every seed in the fixed matrix.
+    ///
+    /// The control is a corpus that NEVER contained the tombstoned documents,
+    /// not the same corpus with deletions replayed onto it. Compaction must
+    /// leave the two observationally identical in membership.
+    #[test]
+    fn the_tombstone_compaction_law_holds_across_the_seed_matrix() {
+        let documents = maintenance_corpus();
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            for seed in MAINTENANCE_SEED_MATRIX {
+                let schedule = tombstone_compaction_schedule(seed, documents.len());
+                let survivors = survivors_of(&documents, &schedule);
+                assert!(
+                    !survivors.is_empty() && survivors.len() < documents.len(),
+                    "seed {seed:#018x} must delete some documents and spare some: {}",
+                    schedule.replay_signature()
+                );
+                let outcome = run_tombstone_compaction_law(
+                    &cx,
+                    merging_config(),
+                    &documents,
+                    &survivors,
+                    &schedule,
+                    PROBE,
+                )
+                .await;
+                assert!(
+                    outcome.commits_executed >= 1,
+                    "a tombstone needs a committed target: {}",
+                    outcome.replay_signature
+                );
+                assert!(
+                    outcome.compactions_with_work >= 1,
+                    "no compaction pass dropped a tombstoned row, so the law would be \
+                     vacuously true: {}",
+                    outcome.replay_signature
+                );
+                assert!(
+                    outcome.verdict.is_equivalent(),
+                    "tombstone-compaction law violated for {}: {:?} (membership divergences \
+                     {:?})",
+                    outcome.replay_signature,
+                    outcome.verdict,
+                    outcome.membership_divergences
+                );
+            }
+        });
+    }
+
+    /// THE MEASUREMENT THAT DISCHARGED THIS LAW'S SKIP REASON.
+    ///
+    /// The registry skips this law for `ScoreSensitiveCorpusStatistics`, and
+    /// the note on [`super::TOMBSTONE_COMPACTION_ALLOWED`] predicted that the
+    /// total projection would manufacture false failures here. Measurement says
+    /// otherwise once COMPACTION is part of the transform: across the whole
+    /// seed matrix, a compacted index is identical under the total lexical
+    /// observation to a corpus that never contained the deleted documents.
+    ///
+    /// That is why this law is bound to the total projection rather than to the
+    /// score-insensitive membership projection built for the fallback case. The
+    /// membership projection is asserted empty too, so a future regression can
+    /// be read straight off the pair: membership divergences mean a
+    /// resurrection or a loss, total-only divergences mean statistics drifted.
+    #[test]
+    fn compaction_restores_never_added_statistics() {
+        let documents = maintenance_corpus();
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            for seed in MAINTENANCE_SEED_MATRIX {
+                let schedule = tombstone_compaction_schedule(seed, documents.len());
+                let survivors = survivors_of(&documents, &schedule);
+                let outcome = run_tombstone_compaction_law(
+                    &cx,
+                    merging_config(),
+                    &documents,
+                    &survivors,
+                    &schedule,
+                    PROBE,
+                )
+                .await;
+                assert!(
+                    outcome.compactions_with_work >= 1,
+                    "no compaction pass dropped a row, so this measures nothing: {}",
+                    outcome.replay_signature
+                );
+                assert!(
+                    outcome.membership_divergences.is_empty(),
+                    "compaction changed which documents are retrievable for {}: {:?}",
+                    outcome.replay_signature,
+                    outcome.membership_divergences
+                );
+                assert!(
+                    outcome.total_divergences.is_empty(),
+                    "compaction did not restore never-added statistics for {}: {:?}. If this \
+                     becomes a standing difference, this law must move back to the membership \
+                     projection and say so, not widen its allow-list",
+                    outcome.replay_signature,
+                    outcome.total_divergences
+                );
+            }
+        });
+    }
+
+    /// THE CONTROL that keeps the parity above from being a property of the
+    /// fixture rather than of compaction.
+    ///
+    /// Same corpus, same tombstones, same probe — with the `Compact` step
+    /// removed. A tombstoned document still occupies the corpus statistics, so
+    /// the survivors' scores differ from a never-added corpus and the total
+    /// projection diverges. This reproduces the earlier probe on this bead that
+    /// saw a survivor's score bits move, and it is what makes
+    /// `compaction_restores_never_added_statistics` a statement about
+    /// compaction.
+    ///
+    /// Membership must still agree here: deleting is not losing. If membership
+    /// ever diverges in this control, the failure is a real deletion defect and
+    /// not the statistics effect this test is about.
+    #[test]
+    fn without_the_compaction_step_the_total_projection_diverges() {
+        let documents = maintenance_corpus();
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let compacting =
+                tombstone_compaction_schedule(MAINTENANCE_SEED_MATRIX[0], documents.len());
+            let survivors = survivors_of(&documents, &compacting);
+            let uncompacted = MaintenanceSchedule::from_steps_for_test(
+                compacting.seed(),
+                compacting.corpus_len(),
+                compacting
+                    .steps()
+                    .iter()
+                    .filter(|step| !matches!(step, MaintenanceStep::Compact))
+                    .copied()
+                    .collect(),
+            );
+            let outcome = run_tombstone_compaction_law(
+                &cx,
+                merging_config(),
+                &documents,
+                &survivors,
+                &uncompacted,
+                PROBE,
+            )
+            .await;
+            assert_eq!(
+                outcome.compactions_with_work, 0,
+                "this control must not compact: {}",
+                outcome.replay_signature
+            );
+            assert!(
+                outcome.membership_divergences.is_empty(),
+                "deleting without compacting must not change which documents are \
+                 retrievable: {:?}",
+                outcome.membership_divergences
+            );
+            assert!(
+                !outcome.total_divergences.is_empty(),
+                "an uncompacted delete matched never-added statistics exactly for {}, so \
+                 compaction is not what produces the parity and the claim that it is must be \
+                 withdrawn",
+                outcome.replay_signature
+            );
+        });
+    }
+
+    /// PLANTED-INVALID NEGATIVE #1: a RESURRECTED document.
+    ///
+    /// The control is given the full corpus, as if compaction had brought a
+    /// tombstoned document back. This is one of the two failures the law exists
+    /// to catch, and it must be caught under either projection — so the
+    /// membership divergences are asserted non-empty too, proving the catch
+    /// does not depend on the score-bearing half of the observation.
+    #[test]
+    fn a_resurrected_document_violates_the_tombstone_compaction_law() {
+        let documents = maintenance_corpus();
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let schedule =
+                tombstone_compaction_schedule(MAINTENANCE_SEED_MATRIX[0], documents.len());
+            let outcome = run_tombstone_compaction_law(
+                &cx,
+                merging_config(),
+                &documents,
+                // Never-added control that never deleted anything: equivalent
+                // to a compaction that resurrected every tombstone.
+                &documents,
+                &schedule,
+                PROBE,
+            )
+            .await;
+            let LawVerdict::Violated { offending } = &outcome.verdict else {
+                panic!(
+                    "a resurrected document must violate the law, got {:?} with membership \
+                     divergences {:?}",
+                    outcome.verdict, outcome.membership_divergences
+                );
+            };
+            assert!(
+                !offending.is_empty(),
+                "a violation must name the classes it rejected"
+            );
+            assert!(
+                !outcome.membership_divergences.is_empty(),
+                "a resurrection must be caught by the score-insensitive projection too, or the \
+                 catch depends on the score-bearing half of the observation"
+            );
+        });
+    }
+
+    /// PLANTED-INVALID NEGATIVE #2: a LOST survivor.
+    ///
+    /// The control drops a document the schedule never tombstoned, as if
+    /// compaction had discarded a live row. This is the other failure the law
+    /// exists to catch, and like the resurrection control it must be caught
+    /// without leaning on score bits.
+    #[test]
+    fn a_lost_survivor_violates_the_tombstone_compaction_law() {
+        let documents = maintenance_corpus();
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let schedule =
+                tombstone_compaction_schedule(MAINTENANCE_SEED_MATRIX[0], documents.len());
+            let mut survivors = survivors_of(&documents, &schedule);
+            assert!(
+                survivors.len() >= 2,
+                "this control needs a survivor it can afford to drop: {}",
+                schedule.replay_signature()
+            );
+            let dropped = survivors.remove(0);
+            let outcome = run_tombstone_compaction_law(
+                &cx,
+                merging_config(),
+                &documents,
+                &survivors,
+                &schedule,
+                PROBE,
+            )
+            .await;
+            let LawVerdict::Violated { offending } = &outcome.verdict else {
+                panic!(
+                    "losing survivor {} must violate the law, got {:?} with membership \
+                     divergences {:?}",
+                    dropped.id, outcome.verdict, outcome.membership_divergences
+                );
+            };
+            assert!(
+                !offending.is_empty(),
+                "a violation must name the classes it rejected"
+            );
+            assert!(
+                !outcome.membership_divergences.is_empty(),
+                "losing {} must be caught by the score-insensitive projection too",
+                dropped.id
+            );
+        });
+    }
+
+    /// EXECUTABLE PRECONDITION, earned by a witnessed compaction under the
+    /// projection the precondition names.
+    ///
+    /// The capability is `compaction_statistics_parity`, and this test only
+    /// declares it after a run in which a compaction pass provably dropped rows
+    /// AND the law held under the total projection. Declaring it from the
+    /// schedule alone would be a false pass with the paperwork filled in.
+    #[test]
+    fn the_tombstone_capability_flip_is_earned_by_a_witnessed_compaction() {
+        let documents = maintenance_corpus();
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let schedule =
+                tombstone_compaction_schedule(MAINTENANCE_SEED_MATRIX[0], documents.len());
+            let survivors = survivors_of(&documents, &schedule);
+            let outcome = run_tombstone_compaction_law(
+                &cx,
+                merging_config(),
+                &documents,
+                &survivors,
+                &schedule,
+                PROBE,
+            )
+            .await;
+            assert!(
+                outcome.compactions_with_work >= 1,
+                "no witnessed compaction, so no capability may be declared: {}",
+                outcome.replay_signature
+            );
+            assert!(outcome.verdict.is_equivalent());
+
+            let declared = MaintenanceRunnerCapabilities {
+                compaction_statistics_parity: true,
+                ..MaintenanceRunnerCapabilities::none()
+            };
+            assert_eq!(
+                declared.tombstone_compaction(),
+                MetamorphicLawApplicability::Applies,
+                "a runner with an approved score-insensitive projection must apply the law"
+            );
+            assert_eq!(
+                MaintenanceRunnerCapabilities::none().tombstone_compaction(),
+                MetamorphicLawApplicability::SkipWithReason {
+                    reason: MetamorphicSkipReason::ScoreSensitiveCorpusStatistics,
+                },
+                "a runner without the projection must still skip"
+            );
+        });
+    }
+}
+
+/// Live shrink/replay for all three maintenance families.
+///
+/// The shrinker was proven against synthetic predicates when it landed. That
+/// proves the ALGORITHM, not that a failing campaign fixture reduces to
+/// something that still reproduces against a real index — which is the only
+/// property a replay artifact is actually used for. These tests drive the same
+/// [`ShrinkDriver`] the synchronous helper drives, with the live law as the
+/// predicate, and then REPLAY the reduced fixture to confirm it still fails.
+#[cfg(all(test, feature = "perf-harness"))]
+mod live_shrink_replay_tests {
+    use super::maintenance_execution::{maintenance_corpus, merging_config, recovery_config};
+    use super::maintenance_law_execution::{
+        run_merge_schedule_law, run_reopen_recovery_law, run_tombstone_compaction_law, survivors_of,
+    };
+    use crate::metamorphic_maintenance_schedules::{
+        MAINTENANCE_SEED_MATRIX, MaintenanceSchedule, ShrinkDriver, merge_schedule,
+        reopen_recovery_schedule, tombstone_compaction_schedule,
+    };
+    use frankensearch_core::IndexableDocument;
+
+    const PROBE: &str = "alpha";
+
+    /// The corpus whose doc-4 no longer matches the probe, so every law's
+    /// comparison against the unmutated control fails.
+    fn mutated_corpus() -> Vec<IndexableDocument> {
+        let mut documents = maintenance_corpus();
+        documents[3] = IndexableDocument::new("doc-4", "beta gamma delta saffron");
+        documents
+    }
+
+    /// Whether every `Reopen` in a candidate still follows a `Flush`.
+    ///
+    /// This mirrors the scope qualification on `reopen_recovery_schedule`: the
+    /// law is about recovery of committed state, so a fixture that reopens over
+    /// buffered ingest is not a smaller reproduction of the same failure.
+    fn every_reopen_is_committed(candidate: &MaintenanceSchedule) -> bool {
+        candidate
+            .steps()
+            .iter()
+            .enumerate()
+            .filter(|(_, step)| {
+                matches!(
+                    step,
+                    crate::metamorphic_maintenance_schedules::MaintenanceStep::Reopen
+                )
+            })
+            .all(|(position, _)| {
+                position > 0
+                    && matches!(
+                        candidate.steps()[position - 1],
+                        crate::metamorphic_maintenance_schedules::MaintenanceStep::Flush
+                    )
+            })
+    }
+
+    /// Assertions every shrunk fixture must satisfy, kept in one place so a
+    /// family cannot quietly check fewer of them.
+    fn assert_bounded_fixture(original: &MaintenanceSchedule, shrunk: &MaintenanceSchedule) {
+        assert!(
+            shrunk.steps().len() <= original.steps().len(),
+            "shrinking must never grow a fixture"
+        );
+        assert!(
+            shrunk.perturbing_steps() >= 1,
+            "a shrunk fixture with no perturbation no longer exercises its law: {}",
+            shrunk.replay_signature()
+        );
+        assert_eq!(
+            shrunk.ingested(),
+            original.ingested(),
+            "shrinking must not drop ingest steps and change the corpus"
+        );
+        // The artifact this emits travels with a bug report, so it must carry
+        // structure and no corpus text.
+        let signature = shrunk.replay_signature();
+        assert!(
+            !signature.contains("saffron") && !signature.contains("alpha"),
+            "a replay signature must not leak corpus text: {signature}"
+        );
+    }
+
+    #[test]
+    fn a_failing_merge_fixture_shrinks_and_still_reproduces_live() {
+        let baseline = maintenance_corpus();
+        let mutated = mutated_corpus();
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let original = merge_schedule(MAINTENANCE_SEED_MATRIX[0], baseline.len());
+            let mut driver = ShrinkDriver::new(&original);
+            while let Some(candidate) = driver.next_candidate() {
+                let outcome = run_merge_schedule_law(
+                    &cx,
+                    merging_config(),
+                    &baseline,
+                    &mutated,
+                    &candidate,
+                    PROBE,
+                )
+                .await;
+                driver.accept(!outcome.verdict.is_equivalent());
+            }
+            let shrunk = driver.finish();
+            assert_bounded_fixture(&original, &shrunk);
+
+            // REPLAY: the reduced fixture must still fail, or the artifact
+            // points at a reproduction that does not reproduce.
+            let replayed =
+                run_merge_schedule_law(&cx, merging_config(), &baseline, &mutated, &shrunk, PROBE)
+                    .await;
+            assert!(
+                !replayed.verdict.is_equivalent(),
+                "the shrunk merge fixture stopped reproducing: {}",
+                replayed.replay_signature
+            );
+        });
+    }
+
+    #[test]
+    fn a_failing_reopen_fixture_shrinks_and_still_reproduces_live() {
+        let baseline = maintenance_corpus();
+        let mutated = mutated_corpus();
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let original = reopen_recovery_schedule(MAINTENANCE_SEED_MATRIX[0], baseline.len());
+            let mut driver = ShrinkDriver::new(&original);
+            while let Some(candidate) = driver.next_candidate() {
+                // A reduction that moves a reopen to an uncommitted boundary is
+                // OUT OF THIS LAW'S SCOPE, and it would still "fail" -- for a
+                // durability reason the law does not name. Accepting it would
+                // hand back a replay artifact that reproduces a different bug
+                // than the one being shrunk, so the candidate is refused before
+                // it is ever executed.
+                if !every_reopen_is_committed(&candidate) {
+                    driver.accept(false);
+                    continue;
+                }
+                let baseline_root = tempfile::tempdir().expect("baseline index directory");
+                let maintained_root = tempfile::tempdir().expect("maintained index directory");
+                let outcome = run_reopen_recovery_law(
+                    &cx,
+                    recovery_config(),
+                    baseline_root.path(),
+                    maintained_root.path(),
+                    &baseline,
+                    &mutated,
+                    &candidate,
+                    PROBE,
+                )
+                .await;
+                driver.accept(!outcome.verdict.is_equivalent());
+            }
+            let shrunk = driver.finish();
+            assert_bounded_fixture(&original, &shrunk);
+            assert!(
+                every_reopen_is_committed(&shrunk),
+                "the shrunk reopen fixture left this law's scope: {}",
+                shrunk.replay_signature()
+            );
+
+            let baseline_root = tempfile::tempdir().expect("baseline index directory");
+            let maintained_root = tempfile::tempdir().expect("maintained index directory");
+            let replayed = run_reopen_recovery_law(
+                &cx,
+                recovery_config(),
+                baseline_root.path(),
+                maintained_root.path(),
+                &baseline,
+                &mutated,
+                &shrunk,
+                PROBE,
+            )
+            .await;
+            assert!(
+                !replayed.verdict.is_equivalent(),
+                "the shrunk reopen fixture stopped reproducing: {}",
+                replayed.replay_signature
+            );
+        });
+    }
+
+    /// The tombstone family shrinks against a RESURRECTION failure — the
+    /// control is handed the full corpus as its never-added arm — because that
+    /// is the failure mode a compaction bug would actually produce.
+    #[test]
+    fn a_failing_tombstone_fixture_shrinks_and_still_reproduces_live() {
+        let documents = maintenance_corpus();
+        asupersync::test_utils::run_test_with_cx(|cx| async move {
+            let original =
+                tombstone_compaction_schedule(MAINTENANCE_SEED_MATRIX[0], documents.len());
+            let mut driver = ShrinkDriver::new(&original);
+            while let Some(candidate) = driver.next_candidate() {
+                let outcome = run_tombstone_compaction_law(
+                    &cx,
+                    merging_config(),
+                    &documents,
+                    &documents,
+                    &candidate,
+                    PROBE,
+                )
+                .await;
+                driver.accept(!outcome.verdict.is_equivalent());
+            }
+            let shrunk = driver.finish();
+            assert_bounded_fixture(&original, &shrunk);
+            assert!(
+                shrunk.steps().iter().any(|step| matches!(
+                    step,
+                    crate::metamorphic_maintenance_schedules::MaintenanceStep::Tombstone { .. }
+                )),
+                "a tombstone fixture that shrank away every deletion cannot reproduce a \
+                 resurrection: {}",
+                shrunk.replay_signature()
+            );
+
+            let replayed = run_tombstone_compaction_law(
+                &cx,
+                merging_config(),
+                &documents,
+                &documents,
+                &shrunk,
+                PROBE,
+            )
+            .await;
+            assert!(
+                !replayed.verdict.is_equivalent(),
+                "the shrunk tombstone fixture stopped reproducing: {}",
+                replayed.replay_signature
+            );
+            // The survivor set the fixture implies must still be a proper
+            // subset, or the "reproduction" is just an empty deletion.
+            let survivors = survivors_of(&documents, &shrunk);
+            assert!(
+                survivors.len() < documents.len(),
+                "the shrunk fixture deletes nothing: {}",
+                shrunk.replay_signature()
             );
         });
     }
