@@ -31,6 +31,7 @@ pub mod interaction_matrix;
 pub mod interaction_primitives;
 pub mod lexical_pipeline;
 pub mod lifecycle;
+pub mod migration_compat;
 pub mod mount_info;
 pub mod orchestration;
 pub mod output_schema;
