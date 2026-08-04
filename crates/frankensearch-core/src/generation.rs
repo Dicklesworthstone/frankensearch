@@ -4220,6 +4220,364 @@ fn check_document_count_consistency(m: &GenerationManifest, f: &mut Vec<Validati
 }
 
 // ---------------------------------------------------------------------------
+// Exact generation component receipts (bd-exact-generation-component-receipts-rds6v)
+// ---------------------------------------------------------------------------
+
+/// Domain separator for the canonical, ENGINE-NEUTRAL ordered document-set
+/// digest.
+///
+/// Deliberately distinct from the index crate's
+/// `frankensearch.fsvi-v2.ordered-live-docset.v1`. That digest is computed
+/// over FSVI physical rows and is meaningful only inside that format; this one
+/// is what a vector index, a lexical index, an ANN sidecar, and a metadata
+/// checkpoint can each compute from their own view and be required to agree
+/// on. Sharing one domain between the two would let an FSVI-shaped digest
+/// silently satisfy a cross-engine comparison it never actually made.
+pub const CANONICAL_DOCSET_DIGEST_DOMAIN_V1: &[u8] =
+    b"frankensearch.generation.canonical-ordered-docset.v1";
+
+/// Which engine a component receipt speaks for.
+///
+/// Carried so a rejection can name the role that drifted: the acceptance
+/// requires every mutation to be rejected "on the correct role", which a bare
+/// boolean or a digest mismatch without attribution cannot express.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum GenerationComponentRole {
+    /// The FSVI vector index.
+    Vector,
+    /// The lexical (Quill) index.
+    Lexical,
+    /// The ANN sidecar. Optional: it may be absent or disabled.
+    Ann,
+    /// The metadata/checkpoint store.
+    Metadata,
+}
+
+impl GenerationComponentRole {
+    /// Stable identifier used in errors and canonical encoding.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Vector => "vector",
+            Self::Lexical => "lexical",
+            Self::Ann => "ann",
+            Self::Metadata => "metadata",
+        }
+    }
+
+    const fn wire(self) -> u8 {
+        match self {
+            Self::Vector => 1,
+            Self::Lexical => 2,
+            Self::Ann => 3,
+            Self::Metadata => 4,
+        }
+    }
+}
+
+/// The canonical ordered document set a generation was built from.
+///
+/// Every engine derives this from its own live documents. Order is part of the
+/// identity: two components holding the same documents in a different order
+/// are not the same generation, because rank-ordered results and physical row
+/// addressing both depend on it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CanonicalDocsetV1 {
+    documents: Vec<String>,
+}
+
+impl CanonicalDocsetV1 {
+    /// Build a canonical document set from live document ids in their exact
+    /// generation order.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed error for an empty identifier or a duplicate. A
+    /// duplicate is rejected rather than deduplicated: silently collapsing one
+    /// would make a corrupted component agree with a healthy one.
+    pub fn from_ordered_live_documents<I, S>(
+        documents: I,
+    ) -> Result<Self, GenerationAuthorityErrorV1>
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        let documents: Vec<String> = documents.into_iter().map(Into::into).collect();
+        let mut seen = std::collections::BTreeSet::new();
+        for document in &documents {
+            if document.is_empty() {
+                return Err(GenerationAuthorityErrorV1::InvalidField {
+                    field: "component_receipt.docset.document_id",
+                });
+            }
+            if !seen.insert(document.as_str()) {
+                return Err(GenerationAuthorityErrorV1::InvalidField {
+                    field: "component_receipt.docset.duplicate_document_id",
+                });
+            }
+        }
+        Ok(Self { documents })
+    }
+
+    /// Number of live documents.
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.documents.len()
+    }
+
+    /// Whether the generation has no live documents.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.documents.is_empty()
+    }
+
+    /// The canonical digest every component must agree on.
+    ///
+    /// Length-prefixes both the count and each identifier, so neither a
+    /// reordering, a hole, nor a boundary shift between adjacent identifiers
+    /// can collide with a healthy set.
+    #[must_use]
+    pub fn digest(&self) -> [u8; 32] {
+        let mut encoder = CanonicalEncoder::new(CANONICAL_DOCSET_DIGEST_DOMAIN_V1);
+        encoder.usize(self.documents.len());
+        for document in &self.documents {
+            encoder.text(document);
+        }
+        let mut hasher = Sha256::new();
+        hasher.update(&encoder.bytes);
+        hasher.finalize().into()
+    }
+}
+
+/// One identity-complete component receipt.
+///
+/// Distinct from [`GenerationComponentReceiptV1`], which carries only
+/// `byte_len` + `sha256` for the activation-authority lane. Exact bytes prove
+/// an artifact was not rewritten; they cannot prove it was built from the same
+/// documents and the same source checkpoint as its siblings. This carries
+/// both, so a component that is internally perfect but belongs to a different
+/// generation is still rejected.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExactComponentReceiptV1 {
+    /// Which engine this receipt speaks for.
+    pub role: GenerationComponentRole,
+    /// Exact bytes of the component artifact.
+    pub bytes: GenerationComponentReceiptV1,
+    /// Canonical ordered document-set digest this component was built from.
+    pub docset_digest: [u8; 32],
+    /// Live document count, carried separately so a same-count substitution is
+    /// distinguishable from a count drift in diagnostics.
+    pub live_document_count: u64,
+    /// The source checkpoint every component of one generation shares.
+    pub source_checkpoint: [u8; 32],
+}
+
+impl ExactComponentReceiptV1 {
+    /// Validate this receipt in isolation.
+    ///
+    /// # Errors
+    ///
+    /// Returns a typed error when the receipt cannot identify real bytes, or
+    /// when a digest or checkpoint is the all-zero placeholder.
+    pub fn validate(&self) -> Result<(), GenerationAuthorityErrorV1> {
+        self.bytes.validate()?;
+        if self.docset_digest == [0; 32] {
+            return Err(GenerationAuthorityErrorV1::InvalidField {
+                field: "component_receipt.docset_digest",
+            });
+        }
+        if self.source_checkpoint == [0; 32] {
+            return Err(GenerationAuthorityErrorV1::InvalidField {
+                field: "component_receipt.source_checkpoint",
+            });
+        }
+        Ok(())
+    }
+
+    fn encode(&self, encoder: &mut CanonicalEncoder) {
+        encoder.u8(self.role.wire());
+        self.bytes.encode(encoder);
+        encoder.bytes(&self.docset_digest);
+        encoder.u64(self.live_document_count);
+        encoder.bytes(&self.source_checkpoint);
+    }
+}
+
+/// Why a composite generation was refused, and by which role.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum ComponentJoinErrorV1 {
+    /// One component disagreed on the canonical document set.
+    #[error("{role} component was built from a different document set")]
+    DocsetDrift {
+        /// The role whose digest disagreed with the vector anchor.
+        role: &'static str,
+    },
+    /// One component disagreed on the shared source checkpoint.
+    #[error("{role} component was built from a different source checkpoint")]
+    CheckpointDrift {
+        /// The role whose checkpoint disagreed with the vector anchor.
+        role: &'static str,
+    },
+    /// A receipt was filed under the wrong role.
+    #[error("{expected} slot holds a {found} component receipt")]
+    RoleMismatch {
+        /// Slot the receipt was filed in.
+        expected: &'static str,
+        /// Role the receipt actually declares.
+        found: &'static str,
+    },
+    /// A receipt failed its own validation.
+    #[error("{role} component receipt is invalid: {source}")]
+    InvalidComponent {
+        /// The offending role.
+        role: &'static str,
+        /// Underlying field error.
+        #[source]
+        source: GenerationAuthorityErrorV1,
+    },
+}
+
+/// Four component receipts proven to describe ONE generation.
+///
+/// The ANN slot is optional because ANN is an optional accelerator: a
+/// generation with a stale or absent sidecar is still exact, provided the
+/// mandatory roles agree. Vector, lexical, and metadata drift always fails
+/// closed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExactGenerationComponentsV1 {
+    vector: ExactComponentReceiptV1,
+    lexical: ExactComponentReceiptV1,
+    ann: Option<ExactComponentReceiptV1>,
+    metadata: ExactComponentReceiptV1,
+}
+
+impl ExactGenerationComponentsV1 {
+    /// Admit four component receipts as one generation.
+    ///
+    /// The vector receipt is the anchor: it is the only role that owns the
+    /// identity-complete FSVI witness, so the others are compared against it
+    /// rather than against each other. Comparing pairwise would let two
+    /// equally-wrong components agree and outvote the anchor.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ComponentJoinErrorV1`] naming the role that drifted, its
+    /// declared role when filed in the wrong slot, or its own field error.
+    pub fn admit(
+        vector: ExactComponentReceiptV1,
+        lexical: ExactComponentReceiptV1,
+        ann: Option<ExactComponentReceiptV1>,
+        metadata: ExactComponentReceiptV1,
+    ) -> Result<Self, ComponentJoinErrorV1> {
+        for (slot, receipt) in [
+            (GenerationComponentRole::Vector, &vector),
+            (GenerationComponentRole::Lexical, &lexical),
+            (GenerationComponentRole::Metadata, &metadata),
+        ]
+        .into_iter()
+        .chain(
+            ann.as_ref()
+                .map(|receipt| (GenerationComponentRole::Ann, receipt)),
+        ) {
+            if receipt.role != slot {
+                return Err(ComponentJoinErrorV1::RoleMismatch {
+                    expected: slot.as_str(),
+                    found: receipt.role.as_str(),
+                });
+            }
+            receipt
+                .validate()
+                .map_err(|source| ComponentJoinErrorV1::InvalidComponent {
+                    role: slot.as_str(),
+                    source,
+                })?;
+        }
+
+        let anchor_docset = vector.docset_digest;
+        let anchor_checkpoint = vector.source_checkpoint;
+        for receipt in [Some(&lexical), ann.as_ref(), Some(&metadata)]
+            .into_iter()
+            .flatten()
+        {
+            if receipt.docset_digest != anchor_docset {
+                return Err(ComponentJoinErrorV1::DocsetDrift {
+                    role: receipt.role.as_str(),
+                });
+            }
+            if receipt.source_checkpoint != anchor_checkpoint {
+                return Err(ComponentJoinErrorV1::CheckpointDrift {
+                    role: receipt.role.as_str(),
+                });
+            }
+        }
+
+        Ok(Self {
+            vector,
+            lexical,
+            ann,
+            metadata,
+        })
+    }
+
+    /// The canonical document-set digest every admitted component agrees on.
+    #[must_use]
+    pub const fn docset_digest(&self) -> [u8; 32] {
+        self.vector.docset_digest
+    }
+
+    /// The shared source checkpoint.
+    #[must_use]
+    pub const fn source_checkpoint(&self) -> [u8; 32] {
+        self.vector.source_checkpoint
+    }
+
+    /// Whether an ANN component was admitted alongside the mandatory roles.
+    #[must_use]
+    pub const fn has_ann(&self) -> bool {
+        self.ann.is_some()
+    }
+
+    /// Vector component receipt.
+    #[must_use]
+    pub const fn vector(&self) -> &ExactComponentReceiptV1 {
+        &self.vector
+    }
+
+    /// Lexical component receipt.
+    #[must_use]
+    pub const fn lexical(&self) -> &ExactComponentReceiptV1 {
+        &self.lexical
+    }
+
+    /// Metadata component receipt.
+    #[must_use]
+    pub const fn metadata(&self) -> &ExactComponentReceiptV1 {
+        &self.metadata
+    }
+
+    /// ANN component receipt, when one was admitted.
+    #[must_use]
+    pub const fn ann(&self) -> Option<&ExactComponentReceiptV1> {
+        self.ann.as_ref()
+    }
+
+    /// Digest binding the admitted composite, for a manifest to address.
+    #[must_use]
+    pub fn composite_digest(&self) -> [u8; 32] {
+        let mut encoder = CanonicalEncoder::new(b"frankensearch.generation.exact-components.v1");
+        self.vector.encode(&mut encoder);
+        self.lexical.encode(&mut encoder);
+        encoder.option(self.ann.as_ref(), |receipt, encoder| {
+            receipt.encode(encoder);
+        });
+        self.metadata.encode(&mut encoder);
+        let mut hasher = Sha256::new();
+        hasher.update(&encoder.bytes);
+        hasher.finalize().into()
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
@@ -6832,5 +7190,300 @@ mod tests {
             let back: QuantizationFormat = serde_json::from_str(&json).expect("deserialize");
             assert_eq!(fmt, &back);
         }
+    }
+
+    // --- bd-exact-generation-component-receipts-rds6v: paired controls ---
+
+    fn docset(documents: &[&str]) -> CanonicalDocsetV1 {
+        CanonicalDocsetV1::from_ordered_live_documents(documents.iter().copied())
+            .expect("valid canonical docset")
+    }
+
+    const CONTROL_DOCS: [&str; 4] = ["doc-a", "doc-b", "doc-c", "doc-d"];
+
+    fn component(
+        role: GenerationComponentRole,
+        docset_digest: [u8; 32],
+        checkpoint: [u8; 32],
+    ) -> ExactComponentReceiptV1 {
+        ExactComponentReceiptV1 {
+            role,
+            bytes: GenerationComponentReceiptV1 {
+                byte_len: 4096 + u64::from(role.wire()),
+                sha256: [role.wire(); 32],
+            },
+            docset_digest,
+            live_document_count: 4,
+            source_checkpoint: checkpoint,
+        }
+    }
+
+    /// All four roles agreeing. Every mutation test below is this quartet with
+    /// exactly one field moved, so a failure is attributable to that field.
+    fn control_quartet() -> (
+        ExactComponentReceiptV1,
+        ExactComponentReceiptV1,
+        ExactComponentReceiptV1,
+        ExactComponentReceiptV1,
+    ) {
+        let digest = docset(&CONTROL_DOCS).digest();
+        let checkpoint = [0x5c; 32];
+        (
+            component(GenerationComponentRole::Vector, digest, checkpoint),
+            component(GenerationComponentRole::Lexical, digest, checkpoint),
+            component(GenerationComponentRole::Ann, digest, checkpoint),
+            component(GenerationComponentRole::Metadata, digest, checkpoint),
+        )
+    }
+
+    #[test]
+    fn control_quartet_admits_with_and_without_ann() {
+        let (vector, lexical, ann, metadata) = control_quartet();
+        let admitted = ExactGenerationComponentsV1::admit(
+            vector.clone(),
+            lexical.clone(),
+            Some(ann),
+            metadata.clone(),
+        )
+        .expect("agreeing components admit");
+        assert!(admitted.has_ann());
+        assert_eq!(admitted.docset_digest(), docset(&CONTROL_DOCS).digest());
+
+        // ANN is an optional accelerator: absent is still exact.
+        let without_ann = ExactGenerationComponentsV1::admit(vector, lexical, None, metadata)
+            .expect("absent ANN is admissible");
+        assert!(!without_ann.has_ann());
+        assert_ne!(
+            without_ann.composite_digest(),
+            admitted.composite_digest(),
+            "the composite digest must distinguish an admitted ANN from an absent one"
+        );
+    }
+
+    /// Each mandatory role, drifted alone, must reject NAMING THAT ROLE — the
+    /// acceptance requires rejection "on the correct role", so an unattributed
+    /// mismatch would not satisfy it.
+    #[test]
+    fn each_role_docset_drift_rejects_on_that_role() {
+        let other = docset(&["doc-a", "doc-b", "doc-c", "doc-e"]).digest();
+        for role in [
+            GenerationComponentRole::Lexical,
+            GenerationComponentRole::Ann,
+            GenerationComponentRole::Metadata,
+        ] {
+            let (vector, mut lexical, mut ann, mut metadata) = control_quartet();
+            match role {
+                GenerationComponentRole::Lexical => lexical.docset_digest = other,
+                GenerationComponentRole::Ann => ann.docset_digest = other,
+                GenerationComponentRole::Metadata => metadata.docset_digest = other,
+                GenerationComponentRole::Vector => unreachable!("vector is the anchor"),
+            }
+            let observed = ExactGenerationComponentsV1::admit(vector, lexical, Some(ann), metadata);
+            assert!(
+                matches!(
+                    observed,
+                    Err(ComponentJoinErrorV1::DocsetDrift { role: named }) if named == role.as_str()
+                ),
+                "{} docset drift must reject on its own role, observed {observed:?}",
+                role.as_str()
+            );
+        }
+    }
+
+    #[test]
+    fn each_role_checkpoint_drift_rejects_on_that_role() {
+        for role in [
+            GenerationComponentRole::Lexical,
+            GenerationComponentRole::Ann,
+            GenerationComponentRole::Metadata,
+        ] {
+            let (vector, mut lexical, mut ann, mut metadata) = control_quartet();
+            match role {
+                GenerationComponentRole::Lexical => lexical.source_checkpoint = [0x11; 32],
+                GenerationComponentRole::Ann => ann.source_checkpoint = [0x11; 32],
+                GenerationComponentRole::Metadata => metadata.source_checkpoint = [0x11; 32],
+                GenerationComponentRole::Vector => unreachable!("vector is the anchor"),
+            }
+            let observed = ExactGenerationComponentsV1::admit(vector, lexical, Some(ann), metadata);
+            assert!(
+                matches!(
+                    observed,
+                    Err(ComponentJoinErrorV1::CheckpointDrift { role: named })
+                        if named == role.as_str()
+                ),
+                "{} checkpoint drift must reject on its own role, observed {observed:?}",
+                role.as_str()
+            );
+        }
+    }
+
+    /// A receipt filed in the wrong slot is caught before any digest is
+    /// compared — otherwise a lexical receipt sitting in the metadata slot
+    /// would sail through simply because it agrees with the anchor.
+    #[test]
+    fn a_receipt_in_the_wrong_slot_rejects_before_digest_comparison() {
+        let (vector, lexical, ann, _) = control_quartet();
+        let observed = ExactGenerationComponentsV1::admit(
+            vector,
+            lexical.clone(),
+            Some(ann),
+            // A perfectly agreeing LEXICAL receipt in the metadata slot.
+            lexical,
+        );
+        assert!(
+            matches!(
+                observed,
+                Err(ComponentJoinErrorV1::RoleMismatch {
+                    expected: "metadata",
+                    found: "lexical",
+                })
+            ),
+            "a misfiled receipt must reject on the slot, observed {observed:?}"
+        );
+    }
+
+    /// The document-set mutations the bead enumerates. Each must move the
+    /// canonical digest; the control proves the algorithm is not simply
+    /// digesting everything to a constant.
+    #[test]
+    fn canonical_docset_digest_separates_every_enumerated_mutation() {
+        let control = docset(&CONTROL_DOCS).digest();
+        assert_eq!(
+            control,
+            docset(&CONTROL_DOCS).digest(),
+            "the digest must be deterministic across calls"
+        );
+
+        // Reordering: same documents, different generation order.
+        assert_ne!(
+            control,
+            docset(&["doc-b", "doc-a", "doc-c", "doc-d"]).digest(),
+            "document reordering must move the canonical digest"
+        );
+        // A hole: one document missing.
+        assert_ne!(
+            control,
+            docset(&["doc-a", "doc-b", "doc-c"]).digest(),
+            "a missing document must move the canonical digest"
+        );
+        // Same-count substitution — the case a bare count check cannot see.
+        let substituted = docset(&["doc-a", "doc-b", "doc-c", "doc-z"]);
+        assert_eq!(substituted.len(), CONTROL_DOCS.len());
+        assert_ne!(
+            control,
+            substituted.digest(),
+            "a same-count substitution must move the canonical digest"
+        );
+        // A boundary shift between adjacent identifiers must not collide with
+        // the healthy set, which is why each identifier is length-prefixed.
+        assert_ne!(
+            docset(&["doc-a", "bdoc-c", "doc-d"]).digest(),
+            docset(&["doc-ab", "doc-c", "doc-d"]).digest(),
+            "identifier boundaries must be part of the digest"
+        );
+    }
+
+    #[test]
+    fn a_duplicate_document_is_rejected_rather_than_collapsed() {
+        // Silently deduplicating would let a corrupted component agree with a
+        // healthy one that genuinely holds one fewer document.
+        assert!(matches!(
+            CanonicalDocsetV1::from_ordered_live_documents(["doc-a", "doc-b", "doc-a"]),
+            Err(GenerationAuthorityErrorV1::InvalidField {
+                field: "component_receipt.docset.duplicate_document_id"
+            })
+        ));
+        assert!(matches!(
+            CanonicalDocsetV1::from_ordered_live_documents(["doc-a", ""]),
+            Err(GenerationAuthorityErrorV1::InvalidField {
+                field: "component_receipt.docset.document_id"
+            })
+        ));
+        // Control: the same documents without the duplicate are accepted.
+        assert_eq!(
+            docset(&["doc-a", "doc-b"]).len(),
+            2,
+            "the control set must still admit"
+        );
+    }
+
+    /// An empty generation is a legitimate state and must have a stable,
+    /// non-zero digest distinct from any populated one.
+    #[test]
+    fn an_empty_docset_has_a_stable_distinct_digest() {
+        let empty = docset(&[]);
+        assert!(empty.is_empty());
+        assert_eq!(empty.digest(), docset(&[]).digest());
+        assert_ne!(empty.digest(), [0; 32]);
+        assert_ne!(empty.digest(), docset(&["doc-a"]).digest());
+    }
+
+    /// Exact bytes are not identity: a component whose artifact bytes are
+    /// perfect is still refused when it was built from another generation.
+    #[test]
+    fn byte_identical_components_from_different_generations_are_refused() {
+        let (vector, mut lexical, ann, metadata) = control_quartet();
+        // Same artifact bytes as the control quartet's lexical component.
+        assert_eq!(
+            lexical.bytes,
+            component(
+                GenerationComponentRole::Lexical,
+                lexical.docset_digest,
+                lexical.source_checkpoint
+            )
+            .bytes
+        );
+        // ...but built from a different document set.
+        lexical.docset_digest = docset(&["doc-a", "doc-b", "doc-c", "doc-e"]).digest();
+        assert!(
+            lexical.validate().is_ok(),
+            "the receipt is internally valid"
+        );
+        assert!(matches!(
+            ExactGenerationComponentsV1::admit(vector, lexical, Some(ann), metadata),
+            Err(ComponentJoinErrorV1::DocsetDrift { role: "lexical" })
+        ));
+    }
+
+    #[test]
+    fn a_zero_placeholder_digest_or_checkpoint_is_not_a_valid_receipt() {
+        let (vector, mut lexical, ann, metadata) = control_quartet();
+        lexical.docset_digest = [0; 32];
+        assert!(matches!(
+            ExactGenerationComponentsV1::admit(
+                vector.clone(),
+                lexical,
+                Some(ann.clone()),
+                metadata.clone()
+            ),
+            Err(ComponentJoinErrorV1::InvalidComponent {
+                role: "lexical",
+                ..
+            })
+        ));
+
+        let (vector2, lexical2, ann2, mut metadata2) = control_quartet();
+        metadata2.source_checkpoint = [0; 32];
+        assert!(matches!(
+            ExactGenerationComponentsV1::admit(vector2, lexical2, Some(ann2), metadata2),
+            Err(ComponentJoinErrorV1::InvalidComponent {
+                role: "metadata",
+                ..
+            })
+        ));
+    }
+
+    /// The engine-neutral digest must NOT be confused with the index crate's
+    /// FSVI-specific one; separate domains are what keep them distinguishable.
+    #[test]
+    fn the_canonical_domain_is_distinct_from_the_fsvi_domain() {
+        assert_eq!(
+            CANONICAL_DOCSET_DIGEST_DOMAIN_V1,
+            b"frankensearch.generation.canonical-ordered-docset.v1"
+        );
+        assert_ne!(
+            CANONICAL_DOCSET_DIGEST_DOMAIN_V1,
+            b"frankensearch.fsvi-v2.ordered-live-docset.v1".as_slice()
+        );
     }
 }
