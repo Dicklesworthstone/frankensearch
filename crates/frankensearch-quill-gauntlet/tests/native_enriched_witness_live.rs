@@ -199,6 +199,74 @@ fn utf8_windows_and_long_query_truncation_hold_against_real_quill() {
     });
 }
 
+/// bd-8nqz.4.1 slice 4: the typed `QueryCapability` refusal on a real
+/// positionless STORED schema, with its positionful control.
+///
+/// Both arms are real `QuillIndex` instances over the same committed corpus,
+/// differing only in whether their stored schema indexes positions. The
+/// refusal is therefore attributable to the missing capability rather than to
+/// the query, the corpus, or the analyzer — and the served rows prove the
+/// positionless index is otherwise usable, so a blanket refusal cannot pass.
+#[test]
+fn the_typed_capability_refusal_and_its_positionful_control_hold_against_real_quill() {
+    use frankensearch_quill_gauntlet::native_enriched_witness::{
+        CapabilitySchemaArmV1, FIXTURE_CAPABILITY_EXPECTATIONS, adjudicate_capability_probe,
+        probe_quill_capability,
+    };
+
+    asupersync::test_utils::run_test_with_cx(|cx| async move {
+        // One index per arm, built from the arm's own stored schema.
+        let mut arms = Vec::new();
+        for arm in [
+            CapabilitySchemaArmV1::Positionless,
+            CapabilitySchemaArmV1::Positioned,
+        ] {
+            let index = QuillIndex::in_memory_with_schema(
+                arm.schema(),
+                QuillConfig {
+                    deterministic_ingest: true,
+                    max_ingest_shards: 1,
+                    ..QuillConfig::default()
+                },
+            )
+            .expect("build the witness capability index for this schema arm");
+            index
+                .index_documents(&cx, &fixture_documents())
+                .await
+                .expect("index the witness corpus into this schema arm");
+            index
+                .commit(&cx)
+                .await
+                .expect("commit the witness corpus in this schema arm");
+            arms.push((arm, index));
+        }
+
+        let mut failures = Vec::new();
+        for expectation in FIXTURE_CAPABILITY_EXPECTATIONS {
+            let (_, index) = arms
+                .iter()
+                .find(|(arm, _)| *arm == expectation.arm)
+                .expect("both schema arms are built");
+            let outcome = probe_quill_capability(&cx, index, expectation.query, 10);
+            let verdict = adjudicate_capability_probe(expectation, &outcome);
+            if !verdict.passed() {
+                failures.push(format!(
+                    "row {} (query {:?}, {} schema) -> {:?} (observed {outcome:?})",
+                    expectation.label,
+                    expectation.query,
+                    expectation.arm.code(),
+                    verdict.oracle_failures,
+                ));
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "the committed capability expectations do not describe the shipping Quill engine:\n{}",
+            failures.join("\n")
+        );
+    });
+}
+
 /// The same committed expectations must hold against the REAL Tantivy
 /// incumbent. Running both arms against ONE independent oracle is what makes
 /// a common-mode defect visible: neither engine is the other's reference.

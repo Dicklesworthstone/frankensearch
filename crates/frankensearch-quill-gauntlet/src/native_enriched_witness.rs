@@ -679,6 +679,577 @@ pub fn enriched_engines_agree(
 }
 
 // ---------------------------------------------------------------------------
+// Typed query-capability refusal and its positionful control (slice 4)
+// ---------------------------------------------------------------------------
+
+/// Diagnostic name of the witness's own positionless schema.
+///
+/// Deliberately distinct from the QG positionless schema in `engine.rs`: the
+/// receipt names the schema it actually exercised, and two harnesses sharing
+/// one schema name would let a refusal observed under one be replayed as
+/// evidence for the other.
+pub const WITNESS_POSITIONLESS_SCHEMA_NAME: &str = "frankensearch-witness-no-positions-v1";
+
+/// The witness's positionless schema: field-for-field the shipping default,
+/// with `positions` turned OFF on both text fields and nothing else changed.
+///
+/// Holding every other axis fixed is what makes the refusal attributable. A
+/// schema that also dropped a field or changed an analyzer would produce a
+/// refusal that could be explained by something other than the missing
+/// capability.
+const WITNESS_POSITIONLESS_FIELDS: [frankensearch_quill::FieldDescriptor; 5] = [
+    frankensearch_quill::FieldDescriptor {
+        id: 0,
+        name: "id",
+        kind: frankensearch_quill::FieldKind::Keyword,
+        stored: true,
+    },
+    frankensearch_quill::FieldDescriptor {
+        id: 1,
+        name: "content",
+        kind: frankensearch_quill::FieldKind::Text {
+            analyzer: frankensearch_quill::Analyzer::FrankensearchDefault,
+            positions: false,
+        },
+        stored: true,
+    },
+    frankensearch_quill::FieldDescriptor {
+        id: 2,
+        name: "title",
+        kind: frankensearch_quill::FieldKind::Text {
+            analyzer: frankensearch_quill::Analyzer::FrankensearchDefault,
+            positions: false,
+        },
+        stored: true,
+    },
+    frankensearch_quill::FieldDescriptor {
+        id: 3,
+        name: "metadata_json",
+        kind: frankensearch_quill::FieldKind::StoredOnly,
+        stored: true,
+    },
+    frankensearch_quill::FieldDescriptor {
+        id: 4,
+        name: "ord",
+        kind: frankensearch_quill::FieldKind::U64 {
+            indexed: false,
+            fast: true,
+        },
+        stored: true,
+    },
+];
+
+/// The witness's positionless schema descriptor.
+pub const WITNESS_POSITIONLESS_SCHEMA: frankensearch_quill::SchemaDescriptor =
+    frankensearch_quill::SchemaDescriptor {
+        name: WITNESS_POSITIONLESS_SCHEMA_NAME,
+        fields: &WITNESS_POSITIONLESS_FIELDS,
+    };
+
+/// Longest engine diagnostic the witness will carry.
+///
+/// An unmapped engine error is recorded, not swallowed, but a receipt must not
+/// become an unbounded channel for engine-internal text.
+const MAX_DIAGNOSTIC_CHARS: usize = 200;
+
+/// The witness's OWN stable error classification.
+///
+/// This is deliberately a separate namespace from the engine's error rendering.
+/// The engine's `Display` string is an implementation detail that may be
+/// reworded; a receipt that pinned it would either break on a typo fix or, far
+/// worse, silently accept a reworded error as a different one. The class and
+/// code below are the witness's contract, mapped FROM the engine's typed error,
+/// and they change only by deliberate edit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EnrichedErrorClassV1 {
+    /// A position-dependent operator named a field indexed without positions.
+    QueryCapabilityPositionsRequired,
+}
+
+impl EnrichedErrorClassV1 {
+    /// Stable dotted class name.
+    #[must_use]
+    pub const fn class_code(self) -> &'static str {
+        match self {
+            Self::QueryCapabilityPositionsRequired => {
+                "enriched.query_capability.positions_required"
+            }
+        }
+    }
+
+    /// Stable short code, pinned by test so a rename must be deliberate.
+    #[must_use]
+    pub const fn stable_code(self) -> &'static str {
+        match self {
+            Self::QueryCapabilityPositionsRequired => "FSNE-CAP-0001",
+        }
+    }
+}
+
+/// A typed capability refusal, normalized into the witness's own vocabulary.
+///
+/// Every field is carried separately rather than as one rendered message,
+/// because the acceptance names each of them: a refusal that got the schema
+/// right and the field wrong is a different defect from one that got the
+/// operator wrong, and a single string cannot distinguish them.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EnrichedCapabilityRefusalV1 {
+    /// The witness's classification of the refusal.
+    pub class: EnrichedErrorClassV1,
+    /// The class's stable short code, serialized so a stored receipt is
+    /// readable without this crate.
+    pub code: String,
+    /// Schema the engine named.
+    pub schema: String,
+    /// Field the operator named.
+    pub field: String,
+    /// Operator that required the capability, as its `Display` code.
+    pub operator: String,
+    /// Capability the operator required, as its `Display` code.
+    pub capability: String,
+}
+
+/// What one capability probe actually did.
+///
+/// `UnmappedError` exists so a refusal the witness does NOT understand can
+/// never be laundered into the capability class. A bare
+/// `QuillIndexError::UnsupportedQuery` is exactly the shape the bead rejects,
+/// and it lands here rather than in [`CapabilityProbeOutcomeV1::Refused`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "outcome", rename_all = "snake_case", deny_unknown_fields)]
+pub enum CapabilityProbeOutcomeV1 {
+    /// The engine served the query.
+    Served {
+        /// Matching document ids in canonical (sorted) order.
+        ///
+        /// Sorted on purpose: this table's claim is MEMBERSHIP. Page order is
+        /// adjudicated by [`adjudicate`], and only where term-frequency
+        /// separation makes it unambiguous.
+        doc_ids: Vec<String>,
+        /// Exact total. `None` means the engine returned no usable exact
+        /// count despite being asked for one, which is itself a failure.
+        total: Option<usize>,
+    },
+    /// The engine refused with a typed capability error the witness maps.
+    Refused(EnrichedCapabilityRefusalV1),
+    /// The engine failed in a way the witness does not classify. Recorded with
+    /// a bounded rendering so the receipt stays diagnosable without becoming a
+    /// conduit for arbitrary engine text.
+    UnmappedError {
+        /// Bounded, truncation-marked rendering of the engine error.
+        rendered: String,
+    },
+}
+
+/// Bound an engine diagnostic to [`MAX_DIAGNOSTIC_CHARS`] characters.
+fn bounded_diagnostic(text: &str) -> String {
+    if text.chars().count() <= MAX_DIAGNOSTIC_CHARS {
+        return text.to_owned();
+    }
+    let mut bounded: String = text.chars().take(MAX_DIAGNOSTIC_CHARS).collect();
+    bounded.push_str("…[truncated]");
+    bounded
+}
+
+/// Map a typed Quill failure into the witness's own error vocabulary.
+///
+/// Only [`frankensearch_quill::index::QuillIndexError::QueryCapability`] maps
+/// to a class; everything else is recorded as unmapped. That asymmetry is the
+/// point: the acceptance requires the exact capability class, and an engine
+/// that degraded the typed error into a generic failure must not still pass.
+#[must_use]
+pub fn classify_quill_refusal(
+    error: &frankensearch_quill::QuillIndexError,
+) -> CapabilityProbeOutcomeV1 {
+    use frankensearch_quill::query::QueryCapabilityError;
+
+    match error {
+        frankensearch_quill::QuillIndexError::QueryCapability(
+            QueryCapabilityError::PositionsRequired {
+                schema,
+                field,
+                operator,
+                capability,
+            },
+        ) => {
+            let class = EnrichedErrorClassV1::QueryCapabilityPositionsRequired;
+            CapabilityProbeOutcomeV1::Refused(EnrichedCapabilityRefusalV1 {
+                class,
+                code: class.stable_code().to_owned(),
+                schema: (*schema).to_owned(),
+                field: field.clone(),
+                operator: operator.to_string(),
+                capability: capability.to_string(),
+            })
+        }
+        other => CapabilityProbeOutcomeV1::UnmappedError {
+            rendered: bounded_diagnostic(&other.to_string()),
+        },
+    }
+}
+
+/// Which schema arm a capability row runs against.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CapabilitySchemaArmV1 {
+    /// The witness's positionless schema.
+    Positionless,
+    /// The shipping default schema, which indexes positions.
+    Positioned,
+}
+
+impl CapabilitySchemaArmV1 {
+    /// Schema descriptor this arm builds its index from.
+    #[must_use]
+    pub const fn schema(self) -> frankensearch_quill::SchemaDescriptor {
+        match self {
+            Self::Positionless => WITNESS_POSITIONLESS_SCHEMA,
+            Self::Positioned => frankensearch_quill::DEFAULT_SCHEMA,
+        }
+    }
+
+    /// Stable code for hashing and diagnostics.
+    #[must_use]
+    pub const fn code(self) -> &'static str {
+        match self {
+            Self::Positionless => "positionless",
+            Self::Positioned => "positioned",
+        }
+    }
+}
+
+/// What a capability row expects, hand-derived from the schema and the corpus.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CapabilityOutcomeExpectationV1 {
+    /// The engine must refuse, naming exactly these facts.
+    Refused {
+        /// Schema the refusal must name.
+        schema: &'static str,
+        /// Field the refusal must name.
+        field: &'static str,
+        /// Operator `Display` code the refusal must name.
+        operator_code: &'static str,
+        /// Capability `Display` code the refusal must name.
+        capability_code: &'static str,
+        /// The witness class the refusal must map to.
+        class: EnrichedErrorClassV1,
+    },
+    /// The engine must serve, returning exactly this match set and total.
+    Served {
+        /// Matching documents in sorted order.
+        docs: &'static [&'static str],
+        /// Exact total.
+        total: usize,
+    },
+}
+
+/// One committed capability expectation.
+#[derive(Debug, Clone, Copy)]
+pub struct CapabilityProbeExpectationV1 {
+    /// Stable row label, used in diagnostics and in the row digest.
+    pub label: &'static str,
+    /// Query handed to the engine verbatim.
+    pub query: &'static str,
+    /// Schema arm the row runs against.
+    pub arm: CapabilitySchemaArmV1,
+    /// Hand-derived expected outcome.
+    pub outcome: CapabilityOutcomeExpectationV1,
+}
+
+/// The committed capability table.
+///
+/// # Why the served rows are not optional
+///
+/// A table containing only the refusal row would be passed by an engine that
+/// refused EVERY query, or that refused everything on a positionless schema —
+/// which is not the contract. Three independent controls close that:
+///
+/// - a position-INDEPENDENT term query on the SAME positionless index must be
+///   served, so the index itself is demonstrably usable;
+/// - a single-term quote on the positionless index must be served, because it
+///   degenerates to a term match and reads no positions — so the refusal is
+///   scoped to genuine position consumption rather than to quoting;
+/// - the identical multi-term phrase on the POSITIONED schema must be served
+///   and return the right document, so the refusal is attributable to the
+///   missing capability and not to a broken query.
+///
+/// A fourth row makes the positioned control non-vacuous in the other
+/// direction: the REVERSED phrase must match nothing. An engine that ignored
+/// positions and degenerated the phrase into a conjunction would return
+/// `doc-alpha` for it and pass every other row.
+pub const FIXTURE_CAPABILITY_EXPECTATIONS: &[CapabilityProbeExpectationV1] = &[
+    // THE ACCEPTANCE ROW: a real positionless stored-schema phrase.
+    CapabilityProbeExpectationV1 {
+        label: "positionless-multi-term-phrase",
+        query: "\"indexes text\"",
+        arm: CapabilitySchemaArmV1::Positionless,
+        outcome: CapabilityOutcomeExpectationV1::Refused {
+            schema: WITNESS_POSITIONLESS_SCHEMA_NAME,
+            // The default parser expands over `[content, title^2]`, and
+            // `content` is the first field lacking positions, so it is the
+            // field the refusal must name.
+            field: "content",
+            operator_code: "phrase",
+            capability_code: "positions",
+            class: EnrichedErrorClassV1::QueryCapabilityPositionsRequired,
+        },
+    },
+    // Control: a single-term quote reads no positions and stays servable.
+    // "indexes" occurs only in doc-alpha.
+    CapabilityProbeExpectationV1 {
+        label: "positionless-single-term-quote",
+        query: "\"indexes\"",
+        arm: CapabilitySchemaArmV1::Positionless,
+        outcome: CapabilityOutcomeExpectationV1::Served {
+            docs: &["doc-alpha"],
+            total: 1,
+        },
+    },
+    // Control: the positionless index serves position-independent queries.
+    // "quill" occurs in doc-alpha and doc-beta.
+    CapabilityProbeExpectationV1 {
+        label: "positionless-bare-term",
+        query: "quill",
+        arm: CapabilitySchemaArmV1::Positionless,
+        outcome: CapabilityOutcomeExpectationV1::Served {
+            docs: &["doc-alpha", "doc-beta"],
+            total: 2,
+        },
+    },
+    // THE POSITIONFUL CONTROL: the same phrase, served, on the schema that
+    // provides the capability. doc-alpha reads "quill quill quill indexes
+    // text", so "indexes text" is adjacent there and nowhere else.
+    CapabilityProbeExpectationV1 {
+        label: "positionful-multi-term-phrase",
+        query: "\"indexes text\"",
+        arm: CapabilitySchemaArmV1::Positioned,
+        outcome: CapabilityOutcomeExpectationV1::Served {
+            docs: &["doc-alpha"],
+            total: 1,
+        },
+    },
+    // The control's own control: reversed, the phrase matches nothing, which
+    // is only true if positions are genuinely consumed.
+    CapabilityProbeExpectationV1 {
+        label: "positionful-reversed-phrase",
+        query: "\"text indexes\"",
+        arm: CapabilitySchemaArmV1::Positioned,
+        outcome: CapabilityOutcomeExpectationV1::Served {
+            docs: &[],
+            total: 0,
+        },
+    },
+];
+
+/// Digest of the committed capability table.
+#[must_use]
+pub fn capability_manifest_sha256() -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"frankensearch.gauntlet.native-enriched-capability.v1\0");
+    for expectation in FIXTURE_CAPABILITY_EXPECTATIONS {
+        let mut row = String::new();
+        let _ = write!(
+            row,
+            "{}|{}|{}|",
+            expectation.label,
+            expectation.query,
+            expectation.arm.code()
+        );
+        match expectation.outcome {
+            CapabilityOutcomeExpectationV1::Refused {
+                schema,
+                field,
+                operator_code,
+                capability_code,
+                class,
+            } => {
+                let _ = write!(
+                    row,
+                    "refused|{schema}|{field}|{operator_code}|{capability_code}|{}|{}",
+                    class.class_code(),
+                    class.stable_code()
+                );
+            }
+            CapabilityOutcomeExpectationV1::Served { docs, total } => {
+                let _ = write!(row, "served|{}|{total}", docs.join(","));
+            }
+        }
+        hasher.update(row.as_bytes());
+        hasher.update([0u8]);
+    }
+    hex_lower(&hasher.finalize())
+}
+
+/// Run one capability row against a REAL Quill index.
+///
+/// Takes an already-built index rather than building one, so the witness's
+/// production code needs no bench-only constructor; the two schema arms are
+/// constructed by the live suite, which is where the schema-bound index is
+/// legitimately available.
+///
+/// Never returns `Result`: a refusal IS the observable for the acceptance row,
+/// so turning it into an error would force the caller to decide what a refusal
+/// means, which is the oracle's job.
+#[must_use]
+pub fn probe_quill_capability(
+    cx: &Cx,
+    index: &frankensearch_quill::QuillIndex,
+    query: &str,
+    limit: usize,
+) -> CapabilityProbeOutcomeV1 {
+    match index.search_paginated(cx, query, limit, 0, true) {
+        Ok(result) => {
+            let mut doc_ids: Vec<String> = result
+                .hits
+                .iter()
+                .map(|hit| hit.document_id.clone())
+                .collect();
+            doc_ids.sort();
+            CapabilityProbeOutcomeV1::Served {
+                doc_ids,
+                total: result
+                    .total_count
+                    .and_then(|total| usize::try_from(total).ok()),
+            }
+        }
+        Err(error) => classify_quill_refusal(&error),
+    }
+}
+
+/// Adjudicate one capability probe against its committed expectation.
+///
+/// Independent, like every other oracle here: it consults only the committed
+/// row. There is no cross-engine arm to consult even in principle — Tantivy has
+/// no typed capability surface, and that difference is a divergence the witness
+/// records rather than an equality it could assert.
+#[must_use]
+pub fn adjudicate_capability_probe(
+    expectation: &CapabilityProbeExpectationV1,
+    outcome: &CapabilityProbeOutcomeV1,
+) -> NativeVerdictV1 {
+    let mut failures = Vec::new();
+
+    match (expectation.outcome, outcome) {
+        (
+            CapabilityOutcomeExpectationV1::Refused {
+                schema,
+                field,
+                operator_code,
+                capability_code,
+                class,
+            },
+            CapabilityProbeOutcomeV1::Refused(refusal),
+        ) => {
+            if refusal.class != class {
+                failures.push(format!(
+                    "refusal class {:?} != expected {class:?}",
+                    refusal.class
+                ));
+            }
+            if refusal.code != class.stable_code() {
+                failures.push(format!(
+                    "refusal code {} != expected {}",
+                    refusal.code,
+                    class.stable_code()
+                ));
+            }
+            if refusal.schema != schema {
+                failures.push(format!(
+                    "refusal names schema {} != expected {schema}",
+                    refusal.schema
+                ));
+            }
+            if refusal.field != field {
+                failures.push(format!(
+                    "refusal names field {} != expected {field}",
+                    refusal.field
+                ));
+            }
+            if refusal.operator != operator_code {
+                failures.push(format!(
+                    "refusal names operator {} != expected {operator_code}",
+                    refusal.operator
+                ));
+            }
+            if refusal.capability != capability_code {
+                failures.push(format!(
+                    "refusal names capability {} != expected {capability_code}",
+                    refusal.capability
+                ));
+            }
+        }
+        (
+            CapabilityOutcomeExpectationV1::Refused { .. },
+            CapabilityProbeOutcomeV1::Served { .. },
+        ) => {
+            failures.push(
+                "the engine served a query that requires a capability its schema lacks".to_owned(),
+            );
+        }
+        (
+            CapabilityOutcomeExpectationV1::Refused { .. },
+            CapabilityProbeOutcomeV1::UnmappedError { rendered },
+        ) => {
+            // The bead's words: never a bare "unsupported query". A refusal
+            // the witness cannot classify does NOT satisfy a typed-refusal
+            // expectation, however plausible its text.
+            failures.push(format!(
+                "the engine refused with an unclassified error instead of the typed capability \
+                 class: {rendered}"
+            ));
+        }
+        (
+            CapabilityOutcomeExpectationV1::Served { docs, total },
+            CapabilityProbeOutcomeV1::Served {
+                doc_ids,
+                total: observed_total,
+            },
+        ) => {
+            let expected: Vec<String> = docs.iter().map(|doc| (*doc).to_owned()).collect();
+            if *doc_ids != expected {
+                failures.push(format!("served {doc_ids:?} != expected {expected:?}"));
+            }
+            match observed_total {
+                Some(observed) if *observed == total => {}
+                Some(observed) => {
+                    failures.push(format!("served total {observed} != expected {total}"));
+                }
+                None => failures.push(
+                    "no exact total was returned although an exact count was requested".to_owned(),
+                ),
+            }
+        }
+        (
+            CapabilityOutcomeExpectationV1::Served { .. },
+            CapabilityProbeOutcomeV1::Refused(refusal),
+        ) => {
+            // The row that stops a blanket-refusal engine from passing the
+            // acceptance row vacuously.
+            failures.push(format!(
+                "the engine refused a servable query as {} ({})",
+                refusal.class.class_code(),
+                refusal.code
+            ));
+        }
+        (
+            CapabilityOutcomeExpectationV1::Served { .. },
+            CapabilityProbeOutcomeV1::UnmappedError { rendered },
+        ) => {
+            failures.push(format!("the engine failed a servable query: {rendered}"));
+        }
+    }
+
+    NativeVerdictV1 {
+        engine: NativeEngineV1::Quill,
+        query: expectation.query.to_owned(),
+        offset: 0,
+        oracle_failures: failures,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Observations
 // ---------------------------------------------------------------------------
 
@@ -1449,16 +2020,324 @@ mod tests {
         assert!(!MetadataStateV1::EmptyObject.is_present());
     }
 
+    // -----------------------------------------------------------------
+    // Typed capability refusal (slice 4)
+    // -----------------------------------------------------------------
+
+    fn capability_row(label: &str) -> &'static CapabilityProbeExpectationV1 {
+        FIXTURE_CAPABILITY_EXPECTATIONS
+            .iter()
+            .find(|row| row.label == label)
+            .expect("capability fixture row")
+    }
+
+    fn refusal() -> EnrichedCapabilityRefusalV1 {
+        let class = EnrichedErrorClassV1::QueryCapabilityPositionsRequired;
+        EnrichedCapabilityRefusalV1 {
+            class,
+            code: class.stable_code().to_owned(),
+            schema: WITNESS_POSITIONLESS_SCHEMA_NAME.to_owned(),
+            field: "content".to_owned(),
+            operator: "phrase".to_owned(),
+            capability: "positions".to_owned(),
+        }
+    }
+
+    #[test]
+    fn the_expected_typed_refusal_passes() {
+        let row = capability_row("positionless-multi-term-phrase");
+        let verdict =
+            adjudicate_capability_probe(row, &CapabilityProbeOutcomeV1::Refused(refusal()));
+        assert!(verdict.passed(), "{:?}", verdict.oracle_failures);
+    }
+
+    /// One named mutation of a refusal: its label, the edit, and the substring
+    /// the resulting failure must contain.
+    type RefusalMutation = (
+        &'static str,
+        fn(&mut EnrichedCapabilityRefusalV1),
+        &'static str,
+    );
+
+    /// Each named field of the refusal is adjudicated SEPARATELY, so a refusal
+    /// that is right about the schema and wrong about the operator is caught.
+    /// A single rendered-message comparison could not distinguish these.
+    #[test]
+    fn every_named_field_of_the_refusal_is_pinned() {
+        let row = capability_row("positionless-multi-term-phrase");
+        let mutations: [RefusalMutation; 5] = [
+            (
+                "schema",
+                |refusal| refusal.schema = "frankensearch-default-v1".to_owned(),
+                "names schema",
+            ),
+            (
+                "field",
+                |refusal| refusal.field = "title".to_owned(),
+                "names field",
+            ),
+            (
+                "operator",
+                |refusal| refusal.operator = "boolean".to_owned(),
+                "names operator",
+            ),
+            (
+                "capability",
+                |refusal| refusal.capability = "fast".to_owned(),
+                "names capability",
+            ),
+            (
+                "code",
+                |refusal| refusal.code = "FSNE-CAP-9999".to_owned(),
+                "refusal code",
+            ),
+        ];
+        for (name, mutate, expected_failure) in mutations {
+            let mut mutated = refusal();
+            mutate(&mut mutated);
+            let verdict =
+                adjudicate_capability_probe(row, &CapabilityProbeOutcomeV1::Refused(mutated));
+            assert!(!verdict.passed(), "the {name} mutation must fail");
+            assert!(
+                verdict
+                    .oracle_failures
+                    .iter()
+                    .any(|failure| failure.contains(expected_failure)),
+                "the {name} mutation must fail for the right reason: {:?}",
+                verdict.oracle_failures
+            );
+        }
+    }
+
+    /// A bare `UnsupportedQuery` is exactly the degraded error the bead
+    /// rejects. It maps to `UnmappedError`, never into the capability class,
+    /// and it does not satisfy a typed-refusal expectation.
+    #[test]
+    fn a_bare_unsupported_query_is_never_laundered_into_the_capability_class() {
+        let generic = frankensearch_quill::QuillIndexError::UnsupportedQuery {
+            detail: "phrase".to_owned(),
+        };
+        let outcome = classify_quill_refusal(&generic);
+        assert!(
+            matches!(outcome, CapabilityProbeOutcomeV1::UnmappedError { .. }),
+            "got {outcome:?}"
+        );
+
+        let row = capability_row("positionless-multi-term-phrase");
+        let verdict = adjudicate_capability_probe(row, &outcome);
+        assert!(!verdict.passed());
+        assert!(
+            verdict
+                .oracle_failures
+                .iter()
+                .any(|failure| failure.contains("unclassified error")),
+            "got {:?}",
+            verdict.oracle_failures
+        );
+    }
+
+    /// The real typed error maps to the real refusal, so the mapper is proved
+    /// against the engine's own error type rather than a hand-built stand-in.
+    #[test]
+    fn the_real_typed_capability_error_maps_to_the_witness_class() {
+        use frankensearch_quill::query::{IndexCapability, QueryCapabilityError, QueryExplanation};
+
+        let typed = frankensearch_quill::QuillIndexError::QueryCapability(
+            QueryCapabilityError::PositionsRequired {
+                schema: WITNESS_POSITIONLESS_SCHEMA_NAME,
+                field: "content".to_owned(),
+                operator: QueryExplanation::Phrase,
+                capability: IndexCapability::Positions,
+            },
+        );
+        assert_eq!(
+            classify_quill_refusal(&typed),
+            CapabilityProbeOutcomeV1::Refused(refusal())
+        );
+    }
+
+    /// An engine that refused EVERYTHING would pass the acceptance row on its
+    /// own. The served control rows are what stop that, so this proves they
+    /// actually fail on a blanket refusal.
+    #[test]
+    fn a_blanket_refusal_fails_the_served_control_rows() {
+        for label in [
+            "positionless-single-term-quote",
+            "positionless-bare-term",
+            "positionful-multi-term-phrase",
+        ] {
+            let row = capability_row(label);
+            let verdict =
+                adjudicate_capability_probe(row, &CapabilityProbeOutcomeV1::Refused(refusal()));
+            assert!(!verdict.passed(), "{label} must reject a blanket refusal");
+            assert!(
+                verdict
+                    .oracle_failures
+                    .iter()
+                    .any(|failure| failure.contains("refused a servable query")),
+                "got {:?}",
+                verdict.oracle_failures
+            );
+        }
+    }
+
+    /// The reversed-phrase row is what makes the positionful control
+    /// non-vacuous: an engine that degenerated a phrase into a conjunction
+    /// would return doc-alpha for it.
+    #[test]
+    fn a_phrase_degenerated_into_a_conjunction_fails_the_reversed_row() {
+        let row = capability_row("positionful-reversed-phrase");
+        let degenerated = CapabilityProbeOutcomeV1::Served {
+            doc_ids: vec!["doc-alpha".to_owned()],
+            total: Some(1),
+        };
+        let verdict = adjudicate_capability_probe(row, &degenerated);
+        assert!(!verdict.passed());
+        assert!(
+            verdict
+                .oracle_failures
+                .iter()
+                .any(|failure| failure.contains("served [\"doc-alpha\"] != expected []")),
+            "got {:?}",
+            verdict.oracle_failures
+        );
+    }
+
+    /// A served page with no exact count fails: `exact_count` was requested.
+    #[test]
+    fn a_served_row_without_an_exact_count_fails() {
+        let row = capability_row("positionful-multi-term-phrase");
+        let countless = CapabilityProbeOutcomeV1::Served {
+            doc_ids: vec!["doc-alpha".to_owned()],
+            total: None,
+        };
+        let verdict = adjudicate_capability_probe(row, &countless);
+        assert!(!verdict.passed());
+        assert!(
+            verdict
+                .oracle_failures
+                .iter()
+                .any(|failure| failure.contains("no exact total")),
+            "got {:?}",
+            verdict.oracle_failures
+        );
+    }
+
+    #[test]
+    fn the_stable_error_code_is_pinned() {
+        let class = EnrichedErrorClassV1::QueryCapabilityPositionsRequired;
+        assert_eq!(class.stable_code(), "FSNE-CAP-0001");
+        assert_eq!(
+            class.class_code(),
+            "enriched.query_capability.positions_required"
+        );
+    }
+
+    #[test]
+    fn engine_diagnostics_are_bounded() {
+        let long = "x".repeat(MAX_DIAGNOSTIC_CHARS * 3);
+        let bounded = bounded_diagnostic(&long);
+        assert!(bounded.starts_with(&"x".repeat(MAX_DIAGNOSTIC_CHARS)));
+        assert!(bounded.ends_with("…[truncated]"));
+        assert_eq!(bounded.chars().count(), MAX_DIAGNOSTIC_CHARS + 12);
+        // A multi-byte diagnostic must be cut on a character boundary, not a
+        // byte offset, or the bound itself would corrupt the record.
+        let multibyte = "é".repeat(MAX_DIAGNOSTIC_CHARS * 2);
+        assert!(!bounded_diagnostic(&multibyte).contains('\u{FFFD}'));
+    }
+
+    /// The positionless schema must differ from the shipping default in
+    /// EXACTLY one axis. If it drifted in another, a refusal would no longer
+    /// be attributable to the missing capability.
+    #[test]
+    fn the_positionless_schema_differs_only_in_positions() {
+        use frankensearch_quill::{DEFAULT_SCHEMA, FieldKind};
+
+        WITNESS_POSITIONLESS_SCHEMA
+            .validate()
+            .expect("the witness positionless schema must be valid");
+        assert_ne!(
+            WITNESS_POSITIONLESS_SCHEMA.name, DEFAULT_SCHEMA.name,
+            "the arms must be distinguishable by name"
+        );
+        assert_eq!(
+            WITNESS_POSITIONLESS_SCHEMA.fields.len(),
+            DEFAULT_SCHEMA.fields.len()
+        );
+        let mut positionless_text_fields = 0;
+        for (witness, shipping) in WITNESS_POSITIONLESS_SCHEMA
+            .fields
+            .iter()
+            .zip(DEFAULT_SCHEMA.fields)
+        {
+            assert_eq!(witness.id, shipping.id);
+            assert_eq!(witness.name, shipping.name);
+            assert_eq!(witness.stored, shipping.stored);
+            match (witness.kind, shipping.kind) {
+                (
+                    FieldKind::Text {
+                        analyzer: witness_analyzer,
+                        positions: witness_positions,
+                    },
+                    FieldKind::Text {
+                        analyzer: shipping_analyzer,
+                        positions: shipping_positions,
+                    },
+                ) => {
+                    assert_eq!(
+                        witness_analyzer, shipping_analyzer,
+                        "the analyzer must not drift with the capability"
+                    );
+                    assert!(
+                        shipping_positions,
+                        "the shipping control must be positioned"
+                    );
+                    assert!(!witness_positions);
+                    positionless_text_fields += 1;
+                }
+                (witness_kind, shipping_kind) => {
+                    assert_eq!(witness_kind, shipping_kind, "non-text fields must match");
+                }
+            }
+        }
+        assert_eq!(
+            positionless_text_fields, 2,
+            "both text fields must lose positions"
+        );
+    }
+
+    /// The served rows are written sorted, because the probe canonicalizes its
+    /// observation by sorting. An unsorted row would fail for a reason that
+    /// has nothing to do with the engine.
+    #[test]
+    fn the_committed_served_rows_are_canonically_sorted() {
+        for row in FIXTURE_CAPABILITY_EXPECTATIONS {
+            if let CapabilityOutcomeExpectationV1::Served { docs, .. } = row.outcome {
+                let mut sorted = docs.to_vec();
+                sorted.sort_unstable();
+                assert_eq!(docs, sorted.as_slice(), "row {} is not sorted", row.label);
+            }
+        }
+    }
+
     #[test]
     fn the_manifests_change_when_the_fixtures_change() {
         let corpus = corpus_manifest_sha256();
         let queries = query_manifest_sha256();
+        let capabilities = capability_manifest_sha256();
         assert_eq!(corpus.len(), 64);
         assert_eq!(queries.len(), 64);
-        assert_ne!(
-            corpus, queries,
-            "distinct domains must not collide into one digest"
-        );
+        assert_eq!(capabilities.len(), 64);
+        for (left, right) in [
+            (&corpus, &queries),
+            (&corpus, &capabilities),
+            (&queries, &capabilities),
+        ] {
+            assert_ne!(
+                left, right,
+                "distinct domains must not collide into one digest"
+            );
+        }
         assert_eq!(
             FIXTURE_CORPUS.len(),
             FIXTURE_DOC_COUNT,
